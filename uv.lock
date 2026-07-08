@@ -384,6 +384,8 @@ dependencies = [
     { name = "pydantic" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
+    { name = "starlette" },
+    { name = "uvicorn" },
 ]
 
 [package.optional-dependencies]
@@ -406,6 +408,8 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.2,<2" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15,<1" },
+    { name = "starlette", specifier = ">=1.3,<2" },
+    { name = "uvicorn", specifier = ">=0.50,<1" },
 ]
 provides-extras = ["dev"]
 

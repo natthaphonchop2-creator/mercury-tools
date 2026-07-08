@@ -10,6 +10,10 @@ from dotenv import load_dotenv
 
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_EMBEDDING_DIM = 1536
+DEFAULT_MCP_TRANSPORT = "streamable-http"
+DEFAULT_MCP_HOST = "0.0.0.0"
+DEFAULT_MCP_PORT = 8000
+DEFAULT_MCP_PATH = "/mcp"
 
 
 @dataclass(frozen=True)
@@ -21,6 +25,13 @@ class Settings:
     embedding_dim: int = DEFAULT_EMBEDDING_DIM
     mercury_agent_path: Path | None = None
     mercury_home: Path | None = None
+    mcp_transport: str = DEFAULT_MCP_TRANSPORT
+    mcp_host: str = DEFAULT_MCP_HOST
+    mcp_port: int = DEFAULT_MCP_PORT
+    mcp_path: str = DEFAULT_MCP_PATH
+    public_base_url: str = ""
+    http_bearer_token: str = ""
+    http_require_auth: bool = False
 
     @property
     def supabase_configured(self) -> bool:
@@ -29,6 +40,42 @@ class Settings:
     @property
     def openai_configured(self) -> bool:
         return bool(self.openai_api_key)
+
+    @property
+    def http_auth_configured(self) -> bool:
+        return bool(self.http_bearer_token)
+
+    @property
+    def mcp_endpoint(self) -> str:
+        if self.public_base_url:
+            return f"{self.public_base_url.rstrip('/')}{self.mcp_path}"
+        return f"http://{self.mcp_host}:{self.mcp_port}{self.mcp_path}"
+
+
+def _env_bool(name: str, *, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(names: tuple[str, ...], *, default: int) -> int:
+    for name in names:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            return default
+    return default
+
+
+def _normalize_path(value: str, *, default: str) -> str:
+    path = value.strip() or default
+    if not path.startswith("/"):
+        path = f"/{path}"
+    return path
 
 
 def load_settings(*, dotenv_path: str | Path | None = None) -> Settings:
@@ -45,6 +92,10 @@ def load_settings(*, dotenv_path: str | Path | None = None) -> Settings:
 
     mercury_agent = os.environ.get("MERCURY_AGENT_PATH", "").strip()
     mercury_home = os.environ.get("MERCURY_HOME", "").strip()
+    mcp_path = _normalize_path(
+        os.environ.get("MERCURY_TOOLS_MCP_PATH", DEFAULT_MCP_PATH),
+        default=DEFAULT_MCP_PATH,
+    )
     return Settings(
         supabase_url=os.environ.get("SUPABASE_URL", "").strip().rstrip("/"),
         supabase_service_role_key=os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip(),
@@ -53,10 +104,16 @@ def load_settings(*, dotenv_path: str | Path | None = None) -> Settings:
         embedding_dim=embedding_dim,
         mercury_agent_path=Path(mercury_agent).expanduser() if mercury_agent else None,
         mercury_home=Path(mercury_home).expanduser() if mercury_home else None,
+        mcp_transport=os.environ.get("MERCURY_TOOLS_MCP_TRANSPORT", DEFAULT_MCP_TRANSPORT),
+        mcp_host=os.environ.get("MERCURY_TOOLS_HOST", DEFAULT_MCP_HOST).strip() or DEFAULT_MCP_HOST,
+        mcp_port=_env_int(("MERCURY_TOOLS_PORT", "PORT"), default=DEFAULT_MCP_PORT),
+        mcp_path=mcp_path,
+        public_base_url=os.environ.get("MERCURY_TOOLS_PUBLIC_BASE_URL", "").strip().rstrip("/"),
+        http_bearer_token=os.environ.get("MERCURY_TOOLS_HTTP_BEARER_TOKEN", "").strip(),
+        http_require_auth=_env_bool("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", default=False),
     )
 
 
 def require_supabase(settings: Settings) -> None:
     if not settings.supabase_configured:
         raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required.")
-

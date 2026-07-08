@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: mercury-tools-mcp
+    env: docker
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: MERCURY_TOOLS_MCP_TRANSPORT
+        value: streamable-http
+      - key: MERCURY_TOOLS_HOST
+        value: 0.0.0.0
+      - key: MERCURY_TOOLS_MCP_PATH
+        value: /mcp
+      - key: MERCURY_TOOLS_HTTP_REQUIRE_AUTH
+        value: "true"
+      - key: MERCURY_TOOLS_PUBLIC_BASE_URL
+        sync: false
+      - key: MERCURY_TOOLS_HTTP_BEARER_TOKEN
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: MERCURY_TOOLS_EMBEDDING_MODEL
+        value: text-embedding-3-small
+      - key: MERCURY_TOOLS_EMBEDDING_DIM
+        value: "1536"

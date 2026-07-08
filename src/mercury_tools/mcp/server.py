@@ -5,6 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
 
 from mercury_tools.config import load_settings
 from mercury_tools.db.supabase import SupabaseRagStore
@@ -17,6 +20,25 @@ from mercury_tools.rag.service import RagService
 from mercury_tools.safety.redaction import redact_json
 
 mcp = FastMCP("Mercury Tools")
+
+
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, *, token: str, protected_path: str):
+        super().__init__(app)
+        self.token = token
+        self.protected_path = protected_path.rstrip("/") or "/"
+
+    async def dispatch(self, request: Request, call_next):
+        if request.method == "OPTIONS" or not request.url.path.startswith(self.protected_path):
+            return await call_next(request)
+
+        expected = f"Bearer {self.token}"
+        if request.headers.get("authorization") != expected:
+            return JSONResponse(
+                {"error": "unauthorized", "message": "Valid bearer token is required."},
+                status_code=401,
+            )
+        return await call_next(request)
 
 
 def _service() -> RagService:
@@ -116,7 +138,7 @@ def get_document(document_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 def connector_status() -> dict[str, Any]:
-    """Read sanitized Mercury connector status from the local Mercury runtime."""
+    """Read sanitized Mercury connector status from Mercury runtime metadata."""
     payload = read_connector_status()
     _audit("connector_status", {}, {"status": payload.get("status")})
     return payload
@@ -212,14 +234,70 @@ def connector_setup_guide_th() -> str:
     return get_prompt("connector_setup_guide_th")
 
 
-def serve(*, transport: str = "stdio", host: str = "127.0.0.1", port: int = 8000) -> None:
+async def root(request: Request) -> Response:
+    settings = load_settings()
+    base_url = settings.public_base_url or str(request.base_url).rstrip("/")
+    return JSONResponse(
+        {
+            "name": "Mercury Tools MCP",
+            "status": "ok",
+            "transport": "streamable-http",
+            "mcp_path": settings.mcp_path,
+            "mcp_endpoint": f"{base_url}{settings.mcp_path}",
+            "health": "/healthz",
+        }
+    )
+
+
+async def healthz(_: Request) -> Response:
+    settings = load_settings()
+    return JSONResponse(
+        {
+            "status": "ok",
+            "supabase": settings.supabase_configured,
+            "openai": settings.openai_configured,
+            "mcp_path": settings.mcp_path,
+            "http_auth_required": settings.http_require_auth,
+            "http_auth_configured": settings.http_auth_configured,
+        }
+    )
+
+
+def create_http_app(*, require_auth: bool | None = None):
+    settings = load_settings()
+    mcp.settings.streamable_http_path = settings.mcp_path
+    app = mcp.streamable_http_app()
+    app.add_route("/", root, methods=["GET"])
+    app.add_route("/healthz", healthz, methods=["GET"])
+
+    should_require_auth = settings.http_require_auth if require_auth is None else require_auth
+    if should_require_auth:
+        if not settings.http_bearer_token:
+            raise RuntimeError(
+                "MERCURY_TOOLS_HTTP_BEARER_TOKEN is required when HTTP auth is enabled."
+            )
+        app.add_middleware(
+            BearerAuthMiddleware,
+            token=settings.http_bearer_token,
+            protected_path=settings.mcp_path,
+        )
+    return app
+
+
+def serve(
+    *,
+    transport: str = "streamable-http",
+    host: str = "0.0.0.0",
+    port: int = 8000,
+    require_auth: bool | None = None,
+) -> None:
     if transport == "stdio":
         mcp.run(transport="stdio")
         return
     if transport in {"http", "streamable-http"}:
-        mcp.settings.host = host
-        mcp.settings.port = port
-        mcp.run(transport="streamable-http")
+        import uvicorn
+
+        uvicorn.run(create_http_app(require_auth=require_auth), host=host, port=port)
         return
     raise ValueError(f"Unsupported transport: {transport}")
 

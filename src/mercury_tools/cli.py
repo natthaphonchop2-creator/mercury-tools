@@ -38,6 +38,15 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
                 str(settings.mercury_agent_path) if settings.mercury_agent_path else None
             ),
             "mercury_home": str(settings.mercury_home) if settings.mercury_home else None,
+            "mcp": {
+                "transport": settings.mcp_transport,
+                "host": settings.mcp_host,
+                "port": settings.mcp_port,
+                "path": settings.mcp_path,
+                "endpoint": settings.mcp_endpoint,
+                "http_auth_required": settings.http_require_auth,
+                "http_auth_configured": settings.http_auth_configured,
+            },
         }
     )
     return 0
@@ -92,7 +101,18 @@ def cmd_search(args: argparse.Namespace) -> int:
 def cmd_mcp_serve(args: argparse.Namespace) -> int:
     from mercury_tools.mcp.server import serve
 
-    serve(transport=args.transport, host=args.host, port=args.port)
+    settings = load_settings()
+    require_auth = settings.http_require_auth
+    if args.require_auth:
+        require_auth = True
+    if args.allow_unauthenticated:
+        require_auth = False
+    serve(
+        transport=args.transport or settings.mcp_transport,
+        host=args.host or settings.mcp_host,
+        port=args.port or settings.mcp_port,
+        require_auth=require_auth,
+    )
     return 0
 
 
@@ -126,9 +146,11 @@ def build_parser() -> argparse.ArgumentParser:
     mcp = sub.add_parser("mcp")
     mcp_sub = mcp.add_subparsers(dest="mcp_command", required=True)
     serve = mcp_sub.add_parser("serve")
-    serve.add_argument("--transport", choices=["stdio", "http", "streamable-http"], default="stdio")
-    serve.add_argument("--host", default="127.0.0.1")
-    serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument("--transport", choices=["stdio", "http", "streamable-http"])
+    serve.add_argument("--host")
+    serve.add_argument("--port", type=int)
+    serve.add_argument("--require-auth", action="store_true")
+    serve.add_argument("--allow-unauthenticated", action="store_true")
     serve.set_defaults(func=cmd_mcp_serve)
     return parser
 

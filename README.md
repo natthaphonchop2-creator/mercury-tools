@@ -4,10 +4,10 @@ Mercury Tools is the MCP and RAG companion repo for Mercury Agent. It exposes
 accounting knowledge, curated LLM Wiki pages, connector metadata, and skill
 prompts to MCP hosts such as Codex, Cursor, and Claude Desktop.
 
-v1 is intentionally read-oriented:
+v1 is remote-first and read-oriented:
 
 - Python package with `mercury-tools` CLI
-- MCP server, stdio-first
+- MCP server, Streamable HTTP first
 - Supabase Postgres + pgvector RAG store
 - Hybrid search over curated knowledge
 - Context packs with citations for host agents
@@ -30,13 +30,25 @@ uv run mercury-tools ingest wiki --path ./wiki
 uv run mercury-tools search "vat input tax" --json
 ```
 
-Start the MCP server:
+Start the remote MCP server locally:
+
+```bash
+uv run mercury-tools mcp serve
+```
+
+The default remote endpoint is:
+
+```text
+http://localhost:8000/mcp
+```
+
+For stdio compatibility:
 
 ```bash
 uv run mercury-tools mcp serve --transport stdio
 ```
 
-Example MCP client config:
+Example local stdio MCP client config:
 
 ```json
 {
@@ -49,12 +61,18 @@ Example MCP client config:
         "run",
         "mercury-tools",
         "mcp",
-        "serve"
+        "serve",
+        "--transport",
+        "stdio"
       ]
     }
   }
 }
 ```
+
+Remote deployment guide:
+
+- [docs/REMOTE_DEPLOYMENT.md](docs/REMOTE_DEPLOYMENT.md)
 
 ## Environment
 
@@ -63,6 +81,7 @@ Required for live RAG:
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `OPENAI_API_KEY`
+- `MERCURY_TOOLS_HTTP_BEARER_TOKEN` for remote MCP auth
 
 The service role key must stay local/server-side. Do not put it in MCP client
 configs that sync to cloud services.
