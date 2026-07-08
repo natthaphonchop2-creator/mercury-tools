@@ -72,6 +72,7 @@ def test_connect_page_and_status(monkeypatch) -> None:
     assert status.json()["mcp_endpoint"] == "https://mercury.example.com/mcp"
     assert status.json()["invite_required"] is True
     assert status.json()["dashboard"] == "/api/dashboard"
+    assert status.json()["connector_credentials"] == "/api/connectors/credentials"
 
 
 def test_connect_api_rejects_bad_invite(monkeypatch) -> None:

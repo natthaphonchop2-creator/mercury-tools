@@ -378,6 +378,7 @@ name = "mercury-tools"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "httpx" },
     { name = "mcp" },
     { name = "openai" },
@@ -398,6 +399,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", specifier = ">=49.0,<50" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "mcp", specifier = "==1.26.0" },
     { name = "mcp", extras = ["cli"], marker = "extra == 'dev'", specifier = "==1.26.0" },

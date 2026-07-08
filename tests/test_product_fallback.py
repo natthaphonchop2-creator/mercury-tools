@@ -10,6 +10,7 @@ class AuditFallbackStore(SupabaseProductStore):
                 supabase_url="https://example.supabase.co",
                 supabase_service_role_key="service-role",
                 openai_api_key="",
+                connect_signing_secret="signing-secret",
             )
         )
         self.events: list[dict] = []
@@ -123,6 +124,38 @@ def test_product_store_audit_fallback_records_team_invite() -> None:
     invited = next(item for item in dashboard["members"] if item.get("status") == "invited")
     assert invited["role"] == "viewer"
     assert dashboard["events"][0]["event_type"] == "team.member_invited"
+
+
+def test_product_store_audit_fallback_encrypts_connector_credentials() -> None:
+    store = AuditFallbackStore()
+    request = ConnectRequest(
+        email="owner@example.com",
+        company="Demo Co",
+        host_app="codex",
+        invite_code="invite",
+    )
+    store.upsert_connection(request, token_payload())
+
+    result = store.set_connector_credentials(
+        token_payload=token_payload(),
+        connector_id="flowaccount",
+        environment="production",
+        credentials={
+            "client_id": "demo-client-id",
+            "client_secret": "super-secret-value",
+        },
+    )
+    dashboard = store.dashboard(token_payload())
+    serialized_events = str(store.events)
+    profile = dashboard["connector_profiles"][0]
+
+    assert result["status"] == "credentials_configured"
+    assert profile["status"] == "credentials_configured"
+    assert profile["metadata"]["credentials_configured"] is True
+    assert "client_id" in result["credential_fields"]
+    assert "super-secret-value" not in serialized_events
+    assert "demo-client-id" not in serialized_events
+    assert "ciphertext" in serialized_events
 
 
 def test_product_store_audit_fallback_records_uploaded_skill() -> None:

@@ -583,6 +583,7 @@ async def status(_: Request) -> Response:
             "connect": "/api/connect",
             "dashboard": "/api/dashboard",
             "connector_setup": "/api/connectors/setup",
+            "connector_credentials": "/api/connectors/credentials",
             "team_invite": "/api/team/invite",
             "skill_enable": "/api/skills/enable",
             "skill_upload": "/api/skills/upload",
@@ -671,6 +672,35 @@ async def setup_connector(request: Request) -> Response:
             metadata={"source": "connect-ui"},
         )
         return JSONResponse(redact_json({"status": "ok", "profile": profile}))
+    except PermissionError as exc:
+        return _json_error("unauthorized", str(exc), status_code=401)
+    except ValueError as exc:
+        return _json_error("bad_request", str(exc), status_code=400)
+    except RuntimeError as exc:
+        return _json_error("service_unavailable", str(exc), status_code=503)
+
+
+async def setup_connector_credentials(request: Request) -> Response:
+    settings = load_settings()
+    try:
+        token_payload = _client_token_payload(request)
+        if not settings.supabase_configured:
+            return _json_error(
+                "service_unavailable",
+                "Supabase is required to save connector credentials.",
+                status_code=503,
+            )
+        data = await request.json()
+        credentials = data.get("credentials") or {}
+        if not isinstance(credentials, dict):
+            raise ValueError("credentials must be an object.")
+        result = _product_store(settings).set_connector_credentials(
+            token_payload=token_payload,
+            connector_id=str(data.get("connector_id") or "").strip().lower(),
+            environment=str(data.get("environment") or "").strip().lower(),
+            credentials={str(key): str(value) for key, value in credentials.items()},
+        )
+        return JSONResponse(redact_json({"status": "ok", "credentials": result}))
     except PermissionError as exc:
         return _json_error("unauthorized", str(exc), status_code=401)
     except ValueError as exc:
@@ -836,6 +866,7 @@ def create_http_app(*, require_auth: bool | None = None):
     app.add_route("/api/connect", connect, methods=["POST"])
     app.add_route("/api/dashboard", dashboard, methods=["GET"])
     app.add_route("/api/connectors/setup", setup_connector, methods=["POST"])
+    app.add_route("/api/connectors/credentials", setup_connector_credentials, methods=["POST"])
     app.add_route("/api/team/invite", invite_member, methods=["POST"])
     app.add_route("/api/skills/enable", enable_skill, methods=["POST"])
     app.add_route("/api/skills/upload", upload_skill, methods=["POST"])

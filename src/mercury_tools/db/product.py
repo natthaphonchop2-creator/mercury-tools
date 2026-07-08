@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -9,6 +10,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
+from cryptography.fernet import Fernet
 
 from mercury_tools.config import Settings, require_supabase
 from mercury_tools.product import ConnectRequest, normalize_host_app
@@ -134,6 +136,58 @@ def email_hash(email: str) -> str:
 def email_domain(email: str) -> str:
     parts = email.strip().lower().split("@", 1)
     return parts[1] if len(parts) == 2 else ""
+
+
+def connector_by_id(connector_id: str) -> dict[str, Any] | None:
+    return next(
+        (item for item in CONNECTOR_CATALOG if item["connector_id"] == connector_id),
+        None,
+    )
+
+
+def vault_key(settings: Settings, workspace_key_value: str) -> bytes:
+    material = f"{settings.connect_signing_secret}:vault:{workspace_key_value}".encode()
+    return base64.urlsafe_b64encode(hashlib.sha256(material).digest())
+
+
+def encrypt_connector_credentials(
+    settings: Settings,
+    *,
+    workspace_key_value: str,
+    connector_id: str,
+    environment: str,
+    credentials: dict[str, str],
+) -> dict[str, Any]:
+    if not settings.connect_signing_secret:
+        raise RuntimeError("MERCURY_CONNECT_SIGNING_SECRET is required for credential vault.")
+    cleaned = {
+        key: str(value).strip()
+        for key, value in credentials.items()
+        if str(value).strip()
+    }
+    plaintext = json.dumps(
+        {
+            "connector_id": connector_id,
+            "environment": environment,
+            "credentials": cleaned,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
+    token = Fernet(vault_key(settings, workspace_key_value)).encrypt(plaintext).decode("ascii")
+    return {
+        "version": 1,
+        "algorithm": "fernet-sha256-derived",
+        "connector_id": connector_id,
+        "environment": environment,
+        "fields": sorted(cleaned),
+        "fingerprints": {
+            field: hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+            for field, value in cleaned.items()
+        },
+        "ciphertext": token,
+        "configured_at": now_utc(),
+    }
 
 
 def is_product_schema_error(exc: RuntimeError) -> bool:
@@ -305,7 +359,7 @@ class SupabaseProductStore:
         for row in self._fallback_state_events(key):
             summary = row.get("output_summary") or {}
             event_type = str(summary.get("event_type") or "")
-            if event_type == "connector.profile_configured":
+            if event_type in {"connector.profile_configured", "connector.credentials_configured"}:
                 profile = summary.get("profile") or {}
                 profile_key = f"{profile.get('connector_id')}:{profile.get('environment')}"
                 connector_profiles[profile_key] = profile
@@ -484,6 +538,214 @@ class SupabaseProductStore:
             },
         )
         return profile
+
+    def set_connector_credentials(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        environment: str,
+        credentials: dict[str, str],
+    ) -> dict[str, Any]:
+        connector = connector_by_id(connector_id)
+        if not connector:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        if environment not in connector["environments"]:
+            raise ValueError(f"Unsupported environment for {connector_id}: {environment}")
+        required_fields = list(connector["required_secret_fields"])
+        missing = [
+            field
+            for field in required_fields
+            if not str(credentials.get(field) or "").strip()
+        ]
+        if missing:
+            raise ValueError(f"Missing credential fields: {', '.join(missing)}")
+
+        try:
+            return self._set_connector_credentials_product_tables(
+                token_payload=token_payload,
+                connector_id=connector_id,
+                environment=environment,
+                credentials=credentials,
+            )
+        except RuntimeError as exc:
+            if is_product_schema_error(exc):
+                return self._fallback_set_connector_credentials(
+                    token_payload=token_payload,
+                    connector_id=connector_id,
+                    environment=environment,
+                    credentials=credentials,
+                )
+            raise
+
+    def _set_connector_credentials_product_tables(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        environment: str,
+        credentials: dict[str, str],
+    ) -> dict[str, Any]:
+        context = self.workspace_for_token(token_payload)
+        if not context:
+            raise ValueError("Workspace is not registered for this client token.")
+        connector = connector_by_id(connector_id)
+        if not connector:
+            raise ValueError(f"Unknown connector: {connector_id}")
+
+        rows = self._request(
+            "GET",
+            "mercury_connector_profiles",
+            params={
+                "workspace_id": f"eq.{context['workspace']['id']}",
+                "connector_id": f"eq.{connector_id}",
+                "environment": f"eq.{environment}",
+                "select": "id,metadata,display_name,company_name",
+                "limit": "1",
+            },
+        )
+        if rows:
+            profile = rows[0]
+        else:
+            profile = self._set_connector_profile_product_tables(
+                token_payload=token_payload,
+                connector_id=connector_id,
+                environment=environment,
+                company_name=str(context["workspace"].get("name") or ""),
+            )
+
+        vault_record = encrypt_connector_credentials(
+            self.settings,
+            workspace_key_value=context["workspace"]["workspace_key"],
+            connector_id=connector_id,
+            environment=environment,
+            credentials=credentials,
+        )
+        public_metadata = {
+            **(profile.get("metadata") or {}),
+            "credential_storage": "encrypted_server_vault",
+            "credential_fields": vault_record["fields"],
+            "credential_fingerprints": vault_record["fingerprints"],
+            "credentials_configured": True,
+            "credentials_configured_at": vault_record["configured_at"],
+        }
+        rows = self._request(
+            "PATCH",
+            "mercury_connector_profiles",
+            params={"id": f"eq.{profile['id']}"},
+            headers={**self.headers, "Prefer": "return=representation"},
+            json={
+                "status": "credentials_configured",
+                "metadata": public_metadata,
+                "updated_at": now_utc(),
+            },
+        )
+        self._fallback_record_state_event(
+            workspace_key=context["workspace"]["workspace_key"],
+            client_jti=str(token_payload.get("jti") or ""),
+            event_type="connector.credentials_configured",
+            input_payload={
+                "connector_id": connector_id,
+                "environment": environment,
+                "credential_fields": vault_record["fields"],
+            },
+            summary={
+                "profile": {
+                    **(rows[0] if rows else profile),
+                    "status": "credentials_configured",
+                    "metadata": public_metadata,
+                },
+                "vault_record": vault_record,
+                "event_summary": {
+                    "connector_id": connector_id,
+                    "environment": environment,
+                    "credential_fields": vault_record["fields"],
+                    "status": "credentials_configured",
+                },
+            },
+        )
+        return {
+            "status": "credentials_configured",
+            "connector_id": connector_id,
+            "environment": environment,
+            "credential_fields": vault_record["fields"],
+            "credential_fingerprints": vault_record["fingerprints"],
+            "configured_at": vault_record["configured_at"],
+        }
+
+    def _fallback_set_connector_credentials(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        environment: str,
+        credentials: dict[str, str],
+    ) -> dict[str, Any]:
+        context = self._fallback_workspace_for_token(token_payload)
+        connector = connector_by_id(connector_id)
+        if not connector:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        vault_record = encrypt_connector_credentials(
+            self.settings,
+            workspace_key_value=context["workspace"]["workspace_key"],
+            connector_id=connector_id,
+            environment=environment,
+            credentials=credentials,
+        )
+        profile = {
+            "id": stable_id(
+                "connector",
+                context["workspace"]["workspace_key"],
+                connector_id,
+                environment,
+            ),
+            "workspace_id": context["workspace"]["id"],
+            "connector_id": connector_id,
+            "environment": environment,
+            "display_name": connector["name"],
+            "company_name": context["workspace"]["name"],
+            "status": "credentials_configured",
+            "metadata": {
+                "required_secret_fields": connector["required_secret_fields"],
+                "preset": connector["preset"],
+                "credential_storage": "encrypted_server_vault",
+                "credential_fields": vault_record["fields"],
+                "credential_fingerprints": vault_record["fingerprints"],
+                "credentials_configured": True,
+                "credentials_configured_at": vault_record["configured_at"],
+                "storage": "audit_fallback",
+            },
+            "created_at": now_utc(),
+            "updated_at": now_utc(),
+        }
+        self._fallback_record_state_event(
+            workspace_key=context["workspace"]["workspace_key"],
+            client_jti=str(token_payload.get("jti") or ""),
+            event_type="connector.credentials_configured",
+            input_payload={
+                "connector_id": connector_id,
+                "environment": environment,
+                "credential_fields": vault_record["fields"],
+            },
+            summary={
+                "profile": profile,
+                "vault_record": vault_record,
+                "event_summary": {
+                    "connector_id": connector_id,
+                    "environment": environment,
+                    "credential_fields": vault_record["fields"],
+                    "status": "credentials_configured",
+                },
+            },
+        )
+        return {
+            "status": "credentials_configured",
+            "connector_id": connector_id,
+            "environment": environment,
+            "credential_fields": vault_record["fields"],
+            "credential_fingerprints": vault_record["fingerprints"],
+            "configured_at": vault_record["configured_at"],
+        }
 
     def _fallback_record_uploaded_skill(
         self,

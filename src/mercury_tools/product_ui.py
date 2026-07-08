@@ -337,6 +337,21 @@ CONNECT_HTML = """<!doctype html>
               <div id="connector-list" class="list"><div class="item"><small>No connector profile yet.</small></div></div>
             </div>
           </div>
+          <form id="credential-form">
+            <h3 style="margin-top:16px">Encrypted credential vault</h3>
+            <div class="two">
+              <div>
+                <label for="credential_client_id">Client id / API key</label>
+                <input id="credential_client_id" name="client_id" type="password" autocomplete="off" />
+              </div>
+              <div>
+                <label for="credential_client_secret">Client secret</label>
+                <input id="credential_client_secret" name="client_secret" type="password" autocomplete="off" />
+              </div>
+            </div>
+            <button class="full" type="submit">Save encrypted credentials</button>
+            <div id="credential-message" class="message"></div>
+          </form>
         </section>
 
         <section class="panel">
@@ -507,6 +522,28 @@ CONNECT_HTML = """<!doctype html>
         await loadDashboard();
       } catch (error) {
         message('#connector-message', error.message, 'error');
+      }
+    });
+
+    $('#credential-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      try {
+        message('#credential-message', 'Encrypting credentials...');
+        const payload = Object.fromEntries(new FormData(event.target).entries());
+        const data = await authFetch('/api/connectors/credentials', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            connector_id: $('#connector_id').value,
+            environment: $('#environment').value,
+            credentials: payload
+          })
+        });
+        message('#credential-message', 'Saved encrypted credentials for ' + data.credentials.connector_id + '.', 'ok');
+        event.target.reset();
+        await loadDashboard();
+      } catch (error) {
+        message('#credential-message', error.message, 'error');
       }
     });
 

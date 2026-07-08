@@ -99,6 +99,7 @@ Mercury Connect also exposes product APIs:
 - `GET /api/dashboard`
 - `POST /api/team/invite`
 - `POST /api/connectors/setup`
+- `POST /api/connectors/credentials`
 - `POST /api/skills/enable`
 - `POST /api/skills/upload`
 
@@ -111,6 +112,10 @@ If the dedicated product tables from `0002_mercury_product_layer.sql` have not
 been applied yet, Mercury falls back to an event-sourced product state stored in
 the existing `mcp_audit_events` table. This keeps the demo usable while the
 database owner applies the full product migration later.
+
+Connector credentials are accepted through the Connect UI and encrypted before
+they are stored in the event-backed vault. Dashboard responses show only field
+names, fingerprints, and configuration status; raw credentials are not returned.
 
 ## Environment
 
