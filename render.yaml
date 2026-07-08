@@ -2,7 +2,7 @@ services:
   - type: web
     name: mercury-tools-mcp
     env: docker
-    plan: starter
+    plan: free
     autoDeploy: true
     healthCheckPath: /healthz
     envVars:
