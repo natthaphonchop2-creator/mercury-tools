@@ -23,10 +23,11 @@ machine it is saved outside the repo at:
 
 ## 1. Prepare Supabase
 
-Create a Supabase project and run:
+Create a Supabase project and run both migrations:
 
 ```sql
 -- supabase/migrations/0001_mercury_tools_rag.sql
+-- supabase/migrations/0002_mercury_product_layer.sql
 ```
 
 Required extensions:
@@ -62,17 +63,18 @@ migration. The target project for Mercury Tools v1 is:
 vbnlkqvauqwnjbxngkas
 ```
 
-For a dashboard-first setup, paste the full migration from:
+For a dashboard-first setup, paste the full migrations from:
 
 ```text
 supabase/migrations/0001_mercury_tools_rag.sql
+supabase/migrations/0002_mercury_product_layer.sql
 ```
 
-into the Supabase SQL Editor for that project and run it once.
+into the Supabase SQL Editor for that project and run them once in order.
 
-The migration is private by default:
+The migrations are private by default:
 
-- RLS is enabled on all Mercury RAG tables.
+- RLS is enabled on all Mercury RAG and product tables.
 - `anon` and `authenticated` are revoked.
 - `service_role` is the only role granted table access.
 - `match_knowledge_chunks` execution is granted only to `service_role`.
@@ -150,6 +152,22 @@ https://mercury-tools-mcp.onrender.com/
 They enter the invite code, email, company, and AI host, then Mercury generates
 copy-ready MCP setup instructions. The resulting client token is signed and
 time-limited, so users do not need access to the server bearer token file.
+
+If `0002_mercury_product_layer.sql` is not applied yet, the Connect page still
+generates MCP client tokens, but dashboard persistence runs in degraded mode.
+After `0002` is applied, the same page persists:
+
+- workspaces
+- workspace members
+- client token records
+- connector profiles
+- enabled workspace skills
+- uploaded skill drafts
+- product usage/audit events
+
+In v1, connector profiles intentionally do not store raw accounting API keys or
+client secrets. Store those in a proper host/user secret vault until Mercury has
+a dedicated encrypted connector vault.
 
 You can verify the deployed service from this repo with:
 

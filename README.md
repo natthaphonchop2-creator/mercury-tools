@@ -12,6 +12,8 @@ v1 is remote-first and read-oriented:
 - Hybrid search over curated knowledge
 - Context packs with citations for host agents
 - Redacted MCP audit events
+- Mercury Connect product console for workspace setup, connector profiles, skill
+  enablement, skill uploads, and usage events
 
 ## Quick Start
 
@@ -21,8 +23,8 @@ cp .env.example .env
 uv sync --extra dev
 ```
 
-Apply the Supabase migration in `supabase/migrations/0001_mercury_tools_rag.sql`
-to your Supabase project, then ingest the seed wiki:
+Apply the Supabase migrations in `supabase/migrations/` to your Supabase
+project, then ingest the seed wiki:
 
 ```bash
 uv run mercury-tools doctor
@@ -91,6 +93,18 @@ https://mercury-tools-mcp.onrender.com/
 Mercury Connect issues per-user signed MCP tokens from an invite code and
 generates copy-ready MCP config for Codex, Cursor, Claude, or generic MCP hosts.
 Users should not use the server bearer token file directly.
+
+Mercury Connect also exposes product APIs:
+
+- `GET /api/dashboard`
+- `POST /api/connectors/setup`
+- `POST /api/skills/enable`
+- `POST /api/skills/upload`
+
+These APIs require a Mercury client token (`mc_...`) generated from the Connect
+page. The server bearer token is for MCP/admin compatibility, not normal users.
+Connector credentials are not stored in Supabase in v1; connector profiles store
+the selected program, environment, company label, and required secret fields.
 
 ## Environment
 

@@ -13,6 +13,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
 from mercury_tools.config import load_settings
+from mercury_tools.db.product import SupabaseProductStore, slugify
 from mercury_tools.db.supabase import SupabaseRagStore
 from mercury_tools.mercury_runtime import connector_status as read_connector_status
 from mercury_tools.mercury_runtime import skill_markdown
@@ -21,10 +22,13 @@ from mercury_tools.product import (
     create_client_token,
     is_authorized_bearer,
     validate_connect_request,
+    verify_client_token,
 )
+from mercury_tools.product_ui import CONNECT_HTML as PRODUCT_CONNECT_HTML
 from mercury_tools.prompts import get_prompt
+from mercury_tools.rag.chunking import chunk_document, sha256_text
 from mercury_tools.rag.embeddings import create_embedding_provider
-from mercury_tools.rag.models import SearchFilters
+from mercury_tools.rag.models import KnowledgeDocument, SearchFilters
 from mercury_tools.rag.service import RagService
 from mercury_tools.safety.redaction import redact_json
 
@@ -81,6 +85,41 @@ def _filters(filters: dict[str, Any] | None) -> SearchFilters:
         review_status=filters.get("review_status"),
         effective_date=filters.get("effective_date"),
     )
+
+
+def _client_token_payload(request: Request) -> dict[str, Any]:
+    settings = load_settings()
+    authorization = request.headers.get("authorization") or ""
+    if not authorization.startswith("Bearer "):
+        raise PermissionError("Mercury client token is required.")
+    token = authorization.removeprefix("Bearer ").strip()
+    if not token.startswith("mc_"):
+        raise PermissionError("Mercury client token is required for product APIs.")
+    return verify_client_token(settings, token)
+
+
+def _product_store(settings=None) -> SupabaseProductStore:
+    return SupabaseProductStore(settings or load_settings())
+
+
+def _fallback_dashboard(token_payload: dict[str, Any], *, reason: str) -> dict[str, Any]:
+    return {
+        "status": "degraded",
+        "reason": reason,
+        "workspace": {
+            "name": token_payload.get("company"),
+            "host_app": token_payload.get("host_app"),
+        },
+        "member": {"email": token_payload.get("sub")},
+        "connectors": [],
+        "connector_profiles": [],
+        "skills": [],
+        "events": [],
+    }
+
+
+def _json_error(error: str, message: str, *, status_code: int) -> JSONResponse:
+    return JSONResponse({"error": error, "message": message}, status_code=status_code)
 
 
 @mcp.tool()
@@ -524,7 +563,7 @@ CONNECT_HTML = """<!doctype html>
 
 
 async def root(_: Request) -> Response:
-    return HTMLResponse(CONNECT_HTML)
+    return HTMLResponse(PRODUCT_CONNECT_HTML)
 
 
 async def status(_: Request) -> Response:
@@ -542,6 +581,10 @@ async def status(_: Request) -> Response:
             "mcp_endpoint": settings.mcp_endpoint,
             "health": "/healthz",
             "connect": "/api/connect",
+            "dashboard": "/api/dashboard",
+            "connector_setup": "/api/connectors/setup",
+            "skill_enable": "/api/skills/enable",
+            "skill_upload": "/api/skills/upload",
             "http_auth_configured": settings.http_auth_configured,
             "invite_required": bool(settings.connect_invite_code),
         }
@@ -554,6 +597,7 @@ async def connect(request: Request) -> Response:
         data = await request.json()
         connect_request = validate_connect_request(settings, data)
         token = create_client_token(settings, connect_request)
+        token_payload = verify_client_token(settings, token)
         payload = build_connection_payload(
             public_base_url=settings.public_base_url or str(request.base_url).rstrip("/"),
             mcp_path=settings.mcp_path,
@@ -562,11 +606,175 @@ async def connect(request: Request) -> Response:
             company=connect_request.company,
             host_app=connect_request.host_app,
         )
+        payload["dashboard"] = {"api": "/api/dashboard", "url": str(request.base_url).rstrip("/")}
+        if settings.supabase_configured:
+            try:
+                persisted = _product_store(settings).upsert_connection(connect_request, token_payload)
+                payload["persistence"] = {
+                    "status": "ok",
+                    "workspace_id": persisted["workspace"]["id"],
+                    "member_id": persisted["member"]["id"],
+                }
+            except RuntimeError as exc:
+                payload["persistence"] = {
+                    "status": "degraded",
+                    "reason": str(exc),
+                }
+        else:
+            payload["persistence"] = {
+                "status": "degraded",
+                "reason": "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are not configured.",
+            }
         return JSONResponse(payload)
     except PermissionError as exc:
         return JSONResponse({"error": "forbidden", "message": str(exc)}, status_code=403)
     except (RuntimeError, ValueError) as exc:
         return JSONResponse({"error": "bad_request", "message": str(exc)}, status_code=400)
+
+
+async def dashboard(request: Request) -> Response:
+    settings = load_settings()
+    try:
+        token_payload = _client_token_payload(request)
+        if not settings.supabase_configured:
+            return JSONResponse(
+                _fallback_dashboard(token_payload, reason="Supabase is not configured.")
+            )
+        store = _product_store(settings)
+        store.seed_skill_catalog()
+        return JSONResponse(redact_json(store.dashboard(token_payload)))
+    except PermissionError as exc:
+        return _json_error("unauthorized", str(exc), status_code=401)
+    except ValueError as exc:
+        return _json_error("bad_request", str(exc), status_code=400)
+    except RuntimeError as exc:
+        return JSONResponse(_fallback_dashboard(token_payload, reason=str(exc)))
+
+
+async def setup_connector(request: Request) -> Response:
+    settings = load_settings()
+    try:
+        token_payload = _client_token_payload(request)
+        if not settings.supabase_configured:
+            return _json_error(
+                "service_unavailable",
+                "Supabase is required to save connector profiles.",
+                status_code=503,
+            )
+        data = await request.json()
+        profile = _product_store(settings).set_connector_profile(
+            token_payload=token_payload,
+            connector_id=str(data.get("connector_id") or "").strip().lower(),
+            environment=str(data.get("environment") or "").strip().lower(),
+            company_name=str(data.get("company_name") or "").strip(),
+            metadata={"source": "connect-ui"},
+        )
+        return JSONResponse(redact_json({"status": "ok", "profile": profile}))
+    except PermissionError as exc:
+        return _json_error("unauthorized", str(exc), status_code=401)
+    except ValueError as exc:
+        return _json_error("bad_request", str(exc), status_code=400)
+    except RuntimeError as exc:
+        return _json_error("service_unavailable", str(exc), status_code=503)
+
+
+async def enable_skill(request: Request) -> Response:
+    settings = load_settings()
+    try:
+        token_payload = _client_token_payload(request)
+        if not settings.supabase_configured:
+            return _json_error(
+                "service_unavailable",
+                "Supabase is required to manage workspace skills.",
+                status_code=503,
+            )
+        data = await request.json()
+        row = _product_store(settings).set_skill_enabled(
+            token_payload=token_payload,
+            skill_id=str(data.get("skill_id") or "").strip(),
+            enabled=bool(data.get("enabled")),
+        )
+        return JSONResponse(redact_json({"status": "ok", "skill": row}))
+    except PermissionError as exc:
+        return _json_error("unauthorized", str(exc), status_code=401)
+    except ValueError as exc:
+        return _json_error("bad_request", str(exc), status_code=400)
+    except RuntimeError as exc:
+        return _json_error("service_unavailable", str(exc), status_code=503)
+
+
+async def upload_skill(request: Request) -> Response:
+    settings = load_settings()
+    try:
+        token_payload = _client_token_payload(request)
+        if not settings.supabase_configured:
+            return _json_error(
+                "service_unavailable",
+                "Supabase is required to upload workspace skills.",
+                status_code=503,
+            )
+        data = await request.json()
+        title = str(data.get("title") or "").strip()
+        markdown = str(data.get("markdown") or "").strip()
+        if not title:
+            raise ValueError("Skill title is required.")
+        if len(markdown) < 20:
+            raise ValueError("Skill Markdown is too short.")
+
+        context = _product_store(settings).workspace_for_token(token_payload)
+        if not context:
+            raise ValueError("Workspace is not registered for this client token.")
+        skill_hash = sha256_text(f"{title}\n{markdown}")[:8]
+        skill_id = f"workspace-{slugify(title, fallback='skill')}-{skill_hash}"
+        document_uri = f"mercury://workspace/{context['workspace']['id']}/skills/{skill_id}"
+        document = KnowledgeDocument(
+            document_uri=document_uri,
+            title=title,
+            body=markdown,
+            sha256=sha256_text(markdown),
+            source_uri=document_uri,
+            source_title=title,
+            jurisdiction=str(data.get("jurisdiction") or "TH"),
+            connector=str(data.get("connector") or "") or None,
+            doc_type="skill",
+            review_status="draft",
+            metadata={
+                "workspace_id": context["workspace"]["id"],
+                "skill_id": skill_id,
+                "source": "connect-ui-upload",
+            },
+        )
+        chunks = chunk_document(document)
+        embeddings = create_embedding_provider(settings).embed_texts([chunk.text for chunk in chunks])
+        SupabaseRagStore(settings).upsert_document_with_chunks(document, chunks, embeddings)
+        upload = _product_store(settings).record_uploaded_skill(
+            token_payload=token_payload,
+            skill_id=skill_id,
+            title=title,
+            markdown=markdown,
+            metadata={
+                "category": str(data.get("category") or "custom"),
+                "document_uri": document_uri,
+                "chunks": len(chunks),
+            },
+        )
+        return JSONResponse(
+            redact_json(
+                {
+                    "status": "ok",
+                    "skill_id": skill_id,
+                    "document_uri": document_uri,
+                    "chunks": len(chunks),
+                    "upload": upload,
+                }
+            )
+        )
+    except PermissionError as exc:
+        return _json_error("unauthorized", str(exc), status_code=401)
+    except ValueError as exc:
+        return _json_error("bad_request", str(exc), status_code=400)
+    except RuntimeError as exc:
+        return _json_error("service_unavailable", str(exc), status_code=503)
 
 
 async def healthz(_: Request) -> Response:
@@ -600,6 +808,10 @@ def create_http_app(*, require_auth: bool | None = None):
     app.add_route("/", root, methods=["GET"])
     app.add_route("/api/status", status, methods=["GET"])
     app.add_route("/api/connect", connect, methods=["POST"])
+    app.add_route("/api/dashboard", dashboard, methods=["GET"])
+    app.add_route("/api/connectors/setup", setup_connector, methods=["POST"])
+    app.add_route("/api/skills/enable", enable_skill, methods=["POST"])
+    app.add_route("/api/skills/upload", upload_skill, methods=["POST"])
     app.add_route("/healthz", healthz, methods=["GET"])
 
     should_require_auth = settings.http_require_auth if require_auth is None else require_auth
