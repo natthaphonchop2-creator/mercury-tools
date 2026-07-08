@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -266,6 +267,14 @@ async def healthz(_: Request) -> Response:
 def create_http_app(*, require_auth: bool | None = None):
     settings = load_settings()
     mcp.settings.streamable_http_path = settings.mcp_path
+    if settings.public_base_url:
+        public_url = urlparse(settings.public_base_url)
+        allowed_host = public_url.netloc
+        allowed_origin = f"{public_url.scheme}://{public_url.netloc}"
+        if allowed_host and allowed_host not in mcp.settings.transport_security.allowed_hosts:
+            mcp.settings.transport_security.allowed_hosts.append(allowed_host)
+        if allowed_origin and allowed_origin not in mcp.settings.transport_security.allowed_origins:
+            mcp.settings.transport_security.allowed_origins.append(allowed_origin)
     app = mcp.streamable_http_app()
     app.add_route("/", root, methods=["GET"])
     app.add_route("/healthz", healthz, methods=["GET"])
