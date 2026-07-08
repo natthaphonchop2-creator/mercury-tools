@@ -106,6 +106,11 @@ page. The server bearer token is for MCP/admin compatibility, not normal users.
 Connector credentials are not stored in Supabase in v1; connector profiles store
 the selected program, environment, company label, and required secret fields.
 
+If the dedicated product tables from `0002_mercury_product_layer.sql` have not
+been applied yet, Mercury falls back to an event-sourced product state stored in
+the existing `mcp_audit_events` table. This keeps the demo usable while the
+database owner applies the full product migration later.
+
 ## Environment
 
 Required for live RAG:

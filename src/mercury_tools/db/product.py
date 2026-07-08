@@ -99,6 +99,9 @@ CONNECTOR_CATALOG: list[dict[str, Any]] = [
     },
 ]
 
+PRODUCT_STATE_TOOL = "mercury_product_state"
+PRODUCT_FALLBACK_LIMIT = 500
+
 
 def slugify(value: str, *, fallback: str = "workspace") -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
@@ -113,6 +116,39 @@ def workspace_key(company: str) -> str:
 
 def utc_from_epoch(timestamp: int) -> str:
     return datetime.fromtimestamp(timestamp, tz=UTC).isoformat()
+
+
+def now_utc() -> str:
+    return datetime.now(tz=UTC).isoformat()
+
+
+def stable_id(prefix: str, *parts: object) -> str:
+    digest = hashlib.sha256("|".join(str(part) for part in parts).encode("utf-8")).hexdigest()
+    return f"{prefix}_{digest[:24]}"
+
+
+def is_product_schema_error(exc: RuntimeError) -> bool:
+    text = str(exc).lower()
+    return "mercury_" in text and (
+        "404" in text
+        or "pgrst" in text
+        or "schema cache" in text
+        or "does not exist" in text
+        or "could not find" in text
+    )
+
+
+def skill_catalog_rows() -> list[dict[str, Any]]:
+    return [
+        {
+            **skill,
+            "enabled": False,
+            "configured_at": None,
+            "metadata": skill.get("metadata") or {},
+            "updated_at": None,
+        }
+        for skill in SKILL_CATALOG_SEED
+    ]
 
 
 class SupabaseProductStore:
@@ -161,20 +197,359 @@ class SupabaseProductStore:
         )
         return rows[0]
 
-    def seed_skill_catalog(self) -> int:
+    def _fallback_workspace_for_token(self, token_payload: dict[str, Any]) -> dict[str, Any]:
+        key = workspace_key(
+            str(token_payload.get("company") or token_payload.get("sub") or "workspace")
+        )
+        workspace = {
+            "id": stable_id("workspace", key),
+            "workspace_key": key,
+            "name": str(token_payload.get("company") or "Mercury Workspace"),
+            "plan": "invite-preview",
+            "status": "active",
+            "metadata": {"storage": "audit_fallback"},
+            "created_at": utc_from_epoch(int(token_payload.get("iat") or 0)),
+            "updated_at": now_utc(),
+        }
+        member = {
+            "id": stable_id("member", key, token_payload.get("sub")),
+            "email": str(token_payload.get("sub") or ""),
+            "role": "owner",
+            "host_app": normalize_host_app(str(token_payload.get("host_app") or "generic")),
+            "status": "active",
+            "created_at": utc_from_epoch(int(token_payload.get("iat") or 0)),
+            "last_seen_at": now_utc(),
+        }
+        token = {
+            "id": stable_id("client", token_payload.get("jti")),
+            "status": "active",
+            "workspace_id": workspace["id"],
+            "member_id": member["id"],
+            "host_app": member["host_app"],
+            "expires_at": utc_from_epoch(int(token_payload.get("exp") or 0)),
+        }
+        return {"token": token, "workspace": workspace, "member": member}
+
+    def _fallback_upsert_connection(
+        self,
+        request: ConnectRequest,
+        token_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        context = self._fallback_workspace_for_token(token_payload)
+        key = context["workspace"]["workspace_key"]
+        self._fallback_record_state_event(
+            workspace_key=key,
+            client_jti=str(token_payload.get("jti") or ""),
+            event_type="connect.token_issued",
+            input_payload={"company": request.company, "host_app": request.host_app},
+            summary={
+                "workspace": {
+                    "id": context["workspace"]["id"],
+                    "workspace_key": key,
+                    "name": request.company.strip(),
+                    "plan": context["workspace"]["plan"],
+                    "status": "active",
+                },
+                "member": {
+                    "id": context["member"]["id"],
+                    "role": context["member"]["role"],
+                    "host_app": context["member"]["host_app"],
+                    "status": "active",
+                },
+                "client": {
+                    "id": context["token"]["id"],
+                    "host_app": context["token"]["host_app"],
+                    "expires_at": context["token"]["expires_at"],
+                },
+                "event_summary": {"host_app": context["member"]["host_app"]},
+            },
+        )
+        return context
+
+    def _fallback_state_events(self, workspace_key_value: str) -> list[dict[str, Any]]:
+        rows = self._request(
+            "GET",
+            "mcp_audit_events",
+            params={
+                "tool_name": f"eq.{PRODUCT_STATE_TOOL}",
+                "select": "id,created_at,tool_name,output_summary,status,metadata",
+                "order": "created_at.asc",
+                "limit": str(PRODUCT_FALLBACK_LIMIT),
+            },
+        )
+        return [
+            row
+            for row in rows or []
+            if (row.get("metadata") or {}).get("workspace_key") == workspace_key_value
+        ]
+
+    def _fallback_dashboard(self, token_payload: dict[str, Any]) -> dict[str, Any]:
+        context = self._fallback_workspace_for_token(token_payload)
+        key = context["workspace"]["workspace_key"]
+        skills = {skill["skill_id"]: skill for skill in skill_catalog_rows()}
+        connector_profiles: dict[str, dict[str, Any]] = {}
+        events: list[dict[str, Any]] = []
+
+        for row in self._fallback_state_events(key):
+            summary = row.get("output_summary") or {}
+            event_type = str(summary.get("event_type") or "")
+            if event_type == "connector.profile_configured":
+                profile = summary.get("profile") or {}
+                profile_key = f"{profile.get('connector_id')}:{profile.get('environment')}"
+                connector_profiles[profile_key] = profile
+            elif event_type in {"skill.enabled", "skill.disabled"}:
+                skill_id = str(summary.get("skill_id") or "")
+                if skill_id in skills:
+                    skills[skill_id]["enabled"] = bool(summary.get("enabled"))
+                    skills[skill_id]["configured_at"] = row.get("created_at")
+            elif event_type == "skill.uploaded":
+                skill = summary.get("skill") or {}
+                if skill.get("skill_id"):
+                    skills[str(skill["skill_id"])] = {
+                        **skill,
+                        "enabled": True,
+                        "configured_at": row.get("created_at"),
+                    }
+
+            events.append(
+                {
+                    "id": row.get("id"),
+                    "created_at": row.get("created_at"),
+                    "event_type": event_type,
+                    "summary": summary.get("event_summary") or {},
+                    "status": row.get("status"),
+                    "metadata": {"storage": "audit_fallback"},
+                }
+            )
+
+        return {
+            "status": "ok",
+            "storage": "audit_fallback",
+            **context,
+            "connectors": CONNECTOR_CATALOG,
+            "connector_profiles": list(connector_profiles.values()),
+            "skills": sorted(skills.values(), key=lambda item: (item["category"], item["title"])),
+            "events": list(reversed(events[-12:])),
+        }
+
+    def _fallback_set_skill_enabled(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        skill_id: str,
+        enabled: bool,
+    ) -> dict[str, Any]:
+        context = self._fallback_workspace_for_token(token_payload)
+        skill = next((item for item in skill_catalog_rows() if item["skill_id"] == skill_id), None)
+        if not skill and not skill_id.startswith("workspace-"):
+            raise ValueError(f"Unknown skill: {skill_id}")
+        row = {
+            "id": stable_id("workspace_skill", context["workspace"]["workspace_key"], skill_id),
+            "workspace_id": context["workspace"]["id"],
+            "skill_id": skill_id,
+            "enabled": enabled,
+            "configured_by_member_id": context["member"]["id"],
+            "configured_at": now_utc(),
+            "storage": "audit_fallback",
+        }
+        self._fallback_record_state_event(
+            workspace_key=context["workspace"]["workspace_key"],
+            client_jti=str(token_payload.get("jti") or ""),
+            event_type="skill.enabled" if enabled else "skill.disabled",
+            input_payload={"skill_id": skill_id},
+            summary={
+                "skill_id": skill_id,
+                "enabled": enabled,
+                "event_summary": {"skill_id": skill_id, "enabled": enabled},
+            },
+        )
+        return row
+
+    def _fallback_set_connector_profile(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        environment: str,
+        company_name: str,
+        display_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        context = self._fallback_workspace_for_token(token_payload)
+        connector = next(
+            (item for item in CONNECTOR_CATALOG if item["connector_id"] == connector_id),
+            None,
+        )
+        if not connector:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        if environment not in connector["environments"]:
+            raise ValueError(f"Unsupported environment for {connector_id}: {environment}")
+        profile = {
+            "id": stable_id(
+                "connector",
+                context["workspace"]["workspace_key"],
+                connector_id,
+                environment,
+            ),
+            "workspace_id": context["workspace"]["id"],
+            "connector_id": connector_id,
+            "environment": environment,
+            "display_name": display_name or connector["name"],
+            "company_name": company_name,
+            "status": "requires_credentials",
+            "metadata": {
+                "required_secret_fields": connector["required_secret_fields"],
+                "preset": connector["preset"],
+                "credential_storage": "host_or_user_vault",
+                "storage": "audit_fallback",
+                **(metadata or {}),
+            },
+            "created_at": now_utc(),
+            "updated_at": now_utc(),
+        }
+        self._fallback_record_state_event(
+            workspace_key=context["workspace"]["workspace_key"],
+            client_jti=str(token_payload.get("jti") or ""),
+            event_type="connector.profile_configured",
+            input_payload={"connector_id": connector_id, "environment": environment},
+            summary={
+                "profile": profile,
+                "event_summary": {
+                    "connector_id": connector_id,
+                    "environment": environment,
+                    "status": profile["status"],
+                },
+            },
+        )
+        return profile
+
+    def _fallback_record_uploaded_skill(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        skill_id: str,
+        title: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        context = self._fallback_workspace_for_token(token_payload)
+        skill = {
+            "skill_id": skill_id,
+            "title": title,
+            "category": str(metadata.get("category") or "custom"),
+            "summary": str(metadata.get("summary") or "Uploaded workspace skill."),
+            "status": "uploaded",
+            "version": "0.1.0",
+            "required_connectors": metadata.get("required_connectors") or [],
+            "tags": metadata.get("tags") or ["uploaded"],
+            "metadata": {
+                "source": "workspace_upload",
+                "workspace_id": context["workspace"]["id"],
+                "document_uri": metadata.get("document_uri"),
+                "storage": "audit_fallback",
+            },
+            "updated_at": now_utc(),
+        }
+        upload = {
+            "id": stable_id("upload", context["workspace"]["workspace_key"], skill_id),
+            "workspace_id": context["workspace"]["id"],
+            "member_id": context["member"]["id"],
+            "skill_id": skill_id,
+            "title": title,
+            "status": "draft",
+            "metadata": metadata,
+            "created_at": now_utc(),
+            "storage": "audit_fallback",
+        }
+        self._fallback_record_state_event(
+            workspace_key=context["workspace"]["workspace_key"],
+            client_jti=str(token_payload.get("jti") or ""),
+            event_type="skill.uploaded",
+            input_payload={"skill_id": skill_id, "title": title},
+            summary={
+                "skill": skill,
+                "upload": upload,
+                "event_summary": {"skill_id": skill_id, "status": "draft"},
+            },
+        )
+        self._fallback_set_skill_enabled(
+            token_payload=token_payload,
+            skill_id=skill_id,
+            enabled=True,
+        )
+        return {"catalog": skill, "upload": upload}
+
+    def _fallback_record_state_event(
+        self,
+        *,
+        workspace_key: str,
+        client_jti: str,
+        event_type: str,
+        input_payload: dict[str, Any],
+        summary: dict[str, Any],
+        status: str = "ok",
+    ) -> dict[str, Any]:
+        sanitized_input = redact_json(input_payload)
+        sanitized_summary = redact_json(
+            {
+                "event_type": event_type,
+                "workspace_key": workspace_key,
+                **summary,
+            }
+        )
         rows = self._request(
             "POST",
-            "mercury_skill_catalog",
-            params={"on_conflict": "skill_id"},
-            headers={
-                **self.headers,
-                "Prefer": "resolution=merge-duplicates,return=representation",
-            },
-            json=SKILL_CATALOG_SEED,
+            "mcp_audit_events",
+            headers={**self.headers, "Prefer": "return=representation"},
+            json=[
+                {
+                    "tool_name": PRODUCT_STATE_TOOL,
+                    "input_hash": hashlib.sha256(
+                        json.dumps(sanitized_input, sort_keys=True).encode("utf-8")
+                    ).hexdigest(),
+                    "output_summary": sanitized_summary,
+                    "status": status,
+                    "metadata": {
+                        "product_layer": True,
+                        "storage": "audit_fallback",
+                        "workspace_key": workspace_key,
+                        "client_jti": client_jti,
+                    },
+                }
+            ],
         )
-        return len(rows or [])
+        return rows[0]
+
+    def seed_skill_catalog(self) -> int:
+        try:
+            rows = self._request(
+                "POST",
+                "mercury_skill_catalog",
+                params={"on_conflict": "skill_id"},
+                headers={
+                    **self.headers,
+                    "Prefer": "resolution=merge-duplicates,return=representation",
+                },
+                json=SKILL_CATALOG_SEED,
+            )
+            return len(rows or [])
+        except RuntimeError as exc:
+            if is_product_schema_error(exc):
+                return len(SKILL_CATALOG_SEED)
+            raise
 
     def upsert_connection(
+        self,
+        request: ConnectRequest,
+        token_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            return self._upsert_connection_product_tables(request, token_payload)
+        except RuntimeError as exc:
+            if is_product_schema_error(exc):
+                return self._fallback_upsert_connection(request, token_payload)
+            raise
+
+    def _upsert_connection_product_tables(
         self,
         request: ConnectRequest,
         token_payload: dict[str, Any],
@@ -226,6 +601,17 @@ class SupabaseProductStore:
         return {"workspace": workspace, "member": member, "token": token}
 
     def workspace_for_token(self, token_payload: dict[str, Any]) -> dict[str, Any] | None:
+        try:
+            return self._workspace_for_token_product_tables(token_payload)
+        except RuntimeError as exc:
+            if is_product_schema_error(exc):
+                return self._fallback_workspace_for_token(token_payload)
+            raise
+
+    def _workspace_for_token_product_tables(
+        self,
+        token_payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
         rows = self._request(
             "GET",
             "mercury_client_tokens",
@@ -259,6 +645,14 @@ class SupabaseProductStore:
         return {"token": token, "workspace": workspace, "member": member}
 
     def dashboard(self, token_payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return self._dashboard_product_tables(token_payload)
+        except RuntimeError as exc:
+            if is_product_schema_error(exc):
+                return self._fallback_dashboard(token_payload)
+            raise
+
+    def _dashboard_product_tables(self, token_payload: dict[str, Any]) -> dict[str, Any]:
         context = self.workspace_for_token(token_payload)
         if not context:
             return {
@@ -347,6 +741,28 @@ class SupabaseProductStore:
         skill_id: str,
         enabled: bool,
     ) -> dict[str, Any]:
+        try:
+            return self._set_skill_enabled_product_tables(
+                token_payload=token_payload,
+                skill_id=skill_id,
+                enabled=enabled,
+            )
+        except RuntimeError as exc:
+            if is_product_schema_error(exc):
+                return self._fallback_set_skill_enabled(
+                    token_payload=token_payload,
+                    skill_id=skill_id,
+                    enabled=enabled,
+                )
+            raise
+
+    def _set_skill_enabled_product_tables(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        skill_id: str,
+        enabled: bool,
+    ) -> dict[str, Any]:
         context = self.workspace_for_token(token_payload)
         if not context:
             raise ValueError("Workspace is not registered for this client token.")
@@ -371,6 +787,37 @@ class SupabaseProductStore:
         return row
 
     def set_connector_profile(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        environment: str,
+        company_name: str,
+        display_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return self._set_connector_profile_product_tables(
+                token_payload=token_payload,
+                connector_id=connector_id,
+                environment=environment,
+                company_name=company_name,
+                display_name=display_name,
+                metadata=metadata,
+            )
+        except RuntimeError as exc:
+            if is_product_schema_error(exc):
+                return self._fallback_set_connector_profile(
+                    token_payload=token_payload,
+                    connector_id=connector_id,
+                    environment=environment,
+                    company_name=company_name,
+                    display_name=display_name,
+                    metadata=metadata,
+                )
+            raise
+
+    def _set_connector_profile_product_tables(
         self,
         *,
         token_payload: dict[str, Any],
@@ -432,6 +879,33 @@ class SupabaseProductStore:
         markdown: str,
         metadata: dict[str, Any],
     ) -> dict[str, Any]:
+        try:
+            return self._record_uploaded_skill_product_tables(
+                token_payload=token_payload,
+                skill_id=skill_id,
+                title=title,
+                markdown=markdown,
+                metadata=metadata,
+            )
+        except RuntimeError as exc:
+            if is_product_schema_error(exc):
+                return self._fallback_record_uploaded_skill(
+                    token_payload=token_payload,
+                    skill_id=skill_id,
+                    title=title,
+                    metadata=metadata,
+                )
+            raise
+
+    def _record_uploaded_skill_product_tables(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        skill_id: str,
+        title: str,
+        markdown: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
         context = self.workspace_for_token(token_payload)
         if not context:
             raise ValueError("Workspace is not registered for this client token.")
@@ -485,6 +959,40 @@ class SupabaseProductStore:
         return {"catalog": catalog, "upload": rows[0]}
 
     def record_event(
+        self,
+        *,
+        workspace_id: str,
+        member_id: str | None,
+        event_type: str,
+        input_payload: dict[str, Any],
+        summary: dict[str, Any],
+        status: str = "ok",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return self._record_event_product_tables(
+                workspace_id=workspace_id,
+                member_id=member_id,
+                event_type=event_type,
+                input_payload=input_payload,
+                summary=summary,
+                status=status,
+                metadata=metadata,
+            )
+        except RuntimeError as exc:
+            if is_product_schema_error(exc):
+                workspace_key_value = str((metadata or {}).get("workspace_key") or workspace_id)
+                return self._fallback_record_state_event(
+                    workspace_key=workspace_key_value,
+                    client_jti=str((metadata or {}).get("client_jti") or ""),
+                    event_type=event_type,
+                    input_payload=input_payload,
+                    summary=summary,
+                    status=status,
+                )
+            raise
+
+    def _record_event_product_tables(
         self,
         *,
         workspace_id: str,

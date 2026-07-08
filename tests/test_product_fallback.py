@@ -1,0 +1,129 @@
+from mercury_tools.config import Settings
+from mercury_tools.db.product import SupabaseProductStore
+from mercury_tools.product import ConnectRequest
+
+
+class AuditFallbackStore(SupabaseProductStore):
+    def __init__(self):
+        super().__init__(
+            Settings(
+                supabase_url="https://example.supabase.co",
+                supabase_service_role_key="service-role",
+                openai_api_key="",
+            )
+        )
+        self.events: list[dict] = []
+
+    def _request(self, method: str, path: str, **kwargs):
+        if path.startswith("mercury_"):
+            raise RuntimeError(
+                f"Supabase product request failed: HTTP 404 could not find {path}"
+            )
+        if path != "mcp_audit_events":
+            raise AssertionError(f"unexpected path: {path}")
+        if method == "POST":
+            row = {
+                **kwargs["json"][0],
+                "id": f"evt-{len(self.events) + 1}",
+                "created_at": f"2026-07-09T00:00:0{len(self.events)}+00:00",
+            }
+            self.events.append(row)
+            return [row]
+        if method == "GET":
+            return list(self.events)
+        raise AssertionError(f"unexpected method: {method}")
+
+
+def token_payload() -> dict:
+    return {
+        "sub": "owner@example.com",
+        "company": "Demo Co",
+        "host_app": "codex",
+        "iat": 1783536613,
+        "exp": 1786128613,
+        "jti": "client-jti",
+        "scope": ["mcp:read"],
+    }
+
+
+def test_product_store_uses_audit_fallback_for_workspace_and_dashboard() -> None:
+    store = AuditFallbackStore()
+    request = ConnectRequest(
+        email="owner@example.com",
+        company="Demo Co",
+        host_app="codex",
+        invite_code="invite",
+    )
+
+    connection = store.upsert_connection(request, token_payload())
+    dashboard = store.dashboard(token_payload())
+
+    assert connection["workspace"]["name"] == "Demo Co"
+    assert connection["workspace"]["metadata"]["storage"] == "audit_fallback"
+    assert dashboard["status"] == "ok"
+    assert dashboard["storage"] == "audit_fallback"
+    assert dashboard["workspace"]["name"] == "Demo Co"
+    assert len(dashboard["skills"]) >= 5
+    assert dashboard["events"][0]["event_type"] == "connect.token_issued"
+
+
+def test_product_store_audit_fallback_persists_connector_and_skill_state() -> None:
+    store = AuditFallbackStore()
+    request = ConnectRequest(
+        email="owner@example.com",
+        company="Demo Co",
+        host_app="codex",
+        invite_code="invite",
+    )
+    store.upsert_connection(request, token_payload())
+
+    profile = store.set_connector_profile(
+        token_payload=token_payload(),
+        connector_id="flowaccount",
+        environment="production",
+        company_name="Demo Co Books",
+    )
+    skill = store.set_skill_enabled(
+        token_payload=token_payload(),
+        skill_id="vat-summary-th",
+        enabled=True,
+    )
+    dashboard = store.dashboard(token_payload())
+
+    assert profile["status"] == "requires_credentials"
+    assert skill["enabled"] is True
+    assert dashboard["connector_profiles"][0]["connector_id"] == "flowaccount"
+    vat_skill = next(item for item in dashboard["skills"] if item["skill_id"] == "vat-summary-th")
+    assert vat_skill["enabled"] is True
+    assert {event["event_type"] for event in dashboard["events"]} >= {
+        "connector.profile_configured",
+        "skill.enabled",
+    }
+
+
+def test_product_store_audit_fallback_records_uploaded_skill() -> None:
+    store = AuditFallbackStore()
+    request = ConnectRequest(
+        email="owner@example.com",
+        company="Demo Co",
+        host_app="codex",
+        invite_code="invite",
+    )
+    store.upsert_connection(request, token_payload())
+
+    upload = store.record_uploaded_skill(
+        token_payload=token_payload(),
+        skill_id="workspace-monthly-report-12345678",
+        title="Monthly Report",
+        markdown="# Monthly Report\n\nDraft report workflow.",
+        metadata={"category": "reporting", "document_uri": "mercury://workspace/demo/skill"},
+    )
+    dashboard = store.dashboard(token_payload())
+
+    assert upload["catalog"]["status"] == "uploaded"
+    uploaded_skill = next(
+        item
+        for item in dashboard["skills"]
+        if item["skill_id"] == "workspace-monthly-report-12345678"
+    )
+    assert uploaded_skill["enabled"] is True
