@@ -264,6 +264,17 @@ CONNECT_HTML = """<!doctype html>
           <div id="connect-message" class="message"></div>
         </section>
 
+        <section class="panel">
+          <h2>Restore workspace</h2>
+          <p class="lead">Paste an existing Mercury client token to load this workspace on another browser or machine.</p>
+          <form id="restore-form">
+            <label for="restore_token">Mercury client token</label>
+            <input id="restore_token" name="token" type="password" autocomplete="off" />
+            <button class="full" type="submit">Load workspace</button>
+          </form>
+          <div id="restore-message" class="message"></div>
+        </section>
+
         <section id="install-panel" class="panel hidden">
           <div class="codebar"><h2>Codex install</h2><button class="secondary" type="button" data-copy="codex-command">Copy</button></div>
           <pre id="codex-command"></pre>
@@ -388,7 +399,10 @@ CONNECT_HTML = """<!doctype html>
     </div>
   </main>
   <script>
-    const state = { token: localStorage.getItem('mercury_client_token') || '' };
+    const state = {
+      token: localStorage.getItem('mercury_client_token') || '',
+      endpoint: ''
+    };
     const $ = (selector) => document.querySelector(selector);
     const message = (selector, text, kind = '') => {
       const node = $(selector);
@@ -400,6 +414,7 @@ CONNECT_HTML = """<!doctype html>
     async function loadStatus() {
       const res = await fetch('/api/status');
       const data = await res.json();
+      state.endpoint = data.mcp_endpoint;
       $('#status-supabase').textContent = data.supabase ? 'Supabase ready' : 'Supabase missing';
       $('#status-embedding').textContent = data.embedding_provider + ' embeddings';
       $('#status-auth').textContent = data.http_auth_configured ? 'MCP auth ready' : 'MCP auth missing';
@@ -424,6 +439,21 @@ CONNECT_HTML = """<!doctype html>
       $('#install-panel').classList.remove('hidden');
       $('#codex-command').textContent = payload.codex.command;
       $('#mcp-config').textContent = JSON.stringify(payload.cursor.config, null, 2);
+    }
+
+    function renderInstallFromToken(token) {
+      if (!state.endpoint) return;
+      $('#install-panel').classList.remove('hidden');
+      $('#codex-command').textContent = "export MERCURY_MCP_TOKEN='" + token + "'\\n" +
+        'codex mcp add mercury-tools --url ' + state.endpoint + ' --bearer-token-env-var MERCURY_MCP_TOKEN';
+      $('#mcp-config').textContent = JSON.stringify({
+        mcpServers: {
+          'mercury-tools': {
+            url: state.endpoint,
+            headers: { Authorization: 'Bearer ${MERCURY_MCP_TOKEN}' }
+          }
+        }
+      }, null, 2);
     }
 
     function renderDashboard(data) {
@@ -525,6 +555,28 @@ CONNECT_HTML = """<!doctype html>
       }
     });
 
+    $('#restore-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const payload = Object.fromEntries(new FormData(event.target).entries());
+      const token = (payload.token || '').trim();
+      if (!token.startsWith('mc_')) {
+        message('#restore-message', 'Mercury client token must start with mc_.', 'error');
+        return;
+      }
+      state.token = token;
+      localStorage.setItem('mercury_client_token', state.token);
+      try {
+        await loadDashboard();
+        renderInstallFromToken(state.token);
+        message('#restore-message', 'Workspace loaded from Mercury token.', 'ok');
+        event.target.reset();
+      } catch (error) {
+        localStorage.removeItem('mercury_client_token');
+        state.token = '';
+        message('#restore-message', error.message, 'error');
+      }
+    });
+
     $('#credential-form').addEventListener('submit', async (event) => {
       event.preventDefault();
       try {
@@ -612,7 +664,9 @@ CONNECT_HTML = """<!doctype html>
       setTimeout(() => event.target.textContent = 'Copy', 1200);
     });
 
-    loadStatus().catch(() => {});
+    loadStatus().then(() => {
+      if (state.token) renderInstallFromToken(state.token);
+    }).catch(() => {});
     loadDashboard().catch(() => {});
   </script>
 </body>
