@@ -74,6 +74,14 @@ Remote deployment guide:
 
 - [docs/REMOTE_DEPLOYMENT.md](docs/REMOTE_DEPLOYMENT.md)
 
+Verify the current contest Render deployment:
+
+```bash
+uv run mercury-tools remote verify \
+  --url https://mercury-tools-mcp.onrender.com \
+  --token-file ~/.mercury-tools/render-mcp-token.txt
+```
+
 ## Environment
 
 Required for live RAG:

@@ -13,6 +13,7 @@ from mercury_tools.rag.embeddings import HashEmbeddingProvider, OpenAIEmbeddingP
 from mercury_tools.rag.ingest import ingest_wiki
 from mercury_tools.rag.models import SearchFilters
 from mercury_tools.rag.service import RagService
+from mercury_tools.remote import DEFAULT_RENDER_URL, DEFAULT_TOKEN_FILE, read_token, verify_remote
 
 
 def _print_json(data: Any) -> None:
@@ -116,6 +117,37 @@ def cmd_mcp_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_remote_verify(args: argparse.Namespace) -> int:
+    token = read_token(token=args.token, token_file=args.token_file)
+    result = verify_remote(
+        base_url=args.url,
+        mcp_path=args.mcp_path,
+        token=token,
+        timeout=args.timeout,
+    )
+    payload = result.as_dict()
+    if args.json:
+        _print_json(payload)
+    else:
+        print(f"Mercury Tools remote: {payload['base_url']}")
+        print(f"healthz: HTTP {payload['health_status_code']} -> {payload['health'].get('status')}")
+        print(f"supabase: {payload['health'].get('supabase')}")
+        print(f"openai: {payload['health'].get('openai')}")
+        print(f"mcp: {payload['mcp_url']}")
+        print(f"auth configured: {payload['health'].get('http_auth_configured')}")
+        print(f"auth check: {payload['authenticated_mcp_reachable']}")
+        if payload["missing"]:
+            print("missing:")
+            for item in payload["missing"]:
+                print(f"- {item}")
+        if payload["errors"]:
+            print("errors:")
+            for item in payload["errors"]:
+                print(f"- {item}")
+        print(f"ready: {payload['ready']}")
+    return 0 if result.ready else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mercury-tools")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -152,6 +184,17 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--require-auth", action="store_true")
     serve.add_argument("--allow-unauthenticated", action="store_true")
     serve.set_defaults(func=cmd_mcp_serve)
+
+    remote = sub.add_parser("remote")
+    remote_sub = remote.add_subparsers(dest="remote_command", required=True)
+    verify = remote_sub.add_parser("verify")
+    verify.add_argument("--url", default=DEFAULT_RENDER_URL)
+    verify.add_argument("--mcp-path", default="/mcp")
+    verify.add_argument("--token")
+    verify.add_argument("--token-file", default=str(DEFAULT_TOKEN_FILE))
+    verify.add_argument("--timeout", type=float, default=20)
+    verify.add_argument("--json", action="store_true")
+    verify.set_defaults(func=cmd_remote_verify)
     return parser
 
 

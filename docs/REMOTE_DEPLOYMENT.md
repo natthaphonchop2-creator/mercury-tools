@@ -124,6 +124,22 @@ gh secret set OPENAI_API_KEY --repo natthaphonchop2-creator/mercury-tools --body
 Set the same values in the Render service environment. After that, redeploy and
 confirm `/healthz` returns `"supabase": true` and `"openai": true`.
 
+You can verify the deployed service from this repo with:
+
+```bash
+uv run mercury-tools remote verify \
+  --url https://mercury-tools-mcp.onrender.com \
+  --token-file ~/.mercury-tools/render-mcp-token.txt
+```
+
+The command exits with code `0` only when:
+
+- `/healthz` is reachable.
+- Supabase and OpenAI env vars are present on Render.
+- MCP HTTP bearer auth is configured.
+- unauthenticated MCP requests are rejected.
+- authenticated MCP requests reach the MCP endpoint.
+
 ## 4. MCP client connection
 
 Remote MCP endpoint:
