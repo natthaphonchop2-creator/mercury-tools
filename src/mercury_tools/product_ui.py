@@ -88,20 +88,23 @@ CONNECT_HTML = """<!doctype html>
       grid-template-columns: 380px 1fr;
       gap: 16px;
       align-items: start;
+      min-width: 0;
     }
     section, .panel {
       border: 1px solid var(--line);
       border-radius: 8px;
       background: rgba(24, 35, 49, .94);
       box-shadow: 0 20px 64px rgba(0, 0, 0, .2);
+      min-width: 0;
     }
     .panel { padding: 18px; }
-    .stack { display: grid; gap: 12px; }
-    .console { display: grid; gap: 16px; }
+    .stack { display: grid; gap: 12px; min-width: 0; }
+    .console { display: grid; gap: 16px; min-width: 0; }
     .console-grid {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 12px;
+      min-width: 0;
     }
     .card {
       border: 1px solid var(--line);
@@ -109,6 +112,7 @@ CONNECT_HTML = """<!doctype html>
       padding: 13px;
       background: rgba(16, 23, 32, .72);
       min-height: 86px;
+      min-width: 0;
     }
     .card b {
       display: block;
@@ -200,6 +204,9 @@ CONNECT_HTML = """<!doctype html>
       padding: 13px;
       min-height: 84px;
       max-height: 220px;
+      min-width: 0;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }
     .message {
       min-height: 22px;
