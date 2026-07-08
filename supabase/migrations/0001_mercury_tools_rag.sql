@@ -61,6 +61,21 @@ create index if not exists knowledge_chunks_search_tsv_idx
 create index if not exists knowledge_sources_filter_idx
   on public.knowledge_sources (jurisdiction, connector, doc_type, review_status);
 
+alter table public.knowledge_sources enable row level security;
+alter table public.knowledge_documents enable row level security;
+alter table public.knowledge_chunks enable row level security;
+alter table public.mcp_audit_events enable row level security;
+
+revoke all on table public.knowledge_sources from anon, authenticated;
+revoke all on table public.knowledge_documents from anon, authenticated;
+revoke all on table public.knowledge_chunks from anon, authenticated;
+revoke all on table public.mcp_audit_events from anon, authenticated;
+
+grant all on table public.knowledge_sources to service_role;
+grant all on table public.knowledge_documents to service_role;
+grant all on table public.knowledge_chunks to service_role;
+grant all on table public.mcp_audit_events to service_role;
+
 create or replace function public.match_knowledge_chunks(
   query_text text,
   query_embedding vector(1536) default null,
@@ -147,3 +162,26 @@ as $$
   limit greatest(1, least(match_count, 50));
 $$;
 
+revoke all on function public.match_knowledge_chunks(
+  text,
+  vector(1536),
+  integer,
+  text,
+  text,
+  text,
+  text,
+  text,
+  date
+) from public, anon, authenticated;
+
+grant execute on function public.match_knowledge_chunks(
+  text,
+  vector(1536),
+  integer,
+  text,
+  text,
+  text,
+  text,
+  text,
+  date
+) to service_role;
