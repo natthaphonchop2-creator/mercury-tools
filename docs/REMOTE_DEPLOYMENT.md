@@ -7,6 +7,7 @@ This guide turns Mercury Tools into a cloud-hosted Streamable HTTP MCP server.
 - GitHub repo: `https://github.com/natthaphonchop2-creator/mercury-tools`
 - Render service: `mercury-tools-mcp`
 - Render URL: `https://mercury-tools-mcp.onrender.com`
+- Mercury Connect: `https://mercury-tools-mcp.onrender.com/`
 - MCP endpoint: `https://mercury-tools-mcp.onrender.com/mcp`
 - Health endpoint: `https://mercury-tools-mcp.onrender.com/healthz`
 - Supabase project ref: `vbnlkqvauqwnjbxngkas`
@@ -39,8 +40,12 @@ Required environment variables for the MCP service:
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `MERCURY_TOOLS_EMBEDDING_PROVIDER=hash`
 - `MERCURY_TOOLS_HTTP_BEARER_TOKEN`
+- `MERCURY_CONNECT_INVITE_CODE`
+- `MERCURY_CONNECT_SIGNING_SECRET`
 
 Do not expose the Supabase service role key to MCP clients.
+Do not give normal users the server bearer token file. Send them to Mercury
+Connect and share an invite code for the demo workspace.
 
 Mercury Tools v1 does not need to call an LLM by itself. In contest/demo mode it
 uses deterministic local `hash` embeddings and serves cited context packs to the
@@ -128,6 +133,23 @@ gh secret set SUPABASE_SERVICE_ROLE_KEY --repo natthaphonchop2-creator/mercury-t
 
 Set the same values in the Render service environment. After that, redeploy and
 confirm `/healthz` returns `"supabase": true` and `"embedding_configured": true`.
+
+Set product-layer secrets in Render as well:
+
+```text
+MERCURY_CONNECT_INVITE_CODE=<demo invite code>
+MERCURY_CONNECT_SIGNING_SECRET=<long random signing secret>
+```
+
+Users then open:
+
+```text
+https://mercury-tools-mcp.onrender.com/
+```
+
+They enter the invite code, email, company, and AI host, then Mercury generates
+copy-ready MCP setup instructions. The resulting client token is signed and
+time-limited, so users do not need access to the server bearer token file.
 
 You can verify the deployed service from this repo with:
 

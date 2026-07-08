@@ -34,6 +34,8 @@ class Settings:
     public_base_url: str = ""
     http_bearer_token: str = ""
     http_require_auth: bool = False
+    connect_invite_code: str = ""
+    connect_signing_secret: str = ""
 
     @property
     def supabase_configured(self) -> bool:
@@ -51,7 +53,7 @@ class Settings:
 
     @property
     def http_auth_configured(self) -> bool:
-        return bool(self.http_bearer_token)
+        return bool(self.http_bearer_token or self.connect_signing_secret)
 
     @property
     def mcp_endpoint(self) -> str:
@@ -126,6 +128,8 @@ def load_settings(*, dotenv_path: str | Path | None = None) -> Settings:
         public_base_url=os.environ.get("MERCURY_TOOLS_PUBLIC_BASE_URL", "").strip().rstrip("/"),
         http_bearer_token=os.environ.get("MERCURY_TOOLS_HTTP_BEARER_TOKEN", "").strip(),
         http_require_auth=_env_bool("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", default=False),
+        connect_invite_code=os.environ.get("MERCURY_CONNECT_INVITE_CODE", "").strip(),
+        connect_signing_secret=os.environ.get("MERCURY_CONNECT_SIGNING_SECRET", "").strip(),
     )
 
 

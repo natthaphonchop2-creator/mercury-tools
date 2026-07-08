@@ -82,6 +82,16 @@ uv run mercury-tools remote verify \
   --token-file ~/.mercury-tools/render-mcp-token.txt
 ```
 
+Open the product onboarding layer:
+
+```text
+https://mercury-tools-mcp.onrender.com/
+```
+
+Mercury Connect issues per-user signed MCP tokens from an invite code and
+generates copy-ready MCP config for Codex, Cursor, Claude, or generic MCP hosts.
+Users should not use the server bearer token file directly.
+
 ## Environment
 
 Required for live RAG:
@@ -90,6 +100,8 @@ Required for live RAG:
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `MERCURY_TOOLS_EMBEDDING_PROVIDER=hash` for the Codex/host-AI demo mode
 - `MERCURY_TOOLS_HTTP_BEARER_TOKEN` for remote MCP auth
+- `MERCURY_CONNECT_INVITE_CODE` for the Connect page
+- `MERCURY_CONNECT_SIGNING_SECRET` for per-user client tokens
 
 `OPENAI_API_KEY` is optional and only needed when
 `MERCURY_TOOLS_EMBEDDING_PROVIDER=openai`.
