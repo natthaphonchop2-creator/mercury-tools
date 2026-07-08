@@ -247,7 +247,7 @@ CONNECT_HTML = """<!doctype html>
           <p class="lead">Create a Mercury workspace token, then use the generated MCP config in Codex, Cursor, Claude, or another MCP client.</p>
           <form id="connect-form">
             <label for="invite_code">Invite code</label>
-            <input id="invite_code" name="invite_code" autocomplete="one-time-code" required />
+            <input id="invite_code" name="invite_code" type="password" autocomplete="one-time-code" required />
             <label for="email">Work email</label>
             <input id="email" name="email" type="email" autocomplete="email" required />
             <label for="company">Company</label>
