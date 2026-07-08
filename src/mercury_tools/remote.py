@@ -105,8 +105,12 @@ def verify_remote(
             missing.append("healthy Mercury Tools service")
         if health.get("supabase") is not True:
             missing.append("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY on remote service")
-        if health.get("openai") is not True:
-            missing.append("OPENAI_API_KEY on remote service")
+        if health.get("embedding_configured") is not True:
+            provider = str(health.get("embedding_provider") or "unknown")
+            if provider == "openai":
+                missing.append("OPENAI_API_KEY on remote service")
+            else:
+                missing.append(f"configured embedding provider on remote service ({provider})")
         if (
             health.get("http_auth_required") is True
             and health.get("http_auth_configured") is not True

@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_EMBEDDING_DIM = 1536
+DEFAULT_EMBEDDING_PROVIDER = "hash"
 DEFAULT_MCP_TRANSPORT = "streamable-http"
 DEFAULT_MCP_HOST = "0.0.0.0"
 DEFAULT_MCP_PORT = 8000
@@ -21,6 +22,7 @@ class Settings:
     supabase_url: str
     supabase_service_role_key: str
     openai_api_key: str
+    embedding_provider: str = DEFAULT_EMBEDDING_PROVIDER
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     embedding_dim: int = DEFAULT_EMBEDDING_DIM
     mercury_agent_path: Path | None = None
@@ -40,6 +42,12 @@ class Settings:
     @property
     def openai_configured(self) -> bool:
         return bool(self.openai_api_key)
+
+    @property
+    def embedding_configured(self) -> bool:
+        if self.embedding_provider == "openai":
+            return self.openai_configured
+        return self.embedding_provider == "hash"
 
     @property
     def http_auth_configured(self) -> bool:
@@ -100,6 +108,13 @@ def load_settings(*, dotenv_path: str | Path | None = None) -> Settings:
         supabase_url=os.environ.get("SUPABASE_URL", "").strip().rstrip("/"),
         supabase_service_role_key=os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip(),
         openai_api_key=os.environ.get("OPENAI_API_KEY", "").strip(),
+        embedding_provider=os.environ.get(
+            "MERCURY_TOOLS_EMBEDDING_PROVIDER",
+            DEFAULT_EMBEDDING_PROVIDER,
+        )
+        .strip()
+        .lower()
+        or DEFAULT_EMBEDDING_PROVIDER,
         embedding_model=os.environ.get("MERCURY_TOOLS_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL),
         embedding_dim=embedding_dim,
         mercury_agent_path=Path(mercury_agent).expanduser() if mercury_agent else None,

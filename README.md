@@ -88,8 +88,11 @@ Required for live RAG:
 
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
-- `OPENAI_API_KEY`
+- `MERCURY_TOOLS_EMBEDDING_PROVIDER=hash` for the Codex/host-AI demo mode
 - `MERCURY_TOOLS_HTTP_BEARER_TOKEN` for remote MCP auth
+
+`OPENAI_API_KEY` is optional and only needed when
+`MERCURY_TOOLS_EMBEDDING_PROVIDER=openai`.
 
 The service role key must stay local/server-side. Do not put it in MCP client
 configs that sync to cloud services.

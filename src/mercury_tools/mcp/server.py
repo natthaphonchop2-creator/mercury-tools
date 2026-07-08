@@ -15,7 +15,7 @@ from mercury_tools.db.supabase import SupabaseRagStore
 from mercury_tools.mercury_runtime import connector_status as read_connector_status
 from mercury_tools.mercury_runtime import skill_markdown
 from mercury_tools.prompts import get_prompt
-from mercury_tools.rag.embeddings import OpenAIEmbeddingProvider
+from mercury_tools.rag.embeddings import create_embedding_provider
 from mercury_tools.rag.models import SearchFilters
 from mercury_tools.rag.service import RagService
 from mercury_tools.safety.redaction import redact_json
@@ -44,7 +44,10 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
 def _service() -> RagService:
     settings = load_settings()
-    return RagService(store=SupabaseRagStore(settings), embedder=OpenAIEmbeddingProvider(settings))
+    return RagService(
+        store=SupabaseRagStore(settings),
+        embedder=create_embedding_provider(settings),
+    )
 
 
 def _audit(tool_name: str, input_payload: dict[str, Any], output_summary: dict[str, Any]) -> None:
@@ -257,6 +260,8 @@ async def healthz(_: Request) -> Response:
             "status": "ok",
             "supabase": settings.supabase_configured,
             "openai": settings.openai_configured,
+            "embedding_provider": settings.embedding_provider,
+            "embedding_configured": settings.embedding_configured,
             "mcp_path": settings.mcp_path,
             "http_auth_required": settings.http_require_auth,
             "http_auth_configured": settings.http_auth_configured,

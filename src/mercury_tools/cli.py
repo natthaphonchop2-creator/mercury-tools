@@ -9,7 +9,7 @@ from typing import Any
 
 from mercury_tools.config import load_settings
 from mercury_tools.db.supabase import SupabaseRagStore
-from mercury_tools.rag.embeddings import HashEmbeddingProvider, OpenAIEmbeddingProvider
+from mercury_tools.rag.embeddings import create_embedding_provider
 from mercury_tools.rag.ingest import ingest_wiki
 from mercury_tools.rag.models import SearchFilters
 from mercury_tools.rag.service import RagService
@@ -22,9 +22,7 @@ def _print_json(data: Any) -> None:
 
 def _embedder(args: argparse.Namespace):
     settings = load_settings()
-    if getattr(args, "embedding_provider", "openai") == "hash":
-        return HashEmbeddingProvider(settings.embedding_dim)
-    return OpenAIEmbeddingProvider(settings)
+    return create_embedding_provider(settings, provider=getattr(args, "embedding_provider", None))
 
 
 def cmd_doctor(_args: argparse.Namespace) -> int:
@@ -33,6 +31,8 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
         {
             "supabase": settings.supabase_configured,
             "openai": settings.openai_configured,
+            "embedding_provider": settings.embedding_provider,
+            "embedding_configured": settings.embedding_configured,
             "embedding_model": settings.embedding_model,
             "embedding_dim": settings.embedding_dim,
             "mercury_agent_path": (
@@ -132,6 +132,8 @@ def cmd_remote_verify(args: argparse.Namespace) -> int:
         print(f"Mercury Tools remote: {payload['base_url']}")
         print(f"healthz: HTTP {payload['health_status_code']} -> {payload['health'].get('status')}")
         print(f"supabase: {payload['health'].get('supabase')}")
+        print(f"embedding: {payload['health'].get('embedding_provider')}")
+        print(f"embedding configured: {payload['health'].get('embedding_configured')}")
         print(f"openai: {payload['health'].get('openai')}")
         print(f"mcp: {payload['mcp_url']}")
         print(f"auth configured: {payload['health'].get('http_auth_configured')}")
@@ -159,7 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_sub = ingest.add_subparsers(dest="ingest_command", required=True)
     wiki = ingest_sub.add_parser("wiki")
     wiki.add_argument("--path", required=True)
-    wiki.add_argument("--embedding-provider", choices=["openai", "hash"], default="openai")
+    wiki.add_argument("--embedding-provider", choices=["openai", "hash"])
     wiki.set_defaults(func=cmd_ingest_wiki)
 
     search = sub.add_parser("search")
@@ -172,7 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--doc-type")
     search.add_argument("--review-status")
     search.add_argument("--effective-date")
-    search.add_argument("--embedding-provider", choices=["openai", "hash"], default="openai")
+    search.add_argument("--embedding-provider", choices=["openai", "hash"])
     search.set_defaults(func=cmd_search)
 
     mcp = sub.add_parser("mcp")

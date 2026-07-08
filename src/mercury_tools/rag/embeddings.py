@@ -66,3 +66,15 @@ class HashEmbeddingProvider:
     def embed_query(self, text: str) -> list[float]:
         return self._embed(text)
 
+
+def create_embedding_provider(
+    settings: Settings,
+    *,
+    provider: str | None = None,
+) -> EmbeddingProvider:
+    selected = (provider or settings.embedding_provider).strip().lower()
+    if selected == "openai":
+        return OpenAIEmbeddingProvider(settings)
+    if selected == "hash":
+        return HashEmbeddingProvider(settings.embedding_dim)
+    raise ValueError(f"Unsupported embedding provider: {selected}")

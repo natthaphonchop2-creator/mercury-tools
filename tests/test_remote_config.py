@@ -8,6 +8,7 @@ def test_remote_settings_use_port_and_normalize_path(monkeypatch) -> None:
     monkeypatch.setenv("MERCURY_TOOLS_PUBLIC_BASE_URL", "https://mercury.example.com/")
     monkeypatch.setenv("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", "true")
     monkeypatch.setenv("MERCURY_TOOLS_HTTP_BEARER_TOKEN", "demo-token")
+    monkeypatch.setenv("MERCURY_TOOLS_EMBEDDING_PROVIDER", "hash")
 
     settings = load_settings()
 
@@ -17,3 +18,16 @@ def test_remote_settings_use_port_and_normalize_path(monkeypatch) -> None:
     assert settings.mcp_endpoint == "https://mercury.example.com/mcp"
     assert settings.http_require_auth is True
     assert settings.http_auth_configured is True
+    assert settings.embedding_provider == "hash"
+    assert settings.embedding_configured is True
+
+
+def test_openai_embedding_provider_requires_api_key(monkeypatch) -> None:
+    monkeypatch.setenv("MERCURY_TOOLS_EMBEDDING_PROVIDER", "openai")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    settings = load_settings()
+
+    assert settings.embedding_provider == "openai"
+    assert settings.openai_configured is False
+    assert settings.embedding_configured is False

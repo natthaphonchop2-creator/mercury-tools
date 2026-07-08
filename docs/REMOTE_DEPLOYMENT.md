@@ -37,10 +37,16 @@ Required environment variables for the MCP service:
 
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
-- `OPENAI_API_KEY`
+- `MERCURY_TOOLS_EMBEDDING_PROVIDER=hash`
 - `MERCURY_TOOLS_HTTP_BEARER_TOKEN`
 
 Do not expose the Supabase service role key to MCP clients.
+
+Mercury Tools v1 does not need to call an LLM by itself. In contest/demo mode it
+uses deterministic local `hash` embeddings and serves cited context packs to the
+host AI tool, such as Codex, Cursor, or Claude Desktop. Set
+`MERCURY_TOOLS_EMBEDDING_PROVIDER=openai` and provide `OPENAI_API_KEY` only if
+you explicitly want OpenAI embeddings later.
 
 If the Supabase project is in a different organization than the currently
 connected Codex/Supabase integration, re-authenticate that integration with an
@@ -86,7 +92,9 @@ Expected response:
 {
   "status": "ok",
   "supabase": true,
-  "openai": true,
+  "openai": false,
+  "embedding_provider": "hash",
+  "embedding_configured": true,
   "mcp_path": "/mcp",
   "http_auth_required": true,
   "http_auth_configured": true
@@ -105,7 +113,6 @@ For GitHub-based ingestion, add these repository secrets:
 
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
-- `OPENAI_API_KEY`
 
 Then run the `Ingest Mercury Wiki` workflow manually.
 
@@ -114,15 +121,13 @@ Safe local secret entry pattern:
 ```bash
 export SUPABASE_URL="https://vbnlkqvauqwnjbxngkas.supabase.co"
 read -rsp "SUPABASE_SERVICE_ROLE_KEY: " SUPABASE_SERVICE_ROLE_KEY; echo
-read -rsp "OPENAI_API_KEY: " OPENAI_API_KEY; echo
 
 gh secret set SUPABASE_URL --repo natthaphonchop2-creator/mercury-tools --body "$SUPABASE_URL"
 gh secret set SUPABASE_SERVICE_ROLE_KEY --repo natthaphonchop2-creator/mercury-tools --body "$SUPABASE_SERVICE_ROLE_KEY"
-gh secret set OPENAI_API_KEY --repo natthaphonchop2-creator/mercury-tools --body "$OPENAI_API_KEY"
 ```
 
 Set the same values in the Render service environment. After that, redeploy and
-confirm `/healthz` returns `"supabase": true` and `"openai": true`.
+confirm `/healthz` returns `"supabase": true` and `"embedding_configured": true`.
 
 You can verify the deployed service from this repo with:
 
@@ -135,7 +140,7 @@ uv run mercury-tools remote verify \
 The command exits with code `0` only when:
 
 - `/healthz` is reachable.
-- Supabase and OpenAI env vars are present on Render.
+- Supabase env vars and the selected embedding provider are configured on Render.
 - MCP HTTP bearer auth is configured.
 - unauthenticated MCP requests are rejected.
 - authenticated MCP requests reach the MCP endpoint.

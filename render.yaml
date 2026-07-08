@@ -22,8 +22,8 @@ services:
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
-      - key: OPENAI_API_KEY
-        sync: false
+      - key: MERCURY_TOOLS_EMBEDDING_PROVIDER
+        value: hash
       - key: MERCURY_TOOLS_EMBEDDING_MODEL
         value: text-embedding-3-small
       - key: MERCURY_TOOLS_EMBEDDING_DIM
