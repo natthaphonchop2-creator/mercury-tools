@@ -127,6 +127,15 @@ def stable_id(prefix: str, *parts: object) -> str:
     return f"{prefix}_{digest[:24]}"
 
 
+def email_hash(email: str) -> str:
+    return hashlib.sha256(email.strip().lower().encode("utf-8")).hexdigest()[:16]
+
+
+def email_domain(email: str) -> str:
+    parts = email.strip().lower().split("@", 1)
+    return parts[1] if len(parts) == 2 else ""
+
+
 def is_product_schema_error(exc: RuntimeError) -> bool:
     text = str(exc).lower()
     return "mercury_" in text and (
@@ -288,6 +297,9 @@ class SupabaseProductStore:
         key = context["workspace"]["workspace_key"]
         skills = {skill["skill_id"]: skill for skill in skill_catalog_rows()}
         connector_profiles: dict[str, dict[str, Any]] = {}
+        members: dict[str, dict[str, Any]] = {
+            context["member"]["id"]: context["member"],
+        }
         events: list[dict[str, Any]] = []
 
         for row in self._fallback_state_events(key):
@@ -310,6 +322,10 @@ class SupabaseProductStore:
                         "enabled": True,
                         "configured_at": row.get("created_at"),
                     }
+            elif event_type == "team.member_invited":
+                member = summary.get("member") or {}
+                if member.get("id"):
+                    members[str(member["id"])] = member
 
             events.append(
                 {
@@ -328,6 +344,7 @@ class SupabaseProductStore:
             **context,
             "connectors": CONNECTOR_CATALOG,
             "connector_profiles": list(connector_profiles.values()),
+            "members": list(members.values()),
             "skills": sorted(skills.values(), key=lambda item: (item["category"], item["title"])),
             "events": list(reversed(events[-12:])),
         }
@@ -364,6 +381,51 @@ class SupabaseProductStore:
             },
         )
         return row
+
+    def _fallback_invite_member(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        email: str,
+        role: str = "member",
+    ) -> dict[str, Any]:
+        context = self._fallback_workspace_for_token(token_payload)
+        normalized_email = email.strip().lower()
+        if "@" not in normalized_email:
+            raise ValueError("Valid member email is required.")
+        member_role = role if role in {"owner", "admin", "member", "viewer"} else "member"
+        member = {
+            "id": stable_id(
+                "member",
+                context["workspace"]["workspace_key"],
+                email_hash(normalized_email),
+            ),
+            "workspace_id": context["workspace"]["id"],
+            "email_hash": email_hash(normalized_email),
+            "email_domain": email_domain(normalized_email),
+            "role": member_role,
+            "host_app": "pending",
+            "status": "invited",
+            "created_at": now_utc(),
+            "last_seen_at": None,
+            "storage": "audit_fallback",
+        }
+        self._fallback_record_state_event(
+            workspace_key=context["workspace"]["workspace_key"],
+            client_jti=str(token_payload.get("jti") or ""),
+            event_type="team.member_invited",
+            input_payload={"member_email": normalized_email, "role": member_role},
+            summary={
+                "member": member,
+                "event_summary": {
+                    "member_email_hash": member["email_hash"],
+                    "email_domain": member["email_domain"],
+                    "role": member_role,
+                    "status": "invited",
+                },
+            },
+        )
+        return member
 
     def _fallback_set_connector_profile(
         self,
@@ -708,6 +770,15 @@ class SupabaseProductStore:
                 "order": "updated_at.desc",
             },
         )
+        members = self._request(
+            "GET",
+            "mercury_workspace_members",
+            params={
+                "workspace_id": f"eq.{workspace_id}",
+                "select": "id,email,role,host_app,status,created_at,last_seen_at",
+                "order": "created_at.asc",
+            },
+        )
         events = self._request(
             "GET",
             "mercury_product_events",
@@ -723,6 +794,7 @@ class SupabaseProductStore:
             **context,
             "connectors": CONNECTOR_CATALOG,
             "connector_profiles": connector_profiles or [],
+            "members": members or [],
             "skills": [
                 {
                     **skill,
@@ -783,6 +855,68 @@ class SupabaseProductStore:
             event_type="skill.enabled" if enabled else "skill.disabled",
             input_payload={"skill_id": skill_id},
             summary={"skill_id": skill_id, "enabled": enabled},
+        )
+        return row
+
+    def invite_member(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        email: str,
+        role: str = "member",
+    ) -> dict[str, Any]:
+        try:
+            return self._invite_member_product_tables(
+                token_payload=token_payload,
+                email=email,
+                role=role,
+            )
+        except RuntimeError as exc:
+            if is_product_schema_error(exc):
+                return self._fallback_invite_member(
+                    token_payload=token_payload,
+                    email=email,
+                    role=role,
+                )
+            raise
+
+    def _invite_member_product_tables(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        email: str,
+        role: str = "member",
+    ) -> dict[str, Any]:
+        context = self.workspace_for_token(token_payload)
+        if not context:
+            raise ValueError("Workspace is not registered for this client token.")
+        normalized_email = email.strip().lower()
+        if "@" not in normalized_email:
+            raise ValueError("Valid member email is required.")
+        member_role = role if role in {"owner", "admin", "member", "viewer"} else "member"
+        row = self._upsert_one(
+            "mercury_workspace_members",
+            {
+                "workspace_id": context["workspace"]["id"],
+                "email": normalized_email,
+                "role": member_role,
+                "host_app": "pending",
+                "status": "invited",
+            },
+            on_conflict="workspace_id,email",
+        )
+        self.record_event(
+            workspace_id=context["workspace"]["id"],
+            member_id=context["member"]["id"],
+            event_type="team.member_invited",
+            input_payload={"member_email": normalized_email, "role": member_role},
+            summary={
+                "member_id": row["id"],
+                "member_email_hash": email_hash(normalized_email),
+                "email_domain": email_domain(normalized_email),
+                "role": member_role,
+                "status": "invited",
+            },
         )
         return row
 

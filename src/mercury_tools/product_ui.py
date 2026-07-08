@@ -290,6 +290,28 @@ CONNECT_HTML = """<!doctype html>
         </section>
 
         <section class="panel">
+          <div class="row"><h2>Team workspace</h2><span class="pill">invite preview</span></div>
+          <div class="two">
+            <form id="team-form">
+              <label for="member_email">Member email</label>
+              <input id="member_email" name="email" type="email" autocomplete="email" />
+              <label for="member_role">Role</label>
+              <select id="member_role" name="role">
+                <option value="member">Member</option>
+                <option value="admin">Admin</option>
+                <option value="viewer">Viewer</option>
+              </select>
+              <button class="full" type="submit">Invite member</button>
+              <div id="team-message" class="message"></div>
+            </form>
+            <div>
+              <h3>Members</h3>
+              <div id="member-list" class="list"><div class="item"><small>No members loaded yet.</small></div></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
           <div class="row"><h2>Accounting connectors</h2><span class="pill">secrets stay outside Supabase</span></div>
           <div class="two">
             <form id="connector-form">
@@ -405,6 +427,18 @@ CONNECT_HTML = """<!doctype html>
         </div>
       `).join('') : '<div class="item"><small>No connector profile yet.</small></div>';
 
+      const members = data.members || [];
+      $('#member-list').innerHTML = members.length ? members.map((item) => {
+        const label = item.email_hash ? 'member ' + item.email_hash : (item.email === '[REDACTED_EMAIL]' ? 'member email hidden' : (item.email || 'workspace member'));
+        const domain = item.email_domain ? ' · ' + item.email_domain : '';
+        return `
+          <div class="item">
+            <strong>${label}</strong>
+            <small>${item.role || 'member'} · ${item.status || 'active'}${domain}</small>
+          </div>
+        `;
+      }).join('') : '<div class="item"><small>No members loaded yet.</small></div>';
+
       const skills = data.skills || [];
       $('#skills-list').innerHTML = skills.length ? skills.map((item) => `
         <div class="item">
@@ -473,6 +507,24 @@ CONNECT_HTML = """<!doctype html>
         await loadDashboard();
       } catch (error) {
         message('#connector-message', error.message, 'error');
+      }
+    });
+
+    $('#team-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      try {
+        message('#team-message', 'Inviting member...');
+        const payload = Object.fromEntries(new FormData(event.target).entries());
+        const data = await authFetch('/api/team/invite', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload)
+        });
+        message('#team-message', 'Invited workspace member.', 'ok');
+        event.target.reset();
+        await loadDashboard();
+      } catch (error) {
+        message('#team-message', error.message, 'error');
       }
     });
 

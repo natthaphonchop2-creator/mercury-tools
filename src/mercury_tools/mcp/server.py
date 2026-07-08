@@ -583,6 +583,7 @@ async def status(_: Request) -> Response:
             "connect": "/api/connect",
             "dashboard": "/api/dashboard",
             "connector_setup": "/api/connectors/setup",
+            "team_invite": "/api/team/invite",
             "skill_enable": "/api/skills/enable",
             "skill_upload": "/api/skills/upload",
             "http_auth_configured": settings.http_auth_configured,
@@ -703,6 +704,31 @@ async def enable_skill(request: Request) -> Response:
         return _json_error("service_unavailable", str(exc), status_code=503)
 
 
+async def invite_member(request: Request) -> Response:
+    settings = load_settings()
+    try:
+        token_payload = _client_token_payload(request)
+        if not settings.supabase_configured:
+            return _json_error(
+                "service_unavailable",
+                "Supabase is required to invite workspace members.",
+                status_code=503,
+            )
+        data = await request.json()
+        member = _product_store(settings).invite_member(
+            token_payload=token_payload,
+            email=str(data.get("email") or "").strip(),
+            role=str(data.get("role") or "member").strip().lower(),
+        )
+        return JSONResponse(redact_json({"status": "ok", "member": member}))
+    except PermissionError as exc:
+        return _json_error("unauthorized", str(exc), status_code=401)
+    except ValueError as exc:
+        return _json_error("bad_request", str(exc), status_code=400)
+    except RuntimeError as exc:
+        return _json_error("service_unavailable", str(exc), status_code=503)
+
+
 async def upload_skill(request: Request) -> Response:
     settings = load_settings()
     try:
@@ -810,6 +836,7 @@ def create_http_app(*, require_auth: bool | None = None):
     app.add_route("/api/connect", connect, methods=["POST"])
     app.add_route("/api/dashboard", dashboard, methods=["GET"])
     app.add_route("/api/connectors/setup", setup_connector, methods=["POST"])
+    app.add_route("/api/team/invite", invite_member, methods=["POST"])
     app.add_route("/api/skills/enable", enable_skill, methods=["POST"])
     app.add_route("/api/skills/upload", upload_skill, methods=["POST"])
     app.add_route("/healthz", healthz, methods=["GET"])

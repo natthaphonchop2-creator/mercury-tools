@@ -97,6 +97,7 @@ Users should not use the server bearer token file directly.
 Mercury Connect also exposes product APIs:
 
 - `GET /api/dashboard`
+- `POST /api/team/invite`
 - `POST /api/connectors/setup`
 - `POST /api/skills/enable`
 - `POST /api/skills/upload`

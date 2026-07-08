@@ -101,6 +101,30 @@ def test_product_store_audit_fallback_persists_connector_and_skill_state() -> No
     }
 
 
+def test_product_store_audit_fallback_records_team_invite() -> None:
+    store = AuditFallbackStore()
+    request = ConnectRequest(
+        email="owner@example.com",
+        company="Demo Co",
+        host_app="codex",
+        invite_code="invite",
+    )
+    store.upsert_connection(request, token_payload())
+
+    member = store.invite_member(
+        token_payload=token_payload(),
+        email="teammate@example.com",
+        role="viewer",
+    )
+    dashboard = store.dashboard(token_payload())
+
+    assert member["status"] == "invited"
+    assert member["email_hash"]
+    invited = next(item for item in dashboard["members"] if item.get("status") == "invited")
+    assert invited["role"] == "viewer"
+    assert dashboard["events"][0]["event_type"] == "team.member_invited"
+
+
 def test_product_store_audit_fallback_records_uploaded_skill() -> None:
     store = AuditFallbackStore()
     request = ConnectRequest(
