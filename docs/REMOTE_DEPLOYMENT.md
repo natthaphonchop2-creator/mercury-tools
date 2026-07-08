@@ -2,6 +2,24 @@
 
 This guide turns Mercury Tools into a cloud-hosted Streamable HTTP MCP server.
 
+## Current contest deployment
+
+- GitHub repo: `https://github.com/natthaphonchop2-creator/mercury-tools`
+- Render service: `mercury-tools-mcp`
+- Render URL: `https://mercury-tools-mcp.onrender.com`
+- MCP endpoint: `https://mercury-tools-mcp.onrender.com/mcp`
+- Health endpoint: `https://mercury-tools-mcp.onrender.com/healthz`
+- Supabase project ref: `vbnlkqvauqwnjbxngkas`
+- Supabase URL: `https://vbnlkqvauqwnjbxngkas.supabase.co`
+
+The MCP endpoint requires `Authorization: Bearer <MERCURY_TOOLS_HTTP_BEARER_TOKEN>`.
+The demo bearer token is intentionally not stored in Git; on the development
+machine it is saved outside the repo at:
+
+```text
+~/.mercury-tools/render-mcp-token.txt
+```
+
 ## 1. Prepare Supabase
 
 Create a Supabase project and run:
@@ -23,6 +41,30 @@ Required environment variables for the MCP service:
 - `MERCURY_TOOLS_HTTP_BEARER_TOKEN`
 
 Do not expose the Supabase service role key to MCP clients.
+
+If the Supabase project is in a different organization than the currently
+connected Codex/Supabase integration, re-authenticate that integration with an
+account that is a member of the target organization before applying the
+migration. The target project for Mercury Tools v1 is:
+
+```text
+vbnlkqvauqwnjbxngkas
+```
+
+For a dashboard-first setup, paste the full migration from:
+
+```text
+supabase/migrations/0001_mercury_tools_rag.sql
+```
+
+into the Supabase SQL Editor for that project and run it once.
+
+The migration is private by default:
+
+- RLS is enabled on all Mercury RAG tables.
+- `anon` and `authenticated` are revoked.
+- `service_role` is the only role granted table access.
+- `match_knowledge_chunks` execution is granted only to `service_role`.
 
 ## 2. Deploy the MCP service
 
@@ -66,6 +108,21 @@ For GitHub-based ingestion, add these repository secrets:
 - `OPENAI_API_KEY`
 
 Then run the `Ingest Mercury Wiki` workflow manually.
+
+Safe local secret entry pattern:
+
+```bash
+export SUPABASE_URL="https://vbnlkqvauqwnjbxngkas.supabase.co"
+read -rsp "SUPABASE_SERVICE_ROLE_KEY: " SUPABASE_SERVICE_ROLE_KEY; echo
+read -rsp "OPENAI_API_KEY: " OPENAI_API_KEY; echo
+
+gh secret set SUPABASE_URL --repo natthaphonchop2-creator/mercury-tools --body "$SUPABASE_URL"
+gh secret set SUPABASE_SERVICE_ROLE_KEY --repo natthaphonchop2-creator/mercury-tools --body "$SUPABASE_SERVICE_ROLE_KEY"
+gh secret set OPENAI_API_KEY --repo natthaphonchop2-creator/mercury-tools --body "$OPENAI_API_KEY"
+```
+
+Set the same values in the Render service environment. After that, redeploy and
+confirm `/healthz` returns `"supabase": true` and `"openai": true`.
 
 ## 4. MCP client connection
 
