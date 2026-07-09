@@ -960,7 +960,7 @@ onFlowStart:
           <section class="panel">
             <div class="row"><h2>MCP contract</h2><span class="pill">host-facing</span></div>
             <div class="cards-2">
-              <div class="card"><b>Tools</b><span>search_knowledge, retrieve_context_pack, run_accounting_skill, flow tools, connector status</span></div>
+              <div class="card"><b>Tools</b><span>search_knowledge, retrieve_context_pack, run_accounting_skill, run_flow, run_flow_files, connector status</span></div>
               <div class="card"><b>Resources</b><span>mercury://wiki, mercury://skills, mercury://connectors, mercury://flows, mercury://audit</span></div>
               <div class="card"><b>Prompts</b><span>Thai accounting report, VAT, invoice review, setup guide, management summary</span></div>
               <div class="card"><b>Transport</b><span>stdio for local clients, Streamable HTTP for hosted Mercury</span></div>

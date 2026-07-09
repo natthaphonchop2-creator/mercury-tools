@@ -23,7 +23,12 @@ def test_hash_embedding_dimension() -> None:
 
 def test_mcp_flow_tools_validate_and_dry_run() -> None:
     from mercury_tools.flows.templates import COMPANY_HEALTH_TEMPLATE
-    from mercury_tools.mcp.server import check_flow_syntax, flow_cheat_sheet, run_flow
+    from mercury_tools.mcp.server import (
+        check_flow_syntax,
+        flow_cheat_sheet,
+        run_flow,
+        run_flow_files,
+    )
 
     assert "Mercury Flow" in flow_cheat_sheet()["cheat_sheet"]
 
@@ -49,6 +54,50 @@ env:
     assert parameterized["status"] == "planned"
     assert parameterized["variables"]["env"]["month"] == "2026-10"
     assert parameterized["artifacts"][0]["title"] == "Month 2026-10"
+
+    suite = run_flow_files(
+        {
+            "main.yaml": """name: Main
+tags: [accounting]
+onFlowStart:
+  - emitReport:
+      title: "Start ${month}"
+---
+- runFlow:
+    file: sub.yaml
+    env:
+      subMonth: "${month}"
+    saveAs: subflow
+- emitReport:
+    title: "Main ${month}"
+""",
+            "sub.yaml": """name: Subflow
+tags: [helper]
+---
+- emitReport:
+    title: "Sub ${subMonth}"
+""",
+        },
+        dry_run=True,
+        env={"month": "2026-10"},
+        include_tags=["accounting"],
+    )
+    assert suite["status"] == "planned"
+    assert suite["flow_count"] == 2
+    assert suite["selected_count"] == 1
+    assert suite["skipped_count"] == 1
+    assert suite["env_keys"] == ["month"]
+    assert suite["flows"][0]["path"] == "main.yaml"
+    assert suite["results"][0]["flow"]["path"] == "main.yaml"
+    assert [step["source"] for step in suite["results"][0]["steps"]] == [
+        "onFlowStart",
+        "commands",
+        "commands",
+    ]
+    assert suite["results"][0]["artifacts"][0]["title"] == "Start 2026-10"
+    assert suite["results"][0]["artifacts"][1]["title"] == "Main 2026-10"
+    assert suite["results"][0]["variables"]["subflow"]["flow"]["path"] == "sub.yaml"
+    assert suite["results"][0]["variables"]["subflow"]["artifacts"][0]["title"] == "Sub 2026-10"
 
 
 def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:

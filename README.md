@@ -232,8 +232,9 @@ Flow CLI:
 - `mercury-tools flow cheat-sheet`
 
 MCP and HTTP flow runs also accept runtime env overrides. Values are coerced to
-strings, matching Maestro-style `-e KEY=value` behavior. Audit and run history
-record only the env key names:
+strings, matching Maestro-style `-e KEY=value` behavior. `run_flow_files` lets
+an MCP host submit multiple YAML files in one call, including subflows referenced
+with `runFlow: file`. Audit and run history record only the env key names:
 
 ```json
 {
@@ -360,6 +361,7 @@ Flow MCP tools:
 - `flow_cheat_sheet`
 - `check_flow_syntax`
 - `run_flow`
+- `run_flow_files`
 - `save_workspace_flow`
 - `list_workspace_flows`
 - `run_workspace_flow`
@@ -403,6 +405,7 @@ Tools:
 - `flow_cheat_sheet`
 - `check_flow_syntax`
 - `run_flow`
+- `run_flow_files`
 - `save_workspace_flow`
 - `list_workspace_flows`
 - `run_workspace_flow`

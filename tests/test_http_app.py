@@ -86,6 +86,7 @@ def test_connect_page_and_status(monkeypatch) -> None:
     assert status.json()["pages"]["flows"] == "/flows"
     assert status.json()["pages"]["mcp_api"] == "/mcp-api"
     assert "run_flow" in status.json()["flow_tools"]
+    assert "run_flow_files" in status.json()["flow_tools"]
     assert "save_workspace_flow" in status.json()["flow_tools"]
     assert "list_workspace_flows" in status.json()["flow_tools"]
     assert "run_workspace_flow" in status.json()["flow_tools"]

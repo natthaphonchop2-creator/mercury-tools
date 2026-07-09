@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 from urllib.parse import urlparse
 
@@ -36,6 +38,9 @@ from mercury_tools.rag.service import RagService
 from mercury_tools.safety.redaction import redact_json
 
 mcp = FastMCP("Mercury Tools")
+
+MAX_MCP_FLOW_FILES = 50
+MAX_MCP_FLOW_FILE_CHARS = 500_000
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -109,6 +114,124 @@ def _env_overrides_from_payload(raw: Any) -> dict[str, str]:
 
 def _env_keys(env: dict[str, str]) -> list[str]:
     return sorted(env)
+
+
+def _string_list_from_payload(raw: Any, *, label: str) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list):
+        return [str(item) for item in raw]
+    raise ValueError(f"{label} must be a string or list.")
+
+
+def _matches_tag_filter(tags: list[str], *, include: set[str], exclude: set[str]) -> bool:
+    tag_set = set(tags)
+    if include and not tag_set.intersection(include):
+        return False
+    return not bool(tag_set.intersection(exclude))
+
+
+def _safe_flow_file_path(raw: Any) -> str:
+    path = str(raw or "").strip().replace("\\", "/")
+    if not path:
+        raise ValueError("flow file path is required.")
+    candidate = Path(path)
+    if candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
+        raise ValueError(f"flow file path must be relative and safe: {path}")
+    return candidate.as_posix()
+
+
+def _flow_files_from_payload(raw: Any) -> list[dict[str, str]]:
+    if isinstance(raw, dict):
+        items = [
+            {"path": _safe_flow_file_path(path), "flow_yaml": str(flow_yaml or "")}
+            for path, flow_yaml in raw.items()
+        ]
+    elif isinstance(raw, list):
+        items = []
+        for index, item in enumerate(raw):
+            if not isinstance(item, dict):
+                raise ValueError(f"flow_files[{index}] must be an object.")
+            path = item.get("path") or item.get("filename") or item.get("name")
+            flow_yaml = item.get("flow_yaml")
+            if flow_yaml is None:
+                flow_yaml = item.get("yaml")
+            if flow_yaml is None:
+                flow_yaml = item.get("content")
+            items.append(
+                {
+                    "path": _safe_flow_file_path(path),
+                    "flow_yaml": str(flow_yaml or ""),
+                }
+            )
+    else:
+        raise ValueError("flow_files must be an object or list.")
+
+    if not items:
+        raise ValueError("flow_files must include at least one flow file.")
+    if len(items) > MAX_MCP_FLOW_FILES:
+        raise ValueError(f"flow_files may include at most {MAX_MCP_FLOW_FILES} files.")
+    total_chars = sum(len(item["flow_yaml"]) for item in items)
+    if total_chars > MAX_MCP_FLOW_FILE_CHARS:
+        raise ValueError(
+            f"flow_files total content may be at most {MAX_MCP_FLOW_FILE_CHARS} characters."
+        )
+    return items
+
+
+def _suite_status(results: list[dict[str, Any]]) -> str:
+    if not results:
+        return "empty"
+    if any(result.get("status") == "error" for result in results):
+        return "failed"
+    if all(result.get("status") == "planned" for result in results):
+        return "planned"
+    return "ok"
+
+
+def _flow_file_error_result(
+    *,
+    path: str,
+    message: str,
+    dry_run: bool,
+) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "dry_run": dry_run,
+        "flow": {
+            "name": Path(path).stem or "Mercury Flow",
+            "description": None,
+            "tags": [],
+            "env": {},
+            "path": path,
+            "command_count": 0,
+            "on_flow_start_count": 0,
+            "on_flow_complete_count": 0,
+            "commands": [],
+        },
+        "steps": [],
+        "variables": {},
+        "artifacts": [{"status": "error", "message": message}],
+    }
+
+
+def _relativize_temp_paths(value: Any, *, root: Path) -> Any:
+    if isinstance(value, dict):
+        converted: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "path" and isinstance(item, str):
+                try:
+                    converted[key] = Path(item).resolve().relative_to(root).as_posix()
+                    continue
+                except (OSError, ValueError):
+                    pass
+            converted[key] = _relativize_temp_paths(item, root=root)
+        return converted
+    if isinstance(value, list):
+        return [_relativize_temp_paths(item, root=root) for item in value]
+    return value
 
 
 def _client_token_audit_ref(client_token: str) -> dict[str, str]:
@@ -340,6 +463,127 @@ def run_flow(
                 "flow_yaml_length": len(flow_yaml),
                 "dry_run": dry_run,
                 "env_keys": safe_env_keys,
+            },
+            payload,
+        )
+        return payload
+
+
+@mcp.tool()
+def run_flow_files(
+    flow_files: dict[str, str] | list[dict[str, Any]],
+    dry_run: bool = False,
+    env: dict[str, Any] | None = None,
+    include_tags: list[str] | str | None = None,
+    exclude_tags: list[str] | str | None = None,
+    continue_on_failure: bool = True,
+) -> dict[str, Any]:
+    """Run multiple Mercury YAML flow files as an in-memory suite."""
+    normalized_files: list[dict[str, str]] = []
+    env_overrides: dict[str, str] = {}
+    try:
+        normalized_files = _flow_files_from_payload(flow_files)
+        env_overrides = _env_overrides_from_payload(env)
+        include = set(_string_list_from_payload(include_tags, label="include_tags"))
+        exclude = set(_string_list_from_payload(exclude_tags, label="exclude_tags"))
+        file_records: list[dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
+
+        with TemporaryDirectory(prefix="mercury-flow-files-") as temp_dir:
+            root = Path(temp_dir).resolve()
+            for item in normalized_files:
+                target = root / item["path"]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(item["flow_yaml"], encoding="utf-8")
+
+            runner = create_default_runner(dry_run=dry_run)
+            for item in normalized_files:
+                relative_path = item["path"]
+                target = root / relative_path
+                try:
+                    syntax = validate_flow_text(item["flow_yaml"], path=target)
+                    flow_summary = syntax["flow"]
+                    tags = [str(tag) for tag in flow_summary.get("tags") or []]
+                    selected = _matches_tag_filter(tags, include=include, exclude=exclude)
+                    file_records.append(
+                        {
+                            "path": relative_path,
+                            "name": flow_summary.get("name"),
+                            "tags": tags,
+                            "command_count": flow_summary.get("command_count") or 0,
+                            "selected": selected,
+                            "status": "valid",
+                        }
+                    )
+                    if not selected:
+                        continue
+                    result = runner.run_path(target, env=env_overrides).as_dict()
+                    results.append(_relativize_temp_paths(result, root=root))
+                except (FlowValidationError, RuntimeError, ValueError) as exc:
+                    selected = not include
+                    file_records.append(
+                        {
+                            "path": relative_path,
+                            "name": None,
+                            "tags": [],
+                            "command_count": 0,
+                            "selected": selected,
+                            "status": "invalid" if isinstance(exc, FlowValidationError) else "error",
+                            "error": str(exc),
+                        }
+                    )
+                    if not selected:
+                        continue
+                    if not continue_on_failure:
+                        raise
+                    results.append(
+                        _flow_file_error_result(
+                            path=relative_path,
+                            message=str(exc),
+                            dry_run=dry_run,
+                        )
+                    )
+
+        payload = redact_json(
+            {
+                "status": _suite_status(results),
+                "dry_run": dry_run,
+                "flow_count": len(normalized_files),
+                "selected_count": len([item for item in file_records if item.get("selected")]),
+                "skipped_count": len([item for item in file_records if not item.get("selected")]),
+                "env_keys": _env_keys(env_overrides),
+                "include_tags": sorted(include),
+                "exclude_tags": sorted(exclude),
+                "flows": file_records,
+                "results": results,
+            }
+        )
+        _audit(
+            "run_flow_files",
+            {
+                "flow_count": len(normalized_files),
+                "selected_count": payload["selected_count"],
+                "dry_run": dry_run,
+                "env_keys": _env_keys(env_overrides),
+                "include_tags": sorted(include),
+                "exclude_tags": sorted(exclude),
+                "total_flow_yaml_length": sum(len(item["flow_yaml"]) for item in normalized_files),
+            },
+            {
+                "status": payload["status"],
+                "result_count": len(payload["results"]),
+                "dry_run": dry_run,
+            },
+        )
+        return payload
+    except (FlowValidationError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc), "dry_run": dry_run}
+        _audit(
+            "run_flow_files",
+            {
+                "flow_count": len(normalized_files),
+                "dry_run": dry_run,
+                "env_keys": _env_keys(env_overrides),
             },
             payload,
         )
@@ -607,6 +851,7 @@ async def status(_: Request) -> Response:
                 "flow_cheat_sheet",
                 "check_flow_syntax",
                 "run_flow",
+                "run_flow_files",
                 "save_workspace_flow",
                 "list_workspace_flows",
                 "run_workspace_flow",

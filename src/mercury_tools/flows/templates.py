@@ -65,6 +65,8 @@ Template variables:
 - {{ context.query }} reads a previous step saved with saveAs: context.
 - CLI overrides use -e KEY=value or --env KEY=value and take precedence over flow/workspace env.
 - MCP/HTTP run_flow accepts env: {"month": "2026-09"} and stores only env key names in run history.
+- MCP run_flow_files accepts multiple in-memory YAML files so runFlow file
+  references can resolve in one host call.
 
 Conditional execution:
 - Add when: to any command to skip it unless the condition passes.
