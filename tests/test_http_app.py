@@ -1,6 +1,7 @@
 import pytest
 from starlette.testclient import TestClient
 
+from mercury_tools.flows.templates import COMPANY_HEALTH_TEMPLATE
 from mercury_tools.mcp.server import create_http_app
 
 
@@ -73,9 +74,11 @@ def test_connect_page_and_status(monkeypatch) -> None:
     assert status.json()["mcp_endpoint"] == "https://mercury.example.com/mcp"
     assert status.json()["invite_required"] is True
     assert status.json()["pages"]["connectors"] == "/connectors"
+    assert status.json()["pages"]["flows"] == "/flows"
     assert "run_flow" in status.json()["flow_tools"]
     assert status.json()["dashboard"] == "/api/dashboard"
     assert status.json()["connector_credentials"] == "/api/connectors/credentials"
+    assert status.json()["flow_validate"] == "/api/flows/validate"
 
 
 def test_product_console_exposes_separate_pages(monkeypatch) -> None:
@@ -89,12 +92,15 @@ def test_product_console_exposes_separate_pages(monkeypatch) -> None:
         ("/workspace", "workspace"),
         ("/connectors", "connectors"),
         ("/skills", "skills"),
+        ("/flows", "flows"),
         ("/audit", "audit"),
     ):
         response = client.get(path)
 
         assert response.status_code == 200
         assert f'data-page="{page_name}"' in response.text
+        assert response.text.count('<section class="page" data-page=') == 1
+        assert "history.pushState" not in response.text
 
 
 def test_connect_api_rejects_bad_invite(monkeypatch) -> None:
@@ -185,6 +191,7 @@ def test_product_dashboard_uses_token_when_supabase_missing(monkeypatch) -> None
     assert payload["status"] == "degraded"
     assert payload["workspace"]["name"] == "Demo Co"
     assert payload["member"]["email"] == "user@example.com"
+    assert payload["flows"] == []
 
 
 def test_product_mutation_requires_supabase(monkeypatch) -> None:
@@ -214,3 +221,42 @@ def test_product_mutation_requires_supabase(monkeypatch) -> None:
     )
 
     assert response.status_code == 503
+
+
+def test_workspace_flow_validate_and_dry_run_use_client_token(monkeypatch) -> None:
+    monkeypatch.setenv("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("MERCURY_CONNECT_INVITE_CODE", "invite-demo")
+    monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
+
+    client = TestClient(create_http_app(require_auth=True), raise_server_exceptions=False)
+    token = client.post(
+        "/api/connect",
+        json={
+            "invite_code": "invite-demo",
+            "email": "user@example.com",
+            "company": "Demo Co",
+            "host_app": "codex",
+        },
+    ).json()["token"]
+
+    validate = client.post(
+        "/api/flows/validate",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"flow_yaml": COMPANY_HEALTH_TEMPLATE},
+    )
+    dry_run = client.post(
+        "/api/flows/run",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"flow_yaml": COMPANY_HEALTH_TEMPLATE, "dry_run": True},
+    )
+    save = client.post(
+        "/api/flows/save",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"title": "Company Health Check", "flow_yaml": COMPANY_HEALTH_TEMPLATE},
+    )
+
+    assert validate.status_code == 200
+    assert validate.json()["flow"]["name"] == "Company Health Check"
+    assert dry_run.status_code == 200
+    assert dry_run.json()["status"] == "planned"
+    assert save.status_code == 503

@@ -13,6 +13,7 @@ import httpx
 from cryptography.fernet import Fernet
 
 from mercury_tools.config import Settings, require_supabase
+from mercury_tools.flows.parser import parse_flow_text
 from mercury_tools.product import ConnectRequest, normalize_host_app
 from mercury_tools.safety.redaction import redact_json
 
@@ -127,6 +128,38 @@ def now_utc() -> str:
 def stable_id(prefix: str, *parts: object) -> str:
     digest = hashlib.sha256("|".join(str(part) for part in parts).encode("utf-8")).hexdigest()
     return f"{prefix}_{digest[:24]}"
+
+
+def flow_id_from_title(title: str, flow_yaml: str) -> str:
+    digest = hashlib.sha256(f"{title}\n{flow_yaml}".encode()).hexdigest()[:8]
+    return f"workspace-{slugify(title, fallback='flow')}-{digest}"
+
+
+def flow_summary_from_yaml(
+    flow_yaml: str,
+    *,
+    title: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    flow = parse_flow_text(flow_yaml)
+    flow_title = (title or flow.name).strip()
+    if not flow_title:
+        raise ValueError("Flow title is required.")
+    return {
+        "flow_id": flow_id_from_title(flow_title, flow_yaml),
+        "title": flow_title,
+        "name": flow.name,
+        "description": flow.description,
+        "tags": flow.tags,
+        "command_count": len(flow.commands),
+        "on_flow_start_count": len(flow.on_flow_start),
+        "on_flow_complete_count": len(flow.on_flow_complete),
+        "sha256": hashlib.sha256(flow_yaml.encode()).hexdigest(),
+        "status": "draft",
+        "yaml": flow_yaml,
+        "metadata": metadata or {},
+        "updated_at": now_utc(),
+    }
 
 
 def email_hash(email: str) -> str:
@@ -354,6 +387,7 @@ class SupabaseProductStore:
         members: dict[str, dict[str, Any]] = {
             context["member"]["id"]: context["member"],
         }
+        flows: dict[str, dict[str, Any]] = {}
         events: list[dict[str, Any]] = []
 
         for row in self._fallback_state_events(key):
@@ -380,6 +414,10 @@ class SupabaseProductStore:
                 member = summary.get("member") or {}
                 if member.get("id"):
                     members[str(member["id"])] = member
+            elif event_type == "flow.saved":
+                flow = summary.get("flow") or {}
+                if flow.get("flow_id"):
+                    flows[str(flow["flow_id"])] = flow
 
             events.append(
                 {
@@ -400,8 +438,65 @@ class SupabaseProductStore:
             "connector_profiles": list(connector_profiles.values()),
             "members": list(members.values()),
             "skills": sorted(skills.values(), key=lambda item: (item["category"], item["title"])),
+            "flows": sorted(
+                flows.values(),
+                key=lambda item: str(item.get("updated_at") or ""),
+                reverse=True,
+            ),
             "events": list(reversed(events[-12:])),
         }
+
+    def _fallback_flows_for_workspace_key(self, workspace_key_value: str) -> list[dict[str, Any]]:
+        flows: dict[str, dict[str, Any]] = {}
+        for row in self._fallback_state_events(workspace_key_value):
+            summary = row.get("output_summary") or {}
+            if str(summary.get("event_type") or "") != "flow.saved":
+                continue
+            flow = summary.get("flow") or {}
+            if flow.get("flow_id"):
+                flows[str(flow["flow_id"])] = flow
+        return sorted(
+            flows.values(),
+            key=lambda item: str(item.get("updated_at") or ""),
+            reverse=True,
+        )
+
+    def get_flow(self, *, token_payload: dict[str, Any], flow_id: str) -> dict[str, Any] | None:
+        context = self._fallback_workspace_for_token(token_payload)
+        for flow in self._fallback_flows_for_workspace_key(context["workspace"]["workspace_key"]):
+            if flow.get("flow_id") == flow_id:
+                return flow
+        return None
+
+    def save_flow(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        title: str | None,
+        flow_yaml: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        context = self._fallback_workspace_for_token(token_payload)
+        flow = flow_summary_from_yaml(flow_yaml, title=title, metadata=metadata)
+        self._fallback_record_state_event(
+            workspace_key=context["workspace"]["workspace_key"],
+            client_jti=str(token_payload.get("jti") or ""),
+            event_type="flow.saved",
+            input_payload={
+                "flow_id": flow["flow_id"],
+                "title": flow["title"],
+                "sha256": flow["sha256"],
+            },
+            summary={
+                "flow": flow,
+                "event_summary": {
+                    "flow_id": flow["flow_id"],
+                    "title": flow["title"],
+                    "status": flow["status"],
+                },
+            },
+        )
+        return flow
 
     def _fallback_set_skill_enabled(
         self,
@@ -987,6 +1082,7 @@ class SupabaseProductStore:
                 },
                 "member": {"email": token_payload.get("sub")},
                 "skills": [],
+                "flows": [],
                 "connectors": CONNECTOR_CATALOG,
                 "connector_profiles": [],
                 "events": [],
@@ -994,6 +1090,7 @@ class SupabaseProductStore:
 
         workspace_id = context["workspace"]["id"]
         member_id = context["member"]["id"]
+        flows = self._fallback_flows_for_workspace_key(context["workspace"]["workspace_key"])
         self._request(
             "PATCH",
             "mercury_workspace_members",
@@ -1065,6 +1162,7 @@ class SupabaseProductStore:
                 }
                 for skill in catalog or []
             ],
+            "flows": flows,
             "events": events or [],
         }
 

@@ -1,5 +1,6 @@
 from mercury_tools.config import Settings
 from mercury_tools.db.product import SupabaseProductStore
+from mercury_tools.flows.templates import COMPANY_HEALTH_TEMPLATE
 from mercury_tools.product import ConnectRequest
 
 
@@ -184,3 +185,29 @@ def test_product_store_audit_fallback_records_uploaded_skill() -> None:
         if item["skill_id"] == "workspace-monthly-report-12345678"
     )
     assert uploaded_skill["enabled"] is True
+
+
+def test_product_store_audit_fallback_records_workspace_flow() -> None:
+    store = AuditFallbackStore()
+    request = ConnectRequest(
+        email="owner@example.com",
+        company="Demo Co",
+        host_app="codex",
+        invite_code="invite",
+    )
+    store.upsert_connection(request, token_payload())
+
+    flow = store.save_flow(
+        token_payload=token_payload(),
+        title="Company Health Check",
+        flow_yaml=COMPANY_HEALTH_TEMPLATE,
+        metadata={"source": "test"},
+    )
+    dashboard = store.dashboard(token_payload())
+    fetched = store.get_flow(token_payload=token_payload(), flow_id=flow["flow_id"])
+
+    assert flow["status"] == "draft"
+    assert flow["command_count"] == 3
+    assert dashboard["flows"][0]["flow_id"] == flow["flow_id"]
+    assert fetched is not None
+    assert fetched["yaml"] == COMPANY_HEALTH_TEMPLATE

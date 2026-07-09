@@ -27,7 +27,7 @@ from mercury_tools.product import (
     validate_connect_request,
     verify_client_token,
 )
-from mercury_tools.product_ui import CONNECT_HTML as PRODUCT_CONNECT_HTML
+from mercury_tools.product_ui import render_connect_html
 from mercury_tools.prompts import get_prompt
 from mercury_tools.rag.chunking import chunk_document, sha256_text
 from mercury_tools.rag.embeddings import create_embedding_provider
@@ -117,6 +117,7 @@ def _fallback_dashboard(token_payload: dict[str, Any], *, reason: str) -> dict[s
         "connectors": [],
         "connector_profiles": [],
         "skills": [],
+        "flows": [],
         "events": [],
     }
 
@@ -618,8 +619,9 @@ CONNECT_HTML = """<!doctype html>
 </html>"""
 
 
-async def root(_: Request) -> Response:
-    return HTMLResponse(PRODUCT_CONNECT_HTML)
+async def root(request: Request) -> Response:
+    page = request.url.path.strip("/") or "connect"
+    return HTMLResponse(render_connect_html(page))
 
 
 async def status(_: Request) -> Response:
@@ -641,6 +643,7 @@ async def status(_: Request) -> Response:
                 "workspace": "/workspace",
                 "connectors": "/connectors",
                 "skills": "/skills",
+                "flows": "/flows",
                 "audit": "/audit",
             },
             "connect": "/api/connect",
@@ -650,6 +653,9 @@ async def status(_: Request) -> Response:
             "team_invite": "/api/team/invite",
             "skill_enable": "/api/skills/enable",
             "skill_upload": "/api/skills/upload",
+            "flow_validate": "/api/flows/validate",
+            "flow_save": "/api/flows/save",
+            "flow_run": "/api/flows/run",
             "flow_tools": ["flow_cheat_sheet", "check_flow_syntax", "run_flow"],
             "http_auth_configured": settings.http_auth_configured,
             "invite_required": bool(settings.connect_invite_code),
@@ -715,6 +721,75 @@ async def dashboard(request: Request) -> Response:
         return _json_error("bad_request", str(exc), status_code=400)
     except RuntimeError as exc:
         return JSONResponse(_fallback_dashboard(token_payload, reason=str(exc)))
+
+
+async def validate_workspace_flow(request: Request) -> Response:
+    try:
+        _client_token_payload(request)
+        data = await request.json()
+        flow_yaml = str(data.get("flow_yaml") or "")
+        return JSONResponse(validate_flow_text(flow_yaml))
+    except PermissionError as exc:
+        return _json_error("unauthorized", str(exc), status_code=401)
+    except FlowValidationError as exc:
+        return _json_error("invalid_flow", str(exc), status_code=400)
+    except ValueError as exc:
+        return _json_error("bad_request", str(exc), status_code=400)
+
+
+async def save_workspace_flow(request: Request) -> Response:
+    settings = load_settings()
+    try:
+        token_payload = _client_token_payload(request)
+        if not settings.supabase_configured:
+            return _json_error(
+                "service_unavailable",
+                "Supabase is required to save workspace flows.",
+                status_code=503,
+            )
+        data = await request.json()
+        flow = _product_store(settings).save_flow(
+            token_payload=token_payload,
+            title=str(data.get("title") or "").strip() or None,
+            flow_yaml=str(data.get("flow_yaml") or ""),
+            metadata=data.get("metadata") if isinstance(data.get("metadata"), dict) else {},
+        )
+        return JSONResponse(redact_json({"status": "ok", "flow": flow}))
+    except PermissionError as exc:
+        return _json_error("unauthorized", str(exc), status_code=401)
+    except FlowValidationError as exc:
+        return _json_error("invalid_flow", str(exc), status_code=400)
+    except ValueError as exc:
+        return _json_error("bad_request", str(exc), status_code=400)
+    except RuntimeError as exc:
+        return _json_error("server_error", str(exc), status_code=500)
+
+
+async def run_workspace_flow(request: Request) -> Response:
+    settings = load_settings()
+    try:
+        token_payload = _client_token_payload(request)
+        data = await request.json()
+        dry_run = bool(data.get("dry_run", True))
+        flow_yaml = str(data.get("flow_yaml") or "")
+        flow_id = str(data.get("flow_id") or "").strip()
+        if flow_id and not flow_yaml:
+            if not settings.supabase_configured:
+                return _json_error(
+                    "service_unavailable",
+                    "Supabase is required to load saved workspace flows.",
+                    status_code=503,
+                )
+            flow = _product_store(settings).get_flow(token_payload=token_payload, flow_id=flow_id)
+            if not flow:
+                return _json_error("not_found", f"Workspace flow not found: {flow_id}", status_code=404)
+            flow_yaml = str(flow.get("yaml") or "")
+        result = create_default_runner(dry_run=dry_run).run_text(flow_yaml)
+        return JSONResponse(redact_json(result.as_dict()))
+    except PermissionError as exc:
+        return _json_error("unauthorized", str(exc), status_code=401)
+    except (FlowValidationError, RuntimeError, ValueError) as exc:
+        return _json_error("bad_request", str(exc), status_code=400)
 
 
 async def setup_connector(request: Request) -> Response:
@@ -925,7 +1000,7 @@ def create_http_app(*, require_auth: bool | None = None):
         if allowed_origin and allowed_origin not in mcp.settings.transport_security.allowed_origins:
             mcp.settings.transport_security.allowed_origins.append(allowed_origin)
     app = mcp.streamable_http_app()
-    for page_path in ("/", "/connect", "/workspace", "/connectors", "/skills", "/audit"):
+    for page_path in ("/", "/connect", "/workspace", "/connectors", "/skills", "/flows", "/audit"):
         app.add_route(page_path, root, methods=["GET"])
     app.add_route("/api/status", status, methods=["GET"])
     app.add_route("/api/connect", connect, methods=["POST"])
@@ -935,6 +1010,9 @@ def create_http_app(*, require_auth: bool | None = None):
     app.add_route("/api/team/invite", invite_member, methods=["POST"])
     app.add_route("/api/skills/enable", enable_skill, methods=["POST"])
     app.add_route("/api/skills/upload", upload_skill, methods=["POST"])
+    app.add_route("/api/flows/validate", validate_workspace_flow, methods=["POST"])
+    app.add_route("/api/flows/save", save_workspace_flow, methods=["POST"])
+    app.add_route("/api/flows/run", run_workspace_flow, methods=["POST"])
     app.add_route("/healthz", healthz, methods=["GET"])
 
     should_require_auth = settings.http_require_auth if require_auth is None else require_auth

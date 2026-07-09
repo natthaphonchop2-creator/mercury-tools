@@ -2,6 +2,10 @@
 
 # ruff: noqa: E501
 
+from __future__ import annotations
+
+import re
+
 CONNECT_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -328,10 +332,12 @@ CONNECT_HTML = """<!doctype html>
       <a href="/workspace" data-nav="workspace">Workspace</a>
       <a href="/connectors" data-nav="connectors">Connectors</a>
       <a href="/skills" data-nav="skills">Skills</a>
+      <a href="/flows" data-nav="flows">Flows</a>
       <a href="/audit" data-nav="audit">Audit</a>
       <span class="hint">Mercury stays MCP-first. The AI host still does the conversation.</span>
     </nav>
 
+    <!-- PAGE:connect:start -->
     <section class="page" data-page="connect">
       <div class="page-head">
         <span class="eyebrow">Mercury Control Plane</span>
@@ -394,7 +400,9 @@ CONNECT_HTML = """<!doctype html>
         </div>
       </div>
     </section>
+    <!-- PAGE:connect:end -->
 
+    <!-- PAGE:workspace:start -->
     <section class="page" data-page="workspace">
       <div class="page-head">
         <span class="eyebrow">Workspace</span>
@@ -437,7 +445,9 @@ CONNECT_HTML = """<!doctype html>
         </section>
       </div>
     </section>
+    <!-- PAGE:workspace:end -->
 
+    <!-- PAGE:connectors:start -->
     <section class="page" data-page="connectors">
       <div class="page-head">
         <span class="eyebrow">Connector Setup</span>
@@ -492,7 +502,9 @@ CONNECT_HTML = """<!doctype html>
         </div>
       </div>
     </section>
+    <!-- PAGE:connectors:end -->
 
+    <!-- PAGE:skills:start -->
     <section class="page" data-page="skills">
       <div class="page-head">
         <span class="eyebrow">Skills</span>
@@ -527,7 +539,91 @@ CONNECT_HTML = """<!doctype html>
         </section>
       </div>
     </section>
+    <!-- PAGE:skills:end -->
 
+    <!-- PAGE:flows:start -->
+    <section class="page" data-page="flows">
+      <div class="page-head">
+        <span class="eyebrow">Mercury Flows</span>
+        <h1>Build repeatable accounting agent workflows.</h1>
+        <p>Flows are YAML runbooks for MCP hosts. They package connector state, cited RAG context, skills, checks, and report handoffs without turning Mercury into the chat surface.</p>
+      </div>
+      <div class="page-grid reverse">
+        <section class="panel">
+          <div class="row">
+            <div>
+              <h2>Flow editor</h2>
+              <p class="lead">Validate and dry-run before a host agent uses the workflow.</p>
+            </div>
+            <span class="pill">dry-run first</span>
+          </div>
+          <form id="flow-form">
+            <label for="flow_title">Flow title</label>
+            <input id="flow_title" name="title" value="Company Health Check" />
+            <label for="flow_yaml">Flow YAML</label>
+            <textarea id="flow_yaml" name="flow_yaml">name: Company Health Check
+description: Read-only Mercury flow for a Thai accounting health-check handoff.
+tags: [accounting, read-only, flowaccount]
+env:
+  jurisdiction: TH
+  connector: flowaccount
+onFlowStart:
+  - connectorStatus:
+      saveAs: connector
+---
+- retrieveContextPack:
+    query: "company health check revenue VAT cash flow accounting Thailand"
+    task: "company_health_check_th"
+    filters:
+      jurisdiction: "${jurisdiction}"
+      connector: "${connector}"
+      review_status: reviewed
+    maxChunks: 8
+    saveAs: context
+- runSkill:
+    skillId: company-health-check-th
+    inputs:
+      task: "Prepare a concise Thai company health-check answer."
+      connector: "${connector}"
+      context_query: "{{ context.query }}"
+    evidenceMode: true
+    saveAs: skill
+- emitReport:
+    title: "Company health-check context pack"
+    sections:
+      - "Use the retrieved citations and skill package to answer in Thai."
+      - "Do not expose raw tax IDs, emails, bearer tokens, or API keys."</textarea>
+            <div class="two" style="margin-top:12px">
+              <button id="flow-validate" class="secondary" type="button">Validate</button>
+              <button id="flow-run" class="secondary" type="button">Dry-run</button>
+            </div>
+            <button class="full" type="submit">Save flow to workspace</button>
+            <div id="flow-message" class="message"></div>
+          </form>
+          <div class="codebar"><h2>Flow result</h2><span class="pill">sanitized</span></div>
+          <pre id="flow-result">No flow action yet.</pre>
+        </section>
+
+        <div class="surface">
+          <section class="panel">
+            <div class="row"><h2>Saved flows</h2><span class="pill">workspace scoped</span></div>
+            <div id="flow-list" class="list"><div class="item"><small>No workspace flows saved yet.</small></div></div>
+          </section>
+          <section class="panel">
+            <h2>Flow boundary</h2>
+            <div class="cards-2">
+              <div class="card"><b>Purpose</b><span>repeatable AI-agent runbooks</span></div>
+              <div class="card"><b>Execution</b><span>MCP tool calls and context handoffs</span></div>
+              <div class="card"><b>Writes</b><span>blocked unless future approval flow allows them</span></div>
+              <div class="card"><b>Owner</b><span>workspace, not local machine config</span></div>
+            </div>
+          </section>
+        </div>
+      </div>
+    </section>
+    <!-- PAGE:flows:end -->
+
+    <!-- PAGE:audit:start -->
     <section class="page" data-page="audit">
       <div class="page-head">
         <span class="eyebrow">Audit</span>
@@ -550,20 +646,32 @@ CONNECT_HTML = """<!doctype html>
         </section>
       </div>
     </section>
+    <!-- PAGE:audit:end -->
   </main>
   <script>
     const state = {
       token: localStorage.getItem('mercury_client_token') || '',
-      endpoint: ''
+      endpoint: '',
+      flows: []
     };
-    const $ = (selector) => document.querySelector(selector);
+    const noopNode = {
+      textContent: '',
+      innerHTML: '',
+      value: '',
+      className: '',
+      style: {},
+      classList: { add() {}, remove() {}, toggle() {} },
+      addEventListener() {},
+      reset() {}
+    };
+    const $ = (selector) => document.querySelector(selector) || noopNode;
     const message = (selector, text, kind = '') => {
       const node = $(selector);
       node.textContent = text;
       node.className = 'message' + (kind ? ' ' + kind : '');
     };
     const authHeaders = () => ({ 'Authorization': 'Bearer ' + state.token });
-    const pageNames = ['connect', 'workspace', 'connectors', 'skills', 'audit'];
+    const pageNames = ['connect', 'workspace', 'connectors', 'skills', 'flows', 'audit'];
 
     function pageFromPath() {
       const page = location.pathname.replace(/^\\//, '') || 'connect';
@@ -667,6 +775,19 @@ CONNECT_HTML = """<!doctype html>
         </div>
       `).join('') : '<div class="item"><small>No skills loaded yet.</small></div>';
 
+      state.flows = data.flows || [];
+      $('#flow-list').innerHTML = state.flows.length ? state.flows.map((item) => `
+        <div class="item">
+          <div class="row">
+            <div>
+              <strong>${item.title || item.name}</strong>
+              <small>${item.flow_id} · ${item.command_count || 0} commands · ${item.status || 'draft'}</small>
+            </div>
+            <button class="secondary" type="button" data-flow-load="${item.flow_id}">Load</button>
+          </div>
+        </div>
+      `).join('') : '<div class="item"><small>No workspace flows saved yet.</small></div>';
+
       const events = data.events || [];
       $('#event-list').innerHTML = events.length ? events.map((item) => `
         <div class="item">
@@ -686,17 +807,6 @@ CONNECT_HTML = """<!doctype html>
         $('#workspace-subtitle').textContent = error.message;
       }
     }
-
-    document.querySelectorAll('[data-nav]').forEach((node) => {
-      node.addEventListener('click', (event) => {
-        event.preventDefault();
-        const page = node.getAttribute('data-nav');
-        history.pushState({}, '', page === 'connect' ? '/connect' : '/' + page);
-        setPage(page);
-      });
-    });
-
-    window.addEventListener('popstate', () => setPage(pageFromPath()));
 
     $('#connect-form').addEventListener('submit', async (event) => {
       event.preventDefault();
@@ -831,6 +941,67 @@ CONNECT_HTML = """<!doctype html>
       }
     });
 
+    $('#flow-list').addEventListener('click', (event) => {
+      const flowId = event.target.getAttribute('data-flow-load');
+      if (!flowId) return;
+      const flow = state.flows.find((item) => item.flow_id === flowId);
+      if (!flow) return;
+      $('#flow_title').value = flow.title || flow.name || '';
+      $('#flow_yaml').value = flow.yaml || '';
+      message('#flow-message', 'Loaded ' + flowId + '.', 'ok');
+    });
+
+    $('#flow-validate').addEventListener('click', async () => {
+      try {
+        message('#flow-message', 'Validating flow...');
+        const data = await authFetch('/api/flows/validate', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ flow_yaml: $('#flow_yaml').value })
+        });
+        $('#flow-result').textContent = JSON.stringify(data, null, 2);
+        message('#flow-message', 'Flow syntax is valid.', 'ok');
+      } catch (error) {
+        $('#flow-result').textContent = error.message;
+        message('#flow-message', error.message, 'error');
+      }
+    });
+
+    $('#flow-run').addEventListener('click', async () => {
+      try {
+        message('#flow-message', 'Running dry-run...');
+        const data = await authFetch('/api/flows/run', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ flow_yaml: $('#flow_yaml').value, dry_run: true })
+        });
+        $('#flow-result').textContent = JSON.stringify(data, null, 2);
+        message('#flow-message', 'Dry-run plan is ready.', 'ok');
+      } catch (error) {
+        $('#flow-result').textContent = error.message;
+        message('#flow-message', error.message, 'error');
+      }
+    });
+
+    $('#flow-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      try {
+        message('#flow-message', 'Saving flow...');
+        const payload = Object.fromEntries(new FormData(event.target).entries());
+        const data = await authFetch('/api/flows/save', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload)
+        });
+        $('#flow-result').textContent = JSON.stringify(data, null, 2);
+        message('#flow-message', 'Saved ' + data.flow.flow_id + '.', 'ok');
+        await loadDashboard();
+      } catch (error) {
+        $('#flow-result').textContent = error.message;
+        message('#flow-message', error.message, 'error');
+      }
+    });
+
     $('#refresh-dashboard').addEventListener('click', loadDashboard);
     $('#forget-token').addEventListener('click', () => {
       localStorage.removeItem('mercury_client_token');
@@ -853,3 +1024,19 @@ CONNECT_HTML = """<!doctype html>
   </script>
 </body>
 </html>"""
+
+PAGE_NAMES = ("connect", "workspace", "connectors", "skills", "flows", "audit")
+PAGE_BLOCK_PATTERN = re.compile(
+    r"\n    <!-- PAGE:(?P<name>[a-z]+):start -->.*?\n    <!-- PAGE:(?P=name):end -->",
+    re.DOTALL,
+)
+
+
+def render_connect_html(active_page: str = "connect") -> str:
+    """Render one Mercury Console page instead of shipping every section at once."""
+    page = active_page if active_page in PAGE_NAMES else "connect"
+
+    def keep_active(match: re.Match[str]) -> str:
+        return match.group(0) if match.group("name") == page else ""
+
+    return PAGE_BLOCK_PATTERN.sub(keep_active, CONNECT_HTML)
