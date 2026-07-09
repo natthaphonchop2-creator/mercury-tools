@@ -187,12 +187,68 @@ def test_submit_connector_credentials_stores_only_field_names(monkeypatch) -> No
     assert "demo-client-id" not in str(payload)
 
 
-def test_validate_connector_connection_is_non_http_stub(monkeypatch) -> None:
-    from mercury_tools.mcp.server import validate_connector_connection
+def test_validate_connector_connection_validates_flowaccount_read_only(monkeypatch) -> None:
+    from mercury_tools.mcp import server
 
     configure_product_env(monkeypatch)
+    calls: list[tuple[str, str]] = []
 
-    payload = validate_connector_connection(
+    class FakeResponse:
+        def __init__(self, status_code: int, payload: dict):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = str(payload)
+
+        def json(self):
+            return self._payload
+
+    def fake_post(url, data=None, timeout=60):
+        calls.append(("POST", url))
+        assert data == {
+            "grant_type": "client_credentials",
+            "scope": "flowaccount-api",
+            "client_id": "demo-client-id",
+            "client_secret": "super-secret-value",
+        }
+        assert timeout == 60
+        return FakeResponse(200, {"access_token": "secret-token", "token_type": "Bearer"})
+
+    def fake_get(url, headers=None, timeout=60):
+        calls.append(("GET", url))
+        assert headers == {"Authorization": "Bearer secret-token"}
+        assert timeout == 60
+        return FakeResponse(200, {"companyName": "Demo Books"})
+
+    class FakeStore:
+        def __init__(self):
+            self.profile_payloads: list[dict[str, Any]] = []
+
+        def set_connector_profile(
+            self,
+            *,
+            token_payload: dict[str, Any],
+            connector_id: str,
+            environment: str,
+            company_name: str | None = None,
+            metadata: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            assert token_payload["sub"] == "owner@example.com"
+            payload = {
+                "connector_id": connector_id,
+                "environment": environment,
+                "company_name": company_name,
+                "metadata": metadata or {},
+            }
+            self.profile_payloads.append(payload)
+            return payload
+
+    store = FakeStore()
+    monkeypatch.setattr("httpx.post", fake_post)
+    monkeypatch.setattr("httpx.get", fake_get)
+    monkeypatch.setattr(server, "_product_store", lambda settings: store)
+    monkeypatch.setattr(server, "_audit", lambda *args, **kwargs: None)
+
+    payload = server.validate_connector_connection(
         client_token=make_client_token(),
         connector_id="flowaccount",
         environment="production",
@@ -202,10 +258,35 @@ def test_validate_connector_connection_is_non_http_stub(monkeypatch) -> None:
         },
     )
 
-    assert payload["status"] == "not_validated"
+    assert payload["status"] == "ready"
     assert payload["connector_id"] == "flowaccount"
     assert payload["environment"] == "production"
-    assert payload["read_only"] is True
-    assert "Task 4" in payload["message"]
+    assert payload["company_name"] == "Demo Books"
+    assert payload["enabled_capabilities"] == [
+        "company.info.read",
+        "contacts.list",
+        "products.list",
+        "documents.invoice.list",
+        "documents.invoice.get",
+        "tax.vat_summary.read",
+    ]
+    assert payload["validation"] == {"token_status": 200, "company_info_status": 200}
+    assert store.profile_payloads == [
+        {
+            "connector_id": "flowaccount",
+            "environment": "production",
+            "company_name": "Demo Books",
+            "metadata": {
+                "setup_state": "ready",
+                "enabled_capabilities": payload["enabled_capabilities"],
+                "validation": {"token_status": 200, "company_info_status": 200},
+            },
+        }
+    ]
+    assert calls == [
+        ("POST", "https://openapi.flowaccount.com/token"),
+        ("GET", "https://openapi.flowaccount.com/v1/company/info"),
+    ]
     assert "super-secret-value" not in str(payload)
     assert "demo-client-id" not in str(payload)
+    assert "secret-token" not in str(payload)

@@ -16,7 +16,7 @@ from starlette.responses import HTMLResponse, JSONResponse, Response
 
 from mercury_tools.config import load_settings
 from mercury_tools.connectors.catalog import connector_by_id, list_connector_summaries
-from mercury_tools.connectors.setup import required_missing_fields
+from mercury_tools.connectors.setup import required_missing_fields, validate_connector_read_only
 from mercury_tools.db.product import SupabaseProductStore, slugify
 from mercury_tools.db.supabase import SupabaseRagStore
 from mercury_tools.flows.parser import FlowValidationError, validate_flow_text
@@ -527,33 +527,43 @@ def validate_connector_connection(
     environment: str,
     credentials: dict[str, Any],
 ) -> dict[str, Any]:
-    """Return a Task 3 validation placeholder without calling external ERP APIs."""
+    """Validate one connector through read-only API calls and return sanitized status."""
     try:
-        _client_token_payload_from_value(client_token)
+        settings = load_settings()
+        token_payload = _client_token_payload_from_value(client_token)
         manifest = connector_by_id(connector_id)
         if not manifest:
             raise ValueError(f"Unknown connector: {connector_id}")
         if environment not in manifest.environments:
             raise ValueError(f"Unsupported environment for {manifest.connector_id}: {environment}")
-        missing = required_missing_fields(manifest, credentials)
-        if missing:
-            payload = {
-                "status": "awaiting_credentials",
-                "connector_id": manifest.connector_id,
-                "environment": environment,
-                "missing_fields": missing,
-                "message": "Required connector credentials are missing.",
-            }
-        else:
-            payload = {
-                "status": "not_validated",
-                "connector_id": manifest.connector_id,
-                "environment": environment,
-                "read_only": manifest.validation.read_only,
-                "validation_method": manifest.validation.method,
-                "message": "Task 4 will perform read-only ERP API validation.",
-            }
+        result = validate_connector_read_only(
+            manifest,
+            credentials=credentials,
+            environment=environment,
+        )
+        result.setdefault("connector_id", manifest.connector_id)
+        result.setdefault("environment", environment)
+        if result["status"] == "connected_read_only":
+            _product_store(settings).set_connector_profile(
+                token_payload=token_payload,
+                connector_id=connector_id,
+                environment=environment,
+                company_name=result.get("company_name"),
+                metadata={
+                    "setup_state": "ready",
+                    "enabled_capabilities": result.get("enabled_capabilities") or [],
+                    "validation": result.get("validation") or {},
+                },
+            )
+            result["status"] = "ready"
+        payload = result
         payload = redact_json(payload)
+        validation = result.get("validation")
+        if isinstance(validation, dict):
+            payload["validation"] = {
+                "token_status": validation.get("token_status"),
+                "company_info_status": validation.get("company_info_status"),
+            }
         _audit(
             "validate_connector_connection",
             {

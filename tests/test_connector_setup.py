@@ -7,6 +7,7 @@ from mercury_tools.connectors.setup import (
     next_setup_state,
     required_missing_fields,
     resolve_setup_state,
+    validate_connector_read_only,
 )
 from mercury_tools.db.product import SupabaseProductStore
 
@@ -34,6 +35,55 @@ def test_required_missing_fields_uses_manifest() -> None:
         manifest,
         {"client_id": "abc", "client_secret": "def"},
     ) == []
+
+
+def test_validate_flowaccount_uses_token_and_company_info(monkeypatch) -> None:
+    manifest = connector_by_id("flowaccount")
+    assert manifest is not None
+    calls: list[tuple[str, str]] = []
+
+    class FakeResponse:
+        def __init__(self, status_code: int, payload: dict):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = str(payload)
+
+        def json(self):
+            return self._payload
+
+    def fake_post(url, data=None, timeout=60):
+        calls.append(("POST", url))
+        assert data["grant_type"] == "client_credentials"
+        assert data["scope"] == "flowaccount-api"
+        assert data["client_id"] == "cid"
+        assert data["client_secret"] == "csecret"
+        assert timeout == 60
+        return FakeResponse(200, {"access_token": "secret-token", "token_type": "Bearer"})
+
+    def fake_get(url, headers=None, timeout=60):
+        calls.append(("GET", url))
+        assert headers["Authorization"] == "Bearer secret-token"
+        assert timeout == 60
+        return FakeResponse(200, {"companyName": "Demo Books"})
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    monkeypatch.setattr("httpx.get", fake_get)
+
+    result = validate_connector_read_only(
+        manifest,
+        credentials={"client_id": "cid", "client_secret": "csecret"},
+        environment="production",
+    )
+
+    assert result["status"] == "connected_read_only"
+    assert result["company_name"] == "Demo Books"
+    assert result["enabled_capabilities"] == manifest.capabilities
+    assert "secret-token" not in str(result)
+    assert "csecret" not in str(result)
+    assert calls == [
+        ("POST", "https://openapi.flowaccount.com/token"),
+        ("GET", "https://openapi.flowaccount.com/v1/company/info"),
+    ]
 
 
 def test_next_setup_state_does_not_skip_credentials() -> None:
