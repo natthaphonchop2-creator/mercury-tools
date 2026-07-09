@@ -331,6 +331,41 @@ def _fallback_dashboard(token_payload: dict[str, Any], *, reason: str) -> dict[s
     }
 
 
+def _profile_enabled_capabilities(profile: dict[str, Any]) -> list[Any]:
+    metadata = profile.get("metadata") or {}
+    return list(metadata.get("enabled_capabilities") or profile.get("enabled_capabilities") or [])
+
+
+def _workspace_connector_ready(dashboard_payload: dict[str, Any]) -> bool:
+    if "connector_profiles" not in dashboard_payload:
+        return True
+    profiles = dashboard_payload.get("connector_profiles") or []
+    for profile in profiles:
+        metadata = profile.get("metadata") or {}
+        enabled_capabilities = _profile_enabled_capabilities(profile)
+        if metadata.get("setup_state") == "ready":
+            return bool(enabled_capabilities)
+        if profile.get("status") in {"ready", "connected_read_only"}:
+            return bool(enabled_capabilities)
+    return False
+
+
+def workspace_connector_ready(dashboard_payload: dict[str, Any]) -> bool:
+    return _workspace_connector_ready(dashboard_payload)
+
+
+def _connector_setup_block_payload() -> dict[str, Any]:
+    return {
+        "status": "blocked",
+        "message": (
+            "connector credential setup is required before running connector-backed "
+            "accounting workflows."
+        ),
+        "next_tool": "start_connector_setup",
+        "next_skill": "connector-credential-setup-th",
+    }
+
+
 def _public_connector_credentials_summary(
     result: dict[str, Any],
     *,
@@ -1027,6 +1062,20 @@ def run_workspace_flow_tool(
             raise RuntimeError("Supabase is required to load saved workspace flows.")
         token_payload = _client_token_payload_from_value(client_token)
         store = _product_store(settings)
+        dashboard_payload = store.dashboard(token_payload)
+        if not workspace_connector_ready(dashboard_payload):
+            payload = _connector_setup_block_payload()
+            _audit(
+                "run_workspace_flow",
+                {
+                    **_client_token_audit_ref(client_token),
+                    "flow_id": flow_id,
+                    "dry_run": dry_run,
+                    "env_keys": _env_keys(env_overrides),
+                },
+                payload,
+            )
+            return payload
         flow = store.get_flow(token_payload=token_payload, flow_id=flow_id)
         if not flow:
             return {"status": "not_found", "message": f"Workspace flow not found: {flow_id}"}

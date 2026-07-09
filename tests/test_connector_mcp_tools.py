@@ -494,3 +494,36 @@ def test_validate_connector_connection_http_error_is_sanitized(
     assert payload["error_type"] == "ReadError"
     assert "Traceback" not in str(payload)
     assert_values_absent(payload, ["demo-client-id", "super-secret-value"])
+
+
+def test_run_workspace_flow_requires_ready_connector(monkeypatch) -> None:
+    from mercury_tools.mcp import server
+
+    class FakeStore:
+        def dashboard(self, token_payload):
+            return {
+                "workspace": {"name": "Demo Co"},
+                "connector_profiles": [
+                    {
+                        "connector_id": "flowaccount",
+                        "environment": "production",
+                        "status": "credentials_configured",
+                        "metadata": {"setup_state": "credentials_received"},
+                    }
+                ],
+            }
+
+        def get_flow(self, token_payload, flow_id):
+            raise AssertionError("blocked connector setup should not load the flow")
+
+    configure_product_env(monkeypatch)
+    monkeypatch.setattr(server, "_product_store", lambda settings=None: FakeStore())
+
+    payload = server.run_workspace_flow_tool(
+        client_token=make_client_token(),
+        flow_id="workspace-revenue",
+        dry_run=False,
+    )
+
+    assert payload["status"] == "blocked"
+    assert "connector credential setup" in payload["message"]
