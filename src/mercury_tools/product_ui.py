@@ -758,6 +758,7 @@ PAGE_CONTENT: dict[str, str] = {
                 <option value="flowaccount">FlowAccount</option>
                 <option value="peak">PEAK Accounting</option>
                 <option value="express">Express Account</option>
+                <option value="custom">Custom ERP</option>
               </select>
               <label for="environment">Environment</label>
               <select id="environment" name="environment">

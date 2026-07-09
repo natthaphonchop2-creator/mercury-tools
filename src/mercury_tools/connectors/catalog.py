@@ -94,6 +94,14 @@ CONNECTOR_CATALOG: list[ConnectorManifest] = [
         required_secret_fields=["gateway_url", "api_key"],
         capabilities=[],
     ),
+    ConnectorManifest(
+        connector_id="custom",
+        name="Custom ERP",
+        status="setup_target",
+        environments=["production", "sandbox", "gateway"],
+        required_secret_fields=["base_url", "api_key"],
+        capabilities=[],
+    ),
 ]
 
 

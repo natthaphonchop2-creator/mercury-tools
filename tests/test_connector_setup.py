@@ -282,6 +282,79 @@ def test_validate_flowaccount_token_failure_sanitizes_provider_response_keys(
     )
 
 
+@pytest.mark.parametrize(
+    "body_failure",
+    [
+        pytest.param({"status": False}, id="status-false"),
+        pytest.param({"success": False}, id="success-false"),
+        pytest.param({"code": 12}, id="nonzero-code"),
+        pytest.param({"resCode": "600"}, id="nonzero-res-code"),
+        pytest.param(
+            {"error": "provider echoed demo-client-id and super-secret-value"},
+            id="truthy-error",
+        ),
+    ],
+)
+def test_validate_flowaccount_company_info_body_failure_returns_sanitized_validation_failed(
+    monkeypatch,
+    body_failure: dict,
+) -> None:
+    manifest = connector_by_id("flowaccount")
+    assert manifest is not None
+
+    class FakeResponse:
+        def __init__(self, status_code: int, payload: dict):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake_post(url, data=None, timeout=60):
+        return FakeResponse(
+            200,
+            {"access_token": "secret-token", "token_type": "Bearer"},
+        )
+
+    def fake_get(url, headers=None, timeout=60):
+        return FakeResponse(
+            200,
+            {
+                **body_failure,
+                "companyName": "Demo Books",
+                "client_id": "demo-client-id",
+                "client_secret": "super-secret-value",
+                "detail": "body echoed demo-client-id super-secret-value secret-token",
+                "access_token": "secret-token",
+            },
+        )
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    monkeypatch.setattr("httpx.get", fake_get)
+
+    result = validate_connector_read_only(
+        manifest,
+        credentials={
+            "client_id": "demo-client-id",
+            "client_secret": "super-secret-value",
+        },
+        environment="production",
+    )
+
+    assert result["status"] == "validation_failed"
+    assert result["http_status"] == 200
+    assert result["message"].startswith("Company info request failed.")
+    assert "provider_response" in result
+    assert_key_fragments_absent(
+        result["provider_response"],
+        ["client_id", "client_secret", "access_token"],
+    )
+    assert_values_absent(
+        result,
+        ["demo-client-id", "super-secret-value", "secret-token"],
+    )
+
+
 def test_next_setup_state_does_not_skip_credentials() -> None:
     assert (
         next_setup_state(has_environment=False, missing_fields=["client_id"])
@@ -538,6 +611,32 @@ def test_start_connector_setup_stores_environment_specific_preset() -> None:
     assert profile["metadata"]["preset"]["token_url"] == (
         "https://openapi.flowaccount.com/test/token"
     )
+
+
+def test_start_connector_setup_supports_custom_erp_setup_target() -> None:
+    store = StoreForSetup()
+    profile = store.start_connector_setup(
+        token_payload={
+            "sub": "owner@example.com",
+            "company": "Demo Co",
+            "host_app": "codex",
+            "iat": 0,
+            "exp": 99999,
+            "jti": "token-jti",
+        },
+        connector_id="custom",
+        environment="gateway",
+        company_name="Demo Co ERP",
+    )
+
+    assert profile["connector_id"] == "custom"
+    assert profile["environment"] == "gateway"
+    assert profile["display_name"] == "Custom ERP"
+    assert profile["company_name"] == "Demo Co ERP"
+    assert profile["status"] == "requires_credentials"
+    assert profile["metadata"]["setup_state"] == "awaiting_credentials"
+    assert profile["metadata"]["required_secret_fields"] == ["base_url", "api_key"]
+    assert profile["metadata"]["capabilities"] == []
 
 
 def test_ready_connector_profile_metadata_sets_connected_read_only_status() -> None:

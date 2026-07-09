@@ -66,6 +66,7 @@ def test_list_connectors_exposes_setup_targets_without_secrets() -> None:
         "flowaccount",
         "peak",
         "express",
+        "custom",
     }
     assert "super-secret" not in str(payload)
     assert "client_secret_value" not in str(payload)
@@ -214,7 +215,9 @@ def test_submit_connector_credentials_stores_only_field_names(monkeypatch) -> No
     assert "demo-client-id" not in str(payload)
 
 
-def test_validate_connector_connection_validates_flowaccount_read_only(monkeypatch) -> None:
+def test_validate_connector_connection_stores_credentials_before_ready(
+    monkeypatch,
+) -> None:
     from mercury_tools.mcp import server
 
     configure_product_env(monkeypatch)
@@ -248,7 +251,36 @@ def test_validate_connector_connection_validates_flowaccount_read_only(monkeypat
 
     class FakeStore:
         def __init__(self):
+            self.calls: list[str] = []
+            self.credential_payloads: list[dict[str, Any]] = []
             self.profile_payloads: list[dict[str, Any]] = []
+
+        def set_connector_credentials(
+            self,
+            *,
+            token_payload: dict[str, Any],
+            connector_id: str,
+            environment: str,
+            credentials: dict[str, str],
+        ) -> dict[str, Any]:
+            assert token_payload["sub"] == "owner@example.com"
+            assert credentials == {
+                "client_id": "demo-client-id",
+                "client_secret": "super-secret-value",
+            }
+            payload = {
+                "connector_id": connector_id,
+                "environment": environment,
+                "credential_fields": sorted(credentials),
+                "credential_fingerprints": {
+                    "client_id": "client-id-fp",
+                    "client_secret": "client-secret-fp",
+                },
+                "ciphertext": "encrypted-secret-derived-value",
+            }
+            self.calls.append("set_connector_credentials")
+            self.credential_payloads.append(payload)
+            return payload
 
         def set_connector_profile(
             self,
@@ -266,6 +298,7 @@ def test_validate_connector_connection_validates_flowaccount_read_only(monkeypat
                 "company_name": company_name,
                 "metadata": metadata or {},
             }
+            self.calls.append("set_connector_profile")
             self.profile_payloads.append(payload)
             return payload
 
@@ -298,6 +331,19 @@ def test_validate_connector_connection_validates_flowaccount_read_only(monkeypat
         "tax.vat_summary.read",
     ]
     assert payload["validation"] == {"token_status": 200, "company_info_status": 200}
+    assert store.calls == ["set_connector_credentials", "set_connector_profile"]
+    assert store.credential_payloads == [
+        {
+            "connector_id": "flowaccount",
+            "environment": "production",
+            "credential_fields": ["client_id", "client_secret"],
+            "credential_fingerprints": {
+                "client_id": "client-id-fp",
+                "client_secret": "client-secret-fp",
+            },
+            "ciphertext": "encrypted-secret-derived-value",
+        }
+    ]
     assert store.profile_payloads == [
         {
             "connector_id": "flowaccount",
@@ -317,6 +363,7 @@ def test_validate_connector_connection_validates_flowaccount_read_only(monkeypat
     assert "super-secret-value" not in str(payload)
     assert "demo-client-id" not in str(payload)
     assert "secret-token" not in str(payload)
+    assert "encrypted-secret-derived-value" not in str(payload)
 
 
 def test_validate_connector_connection_token_failure_sanitizes_provider_echoes(
@@ -503,17 +550,31 @@ def ready_connector_profile(
     connector_id: str = "flowaccount",
     environment: str = "production",
     capabilities: list[str] | None = None,
+    credential_metadata: bool = True,
 ) -> dict[str, Any]:
+    metadata = {
+        "setup_state": "ready",
+        "enabled_capabilities": (
+            ["company.info.read"] if capabilities is None else capabilities
+        ),
+    }
+    if credential_metadata:
+        metadata.update(
+            {
+                "credential_storage": "encrypted_server_vault",
+                "credential_fields": ["client_id", "client_secret"],
+                "credential_fingerprints": {
+                    "client_id": "client-id-fp",
+                    "client_secret": "client-secret-fp",
+                },
+                "credentials_configured": True,
+            }
+        )
     return {
         "connector_id": connector_id,
         "environment": environment,
         "status": "ready",
-        "metadata": {
-            "setup_state": "ready",
-            "enabled_capabilities": (
-                ["company.info.read"] if capabilities is None else capabilities
-            ),
-        },
+        "metadata": metadata,
     }
 
 
@@ -649,6 +710,22 @@ def test_workspace_connector_ready_blocks_ready_profile_without_capabilities() -
     )
 
 
+def test_workspace_connector_ready_blocks_ready_profile_without_credential_metadata() -> None:
+    from mercury_tools.mcp.server import workspace_connector_ready
+
+    profile = ready_connector_profile(credential_metadata=False)
+
+    assert (
+        workspace_connector_ready(
+            {"connector_profiles": [profile]},
+            connector_id="flowaccount",
+            environment="production",
+            required_capabilities=["company.info.read"],
+        )
+        is False
+    )
+
+
 def test_workspace_connector_ready_accepts_flowaccount_required_capability() -> None:
     from mercury_tools.mcp.server import workspace_connector_ready
 
@@ -761,6 +838,13 @@ def test_retrieve_workspace_context_pack_uses_active_connector(monkeypatch) -> N
                         "metadata": {
                             "setup_state": "ready",
                             "enabled_capabilities": ["documents.invoice.list"],
+                            "credential_storage": "encrypted_server_vault",
+                            "credential_fields": ["client_id", "client_secret"],
+                            "credential_fingerprints": {
+                                "client_id": "client-id-fp",
+                                "client_secret": "client-secret-fp",
+                            },
+                            "credentials_configured": True,
                         },
                     }
                 ]
@@ -906,6 +990,13 @@ def test_workspace_connector_status_returns_token_scoped_sanitized_profiles(
                         "metadata": {
                             "setup_state": "ready",
                             "enabled_capabilities": ["company.info.read"],
+                            "credential_storage": "encrypted_server_vault",
+                            "credential_fields": ["client_id", "client_secret"],
+                            "credential_fingerprints": {
+                                "client_id": "client-id-fp",
+                                "client_secret": "client-secret-fp",
+                            },
+                            "credentials_configured": True,
                             "server_vault": {
                                 "ciphertext": "encrypted-secret-derived-value"
                             },
@@ -933,7 +1024,7 @@ def test_workspace_connector_status_returns_token_scoped_sanitized_profiles(
     assert payload["setup_required"] is False
     assert payload["active_connector"]["connector_id"] == "flowaccount"
     assert payload["connector_profiles"][0]["status"] == "connected_read_only"
-    assert "server_vault" not in str(payload)
+    assert "'server_vault':" not in str(payload)
     assert "ciphertext" not in str(payload)
     assert "encrypted-secret-derived-value" not in str(payload)
     assert token not in str(audit_events)

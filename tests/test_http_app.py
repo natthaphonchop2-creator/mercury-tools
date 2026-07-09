@@ -27,6 +27,13 @@ def ready_connector_profile(connector_id: str = "flowaccount") -> dict:
         "metadata": {
             "setup_state": "ready",
             "enabled_capabilities": ["company.info.read"],
+            "credential_storage": "encrypted_server_vault",
+            "credential_fields": ["client_id", "client_secret"],
+            "credential_fingerprints": {
+                "client_id": "client-id-fp",
+                "client_secret": "client-secret-fp",
+            },
+            "credentials_configured": True,
         },
     }
 

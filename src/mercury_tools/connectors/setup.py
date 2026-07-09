@@ -63,6 +63,45 @@ def _flowaccount_company_name(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def _is_false_provider_flag(value: Any) -> bool:
+    if value is False:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {"false", "failed", "failure", "error"}
+    return False
+
+
+def _is_nonzero_provider_code(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value is not False
+    if isinstance(value, int | float):
+        return value != 0
+    if isinstance(value, str):
+        clean = value.strip()
+        if not clean:
+            return False
+        try:
+            return float(clean) != 0
+        except ValueError:
+            return False
+    return False
+
+
+def _provider_body_failure(payload: dict[str, Any]) -> str | None:
+    if _is_false_provider_flag(payload.get("status")):
+        return "Provider response reported status=false."
+    if _is_false_provider_flag(payload.get("success")):
+        return "Provider response reported success=false."
+    for key in ("code", "resCode"):
+        if _is_nonzero_provider_code(payload.get(key)):
+            return f"Provider response reported nonzero {key}."
+    if payload.get("error"):
+        return "Provider response reported an error."
+    return None
+
+
 def _collect_sensitive_values(value: Any, collected: list[str]) -> None:
     if isinstance(value, dict):
         for item in value.values():
@@ -298,6 +337,16 @@ def validate_connector_read_only(
             extra_sensitive_values=(access_token,),
         )
 
+    token_failure = _provider_body_failure(token_payload)
+    if token_failure:
+        return _validation_failed(
+            f"Token request failed. {token_failure}",
+            credentials=credentials,
+            http_status=token_response.status_code,
+            provider_response=token_payload,
+            extra_sensitive_values=(access_token,),
+        )
+
     info_url = f"{preset['api_base_url'].rstrip('/')}/company/info"
     try:
         info_response = httpx.get(
@@ -335,6 +384,16 @@ def validate_connector_read_only(
     if info_response.status_code >= 300:
         return _validation_failed(
             "Company info request failed.",
+            credentials=credentials,
+            http_status=info_response.status_code,
+            provider_response=info_payload,
+            extra_sensitive_values=(access_token,),
+        )
+
+    info_failure = _provider_body_failure(info_payload)
+    if info_failure:
+        return _validation_failed(
+            f"Company info request failed. {info_failure}",
             credentials=credentials,
             http_status=info_response.status_code,
             provider_response=info_payload,

@@ -20,11 +20,16 @@ def test_flowaccount_manifest_has_presets_and_capabilities() -> None:
 def test_setup_target_manifests_are_visible_but_not_live() -> None:
     peak = connector_by_id("peak")
     express = connector_by_id("express")
+    custom = connector_by_id("custom")
 
     assert peak is not None
     assert peak.status == "setup_target"
     assert express is not None
     assert express.status == "setup_target"
+    assert custom is not None
+    assert custom.name == "Custom ERP"
+    assert custom.status == "setup_target"
+    assert custom.environments == ["production", "sandbox", "gateway"]
 
 
 def test_connector_by_id_is_case_and_whitespace_normalized() -> None:
@@ -46,6 +51,7 @@ def test_connector_summaries_do_not_include_secrets() -> None:
         "flowaccount",
         "peak",
         "express",
+        "custom",
     }
     assert "client_secret" in serialized
     assert "super-secret" not in serialized

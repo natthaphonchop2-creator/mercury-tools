@@ -363,6 +363,23 @@ def _profile_enabled_capabilities(profile: dict[str, Any]) -> list[Any]:
     return []
 
 
+def _profile_has_public_encrypted_credentials(profile: dict[str, Any]) -> bool:
+    metadata = profile.get("metadata") if isinstance(profile.get("metadata"), dict) else {}
+    if _clean_selector(metadata.get("credential_storage")) != "encrypted_server_vault":
+        return False
+    if metadata.get("credentials_configured") is not True:
+        return False
+    credential_fields = [
+        str(field).strip()
+        for field in metadata.get("credential_fields") or []
+        if str(field).strip()
+    ]
+    credential_fingerprints = metadata.get("credential_fingerprints")
+    if not credential_fields or not isinstance(credential_fingerprints, dict):
+        return False
+    return all(str(credential_fingerprints.get(field) or "").strip() for field in credential_fields)
+
+
 def _manifest_has_read_only_validation_adapter(manifest: Any) -> bool:
     validation = getattr(manifest, "validation", None)
     method = str(getattr(validation, "method", "") or "").strip().lower()
@@ -646,8 +663,9 @@ def _workspace_connector_ready(
             continue
         metadata = profile.get("metadata") or {}
         setup_state = _clean_selector(metadata.get("setup_state")) if isinstance(metadata, dict) else None
-        status = _clean_selector(profile.get("status"))
-        if setup_state != "ready" and status not in {"ready", "connected_read_only"}:
+        if setup_state != "ready":
+            continue
+        if not _profile_has_public_encrypted_credentials(profile):
             continue
         enabled_capabilities = {str(item).strip() for item in _profile_enabled_capabilities(profile)}
         if not enabled_capabilities:
@@ -1012,9 +1030,16 @@ def validate_connector_connection(
         result.setdefault("connector_id", manifest.connector_id)
         result.setdefault("environment", environment)
         if result["status"] == "connected_read_only":
-            _product_store(settings).set_connector_profile(
+            store = _product_store(settings)
+            store.set_connector_credentials(
                 token_payload=token_payload,
-                connector_id=connector_id,
+                connector_id=manifest.connector_id,
+                environment=environment,
+                credentials={str(key): str(value) for key, value in credentials.items()},
+            )
+            store.set_connector_profile(
+                token_payload=token_payload,
+                connector_id=manifest.connector_id,
                 environment=environment,
                 company_name=result.get("company_name"),
                 metadata={
