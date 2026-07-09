@@ -19,3 +19,15 @@ def test_redaction_masks_secret_keys_in_json() -> None:
 
     assert payload["access_token"] == "[REDACTED]"
     assert payload["nested"]["email"] == "[REDACTED_EMAIL]"
+
+
+def test_redaction_keeps_connector_schema_field_names() -> None:
+    payload = redact_json(
+        {
+            "required_secret_fields": ["client_id", "client_secret"],
+            "client_secret": "raw-value",
+        }
+    )
+
+    assert payload["required_secret_fields"] == ["client_id", "client_secret"]
+    assert payload["client_secret"] == "[REDACTED]"

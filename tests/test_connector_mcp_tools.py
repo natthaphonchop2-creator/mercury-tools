@@ -130,7 +130,10 @@ def test_start_connector_setup_returns_redacted_profile(monkeypatch) -> None:
                 "environment": environment,
                 "company_name": company_name,
                 "status": "requires_credentials",
-                "metadata": {"client_secret": "super-secret-value"},
+                "metadata": {
+                    "required_secret_fields": ["client_id", "client_secret"],
+                    "client_secret": "super-secret-value",
+                },
             }
 
     monkeypatch.setattr(server, "_product_store", lambda settings: FakeStore())
@@ -145,6 +148,10 @@ def test_start_connector_setup_returns_redacted_profile(monkeypatch) -> None:
     assert payload["status"] == "ok"
     assert payload["profile"]["connector_id"] == "flowaccount"
     assert payload["profile"]["company_name"] == "Demo Co Books"
+    assert payload["profile"]["metadata"]["required_secret_fields"] == [
+        "client_id",
+        "client_secret",
+    ]
     assert payload["profile"]["metadata"]["client_secret"] == "[REDACTED]"
     assert "super-secret-value" not in str(payload)
 
