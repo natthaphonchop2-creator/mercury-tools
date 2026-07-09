@@ -14,6 +14,7 @@ from cryptography.fernet import Fernet
 
 from mercury_tools.config import Settings, require_supabase
 from mercury_tools.connectors.catalog import connector_by_id, list_connector_summaries
+from mercury_tools.connectors.setup import required_missing_fields, resolve_setup_state
 from mercury_tools.flows.parser import parse_flow_text
 from mercury_tools.product import ConnectRequest, normalize_host_app
 from mercury_tools.safety.redaction import redact_json
@@ -652,7 +653,7 @@ class SupabaseProductStore:
         token_payload: dict[str, Any],
         connector_id: str,
         environment: str,
-        company_name: str,
+        company_name: str | None,
         display_name: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -665,6 +666,20 @@ class SupabaseProductStore:
             raise ValueError(
                 f"Unsupported environment for {canonical_connector_id}: {environment}"
             )
+        existing_profile: dict[str, Any] | None = None
+        for row in self._fallback_state_events(context["workspace"]["workspace_key"]):
+            summary = row.get("output_summary") or {}
+            if summary.get("event_type") not in {
+                "connector.profile_configured",
+                "connector.credentials_configured",
+            }:
+                continue
+            profile = summary.get("profile") or {}
+            if (
+                profile.get("connector_id") == canonical_connector_id
+                and profile.get("environment") == environment
+            ):
+                existing_profile = profile
         profile = {
             "id": stable_id(
                 "connector",
@@ -676,7 +691,11 @@ class SupabaseProductStore:
             "connector_id": canonical_connector_id,
             "environment": environment,
             "display_name": display_name or connector.name,
-            "company_name": company_name,
+            "company_name": (
+                company_name
+                if company_name is not None
+                else (existing_profile or {}).get("company_name")
+            ),
             "status": "requires_credentials",
             "metadata": {
                 "required_secret_fields": connector.required_secret_fields,
@@ -720,13 +739,18 @@ class SupabaseProductStore:
             raise ValueError(f"Unknown connector: {connector_id}")
         if environment not in manifest.environments:
             raise ValueError(f"Unsupported environment for {connector_id}: {environment}")
+        setup_state = resolve_setup_state(
+            has_program=True,
+            has_environment=bool(environment),
+            missing_fields=required_missing_fields(manifest, {}),
+        )
         return self.set_connector_profile(
             token_payload=token_payload,
             connector_id=manifest.connector_id,
             environment=environment,
-            company_name=company_name or "",
+            company_name=company_name,
             metadata={
-                "setup_state": "awaiting_credentials",
+                "setup_state": setup_state,
                 "required_secret_fields": manifest.required_secret_fields,
                 "preset": manifest.preset,
                 "capabilities": manifest.capabilities,
@@ -1410,7 +1434,7 @@ class SupabaseProductStore:
         token_payload: dict[str, Any],
         connector_id: str,
         environment: str,
-        company_name: str,
+        company_name: str | None = None,
         display_name: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -1445,7 +1469,7 @@ class SupabaseProductStore:
         token_payload: dict[str, Any],
         connector_id: str,
         environment: str,
-        company_name: str,
+        company_name: str | None,
         display_name: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -1466,17 +1490,19 @@ class SupabaseProductStore:
             "credential_storage": "host_or_user_vault",
             **(metadata or {}),
         }
+        payload = {
+            "workspace_id": context["workspace"]["id"],
+            "connector_id": canonical_connector_id,
+            "environment": environment,
+            "display_name": display_name or connector.name,
+            "status": "requires_credentials",
+            "metadata": merged_metadata,
+        }
+        if company_name is not None:
+            payload["company_name"] = company_name
         row = self._upsert_one(
             "mercury_connector_profiles",
-            {
-                "workspace_id": context["workspace"]["id"],
-                "connector_id": canonical_connector_id,
-                "environment": environment,
-                "display_name": display_name or connector.name,
-                "company_name": company_name,
-                "status": "requires_credentials",
-                "metadata": merged_metadata,
-            },
+            payload,
             on_conflict="workspace_id,connector_id,environment",
         )
         self.record_event(

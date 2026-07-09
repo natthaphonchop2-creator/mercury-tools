@@ -6,6 +6,7 @@ from mercury_tools.connectors.setup import (
     CONNECTOR_SETUP_STATES,
     next_setup_state,
     required_missing_fields,
+    resolve_setup_state,
 )
 from mercury_tools.db.product import SupabaseProductStore
 
@@ -47,6 +48,81 @@ def test_next_setup_state_does_not_skip_credentials() -> None:
     assert next_setup_state(has_environment=True, missing_fields=[]) == "credentials_received"
 
 
+def test_resolve_setup_state_covers_declared_states() -> None:
+    assert (
+        resolve_setup_state(
+            has_program=False,
+            has_environment=False,
+            missing_fields=["client_id"],
+        )
+        == "not_started"
+    )
+    assert (
+        resolve_setup_state(
+            has_program=True,
+            has_environment=False,
+            missing_fields=["client_id"],
+        )
+        == "program_selected"
+    )
+    assert (
+        resolve_setup_state(
+            has_program=True,
+            has_environment=True,
+            missing_fields=[],
+        )
+        == "environment_selected"
+    )
+    assert (
+        resolve_setup_state(
+            has_program=True,
+            has_environment=True,
+            missing_fields=["client_id"],
+        )
+        == "awaiting_credentials"
+    )
+    assert (
+        resolve_setup_state(
+            has_program=True,
+            has_environment=True,
+            missing_fields=[],
+            credentials_received=True,
+        )
+        == "credentials_received"
+    )
+    assert (
+        resolve_setup_state(
+            has_program=True,
+            has_environment=True,
+            missing_fields=[],
+            credentials_received=True,
+            validation_status="failed",
+        )
+        == "validation_failed"
+    )
+    assert (
+        resolve_setup_state(
+            has_program=True,
+            has_environment=True,
+            missing_fields=[],
+            credentials_received=True,
+            validation_status="valid",
+        )
+        == "connected_read_only"
+    )
+    assert (
+        resolve_setup_state(
+            has_program=True,
+            has_environment=True,
+            missing_fields=[],
+            credentials_received=True,
+            validation_status="valid",
+            read_only_capability_count=1,
+        )
+        == "ready"
+    )
+
+
 class StoreForSetup(SupabaseProductStore):
     def __init__(self):
         super().__init__(
@@ -58,6 +134,8 @@ class StoreForSetup(SupabaseProductStore):
             )
         )
         self.rows: list[dict] = []
+        self.profiles: dict[tuple[str, str, str], dict] = {}
+        self.profile_payloads: list[dict] = []
 
     def _request(self, method: str, path: str, **kwargs):
         if path == "mercury_client_tokens" and method == "GET":
@@ -97,12 +175,23 @@ class StoreForSetup(SupabaseProductStore):
                 }
             ]
         if path == "mercury_connector_profiles" and method == "POST":
+            payload = kwargs["json"][0]
+            self.profile_payloads.append(payload)
+            key = (
+                payload["workspace_id"],
+                payload["connector_id"],
+                payload["environment"],
+            )
+            existing = self.profiles.get(key)
             row = {
-                **kwargs["json"][0],
-                "id": "profile-1",
-                "created_at": "2026-07-09T00:00:00+00:00",
+                **(existing or {}),
+                **payload,
+                "id": (existing or {}).get("id") or "profile-1",
+                "created_at": (existing or {}).get("created_at")
+                or "2026-07-09T00:00:00+00:00",
                 "updated_at": "2026-07-09T00:00:00+00:00",
             }
+            self.profiles[key] = row
             self.rows.append(row)
             return [row]
         if path == "mercury_product_events" and method == "POST":
@@ -145,6 +234,33 @@ def test_start_connector_setup_stores_setup_metadata() -> None:
         "documents.invoice.get",
         "tax.vat_summary.read",
     ]
+
+
+def test_start_connector_setup_resume_without_company_name_preserves_label() -> None:
+    store = StoreForSetup()
+    token_payload = {
+        "sub": "owner@example.com",
+        "company": "Demo Co",
+        "host_app": "codex",
+        "iat": 0,
+        "exp": 99999,
+        "jti": "token-jti",
+    }
+    first_profile = store.start_connector_setup(
+        token_payload=token_payload,
+        connector_id="flowaccount",
+        environment="production",
+        company_name="Demo Co Books",
+    )
+    resumed_profile = store.start_connector_setup(
+        token_payload=token_payload,
+        connector_id="flowaccount",
+        environment="production",
+    )
+
+    assert first_profile["company_name"] == "Demo Co Books"
+    assert resumed_profile["company_name"] == "Demo Co Books"
+    assert "company_name" not in store.profile_payloads[-1]
 
 
 def test_start_connector_setup_rejects_unknown_connector() -> None:
