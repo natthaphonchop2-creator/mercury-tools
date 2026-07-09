@@ -56,6 +56,14 @@ Workspace quickstart:
 - mercury-tools flow list ./my-mercury-flows
 - mercury-tools flow run-suite ./my-mercury-flows --dry-run
 - mercury-tools flow push ./my-mercury-flows --dry-run
+
+Workspace config keys:
+- flows: glob patterns for YAML flow discovery.
+- includeTags / excludeTags: workspace-level flow selection gates.
+- env: variables available as ${name}.
+- executionOrder.flowsOrder: deterministic ordered flow names or filenames.
+- executionOrder.continueOnFailure: collect failures and continue when true.
+- testOutputDir: writes suite-report.json for the run.
 """
 
 

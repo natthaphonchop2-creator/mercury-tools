@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import httpx
@@ -111,7 +112,18 @@ def test_flow_cli_init_workspace_creates_runnable_suite(tmp_path: Path, capsys) 
     assert "2 discovered, 2 selected" in capsys.readouterr().out
 
     assert main(["flow", "run-suite", str(workspace), "--dry-run"]) == 0
-    assert "Flow suite planned: 2 selected / 2 discovered" in capsys.readouterr().out
+    suite_output = capsys.readouterr().out
+    assert "Flow suite planned: 2 selected / 2 discovered" in suite_output
+    assert "report:" in suite_output
+    report_path = workspace / ".mercury" / "reports" / "suite-report.json"
+    assert report_path.exists()
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "planned"
+    assert report["report_path"] == str(report_path)
+    assert report["workspace"]["execution_order"] == [
+        "flows/company-health.yaml",
+        "flows/vat-summary.yaml",
+    ]
 
 
 def test_flow_cli_init_workspace_refuses_overwrite(tmp_path: Path, capsys) -> None:
@@ -184,6 +196,111 @@ env:
     assert payload["status"] == "planned"
     assert payload["workspace"]["selected_count"] == 1
     assert payload["results"][0]["variables"]["env"]["month"] == "2026-07"
+
+
+def test_flow_workspace_respects_execution_order(tmp_path: Path) -> None:
+    flows = tmp_path / "flows"
+    flows.mkdir()
+    (tmp_path / "config.yaml").write_text(
+        """
+flows: flows/**/*.yaml
+includeTags: [accounting]
+env:
+  month: "2026-07"
+executionOrder:
+  flowsOrder:
+    - vat-summary
+    - company-health
+""",
+        encoding="utf-8",
+    )
+    (flows / "company-health.yaml").write_text(COMPANY_HEALTH_TEMPLATE, encoding="utf-8")
+    (flows / "vat-summary.yaml").write_text(
+        COMPANY_HEALTH_TEMPLATE.replace("name: Company Health Check", "name: VAT Summary"),
+        encoding="utf-8",
+    )
+
+    suite = run_workspace_flows(tmp_path, dry_run=True)
+    payload = suite.as_dict()
+
+    assert payload["workspace"]["execution_order"] == [
+        "flows/vat-summary.yaml",
+        "flows/company-health.yaml",
+    ]
+    assert [result["flow"]["name"] for result in payload["results"]] == [
+        "VAT Summary",
+        "Company Health Check",
+    ]
+
+
+def test_flow_workspace_continue_on_failure_records_error(tmp_path: Path) -> None:
+    flows = tmp_path / "flows"
+    flows.mkdir()
+    (tmp_path / "config.yaml").write_text(
+        """
+flows: flows/**/*.yaml
+includeTags: [accounting]
+executionOrder:
+  continueOnFailure: true
+  flowsOrder:
+    - bad
+    - good
+""",
+        encoding="utf-8",
+    )
+    (flows / "bad.yaml").write_text(
+        """
+name: Bad
+tags: [accounting]
+---
+- assert:
+    exists: false
+""",
+        encoding="utf-8",
+    )
+    (flows / "good.yaml").write_text(
+        """
+name: Good
+tags: [accounting]
+---
+- emitReport:
+    title: "Good report"
+""",
+        encoding="utf-8",
+    )
+
+    suite = run_workspace_flows(tmp_path, runner=MercuryFlowRunner())
+    payload = suite.as_dict()
+
+    assert payload["status"] == "failed"
+    assert [result["status"] for result in payload["results"]] == ["error", "ok"]
+
+
+def test_flow_workspace_continue_on_failure_false_raises(tmp_path: Path) -> None:
+    flows = tmp_path / "flows"
+    flows.mkdir()
+    (tmp_path / "config.yaml").write_text(
+        """
+flows: flows/**/*.yaml
+includeTags: [accounting]
+executionOrder:
+  continueOnFailure: false
+""",
+        encoding="utf-8",
+    )
+    (flows / "bad.yaml").write_text(
+        """
+name: Bad
+tags: [accounting]
+---
+- assert:
+    exists: false
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(FlowValidationError, match="assert exists failed"):
+        run_workspace_flows(tmp_path, runner=MercuryFlowRunner())
 
 
 def test_flow_cli_lists_and_runs_suite(tmp_path: Path, capsys) -> None:

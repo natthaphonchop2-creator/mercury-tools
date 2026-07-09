@@ -203,16 +203,21 @@ flows:
   - "flows/**/*.yaml"
 includeTags: [accounting]
 excludeTags: [disabled]
+testOutputDir: ".mercury/reports"
 env:
   jurisdiction: TH
   connector: flowaccount
-execution:
-  sequential: true
+  month: "2026-07"
+executionOrder:
+  continueOnFailure: true
+  flowsOrder:
+    - company-health
+    - vat-summary
 ```
 
 This mirrors Maestro's workspace model at the Mercury layer: config, folder
-architecture, tag-based discovery, and interpreted execution are separated from
-the host AI conversation.
+architecture, tag-based discovery, deterministic execution order, output
+reports, and interpreted execution are separated from the host AI conversation.
 
 `flow init-workspace` creates a runnable starter workspace with:
 
@@ -220,6 +225,10 @@ the host AI conversation.
 - `flows/company-health.yaml`
 - `flows/vat-summary.yaml`
 - `README.md`
+
+When `testOutputDir` is set, `flow run-suite` writes
+`suite-report.json` with the selected flow order, step summaries, artifacts, and
+sanitized variables.
 
 Flow MCP tools:
 

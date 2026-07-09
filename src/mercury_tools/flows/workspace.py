@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date
+import json
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,9 @@ class FlowWorkspaceConfig:
     include_tags: set[str]
     exclude_tags: set[str]
     env: dict[str, Any]
+    output_dir: Path | None = None
+    flows_order: list[str] = field(default_factory=list)
+    continue_on_failure: bool = True
     sequential: bool = True
 
     def as_dict(self) -> dict[str, Any]:
@@ -61,6 +65,11 @@ class FlowWorkspaceConfig:
             "include_tags": sorted(self.include_tags),
             "exclude_tags": sorted(self.exclude_tags),
             "env": self.env,
+            "output_dir": str(self.output_dir) if self.output_dir else None,
+            "execution_order": {
+                "continue_on_failure": self.continue_on_failure,
+                "flows_order": self.flows_order,
+            },
             "sequential": self.sequential,
         }
 
@@ -101,11 +110,39 @@ class FlowWorkspace:
     def selected(self) -> list[FlowFileRecord]:
         return [record for record in self.records if record.selected]
 
+    @property
+    def ordered_selected(self) -> list[FlowFileRecord]:
+        selected = self.selected
+        if not self.config.flows_order:
+            return selected
+
+        ordered: list[FlowFileRecord] = []
+        used: set[Path] = set()
+        for key in self.config.flows_order:
+            match = next(
+                (
+                    record
+                    for record in selected
+                    if record.path not in used
+                    and _record_matches_order_key(record, self.config.root, key)
+                ),
+                None,
+            )
+            if match:
+                ordered.append(match)
+                used.add(match.path)
+        ordered.extend(record for record in selected if record.path not in used)
+        return ordered
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "config": self.config.as_dict(),
             "flow_count": len(self.records),
             "selected_count": len(self.selected),
+            "execution_order": [
+                record.as_dict(root=self.config.root)["relative_path"]
+                for record in self.ordered_selected
+            ],
             "flows": [record.as_dict(root=self.config.root) for record in self.records],
         }
 
@@ -114,10 +151,13 @@ class FlowWorkspace:
 class FlowSuiteRun:
     workspace: FlowWorkspace
     results: list[FlowRunResult]
+    report_path: Path | None = None
 
     def as_dict(self) -> dict[str, Any]:
         if not self.results:
             status = "empty"
+        elif any(result.status == "error" for result in self.results):
+            status = "failed"
         elif all(result.status == "planned" for result in self.results):
             status = "planned"
         else:
@@ -126,7 +166,73 @@ class FlowSuiteRun:
             "status": status,
             "workspace": self.workspace.as_dict(),
             "results": [result.as_dict() for result in self.results],
+            "report_path": str(self.report_path) if self.report_path else None,
         }
+
+
+def _record_matches_order_key(record: FlowFileRecord, root: Path, key: str) -> bool:
+    clean = key.strip()
+    try:
+        relative = record.path.relative_to(root).as_posix()
+    except ValueError:
+        relative = record.path.as_posix()
+    variants = {
+        relative,
+        Path(relative).with_suffix("").as_posix(),
+        record.path.name,
+        record.path.stem,
+    }
+    if record.name:
+        variants.add(record.name)
+    return clean in variants
+
+
+def _resolve_output_dir(root: Path, value: Any) -> Path | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise FlowValidationError("testOutputDir must be a string.")
+    raw = value.strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = root / path
+    return path.resolve()
+
+
+def _error_result(record: FlowFileRecord, *, dry_run: bool, message: str) -> FlowRunResult:
+    flow = parse_flow_path(record.path)
+    return FlowRunResult(
+        status="error",
+        flow=flow,
+        dry_run=dry_run,
+        steps=[],
+        variables={},
+        artifacts=[{"status": "error", "message": message}],
+    )
+
+
+def _write_suite_report(suite: FlowSuiteRun) -> FlowSuiteRun:
+    output_dir = suite.workspace.config.output_dir
+    if not output_dir:
+        return suite
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / "suite-report.json"
+    payload = {
+        **suite.as_dict(),
+        "report_path": str(report_path),
+        "generated_at": datetime.now(UTC).isoformat(),
+    }
+    report_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return FlowSuiteRun(
+        workspace=suite.workspace,
+        results=suite.results,
+        report_path=report_path,
+    )
 
 
 def _render_starter_flow(template: str, *, connector: str, jurisdiction: str) -> str:
@@ -143,12 +249,16 @@ def _starter_workspace_files(*, connector: str, jurisdiction: str, month: str) -
   - "flows/**/*.yaml"
 includeTags: [accounting]
 excludeTags: [disabled]
+testOutputDir: ".mercury/reports"
 env:
   jurisdiction: {jurisdiction}
   connector: {connector}
   month: "{month}"
-execution:
-  sequential: true
+executionOrder:
+  continueOnFailure: true
+  flowsOrder:
+    - company-health
+    - vat-summary
 """,
         "flows/company-health.yaml": _render_starter_flow(
             COMPANY_HEALTH_TEMPLATE,
@@ -182,6 +292,7 @@ mercury-tools flow push . --dry-run
 - discovery: `flows/**/*.yaml`
 - include tags: `accounting`
 - exclude tags: `disabled`
+- reports: `.mercury/reports/suite-report.json`
 """,
     }
 
@@ -250,6 +361,7 @@ def load_workspace_config(path: Path) -> FlowWorkspaceConfig:
         raw = {str(key): value for key, value in loaded.items()}
 
     execution = _as_mapping(raw.get("execution"), label="execution")
+    execution_order = _as_mapping(raw.get("executionOrder"), label="executionOrder")
     flows = _as_string_list(raw.get("flows"), label="flows") or list(DEFAULT_FLOW_PATTERNS)
     return FlowWorkspaceConfig(
         root=root,
@@ -258,6 +370,12 @@ def load_workspace_config(path: Path) -> FlowWorkspaceConfig:
         include_tags=set(_as_string_list(raw.get("includeTags"), label="includeTags")),
         exclude_tags=set(_as_string_list(raw.get("excludeTags"), label="excludeTags")),
         env=_as_mapping(raw.get("env"), label="env"),
+        output_dir=_resolve_output_dir(root, raw.get("testOutputDir") or raw.get("outputDir")),
+        flows_order=_as_string_list(
+            execution_order.get("flowsOrder"),
+            label="executionOrder.flowsOrder",
+        ),
+        continue_on_failure=bool(execution_order.get("continueOnFailure", True)),
         sequential=bool(execution.get("sequential", True)),
     )
 
@@ -286,6 +404,9 @@ def discover_workspace_flows(
             include_tags=config.include_tags.union(include_tags or []),
             exclude_tags=config.exclude_tags.union(exclude_tags or []),
             env=config.env,
+            output_dir=config.output_dir,
+            flows_order=config.flows_order,
+            continue_on_failure=config.continue_on_failure,
             sequential=config.sequential,
         )
 
@@ -350,8 +471,12 @@ def run_workspace_flows(
         raise FlowValidationError(f"Invalid workspace flow {first.path}: {first.error}")
 
     flow_runner = runner or create_default_runner(dry_run=dry_run)
-    results = [
-        flow_runner.run_path(record.path, env=workspace.config.env)
-        for record in workspace.selected
-    ]
-    return FlowSuiteRun(workspace=workspace, results=results)
+    results: list[FlowRunResult] = []
+    for record in workspace.ordered_selected:
+        try:
+            results.append(flow_runner.run_path(record.path, env=workspace.config.env))
+        except (FlowValidationError, RuntimeError, ValueError) as exc:
+            if not workspace.config.continue_on_failure:
+                raise
+            results.append(_error_result(record, dry_run=dry_run, message=str(exc)))
+    return _write_suite_report(FlowSuiteRun(workspace=workspace, results=results))

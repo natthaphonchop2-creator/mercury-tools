@@ -266,6 +266,8 @@ def cmd_flow_run_suite(args: argparse.Namespace) -> int:
         )
         for result in payload["results"]:
             print(f"- {result['flow']['name']}: {result['status']} ({len(result['steps'])} steps)")
+        if payload.get("report_path"):
+            print(f"report: {payload['report_path']}")
     return 0
 
 
