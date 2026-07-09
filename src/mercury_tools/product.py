@@ -129,7 +129,7 @@ def build_connection_payload(
 ) -> dict[str, Any]:
     endpoint = f"{public_base_url.rstrip('/')}{mcp_path}"
     server_name = "mercury-tools"
-    env_name = "MERCURY_MCP_TOKEN"
+    env_name = "MERCURY_TOOLS_MCP_TOKEN"
     codex_command = (
         f"export {env_name}='{token}'\n"
         f"codex mcp add {server_name} --url {endpoint} --bearer-token-env-var {env_name}"
@@ -158,7 +158,7 @@ def build_connection_payload(
         },
         "cursor": {
             "config": remote_config,
-            "note": "Add this MCP server in Cursor settings and set MERCURY_MCP_TOKEN locally.",
+            "note": f"Add this MCP server in Cursor settings and set {env_name} locally.",
         },
         "claude": {
             "config": remote_config,

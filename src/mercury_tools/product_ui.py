@@ -1039,13 +1039,13 @@ SCRIPT = """
     function renderInstallFromToken(token) {
       if (!state.endpoint) return;
       $('#install-panel').classList.remove('hidden');
-      $('#codex-command').textContent = "export MERCURY_MCP_TOKEN='" + token + "'\\n" +
-        'codex mcp add mercury-tools --url ' + state.endpoint + ' --bearer-token-env-var MERCURY_MCP_TOKEN';
+      $('#codex-command').textContent = "export MERCURY_TOOLS_MCP_TOKEN='" + token + "'\\n" +
+        'codex mcp add mercury-tools --url ' + state.endpoint + ' --bearer-token-env-var MERCURY_TOOLS_MCP_TOKEN';
       $('#mcp-config').textContent = JSON.stringify({
         mcpServers: {
           'mercury-tools': {
             url: state.endpoint,
-            headers: { Authorization: 'Bearer ${MERCURY_MCP_TOKEN}' }
+            headers: { Authorization: 'Bearer ${MERCURY_TOOLS_MCP_TOKEN}' }
           }
         }
       }, null, 2);

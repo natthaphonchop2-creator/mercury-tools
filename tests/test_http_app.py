@@ -206,6 +206,9 @@ def test_connect_api_issues_client_token_for_mcp(monkeypatch) -> None:
     payload = response.json()
     assert payload["token"].startswith("mc_")
     assert "codex mcp add mercury-tools" in payload["codex"]["command"]
+    assert payload["codex"]["env_var"] == "MERCURY_TOOLS_MCP_TOKEN"
+    assert "--bearer-token-env-var MERCURY_TOOLS_MCP_TOKEN" in payload["codex"]["command"]
+    assert "MERCURY_TOOLS_MCP_TOKEN" in payload["cursor"]["note"]
     assert payload["endpoint"] == "https://mercury.example.com/mcp"
     assert payload["persistence"]["status"] == "degraded"
 
