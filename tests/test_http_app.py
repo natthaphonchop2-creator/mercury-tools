@@ -69,10 +69,14 @@ def test_connect_page_and_status(monkeypatch) -> None:
 
     assert page.status_code == 200
     assert "Mercury Connect" in page.text
+    assert "MCP setup console for accounting AI hosts" in page.text
+    assert "The AI host remains the product surface." in page.text
     assert 'data-page="connect"' in page.text
     assert status.status_code == 200
     assert status.json()["mcp_endpoint"] == "https://mercury.example.com/mcp"
     assert status.json()["invite_required"] is True
+    assert status.json()["console"]["purpose"] == "setup-console"
+    assert status.json()["console"]["product_surface"] == "mcp-host"
     assert status.json()["pages"]["connectors"] == "/connectors"
     assert status.json()["pages"]["knowledge"] == "/knowledge"
     assert status.json()["pages"]["flows"] == "/flows"

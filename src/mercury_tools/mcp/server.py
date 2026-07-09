@@ -489,6 +489,11 @@ async def status(_: Request) -> Response:
             "mcp_path": settings.mcp_path,
             "mcp_endpoint": settings.mcp_endpoint,
             "health": "/healthz",
+            "console": {
+                "purpose": "setup-console",
+                "product_surface": "mcp-host",
+                "note": "Pages configure Mercury tools and context; Codex, Cursor, Claude, or another host owns chat.",
+            },
             "pages": {
                 "connect": "/connect",
                 "workspace": "/workspace",

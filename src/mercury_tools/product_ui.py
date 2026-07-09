@@ -9,10 +9,10 @@ from html import escape
 PAGE_NAMES = ("connect", "workspace", "connectors", "knowledge", "skills", "flows", "audit")
 
 NAV_ITEMS = (
-    ("connect", "MCP Connect", "Host access"),
+    ("connect", "Connect", "MCP host access"),
     ("workspace", "Workspace", "Company context"),
-    ("connectors", "Connectors", "Accounting systems"),
-    ("knowledge", "Knowledge", "RAG wiki"),
+    ("connectors", "Programs", "Accounting systems"),
+    ("knowledge", "Wiki", "RAG context"),
     ("skills", "Skills", "Agent playbooks"),
     ("flows", "Flows", "Runbooks"),
     ("audit", "Audit", "Evidence trail"),
@@ -478,7 +478,7 @@ PAGE_CONTENT: dict[str, str] = {
                 <div class="card"><b>Scope</b><span>one company context per client token</span></div>
                 <div class="card"><b>Runtime</b><span>host AI calls Mercury tools through MCP</span></div>
                 <div class="card"><b>Storage</b><span>Supabase product state and audit metadata</span></div>
-                <div class="card"><b>Secrets</b><span>never returned in dashboard or MCP output</span></div>
+                <div class="card"><b>Secrets</b><span>never returned in console pages or MCP output</span></div>
               </div>
             </section>
           </div>
@@ -506,8 +506,8 @@ PAGE_CONTENT: dict[str, str] = {
       <section class="page" data-page="connectors">
         <div class="page-head">
           <span class="eyebrow">Connector Setup</span>
-          <h1>Connect the accounting program Mercury may reference.</h1>
-          <p>This page stores the selected accounting program, environment, company label, and encrypted credential metadata. Connector tools remain permissioned through the AI host.</p>
+          <h1>Choose the accounting program Mercury tools may use.</h1>
+          <p>This page stores only the program profile, environment, company label, and encrypted credential metadata. The AI host calls connector tools through Mercury MCP.</p>
         </div>
         <div class="page-grid">
           <section class="panel">
@@ -562,7 +562,7 @@ PAGE_CONTENT: dict[str, str] = {
       <section class="page" data-page="knowledge">
         <div class="page-head">
           <span class="eyebrow">Knowledge</span>
-          <h1>Maintain the cited accounting wiki behind Mercury tools.</h1>
+          <h1>Maintain the cited accounting wiki behind Mercury MCP.</h1>
           <p>Knowledge is not a chat page. It is the RAG source layer that MCP tools use to return context packs, citations, and prompt-ready evidence to the host AI.</p>
         </div>
         <div class="page-grid">
@@ -1107,7 +1107,7 @@ def _nav(active_page: str) -> str:
 
 
 def render_connect_html(active_page: str = "connect") -> str:
-    """Render one focused Mercury Console page."""
+    """Render one focused Mercury setup-console page."""
     page = active_page if active_page in PAGE_NAMES else "connect"
     title = "Mercury Connect" if page == "connect" else f"Mercury {page.title()}"
     body = PAGE_CONTENT[page]
@@ -1126,7 +1126,7 @@ def render_connect_html(active_page: str = "connect") -> str:
       <header>
         <div class="brand">
           <div class="mark">Mx</div>
-          <div><b>Mercury Connect</b><span>Remote MCP control plane for accounting AI hosts</span></div>
+          <div><b>Mercury Connect</b><span>MCP setup console for accounting AI hosts</span></div>
         </div>
         <div class="status">
           <span id="status-supabase">Supabase</span>
@@ -1136,15 +1136,15 @@ def render_connect_html(active_page: str = "connect") -> str:
         </div>
       </header>
 
-      <aside class="rail" aria-label="Mercury console navigation">
+      <aside class="rail" aria-label="Mercury setup-console navigation">
         <div class="rail-head">
-          <b>Operator Console</b>
-          <span>Configure tools. The AI host remains the chat surface.</span>
+          <b>Setup Console</b>
+          <span>Separate setup pages. The AI host remains the product surface.</span>
         </div>
         <nav class="nav-list">
           {_nav(page)}
         </nav>
-        <p class="rail-note">Mercury is MCP-first: setup, context, tools, and audit are separated by workspace.</p>
+        <p class="rail-note">Mercury is MCP-first. This console only manages setup, context, tools, flows, and audit boundaries.</p>
       </aside>
 
       <div class="content">

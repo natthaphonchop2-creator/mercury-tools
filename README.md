@@ -113,8 +113,9 @@ Mercury Connect issues per-user signed MCP tokens from an invite code and
 generates copy-ready MCP config for Codex, Cursor, Claude, or generic MCP hosts.
 Users should not use the server bearer token file directly.
 
-The browser console is split into focused control-plane pages instead of one
-large dashboard:
+The browser setup console is split into focused pages instead of one large
+dashboard. It is not the main Mercury chat surface; Codex, Cursor, Claude, or
+another MCP host remains the user-facing AI:
 
 - `/connect` creates or restores a host MCP connection
 - `/workspace` shows workspace identity and team access
