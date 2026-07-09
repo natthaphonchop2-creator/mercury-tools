@@ -747,7 +747,11 @@ class MercuryFlowRunner:
         return {"status": "ok", "assertions": assertions}
 
 
-def create_default_runner(*, dry_run: bool = False) -> MercuryFlowRunner:
+def create_default_runner(
+    *,
+    dry_run: bool = False,
+    connector_status_getter: Callable[[], dict[str, Any]] | None = None,
+) -> MercuryFlowRunner:
     settings = load_settings()
 
     def rag_service_factory():
@@ -765,7 +769,7 @@ def create_default_runner(*, dry_run: bool = False) -> MercuryFlowRunner:
 
         return SupabaseRagStore(settings).get_document(document_id)
 
-    def connector_status_getter():
+    def local_connector_status_getter():
         from mercury_tools.mercury_runtime import connector_status
 
         return connector_status()
@@ -790,6 +794,6 @@ def create_default_runner(*, dry_run: bool = False) -> MercuryFlowRunner:
         dry_run=dry_run,
         rag_service_factory=rag_service_factory,
         document_getter=document_getter,
-        connector_status_getter=connector_status_getter,
+        connector_status_getter=connector_status_getter or local_connector_status_getter,
         skill_runner=skill_runner,
     )

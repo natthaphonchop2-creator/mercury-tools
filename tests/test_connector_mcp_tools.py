@@ -1244,6 +1244,62 @@ env:
     assert "connector credential setup" in payload["message"]
 
 
+def test_run_workspace_flow_connector_status_uses_public_workspace_state(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from mercury_tools.mcp import server
+
+    workspace_id = make_workspace_id()
+    flow = {
+        "flow_id": "workspace-public-status",
+        "title": "Public Connector Status",
+        "yaml": """name: Public Connector Status
+tags: [accounting, flowaccount]
+env:
+  connector: flowaccount
+  environment: production
+  required_capabilities: [company.info.read]
+---
+- connectorStatus:
+    saveAs: connectorState
+""",
+    }
+
+    class FakeStore:
+        def public_dashboard(self, requested_workspace_id):
+            assert requested_workspace_id == workspace_id
+            return {
+                "status": "ok",
+                "workspace": {"name": "Public Demo Co"},
+                "flows": [flow],
+                "connector_profiles": [ready_connector_profile()],
+            }
+
+        def get_flow(self, *, token_payload, flow_id):
+            return flow if flow_id == flow["flow_id"] else None
+
+    configure_product_env(monkeypatch)
+    monkeypatch.setenv("MERCURY_HOME", str(tmp_path))
+    (tmp_path / "config.json").write_text(
+        '{"selected_connector":"local-only","environment":"production"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server, "_product_store", lambda settings=None: FakeStore())
+
+    payload = server.run_workspace_flow_tool(
+        workspace_id=workspace_id,
+        flow_id=flow["flow_id"],
+        dry_run=False,
+    )
+
+    connector_state = payload["variables"]["connectorState"]
+    assert connector_state["status"] == "ok"
+    assert connector_state["active_connector"]["connector_id"] == "flowaccount"
+    assert "home" not in connector_state
+    assert str(tmp_path) not in str(payload)
+
+
 def test_run_workspace_flow_blocks_selected_connector_mismatch(monkeypatch) -> None:
     from mercury_tools.mcp import server
 
@@ -1349,6 +1405,7 @@ def test_http_workspace_flow_run_requires_ready_connector(monkeypatch) -> None:
             raise AssertionError("blocked HTTP connector setup should not load the flow")
 
     configure_product_env(monkeypatch)
+    monkeypatch.setenv("MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API", "true")
     monkeypatch.setattr(server, "_product_store", lambda settings=None: FakeStore())
 
     client = TestClient(server.create_http_app(require_auth=True), raise_server_exceptions=False)

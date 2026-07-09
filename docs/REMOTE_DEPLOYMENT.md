@@ -42,6 +42,7 @@ MERCURY_CREDENTIAL_VAULT_SECRET
 MERCURY_TOOLS_PUBLIC_BASE_URL=https://mercury-tools-mcp.onrender.com
 MERCURY_TOOLS_EMBEDDING_PROVIDER=hash
 MERCURY_TOOLS_HTTP_REQUIRE_AUTH=false
+MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API=false
 ```
 
 The vault secret must be a long random server-only value. Do not place the
@@ -87,7 +88,8 @@ Expected health properties:
   "embedding_provider": "hash",
   "embedding_configured": true,
   "mcp_path": "/mcp",
-  "http_auth_required": false
+  "http_auth_required": false,
+  "legacy_http_api": "disabled"
 }
 ```
 

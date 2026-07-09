@@ -389,6 +389,7 @@ Required for live RAG:
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `MERCURY_TOOLS_EMBEDDING_PROVIDER=hash` for the Codex/host-AI demo mode
 - `MERCURY_TOOLS_HTTP_REQUIRE_AUTH=false` for the public contest MCP endpoint
+- `MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API=false` so only MCP, health, and status routes are exposed
 - `MERCURY_CREDENTIAL_VAULT_SECRET` for encrypted connector credential records
 
 `OPENAI_API_KEY` is optional and only needed when

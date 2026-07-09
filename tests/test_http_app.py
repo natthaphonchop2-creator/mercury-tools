@@ -13,10 +13,12 @@ def _clear_live_env(monkeypatch) -> None:
         "OPENAI_API_KEY",
         "MERCURY_TOOLS_PUBLIC_BASE_URL",
         "MERCURY_TOOLS_HTTP_BEARER_TOKEN",
+        "MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API",
         "MERCURY_CONNECT_INVITE_CODE",
         "MERCURY_CONNECT_SIGNING_SECRET",
     ):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API", "true")
 
 
 def ready_connector_profile(connector_id: str = "flowaccount") -> dict:
@@ -48,6 +50,24 @@ def test_remote_http_app_exposes_healthz(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
     assert response.json()["mcp_path"] == "/mcp"
+
+
+def test_public_contest_app_does_not_mount_legacy_http_api(monkeypatch) -> None:
+    monkeypatch.setenv("MERCURY_TOOLS_MCP_PATH", "/mcp")
+    monkeypatch.delenv("MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API", raising=False)
+
+    client = TestClient(create_http_app(require_auth=False), raise_server_exceptions=False)
+
+    assert client.get("/start").status_code == 404
+    assert client.post("/api/connect", json={}).status_code == 404
+    assert client.get("/api/dashboard").status_code == 404
+    assert client.post("/api/team/invite", json={}).status_code == 404
+    assert client.post("/api/skills/upload", json={}).status_code == 404
+    assert client.post("/api/flows/run", json={}).status_code == 404
+    status = client.get("/api/status").json()
+    assert status["legacy_http_api"] == "disabled"
+    assert "dashboard" not in status
+    assert "skill_upload" not in status
 
 
 def test_remote_http_app_allows_public_base_url_host(monkeypatch) -> None:

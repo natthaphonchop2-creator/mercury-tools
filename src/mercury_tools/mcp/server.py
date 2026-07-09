@@ -1476,7 +1476,10 @@ def run_flow(
                 payload,
             )
             return payload
-        result = create_default_runner(dry_run=dry_run).run_flow(
+        result = create_default_runner(
+            dry_run=dry_run,
+            connector_status_getter=lambda: connector_status(workspace_id),
+        ).run_flow(
             parsed_flow,
             env=env_overrides,
         )
@@ -1545,7 +1548,10 @@ def run_flow_files(
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(item["flow_yaml"], encoding="utf-8")
 
-            runner = create_default_runner(dry_run=dry_run)
+            runner = create_default_runner(
+                dry_run=dry_run,
+                connector_status_getter=lambda: connector_status(workspace_id),
+            )
             if config_yaml:
                 workspace = discover_workspace_flows(
                     root,
@@ -1898,7 +1904,10 @@ def run_workspace_flow_tool(
         flow = store.get_flow(token_payload=token_payload, flow_id=flow_id)
         if not flow:
             return {"status": "not_found", "message": f"Workspace flow not found: {flow_id}"}
-        result = create_default_runner(dry_run=dry_run).run_text(
+        result = create_default_runner(
+            dry_run=dry_run,
+            connector_status_getter=lambda: connector_status(workspace_id),
+        ).run_text(
             str(flow.get("yaml") or ""),
             env=env_overrides,
         )
@@ -2120,47 +2129,54 @@ async def root(request: Request) -> Response:
 
 async def status(_: Request) -> Response:
     settings = load_settings()
-    return JSONResponse(
-        {
-            "name": "Mercury Tools MCP",
-            "status": "ok",
-            "supabase": settings.supabase_configured,
-            "openai": settings.openai_configured,
-            "embedding_provider": settings.embedding_provider,
-            "embedding_configured": settings.embedding_configured,
-            "transport": "streamable-http",
-            "mcp_path": settings.mcp_path,
-            "mcp_endpoint": settings.mcp_endpoint,
-            "health": "/healthz",
-            "surface": "mcp-plugin-first",
-            "browser_ui": "disabled",
-            "note": "Mercury is not a web app. Host AI clients call the MCP endpoint.",
-            "connect": "/api/connect",
-            "dashboard": "/api/dashboard",
-            "connector_setup": "/api/connectors/setup",
-            "connector_credentials": "/api/connectors/credentials",
-            "team_invite": "/api/team/invite",
-            "skill_enable": "/api/skills/enable",
-            "skill_upload": "/api/skills/upload",
-            "flow_validate": "/api/flows/validate",
-            "flow_save": "/api/flows/save",
-            "flow_import": "/api/flows/import",
-            "flow_run": "/api/flows/run",
-            "flow_tools": [
-                "flow_cheat_sheet",
-                "check_flow_syntax",
-                "inspect_flow_files",
-                "run_mercury_flow",
-                "run_flow",
-                "run_flow_files",
-                "save_workspace_flow",
-                "list_workspace_flows",
-                "run_workspace_flow",
-            ],
-            "http_auth_configured": settings.http_auth_configured,
-            "invite_required": bool(settings.connect_invite_code),
-        }
-    )
+    payload = {
+        "name": "Mercury Tools MCP",
+        "status": "ok",
+        "supabase": settings.supabase_configured,
+        "openai": settings.openai_configured,
+        "embedding_provider": settings.embedding_provider,
+        "embedding_configured": settings.embedding_configured,
+        "transport": "streamable-http",
+        "mcp_path": settings.mcp_path,
+        "mcp_endpoint": settings.mcp_endpoint,
+        "health": "/healthz",
+        "surface": "mcp-plugin-first",
+        "browser_ui": "disabled",
+        "legacy_http_api": (
+            "enabled" if settings.enable_legacy_http_api else "disabled"
+        ),
+        "note": "Mercury is not a web app. Host AI clients call the MCP endpoint.",
+        "flow_tools": [
+            "flow_cheat_sheet",
+            "check_flow_syntax",
+            "inspect_flow_files",
+            "run_mercury_flow",
+            "run_flow",
+            "run_flow_files",
+            "save_workspace_flow",
+            "list_workspace_flows",
+            "run_workspace_flow",
+        ],
+        "http_auth_configured": settings.http_auth_configured,
+    }
+    if settings.enable_legacy_http_api:
+        payload.update(
+            {
+                "connect": "/api/connect",
+                "dashboard": "/api/dashboard",
+                "connector_setup": "/api/connectors/setup",
+                "connector_credentials": "/api/connectors/credentials",
+                "team_invite": "/api/team/invite",
+                "skill_enable": "/api/skills/enable",
+                "skill_upload": "/api/skills/upload",
+                "flow_validate": "/api/flows/validate",
+                "flow_save": "/api/flows/save",
+                "flow_import": "/api/flows/import",
+                "flow_run": "/api/flows/run",
+                "invite_required": bool(settings.connect_invite_code),
+            }
+        )
+    return JSONResponse(payload)
 
 
 async def connect(request: Request) -> Response:
@@ -2614,6 +2630,9 @@ async def healthz(request: Request) -> Response:
             "mcp_path": settings.mcp_path,
             "http_auth_required": http_auth_required,
             "http_auth_configured": settings.http_auth_configured,
+            "legacy_http_api": (
+                "enabled" if settings.enable_legacy_http_api else "disabled"
+            ),
         }
     )
 
@@ -2630,32 +2649,37 @@ def create_http_app(*, require_auth: bool | None = None):
         if allowed_origin and allowed_origin not in mcp.settings.transport_security.allowed_origins:
             mcp.settings.transport_security.allowed_origins.append(allowed_origin)
     app = mcp.streamable_http_app()
-    for page_path in (
-        "/",
-        "/start",
-        "/connect",
-        "/workspace",
-        "/connectors",
-        "/knowledge",
-        "/skills",
-        "/flows",
-        "/mcp-api",
-        "/audit",
-    ):
-        app.add_route(page_path, root, methods=["GET"])
+    app.add_route("/", root, methods=["GET"])
     app.add_route("/api/status", status, methods=["GET"])
-    app.add_route("/api/connect", connect, methods=["POST"])
-    app.add_route("/api/dashboard", dashboard, methods=["GET"])
-    app.add_route("/api/connectors/setup", setup_connector, methods=["POST"])
-    app.add_route("/api/connectors/credentials", setup_connector_credentials, methods=["POST"])
-    app.add_route("/api/team/invite", invite_member, methods=["POST"])
-    app.add_route("/api/skills/enable", enable_skill, methods=["POST"])
-    app.add_route("/api/skills/upload", upload_skill, methods=["POST"])
-    app.add_route("/api/flows/validate", validate_workspace_flow, methods=["POST"])
-    app.add_route("/api/flows/save", save_workspace_flow, methods=["POST"])
-    app.add_route("/api/flows/import", import_workspace_flows, methods=["POST"])
-    app.add_route("/api/flows/run", run_workspace_flow, methods=["POST"])
     app.add_route("/healthz", healthz, methods=["GET"])
+    if settings.enable_legacy_http_api:
+        for page_path in (
+            "/start",
+            "/connect",
+            "/workspace",
+            "/connectors",
+            "/knowledge",
+            "/skills",
+            "/flows",
+            "/mcp-api",
+            "/audit",
+        ):
+            app.add_route(page_path, root, methods=["GET"])
+        app.add_route("/api/connect", connect, methods=["POST"])
+        app.add_route("/api/dashboard", dashboard, methods=["GET"])
+        app.add_route("/api/connectors/setup", setup_connector, methods=["POST"])
+        app.add_route(
+            "/api/connectors/credentials",
+            setup_connector_credentials,
+            methods=["POST"],
+        )
+        app.add_route("/api/team/invite", invite_member, methods=["POST"])
+        app.add_route("/api/skills/enable", enable_skill, methods=["POST"])
+        app.add_route("/api/skills/upload", upload_skill, methods=["POST"])
+        app.add_route("/api/flows/validate", validate_workspace_flow, methods=["POST"])
+        app.add_route("/api/flows/save", save_workspace_flow, methods=["POST"])
+        app.add_route("/api/flows/import", import_workspace_flows, methods=["POST"])
+        app.add_route("/api/flows/run", run_workspace_flow, methods=["POST"])
 
     should_require_auth = settings.http_require_auth if require_auth is None else require_auth
     app.state.mercury_http_require_auth = should_require_auth
