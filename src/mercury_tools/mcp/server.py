@@ -105,6 +105,35 @@ def _product_store(settings=None) -> SupabaseProductStore:
     return SupabaseProductStore(settings or load_settings())
 
 
+def _client_token_payload_from_value(client_token: str) -> dict[str, Any]:
+    token = client_token.strip()
+    if not token.startswith("mc_"):
+        raise PermissionError("Mercury client token must start with mc_.")
+    return verify_client_token(load_settings(), token)
+
+
+def _public_flow_summary(flow: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in flow.items()
+        if key
+        in {
+            "flow_id",
+            "title",
+            "name",
+            "description",
+            "tags",
+            "command_count",
+            "on_flow_start_count",
+            "on_flow_complete_count",
+            "sha256",
+            "status",
+            "metadata",
+            "updated_at",
+        }
+    }
+
+
 def _fallback_dashboard(token_payload: dict[str, Any], *, reason: str) -> dict[str, Any]:
     return {
         "status": "degraded",
@@ -267,6 +296,71 @@ def run_flow(flow_yaml: str, dry_run: bool = False) -> dict[str, Any]:
     except (FlowValidationError, RuntimeError, ValueError) as exc:
         payload = {"status": "error", "message": str(exc), "dry_run": dry_run}
         _audit("run_flow", {"flow_yaml_length": len(flow_yaml), "dry_run": dry_run}, payload)
+        return payload
+
+
+@mcp.tool()
+def list_workspace_flows(client_token: str) -> dict[str, Any]:
+    """List saved Mercury workspace flows for a connected host token."""
+    try:
+        settings = load_settings()
+        if not settings.supabase_configured:
+            raise RuntimeError("Supabase is required to list saved workspace flows.")
+        token_payload = _client_token_payload_from_value(client_token)
+        dashboard_payload = _product_store(settings).dashboard(token_payload)
+        flows = [_public_flow_summary(flow) for flow in dashboard_payload.get("flows", [])]
+        payload = redact_json(
+            {
+                "status": "ok",
+                "workspace": dashboard_payload.get("workspace") or {},
+                "flow_count": len(flows),
+                "flows": flows,
+            }
+        )
+        _audit("list_workspace_flows", {"client_token": client_token}, {"flow_count": len(flows)})
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit("list_workspace_flows", {"client_token": client_token}, payload)
+        return payload
+
+
+@mcp.tool(name="run_workspace_flow")
+def run_workspace_flow_tool(client_token: str, flow_id: str, dry_run: bool = True) -> dict[str, Any]:
+    """Run one saved Mercury workspace flow by id, or return a dry-run plan."""
+    try:
+        settings = load_settings()
+        if not settings.supabase_configured:
+            raise RuntimeError("Supabase is required to load saved workspace flows.")
+        token_payload = _client_token_payload_from_value(client_token)
+        flow = _product_store(settings).get_flow(token_payload=token_payload, flow_id=flow_id)
+        if not flow:
+            return {"status": "not_found", "message": f"Workspace flow not found: {flow_id}"}
+        result = create_default_runner(dry_run=dry_run).run_text(str(flow.get("yaml") or ""))
+        payload = redact_json(
+            {
+                **result.as_dict(),
+                "workspace_flow": _public_flow_summary(flow),
+            }
+        )
+        _audit(
+            "run_workspace_flow",
+            {"client_token": client_token, "flow_id": flow_id, "dry_run": dry_run},
+            {
+                "status": payload["status"],
+                "flow_id": flow_id,
+                "step_count": len(payload["steps"]),
+                "dry_run": dry_run,
+            },
+        )
+        return payload
+    except (PermissionError, FlowValidationError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc), "dry_run": dry_run}
+        _audit(
+            "run_workspace_flow",
+            {"client_token": client_token, "flow_id": flow_id, "dry_run": dry_run},
+            payload,
+        )
         return payload
 
 
@@ -656,7 +750,13 @@ async def status(_: Request) -> Response:
             "flow_validate": "/api/flows/validate",
             "flow_save": "/api/flows/save",
             "flow_run": "/api/flows/run",
-            "flow_tools": ["flow_cheat_sheet", "check_flow_syntax", "run_flow"],
+            "flow_tools": [
+                "flow_cheat_sheet",
+                "check_flow_syntax",
+                "run_flow",
+                "list_workspace_flows",
+                "run_workspace_flow",
+            ],
             "http_auth_configured": settings.http_auth_configured,
             "invite_required": bool(settings.connect_invite_code),
         }

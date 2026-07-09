@@ -6,7 +6,7 @@ import re
 from typing import Any
 
 TOKEN_RE = re.compile(
-    r"(?i)\b(?:bearer\s+)?(?:sk-[a-z0-9_-]{12,}|gho_[a-z0-9_]{12,}|eyj[a-z0-9_-]{20,})\b"
+    r"(?i)\b(?:bearer\s+)?(?:sk-[a-z0-9_-]{12,}|gho_[a-z0-9_]{12,}|eyj[a-z0-9_-]{20,}|mc_[a-z0-9_-]{20,}\.[a-z0-9_-]{20,})\b"
 )
 KEY_VALUE_RE = re.compile(
     r"(?i)\b(api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|password)\s*[:=]\s*([^\s,;]+)"
@@ -39,4 +39,3 @@ def redact_json(value: Any) -> Any:
                 redacted[key] = redact_json(item)
         return redacted
     return value
-

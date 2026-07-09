@@ -76,6 +76,8 @@ def test_connect_page_and_status(monkeypatch) -> None:
     assert status.json()["pages"]["connectors"] == "/connectors"
     assert status.json()["pages"]["flows"] == "/flows"
     assert "run_flow" in status.json()["flow_tools"]
+    assert "list_workspace_flows" in status.json()["flow_tools"]
+    assert "run_workspace_flow" in status.json()["flow_tools"]
     assert status.json()["dashboard"] == "/api/dashboard"
     assert status.json()["connector_credentials"] == "/api/connectors/credentials"
     assert status.json()["flow_validate"] == "/api/flows/validate"

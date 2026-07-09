@@ -72,7 +72,7 @@ def create_client_token(
         "iat": now,
         "exp": now + ttl_seconds,
         "jti": secrets.token_urlsafe(12),
-        "scope": ["mcp:read", "rag:read", "skills:read"],
+        "scope": ["mcp:read", "rag:read", "skills:read", "flows:read", "flows:run"],
     }
     body = _b64url_encode(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode())
     signature = _sign(body, settings.connect_signing_secret)

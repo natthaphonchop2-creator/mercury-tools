@@ -1,3 +1,4 @@
+from mercury_tools.product import ConnectRequest, create_client_token
 from mercury_tools.prompts import get_prompt
 from mercury_tools.rag.embeddings import HashEmbeddingProvider
 
@@ -33,3 +34,61 @@ def test_mcp_flow_tools_validate_and_dry_run() -> None:
     result = run_flow(COMPANY_HEALTH_TEMPLATE, dry_run=True)
     assert result["status"] == "planned"
     assert result["steps"][0]["command"] == "connectorStatus"
+
+
+def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:
+    from mercury_tools.config import Settings
+    from mercury_tools.flows.templates import COMPANY_HEALTH_TEMPLATE
+    from mercury_tools.mcp import server
+
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
+    monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
+
+    token = create_client_token(
+        Settings(
+            supabase_url="https://example.supabase.co",
+            supabase_service_role_key="service-role",
+            openai_api_key="",
+            connect_signing_secret="signing-secret",
+        ),
+        ConnectRequest(
+            email="owner@example.com",
+            company="Demo Co",
+            host_app="codex",
+            invite_code="invite",
+        ),
+        now=1783536613,
+    )
+
+    class FakeStore:
+        flow = {
+            "flow_id": "workspace-company-health-12345678",
+            "title": "Company Health Check",
+            "name": "Company Health Check",
+            "status": "draft",
+            "command_count": 3,
+            "tags": ["accounting"],
+            "yaml": COMPANY_HEALTH_TEMPLATE,
+        }
+
+        def dashboard(self, _token_payload):
+            return {
+                "workspace": {"name": "Demo Co", "workspace_key": "demo"},
+                "flows": [self.flow],
+            }
+
+        def get_flow(self, *, token_payload, flow_id):
+            return self.flow if flow_id == self.flow["flow_id"] else None
+
+    monkeypatch.setattr(server, "_product_store", lambda _settings=None: FakeStore())
+
+    listed = server.list_workspace_flows(token)
+    ran = server.run_workspace_flow_tool(token, "workspace-company-health-12345678", dry_run=True)
+
+    assert listed["status"] == "ok"
+    assert listed["flow_count"] == 1
+    assert "yaml" not in listed["flows"][0]
+    assert ran["status"] == "planned"
+    assert ran["workspace_flow"]["flow_id"] == "workspace-company-health-12345678"
+    assert ran["steps"][0]["command"] == "connectorStatus"
