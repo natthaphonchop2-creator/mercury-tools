@@ -70,6 +70,22 @@ def test_list_connectors_exposes_setup_targets_without_secrets() -> None:
     }
     assert "super-secret" not in str(payload)
     assert "client_secret_value" not in str(payload)
+    flowaccount = next(
+        item for item in payload["connectors"] if item["connector_id"] == "flowaccount"
+    )
+    assert flowaccount["required_secret_fields"] == ["client_id", "client_secret"]
+    assert flowaccount["preset"]["token_url"] == "https://openapi.flowaccount.com/token"
+
+
+def test_connector_capabilities_returns_public_policy() -> None:
+    from mercury_tools.mcp.server import connector_capabilities
+
+    payload = connector_capabilities("flowaccount")
+
+    assert payload["status"] == "ok"
+    assert payload["connector_id"] == "flowaccount"
+    assert "documents.invoice.list" in payload["capabilities"]
+    assert payload["public_policy"] == "read_only_validation"
 
 
 def test_start_connector_setup_requires_valid_connector(monkeypatch) -> None:

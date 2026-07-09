@@ -39,6 +39,26 @@ class ConnectorManifest:
         data["capabilities"] = list(self.capabilities)
         return data
 
+    def public_summary(self) -> dict[str, Any]:
+        return {
+            "connector_id": self.connector_id,
+            "name": self.name,
+            "status": self.status,
+            "environments": list(self.environments),
+            "required_secret_fields": list(self.required_secret_fields),
+            "preset": dict(self.preset),
+            "environment_presets": {
+                key: dict(value) for key, value in self.environment_presets.items()
+            },
+            "capabilities": list(self.capabilities),
+            "validation": {
+                "method": self.validation.method,
+                "token_url": self.validation.token_url,
+                "healthcheck_endpoint": self.validation.read_only_endpoint,
+                "safe_probe": self.validation.read_only,
+            },
+        }
+
 
 CONNECTOR_CATALOG: list[ConnectorManifest] = [
     ConnectorManifest(
@@ -198,3 +218,7 @@ def connector_by_id(connector_id: str) -> ConnectorManifest | None:
 
 def list_connector_summaries() -> list[dict[str, Any]]:
     return [item.summary() for item in CONNECTOR_CATALOG]
+
+
+def list_connector_public_summaries() -> list[dict[str, Any]]:
+    return [item.public_summary() for item in CONNECTOR_CATALOG]

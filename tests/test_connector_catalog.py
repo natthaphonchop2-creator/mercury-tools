@@ -72,3 +72,15 @@ def test_connector_summaries_do_not_include_secrets() -> None:
     assert "client_secret" in serialized
     assert "super-secret" not in serialized
     assert "bearer" not in serialized
+
+
+def test_flowaccount_public_summary_keeps_setup_field_names_and_urls() -> None:
+    manifest = connector_by_id("flowaccount")
+
+    assert manifest is not None
+    summary = manifest.public_summary()
+
+    assert summary["required_secret_fields"] == ["client_id", "client_secret"]
+    assert summary["preset"]["token_url"] == "https://openapi.flowaccount.com/token"
+    assert summary["validation"]["token_url"] == "https://openapi.flowaccount.com/token"
+    assert "credential_values" not in summary

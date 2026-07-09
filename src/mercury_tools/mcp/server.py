@@ -16,7 +16,10 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
 from mercury_tools.config import load_settings
-from mercury_tools.connectors.catalog import connector_by_id, list_connector_summaries
+from mercury_tools.connectors.catalog import (
+    connector_by_id,
+    list_connector_public_summaries,
+)
 from mercury_tools.connectors.setup import required_missing_fields, validate_connector_read_only
 from mercury_tools.db.product import (
     SupabaseProductStore,
@@ -904,8 +907,30 @@ def get_document(document_id: str) -> dict[str, Any]:
 @mcp.tool()
 def list_connectors() -> dict[str, Any]:
     """List Mercury accounting and ERP connector options without secrets."""
-    payload = redact_json({"status": "ok", "connectors": list_connector_summaries()})
+    payload = {"status": "ok", "connectors": list_connector_public_summaries()}
     _audit("list_connectors", {}, {"count": len(payload["connectors"])})
+    return payload
+
+
+@mcp.tool()
+def connector_capabilities(connector_id: str) -> dict[str, Any]:
+    """List declared capabilities for one Mercury connector."""
+    manifest = connector_by_id(connector_id)
+    if manifest is None:
+        payload = {"status": "not_found", "connector_id": connector_id}
+        _audit("connector_capabilities", {"connector_id": connector_id}, payload)
+        return payload
+    payload = {
+        "status": "ok",
+        "connector_id": manifest.connector_id,
+        "capabilities": list(manifest.capabilities),
+        "public_policy": "read_only_validation",
+    }
+    _audit(
+        "connector_capabilities",
+        {"connector_id": manifest.connector_id},
+        {"status": "ok", "capability_count": len(manifest.capabilities)},
+    )
     return payload
 
 
