@@ -13,6 +13,7 @@ import httpx
 from cryptography.fernet import Fernet
 
 from mercury_tools.config import Settings, require_supabase
+from mercury_tools.connectors.catalog import CONNECTOR_CATALOG, connector_by_id
 from mercury_tools.flows.parser import parse_flow_text
 from mercury_tools.product import ConnectRequest, normalize_host_app
 from mercury_tools.safety.redaction import redact_json
@@ -67,38 +68,6 @@ SKILL_CATALOG_SEED: list[dict[str, Any]] = [
         "version": "0.1.0",
         "required_connectors": [],
         "tags": ["setup", "connector", "thai"],
-    },
-]
-
-CONNECTOR_CATALOG: list[dict[str, Any]] = [
-    {
-        "connector_id": "flowaccount",
-        "name": "FlowAccount",
-        "status": "available",
-        "environments": ["production", "sandbox"],
-        "required_secret_fields": ["client_id", "client_secret"],
-        "preset": {
-            "grant_type": "client_credentials",
-            "scope": "flowaccount-api",
-            "api_base_url": "https://openapi.flowaccount.com/v1",
-            "token_url": "https://openapi.flowaccount.com/token",
-        },
-    },
-    {
-        "connector_id": "peak",
-        "name": "PEAK Accounting",
-        "status": "setup_target",
-        "environments": ["production", "sandbox"],
-        "required_secret_fields": ["client_id", "client_secret"],
-        "preset": {},
-    },
-    {
-        "connector_id": "express",
-        "name": "Express Account",
-        "status": "setup_target",
-        "environments": ["local", "gateway"],
-        "required_secret_fields": ["gateway_url", "api_key"],
-        "preset": {},
     },
 ]
 
@@ -218,13 +187,6 @@ def email_hash(email: str) -> str:
 def email_domain(email: str) -> str:
     parts = email.strip().lower().split("@", 1)
     return parts[1] if len(parts) == 2 else ""
-
-
-def connector_by_id(connector_id: str) -> dict[str, Any] | None:
-    return next(
-        (item for item in CONNECTOR_CATALOG if item["connector_id"] == connector_id),
-        None,
-    )
 
 
 def vault_key(settings: Settings, workspace_key_value: str) -> bytes:
@@ -488,7 +450,7 @@ class SupabaseProductStore:
             "status": "ok",
             "storage": "audit_fallback",
             **context,
-            "connectors": CONNECTOR_CATALOG,
+            "connectors": [connector.summary() for connector in CONNECTOR_CATALOG],
             "connector_profiles": list(connector_profiles.values()),
             "members": list(members.values()),
             "skills": sorted(skills.values(), key=lambda item: (item["category"], item["title"])),
@@ -695,13 +657,10 @@ class SupabaseProductStore:
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         context = self._fallback_workspace_for_token(token_payload)
-        connector = next(
-            (item for item in CONNECTOR_CATALOG if item["connector_id"] == connector_id),
-            None,
-        )
+        connector = connector_by_id(connector_id)
         if not connector:
             raise ValueError(f"Unknown connector: {connector_id}")
-        if environment not in connector["environments"]:
+        if environment not in connector.environments:
             raise ValueError(f"Unsupported environment for {connector_id}: {environment}")
         profile = {
             "id": stable_id(
@@ -713,12 +672,12 @@ class SupabaseProductStore:
             "workspace_id": context["workspace"]["id"],
             "connector_id": connector_id,
             "environment": environment,
-            "display_name": display_name or connector["name"],
+            "display_name": display_name or connector.name,
             "company_name": company_name,
             "status": "requires_credentials",
             "metadata": {
-                "required_secret_fields": connector["required_secret_fields"],
-                "preset": connector["preset"],
+                "required_secret_fields": connector.required_secret_fields,
+                "preset": connector.preset,
                 "credential_storage": "host_or_user_vault",
                 "storage": "audit_fallback",
                 **(metadata or {}),
@@ -753,9 +712,9 @@ class SupabaseProductStore:
         connector = connector_by_id(connector_id)
         if not connector:
             raise ValueError(f"Unknown connector: {connector_id}")
-        if environment not in connector["environments"]:
+        if environment not in connector.environments:
             raise ValueError(f"Unsupported environment for {connector_id}: {environment}")
-        required_fields = list(connector["required_secret_fields"])
+        required_fields = list(connector.required_secret_fields)
         missing = [
             field
             for field in required_fields
@@ -905,12 +864,12 @@ class SupabaseProductStore:
             "workspace_id": context["workspace"]["id"],
             "connector_id": connector_id,
             "environment": environment,
-            "display_name": connector["name"],
+            "display_name": connector.name,
             "company_name": context["workspace"]["name"],
             "status": "credentials_configured",
             "metadata": {
-                "required_secret_fields": connector["required_secret_fields"],
-                "preset": connector["preset"],
+                "required_secret_fields": connector.required_secret_fields,
+                "preset": connector.preset,
                 "credential_storage": "encrypted_server_vault",
                 "credential_fields": vault_record["fields"],
                 "credential_fingerprints": vault_record["fingerprints"],
@@ -1191,7 +1150,7 @@ class SupabaseProductStore:
                 "member": {"email": token_payload.get("sub")},
                 "skills": [],
                 "flows": [],
-                "connectors": CONNECTOR_CATALOG,
+                "connectors": [connector.summary() for connector in CONNECTOR_CATALOG],
                 "connector_profiles": [],
                 "events": [],
             }
@@ -1270,7 +1229,7 @@ class SupabaseProductStore:
         return {
             "status": "ok",
             **context,
-            "connectors": CONNECTOR_CATALOG,
+            "connectors": [connector.summary() for connector in CONNECTOR_CATALOG],
             "connector_profiles": connector_profiles or [],
             "members": members or [],
             "skills": [
@@ -1452,17 +1411,14 @@ class SupabaseProductStore:
         context = self.workspace_for_token(token_payload)
         if not context:
             raise ValueError("Workspace is not registered for this client token.")
-        connector = next(
-            (item for item in CONNECTOR_CATALOG if item["connector_id"] == connector_id),
-            None,
-        )
+        connector = connector_by_id(connector_id)
         if not connector:
             raise ValueError(f"Unknown connector: {connector_id}")
-        if environment not in connector["environments"]:
+        if environment not in connector.environments:
             raise ValueError(f"Unsupported environment for {connector_id}: {environment}")
         merged_metadata = {
-            "required_secret_fields": connector["required_secret_fields"],
-            "preset": connector["preset"],
+            "required_secret_fields": connector.required_secret_fields,
+            "preset": connector.preset,
             "credential_storage": "host_or_user_vault",
             **(metadata or {}),
         }
@@ -1472,7 +1428,7 @@ class SupabaseProductStore:
                 "workspace_id": context["workspace"]["id"],
                 "connector_id": connector_id,
                 "environment": environment,
-                "display_name": display_name or connector["name"],
+                "display_name": display_name or connector.name,
                 "company_name": company_name,
                 "status": "requires_credentials",
                 "metadata": merged_metadata,
