@@ -253,6 +253,24 @@ this deterministic for accounting workflows: `true`, `exists`, `notExists`,
 `equals`, and `notEquals` are supported, and multiple conditions are ANDed.
 Arbitrary JavaScript evaluation is intentionally not enabled in Mercury v1.
 
+Like Maestro's `repeat`, Mercury can run a small command group more than once.
+Use `times` for a fixed loop, or `while` with Mercury's deterministic conditions.
+When `while` is used without `times`, Mercury caps execution with
+`maxIterations` and defaults that cap to `10`. Each iteration exposes
+`${repeat.index}`, `${repeat.iteration}`, and `${repeat.remaining}`.
+
+```yaml
+- repeat:
+    label: Monthly section draft
+    times: 3
+    commands:
+      - emitReport:
+          title: "Monthly section ${repeat.iteration}"
+          sections:
+            - "Prepare one repeated period handoff."
+    saveAs: monthlySections
+```
+
 Like Maestro's `runFlow`, Mercury can run a subflow file or an inline command
 list. Inline `commands` are useful for small conditional accounting handoffs;
 `label` names the grouped subflow in reports, and `env` inherits parent values
@@ -313,7 +331,8 @@ MCP host.
 
 Supported flow commands are read-oriented: `connectorStatus`, `searchKnowledge`,
 `retrieveContextPack`, `getDocument`, `runSkill`, `emitReport`, `assert`,
-`runFlow`, and `retry`. Production accounting writes remain out of scope for v1.
+`repeat`, `runFlow`, and `retry`. Production accounting writes remain out of
+scope for v1.
 
 ## Environment
 

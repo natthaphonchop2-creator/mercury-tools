@@ -53,6 +53,7 @@ Commands:
 - runSkill: package an accounting skill. Args: skillId, inputs, evidenceMode, saveAs.
 - emitReport: create a structured handoff artifact. Args: title, sections, metadata.
 - assert: fail the flow on missing required values. Args: exists or minCount.
+- repeat: repeat a small command group. Args: times, while, maxIterations, commands, saveAs.
 - runFlow: call another flow file relative to the current flow.
   Args: file/path, env, label, commands, saveAs.
 - retry: retry a small file or inline command group on failure.
@@ -68,6 +69,24 @@ Conditional execution:
 - Supported conditions: true, exists, notExists, equals, notEquals.
 - Multiple conditions are ANDed.
 - Mercury does not evaluate arbitrary JavaScript in v1.
+
+Repeat blocks:
+- repeat runs a small command group multiple times.
+- times sets the exact iteration count, up to 100.
+- while uses Mercury's deterministic conditions and is checked before each iteration.
+- If while is used without times, Mercury caps the loop with maxIterations, default 10.
+- Each iteration exposes ${repeat.index}, ${repeat.iteration}, and ${repeat.remaining}.
+
+Example:
+- repeat:
+    label: Monthly section draft
+    times: 3
+    commands:
+      - emitReport:
+          title: "Monthly section ${repeat.iteration}"
+          sections:
+            - "Use this slot for a repeated period or dataset handoff."
+    saveAs: monthlySections
 
 Inline subflows:
 - runFlow can call file: another-flow.yaml or commands: [...] inline.

@@ -224,6 +224,92 @@ name: Inline Execute
     assert payload["variables"]["nested"]["artifacts"][0]["title"] == "Inline done"
 
 
+def test_flow_runner_repeats_inline_commands_with_iteration_context() -> None:
+    result = MercuryFlowRunner(dry_run=True).run_text(
+        """
+name: Repeat Dry Run
+---
+- repeat:
+    label: Monthly review
+    times: 3
+    commands:
+      - emitReport:
+          title: "Iteration ${repeat.iteration}"
+          sections:
+            - "index ${repeat.index}"
+    saveAs: repeated
+"""
+    )
+
+    payload = result.as_dict()
+    repeated = payload["variables"]["repeated"]
+
+    assert payload["status"] == "planned"
+    assert payload["steps"][0]["command"] == "repeat"
+    assert payload["steps"][0]["output_summary"]["iterations"] == 3
+    assert repeated["iterations"] == 3
+    assert repeated["max_iterations"] == 3
+    assert repeated["iteration_history"][-1]["iteration"] == 3
+    assert repeated["results"][0]["artifacts"][0]["title"] == "Iteration 1"
+    assert repeated["results"][2]["artifacts"][0]["sections"] == ["index 2"]
+
+
+def test_flow_runner_repeat_while_condition_stops_iterations() -> None:
+    result = MercuryFlowRunner(dry_run=True).run_text(
+        """
+name: Repeat While
+---
+- repeat:
+    times: 5
+    while:
+      notEquals:
+        value: "${repeat.index}"
+        expected: 2
+    commands:
+      - emitReport:
+          title: "Loop ${repeat.iteration}"
+    saveAs: repeated
+"""
+    )
+
+    payload = result.as_dict()
+    repeated = payload["variables"]["repeated"]
+
+    assert repeated["iterations"] == 2
+    assert repeated["stopped_reason"] == "while condition evaluated false"
+    assert repeated["while"]["notEquals"]["value"] == "2"
+    assert [item["iteration"] for item in repeated["iteration_history"]] == [1, 2]
+
+
+def test_flow_runner_rejects_repeat_without_bound_or_condition() -> None:
+    with pytest.raises(FlowValidationError, match="repeat requires times or while"):
+        MercuryFlowRunner(dry_run=True).run_text(
+            """
+name: Bad Repeat
+---
+- repeat:
+    commands:
+      - emitReport:
+          title: "bad"
+"""
+        )
+
+
+def test_flow_runner_rejects_repeat_too_many_times() -> None:
+    with pytest.raises(FlowValidationError, match="repeat times must be between 0 and 100"):
+        MercuryFlowRunner(dry_run=True).run_text(
+            """
+name: Bad Repeat Count
+---
+- repeat:
+    times: 101
+    commands:
+      - emitReport:
+          title: "bad"
+"""
+        )
+
+
 def test_flow_runner_retries_inline_commands_until_success() -> None:
     calls = {"count": 0}
 

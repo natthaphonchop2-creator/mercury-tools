@@ -11,6 +11,7 @@ SUPPORTED_COMMANDS = {
     "connectorStatus",
     "emitReport",
     "getDocument",
+    "repeat",
     "retrieveContextPack",
     "retry",
     "runFlow",

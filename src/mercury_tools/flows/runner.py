@@ -47,10 +47,15 @@ def _interpolate(value: Any, variables: dict[str, Any]) -> Any:
     return value
 
 
-def _interpolate_run_flow_args(args: dict[str, Any], variables: dict[str, Any]) -> dict[str, Any]:
+def _interpolate_group_args(
+    args: dict[str, Any],
+    variables: dict[str, Any],
+    *,
+    preserve_while: bool = False,
+) -> dict[str, Any]:
     rendered: dict[str, Any] = {}
     for key, value in args.items():
-        if key == "commands":
+        if key == "commands" or (preserve_while and key == "while"):
             rendered[key] = value
         else:
             rendered[key] = _interpolate(value, variables)
@@ -95,6 +100,10 @@ def _summary(payload: Any) -> dict[str, Any]:
             summary["attempts"] = redacted["attempts"]
         if "max_retries" in redacted:
             summary["max_retries"] = redacted["max_retries"]
+        if "iterations" in redacted:
+            summary["iterations"] = redacted["iterations"]
+        if "max_iterations" in redacted:
+            summary["max_iterations"] = redacted["max_iterations"]
         return summary
     if isinstance(redacted, list):
         return {"count": len(redacted)}
@@ -241,11 +250,15 @@ class MercuryFlowRunner:
                     )
                 )
                 continue
-            if command.name in {"retry", "runFlow"}:
-                rendered_args = _interpolate_run_flow_args(command.args, variables)
+            if command.name in {"repeat", "retry", "runFlow"}:
+                rendered_args = _interpolate_group_args(
+                    command.args,
+                    variables,
+                    preserve_while=command.name == "repeat",
+                )
             else:
                 rendered_args = _interpolate(command.args, variables)
-            if self.dry_run and command.name not in {"retry", "runFlow"}:
+            if self.dry_run and command.name not in {"repeat", "retry", "runFlow"}:
                 output = self._planned_output(command, rendered_args)
             else:
                 output = self._execute(
@@ -370,6 +383,13 @@ class MercuryFlowRunner:
                 parent_env=parent_env,
             ).as_dict()
 
+        if command.name == "repeat":
+            return self._repeat(
+                args=args,
+                base_dir=base_dir,
+                parent_env=parent_env,
+            )
+
         if command.name == "retry":
             return self._retry(
                 args=args,
@@ -404,7 +424,7 @@ class MercuryFlowRunner:
                     f"{command_name} commands must include at least one command."
                 )
             label = str(args.get("label") or "Inline Flow").strip() or "Inline Flow"
-            suffix = "retry" if command_name == "retry" else "inline"
+            suffix = command_name if command_name in {"repeat", "retry"} else "inline"
             child_flow = MercuryFlow(
                 name=label,
                 description=f"Inline Mercury {command_name} flow",
@@ -420,6 +440,94 @@ class MercuryFlowRunner:
         if not child_path.exists():
             raise FlowValidationError(f"Nested flow does not exist: {raw_path}")
         return self.run_path(child_path, env=child_env)
+
+    def _repeat(
+        self,
+        *,
+        args: dict[str, Any],
+        base_dir: Path,
+        parent_env: dict[str, Any],
+    ) -> dict[str, Any]:
+        times_raw = args.get("times")
+        while_condition = args.get("while")
+        has_times = times_raw is not None and times_raw != ""
+        if not has_times and while_condition is None:
+            raise FlowValidationError("repeat requires times or while.")
+
+        inline_commands = args.get("commands")
+        raw_path = str(args.get("file") or args.get("path") or args.get("value") or "").strip()
+        if inline_commands is not None and raw_path:
+            raise FlowValidationError("repeat accepts either file/path or commands, not both.")
+        if inline_commands is None and not raw_path:
+            raise FlowValidationError("repeat requires file/path or commands.")
+        if inline_commands is not None:
+            commands = parse_inline_commands(inline_commands, source="repeat.commands")
+            if not commands:
+                raise FlowValidationError("repeat commands must include at least one command.")
+        elif not (base_dir / raw_path).resolve().exists():
+            raise FlowValidationError(f"Nested flow does not exist: {raw_path}")
+
+        if has_times:
+            max_iterations = _bounded_int(
+                times_raw,
+                label="repeat times",
+                default=1,
+                minimum=0,
+                maximum=100,
+            )
+        else:
+            max_iterations = _bounded_int(
+                args.get("maxIterations", args.get("max_iterations")),
+                label="repeat maxIterations",
+                default=10,
+                minimum=1,
+                maximum=100,
+            )
+
+        results: list[dict[str, Any]] = []
+        history: list[dict[str, Any]] = []
+        stopped_reason = "times exhausted" if has_times else "maxIterations exhausted"
+        rendered_while: Any = None
+
+        for index in range(max_iterations):
+            repeat_state = {
+                "index": index,
+                "iteration": index + 1,
+                "remaining": max_iterations - index,
+            }
+            repeat_env = {**parent_env, "repeat": repeat_state}
+            if while_condition is not None:
+                condition_variables = {"env": repeat_env, **repeat_env}
+                rendered_while = _interpolate(while_condition, condition_variables)
+                if not _condition_matches(rendered_while):
+                    stopped_reason = "while condition evaluated false"
+                    break
+
+            result = self._run_child_flow_command(
+                command_name="repeat",
+                args=args,
+                base_dir=base_dir,
+                parent_env=repeat_env,
+            )
+            result_payload = result.as_dict()
+            results.append(result_payload)
+            history.append(
+                {
+                    "iteration": index + 1,
+                    "index": index,
+                    "status": result.status,
+                }
+            )
+
+        return {
+            "status": "planned" if self.dry_run else "ok",
+            "iterations": len(results),
+            "max_iterations": max_iterations,
+            "stopped_reason": stopped_reason,
+            "while": redact_json(rendered_while) if rendered_while is not None else None,
+            "results": results,
+            "iteration_history": history,
+        }
 
     def _retry(
         self,
