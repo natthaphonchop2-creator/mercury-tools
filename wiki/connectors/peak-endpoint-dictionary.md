@@ -6,12 +6,9 @@ jurisdiction: TH
 connector: peak
 source_uri: mercury://wiki/connectors/peak-endpoint-dictionary
 source_url: https://developers.peakaccount.com/reference/peak-open-api
-source_path: /Users/natthaphon/Desktop/Peak/PEAK_API.postman_collection.json
+source_path: wiki/connectors/peak-endpoint-dictionary.md
 metadata:
-  local_docs:
-    - /Users/natthaphon/Desktop/Peak/PEAK_API Documentation.pdf
-    - /Users/natthaphon/Desktop/Peak/PEAK_API.postman_collection.json
-    - /Users/natthaphon/Desktop/Peak/PEAK_UAT_Environment.postman_environment.json
+  generated_from: supplied PEAK API documentation and sanitized Postman collection
   production_api_gateway: https://api.peakaccount.com/api/v1
   uat_api_gateway: https://peakengineapidev.azurewebsites.net/api/v1
   auth_method: hmac_sha1_client_token
@@ -26,6 +23,10 @@ metadata:
 > routing, field hints, and safety classes only. It must not store ConnectId,
 > ConnectKey, ApplicationCode, UserToken, ClientToken, API keys, tax IDs, emails,
 > bearer tokens, customer data, or accounting transaction payloads.
+
+> Public contest policy: Mercury may explain every endpoint below, but executes
+> only setup authentication probes and read capabilities. All accounting
+> mutations remain blocked before connector dispatch.
 
 # PEAK API Data Dictionary
 
@@ -54,9 +55,8 @@ When a user asks Mercury to work with PEAK:
 2. Identify the action: get/list, create, edit/update, approve, paidpayment,
    void/voidpayment, create from source document, attach, tag, or invite.
 3. Match the endpoint row below and require the matching capability in the flow.
-4. For POST actions, request missing business fields, show a preview, require
-   explicit approval, and audit connector id, endpoint capability, input hash,
-   and sanitized response summary.
+4. In public contest mode, classify POST mutations as blocked and return
+   `public_preview_read_only`. Their field hints remain documentation only.
 
 ## Intent Keywords
 
@@ -89,12 +89,12 @@ When a user asks Mercury to work with PEAK:
 | --- | --- |
 | `setup_auth` | Authentication/setup probe. Does not create accounting documents. |
 | `safe_read` | GET endpoint for lookup/list/preflight. |
-| `master_write` | POST creates or updates master data such as contacts/products/services/payment methods. |
-| `document_write` | POST creates or updates accounting documents. Requires preview and approval. |
-| `payment_write` | POST records payment or paidpayment. Requires stronger approval. |
-| `status_write` | POST changes status, approval, void, or voidpayment. Requires stronger approval. |
-| `journal_write` | POST creates journal entry. Requires accountant review. |
-| `utility_write` | POST creates tags, invitations, or supporting records. |
+| `master_write` | POST creates or updates master data; blocked in public contest mode. |
+| `document_write` | POST creates or updates accounting documents; blocked in public contest mode. |
+| `payment_write` | POST records payment or paidpayment; blocked in public contest mode. |
+| `status_write` | POST changes status, approval, void, or voidpayment; blocked in public contest mode. |
+| `journal_write` | POST creates journal entries; blocked in public contest mode. |
+| `utility_write` | POST creates tags, invitations, or supporting records; blocked in public contest mode. |
 
 ## Common Field Hints
 

@@ -7,7 +7,19 @@ def test_bundled_peak_skill_is_available_to_mcp_runtime() -> None:
     assert markdown is not None
     assert "PEAK Connector Setup TH" in markdown
     assert "ConnectId" in markdown
-    assert "GET/POST" in markdown
+    assert "read capabilities only" in markdown
+    assert "workspace_id" in markdown
+    assert "validate_connector_connection" in markdown
+
+
+def test_bundled_flowaccount_skill_is_available_to_mcp_runtime() -> None:
+    markdown = skill_markdown("flowaccount-connector-setup-th")
+
+    assert markdown is not None
+    assert "FlowAccount Connector Setup TH" in markdown
+    assert "client_id" in markdown
+    assert "client_secret" in markdown
+    assert "FlowAccount Endpoint Data Dictionary" in markdown
     assert "validate_connector_connection" in markdown
 
 

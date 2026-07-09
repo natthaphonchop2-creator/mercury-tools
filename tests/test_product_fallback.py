@@ -284,8 +284,8 @@ def test_product_store_audit_fallback_validation_preserves_private_vault_metadat
     dashboard_profile = store.dashboard(token_payload())["connector_profiles"][0]
     serialized_events = str(store.events)
 
-    assert ready_profile["status"] == "connected_read_only"
-    assert private_profile["status"] == "connected_read_only"
+    assert ready_profile["status"] == "connected"
+    assert private_profile["status"] == "connected"
     assert private_metadata["server_vault"]["ciphertext"] == server_vault["ciphertext"]
     assert private_metadata["credential_storage"] == "encrypted_server_vault"
     assert private_metadata["credential_fields"] == ["client_id", "client_secret"]
@@ -298,7 +298,7 @@ def test_product_store_audit_fallback_validation_preserves_private_vault_metadat
         == credential_metadata["credentials_configured_at"]
     )
     assert private_metadata["setup_state"] == "ready"
-    assert dashboard_profile["status"] == "connected_read_only"
+    assert dashboard_profile["status"] == "connected"
     assert "'server_vault':" not in str(ready_profile)
     assert "'server_vault':" not in str(dashboard_profile)
     assert server_vault["ciphertext"] not in str(ready_profile)

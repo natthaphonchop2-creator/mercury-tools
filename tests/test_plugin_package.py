@@ -6,51 +6,83 @@ ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = ROOT / "plugins/mercury-finance"
 
 EXPECTED_SKILLS = {
+    "flowaccount-connector-setup-th": [
+        "create_public_workspace",
+        "connector_status",
+        "list_connectors",
+        "start_connector_setup",
+        "submit_connector_credentials",
+        "validate_connector_connection",
+        "retrieve_workspace_context_pack",
+        "search_knowledge",
+    ],
     "connector-credential-setup-th": [
+        "create_public_workspace",
+        "connector_status",
         "list_connectors",
         "start_connector_setup",
         "submit_connector_credentials",
         "validate_connector_connection",
     ],
     "company-health-check-th": [
-        "workspace_connector_status",
+        "connector_status",
         "retrieve_workspace_context_pack",
         "run_mercury_flow",
     ],
     "vat-summary-th": [
-        "workspace_connector_status",
+        "connector_status",
         "retrieve_workspace_context_pack",
         "run_mercury_flow",
     ],
     "invoice-review-th": [
-        "workspace_connector_status",
+        "connector_status",
         "retrieve_workspace_context_pack",
         "run_mercury_flow",
     ],
     "management-report-th": [
-        "workspace_connector_status",
+        "connector_status",
         "retrieve_workspace_context_pack",
         "run_mercury_flow",
     ],
     "connector-setup-guide-th": [
+        "create_public_workspace",
+        "connector_status",
         "list_connectors",
         "start_connector_setup",
         "validate_connector_connection",
     ],
     "peak-connector-setup-th": [
+        "create_public_workspace",
+        "connector_status",
         "list_connectors",
         "start_connector_setup",
         "submit_connector_credentials",
         "validate_connector_connection",
     ],
     "mercury-flow-runner": [
-        "workspace_connector_status",
+        "connector_status",
         "list_workspace_flows",
         "save_workspace_flow",
         "run_workspace_flow",
         "run_mercury_flow",
     ],
 }
+
+
+def test_contest_plugin_uses_public_workspace_contract() -> None:
+    combined = "\n".join(
+        path.read_text() for path in sorted((PLUGIN_ROOT / "skills").rglob("SKILL.md"))
+    )
+
+    assert "workspace_id" in combined
+    assert "client_token" not in combined
+    assert "Mercury Connect" not in combined
+
+
+def test_plugin_capabilities_match_public_read_only_runtime() -> None:
+    manifest = json.loads((PLUGIN_ROOT / ".codex-plugin/plugin.json").read_text())
+
+    assert manifest["interface"]["capabilities"] == ["Interactive", "Read"]
 
 
 def test_marketplace_points_to_plugin_folder() -> None:
@@ -91,6 +123,11 @@ def test_judge_quickstart_mentions_plugin_and_no_secrets() -> None:
     assert "codex plugin marketplace add" in text
     assert "https://mercury-tools-mcp.onrender.com/mcp" in text
     assert "hosted MCP server config" in text
+    assert "create_public_workspace" in text
+    assert "workspace_id" in text
+    assert "private tenant isolation" in text
+    assert "client_token" not in text
+    assert "Mercury Connect" not in text
     assert "token provided by the Mercury demo owner" not in text
     assert "SUPABASE_SERVICE_ROLE_KEY" not in text
     assert "client_secret =" not in text
@@ -103,9 +140,31 @@ def test_connector_credential_skill_is_gated() -> None:
     ).read_text()
 
     assert "Use when" in skill
-    assert "Do not ask the user to paste API keys" in skill
+    assert "create_public_workspace" in skill
+    assert "workspace_id" in skill
     assert "Do not proceed" in skill
     assert "validate_connector_connection" in skill
+
+
+def test_connector_setup_skills_keep_the_gated_public_sequence() -> None:
+    required_order = [
+        "connector_status",
+        "create_public_workspace",
+        "start_connector_setup",
+        "missing_fields",
+        "submit_connector_credentials",
+        "validate_connector_connection",
+        "retrieve_workspace_context_pack",
+    ]
+
+    for skill_name in (
+        "connector-credential-setup-th",
+        "flowaccount-connector-setup-th",
+        "peak-connector-setup-th",
+    ):
+        text = (PLUGIN_ROOT / f"skills/{skill_name}/SKILL.md").read_text()
+        positions = [text.index(item) for item in required_order]
+        assert positions == sorted(positions), skill_name
 
 
 def test_skill_files_are_compact_and_route_to_mcp_tools() -> None:
@@ -119,7 +178,7 @@ def test_skill_files_are_compact_and_route_to_mcp_tools() -> None:
             assert tool_name in skill
 
 
-def test_hosted_workflow_skills_use_token_scoped_connector_status() -> None:
+def test_hosted_workflow_skills_use_public_workspace_connector_status() -> None:
     hosted_skill_names = [
         "company-health-check-th",
         "vat-summary-th",
@@ -130,9 +189,9 @@ def test_hosted_workflow_skills_use_token_scoped_connector_status() -> None:
 
     for skill_name in hosted_skill_names:
         skill = (PLUGIN_ROOT / f"skills/{skill_name}/SKILL.md").read_text()
-        assert "workspace_connector_status" in skill
-        assert "client_token" in skill
-        assert "Use `connector_status`" not in skill
+        assert "connector_status" in skill
+        assert "workspace_id" in skill
+        assert "client_token" not in skill
 
 
 def test_plugin_package_has_no_embedded_secret_env_names_or_values() -> None:

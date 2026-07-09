@@ -81,6 +81,48 @@ def test_flow_runner_executes_with_injected_services() -> None:
     assert payload["variables"]["skill"]["skill_id"] == "company-health-check-th"
 
 
+def test_flow_runner_blocks_mutation_capability_before_connector_dispatch() -> None:
+    calls: list[str] = []
+    runner = MercuryFlowRunner(
+        connector_status_getter=lambda: calls.append("connector") or {"status": "ok"},
+    )
+
+    payload = runner.run_text(
+        """
+name: Blocked Mutation
+---
+- connectorStatus:
+    capability: documents.invoice.create
+"""
+    ).as_dict()
+
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "public_preview_read_only"
+    assert payload["capability"] == "documents.invoice.create"
+    assert payload["steps"][0]["status"] == "blocked"
+    assert calls == []
+
+
+def test_flow_runner_allows_declared_read_capability() -> None:
+    calls: list[str] = []
+    runner = MercuryFlowRunner(
+        connector_status_getter=lambda: calls.append("connector") or {"status": "ok"},
+    )
+
+    payload = runner.run_text(
+        """
+name: Allowed Read
+---
+- connectorStatus:
+    capability: documents.invoice.list
+"""
+    ).as_dict()
+
+    assert payload["status"] == "ok"
+    assert payload["steps"][0]["status"] == "ok"
+    assert calls == ["connector"]
+
+
 def test_flow_runner_supports_when_conditions() -> None:
     result = MercuryFlowRunner(dry_run=True).run_text(
         """
@@ -678,8 +720,8 @@ execution:
     )
     (flows / "company.yaml").write_text(
         COMPANY_HEALTH_TEMPLATE.replace(
-            "tags: [accounting, read-only, flowaccount]",
-            "tags: [accounting, read-only, flowaccount, smoke]",
+            "tags: [accounting, endpoint-capable, flowaccount]",
+            "tags: [accounting, endpoint-capable, flowaccount, smoke]",
         ),
         encoding="utf-8",
     )
@@ -688,7 +730,7 @@ execution:
             "name: Company Health Check",
             "name: Disabled Check",
         ).replace(
-            "tags: [accounting, read-only, flowaccount]",
+            "tags: [accounting, endpoint-capable, flowaccount]",
             "tags: [accounting, disabled]",
         ),
         encoding="utf-8",
@@ -745,7 +787,11 @@ def test_flow_cli_manifest_outputs_agent_handoff(tmp_path: Path, capsys) -> None
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "ok"
     assert payload["surface"] == "mcp-cli"
-    assert payload["discovery"]["tags"] == ["accounting", "flowaccount", "read-only"]
+    assert payload["discovery"]["tags"] == [
+        "accounting",
+        "endpoint-capable",
+        "flowaccount",
+    ]
     assert payload["agent_handoff"]["cli_examples"][1].startswith("mercury-tools flow manifest")
 
 

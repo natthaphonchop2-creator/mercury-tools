@@ -8,7 +8,7 @@ from mercury_tools.connectors.setup import (
     next_setup_state,
     required_missing_fields,
     resolve_setup_state,
-    validate_connector_read_only,
+    validate_connector_connection_healthcheck,
 )
 from mercury_tools.db.product import SupabaseProductStore
 
@@ -44,7 +44,7 @@ def test_setup_states_are_ordered_and_explicit() -> None:
         "awaiting_credentials",
         "credentials_received",
         "validation_failed",
-        "connected_read_only",
+        "connected",
         "ready",
     ]
 
@@ -93,13 +93,13 @@ def test_validate_flowaccount_uses_token_and_company_info(monkeypatch) -> None:
     monkeypatch.setattr("httpx.post", fake_post)
     monkeypatch.setattr("httpx.get", fake_get)
 
-    result = validate_connector_read_only(
+    result = validate_connector_connection_healthcheck(
         manifest,
         credentials={"client_id": "cid", "client_secret": "csecret"},
         environment="production",
     )
 
-    assert result["status"] == "connected_read_only"
+    assert result["status"] == "connected"
     assert result["company_name"] == "Demo Books"
     assert result["enabled_capabilities"] == manifest.capabilities
     assert "secret-token" not in str(result)
@@ -137,13 +137,13 @@ def test_validate_flowaccount_uses_sandbox_token_and_company_info_urls(
     monkeypatch.setattr("httpx.post", fake_post)
     monkeypatch.setattr("httpx.get", fake_get)
 
-    result = validate_connector_read_only(
+    result = validate_connector_connection_healthcheck(
         manifest,
         credentials={"client_id": "cid", "client_secret": "csecret"},
         environment="sandbox",
     )
 
-    assert result["status"] == "connected_read_only"
+    assert result["status"] == "connected"
     assert result["company_name"] == "Sandbox Books"
     assert calls == [
         ("POST", "https://openapi.flowaccount.com/test/token"),
@@ -222,13 +222,13 @@ def test_validate_peak_uses_hmac_client_token_and_user_read(monkeypatch) -> None
     monkeypatch.setattr("httpx.post", fake_post)
     monkeypatch.setattr("httpx.get", fake_get)
 
-    result = validate_connector_read_only(
+    result = validate_connector_connection_healthcheck(
         manifest,
         credentials=credentials,
         environment="uat",
     )
 
-    assert result["status"] == "connected_read_only"
+    assert result["status"] == "connected"
     assert result["connector_id"] == "peak"
     assert result["enabled_capabilities"] == manifest.capabilities
     assert result["validation"] == {
@@ -282,7 +282,7 @@ def test_validate_peak_token_failure_sanitizes_provider_echoes(monkeypatch) -> N
     monkeypatch.setattr("httpx.post", fake_post)
     monkeypatch.setattr("httpx.get", fake_get)
 
-    result = validate_connector_read_only(
+    result = validate_connector_connection_healthcheck(
         manifest,
         credentials={
             "connect_id": "peak-connect-id",
@@ -320,7 +320,7 @@ def test_validate_flowaccount_http_error_returns_sanitized_validation_failed(
 
     monkeypatch.setattr("httpx.post", fake_post)
 
-    result = validate_connector_read_only(
+    result = validate_connector_connection_healthcheck(
         manifest,
         credentials={
             "client_id": "client-id-leak",
@@ -354,7 +354,7 @@ def test_validate_flowaccount_invalid_json_returns_sanitized_validation_failed(
 
     monkeypatch.setattr("httpx.post", fake_post)
 
-    result = validate_connector_read_only(
+    result = validate_connector_connection_healthcheck(
         manifest,
         credentials={
             "client_id": "client-id-leak",
@@ -401,7 +401,7 @@ def test_validate_flowaccount_token_failure_sanitizes_provider_response_keys(
 
     monkeypatch.setattr("httpx.post", fake_post)
 
-    result = validate_connector_read_only(
+    result = validate_connector_connection_healthcheck(
         manifest,
         credentials={
             "client_id": "demo-client-id",
@@ -488,7 +488,7 @@ def test_validate_flowaccount_company_info_body_failure_returns_sanitized_valida
     monkeypatch.setattr("httpx.post", fake_post)
     monkeypatch.setattr("httpx.get", fake_get)
 
-    result = validate_connector_read_only(
+    result = validate_connector_connection_healthcheck(
         manifest,
         credentials={
             "client_id": "demo-client-id",
@@ -583,7 +583,7 @@ def test_resolve_setup_state_covers_declared_states() -> None:
             credentials_received=True,
             validation_status="valid",
         )
-        == "connected_read_only"
+        == "connected"
     )
     assert (
         resolve_setup_state(
@@ -592,7 +592,7 @@ def test_resolve_setup_state_covers_declared_states() -> None:
             missing_fields=[],
             credentials_received=True,
             validation_status="valid",
-            read_only_capability_count=1,
+            validated_capability_count=1,
         )
         == "ready"
     )
@@ -736,14 +736,9 @@ def test_start_connector_setup_stores_setup_metadata() -> None:
     assert profile["metadata"]["setup_state"] == "awaiting_credentials"
     assert profile["metadata"]["required_secret_fields"] == ["client_id", "client_secret"]
     assert profile["metadata"]["preset"]["grant_type"] == "client_credentials"
-    assert profile["metadata"]["capabilities"] == [
-        "company.info.read",
-        "contacts.list",
-        "products.list",
-        "documents.invoice.list",
-        "documents.invoice.get",
-        "tax.vat_summary.read",
-    ]
+    assert profile["metadata"]["capabilities"] == connector_by_id("flowaccount").capabilities
+    assert "documents.invoice.create" in profile["metadata"]["capabilities"]
+    assert "documents.expense.create" in profile["metadata"]["capabilities"]
 
 
 def test_start_connector_setup_stores_environment_specific_preset() -> None:
@@ -795,7 +790,7 @@ def test_start_connector_setup_supports_custom_erp_setup_target() -> None:
     assert profile["metadata"]["capabilities"] == []
 
 
-def test_ready_connector_profile_metadata_sets_connected_read_only_status() -> None:
+def test_ready_connector_profile_metadata_sets_connected_status() -> None:
     store = StoreForSetup()
     profile = store.set_connector_profile(
         token_payload={
@@ -814,8 +809,8 @@ def test_ready_connector_profile_metadata_sets_connected_read_only_status() -> N
         },
     )
 
-    assert profile["status"] == "connected_read_only"
-    assert store.profile_payloads[-1]["status"] == "connected_read_only"
+    assert profile["status"] == "connected"
+    assert store.profile_payloads[-1]["status"] == "connected"
 
 
 def test_product_table_credentials_store_server_vault_on_profile_not_audit() -> None:
@@ -905,8 +900,8 @@ def test_product_table_validation_preserves_private_credential_vault_metadata() 
     stored_metadata = stored_profile["metadata"]
     public_profile = public_connector_profile(stored_profile)
 
-    assert ready_profile["status"] == "connected_read_only"
-    assert stored_profile["status"] == "connected_read_only"
+    assert ready_profile["status"] == "connected"
+    assert stored_profile["status"] == "connected"
     assert stored_metadata["server_vault"]["ciphertext"] == server_vault["ciphertext"]
     assert stored_metadata["credential_storage"] == "encrypted_server_vault"
     assert stored_metadata["credential_fields"] == ["client_id", "client_secret"]

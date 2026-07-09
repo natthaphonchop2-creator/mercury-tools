@@ -100,7 +100,12 @@ def _window_text(text: str, max_chars: int) -> list[str]:
 
 def chunk_document(document: KnowledgeDocument, *, max_chars: int = 1800) -> list[KnowledgeChunk]:
     chunks: list[KnowledgeChunk] = []
-    source_path = str(document.path) if document.path else None
+    declared_source_path = document.metadata.get("source_path")
+    source_path = (
+        str(declared_source_path)
+        if declared_source_path
+        else (str(document.path) if document.path else None)
+    )
     for heading, section in split_markdown_sections(document.body):
         for text in _window_text(section, max_chars=max_chars):
             index = len(chunks)
@@ -135,4 +140,3 @@ def chunk_document(document: KnowledgeDocument, *, max_chars: int = 1800) -> lis
                 )
             )
     return chunks
-

@@ -9,7 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from mercury_tools.config import load_settings
-from mercury_tools.flows.models import FlowCommand, FlowRunResult, FlowStepResult, MercuryFlow
+from mercury_tools.connectors.catalog import public_capability_gate
+from mercury_tools.flows.models import (
+    FlowCommand,
+    FlowRunResult,
+    FlowStepResult,
+    MercuryFlow,
+    declared_command_capabilities,
+)
 from mercury_tools.flows.parser import (
     FlowValidationError,
     parse_flow_path,
@@ -110,6 +117,10 @@ def _summary(payload: Any) -> dict[str, Any]:
             summary["iterations"] = redacted["iterations"]
         if "max_iterations" in redacted:
             summary["max_iterations"] = redacted["max_iterations"]
+        if "reason" in redacted:
+            summary["reason"] = redacted["reason"]
+        if "capability" in redacted:
+            summary["capability"] = redacted["capability"]
         return summary
     if isinstance(redacted, list):
         return {"count": len(redacted)}
@@ -293,6 +304,33 @@ class MercuryFlowRunner:
                 )
             else:
                 rendered_args = _interpolate(command.args, variables)
+            for capability in declared_command_capabilities(rendered_args):
+                blocked = public_capability_gate(capability)
+                if blocked is None:
+                    continue
+                save_as = rendered_args.get("saveAs") or rendered_args.get("save_as")
+                if save_as:
+                    variables[str(save_as)] = blocked
+                steps.append(
+                    FlowStepResult(
+                        index=sequence,
+                        command=command.name,
+                        status="blocked",
+                        source=command.source,
+                        saved_as=str(save_as) if save_as else None,
+                        output_summary=_summary(blocked),
+                    )
+                )
+                return FlowRunResult(
+                    status="blocked",
+                    flow=flow,
+                    dry_run=self.dry_run,
+                    steps=steps,
+                    variables=redact_json(variables),
+                    artifacts=redact_json(artifacts),
+                    reason=str(blocked["reason"]),
+                    capability=str(blocked["capability"]),
+                )
             if self.dry_run and command.name not in {"repeat", "retry", "runFlow"}:
                 output = self._planned_output(command, rendered_args)
             else:
@@ -742,7 +780,10 @@ def create_default_runner(*, dry_run: bool = False) -> MercuryFlowRunner:
             "inputs": inputs,
             "evidence_mode": evidence_mode,
             "skill_markdown": markdown,
-            "note": "Mercury Flow returns a read-only skill package for the host agent.",
+            "note": (
+                "Mercury Flow returns a guided skill package. Endpoint actions are "
+                "gated by connector capability, preview, approval, and audit policy."
+            ),
         }
 
     return MercuryFlowRunner(

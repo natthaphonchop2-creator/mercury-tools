@@ -11,7 +11,7 @@ Shape:
 
 name: Company Health Check
 description: Retrieve cited accounting context and package a skill for the host AI.
-tags: [accounting, read-only]
+tags: [accounting, endpoint-capable]
 env:
   jurisdiction: TH
   environment: production
@@ -180,8 +180,8 @@ CI reporting:
 
 
 COMPANY_HEALTH_TEMPLATE = """name: Company Health Check
-description: Read-only Mercury flow for a Thai accounting health-check handoff.
-tags: [accounting, read-only, flowaccount]
+description: Thai accounting health-check handoff with connector endpoint context.
+tags: [accounting, endpoint-capable, flowaccount]
 env:
   jurisdiction: TH
   environment: production
@@ -217,8 +217,8 @@ onFlowStart:
 
 
 VAT_SUMMARY_TEMPLATE = """name: VAT Summary TH
-description: Read-only Mercury flow for VAT summary context and skill packaging.
-tags: [accounting, read-only, vat, flowaccount]
+description: VAT summary context and skill packaging with connector endpoint context.
+tags: [accounting, endpoint-capable, vat, flowaccount]
 env:
   jurisdiction: TH
   environment: production

@@ -191,7 +191,7 @@ def workspace_manifest(
         "source": source,
         "runtime_boundary": {
             "primary_runtime": "MCP tools and CLI",
-            "browser_console": "setup and read-only evidence only",
+            "browser_console": "setup and sanitized evidence only",
             "host_agent": "Codex, Cursor, Claude, or another MCP client owns chat UX",
         },
         "workspace": {

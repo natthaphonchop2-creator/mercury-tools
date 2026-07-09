@@ -18,7 +18,7 @@ Every wiki page should include:
 ```yaml
 ---
 title: Page title
-doc_type: accounting-standard | tax | connector | workflow | schema | index
+doc_type: accounting-standard | tax | connector | endpoint_dictionary | workflow | schema | index
 jurisdiction: TH | international
 connector: flowaccount | peak | express | null
 review_status: draft | reviewed
@@ -34,4 +34,3 @@ effective_date: YYYY-MM-DD
 - Keep connector credentials out of wiki pages.
 - Use citations and source URLs/paths whenever possible.
 - Write pages as reusable context for MCP host agents, not as final chat answers.
-

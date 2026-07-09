@@ -49,7 +49,7 @@ SKILL_CATALOG_SEED: list[dict[str, Any]] = [
         "skill_id": "invoice-review-th",
         "title": "Invoice Review TH",
         "category": "audit",
-        "summary": "ตรวจใบแจ้งหนี้/ใบกำกับภาษีแบบอ่านอย่างเดียวและทำรายการประเด็นให้ฝ่ายบัญชี",
+        "summary": "ตรวจใบแจ้งหนี้/ใบกำกับภาษีและจัดเตรียมงานตาม endpoint capability ที่เชื่อมอยู่",
         "status": "available",
         "version": "0.1.0",
         "required_connectors": ["flowaccount"],
@@ -238,7 +238,7 @@ def encrypt_connector_credentials(
     credentials: dict[str, str],
 ) -> dict[str, Any]:
     if not settings.connect_signing_secret:
-        raise RuntimeError("MERCURY_CONNECT_SIGNING_SECRET is required for credential vault.")
+        raise RuntimeError("MERCURY_CREDENTIAL_VAULT_SECRET is required for credential vault.")
     cleaned = {
         key: str(value).strip()
         for key, value in credentials.items()
@@ -316,7 +316,10 @@ def _preserved_connector_credential_metadata(metadata: dict[str, Any]) -> dict[s
 
 
 def public_connector_profile(profile: dict[str, Any]) -> dict[str, Any]:
-    return redact_json(_strip_server_only_connector_data(dict(profile)))
+    public = _strip_server_only_connector_data(dict(profile))
+    if str(public.get("status") or "").strip().lower() == "connected_read_only":
+        public["status"] = "connected"
+    return redact_json(public)
 
 
 def public_connector_profiles(profiles: Any) -> list[dict[str, Any]]:
@@ -335,8 +338,8 @@ def public_product_event(row: dict[str, Any]) -> dict[str, Any]:
 
 def connector_profile_status_from_metadata(metadata: dict[str, Any] | None) -> str:
     setup_state = str((metadata or {}).get("setup_state") or "").strip().lower()
-    if setup_state in {"ready", "connected_read_only"}:
-        return "connected_read_only"
+    if setup_state in {"ready", "connected", "connected_read_only"}:
+        return "connected"
     return "requires_credentials"
 
 

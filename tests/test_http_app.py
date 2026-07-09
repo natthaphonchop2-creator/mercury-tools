@@ -139,7 +139,7 @@ def test_legacy_browser_paths_do_not_expose_setup_console(monkeypatch) -> None:
         assert 'id="connect-form"' not in response.text
 
 
-def test_flows_page_is_read_only_control_plane(monkeypatch) -> None:
+def test_flows_page_is_endpoint_capable_control_plane(monkeypatch) -> None:
     monkeypatch.setenv("MERCURY_CONNECT_INVITE_CODE", "invite-demo")
     monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
 
@@ -422,7 +422,7 @@ def test_workspace_flow_run_blocks_raw_yaml_with_connector_missing_environment(m
 
     connector_flow_missing_environment = (
         "name: FlowAccount Missing Environment\n"
-        "tags: [accounting, read-only, flowaccount]\n"
+        "tags: [accounting, endpoint-capable, flowaccount]\n"
         "env:\n"
         "  connector: flowaccount\n"
         "---\n"

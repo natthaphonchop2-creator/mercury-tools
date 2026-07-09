@@ -1,28 +1,31 @@
 ---
 name: connector-credential-setup-th
-description: Use when a user needs to connect FlowAccount, PEAK Accounting, Express Account, or another ERP/API system before running accounting workflows
+description: Use when an accounting or ERP workflow cannot continue because a public Mercury workspace or connector credentials are not ready
 ---
 
 # Connector Credential Setup TH
 
 ## Rule
 
-Do not proceed to the next setup step until the current step is complete and validated.
+Do not proceed to the next setup step until the current step succeeds. Ask only
+for values Mercury reports as missing. Pass them to the credential tool once,
+never repeat them in the response, and never place them in notes or flow YAML.
 
-Do not ask the user to paste API keys, client secrets, bearer tokens, or refresh tokens into normal chat. Use the host app's secure MCP credential path or a server-side credential vault flow.
+## Public Setup Sequence
 
-## Steps
+1. Call `connector_status` with the current `workspace_id` when one exists.
+2. If status is `requires_workspace`, call `create_public_workspace` and retain its `workspace_id` in this task.
+3. Call `start_connector_setup` with `workspace_id`, connector ID, and environment.
+4. Ask only for fields returned in `missing_fields` or `required_secret_fields`.
+5. Call `submit_connector_credentials` once with the collected values.
+6. Call `validate_connector_connection`; do not continue until it returns `ready` or `connected_read_only`.
+7. Call `retrieve_workspace_context_pack` for connector-specific knowledge.
 
-1. Call `list_connectors`.
-2. Ask the user to choose one connector if none is selected.
-3. Call `start_connector_setup` with connector id and environment.
-4. Show preset values that Mercury already knows.
-5. Ask only for required missing credential fields through a secure input path.
-6. Call `submit_connector_credentials`.
-7. Call `validate_connector_connection`.
-8. If validation returns `ready`, continue to the requested accounting workflow.
-9. If validation fails, stay on the failed step and ask for only the missing correction.
+If validation fails, remain on step 6 and request only the correction indicated
+by the sanitized error. Use `list_connectors` when the user has not chosen an ERP.
 
 ## Output
 
-ตอบเป็นภาษาไทยแบบกระชับ ระบุโปรแกรม บริษัทถ้ามี environment, enabled capabilities, และ next safe command. Never show raw credentials.
+ตอบภาษาไทยแบบสั้น: โปรแกรม, environment, บริษัทถ้ามี, validation status,
+enabled read capabilities, blocked capabilities, และ next tool. Never show raw
+credentials, tokens, tax IDs, emails, or customer records.

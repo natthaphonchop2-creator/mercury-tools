@@ -18,7 +18,31 @@ v1 is remote-first and read-oriented:
 - Mercury Flows: Maestro-inspired YAML workflows for accounting agents, with
   CLI validation/execution and MCP tool access.
 
-## Quick Start
+## Contest Install
+
+Judges add the GitHub marketplace and install **Mercury Finance** from Codex:
+
+```bash
+codex plugin marketplace add natthaphonchop2-creator/mercury-tools \
+  --ref main \
+  --sparse .agents/plugins \
+  --sparse plugins/mercury-finance
+```
+
+The plugin registers the public Remote MCP at
+`https://mercury-tools-mcp.onrender.com/mcp`. No clone, local runtime, browser
+dashboard, bearer token, or Mercury LLM is required. The host AI remains Codex,
+Cursor, Claude, or another MCP client.
+
+On first use, call `connector_status`. Mercury creates an opaque public
+`workspace_id`, guides ERP selection and credentials, validates a low-impact
+read endpoint, then routes RAG and flows to the selected connector. Public v1
+enables read capabilities only.
+
+See [docs/JUDGE_QUICKSTART.md](docs/JUDGE_QUICKSTART.md) for the demo sequence
+and explicit contest security boundary.
+
+## Local Development
 
 ```bash
 cd mercury-tools
@@ -104,45 +128,10 @@ uv run mercury-tools remote verify \
   --url https://mercury-tools-mcp.onrender.com
 ```
 
-Mercury is MCP/plugin-first. The hosted root page is only a minimal server
-landing page; it is not a browser setup console, dashboard, or chat surface.
-Codex, Cursor, Claude, or another MCP host remains the user-facing AI.
-
-The product API layer exists for host integrations and secure onboarding:
-
-- `GET /api/dashboard`
-- `POST /api/team/invite`
-- `POST /api/connectors/setup`
-- `POST /api/connectors/credentials`
-- `POST /api/skills/enable`
-- `POST /api/skills/upload`
-- `POST /api/flows/validate`
-- `POST /api/flows/save`
-- `POST /api/flows/import`
-- `POST /api/flows/run`
-
-These APIs require a Mercury client token (`mc_...`) issued by a secure
-host/admin onboarding path, not by a browser UX. The contest MCP endpoint is
-public/read-oriented so the GitHub marketplace plugin can connect without a
-manual token step.
-Flow execution APIs are for MCP/CLI/agent integrations and are not surfaced as
-browser-console workflows.
-Connector credentials are not stored in Supabase in v1; connector profiles store
-the selected program, environment, company label, and required secret fields.
-Flow run history stores sanitized summaries only: status, flow title/id, step
-count, artifact count, artifact titles, and runtime env key names. It does not
-store raw connector secrets, runtime env values, full variables, or raw
-accounting payloads.
-
-If the dedicated product tables from `0002_mercury_product_layer.sql` have not
-been applied yet, Mercury falls back to an event-sourced product state stored in
-the existing `mcp_audit_events` table. This keeps the demo usable while the
-database owner applies the full product migration later.
-
-Connector credentials are accepted through MCP tools or host-provided secure
-inputs and encrypted before they are stored in the event-backed vault. Dashboard
-responses show only field names, fingerprints, and configuration status; raw
-credentials are not returned.
+Mercury is MCP/plugin-first. The hosted root is only a minimal server landing;
+it is not a setup console, dashboard, or chat surface. Public workspaces and
+encrypted connector-vault records are stored through Supabase. MCP responses
+show only field names, fingerprints, setup state, and sanitized summaries.
 
 ## Mercury Flows
 
@@ -154,7 +143,7 @@ Example:
 
 ```yaml
 name: Company Health Check
-tags: [accounting, read-only, flowaccount]
+tags: [accounting, endpoint-capable, flowaccount]
 env:
   jurisdiction: TH
   connector: flowaccount
@@ -213,7 +202,6 @@ Flow CLI:
 - `mercury-tools flow run-suite <workspace> --format junit --output reports/junit.xml`
 - `mercury-tools flow run-suite <workspace> --format html --output reports/flow-report.html`
 - `mercury-tools flow watch <workspace> --dry-run`
-- `mercury-tools flow push <workspace> --url https://mercury-tools-mcp.onrender.com --client-token <mc_...>`
 - `mercury-tools flow cheat-sheet`
 
 MCP and HTTP flow runs also accept runtime env overrides. Values are coerced to
@@ -384,9 +372,9 @@ Flow MCP tools:
 - `list_workspace_flows`
 - `run_workspace_flow`
 
-`save_workspace_flow`, `list_workspace_flows`, and `run_workspace_flow` use a
-Mercury client token to resolve the correct workspace. They do not require or
-expose the Supabase service role key to the MCP host.
+`save_workspace_flow`, `list_workspace_flows`, and `run_workspace_flow` use an
+opaque public `workspace_id` to route contest state. The ID is not
+authentication and must not be treated as private tenant isolation.
 
 Supported flow commands are read-oriented: `connectorStatus`, `searchKnowledge`,
 `retrieveContextPack`, `getDocument`, `runSkill`, `emitReport`, `assert`,
@@ -401,8 +389,7 @@ Required for live RAG:
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `MERCURY_TOOLS_EMBEDDING_PROVIDER=hash` for the Codex/host-AI demo mode
 - `MERCURY_TOOLS_HTTP_REQUIRE_AUTH=false` for the public contest MCP endpoint
-- `MERCURY_CONNECT_INVITE_CODE` for server-side client-token issuance
-- `MERCURY_CONNECT_SIGNING_SECRET` for per-user client tokens
+- `MERCURY_CREDENTIAL_VAULT_SECRET` for encrypted connector credential records
 
 `OPENAI_API_KEY` is optional and only needed when
 `MERCURY_TOOLS_EMBEDDING_PROVIDER=openai`.
@@ -417,7 +404,15 @@ Tools:
 - `search_knowledge`
 - `retrieve_context_pack`
 - `get_document`
+- `create_public_workspace`
+- `get_public_workspace`
+- `list_connectors`
+- `connector_capabilities`
 - `connector_status`
+- `start_connector_setup`
+- `submit_connector_credentials`
+- `validate_connector_connection`
+- `retrieve_workspace_context_pack`
 - `run_accounting_skill`
 - `flow_cheat_sheet`
 - `check_flow_syntax`

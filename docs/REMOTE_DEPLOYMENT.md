@@ -1,103 +1,89 @@
-# Mercury Tools Remote MCP Deployment
+# Mercury Tools Public MCP Deployment
 
-This guide turns Mercury Tools into a cloud-hosted Streamable HTTP MCP server.
+This guide deploys the contest build as a public Streamable HTTP MCP. The AI
+experience stays inside Codex or another MCP host; Render serves tools and
+Supabase stores RAG, public workspace state, encrypted connector records, and
+sanitized audit events.
 
-## Current contest deployment
+## Current Deployment
 
-- GitHub repo: `https://github.com/natthaphonchop2-creator/mercury-tools`
+- GitHub: `https://github.com/natthaphonchop2-creator/mercury-tools`
 - Render service: `mercury-tools-mcp`
-- Render URL: `https://mercury-tools-mcp.onrender.com`
-- Mercury server landing: `https://mercury-tools-mcp.onrender.com/`
-- MCP endpoint: `https://mercury-tools-mcp.onrender.com/mcp`
-- Health endpoint: `https://mercury-tools-mcp.onrender.com/healthz`
-- Supabase project ref: `vbnlkqvauqwnjbxngkas`
-- Supabase URL: `https://vbnlkqvauqwnjbxngkas.supabase.co`
+- Base URL: `https://mercury-tools-mcp.onrender.com`
+- MCP: `https://mercury-tools-mcp.onrender.com/mcp`
+- Health: `https://mercury-tools-mcp.onrender.com/healthz`
+- Supabase project: `vbnlkqvauqwnjbxngkas`
 
-The contest MCP endpoint is public/read-oriented so judges can install the
-GitHub marketplace plugin and use Mercury tools without manually managing a
-bearer token. Private deployments can enable bearer auth later with
-`MERCURY_TOOLS_HTTP_REQUIRE_AUTH=true`.
+## 1. Apply Supabase Migrations
 
-## 1. Prepare Supabase
+Run these files in order against the Mercury Supabase project:
 
-Create a Supabase project and run both migrations:
+1. `supabase/migrations/0001_mercury_tools_rag.sql`
+2. `supabase/migrations/0002_mercury_product_layer.sql`
+3. `supabase/migrations/0003_match_knowledge_chunks_null_embedding.sql`
+4. `supabase/migrations/0004_match_knowledge_chunks_endpoint_terms.sql`
 
-```sql
--- supabase/migrations/0001_mercury_tools_rag.sql
--- supabase/migrations/0002_mercury_product_layer.sql
-```
+Required extensions are `vector` and `pgcrypto`. Tables use RLS and revoke
+direct access from `public`, `anon`, and `authenticated`; the server-side
+service role performs RAG and product operations.
 
-Required extensions:
+Migration 0004 is the final `match_knowledge_chunks` definition. It supports
+connector filters and deterministic endpoint-term matching when embeddings are
+null.
 
-- `vector`
-- `pgcrypto`
+## 2. Configure Render
 
-Required environment variables for the MCP service:
-
-- `SUPABASE_URL`
-- `SUPABASE_SERVICE_ROLE_KEY`
-- `MERCURY_TOOLS_EMBEDDING_PROVIDER=hash`
-- `MERCURY_TOOLS_HTTP_REQUIRE_AUTH=false` for the contest/demo MCP endpoint
-- `MERCURY_CONNECT_INVITE_CODE`
-- `MERCURY_CONNECT_SIGNING_SECRET`
-
-Do not expose the Supabase service role key to MCP clients.
-Do not expose raw connector credentials through MCP outputs. For private
-customer environments, enable MCP auth or put the service behind the host
-platform's authentication layer.
-
-Mercury Tools v1 does not need to call an LLM by itself. In contest/demo mode it
-uses deterministic local `hash` embeddings and serves cited context packs to the
-host AI tool, such as Codex, Cursor, or Claude Desktop. Set
-`MERCURY_TOOLS_EMBEDDING_PROVIDER=openai` and provide `OPENAI_API_KEY` only if
-you explicitly want OpenAI embeddings later.
-
-If the Supabase project is in a different organization than the currently
-connected Codex/Supabase integration, re-authenticate that integration with an
-account that is a member of the target organization before applying the
-migration. The target project for Mercury Tools v1 is:
+Deploy `render.yaml` as a Render Blueprint or Docker web service. Configure:
 
 ```text
-vbnlkqvauqwnjbxngkas
+SUPABASE_URL
+SUPABASE_SERVICE_ROLE_KEY
+MERCURY_CREDENTIAL_VAULT_SECRET
+MERCURY_TOOLS_PUBLIC_BASE_URL=https://mercury-tools-mcp.onrender.com
+MERCURY_TOOLS_EMBEDDING_PROVIDER=hash
+MERCURY_TOOLS_HTTP_REQUIRE_AUTH=false
 ```
 
-For a dashboard-first setup, paste the full migrations from:
+The vault secret must be a long random server-only value. Do not place the
+Supabase service role or vault secret in a plugin, MCP client config, repository
+secret file, or tool response.
 
-```text
-supabase/migrations/0001_mercury_tools_rag.sql
-supabase/migrations/0002_mercury_product_layer.sql
-```
+Mercury does not call an LLM. Hash embeddings plus hybrid keyword search serve
+cited context to the user's host AI. An external embedding provider is optional
+after the contest.
 
-into the Supabase SQL Editor for that project and run them once in order.
+## 3. Ingest The Wiki
 
-The migrations are private by default:
-
-- RLS is enabled on all Mercury RAG and product tables.
-- `anon` and `authenticated` are revoked.
-- `service_role` is the only role granted table access.
-- `match_knowledge_chunks` execution is granted only to `service_role`.
-
-## 2. Deploy the MCP service
-
-Recommended v1 route for the contest build:
-
-1. Push this repo to GitHub.
-2. Create a Render Blueprint from `render.yaml`, or create a Docker web service.
-3. Set the secret env vars in the cloud provider.
-4. Set `MERCURY_TOOLS_PUBLIC_BASE_URL` to the deployed service URL.
-5. Confirm:
+With Supabase variables available locally:
 
 ```bash
-curl https://your-service.example.com/healthz
+uv run mercury-tools ingest wiki --path ./wiki
+uv run mercury-tools search "FlowAccount invoice endpoint" --json
+uv run mercury-tools search "PEAK invoice endpoint" --json
 ```
 
-Expected response:
+Alternatively, configure `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` as
+GitHub repository secrets and run the **Ingest Mercury Wiki** workflow.
+
+Expected routing:
+
+- a FlowAccount query returns FlowAccount sources only;
+- a PEAK query returns PEAK sources only;
+- each result includes source metadata and citation fields.
+
+## 4. Verify The Service
+
+```bash
+uv run mercury-tools remote verify \
+  --url https://mercury-tools-mcp.onrender.com
+```
+
+Expected health properties:
 
 ```json
 {
   "status": "ok",
   "supabase": true,
-  "openai": false,
   "embedding_provider": "hash",
   "embedding_configured": true,
   "mcp_path": "/mcp",
@@ -105,100 +91,16 @@ Expected response:
 }
 ```
 
-## 3. Ingest the LLM Wiki
+Then initialize an MCP session and verify `tools/list`,
+`create_public_workspace`, connector discovery, inferred RAG routing, skill
+loading, and a read-only flow dry run.
 
-After migration and env vars are ready:
+## Contest Boundary
 
-```bash
-uv run mercury-tools ingest wiki --path ./wiki
-```
-
-For GitHub-based ingestion, add these repository secrets:
-
-- `SUPABASE_URL`
-- `SUPABASE_SERVICE_ROLE_KEY`
-
-Then run the `Ingest Mercury Wiki` workflow manually.
-
-Safe local secret entry pattern:
-
-```bash
-export SUPABASE_URL="https://vbnlkqvauqwnjbxngkas.supabase.co"
-read -rsp "SUPABASE_SERVICE_ROLE_KEY: " SUPABASE_SERVICE_ROLE_KEY; echo
-
-gh secret set SUPABASE_URL --repo natthaphonchop2-creator/mercury-tools --body "$SUPABASE_URL"
-gh secret set SUPABASE_SERVICE_ROLE_KEY --repo natthaphonchop2-creator/mercury-tools --body "$SUPABASE_SERVICE_ROLE_KEY"
-```
-
-Set the same values in the Render service environment. After that, redeploy and
-confirm `/healthz` returns `"supabase": true` and `"embedding_configured": true`.
-
-Set product-layer secrets in Render as well:
-
-```text
-MERCURY_CONNECT_INVITE_CODE=<demo invite code>
-MERCURY_CONNECT_SIGNING_SECRET=<long random signing secret>
-```
-
-Users connect through their MCP host. The browser root is only a server landing
-page:
-
-```text
-https://mercury-tools-mcp.onrender.com/
-```
-
-This page is not the Mercury chat/runtime surface, not a setup gateway, and not
-a product dashboard. Users install the GitHub marketplace plugin and let the
-host AI client call the MCP endpoint.
-
-If `0002_mercury_product_layer.sql` is not applied yet, client-token issuance
-still works, but product persistence runs in degraded mode. After `0002` is
-applied, the product layer persists:
-
-- workspaces
-- workspace members
-- client token records
-- connector profiles
-- enabled workspace skills
-- uploaded skill drafts
-- product usage/audit events
-- sanitized Mercury Flow run history
-
-In v1, connector profiles intentionally do not store raw accounting API keys or
-client secrets. Store those in a proper host/user secret vault until Mercury has
-a dedicated encrypted connector vault.
-
-You can verify the deployed service from this repo with:
-
-```bash
-uv run mercury-tools remote verify \
-  --url https://mercury-tools-mcp.onrender.com
-```
-
-The command exits with code `0` only when:
-
-- `/healthz` is reachable.
-- Supabase env vars and the selected embedding provider are configured on Render.
-- The MCP endpoint is reachable with the configured public/private auth mode.
-
-## 4. MCP client connection
-
-Remote MCP endpoint:
-
-```text
-https://your-service.example.com/mcp
-```
-
-Client configuration differs by host app. The important contract is:
-
-- transport: Streamable HTTP
-- URL: deployed `/mcp` endpoint
-- auth: none for the contest public demo endpoint; bearer/OAuth for private deployments
-
-## 5. Security rules
-
-- Keep connector credentials outside Supabase.
-- Keep Supabase service role key server-side only.
-- Keep the contest public endpoint read-oriented.
-- Use bearer/OAuth before enabling private customer data or production mutations.
-- Keep production accounting write tools disabled until tenant auth and approval workflows exist.
+- The MCP endpoint has no login and public `workspace_id` values are routing,
+  not authorization.
+- Use contest, UAT, sandbox, or disposable demo ERP credentials only.
+- Connector values are encrypted server-side and never returned.
+- Production-changing ERP capabilities are blocked before connector dispatch.
+- Private tenant authentication and production mutations are deferred until
+  after the contest.

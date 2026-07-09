@@ -1,6 +1,6 @@
 {
   "name": "mercury-finance",
-  "version": "0.1.0+codex.20260709170308",
+  "version": "0.1.0+codex.20260709190745",
   "description": "Accounting AI for ERP connectors, VAT, reports, audit context, and Mercury Flows.",
   "author": {
     "name": "Mercury Agent",
@@ -21,13 +21,12 @@
   "interface": {
     "displayName": "Mercury Finance",
     "shortDescription": "Accounting AI tools for ERP connectors and finance workflows.",
-    "longDescription": "Mercury Finance connects Codex to hosted accounting tools for ERP/API connector knowledge, Thai finance workflows, VAT context packs, invoice review, management reporting, and auditable Mercury Flows.",
+    "longDescription": "Mercury Finance connects Codex to a public hosted MCP for ERP/API connector knowledge, Thai finance workflows, VAT context packs, invoice review, management reporting, and read-only Mercury Flows.",
     "developerName": "Mercury Agent",
     "category": "Finance",
     "capabilities": [
       "Interactive",
-      "Read",
-      "Write"
+      "Read"
     ],
     "websiteURL": "https://github.com/natthaphonchop2-creator/mercury-tools",
     "defaultPrompt": [

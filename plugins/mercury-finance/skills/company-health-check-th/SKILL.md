@@ -5,8 +5,13 @@ description: Use when the user asks for company health, revenue, VAT, cash flow,
 
 # Company Health Check TH
 
-Use `workspace_connector_status` with `client_token` first. If connector setup is incomplete, route to `connector-credential-setup-th`.
+Call `connector_status` with the current `workspace_id` first. If workspace or
+connector setup is incomplete, route to `connector-credential-setup-th` and do
+not continue.
 
-Use `retrieve_workspace_context_pack` for accounting context and `run_mercury_flow` for approved health-check flows.
+Use `retrieve_workspace_context_pack` for connector-specific accounting
+knowledge and `run_mercury_flow` for a read-only health-check flow. Keep the
+same `workspace_id` throughout the task.
 
-ตอบภาษาไทยสำหรับผู้บริหาร: สรุปสถานะรายได้ VAT กระแสเงินสด ความเสี่ยง และจุดที่ควรให้บัญชีตรวจทาน โดยอ้าง evidence สั้น ๆ และไม่ dump audit paths เว้นแต่ผู้ใช้ขอ.
+ตอบภาษาไทยสำหรับผู้บริหาร: รายได้ VAT กระแสเงินสด ความเสี่ยง และจุดที่ควรให้
+นักบัญชีตรวจทาน อ้าง evidence สั้น ๆ และไม่ dump audit paths เว้นแต่ผู้ใช้ขอ.

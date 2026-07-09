@@ -14,6 +14,7 @@ source_uri: mercury://wiki/index
 ## Connectors
 
 - [FlowAccount Connector](connectors/flowaccount.md) — FlowAccount connector capabilities and setup context.
+- [FlowAccount Endpoint Data Dictionary](connectors/flowaccount-endpoint-dictionary.md) — 190 FlowAccount endpoints, method/path mapping, request fields, test classes, and public capability policy.
 - [PEAK Open API Connector](connectors/peak-open-api.md) — PEAK credential requirements, UAT/production endpoints, auth flow, setup validation, and GET/POST capability groups.
 
 ## Workflows

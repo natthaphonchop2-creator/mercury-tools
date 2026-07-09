@@ -25,6 +25,7 @@ from mercury_tools.flows.workspace import (
 from mercury_tools.rag.embeddings import create_embedding_provider
 from mercury_tools.rag.ingest import ingest_wiki
 from mercury_tools.rag.models import SearchFilters
+from mercury_tools.rag.routing import apply_connector_routing
 from mercury_tools.rag.service import RagService
 from mercury_tools.remote import DEFAULT_RENDER_URL, DEFAULT_TOKEN_FILE, read_token, verify_remote
 
@@ -94,12 +95,27 @@ def cmd_ingest_wiki(args: argparse.Namespace) -> int:
 def cmd_search(args: argparse.Namespace) -> int:
     settings = load_settings()
     service = RagService(store=SupabaseRagStore(settings), embedder=_embedder(args))
+    raw_filters = {
+        key: value
+        for key, value in {
+            "jurisdiction": args.jurisdiction,
+            "connector": args.connector,
+            "doc_type": args.doc_type,
+            "review_status": args.review_status,
+            "effective_date": args.effective_date,
+        }.items()
+        if value is not None
+    }
+    applied_filters, inferred_connector = apply_connector_routing(
+        args.query,
+        raw_filters,
+    )
     filters = SearchFilters(
-        jurisdiction=args.jurisdiction,
-        connector=args.connector,
-        doc_type=args.doc_type,
-        review_status=args.review_status,
-        effective_date=args.effective_date,
+        jurisdiction=applied_filters.get("jurisdiction"),
+        connector=applied_filters.get("connector"),
+        doc_type=applied_filters.get("doc_type"),
+        review_status=applied_filters.get("review_status"),
+        effective_date=applied_filters.get("effective_date"),
     )
     results = service.search(args.query, filters=filters, top_k=args.top_k, mode=args.mode)
     payload = [
@@ -109,6 +125,7 @@ def cmd_search(args: argparse.Namespace) -> int:
             "score": result.score,
             "text": result.text,
             "citation": result.citation,
+            "metadata": result.metadata,
             "source_title": result.source_title,
             "source_uri": result.source_uri,
             "source_url": result.source_url,
@@ -117,7 +134,14 @@ def cmd_search(args: argparse.Namespace) -> int:
         for result in results
     ]
     if args.json:
-        _print_json({"query": args.query, "results": payload})
+        _print_json(
+            {
+                "query": args.query,
+                "applied_filters": applied_filters,
+                "inferred_connector": inferred_connector,
+                "results": payload,
+            }
+        )
     else:
         for item in payload:
             print(f"- {item['source_title']} ({item['score']:.3f})")

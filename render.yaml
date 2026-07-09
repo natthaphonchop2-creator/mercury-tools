@@ -14,13 +14,9 @@ services:
         value: /mcp
       - key: MERCURY_TOOLS_HTTP_REQUIRE_AUTH
         value: "false"
-      - key: MERCURY_CONNECT_INVITE_CODE
-        sync: false
-      - key: MERCURY_CONNECT_SIGNING_SECRET
+      - key: MERCURY_CREDENTIAL_VAULT_SECRET
         sync: false
       - key: MERCURY_TOOLS_PUBLIC_BASE_URL
-        sync: false
-      - key: MERCURY_TOOLS_HTTP_BEARER_TOKEN
         sync: false
       - key: SUPABASE_URL
         sync: false

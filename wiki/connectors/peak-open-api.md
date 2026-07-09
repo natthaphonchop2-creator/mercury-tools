@@ -12,7 +12,7 @@ source_url: https://developers.peakaccount.com/reference/peak-open-api
 
 ## Purpose
 
-PEAK Open API connects an external operating system, order system, marketplace workflow, or ERP-adjacent workflow to PEAK Accounting. Mercury treats PEAK as an endpoint-capable accounting connector: GET endpoints provide context and reconciliation data, while POST endpoints run approved document, master-data, payment, and journal workflows.
+PEAK Open API connects an external operating system, order system, marketplace workflow, or ERP-adjacent workflow to PEAK Accounting. Mercury indexes both GET and POST endpoint metadata, but public contest mode executes only setup probes and declared read capabilities. Document, master-data, payment, status, invitation, attachment, and journal mutations remain blocked.
 
 ## Required Setup Material
 

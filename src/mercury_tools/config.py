@@ -129,7 +129,10 @@ def load_settings(*, dotenv_path: str | Path | None = None) -> Settings:
         http_bearer_token=os.environ.get("MERCURY_TOOLS_HTTP_BEARER_TOKEN", "").strip(),
         http_require_auth=_env_bool("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", default=False),
         connect_invite_code=os.environ.get("MERCURY_CONNECT_INVITE_CODE", "").strip(),
-        connect_signing_secret=os.environ.get("MERCURY_CONNECT_SIGNING_SECRET", "").strip(),
+        connect_signing_secret=(
+            os.environ.get("MERCURY_CREDENTIAL_VAULT_SECRET", "").strip()
+            or os.environ.get("MERCURY_CONNECT_SIGNING_SECRET", "").strip()
+        ),
     )
 
 

@@ -31,7 +31,7 @@ ConnectorSetupStatus = Literal[
     "awaiting_credentials",
     "credentials_received",
     "validation_failed",
-    "connected_read_only",
+    "connected",
     "ready",
 ]
 
@@ -42,7 +42,7 @@ CONNECTOR_SETUP_STATES: list[ConnectorSetupStatus] = [
     "awaiting_credentials",
     "credentials_received",
     "validation_failed",
-    "connected_read_only",
+    "connected",
     "ready",
 ]
 
@@ -430,7 +430,7 @@ def _validate_peak_endpoint_access(
         )
 
     return {
-        "status": "connected_read_only",
+        "status": "connected",
         "connector_id": manifest.connector_id,
         "environment": environment,
         "company_name": None,
@@ -443,7 +443,7 @@ def _validate_peak_endpoint_access(
     }
 
 
-def validate_connector_read_only(
+def validate_connector_connection_healthcheck(
     manifest: ConnectorManifest,
     *,
     credentials: dict[str, Any],
@@ -460,7 +460,7 @@ def validate_connector_read_only(
         return {
             "status": "validation_failed",
             "message": (
-                f"Read-only validation adapter is not available for {manifest.connector_id}."
+                f"Connection healthcheck adapter is not available for {manifest.connector_id}."
             ),
         }
     if environment not in manifest.environments:
@@ -583,7 +583,7 @@ def validate_connector_read_only(
         )
 
     return {
-        "status": "connected_read_only",
+        "status": "connected",
         "connector_id": manifest.connector_id,
         "environment": environment,
         "company_name": _flowaccount_company_name(info_payload),
@@ -602,7 +602,7 @@ def resolve_setup_state(
     missing_fields: list[str],
     credentials_received: bool = False,
     validation_status: str | None = None,
-    read_only_capability_count: int = 0,
+    validated_capability_count: int = 0,
 ) -> ConnectorSetupStatus:
     if not has_program:
         return "not_started"
@@ -617,15 +617,29 @@ def resolve_setup_state(
     if normalized_validation_status in {"ready"}:
         return "ready"
     if normalized_validation_status in {"passed", "success", "valid", "validated"}:
-        if read_only_capability_count > 0:
+        if validated_capability_count > 0:
             return "ready"
-        return "connected_read_only"
-    if normalized_validation_status == "connected_read_only":
-        return "connected_read_only"
+        return "connected"
+    if normalized_validation_status in {"connected", "connected_read_only"}:
+        return "connected"
 
     if credentials_received:
         return "credentials_received"
     return "environment_selected"
+
+
+def validate_connector_read_only(
+    manifest: ConnectorManifest,
+    *,
+    credentials: dict[str, Any],
+    environment: str,
+) -> dict[str, Any]:
+    """Deprecated alias for connection healthcheck validation."""
+    return validate_connector_connection_healthcheck(
+        manifest,
+        credentials=credentials,
+        environment=environment,
+    )
 
 
 def next_setup_state(
