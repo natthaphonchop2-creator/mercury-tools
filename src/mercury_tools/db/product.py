@@ -70,6 +70,19 @@ SKILL_CATALOG_SEED: list[dict[str, Any]] = [
         "required_connectors": [],
         "tags": ["setup", "connector", "thai"],
     },
+    {
+        "skill_id": "peak-connector-setup-th",
+        "title": "PEAK Connector Setup TH",
+        "category": "setup",
+        "summary": (
+            "แนะนำการเชื่อม PEAK Open API, credential ที่ต้องใช้, "
+            "เอกสารอ้างอิง, และ setup validation ก่อนใช้งาน GET/POST endpoint"
+        ),
+        "status": "available",
+        "version": "0.1.0",
+        "required_connectors": ["peak"],
+        "tags": ["setup", "connector", "peak", "thai"],
+    },
 ]
 
 PRODUCT_STATE_TOOL = "mercury_product_state"

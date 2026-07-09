@@ -10,6 +10,7 @@ WORKDIR /app
 
 COPY pyproject.toml README.md LICENSE uv.lock ./
 COPY src ./src
+COPY plugins ./plugins
 COPY wiki ./wiki
 COPY supabase ./supabase
 

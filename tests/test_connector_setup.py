@@ -151,6 +151,162 @@ def test_validate_flowaccount_uses_sandbox_token_and_company_info_urls(
     ]
 
 
+def test_validate_peak_uses_hmac_client_token_and_user_read(monkeypatch) -> None:
+    manifest = connector_by_id("peak")
+    assert manifest is not None
+    calls: list[tuple[str, str]] = []
+
+    class FakeResponse:
+        def __init__(self, status_code: int, payload: dict):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = str(payload)
+
+        def json(self):
+            return self._payload
+
+    credentials = {
+        "connect_id": "peak-connect-id",
+        "connect_key": "peak-connect-key",
+        "application_code": "app-code",
+        "user_token": "user-token-value",
+    }
+
+    def assert_peak_headers(headers: dict) -> None:
+        assert headers["User-Token"] == "user-token-value"
+        assert headers["Time-Stamp"].isdigit()
+        assert len(headers["Time-Stamp"]) == 14
+        assert len(headers["Time-Signature"]) == 40
+
+    def fake_post(url, headers=None, json=None, timeout=60):
+        calls.append(("POST", url))
+        assert url == "https://peakengineapidev.azurewebsites.net/api/v1/clienttoken"
+        assert json == {
+            "PeakClientToken": {
+                "connectId": "peak-connect-id",
+                "password": "peak-connect-key",
+            }
+        }
+        assert_peak_headers(headers)
+        assert headers["Client-Token"] == ""
+        assert timeout == 60
+        return FakeResponse(
+            200,
+            {
+                "PeakClientToken": {
+                    "token": "peak-client-token",
+                    "resCode": "200",
+                    "resDesc": "Token Authorized",
+                }
+            },
+        )
+
+    def fake_get(url, headers=None, timeout=60):
+        calls.append(("GET", url))
+        assert url == "https://peakengineapidev.azurewebsites.net/api/v1/user"
+        assert_peak_headers(headers)
+        assert headers["Client-Token"] == "peak-client-token"
+        assert timeout == 60
+        return FakeResponse(
+            200,
+            {
+                "PeakUser": {
+                    "resCode": "200",
+                    "resDesc": "PeakUser have Completed",
+                    "package": "ProPlus",
+                    "isUserTokenEnable": True,
+                }
+            },
+        )
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    monkeypatch.setattr("httpx.get", fake_get)
+
+    result = validate_connector_read_only(
+        manifest,
+        credentials=credentials,
+        environment="uat",
+    )
+
+    assert result["status"] == "connected_read_only"
+    assert result["connector_id"] == "peak"
+    assert result["enabled_capabilities"] == manifest.capabilities
+    assert result["validation"] == {
+        "clienttoken_status": 200,
+        "user_status": 200,
+        "user_res_code": "200",
+    }
+    assert_values_absent(
+        result,
+        [
+            "peak-connect-id",
+            "peak-connect-key",
+            "app-code",
+            "user-token-value",
+            "peak-client-token",
+        ],
+    )
+    assert calls == [
+        ("POST", "https://peakengineapidev.azurewebsites.net/api/v1/clienttoken"),
+        ("GET", "https://peakengineapidev.azurewebsites.net/api/v1/user"),
+    ]
+
+
+def test_validate_peak_token_failure_sanitizes_provider_echoes(monkeypatch) -> None:
+    manifest = connector_by_id("peak")
+    assert manifest is not None
+
+    class FakeResponse:
+        status_code = 200
+        text = "provider echoed peak-connect-id and peak-connect-key"
+
+        def json(self):
+            return {
+                "PeakClientToken": {
+                    "resCode": "500",
+                    "resDesc": (
+                        "PEAK internal server error for peak-connect-id "
+                        "and peak-connect-key"
+                    ),
+                    "user_token": "user-token-value",
+                    "token": "",
+                }
+            }
+
+    def fake_post(url, headers=None, json=None, timeout=60):
+        return FakeResponse()
+
+    def fake_get(url, headers=None, timeout=60):
+        raise AssertionError("read endpoint must not run after token failure")
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    monkeypatch.setattr("httpx.get", fake_get)
+
+    result = validate_connector_read_only(
+        manifest,
+        credentials={
+            "connect_id": "peak-connect-id",
+            "connect_key": "peak-connect-key",
+            "application_code": "app-code",
+            "user_token": "user-token-value",
+        },
+        environment="uat",
+    )
+
+    assert result["status"] == "validation_failed"
+    assert result["message"] == "PEAK ClientToken request failed."
+    assert_values_absent(
+        result,
+        [
+            "peak-connect-id",
+            "peak-connect-key",
+            "app-code",
+            "user-token-value",
+        ],
+    )
+    assert_key_fragments_absent(result, ["user_token", "token"])
+
+
 def test_validate_flowaccount_http_error_returns_sanitized_validation_failed(
     monkeypatch,
 ) -> None:

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 import httpx
@@ -61,6 +64,47 @@ def _flowaccount_company_name(payload: dict[str, Any]) -> str | None:
         if value:
             return str(value)
     return None
+
+
+def _peak_timestamp() -> str:
+    return datetime.now(tz=UTC).strftime("%Y%m%d%H%M%S")
+
+
+def _peak_signature(timestamp: str, connect_id: str) -> str:
+    return hmac.new(
+        connect_id.encode("utf-8"),
+        timestamp.encode("utf-8"),
+        hashlib.sha1,
+    ).hexdigest()
+
+
+def _peak_headers(
+    *,
+    connect_id: str,
+    client_token: str = "",
+    user_token: str = "",
+) -> dict[str, str]:
+    timestamp = _peak_timestamp()
+    return {
+        "Client-Token": client_token,
+        "User-Token": user_token,
+        "Time-Stamp": timestamp,
+        "Time-Signature": _peak_signature(timestamp, connect_id),
+        "Content-Type": "application/json",
+    }
+
+
+def _peak_node(payload: Any, node_name: str) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    node = payload.get(node_name)
+    if isinstance(node, dict):
+        return node
+    return payload
+
+
+def _peak_success(node: dict[str, Any]) -> bool:
+    return str(node.get("resCode") or "").strip() == "200"
 
 
 def _is_false_provider_flag(value: Any) -> bool:
@@ -268,12 +312,150 @@ def _validation_failed(
     )
 
 
+def _validate_peak_endpoint_access(
+    manifest: ConnectorManifest,
+    *,
+    credentials: dict[str, Any],
+    environment: str,
+) -> dict[str, Any]:
+    if environment not in manifest.environments:
+        return {
+            "status": "validation_failed",
+            "message": f"Unsupported environment for {manifest.connector_id}: {environment}",
+        }
+
+    missing = required_missing_fields(manifest, credentials)
+    if missing:
+        return {"status": "awaiting_credentials", "missing_fields": missing}
+
+    connect_id = str(credentials["connect_id"]).strip()
+    connect_key = str(credentials["connect_key"]).strip()
+    user_token = str(credentials["user_token"]).strip()
+    preset = manifest.preset_for_environment(environment)
+    api_base_url = str(preset["api_base_url"]).rstrip("/")
+    token_url = f"{api_base_url}{preset.get('token_path', '/clienttoken')}"
+
+    try:
+        token_response = httpx.post(
+            token_url,
+            headers=_peak_headers(connect_id=connect_id, user_token=user_token),
+            json={
+                "PeakClientToken": {
+                    "connectId": connect_id,
+                    "password": connect_key,
+                }
+            },
+            timeout=60,
+        )
+    except httpx.HTTPError as exc:
+        return _validation_failed(
+            "PEAK ClientToken request failed before a valid response was received.",
+            credentials=credentials,
+            error=exc,
+        )
+
+    try:
+        token_payload = token_response.json()
+    except ValueError as exc:
+        return _validation_failed(
+            "PEAK ClientToken response was not valid JSON.",
+            credentials=credentials,
+            http_status=token_response.status_code,
+            error=exc,
+        )
+    if not isinstance(token_payload, dict):
+        return _validation_failed(
+            "PEAK ClientToken response JSON was not an object.",
+            credentials=credentials,
+            http_status=token_response.status_code,
+            provider_response=token_payload,
+        )
+
+    token_node = _peak_node(token_payload, "PeakClientToken")
+    client_token = str(token_node.get("token") or "")
+    if token_response.status_code >= 300 or not client_token or not _peak_success(token_node):
+        return _validation_failed(
+            "PEAK ClientToken request failed.",
+            credentials=credentials,
+            http_status=token_response.status_code,
+            provider_response=token_payload,
+            extra_sensitive_values=(client_token,),
+        )
+
+    try:
+        user_response = httpx.get(
+            f"{api_base_url}/user",
+            headers=_peak_headers(
+                connect_id=connect_id,
+                client_token=client_token,
+                user_token=user_token,
+            ),
+            timeout=60,
+        )
+    except httpx.HTTPError as exc:
+        return _validation_failed(
+            "PEAK user request failed before a valid response was received.",
+            credentials=credentials,
+            error=exc,
+            extra_sensitive_values=(client_token,),
+        )
+
+    try:
+        user_payload = user_response.json()
+    except ValueError as exc:
+        return _validation_failed(
+            "PEAK user response was not valid JSON.",
+            credentials=credentials,
+            http_status=user_response.status_code,
+            error=exc,
+            extra_sensitive_values=(client_token,),
+        )
+    if not isinstance(user_payload, dict):
+        return _validation_failed(
+            "PEAK user response JSON was not an object.",
+            credentials=credentials,
+            http_status=user_response.status_code,
+            provider_response=user_payload,
+            extra_sensitive_values=(client_token,),
+        )
+
+    user_node = _peak_node(user_payload, "PeakUser")
+    if user_response.status_code >= 300 or not _peak_success(user_node):
+        return _validation_failed(
+            "PEAK user request failed.",
+            credentials=credentials,
+            http_status=user_response.status_code,
+            provider_response=user_payload,
+            extra_sensitive_values=(client_token,),
+        )
+
+    return {
+        "status": "connected_read_only",
+        "connector_id": manifest.connector_id,
+        "environment": environment,
+        "company_name": None,
+        "enabled_capabilities": manifest.capabilities,
+        "validation": {
+            "clienttoken_status": token_response.status_code,
+            "user_status": user_response.status_code,
+            "user_res_code": str(user_node.get("resCode") or ""),
+        },
+    }
+
+
 def validate_connector_read_only(
     manifest: ConnectorManifest,
     *,
     credentials: dict[str, Any],
     environment: str,
 ) -> dict[str, Any]:
+    if manifest.connector_id == "peak":
+        return _validate_peak_endpoint_access(
+            manifest,
+            credentials=credentials,
+            environment=environment,
+        )
+
     if manifest.connector_id != "flowaccount":
         return {
             "status": "validation_failed",

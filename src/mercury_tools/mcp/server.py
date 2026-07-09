@@ -1013,7 +1013,7 @@ def validate_connector_connection(
     environment: str,
     credentials: dict[str, Any],
 ) -> dict[str, Any]:
-    """Validate one connector through read-only API calls and return sanitized status."""
+    """Validate one connector through safe setup calls and return sanitized status."""
     try:
         settings = load_settings()
         token_payload = _client_token_payload_from_value(client_token)
@@ -1053,9 +1053,15 @@ def validate_connector_connection(
         payload = redact_json(payload)
         validation = result.get("validation")
         if isinstance(validation, dict):
+            public_validation = {
+                "token_status": validation.get("token_status")
+                or validation.get("clienttoken_status"),
+                "company_info_status": validation.get("company_info_status")
+                or validation.get("user_status"),
+                "user_res_code": validation.get("user_res_code"),
+            }
             payload["validation"] = {
-                "token_status": validation.get("token_status"),
-                "company_info_status": validation.get("company_info_status"),
+                key: value for key, value in public_validation.items() if value is not None
             }
         _audit(
             "validate_connector_connection",

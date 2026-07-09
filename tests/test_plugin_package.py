@@ -37,6 +37,12 @@ EXPECTED_SKILLS = {
         "start_connector_setup",
         "validate_connector_connection",
     ],
+    "peak-connector-setup-th": [
+        "list_connectors",
+        "start_connector_setup",
+        "submit_connector_credentials",
+        "validate_connector_connection",
+    ],
     "mercury-flow-runner": [
         "workspace_connector_status",
         "list_workspace_flows",

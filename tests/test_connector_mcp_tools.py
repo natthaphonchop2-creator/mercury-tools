@@ -777,7 +777,6 @@ def test_workspace_connector_ready_blocks_setup_targets_even_if_profile_claims_r
     from mercury_tools.mcp.server import workspace_connector_ready
 
     for connector_id, environment in (
-        ("peak", "production"),
         ("express", "local"),
         ("custom", "production"),
     ):
@@ -797,6 +796,48 @@ def test_workspace_connector_ready_blocks_setup_targets_even_if_profile_claims_r
             environment=environment,
             required_capabilities=["company.info.read"],
         )
+
+
+def test_workspace_connector_ready_accepts_peak_endpoint_capability() -> None:
+    from mercury_tools.mcp.server import workspace_connector_ready
+
+    dashboard = {
+        "connector_profiles": [
+            ready_connector_profile(
+                connector_id="peak",
+                environment="production",
+                capabilities=["user.info.read", "documents.invoice.create"],
+            )
+        ]
+    }
+
+    assert workspace_connector_ready(
+        dashboard,
+        connector_id="peak",
+        environment="production",
+        required_capabilities=["documents.invoice.create"],
+    )
+
+
+def test_workspace_connector_ready_blocks_peak_capability_outside_manifest() -> None:
+    from mercury_tools.mcp.server import workspace_connector_ready
+
+    dashboard = {
+        "connector_profiles": [
+            ready_connector_profile(
+                connector_id="peak",
+                environment="production",
+                capabilities=["user.info.read", "company.info.read"],
+            )
+        ]
+    }
+
+    assert not workspace_connector_ready(
+        dashboard,
+        connector_id="peak",
+        environment="production",
+        required_capabilities=["company.info.read"],
+    )
 
 
 def test_workspace_connector_ready_blocks_capabilities_outside_manifest() -> None:
@@ -1183,7 +1224,9 @@ def test_run_workspace_flow_blocks_selected_connector_mismatch(monkeypatch) -> N
     assert "connector credential setup" in payload["message"]
 
 
-def test_run_workspace_flow_blocks_peak_setup_target_claiming_ready(monkeypatch) -> None:
+def test_run_workspace_flow_blocks_peak_profile_with_unknown_capability(
+    monkeypatch,
+) -> None:
     from mercury_tools.mcp import server
 
     class FakeStore:
@@ -1206,7 +1249,9 @@ def test_run_workspace_flow_blocks_peak_setup_target_claiming_ready(monkeypatch)
             }
 
         def get_flow(self, *, token_payload, flow_id):
-            raise AssertionError("PEAK setup target should not load the flow")
+            raise AssertionError(
+                "PEAK profile with unsupported capabilities should not load the flow"
+            )
 
     configure_product_env(monkeypatch)
     monkeypatch.setattr(server, "_product_store", lambda settings=None: FakeStore())

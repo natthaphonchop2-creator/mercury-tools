@@ -17,13 +17,29 @@ def test_flowaccount_manifest_has_presets_and_capabilities() -> None:
     assert manifest.validation.read_only is True
 
 
-def test_setup_target_manifests_are_visible_but_not_live() -> None:
+def test_peak_manifest_uses_real_open_api_setup_fields() -> None:
     peak = connector_by_id("peak")
     express = connector_by_id("express")
     custom = connector_by_id("custom")
 
     assert peak is not None
-    assert peak.status == "setup_target"
+    assert peak.status == "available"
+    assert peak.required_secret_fields == [
+        "connect_id",
+        "connect_key",
+        "application_code",
+        "user_token",
+    ]
+    assert peak.preset["auth_method"] == "hmac_sha1_client_token"
+    assert peak.preset["token_path"] == "/clienttoken"
+    assert peak.environment_presets["uat"]["api_base_url"] == (
+        "https://peakengineapidev.azurewebsites.net/api/v1"
+    )
+    assert "user.info.read" in peak.capabilities
+    assert "documents.invoice.list" in peak.capabilities
+    assert "documents.invoice.create" in peak.capabilities
+    assert "daily_journal.create" in peak.capabilities
+    assert "contacts.create" in peak.capabilities
     assert express is not None
     assert express.status == "setup_target"
     assert custom is not None

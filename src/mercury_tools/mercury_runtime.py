@@ -43,14 +43,19 @@ def connector_status() -> dict[str, Any]:
 
 def skill_markdown(skill_id: str) -> str | None:
     base = mercury_agent_path()
-    if not base:
-        return None
+    repo_root = Path(__file__).resolve().parents[2]
     candidates = [
-        base / "mercury_accounting" / "skills" / skill_id / "SKILL.md",
-        base / "skills" / "accounting" / skill_id / "SKILL.md",
+        repo_root / "plugins" / "mercury-finance" / "skills" / skill_id / "SKILL.md",
+        repo_root / "skills" / "accounting" / skill_id / "SKILL.md",
     ]
+    if base:
+        candidates.extend(
+            [
+                base / "mercury_accounting" / "skills" / skill_id / "SKILL.md",
+                base / "skills" / "accounting" / skill_id / "SKILL.md",
+            ]
+        )
     for candidate in candidates:
         if candidate.exists():
             return candidate.read_text(encoding="utf-8")
     return None
-

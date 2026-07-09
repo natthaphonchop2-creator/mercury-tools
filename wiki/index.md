@@ -14,8 +14,8 @@ source_uri: mercury://wiki/index
 ## Connectors
 
 - [FlowAccount Connector](connectors/flowaccount.md) — FlowAccount connector capabilities and setup context.
+- [PEAK Open API Connector](connectors/peak-open-api.md) — PEAK credential requirements, UAT/production endpoints, auth flow, setup validation, and GET/POST capability groups.
 
 ## Workflows
 
 - [Management Report Context Pack](workflows/management-report-context-pack.md) — minimum context for management reports.
-
