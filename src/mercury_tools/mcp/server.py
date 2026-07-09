@@ -15,6 +15,8 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
 from mercury_tools.config import load_settings
+from mercury_tools.connectors.catalog import connector_by_id, list_connector_summaries
+from mercury_tools.connectors.setup import required_missing_fields
 from mercury_tools.db.product import SupabaseProductStore, slugify
 from mercury_tools.db.supabase import SupabaseRagStore
 from mercury_tools.flows.parser import FlowValidationError, validate_flow_text
@@ -394,6 +396,164 @@ def get_document(document_id: str) -> dict[str, Any]:
     payload = redact_json({"status": "ok" if document else "not_found", "document": document})
     _audit("get_document", {"document_id": document_id}, {"found": bool(document)})
     return payload
+
+
+@mcp.tool()
+def list_connectors() -> dict[str, Any]:
+    """List Mercury accounting and ERP connector options without secrets."""
+    payload = redact_json({"status": "ok", "connectors": list_connector_summaries()})
+    _audit("list_connectors", {}, {"count": len(payload["connectors"])})
+    return payload
+
+
+@mcp.tool()
+def start_connector_setup(
+    client_token: str,
+    connector_id: str,
+    environment: str,
+    company_name: str | None = None,
+) -> dict[str, Any]:
+    """Start gated connector setup for one workspace."""
+    try:
+        settings = load_settings()
+        token_payload = _client_token_payload_from_value(client_token)
+        profile = _product_store(settings).start_connector_setup(
+            token_payload=token_payload,
+            connector_id=connector_id,
+            environment=environment,
+            company_name=company_name,
+        )
+        payload = redact_json({"status": "ok", "profile": profile})
+        _audit(
+            "start_connector_setup",
+            {**_client_token_audit_ref(client_token), "connector_id": connector_id},
+            {
+                "status": "ok",
+                "connector_id": connector_id,
+                "environment": environment,
+            },
+        )
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit(
+            "start_connector_setup",
+            {**_client_token_audit_ref(client_token), "connector_id": connector_id},
+            payload,
+        )
+        return payload
+
+
+@mcp.tool()
+def submit_connector_credentials(
+    client_token: str,
+    connector_id: str,
+    environment: str,
+    credentials: dict[str, Any],
+) -> dict[str, Any]:
+    """Store connector credentials server-side after checking required fields."""
+    try:
+        manifest = connector_by_id(connector_id)
+        if not manifest:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        missing = required_missing_fields(manifest, credentials)
+        if missing:
+            payload = {
+                "status": "awaiting_credentials",
+                "missing_fields": missing,
+                "message": "Required connector credentials are missing.",
+            }
+            _audit(
+                "submit_connector_credentials",
+                {**_client_token_audit_ref(client_token), "connector_id": connector_id},
+                payload,
+            )
+            return payload
+
+        settings = load_settings()
+        token_payload = _client_token_payload_from_value(client_token)
+        result = _product_store(settings).set_connector_credentials(
+            token_payload=token_payload,
+            connector_id=connector_id,
+            environment=environment,
+            credentials={str(key): str(value) for key, value in credentials.items()},
+        )
+        payload = redact_json({"status": "credentials_received", "result": result})
+        _audit(
+            "submit_connector_credentials",
+            {**_client_token_audit_ref(client_token), "connector_id": connector_id},
+            {
+                "status": "credentials_received",
+                "credential_fields": result["credential_fields"],
+            },
+        )
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit(
+            "submit_connector_credentials",
+            {**_client_token_audit_ref(client_token), "connector_id": connector_id},
+            payload,
+        )
+        return payload
+
+
+@mcp.tool()
+def validate_connector_connection(
+    client_token: str,
+    connector_id: str,
+    environment: str,
+    credentials: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a Task 3 validation placeholder without calling external ERP APIs."""
+    try:
+        _client_token_payload_from_value(client_token)
+        manifest = connector_by_id(connector_id)
+        if not manifest:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        if environment not in manifest.environments:
+            raise ValueError(f"Unsupported environment for {manifest.connector_id}: {environment}")
+        missing = required_missing_fields(manifest, credentials)
+        if missing:
+            payload = {
+                "status": "awaiting_credentials",
+                "connector_id": manifest.connector_id,
+                "environment": environment,
+                "missing_fields": missing,
+                "message": "Required connector credentials are missing.",
+            }
+        else:
+            payload = {
+                "status": "not_validated",
+                "connector_id": manifest.connector_id,
+                "environment": environment,
+                "read_only": manifest.validation.read_only,
+                "validation_method": manifest.validation.method,
+                "message": "Task 4 will perform read-only ERP API validation.",
+            }
+        payload = redact_json(payload)
+        _audit(
+            "validate_connector_connection",
+            {
+                **_client_token_audit_ref(client_token),
+                "connector_id": connector_id,
+                "environment": environment,
+                "credential_fields": sorted(str(key) for key in credentials),
+            },
+            {
+                "status": payload["status"],
+                "connector_id": payload.get("connector_id"),
+            },
+        )
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit(
+            "validate_connector_connection",
+            {**_client_token_audit_ref(client_token), "connector_id": connector_id},
+            payload,
+        )
+        return payload
 
 
 @mcp.tool()

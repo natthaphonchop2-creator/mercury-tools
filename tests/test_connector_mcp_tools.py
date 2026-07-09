@@ -1,0 +1,185 @@
+from __future__ import annotations
+
+from typing import Any
+
+from mercury_tools.config import Settings
+from mercury_tools.product import ConnectRequest, create_client_token
+
+
+def make_client_token() -> str:
+    return create_client_token(
+        Settings(
+            supabase_url="https://example.supabase.co",
+            supabase_service_role_key="service-role",
+            openai_api_key="",
+            connect_signing_secret="signing-secret",
+        ),
+        ConnectRequest(
+            email="owner@example.com",
+            company="Demo Co",
+            host_app="codex",
+            invite_code="invite",
+        ),
+        now=1783536613,
+    )
+
+
+def configure_product_env(monkeypatch) -> None:
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
+    monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
+
+
+def test_list_connectors_exposes_setup_targets_without_secrets() -> None:
+    from mercury_tools.mcp.server import list_connectors
+
+    payload = list_connectors()
+
+    assert payload["status"] == "ok"
+    assert {item["connector_id"] for item in payload["connectors"]} >= {
+        "flowaccount",
+        "peak",
+        "express",
+    }
+    assert "super-secret" not in str(payload)
+    assert "client_secret_value" not in str(payload)
+
+
+def test_start_connector_setup_requires_valid_connector(monkeypatch) -> None:
+    from mercury_tools.mcp.server import start_connector_setup
+
+    configure_product_env(monkeypatch)
+
+    invalid = start_connector_setup(
+        client_token=make_client_token(),
+        connector_id="unknown",
+        environment="production",
+    )
+
+    assert invalid["status"] == "error"
+    assert "Unknown connector" in invalid["message"]
+
+
+def test_start_connector_setup_returns_redacted_profile(monkeypatch) -> None:
+    from mercury_tools.mcp import server
+
+    configure_product_env(monkeypatch)
+
+    class FakeStore:
+        def start_connector_setup(
+            self,
+            *,
+            token_payload: dict[str, Any],
+            connector_id: str,
+            environment: str,
+            company_name: str | None = None,
+        ) -> dict[str, Any]:
+            assert token_payload["sub"] == "owner@example.com"
+            return {
+                "connector_id": connector_id,
+                "environment": environment,
+                "company_name": company_name,
+                "status": "requires_credentials",
+                "metadata": {"client_secret": "super-secret-value"},
+            }
+
+    monkeypatch.setattr(server, "_product_store", lambda settings: FakeStore())
+
+    payload = server.start_connector_setup(
+        client_token=make_client_token(),
+        connector_id="flowaccount",
+        environment="production",
+        company_name="Demo Co Books",
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["profile"]["connector_id"] == "flowaccount"
+    assert payload["profile"]["company_name"] == "Demo Co Books"
+    assert payload["profile"]["metadata"]["client_secret"] == "[REDACTED]"
+    assert "super-secret-value" not in str(payload)
+
+
+def test_submit_connector_credentials_reports_missing_required_fields(monkeypatch) -> None:
+    from mercury_tools.mcp.server import submit_connector_credentials
+
+    configure_product_env(monkeypatch)
+
+    payload = submit_connector_credentials(
+        client_token=make_client_token(),
+        connector_id="flowaccount",
+        environment="production",
+        credentials={"client_id": "demo-client-id"},
+    )
+
+    assert payload["status"] == "awaiting_credentials"
+    assert payload["missing_fields"] == ["client_secret"]
+    assert "Required connector credentials are missing" in payload["message"]
+
+
+def test_submit_connector_credentials_stores_only_field_names(monkeypatch) -> None:
+    from mercury_tools.mcp import server
+
+    configure_product_env(monkeypatch)
+
+    class FakeStore:
+        def set_connector_credentials(
+            self,
+            *,
+            token_payload: dict[str, Any],
+            connector_id: str,
+            environment: str,
+            credentials: dict[str, str],
+        ) -> dict[str, Any]:
+            assert token_payload["sub"] == "owner@example.com"
+            assert credentials == {
+                "client_id": "demo-client-id",
+                "client_secret": "super-secret-value",
+            }
+            return {
+                "status": "credentials_configured",
+                "connector_id": connector_id,
+                "environment": environment,
+                "credential_fields": sorted(credentials),
+                "credential_fingerprints": {"client_secret": "abc123"},
+            }
+
+    monkeypatch.setattr(server, "_product_store", lambda settings: FakeStore())
+
+    payload = server.submit_connector_credentials(
+        client_token=make_client_token(),
+        connector_id="flowaccount",
+        environment="production",
+        credentials={
+            "client_id": "demo-client-id",
+            "client_secret": "super-secret-value",
+        },
+    )
+
+    assert payload["status"] == "credentials_received"
+    assert payload["result"]["credential_fields"] == ["client_id", "client_secret"]
+    assert "super-secret-value" not in str(payload)
+    assert "demo-client-id" not in str(payload)
+
+
+def test_validate_connector_connection_is_non_http_stub(monkeypatch) -> None:
+    from mercury_tools.mcp.server import validate_connector_connection
+
+    configure_product_env(monkeypatch)
+
+    payload = validate_connector_connection(
+        client_token=make_client_token(),
+        connector_id="flowaccount",
+        environment="production",
+        credentials={
+            "client_id": "demo-client-id",
+            "client_secret": "super-secret-value",
+        },
+    )
+
+    assert payload["status"] == "not_validated"
+    assert payload["connector_id"] == "flowaccount"
+    assert payload["environment"] == "production"
+    assert payload["read_only"] is True
+    assert "Task 4" in payload["message"]
+    assert "super-secret-value" not in str(payload)
+    assert "demo-client-id" not in str(payload)
