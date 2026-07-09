@@ -18,4 +18,4 @@ RUN pip install --no-cache-dir .
 
 EXPOSE 8000
 
-CMD ["mercury-tools", "mcp", "serve", "--transport", "streamable-http"]
+CMD ["mercury-tools", "mcp", "serve", "--transport", "streamable-http", "--allow-unauthenticated"]
