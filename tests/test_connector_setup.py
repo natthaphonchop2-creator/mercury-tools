@@ -1,3 +1,4 @@
+import httpx
 import pytest
 
 from mercury_tools.config import Settings
@@ -10,6 +11,12 @@ from mercury_tools.connectors.setup import (
     validate_connector_read_only,
 )
 from mercury_tools.db.product import SupabaseProductStore
+
+
+def assert_values_absent(payload: dict, values: list[str]) -> None:
+    serialized = str(payload)
+    for value in values:
+        assert value not in serialized
 
 
 def test_setup_states_are_ordered_and_explicit() -> None:
@@ -84,6 +91,69 @@ def test_validate_flowaccount_uses_token_and_company_info(monkeypatch) -> None:
         ("POST", "https://openapi.flowaccount.com/token"),
         ("GET", "https://openapi.flowaccount.com/v1/company/info"),
     ]
+
+
+def test_validate_flowaccount_http_error_returns_sanitized_validation_failed(
+    monkeypatch,
+) -> None:
+    manifest = connector_by_id("flowaccount")
+    assert manifest is not None
+
+    def fake_post(url, data=None, timeout=60):
+        raise httpx.ConnectError(
+            "network failed for client-id-leak and client-secret-leak"
+        )
+
+    monkeypatch.setattr("httpx.post", fake_post)
+
+    result = validate_connector_read_only(
+        manifest,
+        credentials={
+            "client_id": "client-id-leak",
+            "client_secret": "client-secret-leak",
+        },
+        environment="production",
+    )
+
+    assert result["status"] == "validation_failed"
+    assert result["error_type"] == "ConnectError"
+    assert "Traceback" not in str(result)
+    assert_values_absent(result, ["client-id-leak", "client-secret-leak"])
+
+
+def test_validate_flowaccount_invalid_json_returns_sanitized_validation_failed(
+    monkeypatch,
+) -> None:
+    manifest = connector_by_id("flowaccount")
+    assert manifest is not None
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            raise ValueError(
+                "invalid JSON for client-id-leak and client-secret-leak"
+            )
+
+    def fake_post(url, data=None, timeout=60):
+        return FakeResponse()
+
+    monkeypatch.setattr("httpx.post", fake_post)
+
+    result = validate_connector_read_only(
+        manifest,
+        credentials={
+            "client_id": "client-id-leak",
+            "client_secret": "client-secret-leak",
+        },
+        environment="production",
+    )
+
+    assert result["status"] == "validation_failed"
+    assert result["http_status"] == 200
+    assert result["error_type"] == "ValueError"
+    assert "Traceback" not in str(result)
+    assert_values_absent(result, ["client-id-leak", "client-secret-leak"])
 
 
 def test_next_setup_state_does_not_skip_credentials() -> None:

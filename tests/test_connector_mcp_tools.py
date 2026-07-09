@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
+
 from mercury_tools.config import Settings
 from mercury_tools.product import ConnectRequest, create_client_token
 
@@ -27,6 +29,12 @@ def configure_product_env(monkeypatch) -> None:
     monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
     monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
     monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
+
+
+def assert_values_absent(payload: dict[str, Any], values: list[str]) -> None:
+    serialized = str(payload)
+    for value in values:
+        assert value not in serialized
 
 
 def test_list_connectors_exposes_setup_targets_without_secrets() -> None:
@@ -290,3 +298,172 @@ def test_validate_connector_connection_validates_flowaccount_read_only(monkeypat
     assert "super-secret-value" not in str(payload)
     assert "demo-client-id" not in str(payload)
     assert "secret-token" not in str(payload)
+
+
+def test_validate_connector_connection_token_failure_sanitizes_provider_echoes(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    configure_product_env(monkeypatch)
+
+    class FakeResponse:
+        def __init__(self, status_code: int, payload: dict[str, Any]):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake_post(url, data=None, timeout=60):
+        return FakeResponse(
+            401,
+            {
+                "error": "invalid_client",
+                "client_id": "demo-client-id",
+                "client_secret": "super-secret-value",
+                "detail": (
+                    "FlowAccount echoed demo-client-id and super-secret-value "
+                    "with echoed-access-token"
+                ),
+                "access_token": "echoed-access-token",
+                "credential_fingerprints": {"client_secret": "fingerprint-leak"},
+                "ciphertext": "ciphertext-leak",
+            },
+        )
+
+    def fake_get(url, headers=None, timeout=60):
+        raise AssertionError("company info should not be called after token failure")
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    monkeypatch.setattr("httpx.get", fake_get)
+    monkeypatch.setattr(server, "_audit", lambda *args, **kwargs: None)
+
+    payload = server.validate_connector_connection(
+        client_token=make_client_token(),
+        connector_id="flowaccount",
+        environment="production",
+        credentials={
+            "client_id": "demo-client-id",
+            "client_secret": "super-secret-value",
+        },
+    )
+
+    assert payload["status"] == "validation_failed"
+    provider_response = payload["provider_response"]
+    assert provider_response["client_id"] == "[REDACTED]"
+    assert provider_response["client_secret"] == "[REDACTED]"
+    assert provider_response["access_token"] == "[REDACTED]"
+    assert provider_response["credential_fingerprints"] == "[REDACTED]"
+    assert provider_response["ciphertext"] == "[REDACTED]"
+    assert_values_absent(
+        payload,
+        [
+            "demo-client-id",
+            "super-secret-value",
+            "echoed-access-token",
+            "fingerprint-leak",
+            "ciphertext-leak",
+        ],
+    )
+
+
+def test_validate_connector_connection_company_info_failure_sanitizes_provider_echoes(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    configure_product_env(monkeypatch)
+
+    class FakeResponse:
+        def __init__(self, status_code: int, payload: dict[str, Any]):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake_post(url, data=None, timeout=60):
+        return FakeResponse(
+            200,
+            {"access_token": "secret-token", "token_type": "Bearer"},
+        )
+
+    def fake_get(url, headers=None, timeout=60):
+        assert headers == {"Authorization": "Bearer secret-token"}
+        return FakeResponse(
+            403,
+            {
+                "error": "forbidden",
+                "client_id": "demo-client-id",
+                "client_secret": "super-secret-value",
+                "detail": (
+                    "Company info echoed demo-client-id, super-secret-value, "
+                    "and secret-token"
+                ),
+                "credential_fingerprints": {"client_secret": "fingerprint-leak"},
+                "ciphertext": "ciphertext-leak",
+            },
+        )
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    monkeypatch.setattr("httpx.get", fake_get)
+    monkeypatch.setattr(server, "_audit", lambda *args, **kwargs: None)
+
+    payload = server.validate_connector_connection(
+        client_token=make_client_token(),
+        connector_id="flowaccount",
+        environment="production",
+        credentials={
+            "client_id": "demo-client-id",
+            "client_secret": "super-secret-value",
+        },
+    )
+
+    assert payload["status"] == "validation_failed"
+    provider_response = payload["provider_response"]
+    assert provider_response["client_id"] == "[REDACTED]"
+    assert provider_response["client_secret"] == "[REDACTED]"
+    assert provider_response["credential_fingerprints"] == "[REDACTED]"
+    assert provider_response["ciphertext"] == "[REDACTED]"
+    assert_values_absent(
+        payload,
+        [
+            "demo-client-id",
+            "super-secret-value",
+            "secret-token",
+            "fingerprint-leak",
+            "ciphertext-leak",
+        ],
+    )
+
+
+def test_validate_connector_connection_http_error_is_sanitized(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    configure_product_env(monkeypatch)
+
+    def fake_post(url, data=None, timeout=60):
+        raise httpx.ReadError(
+            "read failed with demo-client-id and super-secret-value"
+        )
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    monkeypatch.setattr(server, "_audit", lambda *args, **kwargs: None)
+
+    payload = server.validate_connector_connection(
+        client_token=make_client_token(),
+        connector_id="flowaccount",
+        environment="production",
+        credentials={
+            "client_id": "demo-client-id",
+            "client_secret": "super-secret-value",
+        },
+    )
+
+    assert payload["status"] == "validation_failed"
+    assert payload["error_type"] == "ReadError"
+    assert "Traceback" not in str(payload)
+    assert_values_absent(payload, ["demo-client-id", "super-secret-value"])
