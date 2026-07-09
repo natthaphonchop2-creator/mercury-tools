@@ -935,6 +935,54 @@ tags: [accounting]
     assert root.find("./testcase/failure") is not None
 
 
+def test_flow_cli_run_suite_writes_html_report(tmp_path: Path, capsys) -> None:
+    flows = tmp_path / "flows"
+    flows.mkdir()
+    (tmp_path / "config.yaml").write_text(
+        """
+flows: flows/**/*.yaml
+includeTags: [accounting]
+""",
+        encoding="utf-8",
+    )
+    (flows / "good.yaml").write_text(
+        """
+name: Good HTML
+tags: [accounting]
+---
+- emitReport:
+    title: "Good HTML report"
+    sections:
+      - "Readable handoff artifact"
+""",
+        encoding="utf-8",
+    )
+    output = tmp_path / "report.html"
+
+    assert (
+        main(
+            [
+                "flow",
+                "run-suite",
+                str(tmp_path),
+                "--format",
+                "html",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+
+    cli_output = capsys.readouterr().out
+    html = output.read_text(encoding="utf-8")
+    assert f"html: {output.resolve()}" in cli_output
+    assert "Mercury Flow Suite Report" in html
+    assert "Good HTML" in html
+    assert "Good HTML report" in html
+    assert "Status" in html
+
+
 def test_flow_cli_run_suite_allow_failures_keeps_zero_exit(tmp_path: Path) -> None:
     flows = tmp_path / "flows"
     flows.mkdir()

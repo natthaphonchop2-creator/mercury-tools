@@ -155,6 +155,7 @@ Workspace quickstart:
 - mercury-tools flow run-suite ./my-mercury-flows --dry-run -e month=2026-09
 - mercury-tools flow watch ./my-mercury-flows --dry-run
 - mercury-tools flow run-suite ./my-mercury-flows --format junit --output reports/junit.xml
+- mercury-tools flow run-suite ./my-mercury-flows --format html --output reports/flow-report.html
 - mercury-tools flow push ./my-mercury-flows --dry-run
 
 Workspace config keys:
@@ -168,7 +169,8 @@ Workspace config keys:
 
 CI reporting:
 - --format junit writes JUnit XML.
-- --output sets the report path, defaulting to report.xml.
+- --format html writes a readable HTML suite report.
+- --output sets the report path, defaulting to report.xml or report.html.
 - failed suites exit with code 1 unless --allow-failures is set.
 """
 

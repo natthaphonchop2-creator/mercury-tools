@@ -221,6 +221,7 @@ Flow CLI:
 - `mercury-tools flow list <workspace> --tag accounting`
 - `mercury-tools flow run-suite <workspace> --dry-run --exclude-tag disabled -e month=2026-09`
 - `mercury-tools flow run-suite <workspace> --format junit --output reports/junit.xml`
+- `mercury-tools flow run-suite <workspace> --format html --output reports/flow-report.html`
 - `mercury-tools flow watch <workspace> --dry-run`
 - `mercury-tools flow push <workspace> --url https://mercury-tools-mcp.onrender.com --client-token <mc_...>`
 - `mercury-tools flow cheat-sheet`
@@ -329,9 +330,10 @@ When `testOutputDir` is set, `flow run-suite` writes
 sanitized variables.
 
 For CI systems, `flow run-suite --format junit --output <path>` writes a JUnit
-XML report. A failed suite exits with code `1` by default; pass
-`--allow-failures` only when a pipeline should collect the report without
-failing the job.
+XML report. For demo reviews or accountant handoffs,
+`flow run-suite --format html --output <path>` writes a readable HTML report.
+A failed suite exits with code `1` by default; pass `--allow-failures` only when
+a pipeline should collect the report without failing the job.
 
 Flow MCP tools:
 
