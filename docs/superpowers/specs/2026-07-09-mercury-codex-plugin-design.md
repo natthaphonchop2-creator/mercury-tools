@@ -30,7 +30,7 @@ Expected flow:
 
 1. Open Codex.
 2. Add a plugin marketplace from GitHub.
-3. Use the Mercury Tools repository:
+3. Use the Mercury Tools repository source:
 
 ```text
 https://github.com/natthaphonchop2-creator/mercury-tools
@@ -42,10 +42,12 @@ https://github.com/natthaphonchop2-creator/mercury-tools
 main
 ```
 
-5. Use relative marketplace path:
+5. If Codex asks for sparse paths, include both marketplace metadata and the
+   plugin folder:
 
 ```text
 .agents/plugins
+plugins/mercury-finance
 ```
 
 6. Codex discovers the `Mercury Finance` plugin.
@@ -54,6 +56,20 @@ main
 
 This keeps the security confirmation boundary inside Codex while removing the
 manual clone/setup burden from the contest demo.
+
+CLI-equivalent setup for judges or maintainers:
+
+```bash
+codex plugin marketplace add natthaphonchop2-creator/mercury-tools \
+  --ref main \
+  --sparse .agents/plugins \
+  --sparse plugins/mercury-finance
+```
+
+The marketplace file lives at `.agents/plugins/marketplace.json`, but the
+marketplace root is the repository root. Therefore `source.path` entries should
+point to `./plugins/mercury-finance`, not to a path relative to
+`.agents/plugins/`.
 
 ## Repository Structure
 
@@ -134,7 +150,8 @@ The plugin MCP config should point to the Render deployment:
   "mcpServers": {
     "mercury-tools": {
       "type": "http",
-      "url": "https://mercury-tools-mcp.onrender.com/mcp"
+      "url": "https://mercury-tools-mcp.onrender.com/mcp",
+      "bearer_token_env_var": "MERCURY_TOOLS_MCP_TOKEN"
     }
   }
 }
@@ -231,7 +248,8 @@ Normal contest path:
 1. The judge installs the plugin.
 2. The judge opens Mercury Connect if Codex asks for MCP authentication.
 3. Mercury Connect issues a scoped user or workspace client token.
-4. The judge pastes that token into the host app's secure MCP auth prompt.
+4. The judge provides that token through Codex's secure MCP auth path or as the
+   local environment variable `MERCURY_TOOLS_MCP_TOKEN`.
 5. Codex uses the MCP endpoint through the plugin configuration.
 
 The design keeps server bearer tokens and Supabase service role keys on Render.
