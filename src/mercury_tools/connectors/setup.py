@@ -80,14 +80,30 @@ def _collect_sensitive_values(value: Any, collected: list[str]) -> None:
         collected.append(text)
 
 
+def _collect_values_from_sensitive_keys(value: Any, collected: list[str]) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if _is_sensitive_validation_key(key):
+                _collect_sensitive_values(item, collected)
+            else:
+                _collect_values_from_sensitive_keys(item, collected)
+        return
+    if isinstance(value, list | tuple | set):
+        for item in value:
+            _collect_values_from_sensitive_keys(item, collected)
+
+
 def _sensitive_values(
     credentials: dict[str, Any],
     extra_sensitive_values: tuple[Any, ...] = (),
+    provider_response: Any | None = None,
 ) -> tuple[str, ...]:
     values: list[str] = []
     _collect_sensitive_values(credentials, values)
     for item in extra_sensitive_values:
         _collect_sensitive_values(item, values)
+    if provider_response is not None:
+        _collect_values_from_sensitive_keys(provider_response, values)
 
     return tuple(dict.fromkeys(sorted(values, key=len, reverse=True)))
 
@@ -96,7 +112,19 @@ def _is_sensitive_validation_key(key: Any) -> bool:
     normalized = str(key).strip().lower().replace("-", "_")
     return normalized in _SENSITIVE_VALIDATION_KEYS or any(
         marker in normalized
-        for marker in ("secret", "token", "password", "api_key", "apikey")
+        for marker in (
+            "api_key",
+            "apikey",
+            "authorization",
+            "ciphertext",
+            "client_id",
+            "client_secret",
+            "credential",
+            "fingerprint",
+            "password",
+            "secret",
+            "token",
+        )
     )
 
 
@@ -107,6 +135,33 @@ def _mask_sensitive_text(text: str, sensitive_values: tuple[str, ...]) -> str:
     return str(redact_json(masked))
 
 
+def _sanitize_validation_failure_key(
+    key: Any,
+    sensitive_values: tuple[str, ...],
+) -> Any:
+    if _is_sensitive_validation_key(key):
+        return "[REDACTED_KEY]"
+
+    key_text = str(key)
+    masked_key = _mask_sensitive_text(key_text, sensitive_values)
+    if masked_key != key_text:
+        return masked_key
+    return key
+
+
+def _dedupe_validation_key(key: Any, existing: dict[Any, Any]) -> Any:
+    if key not in existing:
+        return key
+
+    base = str(key)
+    counter = 2
+    candidate = f"{base}_{counter}"
+    while candidate in existing:
+        counter += 1
+        candidate = f"{base}_{counter}"
+    return candidate
+
+
 def _sanitize_validation_failure_value(
     value: Any,
     sensitive_values: tuple[str, ...],
@@ -114,10 +169,14 @@ def _sanitize_validation_failure_value(
     if isinstance(value, dict):
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
+            redacted_key = _dedupe_validation_key(
+                _sanitize_validation_failure_key(key, sensitive_values),
+                redacted,
+            )
             if _is_sensitive_validation_key(key):
-                redacted[key] = "[REDACTED]"
+                redacted[redacted_key] = "[REDACTED]"
             else:
-                redacted[key] = _sanitize_validation_failure_value(
+                redacted[redacted_key] = _sanitize_validation_failure_value(
                     item,
                     sensitive_values,
                 )
@@ -162,7 +221,11 @@ def _validation_failed(
 
     return _sanitize_validation_failure_value(
         payload,
-        _sensitive_values(credentials, extra_sensitive_values),
+        _sensitive_values(
+            credentials,
+            extra_sensitive_values,
+            provider_response=provider_response,
+        ),
     )
 
 

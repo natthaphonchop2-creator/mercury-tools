@@ -37,6 +37,23 @@ def assert_values_absent(payload: dict[str, Any], values: list[str]) -> None:
         assert value not in serialized
 
 
+def assert_key_fragments_absent(payload: dict[str, Any], fragments: list[str]) -> None:
+    keys: list[str] = []
+
+    def collect_keys(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                keys.append(str(key))
+                collect_keys(item)
+        elif isinstance(value, list | tuple):
+            for item in value:
+                collect_keys(item)
+
+    collect_keys(payload)
+    for fragment in fragments:
+        assert all(fragment not in key for key in keys)
+
+
 def test_list_connectors_exposes_setup_targets_without_secrets() -> None:
     from mercury_tools.mcp.server import list_connectors
 
@@ -351,11 +368,16 @@ def test_validate_connector_connection_token_failure_sanitizes_provider_echoes(
 
     assert payload["status"] == "validation_failed"
     provider_response = payload["provider_response"]
-    assert provider_response["client_id"] == "[REDACTED]"
-    assert provider_response["client_secret"] == "[REDACTED]"
-    assert provider_response["access_token"] == "[REDACTED]"
-    assert provider_response["credential_fingerprints"] == "[REDACTED]"
-    assert provider_response["ciphertext"] == "[REDACTED]"
+    assert_key_fragments_absent(
+        provider_response,
+        [
+            "client_id",
+            "client_secret",
+            "access_token",
+            "credential_fingerprints",
+            "ciphertext",
+        ],
+    )
     assert_values_absent(
         payload,
         [
@@ -422,10 +444,15 @@ def test_validate_connector_connection_company_info_failure_sanitizes_provider_e
 
     assert payload["status"] == "validation_failed"
     provider_response = payload["provider_response"]
-    assert provider_response["client_id"] == "[REDACTED]"
-    assert provider_response["client_secret"] == "[REDACTED]"
-    assert provider_response["credential_fingerprints"] == "[REDACTED]"
-    assert provider_response["ciphertext"] == "[REDACTED]"
+    assert_key_fragments_absent(
+        provider_response,
+        [
+            "client_id",
+            "client_secret",
+            "credential_fingerprints",
+            "ciphertext",
+        ],
+    )
     assert_values_absent(
         payload,
         [

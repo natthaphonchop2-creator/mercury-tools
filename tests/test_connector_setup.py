@@ -19,6 +19,23 @@ def assert_values_absent(payload: dict, values: list[str]) -> None:
         assert value not in serialized
 
 
+def assert_key_fragments_absent(payload: dict, fragments: list[str]) -> None:
+    keys: list[str] = []
+
+    def collect_keys(value) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                keys.append(str(key))
+                collect_keys(item)
+        elif isinstance(value, list | tuple):
+            for item in value:
+                collect_keys(item)
+
+    collect_keys(payload)
+    for fragment in fragments:
+        assert all(fragment not in key for key in keys)
+
+
 def test_setup_states_are_ordered_and_explicit() -> None:
     assert CONNECTOR_SETUP_STATES == [
         "not_started",
@@ -154,6 +171,74 @@ def test_validate_flowaccount_invalid_json_returns_sanitized_validation_failed(
     assert result["error_type"] == "ValueError"
     assert "Traceback" not in str(result)
     assert_values_absent(result, ["client-id-leak", "client-secret-leak"])
+
+
+def test_validate_flowaccount_token_failure_sanitizes_provider_response_keys(
+    monkeypatch,
+) -> None:
+    manifest = connector_by_id("flowaccount")
+    assert manifest is not None
+
+    class FakeResponse:
+        status_code = 401
+
+        def json(self):
+            return {
+                "error": "invalid_client",
+                "client_id": "demo-client-id",
+                "client_secret": "super-secret-value",
+                "access_token": "echoed-access-token",
+                "demo-client-id": "invalid client",
+                "prefix-super-secret-value-suffix": "invalid secret",
+                "echoed-access-token": "invalid token",
+                "ciphertext": "ciphertext-secret-value",
+                "credential_fingerprints": {
+                    "client_secret": "fingerprint-secret-value"
+                },
+                "ciphertext-secret-value": "invalid ciphertext",
+                "fingerprint-secret-value": "invalid fingerprint",
+            }
+
+    def fake_post(url, data=None, timeout=60):
+        return FakeResponse()
+
+    monkeypatch.setattr("httpx.post", fake_post)
+
+    result = validate_connector_read_only(
+        manifest,
+        credentials={
+            "client_id": "demo-client-id",
+            "client_secret": "super-secret-value",
+        },
+        environment="production",
+    )
+
+    assert result["status"] == "validation_failed"
+    assert_key_fragments_absent(
+        result,
+        [
+            "client_id",
+            "client_secret",
+            "access_token",
+            "ciphertext",
+            "credential_fingerprints",
+            "demo-client-id",
+            "super-secret-value",
+            "echoed-access-token",
+            "ciphertext-secret-value",
+            "fingerprint-secret-value",
+        ],
+    )
+    assert_values_absent(
+        result,
+        [
+            "demo-client-id",
+            "super-secret-value",
+            "echoed-access-token",
+            "ciphertext-secret-value",
+            "fingerprint-secret-value",
+        ],
+    )
 
 
 def test_next_setup_state_does_not_skip_credentials() -> None:
