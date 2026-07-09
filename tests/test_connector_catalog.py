@@ -27,6 +27,17 @@ def test_setup_target_manifests_are_visible_but_not_live() -> None:
     assert express.status == "setup_target"
 
 
+def test_connector_by_id_is_case_and_whitespace_normalized() -> None:
+    spaced = connector_by_id(" FlowAccount ")
+    upper = connector_by_id("FLOWACCOUNT")
+
+    assert spaced is not None
+    assert upper is not None
+    assert spaced.connector_id == "flowaccount"
+    assert upper.connector_id == "flowaccount"
+    assert spaced.connector_id == upper.connector_id
+
+
 def test_connector_summaries_do_not_include_secrets() -> None:
     summaries = list_connector_summaries()
     serialized = str(summaries).lower()

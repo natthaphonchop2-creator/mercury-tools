@@ -13,7 +13,7 @@ import httpx
 from cryptography.fernet import Fernet
 
 from mercury_tools.config import Settings, require_supabase
-from mercury_tools.connectors.catalog import CONNECTOR_CATALOG, connector_by_id
+from mercury_tools.connectors.catalog import connector_by_id, list_connector_summaries
 from mercury_tools.flows.parser import parse_flow_text
 from mercury_tools.product import ConnectRequest, normalize_host_app
 from mercury_tools.safety.redaction import redact_json
@@ -450,7 +450,7 @@ class SupabaseProductStore:
             "status": "ok",
             "storage": "audit_fallback",
             **context,
-            "connectors": [connector.summary() for connector in CONNECTOR_CATALOG],
+            "connectors": list_connector_summaries(),
             "connector_profiles": list(connector_profiles.values()),
             "members": list(members.values()),
             "skills": sorted(skills.values(), key=lambda item: (item["category"], item["title"])),
@@ -660,17 +660,20 @@ class SupabaseProductStore:
         connector = connector_by_id(connector_id)
         if not connector:
             raise ValueError(f"Unknown connector: {connector_id}")
+        canonical_connector_id = connector.connector_id
         if environment not in connector.environments:
-            raise ValueError(f"Unsupported environment for {connector_id}: {environment}")
+            raise ValueError(
+                f"Unsupported environment for {canonical_connector_id}: {environment}"
+            )
         profile = {
             "id": stable_id(
                 "connector",
                 context["workspace"]["workspace_key"],
-                connector_id,
+                canonical_connector_id,
                 environment,
             ),
             "workspace_id": context["workspace"]["id"],
-            "connector_id": connector_id,
+            "connector_id": canonical_connector_id,
             "environment": environment,
             "display_name": display_name or connector.name,
             "company_name": company_name,
@@ -689,11 +692,14 @@ class SupabaseProductStore:
             workspace_key=context["workspace"]["workspace_key"],
             client_jti=str(token_payload.get("jti") or ""),
             event_type="connector.profile_configured",
-            input_payload={"connector_id": connector_id, "environment": environment},
+            input_payload={
+                "connector_id": canonical_connector_id,
+                "environment": environment,
+            },
             summary={
                 "profile": profile,
                 "event_summary": {
-                    "connector_id": connector_id,
+                    "connector_id": canonical_connector_id,
                     "environment": environment,
                     "status": profile["status"],
                 },
@@ -712,8 +718,11 @@ class SupabaseProductStore:
         connector = connector_by_id(connector_id)
         if not connector:
             raise ValueError(f"Unknown connector: {connector_id}")
+        canonical_connector_id = connector.connector_id
         if environment not in connector.environments:
-            raise ValueError(f"Unsupported environment for {connector_id}: {environment}")
+            raise ValueError(
+                f"Unsupported environment for {canonical_connector_id}: {environment}"
+            )
         required_fields = list(connector.required_secret_fields)
         missing = [
             field
@@ -726,7 +735,7 @@ class SupabaseProductStore:
         try:
             return self._set_connector_credentials_product_tables(
                 token_payload=token_payload,
-                connector_id=connector_id,
+                connector_id=canonical_connector_id,
                 environment=environment,
                 credentials=credentials,
             )
@@ -734,7 +743,7 @@ class SupabaseProductStore:
             if is_product_schema_error(exc):
                 return self._fallback_set_connector_credentials(
                     token_payload=token_payload,
-                    connector_id=connector_id,
+                    connector_id=canonical_connector_id,
                     environment=environment,
                     credentials=credentials,
                 )
@@ -754,13 +763,14 @@ class SupabaseProductStore:
         connector = connector_by_id(connector_id)
         if not connector:
             raise ValueError(f"Unknown connector: {connector_id}")
+        canonical_connector_id = connector.connector_id
 
         rows = self._request(
             "GET",
             "mercury_connector_profiles",
             params={
                 "workspace_id": f"eq.{context['workspace']['id']}",
-                "connector_id": f"eq.{connector_id}",
+                "connector_id": f"eq.{canonical_connector_id}",
                 "environment": f"eq.{environment}",
                 "select": "id,metadata,display_name,company_name",
                 "limit": "1",
@@ -771,7 +781,7 @@ class SupabaseProductStore:
         else:
             profile = self._set_connector_profile_product_tables(
                 token_payload=token_payload,
-                connector_id=connector_id,
+                connector_id=canonical_connector_id,
                 environment=environment,
                 company_name=str(context["workspace"].get("name") or ""),
             )
@@ -779,7 +789,7 @@ class SupabaseProductStore:
         vault_record = encrypt_connector_credentials(
             self.settings,
             workspace_key_value=context["workspace"]["workspace_key"],
-            connector_id=connector_id,
+            connector_id=canonical_connector_id,
             environment=environment,
             credentials=credentials,
         )
@@ -807,7 +817,7 @@ class SupabaseProductStore:
             client_jti=str(token_payload.get("jti") or ""),
             event_type="connector.credentials_configured",
             input_payload={
-                "connector_id": connector_id,
+                "connector_id": canonical_connector_id,
                 "environment": environment,
                 "credential_fields": vault_record["fields"],
             },
@@ -819,7 +829,7 @@ class SupabaseProductStore:
                 },
                 "vault_record": vault_record,
                 "event_summary": {
-                    "connector_id": connector_id,
+                    "connector_id": canonical_connector_id,
                     "environment": environment,
                     "credential_fields": vault_record["fields"],
                     "status": "credentials_configured",
@@ -828,7 +838,7 @@ class SupabaseProductStore:
         )
         return {
             "status": "credentials_configured",
-            "connector_id": connector_id,
+            "connector_id": canonical_connector_id,
             "environment": environment,
             "credential_fields": vault_record["fields"],
             "credential_fingerprints": vault_record["fingerprints"],
@@ -847,10 +857,11 @@ class SupabaseProductStore:
         connector = connector_by_id(connector_id)
         if not connector:
             raise ValueError(f"Unknown connector: {connector_id}")
+        canonical_connector_id = connector.connector_id
         vault_record = encrypt_connector_credentials(
             self.settings,
             workspace_key_value=context["workspace"]["workspace_key"],
-            connector_id=connector_id,
+            connector_id=canonical_connector_id,
             environment=environment,
             credentials=credentials,
         )
@@ -858,11 +869,11 @@ class SupabaseProductStore:
             "id": stable_id(
                 "connector",
                 context["workspace"]["workspace_key"],
-                connector_id,
+                canonical_connector_id,
                 environment,
             ),
             "workspace_id": context["workspace"]["id"],
-            "connector_id": connector_id,
+            "connector_id": canonical_connector_id,
             "environment": environment,
             "display_name": connector.name,
             "company_name": context["workspace"]["name"],
@@ -885,7 +896,7 @@ class SupabaseProductStore:
             client_jti=str(token_payload.get("jti") or ""),
             event_type="connector.credentials_configured",
             input_payload={
-                "connector_id": connector_id,
+                "connector_id": canonical_connector_id,
                 "environment": environment,
                 "credential_fields": vault_record["fields"],
             },
@@ -893,7 +904,7 @@ class SupabaseProductStore:
                 "profile": profile,
                 "vault_record": vault_record,
                 "event_summary": {
-                    "connector_id": connector_id,
+                    "connector_id": canonical_connector_id,
                     "environment": environment,
                     "credential_fields": vault_record["fields"],
                     "status": "credentials_configured",
@@ -902,7 +913,7 @@ class SupabaseProductStore:
         )
         return {
             "status": "credentials_configured",
-            "connector_id": connector_id,
+            "connector_id": canonical_connector_id,
             "environment": environment,
             "credential_fields": vault_record["fields"],
             "credential_fingerprints": vault_record["fingerprints"],
@@ -1150,7 +1161,7 @@ class SupabaseProductStore:
                 "member": {"email": token_payload.get("sub")},
                 "skills": [],
                 "flows": [],
-                "connectors": [connector.summary() for connector in CONNECTOR_CATALOG],
+                "connectors": list_connector_summaries(),
                 "connector_profiles": [],
                 "events": [],
             }
@@ -1229,7 +1240,7 @@ class SupabaseProductStore:
         return {
             "status": "ok",
             **context,
-            "connectors": [connector.summary() for connector in CONNECTOR_CATALOG],
+            "connectors": list_connector_summaries(),
             "connector_profiles": connector_profiles or [],
             "members": members or [],
             "skills": [
@@ -1377,10 +1388,14 @@ class SupabaseProductStore:
         display_name: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        connector = connector_by_id(connector_id)
+        if not connector:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        canonical_connector_id = connector.connector_id
         try:
             return self._set_connector_profile_product_tables(
                 token_payload=token_payload,
-                connector_id=connector_id,
+                connector_id=canonical_connector_id,
                 environment=environment,
                 company_name=company_name,
                 display_name=display_name,
@@ -1390,7 +1405,7 @@ class SupabaseProductStore:
             if is_product_schema_error(exc):
                 return self._fallback_set_connector_profile(
                     token_payload=token_payload,
-                    connector_id=connector_id,
+                    connector_id=canonical_connector_id,
                     environment=environment,
                     company_name=company_name,
                     display_name=display_name,
@@ -1414,8 +1429,11 @@ class SupabaseProductStore:
         connector = connector_by_id(connector_id)
         if not connector:
             raise ValueError(f"Unknown connector: {connector_id}")
+        canonical_connector_id = connector.connector_id
         if environment not in connector.environments:
-            raise ValueError(f"Unsupported environment for {connector_id}: {environment}")
+            raise ValueError(
+                f"Unsupported environment for {canonical_connector_id}: {environment}"
+            )
         merged_metadata = {
             "required_secret_fields": connector.required_secret_fields,
             "preset": connector.preset,
@@ -1426,7 +1444,7 @@ class SupabaseProductStore:
             "mercury_connector_profiles",
             {
                 "workspace_id": context["workspace"]["id"],
-                "connector_id": connector_id,
+                "connector_id": canonical_connector_id,
                 "environment": environment,
                 "display_name": display_name or connector.name,
                 "company_name": company_name,
@@ -1439,9 +1457,12 @@ class SupabaseProductStore:
             workspace_id=context["workspace"]["id"],
             member_id=context["member"]["id"],
             event_type="connector.profile_configured",
-            input_payload={"connector_id": connector_id, "environment": environment},
+            input_payload={
+                "connector_id": canonical_connector_id,
+                "environment": environment,
+            },
             summary={
-                "connector_id": connector_id,
+                "connector_id": canonical_connector_id,
                 "environment": environment,
                 "status": row["status"],
             },

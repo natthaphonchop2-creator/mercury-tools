@@ -104,6 +104,39 @@ def test_product_store_audit_fallback_persists_connector_and_skill_state() -> No
     }
 
 
+def test_product_store_audit_fallback_normalizes_connector_ids_for_profile_keys() -> None:
+    store = AuditFallbackStore()
+    request = ConnectRequest(
+        email="owner@example.com",
+        company="Demo Co",
+        host_app="codex",
+        invite_code="invite",
+    )
+    store.upsert_connection(request, token_payload())
+
+    store.set_connector_profile(
+        token_payload=token_payload(),
+        connector_id=" FlowAccount ",
+        environment="production",
+        company_name="Demo Co Books",
+    )
+    result = store.set_connector_credentials(
+        token_payload=token_payload(),
+        connector_id="FLOWACCOUNT",
+        environment="production",
+        credentials={
+            "client_id": "demo-client-id",
+            "client_secret": "super-secret-value",
+        },
+    )
+    dashboard = store.dashboard(token_payload())
+
+    assert result["connector_id"] == "flowaccount"
+    assert {profile["connector_id"] for profile in dashboard["connector_profiles"]} == {
+        "flowaccount"
+    }
+
+
 def test_product_store_audit_fallback_records_team_invite() -> None:
     store = AuditFallbackStore()
     request = ConnectRequest(
