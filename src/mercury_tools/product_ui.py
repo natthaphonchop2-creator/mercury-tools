@@ -61,12 +61,10 @@ STYLE = """
     }
     .shell {
       display: grid;
-      grid-template-columns: 256px minmax(0, 1fr);
-      gap: 16px;
+      gap: 14px;
       align-items: start;
     }
     header {
-      grid-column: 1 / -1;
       display: grid;
       grid-template-columns: minmax(280px, 1fr) auto;
       gap: 18px;
@@ -118,24 +116,27 @@ STYLE = """
       max-width: 100%;
       overflow-wrap: anywhere;
     }
-    .rail {
-      position: sticky;
-      top: 16px;
+    .nav-frame {
       border: 1px solid var(--line);
       border-radius: 8px;
       background: rgba(14, 21, 31, .94);
       overflow: hidden;
     }
-    .rail-head {
-      padding: 14px;
+    .nav-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 11px 12px;
       border-bottom: 1px solid var(--line);
       background: rgba(24, 35, 49, .72);
     }
-    .rail-head b { display: block; color: var(--teal); }
-    .rail-head span { display: block; color: var(--muted); font-size: 12px; margin-top: 3px; }
+    .nav-head b { color: var(--teal); }
+    .nav-head span { color: var(--muted); font-size: 12px; text-align: right; }
     .nav-list {
       display: grid;
-      gap: 2px;
+      grid-template-columns: repeat(8, minmax(0, 1fr));
+      gap: 8px;
       padding: 8px;
     }
     .nav-list a {
@@ -145,8 +146,9 @@ STYLE = """
       text-decoration: none;
       border: 1px solid transparent;
       border-radius: 8px;
-      padding: 10px;
-      min-height: 50px;
+      padding: 9px 10px;
+      min-height: 54px;
+      align-content: center;
     }
     .nav-list a b { font-size: 13px; }
     .nav-list a span { color: var(--muted); font-size: 12px; }
@@ -156,16 +158,6 @@ STYLE = """
       border-color: rgba(245, 191, 69, .72);
     }
     .nav-list a.active span { color: rgba(21, 19, 6, .72); }
-    .rail-note {
-      margin: 0 8px 8px;
-      padding: 10px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      color: var(--muted);
-      background: rgba(16, 23, 32, .66);
-      font-size: 12px;
-      overflow-wrap: anywhere;
-    }
     .content {
       min-width: 0;
     }
@@ -209,10 +201,33 @@ STYLE = """
     }
     .start-layout {
       display: grid;
-      grid-template-columns: minmax(0, 1.05fr) minmax(320px, .95fr);
+      grid-template-columns: minmax(0, .9fr) minmax(320px, 1.1fr);
       gap: 14px;
       align-items: start;
       min-width: 0;
+    }
+    .gateway-card {
+      display: grid;
+      gap: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      background: rgba(16, 23, 32, .72);
+      text-decoration: none;
+      color: #e5edf3;
+    }
+    .gateway-card b {
+      color: var(--teal);
+      font-size: 15px;
+    }
+    .gateway-card span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .boundary-line {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
     }
     .panel {
       border: 1px solid var(--line);
@@ -423,12 +438,13 @@ STYLE = """
     @media (max-width: 980px) {
       header { grid-template-columns: 1fr; }
       .status { justify-content: flex-start; }
-      .shell { grid-template-columns: 1fr; }
-      .rail { position: static; }
+      .nav-head { align-items: flex-start; flex-direction: column; }
+      .nav-head span { text-align: left; }
       .nav-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .start-layout { grid-template-columns: 1fr; }
       .page-grid, .page-grid.reverse, .cards-2 { grid-template-columns: 1fr; }
       .console-grid { grid-template-columns: 1fr; }
+      .boundary-line { grid-template-columns: 1fr; }
       .two { grid-template-columns: 1fr; }
     }
     @media (max-width: 620px) {
@@ -462,32 +478,37 @@ PAGE_CONTENT: dict[str, str] = {
       <section class="page" data-page="start">
         <div class="page-head">
           <span class="eyebrow">Mercury Setup Console</span>
-          <h1>Set up Mercury tools for the AI host. Do not chat here.</h1>
-          <p>Mercury is MCP-first: Codex, Cursor, Claude Desktop, or a customer agent owns the conversation and model. This browser console only prepares access, accounting programs, wiki context, skills, flows, and audit records.</p>
+          <h1>Prepare the accounting tool layer for an AI host.</h1>
+          <p>The AI host remains the product surface. Mercury is MCP-first: this console only prepares access, accounting programs, wiki context, skills, flows, and audit records.</p>
         </div>
         <div class="start-layout">
           <section class="panel">
-            <div class="row"><h2>Recommended setup path</h2><span class="pill">remote MCP</span></div>
+            <div class="row"><h2>First-time setup path</h2><span class="pill">remote MCP</span></div>
             <div class="steps">
-              <div class="step"><b>Create host access</b><span>Generate a workspace token and install Mercury into the AI host.</span></div>
-              <div class="step"><b>Set company context</b><span>Confirm workspace, member, and host identity for one company.</span></div>
-              <div class="step"><b>Connect accounting program</b><span>Select FlowAccount, PEAK, Express, or a future connector and save server-side credentials.</span></div>
-              <div class="step"><b>Enable knowledge, skills, and flows</b><span>The host AI calls Mercury for cited context packs and repeatable runbooks.</span></div>
-              <div class="step"><b>Review audit trail</b><span>Setup and MCP activity produce sanitized evidence without exposing secrets.</span></div>
+              <div class="step"><b>Connect AI host</b><span>Create a workspace token for Codex, Cursor, Claude Desktop, or another MCP client.</span></div>
+              <div class="step"><b>Select accounting program</b><span>Choose FlowAccount, PEAK, Express, or a future connector for this company.</span></div>
+              <div class="step"><b>Enable skills and flows</b><span>Turn accounting playbooks into callable MCP tools and repeatable runbooks.</span></div>
+              <div class="step"><b>Keep evidence</b><span>Log setup and tool activity with sanitized audit records.</span></div>
             </div>
           </section>
 
           <section class="panel">
-            <h2>Open a focused page</h2>
-            <p class="lead">Each page handles one Mercury control-plane job. The runtime stays in the AI host.</p>
-            <div class="route-list">
-              <a class="route-link" href="/connect"><b>Connect host</b><span>Create or restore a Mercury MCP client token.</span></a>
-              <a class="route-link" href="/workspace"><b>Workspace</b><span>Check company, team, host, and product boundary.</span></a>
-              <a class="route-link" href="/connectors"><b>Accounting programs</b><span>Set connector profile and encrypted credentials.</span></a>
-              <a class="route-link" href="/knowledge"><b>LLM Wiki</b><span>Review the cited RAG layer used by MCP tools.</span></a>
-              <a class="route-link" href="/skills"><b>Skills</b><span>Manage accounting playbooks for host agents.</span></a>
-              <a class="route-link" href="/flows"><b>Flows</b><span>Build repeatable agent runbooks.</span></a>
-              <a class="route-link" href="/audit"><b>Audit</b><span>Inspect sanitized evidence and setup events.</span></a>
+            <h2>Open one setup section</h2>
+            <p class="lead">Each section is its own route. Users do not configure everything from one dashboard screen.</p>
+            <div class="stack">
+              <a class="gateway-card" href="/connect"><b>1. Connect host</b><span>Generate MCP setup instructions for the AI program that will run the conversation.</span></a>
+              <a class="gateway-card" href="/connectors"><b>2. Accounting programs</b><span>Select the accounting system and save connector credentials server-side.</span></a>
+              <a class="gateway-card" href="/skills"><b>3. Skills and flows</b><span>Enable playbooks and YAML runbooks that the host agent can call.</span></a>
+              <a class="gateway-card" href="/audit"><b>4. Audit trail</b><span>Review sanitized setup and tool-call evidence.</span></a>
+            </div>
+          </section>
+
+          <section class="panel" style="grid-column:1 / -1">
+            <div class="row"><h2>Mercury product boundary</h2><span class="pill">not a chat web app</span></div>
+            <div class="boundary-line">
+              <div class="card"><b>AI host</b><span>Codex, Cursor, Claude, or a customer agent owns chat, model, and UX.</span></div>
+              <div class="card"><b>Mercury MCP</b><span>Provides accounting tools, wiki context, skills, flows, and audit records.</span></div>
+              <div class="card"><b>Accounting systems</b><span>FlowAccount, PEAK, Express, and future connectors stay behind controlled tools.</span></div>
             </div>
           </section>
         </div>
@@ -1245,16 +1266,15 @@ def render_connect_html(active_page: str = "connect") -> str:
         </div>
       </header>
 
-      <aside class="rail" aria-label="Mercury setup-console navigation">
-        <div class="rail-head">
-          <b>Setup Console</b>
-          <span>Separate setup pages. The AI host remains the product surface.</span>
+      <section class="nav-frame" aria-label="Mercury setup-console navigation">
+        <div class="nav-head">
+          <b>Setup sections</b>
+          <span>Separate pages for setup. Mercury stays MCP-first; the AI host remains the product surface.</span>
         </div>
         <nav class="nav-list">
           {_nav(page)}
         </nav>
-        <p class="rail-note">Mercury is MCP-first. This console only manages setup, context, tools, flows, and audit boundaries.</p>
-      </aside>
+      </section>
 
       <div class="content">
         {body}

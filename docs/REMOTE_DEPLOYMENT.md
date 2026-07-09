@@ -149,7 +149,8 @@ Users then open:
 https://mercury-tools-mcp.onrender.com/
 ```
 
-The first page is a setup map, not the Mercury chat/runtime surface. Users open
+The first page is a setup gateway, not the Mercury chat/runtime surface and not
+a general product dashboard. Users open
 `/connect` from there, enter the invite code, email, company, and AI host, then
 Mercury generates copy-ready MCP setup instructions. The resulting client token
 is signed and time-limited, so users do not need access to the server bearer

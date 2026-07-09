@@ -72,7 +72,8 @@ def test_connect_page_and_status(monkeypatch) -> None:
     assert "MCP setup console for accounting AI hosts" in page.text
     assert "The AI host remains the product surface." in page.text
     assert 'data-page="start"' in page.text
-    assert "Set up Mercury tools for the AI host. Do not chat here." in page.text
+    assert "Prepare the accounting tool layer for an AI host." in page.text
+    assert "not a chat web app" in page.text
     assert 'id="connect-form"' not in page.text
     assert status.status_code == 200
     assert status.json()["mcp_endpoint"] == "https://mercury.example.com/mcp"
