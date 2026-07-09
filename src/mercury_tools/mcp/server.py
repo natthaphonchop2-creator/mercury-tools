@@ -182,6 +182,15 @@ def _flow_files_from_payload(raw: Any) -> list[dict[str, str]]:
     return items
 
 
+def _validate_config_yaml(config_yaml: str | None) -> str | None:
+    if config_yaml is None:
+        return None
+    value = str(config_yaml)
+    if len(value) > MAX_MCP_FLOW_FILE_CHARS:
+        raise ValueError(f"config_yaml may be at most {MAX_MCP_FLOW_FILE_CHARS} characters.")
+    return value
+
+
 def _suite_status(results: list[dict[str, Any]]) -> str:
     if not results:
         return "empty"
@@ -256,6 +265,22 @@ def _client_token_payload(request: Request) -> dict[str, Any]:
 
 def _product_store(settings=None) -> SupabaseProductStore:
     return SupabaseProductStore(settings or load_settings())
+
+
+def _selected_flow_input_modes(
+    *,
+    flow_yaml: str | None,
+    flow_files: Any,
+    workspace_flow_id: str | None,
+) -> list[str]:
+    modes: list[str] = []
+    if flow_yaml is not None:
+        modes.append("flow_yaml")
+    if flow_files is not None:
+        modes.append("flow_files")
+    if workspace_flow_id:
+        modes.append("workspace_flow_id")
+    return modes
 
 
 def _client_token_payload_from_value(client_token: str) -> dict[str, Any]:
@@ -441,10 +466,7 @@ def inspect_flow_files(
     normalized_files: list[dict[str, str]] = []
     try:
         normalized_files = _flow_files_from_payload(flow_files)
-        if config_yaml and len(config_yaml) > MAX_MCP_FLOW_FILE_CHARS:
-            raise ValueError(
-                f"config_yaml may be at most {MAX_MCP_FLOW_FILE_CHARS} characters."
-            )
+        config_yaml = _validate_config_yaml(config_yaml)
         include = _string_list_from_payload(include_tags, label="include_tags")
         exclude = _string_list_from_payload(exclude_tags, label="exclude_tags")
 
@@ -541,6 +563,7 @@ def run_flow(
 @mcp.tool()
 def run_flow_files(
     flow_files: dict[str, str] | list[dict[str, Any]],
+    config_yaml: str | None = None,
     dry_run: bool = False,
     env: dict[str, Any] | None = None,
     include_tags: list[str] | str | None = None,
@@ -552,57 +575,86 @@ def run_flow_files(
     env_overrides: dict[str, str] = {}
     try:
         normalized_files = _flow_files_from_payload(flow_files)
+        config_yaml = _validate_config_yaml(config_yaml)
         env_overrides = _env_overrides_from_payload(env)
         include = set(_string_list_from_payload(include_tags, label="include_tags"))
         exclude = set(_string_list_from_payload(exclude_tags, label="exclude_tags"))
         file_records: list[dict[str, Any]] = []
         results: list[dict[str, Any]] = []
+        selected_paths: list[Path] = []
 
         with TemporaryDirectory(prefix="mercury-flow-files-") as temp_dir:
             root = Path(temp_dir).resolve()
+            if config_yaml:
+                (root / "config.yaml").write_text(config_yaml, encoding="utf-8")
             for item in normalized_files:
                 target = root / item["path"]
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(item["flow_yaml"], encoding="utf-8")
 
             runner = create_default_runner(dry_run=dry_run)
-            for item in normalized_files:
-                relative_path = item["path"]
-                target = root / relative_path
+            if config_yaml:
+                workspace = discover_workspace_flows(
+                    root,
+                    include_tags=sorted(include),
+                    exclude_tags=sorted(exclude),
+                )
+                file_records = [record.as_dict(root=root) for record in workspace.records]
+                selected_paths = [record.path for record in workspace.ordered_selected]
+            else:
+                for item in normalized_files:
+                    relative_path = item["path"]
+                    target = root / relative_path
+                    try:
+                        syntax = validate_flow_text(item["flow_yaml"], path=target)
+                        flow_summary = syntax["flow"]
+                        tags = [str(tag) for tag in flow_summary.get("tags") or []]
+                        selected = _matches_tag_filter(tags, include=include, exclude=exclude)
+                        file_records.append(
+                            {
+                                "path": relative_path,
+                                "name": flow_summary.get("name"),
+                                "tags": tags,
+                                "command_count": flow_summary.get("command_count") or 0,
+                                "selected": selected,
+                                "status": "valid",
+                            }
+                        )
+                        if selected:
+                            selected_paths.append(target)
+                    except (FlowValidationError, RuntimeError, ValueError) as exc:
+                        selected = not include
+                        file_records.append(
+                            {
+                                "path": relative_path,
+                                "name": None,
+                                "tags": [],
+                                "command_count": 0,
+                                "selected": selected,
+                                "status": "invalid"
+                                if isinstance(exc, FlowValidationError)
+                                else "error",
+                                "error": str(exc),
+                            }
+                        )
+                        if not selected:
+                            continue
+                        if not continue_on_failure:
+                            raise
+                        results.append(
+                            _flow_file_error_result(
+                                path=relative_path,
+                                message=str(exc),
+                                dry_run=dry_run,
+                            )
+                        )
+
+            for selected_path in selected_paths:
+                relative_path = selected_path.relative_to(root).as_posix()
                 try:
-                    syntax = validate_flow_text(item["flow_yaml"], path=target)
-                    flow_summary = syntax["flow"]
-                    tags = [str(tag) for tag in flow_summary.get("tags") or []]
-                    selected = _matches_tag_filter(tags, include=include, exclude=exclude)
-                    file_records.append(
-                        {
-                            "path": relative_path,
-                            "name": flow_summary.get("name"),
-                            "tags": tags,
-                            "command_count": flow_summary.get("command_count") or 0,
-                            "selected": selected,
-                            "status": "valid",
-                        }
-                    )
-                    if not selected:
-                        continue
-                    result = runner.run_path(target, env=env_overrides).as_dict()
+                    result = runner.run_path(selected_path, env=env_overrides).as_dict()
                     results.append(_relativize_temp_paths(result, root=root))
                 except (FlowValidationError, RuntimeError, ValueError) as exc:
-                    selected = not include
-                    file_records.append(
-                        {
-                            "path": relative_path,
-                            "name": None,
-                            "tags": [],
-                            "command_count": 0,
-                            "selected": selected,
-                            "status": "invalid" if isinstance(exc, FlowValidationError) else "error",
-                            "error": str(exc),
-                        }
-                    )
-                    if not selected:
-                        continue
                     if not continue_on_failure:
                         raise
                     results.append(
@@ -617,6 +669,7 @@ def run_flow_files(
             {
                 "status": _suite_status(results),
                 "dry_run": dry_run,
+                "config_yaml_present": bool(config_yaml),
                 "flow_count": len(normalized_files),
                 "selected_count": len([item for item in file_records if item.get("selected")]),
                 "skipped_count": len([item for item in file_records if not item.get("selected")]),
@@ -633,6 +686,7 @@ def run_flow_files(
                 "flow_count": len(normalized_files),
                 "selected_count": payload["selected_count"],
                 "dry_run": dry_run,
+                "config_yaml_present": bool(config_yaml),
                 "env_keys": _env_keys(env_overrides),
                 "include_tags": sorted(include),
                 "exclude_tags": sorted(exclude),
@@ -652,11 +706,92 @@ def run_flow_files(
             {
                 "flow_count": len(normalized_files),
                 "dry_run": dry_run,
+                "config_yaml_present": bool(config_yaml),
                 "env_keys": _env_keys(env_overrides),
             },
             payload,
         )
         return payload
+
+
+@mcp.tool()
+def run_mercury_flow(
+    flow_yaml: str | None = None,
+    flow_files: dict[str, str] | list[dict[str, Any]] | None = None,
+    workspace_flow_id: str | None = None,
+    client_token: str | None = None,
+    config_yaml: str | None = None,
+    dry_run: bool = True,
+    env: dict[str, Any] | None = None,
+    include_tags: list[str] | str | None = None,
+    exclude_tags: list[str] | str | None = None,
+    continue_on_failure: bool = True,
+) -> dict[str, Any]:
+    """Run Mercury flows through one Maestro-style MCP entrypoint."""
+    modes = _selected_flow_input_modes(
+        flow_yaml=flow_yaml,
+        flow_files=flow_files,
+        workspace_flow_id=workspace_flow_id,
+    )
+    if len(modes) != 1:
+        payload = {
+            "status": "error",
+            "message": (
+                "Pass exactly one of flow_yaml, flow_files, or workspace_flow_id."
+            ),
+            "selected_modes": modes,
+        }
+        _audit("run_mercury_flow", {"selected_modes": modes, "dry_run": dry_run}, payload)
+        return payload
+
+    if modes[0] == "flow_yaml":
+        if config_yaml is not None or include_tags is not None or exclude_tags is not None:
+            payload = {
+                "status": "error",
+                "message": (
+                    "config_yaml, include_tags, and exclude_tags are valid only "
+                    "with flow_files."
+                ),
+                "selected_modes": modes,
+            }
+            _audit("run_mercury_flow", {"selected_modes": modes, "dry_run": dry_run}, payload)
+            return payload
+        payload = run_flow(flow_yaml or "", dry_run=dry_run, env=env)
+        payload["entrypoint"] = "run_mercury_flow"
+        payload["input_mode"] = "flow_yaml"
+        return payload
+
+    if modes[0] == "flow_files":
+        payload = run_flow_files(
+            flow_files or {},
+            config_yaml=config_yaml,
+            dry_run=dry_run,
+            env=env,
+            include_tags=include_tags,
+            exclude_tags=exclude_tags,
+            continue_on_failure=continue_on_failure,
+        )
+        payload["entrypoint"] = "run_mercury_flow"
+        payload["input_mode"] = "flow_files"
+        return payload
+
+    if not client_token:
+        payload = {
+            "status": "error",
+            "message": "client_token is required with workspace_flow_id.",
+            "selected_modes": modes,
+        }
+        _audit("run_mercury_flow", {"selected_modes": modes, "dry_run": dry_run}, payload)
+        return payload
+    payload = run_workspace_flow_tool(
+        client_token=client_token,
+        flow_id=workspace_flow_id or "",
+        dry_run=dry_run,
+        env=env,
+    )
+    payload["entrypoint"] = "run_mercury_flow"
+    payload["input_mode"] = "workspace_flow_id"
+    return payload
 
 
 @mcp.tool()
@@ -920,6 +1055,7 @@ async def status(_: Request) -> Response:
                 "flow_cheat_sheet",
                 "check_flow_syntax",
                 "inspect_flow_files",
+                "run_mercury_flow",
                 "run_flow",
                 "run_flow_files",
                 "save_workspace_flow",

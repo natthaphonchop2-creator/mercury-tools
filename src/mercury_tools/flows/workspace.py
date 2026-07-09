@@ -230,6 +230,7 @@ def workspace_manifest(
                 "flow_cheat_sheet",
                 "check_flow_syntax",
                 "inspect_flow_files",
+                "run_mercury_flow",
                 "run_flow",
                 "run_flow_files",
                 "save_workspace_flow",

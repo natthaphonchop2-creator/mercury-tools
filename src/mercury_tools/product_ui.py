@@ -874,7 +874,7 @@ PAGE_CONTENT: dict[str, str] = {
             <div class="row"><h2>Host execution path</h2><span class="pill">MCP/CLI only</span></div>
             <div class="flow">
               <div><b>Author locally</b><br><span class="muted">Use files in a repo or generated workspace, not a browser text editor.</span></div>
-              <div><b>Validate and dry-run</b><br><span class="muted">Use mercury-tools flow validate, flow run, flow run-suite, or MCP run_flow/run_flow_files.</span></div>
+              <div><b>Validate and dry-run</b><br><span class="muted">Use mercury-tools flow validate, flow manifest, flow run-suite, or MCP run_mercury_flow.</span></div>
               <div><b>Expose to host agent</b><br><span class="muted">Codex, Cursor, Claude, or a customer agent calls Mercury flow tools during the conversation.</span></div>
               <div><b>Keep evidence</b><br><span class="muted">This console only displays sanitized registry and run history.</span></div>
             </div>
@@ -917,7 +917,7 @@ mercury-tools flow push ./flows --url https://mercury-tools-mcp.onrender.com --c
           <section class="panel">
             <div class="row"><h2>MCP contract</h2><span class="pill">host-facing</span></div>
             <div class="cards-2">
-              <div class="card"><b>Tools</b><span>search_knowledge, retrieve_context_pack, run_accounting_skill, run_flow, run_flow_files, connector status</span></div>
+              <div class="card"><b>Tools</b><span>search_knowledge, retrieve_context_pack, run_accounting_skill, inspect_flow_files, run_mercury_flow, connector status</span></div>
               <div class="card"><b>Resources</b><span>mercury://wiki, mercury://skills, mercury://connectors, mercury://flows, mercury://audit</span></div>
               <div class="card"><b>Prompts</b><span>Thai accounting report, VAT, invoice review, setup guide, management summary</span></div>
               <div class="card"><b>Transport</b><span>stdio for local clients, Streamable HTTP for hosted Mercury</span></div>

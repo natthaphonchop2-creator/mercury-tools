@@ -236,9 +236,11 @@ Flow CLI:
 - `mercury-tools flow cheat-sheet`
 
 MCP and HTTP flow runs also accept runtime env overrides. Values are coerced to
-strings, matching Maestro-style `-e KEY=value` behavior. `run_flow_files` lets
-an MCP host submit multiple YAML files in one call, including subflows referenced
-with `runFlow: file`. Audit and run history record only the env key names:
+strings, matching Maestro-style `-e KEY=value` behavior. Host agents should
+prefer `run_mercury_flow`, a single MCP entrypoint that accepts exactly one of
+`flow_yaml`, `flow_files`, or `workspace_flow_id`. `run_flow` and
+`run_flow_files` remain available as lower-level compatibility tools. Audit and
+run history record only the env key names:
 
 ```json
 {
@@ -247,6 +249,21 @@ with `runFlow: file`. Audit and run history record only the env key names:
   "env": {
     "month": "2026-09",
     "connector": "flowaccount"
+  }
+}
+```
+
+Example `run_mercury_flow` call for a flow pack:
+
+```json
+{
+  "flow_files": {
+    "flows/company-health.yaml": "name: Company Health\\ntags: [accounting]\\n---\\n- emitReport:\\n    title: Company"
+  },
+  "config_yaml": "flows: flows/**/*.yaml\\nincludeTags: [accounting]\\n",
+  "dry_run": true,
+  "env": {
+    "month": "2026-09"
   }
 }
 ```
@@ -381,6 +398,7 @@ Flow MCP tools:
 - `check_flow_syntax`
 - `run_flow`
 - `run_flow_files`
+- `run_mercury_flow`
 - `save_workspace_flow`
 - `list_workspace_flows`
 - `run_workspace_flow`
@@ -423,6 +441,8 @@ Tools:
 - `run_accounting_skill`
 - `flow_cheat_sheet`
 - `check_flow_syntax`
+- `inspect_flow_files`
+- `run_mercury_flow`
 - `run_flow`
 - `run_flow_files`
 - `save_workspace_flow`

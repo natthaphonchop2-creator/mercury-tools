@@ -29,6 +29,7 @@ def test_mcp_flow_tools_validate_and_dry_run() -> None:
         inspect_flow_files,
         run_flow,
         run_flow_files,
+        run_mercury_flow,
     )
 
     assert "Mercury Flow" in flow_cheat_sheet()["cheat_sheet"]
@@ -100,6 +101,35 @@ tags: [helper]
     assert suite["results"][0]["variables"]["subflow"]["flow"]["path"] == "sub.yaml"
     assert suite["results"][0]["variables"]["subflow"]["artifacts"][0]["title"] == "Sub 2026-10"
 
+    config_suite = run_flow_files(
+        {
+            "flows/b.yaml": """name: B
+tags: [accounting]
+---
+- emitReport:
+    title: "B"
+""",
+            "flows/a.yaml": """name: A
+tags: [accounting]
+---
+- emitReport:
+    title: "A"
+""",
+        },
+        config_yaml="""
+flows: flows/**/*.yaml
+includeTags: [accounting]
+executionOrder:
+  flowsOrder:
+    - a
+    - b
+""",
+        dry_run=True,
+    )
+    assert config_suite["status"] == "planned"
+    assert config_suite["config_yaml_present"] is True
+    assert [result["flow"]["name"] for result in config_suite["results"]] == ["A", "B"]
+
     manifest = inspect_flow_files(
         {
             "flows/main.yaml": """name: Main
@@ -127,6 +157,45 @@ tags: [disabled]
     assert manifest["flows"][0]["path"] == "flows/main.yaml"
     assert "mercury-flow-inspect" not in str(manifest)
     assert "run_flow_files" in manifest["agent_handoff"]["mcp_tools"]
+
+    unified_yaml = run_mercury_flow(
+        flow_yaml="""name: Unified
+---
+- emitReport:
+    title: "Unified ${month}"
+""",
+        dry_run=True,
+        env={"month": "2026-10"},
+    )
+    assert unified_yaml["entrypoint"] == "run_mercury_flow"
+    assert unified_yaml["input_mode"] == "flow_yaml"
+    assert unified_yaml["artifacts"][0]["title"] == "Unified 2026-10"
+
+    unified_files = run_mercury_flow(
+        flow_files={
+            "flows/a.yaml": """name: A
+tags: [accounting]
+---
+- emitReport:
+    title: "A"
+""",
+            "flows/disabled.yaml": """name: Disabled
+tags: [disabled]
+---
+- emitReport:
+    title: "Disabled"
+""",
+        },
+        config_yaml="flows: flows/**/*.yaml\nincludeTags: [accounting]\nexcludeTags: [disabled]\n",
+        dry_run=True,
+    )
+    assert unified_files["entrypoint"] == "run_mercury_flow"
+    assert unified_files["input_mode"] == "flow_files"
+    assert unified_files["selected_count"] == 1
+
+    invalid_unified = run_mercury_flow(flow_yaml="name: A\n---\n- emitReport: {}", flow_files={})
+    assert invalid_unified["status"] == "error"
+    assert "exactly one" in invalid_unified["message"]
 
 
 def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:
