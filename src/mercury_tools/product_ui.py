@@ -438,6 +438,41 @@ STYLE = """
       color: var(--muted);
       font-size: 12px;
     }
+    .setup-strip {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin: 12px 0 2px;
+    }
+    .setup-strip div {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(16, 23, 32, .68);
+      padding: 11px;
+      min-width: 0;
+    }
+    .setup-strip b {
+      display: block;
+      color: var(--gold);
+      font-size: 12px;
+      margin-bottom: 3px;
+    }
+    .setup-strip span {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    details.advanced {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(16, 23, 32, .52);
+      margin-top: 14px;
+      padding: 10px;
+    }
+    details.advanced summary {
+      cursor: pointer;
+      color: var(--teal);
+      font-weight: 850;
+    }
     h1, h2, h3, p { margin: 0; }
     h2 { font-size: 16px; margin-bottom: 12px; }
     h3 { font-size: 14px; margin-bottom: 8px; color: #dbe5ec; }
@@ -546,6 +581,7 @@ STYLE = """
       .console-grid { grid-template-columns: 1fr; }
       .boundary-line { grid-template-columns: 1fr; }
       .section-map { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .setup-strip { grid-template-columns: 1fr; }
       .system-band { grid-template-columns: 1fr; }
       .system-arrow { min-height: 20px; transform: rotate(90deg); }
       .two { grid-template-columns: 1fr; }
@@ -670,10 +706,19 @@ PAGE_CONTENT: dict[str, str] = {
 
           <div class="surface">
             <section id="install-panel" class="panel hidden">
-              <div class="codebar"><h2>Codex install</h2><button class="secondary" type="button" data-copy="codex-command">Copy</button></div>
+              <div class="codebar"><h2>Codex one-command setup</h2><button class="secondary" type="button" data-copy="codex-command">Copy</button></div>
+              <p class="lead">Copy this into the terminal on the machine that will run Codex. It installs the Mercury Finance plugin and connects the remote MCP server.</p>
               <pre id="codex-command"></pre>
-              <div class="codebar"><h2>MCP client config</h2><button class="secondary" type="button" data-copy="mcp-config">Copy</button></div>
-              <pre id="mcp-config"></pre>
+              <div class="setup-strip">
+                <div><b>1. Plugin</b><span>Mercury Finance appears in Codex.</span></div>
+                <div><b>2. MCP</b><span>Codex connects to Mercury Tools.</span></div>
+                <div><b>3. Accounting</b><span>Ask Mercury to connect FlowAccount, PEAK, Express, or ERP API.</span></div>
+              </div>
+              <details class="advanced">
+                <summary>Advanced MCP client config</summary>
+                <div class="codebar"><h2>MCP client config</h2><button class="secondary" type="button" data-copy="mcp-config">Copy</button></div>
+                <pre id="mcp-config"></pre>
+              </details>
               <button id="forget-token" class="danger" type="button">Forget local token</button>
             </section>
 
@@ -1032,15 +1077,20 @@ SCRIPT = """
 
     function renderInstall(payload) {
       $('#install-panel').classList.remove('hidden');
-      $('#codex-command').textContent = payload.codex.command;
+      $('#codex-command').textContent = payload.codex.setup_command || payload.codex.command;
       $('#mcp-config').textContent = JSON.stringify(payload.cursor.config, null, 2);
     }
 
     function renderInstallFromToken(token) {
       if (!state.endpoint) return;
       $('#install-panel').classList.remove('hidden');
-      $('#codex-command').textContent = "export MERCURY_TOOLS_MCP_TOKEN='" + token + "'\\n" +
-        'codex mcp add mercury-tools --url ' + state.endpoint + ' --bearer-token-env-var MERCURY_TOOLS_MCP_TOKEN';
+      $('#codex-command').textContent = [
+        "export MERCURY_TOOLS_MCP_TOKEN='" + token + "'",
+        'codex plugin marketplace add natthaphonchop2-creator/mercury-tools --ref main --sparse .agents/plugins --sparse plugins/mercury-finance || true',
+        'codex plugin add mercury-finance || true',
+        'codex mcp remove mercury-tools >/dev/null 2>&1 || true',
+        'codex mcp add mercury-tools --url ' + state.endpoint + ' --bearer-token-env-var MERCURY_TOOLS_MCP_TOKEN'
+      ].join('\\n');
       $('#mcp-config').textContent = JSON.stringify({
         mcpServers: {
           'mercury-tools': {

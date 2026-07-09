@@ -206,6 +206,12 @@ def test_connect_api_issues_client_token_for_mcp(monkeypatch) -> None:
     payload = response.json()
     assert payload["token"].startswith("mc_")
     assert "codex mcp add mercury-tools" in payload["codex"]["command"]
+    assert "codex plugin marketplace add natthaphonchop2-creator/mercury-tools" in (
+        payload["codex"]["setup_command"]
+    )
+    assert "codex plugin add mercury-finance" in payload["codex"]["setup_command"]
+    assert "codex mcp add mercury-tools" in payload["codex"]["setup_command"]
+    assert payload["codex"]["plugin_id"] == "mercury-finance"
     assert payload["codex"]["env_var"] == "MERCURY_TOOLS_MCP_TOKEN"
     assert "--bearer-token-env-var MERCURY_TOOLS_MCP_TOKEN" in payload["codex"]["command"]
     assert "MERCURY_TOOLS_MCP_TOKEN" in payload["cursor"]["note"]
@@ -214,6 +220,21 @@ def test_connect_api_issues_client_token_for_mcp(monkeypatch) -> None:
 
     authorized = client.get("/mcp", headers={"Authorization": f"Bearer {payload['token']}"})
     assert authorized.status_code != 401
+
+
+def test_connect_page_presents_single_codex_setup_with_advanced_config(monkeypatch) -> None:
+    monkeypatch.setenv("MERCURY_TOOLS_PUBLIC_BASE_URL", "https://mercury.example.com")
+    monkeypatch.setenv("MERCURY_TOOLS_MCP_PATH", "/mcp")
+    monkeypatch.setenv("MERCURY_CONNECT_INVITE_CODE", "invite-demo")
+    monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
+
+    client = TestClient(create_http_app(require_auth=True), raise_server_exceptions=False)
+    response = client.get("/connect")
+
+    assert response.status_code == 200
+    assert "Codex one-command setup" in response.text
+    assert "Advanced MCP client config" in response.text
+    assert "data-copy=\"codex-command\"" in response.text
 
 
 def test_product_dashboard_requires_mercury_client_token(monkeypatch) -> None:

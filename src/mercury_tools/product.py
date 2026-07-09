@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import secrets
+import shlex
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -15,6 +16,10 @@ from mercury_tools.config import Settings
 
 DEFAULT_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30
 TOKEN_PREFIX = "mc_"
+CODEX_PLUGIN_MARKETPLACE_SOURCE = "natthaphonchop2-creator/mercury-tools"
+CODEX_PLUGIN_MARKETPLACE_REF = "main"
+CODEX_PLUGIN_ID = "mercury-finance"
+CODEX_PLUGIN_SPARSE_PATHS = (".agents/plugins", "plugins/mercury-finance")
 
 
 @dataclass(frozen=True)
@@ -130,9 +135,27 @@ def build_connection_payload(
     endpoint = f"{public_base_url.rstrip('/')}{mcp_path}"
     server_name = "mercury-tools"
     env_name = "MERCURY_TOOLS_MCP_TOKEN"
-    codex_command = (
+    connect_mcp_command = (
         f"export {env_name}='{token}'\n"
         f"codex mcp add {server_name} --url {endpoint} --bearer-token-env-var {env_name}"
+    )
+    marketplace_command = (
+        "codex plugin marketplace add "
+        f"{CODEX_PLUGIN_MARKETPLACE_SOURCE} "
+        f"--ref {CODEX_PLUGIN_MARKETPLACE_REF} "
+        + " ".join(f"--sparse {path}" for path in CODEX_PLUGIN_SPARSE_PATHS)
+    )
+    setup_command = "\n".join(
+        [
+            f"export {env_name}={shlex.quote(token)}",
+            f"{marketplace_command} || true",
+            f"codex plugin add {CODEX_PLUGIN_ID} || true",
+            f"codex mcp remove {server_name} >/dev/null 2>&1 || true",
+            (
+                f"codex mcp add {server_name} --url {endpoint} "
+                f"--bearer-token-env-var {env_name}"
+            ),
+        ]
     )
     remote_config = {
         "mcpServers": {
@@ -154,7 +177,10 @@ def build_connection_payload(
         },
         "codex": {
             "env_var": env_name,
-            "command": codex_command,
+            "command": connect_mcp_command,
+            "setup_command": setup_command,
+            "marketplace_command": marketplace_command,
+            "plugin_id": CODEX_PLUGIN_ID,
         },
         "cursor": {
             "config": remote_config,

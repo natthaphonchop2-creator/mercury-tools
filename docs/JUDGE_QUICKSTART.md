@@ -3,27 +3,27 @@
 Mercury Finance is an online MCP accounting agent layer for ERP/API connectors,
 RAG context, audit-safe workflows, and Thai finance reporting.
 
-## Install In Codex
+## Connect In Codex
 
-```bash
-codex plugin marketplace add natthaphonchop2-creator/mercury-tools \
-  --ref main \
-  --sparse .agents/plugins \
-  --sparse plugins/mercury-finance
+Open Mercury Connect:
+
+```text
+https://mercury-tools-mcp.onrender.com/connect
 ```
 
-Install `Mercury Finance` from the plugin list.
+Enter the invite code, email, company name, and choose Codex. Mercury returns
+one copy-paste command that installs the `Mercury Finance` plugin and connects
+Codex to the hosted MCP server.
 
-## Connect MCP
+The generated command includes `codex plugin marketplace add`, `codex plugin add
+mercury-finance`, and `codex mcp add` so judges do not need to assemble the MCP
+setup manually.
 
-Endpoint:
+Advanced MCP endpoint:
 
 ```text
 https://mercury-tools-mcp.onrender.com/mcp
 ```
-
-If Codex asks for authentication, open Mercury Connect and use the issued client
-token through Codex's secure MCP auth path.
 
 ## Demo Prompts
 
