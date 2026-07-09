@@ -54,6 +54,7 @@ Commands:
 - emitReport: create a structured handoff artifact. Args: title, sections, metadata.
 - assert: fail the flow on missing required values. Args: exists or minCount.
 - runFlow: call another flow file relative to the current flow.
+  Args: file/path, env, label, commands, saveAs.
 
 Template variables:
 - ${jurisdiction} reads from env.
@@ -65,6 +66,27 @@ Conditional execution:
 - Supported conditions: true, exists, notExists, equals, notEquals.
 - Multiple conditions are ANDed.
 - Mercury does not evaluate arbitrary JavaScript in v1.
+
+Inline subflows:
+- runFlow can call file: another-flow.yaml or commands: [...] inline.
+- label names the inline subflow in reports.
+- env values are inherited from the parent flow and can be overridden per runFlow.
+
+Example:
+- runFlow:
+    label: Production review handoff
+    when:
+      equals:
+        value: "${environment}"
+        expected: production
+    env:
+      review_level: controller
+    commands:
+      - emitReport:
+          title: "Review ${review_level}"
+          sections:
+            - "Only generated for production runs."
+    saveAs: productionReview
 
 Workspace quickstart:
 - mercury-tools flow init-workspace ./my-mercury-flows

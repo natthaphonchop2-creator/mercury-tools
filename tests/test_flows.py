@@ -161,6 +161,84 @@ name: True Condition
     assert payload["flow"]["commands"][0]["args"]["when"]["true"] is True
 
 
+def test_flow_runner_supports_inline_run_flow_commands() -> None:
+    result = MercuryFlowRunner(dry_run=True).run_text(
+        """
+name: Parent Flow
+env:
+  connector: flowaccount
+  environment: production
+---
+- runFlow:
+    label: Inline Review
+    env:
+      segment: weekly
+    commands:
+      - emitReport:
+          title: "${connector} ${segment}"
+          sections:
+            - "${environment}"
+      - emitReport:
+          when:
+            equals:
+              value: "${environment}"
+              expected: sandbox
+          title: "Skipped {{ missing.value }}"
+    saveAs: inline
+- emitReport:
+    title: "Parent saw {{ inline.flow.name }}"
+""",
+    )
+
+    payload = result.as_dict()
+    inline = payload["variables"]["inline"]
+
+    assert payload["steps"][0]["command"] == "runFlow"
+    assert payload["steps"][0]["status"] == "planned"
+    assert inline["flow"]["name"] == "Inline Review"
+    assert inline["steps"][0]["status"] == "planned"
+    assert inline["steps"][1]["status"] == "skipped"
+    assert inline["artifacts"][0]["title"] == "flowaccount weekly"
+    assert payload["artifacts"][0]["title"] == "Parent saw Inline Review"
+
+
+def test_flow_runner_executes_inline_run_flow_commands() -> None:
+    result = MercuryFlowRunner().run_text(
+        """
+name: Inline Execute
+---
+- runFlow:
+    commands:
+      - assert:
+          exists: true
+      - emitReport:
+          title: "Inline done"
+    saveAs: nested
+""",
+    )
+
+    payload = result.as_dict()
+
+    assert payload["status"] == "ok"
+    assert payload["variables"]["nested"]["status"] == "ok"
+    assert payload["variables"]["nested"]["artifacts"][0]["title"] == "Inline done"
+
+
+def test_flow_runner_rejects_run_flow_with_file_and_commands() -> None:
+    with pytest.raises(FlowValidationError, match="either file/path or commands"):
+        MercuryFlowRunner(dry_run=True).run_text(
+            """
+name: Bad Inline
+---
+- runFlow:
+    file: child.yaml
+    commands:
+      - emitReport:
+          title: "bad"
+"""
+        )
+
+
 def test_flow_cli_validate_and_dry_run(tmp_path: Path, capsys) -> None:
     path = tmp_path / "company-health.yaml"
     path.write_text(COMPANY_HEALTH_TEMPLATE, encoding="utf-8")

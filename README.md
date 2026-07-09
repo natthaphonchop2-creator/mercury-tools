@@ -190,6 +190,20 @@ env:
     title: "FlowAccount-only handoff"
     sections:
       - "This step runs only when the selected connector is FlowAccount."
+- runFlow:
+    label: Production review handoff
+    when:
+      equals:
+        value: "${environment}"
+        expected: production
+    env:
+      review_level: controller
+    commands:
+      - emitReport:
+          title: "Review ${review_level}"
+          sections:
+            - "Only generated for production runs."
+    saveAs: productionReview
 - emitReport:
     title: "Company health-check context pack"
     sections:
@@ -237,6 +251,11 @@ Like Maestro's `when` blocks, Mercury commands can run conditionally. v1 keeps
 this deterministic for accounting workflows: `true`, `exists`, `notExists`,
 `equals`, and `notEquals` are supported, and multiple conditions are ANDed.
 Arbitrary JavaScript evaluation is intentionally not enabled in Mercury v1.
+
+Like Maestro's `runFlow`, Mercury can run a subflow file or an inline command
+list. Inline `commands` are useful for small conditional accounting handoffs;
+`label` names the grouped subflow in reports, and `env` inherits parent values
+with per-subflow overrides.
 
 This mirrors Maestro's workspace model at the Mercury layer: config, folder
 architecture, tag-based discovery, deterministic execution order, output

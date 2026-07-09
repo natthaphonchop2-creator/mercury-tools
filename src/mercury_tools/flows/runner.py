@@ -9,7 +9,12 @@ from typing import Any
 
 from mercury_tools.config import load_settings
 from mercury_tools.flows.models import FlowCommand, FlowRunResult, FlowStepResult, MercuryFlow
-from mercury_tools.flows.parser import FlowValidationError, parse_flow_path, parse_flow_text
+from mercury_tools.flows.parser import (
+    FlowValidationError,
+    parse_flow_path,
+    parse_flow_text,
+    parse_inline_commands,
+)
 from mercury_tools.rag.models import SearchFilters
 from mercury_tools.safety.redaction import redact_json
 
@@ -39,6 +44,16 @@ def _interpolate(value: Any, variables: dict[str, Any]) -> Any:
     if isinstance(value, dict):
         return {str(key): _interpolate(item, variables) for key, item in value.items()}
     return value
+
+
+def _interpolate_run_flow_args(args: dict[str, Any], variables: dict[str, Any]) -> dict[str, Any]:
+    rendered: dict[str, Any] = {}
+    for key, value in args.items():
+        if key == "commands":
+            rendered[key] = value
+        else:
+            rendered[key] = _interpolate(value, variables)
+    return rendered
 
 
 def _summary(payload: Any) -> dict[str, Any]:
@@ -201,11 +216,19 @@ class MercuryFlowRunner:
                     )
                 )
                 continue
-            rendered_args = _interpolate(command.args, variables)
-            if self.dry_run:
+            if command.name == "runFlow":
+                rendered_args = _interpolate_run_flow_args(command.args, variables)
+            else:
+                rendered_args = _interpolate(command.args, variables)
+            if self.dry_run and command.name != "runFlow":
                 output = self._planned_output(command, rendered_args)
             else:
-                output = self._execute(command, rendered_args, base_dir=base_dir)
+                output = self._execute(
+                    command,
+                    rendered_args,
+                    base_dir=base_dir,
+                    parent_env=variables["env"],
+                )
             save_as = rendered_args.get("saveAs") or rendered_args.get("save_as")
             if save_as:
                 variables[str(save_as)] = output
@@ -231,7 +254,14 @@ class MercuryFlowRunner:
             artifacts=redact_json(artifacts),
         )
 
-    def _execute(self, command: FlowCommand, args: dict[str, Any], *, base_dir: Path) -> Any:
+    def _execute(
+        self,
+        command: FlowCommand,
+        args: dict[str, Any],
+        *,
+        base_dir: Path,
+        parent_env: dict[str, Any],
+    ) -> Any:
         if command.name == "connectorStatus":
             if not self.connector_status_getter:
                 raise FlowValidationError("connectorStatus is not configured for this runner.")
@@ -308,15 +338,33 @@ class MercuryFlowRunner:
             }
 
         if command.name == "runFlow":
-            raw_path = str(args.get("path") or args.get("value") or "").strip()
-            if not raw_path:
-                raise FlowValidationError("runFlow requires path.")
-            child_path = (base_dir / raw_path).resolve()
-            if not child_path.exists():
-                raise FlowValidationError(f"Nested flow does not exist: {raw_path}")
             child_env = args.get("env") or {}
             if not isinstance(child_env, dict):
                 raise FlowValidationError("runFlow env must be a mapping.")
+            child_env = {**parent_env, **child_env}
+            inline_commands = args.get("commands")
+            raw_path = str(args.get("file") or args.get("path") or args.get("value") or "").strip()
+            if inline_commands is not None and raw_path:
+                raise FlowValidationError("runFlow accepts either file/path or commands, not both.")
+            if inline_commands is not None:
+                commands = parse_inline_commands(inline_commands, source="runFlow.commands")
+                if not commands:
+                    raise FlowValidationError("runFlow commands must include at least one command.")
+                label = str(args.get("label") or "Inline Flow").strip() or "Inline Flow"
+                child_flow = MercuryFlow(
+                    name=label,
+                    description="Inline Mercury subflow",
+                    tags=[],
+                    env=child_env,
+                    commands=commands,
+                    path=base_dir / f"{label}.inline.yaml",
+                )
+                return self.run_flow(child_flow, env=child_env).as_dict()
+            if not raw_path:
+                raise FlowValidationError("runFlow requires file/path or commands.")
+            child_path = (base_dir / raw_path).resolve()
+            if not child_path.exists():
+                raise FlowValidationError(f"Nested flow does not exist: {raw_path}")
             return self.run_path(child_path, env=child_env).as_dict()
 
         raise FlowValidationError(f"Unsupported command: {command.name}")

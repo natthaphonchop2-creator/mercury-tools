@@ -85,6 +85,11 @@ def _parse_commands(raw: Any, *, source: str) -> list[FlowCommand]:
     return [_parse_command(item, source=source, index=index) for index, item in enumerate(raw)]
 
 
+def parse_inline_commands(raw: Any, *, source: str = "commands") -> list[FlowCommand]:
+    """Parse a command list embedded inside another command."""
+    return _parse_commands(raw, source=source)
+
+
 def _split_flow_documents(text: str) -> tuple[dict[str, Any], list[Any]]:
     try:
         docs = list(yaml.safe_load_all(text))
