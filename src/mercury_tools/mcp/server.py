@@ -471,7 +471,7 @@ def connector_setup_guide_th() -> str:
 
 
 async def root(request: Request) -> Response:
-    page = request.url.path.strip("/") or "connect"
+    page = request.url.path.strip("/") or "start"
     return HTMLResponse(render_connect_html(page))
 
 
@@ -495,6 +495,7 @@ async def status(_: Request) -> Response:
                 "note": "Pages configure Mercury tools and context; Codex, Cursor, Claude, or another host owns chat.",
             },
             "pages": {
+                "start": "/",
                 "connect": "/connect",
                 "workspace": "/workspace",
                 "connectors": "/connectors",
@@ -932,6 +933,7 @@ def create_http_app(*, require_auth: bool | None = None):
     app = mcp.streamable_http_app()
     for page_path in (
         "/",
+        "/start",
         "/connect",
         "/workspace",
         "/connectors",

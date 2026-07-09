@@ -149,9 +149,11 @@ Users then open:
 https://mercury-tools-mcp.onrender.com/
 ```
 
-They enter the invite code, email, company, and AI host, then Mercury generates
-copy-ready MCP setup instructions. The resulting client token is signed and
-time-limited, so users do not need access to the server bearer token file.
+The first page is a setup map, not the Mercury chat/runtime surface. Users open
+`/connect` from there, enter the invite code, email, company, and AI host, then
+Mercury generates copy-ready MCP setup instructions. The resulting client token
+is signed and time-limited, so users do not need access to the server bearer
+token file.
 
 If `0002_mercury_product_layer.sql` is not applied yet, the Connect page still
 generates MCP client tokens, but dashboard persistence runs in degraded mode.

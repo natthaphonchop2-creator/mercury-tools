@@ -6,9 +6,10 @@ from __future__ import annotations
 
 from html import escape
 
-PAGE_NAMES = ("connect", "workspace", "connectors", "knowledge", "skills", "flows", "audit")
+PAGE_NAMES = ("start", "connect", "workspace", "connectors", "knowledge", "skills", "flows", "audit")
 
 NAV_ITEMS = (
+    ("start", "Start", "Console map"),
     ("connect", "Connect", "MCP host access"),
     ("workspace", "Workspace", "Company context"),
     ("connectors", "Programs", "Accounting systems"),
@@ -206,6 +207,13 @@ STYLE = """
     .page-grid.reverse {
       grid-template-columns: minmax(0, 1fr) minmax(320px, 430px);
     }
+    .start-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.05fr) minmax(320px, .95fr);
+      gap: 14px;
+      align-items: start;
+      min-width: 0;
+    }
     .panel {
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -251,6 +259,70 @@ STYLE = """
       padding: 10px;
       background: rgba(16, 23, 32, .62);
       color: #cbd6df;
+    }
+    .route-list {
+      display: grid;
+      gap: 9px;
+      margin-top: 12px;
+    }
+    .route-link {
+      display: grid;
+      gap: 2px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      color: #e5edf3;
+      background: rgba(16, 23, 32, .66);
+      text-decoration: none;
+    }
+    .route-link:hover,
+    .route-link:focus {
+      border-color: rgba(66, 198, 187, .78);
+    }
+    .route-link b {
+      color: var(--teal);
+    }
+    .route-link span {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .steps {
+      display: grid;
+      gap: 10px;
+      counter-reset: step;
+    }
+    .step {
+      position: relative;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(16, 23, 32, .66);
+      padding: 12px 12px 12px 46px;
+      min-height: 64px;
+    }
+    .step::before {
+      counter-increment: step;
+      content: counter(step);
+      position: absolute;
+      left: 12px;
+      top: 12px;
+      width: 24px;
+      height: 24px;
+      display: grid;
+      place-items: center;
+      border-radius: 999px;
+      background: var(--gold);
+      color: #1b160a;
+      font-weight: 900;
+      font-size: 12px;
+    }
+    .step b {
+      display: block;
+      color: #e5edf3;
+      margin-bottom: 2px;
+    }
+    .step span {
+      color: var(--muted);
+      font-size: 12px;
     }
     h1, h2, h3, p { margin: 0; }
     h2 { font-size: 16px; margin-bottom: 12px; }
@@ -354,6 +426,7 @@ STYLE = """
       .shell { grid-template-columns: 1fr; }
       .rail { position: static; }
       .nav-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .start-layout { grid-template-columns: 1fr; }
       .page-grid, .page-grid.reverse, .cards-2 { grid-template-columns: 1fr; }
       .console-grid { grid-template-columns: 1fr; }
       .two { grid-template-columns: 1fr; }
@@ -385,6 +458,41 @@ STYLE = """
 """
 
 PAGE_CONTENT: dict[str, str] = {
+    "start": """
+      <section class="page" data-page="start">
+        <div class="page-head">
+          <span class="eyebrow">Mercury Setup Console</span>
+          <h1>Set up Mercury tools for the AI host. Do not chat here.</h1>
+          <p>Mercury is MCP-first: Codex, Cursor, Claude Desktop, or a customer agent owns the conversation and model. This browser console only prepares access, accounting programs, wiki context, skills, flows, and audit records.</p>
+        </div>
+        <div class="start-layout">
+          <section class="panel">
+            <div class="row"><h2>Recommended setup path</h2><span class="pill">remote MCP</span></div>
+            <div class="steps">
+              <div class="step"><b>Create host access</b><span>Generate a workspace token and install Mercury into the AI host.</span></div>
+              <div class="step"><b>Set company context</b><span>Confirm workspace, member, and host identity for one company.</span></div>
+              <div class="step"><b>Connect accounting program</b><span>Select FlowAccount, PEAK, Express, or a future connector and save server-side credentials.</span></div>
+              <div class="step"><b>Enable knowledge, skills, and flows</b><span>The host AI calls Mercury for cited context packs and repeatable runbooks.</span></div>
+              <div class="step"><b>Review audit trail</b><span>Setup and MCP activity produce sanitized evidence without exposing secrets.</span></div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <h2>Open a focused page</h2>
+            <p class="lead">Each page handles one Mercury control-plane job. The runtime stays in the AI host.</p>
+            <div class="route-list">
+              <a class="route-link" href="/connect"><b>Connect host</b><span>Create or restore a Mercury MCP client token.</span></a>
+              <a class="route-link" href="/workspace"><b>Workspace</b><span>Check company, team, host, and product boundary.</span></a>
+              <a class="route-link" href="/connectors"><b>Accounting programs</b><span>Set connector profile and encrypted credentials.</span></a>
+              <a class="route-link" href="/knowledge"><b>LLM Wiki</b><span>Review the cited RAG layer used by MCP tools.</span></a>
+              <a class="route-link" href="/skills"><b>Skills</b><span>Manage accounting playbooks for host agents.</span></a>
+              <a class="route-link" href="/flows"><b>Flows</b><span>Build repeatable agent runbooks.</span></a>
+              <a class="route-link" href="/audit"><b>Audit</b><span>Inspect sanitized evidence and setup events.</span></a>
+            </div>
+          </section>
+        </div>
+      </section>
+    """,
     "connect": """
       <section class="page" data-page="connect">
         <div class="page-head">
@@ -754,7 +862,7 @@ SCRIPT = """
     const authHeaders = () => ({ 'Authorization': 'Bearer ' + state.token });
 
     function setActiveNavigation() {
-      const page = document.body.getAttribute('data-page') || 'connect';
+      const page = document.body.getAttribute('data-page') || 'start';
       document.querySelectorAll('[data-nav]').forEach((node) => {
         node.classList.toggle('active', node.getAttribute('data-nav') === page);
       });
@@ -1100,16 +1208,17 @@ def _nav(active_page: str) -> str:
     items = []
     for key, label, hint in NAV_ITEMS:
         active = " active" if key == active_page else ""
+        href = "/" if key == "start" else f"/{key}"
         items.append(
-            f'<a href="/{key}" data-nav="{key}" class="{active.strip()}"><b>{escape(label)}</b><span>{escape(hint)}</span></a>'
+            f'<a href="{href}" data-nav="{key}" class="{active.strip()}"><b>{escape(label)}</b><span>{escape(hint)}</span></a>'
         )
     return "\n".join(items)
 
 
 def render_connect_html(active_page: str = "connect") -> str:
     """Render one focused Mercury setup-console page."""
-    page = active_page if active_page in PAGE_NAMES else "connect"
-    title = "Mercury Connect" if page == "connect" else f"Mercury {page.title()}"
+    page = active_page if active_page in PAGE_NAMES else "start"
+    title = "Mercury Connect" if page in {"start", "connect"} else f"Mercury {page.title()}"
     body = PAGE_CONTENT[page]
 
     return f"""<!doctype html>

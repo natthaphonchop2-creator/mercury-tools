@@ -71,12 +71,15 @@ def test_connect_page_and_status(monkeypatch) -> None:
     assert "Mercury Connect" in page.text
     assert "MCP setup console for accounting AI hosts" in page.text
     assert "The AI host remains the product surface." in page.text
-    assert 'data-page="connect"' in page.text
+    assert 'data-page="start"' in page.text
+    assert "Set up Mercury tools for the AI host. Do not chat here." in page.text
+    assert 'id="connect-form"' not in page.text
     assert status.status_code == 200
     assert status.json()["mcp_endpoint"] == "https://mercury.example.com/mcp"
     assert status.json()["invite_required"] is True
     assert status.json()["console"]["purpose"] == "setup-console"
     assert status.json()["console"]["product_surface"] == "mcp-host"
+    assert status.json()["pages"]["start"] == "/"
     assert status.json()["pages"]["connectors"] == "/connectors"
     assert status.json()["pages"]["knowledge"] == "/knowledge"
     assert status.json()["pages"]["flows"] == "/flows"
@@ -97,6 +100,8 @@ def test_product_console_exposes_separate_pages(monkeypatch) -> None:
     client = TestClient(create_http_app(require_auth=True), raise_server_exceptions=False)
 
     for path, page_name in (
+        ("/", "start"),
+        ("/start", "start"),
         ("/connect", "connect"),
         ("/workspace", "workspace"),
         ("/connectors", "connectors"),
@@ -111,6 +116,8 @@ def test_product_console_exposes_separate_pages(monkeypatch) -> None:
         assert f'data-page="{page_name}"' in response.text
         assert response.text.count('<section class="page" data-page=') == 1
         assert "history.pushState" not in response.text
+        if page_name != "connect":
+            assert 'id="connect-form"' not in response.text
 
 
 def test_connect_api_rejects_bad_invite(monkeypatch) -> None:

@@ -118,6 +118,7 @@ The browser setup console is split into focused pages instead of one large
 dashboard. It is not the main Mercury chat surface; Codex, Cursor, Claude, or
 another MCP host remains the user-facing AI:
 
+- `/` is the Start page and setup map
 - `/connect` creates or restores a host MCP connection
 - `/workspace` shows workspace identity and team access
 - `/connectors` saves accounting connector profiles and encrypted credentials
