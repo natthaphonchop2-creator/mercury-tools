@@ -70,6 +70,16 @@ def test_plugin_declares_remote_mcp_without_secret_values() -> None:
     assert "client_secret" not in serialized
 
 
+def test_judge_quickstart_mentions_plugin_and_no_secrets() -> None:
+    text = (ROOT / "docs/JUDGE_QUICKSTART.md").read_text()
+
+    assert "Mercury Finance" in text
+    assert "codex plugin marketplace add" in text
+    assert "https://mercury-tools-mcp.onrender.com/mcp" in text
+    assert "SUPABASE_SERVICE_ROLE_KEY" not in text
+    assert "client_secret =" not in text
+
+
 def test_connector_credential_skill_is_gated() -> None:
     skill = (
         ROOT

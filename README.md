@@ -473,3 +473,9 @@ uv run pytest
 uv run ruff check .
 uv run mcp run src/mercury_tools/mcp/server.py
 ```
+
+## Mercury Finance Codex Plugin
+
+See `docs/JUDGE_QUICKSTART.md` for the contest install flow. The plugin
+connects Codex to the hosted Mercury Tools MCP server and keeps connector
+credentials out of Git.
