@@ -40,6 +40,7 @@ Create and test a Mercury Flow:
 ```bash
 uv run mercury-tools flow init-workspace ./my-mercury-flows
 uv run mercury-tools flow list ./my-mercury-flows
+uv run mercury-tools flow manifest ./my-mercury-flows --json
 uv run mercury-tools flow run-suite ./my-mercury-flows --dry-run
 uv run mercury-tools flow run-suite ./my-mercury-flows --dry-run -e month=2026-09
 uv run mercury-tools flow watch ./my-mercury-flows --dry-run
@@ -226,6 +227,7 @@ Flow CLI:
 - `mercury-tools flow validate <path>`
 - `mercury-tools flow run <path> --dry-run -e month=2026-09`
 - `mercury-tools flow list <workspace> --tag accounting`
+- `mercury-tools flow manifest <workspace> --json`
 - `mercury-tools flow run-suite <workspace> --dry-run --exclude-tag disabled -e month=2026-09`
 - `mercury-tools flow run-suite <workspace> --format junit --output reports/junit.xml`
 - `mercury-tools flow run-suite <workspace> --format html --output reports/flow-report.html`
@@ -246,6 +248,21 @@ with `runFlow: file`. Audit and run history record only the env key names:
     "month": "2026-09",
     "connector": "flowaccount"
   }
+}
+```
+
+For host agents, `inspect_flow_files` returns a Maestro-style workspace
+manifest without executing anything. It reports selected/skipped flows,
+available tags, execution order, safe env key names, and the MCP/CLI handoff
+commands. This is the preferred first call when Codex, Cursor, Claude, or
+another agent receives a Mercury flow pack from a user:
+
+```json
+{
+  "flow_files": {
+    "flows/company-health.yaml": "name: Company Health\\ntags: [accounting]\\n---\\n- emitReport:\\n    title: Company"
+  },
+  "config_yaml": "flows: flows/**/*.yaml\\nincludeTags: [accounting]\\n"
 }
 ```
 

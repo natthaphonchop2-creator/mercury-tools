@@ -9,7 +9,11 @@ from mercury_tools.cli import main
 from mercury_tools.flows.parser import FlowValidationError, parse_flow_text, validate_flow_text
 from mercury_tools.flows.runner import MercuryFlowRunner
 from mercury_tools.flows.templates import COMPANY_HEALTH_TEMPLATE
-from mercury_tools.flows.workspace import discover_workspace_flows, run_workspace_flows
+from mercury_tools.flows.workspace import (
+    discover_workspace_flows,
+    run_workspace_flows,
+    workspace_manifest,
+)
 
 
 def test_parse_flow_with_hooks_and_commands() -> None:
@@ -696,6 +700,53 @@ execution:
     assert workspace.config.env["month"] == "2026-07"
     assert len(workspace.records) == 2
     assert [record.name for record in workspace.selected] == ["Company Health Check"]
+
+
+def test_flow_workspace_manifest_is_agent_facing_without_env_values(tmp_path: Path) -> None:
+    flows = tmp_path / "flows"
+    flows.mkdir()
+    (tmp_path / "config.yaml").write_text(
+        """
+flows: flows/**/*.yaml
+includeTags: [accounting]
+excludeTags: [disabled]
+env:
+  month: "2026-07"
+  client_secret: "do-not-return"
+executionOrder:
+  flowsOrder:
+    - company
+""",
+        encoding="utf-8",
+    )
+    (flows / "company.yaml").write_text(COMPANY_HEALTH_TEMPLATE, encoding="utf-8")
+
+    manifest = workspace_manifest(discover_workspace_flows(tmp_path))
+
+    assert manifest["surface"] == "mcp-cli"
+    assert manifest["runtime_boundary"]["primary_runtime"] == "MCP tools and CLI"
+    assert manifest["discovery"]["selected_count"] == 1
+    assert manifest["workspace"]["env_keys"] == ["client_secret", "month"]
+    assert "do-not-return" not in json.dumps(manifest)
+    assert "inspect_flow_files" in manifest["agent_handoff"]["mcp_tools"]
+
+
+def test_flow_cli_manifest_outputs_agent_handoff(tmp_path: Path, capsys) -> None:
+    flows = tmp_path / "flows"
+    flows.mkdir()
+    (tmp_path / "config.yaml").write_text(
+        "flows: flows/**/*.yaml\nincludeTags: [accounting]\n",
+        encoding="utf-8",
+    )
+    (flows / "company.yaml").write_text(COMPANY_HEALTH_TEMPLATE, encoding="utf-8")
+
+    assert main(["flow", "manifest", str(tmp_path), "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ok"
+    assert payload["surface"] == "mcp-cli"
+    assert payload["discovery"]["tags"] == ["accounting", "flowaccount", "read-only"]
+    assert payload["agent_handoff"]["cli_examples"][1].startswith("mercury-tools flow manifest")
 
 
 def test_flow_workspace_run_suite_dry_run(tmp_path: Path) -> None:

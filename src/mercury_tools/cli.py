@@ -20,6 +20,7 @@ from mercury_tools.flows.workspace import (
     create_workspace_scaffold,
     discover_workspace_flows,
     run_workspace_flows,
+    workspace_manifest,
 )
 from mercury_tools.rag.embeddings import create_embedding_provider
 from mercury_tools.rag.ingest import ingest_wiki
@@ -268,6 +269,42 @@ def cmd_flow_list(args: argparse.Namespace) -> int:
             label = record.name or record.error or record.path.name
             relative_path = record.path.relative_to(config.root)
             print(f"{marker} {relative_path} [{record.status}] {label} ({tags})")
+    return 0
+
+
+def cmd_flow_manifest(args: argparse.Namespace) -> int:
+    try:
+        workspace = discover_workspace_flows(
+            Path(args.path),
+            include_tags=args.tag,
+            exclude_tags=args.exclude_tag,
+        )
+    except FlowValidationError as exc:
+        payload = {"status": "error", "message": str(exc), "path": args.path}
+        if args.json:
+            _print_json(payload)
+        else:
+            print(f"Workspace manifest failed: {exc}")
+        return 1
+    payload = workspace_manifest(workspace)
+    if args.json:
+        _print_json(payload)
+    else:
+        discovery = payload["discovery"]
+        print(f"Mercury flow manifest: {payload['workspace']['root']}")
+        print(f"runtime: {payload['runtime_boundary']['primary_runtime']}")
+        print(
+            f"flows: {discovery['selected_count']} selected / "
+            f"{discovery['flow_count']} discovered"
+        )
+        if discovery["tags"]:
+            print("tags: " + ", ".join(discovery["tags"]))
+        print("ordered:")
+        for item in payload["execution"]["ordered_flow_paths"]:
+            print(f"- {item}")
+        print("next:")
+        for item in payload["agent_handoff"]["cli_examples"]:
+            print(f"- {item}")
     return 0
 
 
@@ -628,6 +665,13 @@ def build_parser() -> argparse.ArgumentParser:
     flow_list.add_argument("--exclude-tag", action="append", default=[])
     flow_list.add_argument("--json", action="store_true")
     flow_list.set_defaults(func=cmd_flow_list)
+
+    flow_manifest = flow_sub.add_parser("manifest")
+    flow_manifest.add_argument("path", nargs="?", default=".")
+    flow_manifest.add_argument("--tag", action="append", default=[])
+    flow_manifest.add_argument("--exclude-tag", action="append", default=[])
+    flow_manifest.add_argument("--json", action="store_true")
+    flow_manifest.set_defaults(func=cmd_flow_manifest)
 
     flow_run_suite = flow_sub.add_parser("run-suite")
     flow_run_suite.add_argument("path", nargs="?", default=".")

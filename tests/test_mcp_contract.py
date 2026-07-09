@@ -26,6 +26,7 @@ def test_mcp_flow_tools_validate_and_dry_run() -> None:
     from mercury_tools.mcp.server import (
         check_flow_syntax,
         flow_cheat_sheet,
+        inspect_flow_files,
         run_flow,
         run_flow_files,
     )
@@ -98,6 +99,34 @@ tags: [helper]
     assert suite["results"][0]["artifacts"][1]["title"] == "Main 2026-10"
     assert suite["results"][0]["variables"]["subflow"]["flow"]["path"] == "sub.yaml"
     assert suite["results"][0]["variables"]["subflow"]["artifacts"][0]["title"] == "Sub 2026-10"
+
+    manifest = inspect_flow_files(
+        {
+            "flows/main.yaml": """name: Main
+tags: [accounting, smoke]
+---
+- emitReport:
+    title: "Main"
+""",
+            "flows/wip.yaml": """name: WIP
+tags: [disabled]
+---
+- emitReport:
+    title: "WIP"
+""",
+        },
+        config_yaml="flows: flows/**/*.yaml\nincludeTags: [accounting]\nexcludeTags: [disabled]\n",
+    )
+    assert manifest["status"] == "ok"
+    assert manifest["surface"] == "mcp-cli"
+    assert manifest["discovery"]["selected_count"] == 1
+    assert manifest["discovery"]["skipped_count"] == 1
+    assert manifest["execution"]["ordered_flow_paths"] == ["flows/main.yaml"]
+    assert manifest["workspace"]["root"] == "."
+    assert manifest["workspace"]["config_path"] == "config.yaml"
+    assert manifest["flows"][0]["path"] == "flows/main.yaml"
+    assert "mercury-flow-inspect" not in str(manifest)
+    assert "run_flow_files" in manifest["agent_handoff"]["mcp_tools"]
 
 
 def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:

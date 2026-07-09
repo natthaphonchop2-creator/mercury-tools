@@ -147,6 +147,105 @@ class FlowWorkspace:
         }
 
 
+def workspace_manifest(
+    workspace: FlowWorkspace,
+    *,
+    source: str = "local",
+) -> dict[str, Any]:
+    """Return an agent-facing workspace summary without raw env values."""
+    records = []
+    for record in workspace.records:
+        item = record.as_dict(root=workspace.config.root)
+        if source == "in-memory":
+            item["path"] = item["relative_path"]
+        records.append(item)
+    selected = [record for record in records if record["selected"]]
+    skipped = [record for record in records if not record["selected"]]
+    invalid = [record for record in records if record["status"] != "valid"]
+    all_tags = sorted({tag for record in records for tag in record.get("tags", [])})
+
+    if not records:
+        status = "empty"
+    elif invalid:
+        status = "needs_attention"
+    elif not selected:
+        status = "no_selected_flows"
+    else:
+        status = "ok"
+
+    root_label = "." if source == "in-memory" else str(workspace.config.root)
+    config_path = str(workspace.config.config_path) if workspace.config.config_path else None
+    output_dir = str(workspace.config.output_dir) if workspace.config.output_dir else None
+    if source == "in-memory":
+        config_path = workspace.config.config_path.name if workspace.config.config_path else None
+        if workspace.config.output_dir:
+            try:
+                output_dir = workspace.config.output_dir.relative_to(
+                    workspace.config.root
+                ).as_posix()
+            except ValueError:
+                output_dir = workspace.config.output_dir.name
+    return {
+        "status": status,
+        "surface": "mcp-cli",
+        "source": source,
+        "runtime_boundary": {
+            "primary_runtime": "MCP tools and CLI",
+            "browser_console": "setup and read-only evidence only",
+            "host_agent": "Codex, Cursor, Claude, or another MCP client owns chat UX",
+        },
+        "workspace": {
+            "root": root_label,
+            "config_path": config_path,
+            "config_present": workspace.config.config_path is not None,
+            "flow_patterns": workspace.config.flows,
+            "env_keys": sorted(workspace.config.env),
+            "output_dir": output_dir,
+        },
+        "discovery": {
+            "flow_count": len(records),
+            "selected_count": len(selected),
+            "skipped_count": len(skipped),
+            "invalid_count": len(invalid),
+            "tags": all_tags,
+            "include_tags": sorted(workspace.config.include_tags),
+            "exclude_tags": sorted(workspace.config.exclude_tags),
+            "tag_logic": (
+                "include/exclude tag filters use OR within each list; exclude removes "
+                "matching flows after include selection."
+            ),
+        },
+        "execution": {
+            "sequential": workspace.config.sequential,
+            "continue_on_failure": workspace.config.continue_on_failure,
+            "ordered_flow_paths": [
+                record.as_dict(root=workspace.config.root)["relative_path"]
+                for record in workspace.ordered_selected
+            ],
+            "flows_order": workspace.config.flows_order,
+        },
+        "flows": records,
+        "agent_handoff": {
+            "mcp_tools": [
+                "flow_cheat_sheet",
+                "check_flow_syntax",
+                "inspect_flow_files",
+                "run_flow",
+                "run_flow_files",
+                "save_workspace_flow",
+                "list_workspace_flows",
+                "run_workspace_flow",
+            ],
+            "cli_examples": [
+                f"mercury-tools flow list {root_label}",
+                f"mercury-tools flow manifest {root_label} --json",
+                f"mercury-tools flow run-suite {root_label} --dry-run",
+                f"mercury-tools flow push {root_label} --url <remote> --client-token <mc_...>",
+            ],
+        },
+    }
+
+
 @dataclass(frozen=True)
 class FlowSuiteRun:
     workspace: FlowWorkspace

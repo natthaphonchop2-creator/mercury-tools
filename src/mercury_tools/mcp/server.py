@@ -20,6 +20,7 @@ from mercury_tools.db.supabase import SupabaseRagStore
 from mercury_tools.flows.parser import FlowValidationError, validate_flow_text
 from mercury_tools.flows.runner import create_default_runner
 from mercury_tools.flows.templates import FLOW_CHEAT_SHEET
+from mercury_tools.flows.workspace import discover_workspace_flows, workspace_manifest
 from mercury_tools.mercury_runtime import connector_status as read_connector_status
 from mercury_tools.mercury_runtime import skill_markdown
 from mercury_tools.product import (
@@ -426,6 +427,74 @@ def check_flow_syntax(flow_yaml: str) -> dict[str, Any]:
     except FlowValidationError as exc:
         payload = {"status": "error", "message": str(exc)}
         _audit("check_flow_syntax", {"flow_yaml_length": len(flow_yaml)}, payload)
+        return payload
+
+
+@mcp.tool()
+def inspect_flow_files(
+    flow_files: dict[str, str] | list[dict[str, Any]],
+    config_yaml: str | None = None,
+    include_tags: list[str] | str | None = None,
+    exclude_tags: list[str] | str | None = None,
+) -> dict[str, Any]:
+    """Inspect an in-memory Mercury flow workspace for an MCP host agent."""
+    normalized_files: list[dict[str, str]] = []
+    try:
+        normalized_files = _flow_files_from_payload(flow_files)
+        if config_yaml and len(config_yaml) > MAX_MCP_FLOW_FILE_CHARS:
+            raise ValueError(
+                f"config_yaml may be at most {MAX_MCP_FLOW_FILE_CHARS} characters."
+            )
+        include = _string_list_from_payload(include_tags, label="include_tags")
+        exclude = _string_list_from_payload(exclude_tags, label="exclude_tags")
+
+        with TemporaryDirectory(prefix="mercury-flow-inspect-") as temp_dir:
+            root = Path(temp_dir).resolve()
+            if config_yaml:
+                (root / "config.yaml").write_text(config_yaml, encoding="utf-8")
+            for item in normalized_files:
+                target = root / item["path"]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(item["flow_yaml"], encoding="utf-8")
+
+            workspace = discover_workspace_flows(
+                root,
+                include_tags=include,
+                exclude_tags=exclude,
+            )
+            payload = redact_json(workspace_manifest(workspace, source="in-memory"))
+
+        payload["input"] = {
+            "flow_count": len(normalized_files),
+            "config_yaml_present": bool(config_yaml),
+            "include_tags": include,
+            "exclude_tags": exclude,
+        }
+        _audit(
+            "inspect_flow_files",
+            {
+                "flow_count": len(normalized_files),
+                "config_yaml_present": bool(config_yaml),
+                "include_tags": include,
+                "exclude_tags": exclude,
+                "total_flow_yaml_length": sum(len(item["flow_yaml"]) for item in normalized_files),
+            },
+            {
+                "status": payload["status"],
+                "selected_count": payload["discovery"]["selected_count"],
+            },
+        )
+        return payload
+    except (FlowValidationError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit(
+            "inspect_flow_files",
+            {
+                "flow_count": len(normalized_files),
+                "config_yaml_present": bool(config_yaml),
+            },
+            payload,
+        )
         return payload
 
 
@@ -850,6 +919,7 @@ async def status(_: Request) -> Response:
             "flow_tools": [
                 "flow_cheat_sheet",
                 "check_flow_syntax",
+                "inspect_flow_files",
                 "run_flow",
                 "run_flow_files",
                 "save_workspace_flow",
