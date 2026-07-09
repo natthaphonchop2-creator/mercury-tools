@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from mercury_tools.config import load_settings
 from mercury_tools.db.supabase import SupabaseRagStore
 from mercury_tools.flows.parser import FlowValidationError, validate_flow_path
@@ -263,6 +265,119 @@ def cmd_flow_run_suite(args: argparse.Namespace) -> int:
     return 0
 
 
+def _flow_import_payload(
+    path: Path,
+    *,
+    include_tags: list[str],
+    exclude_tags: list[str],
+) -> dict[str, Any]:
+    workspace = discover_workspace_flows(
+        path,
+        include_tags=include_tags,
+        exclude_tags=exclude_tags,
+    )
+    invalid = [record for record in workspace.selected if record.status == "invalid"]
+    if invalid:
+        first = invalid[0]
+        raise FlowValidationError(f"Invalid workspace flow {first.path}: {first.error}")
+    flows = []
+    for record in workspace.selected:
+        flows.append(
+            {
+                "title": record.name or record.path.stem,
+                "flow_yaml": record.path.read_text(encoding="utf-8"),
+                "metadata": {
+                    "source": "cli-flow-push",
+                    "relative_path": record.as_dict(root=workspace.config.root)["relative_path"],
+                    "tags": record.tags,
+                },
+            }
+        )
+    return {
+        "workspace": workspace.as_dict(),
+        "flows": flows,
+    }
+
+
+def cmd_flow_push(args: argparse.Namespace) -> int:
+    try:
+        payload = _flow_import_payload(
+            Path(args.path),
+            include_tags=args.tag,
+            exclude_tags=args.exclude_tag,
+        )
+        if not payload["flows"]:
+            raise FlowValidationError("No selected flows to push.")
+    except FlowValidationError as exc:
+        error = {"status": "error", "message": str(exc), "path": args.path}
+        if args.json:
+            _print_json(error)
+        else:
+            print(f"Flow push failed: {exc}")
+        return 1
+
+    if args.dry_run:
+        response_payload = {
+            "status": "planned",
+            "url": args.url.rstrip("/"),
+            "flow_count": len(payload["flows"]),
+            "workspace": payload["workspace"],
+        }
+        if args.json:
+            _print_json(response_payload)
+        else:
+            print(
+                f"Flow push planned: {response_payload['flow_count']} flows -> "
+                f"{response_payload['url']}"
+            )
+        return 0
+
+    client_token = read_token(token=args.client_token, token_file=args.client_token_file)
+    if not client_token.startswith("mc_"):
+        print("Flow push requires a Mercury client token (mc_...).")
+        return 1
+
+    url = f"{args.url.rstrip('/')}/api/flows/import"
+    try:
+        response = httpx.post(
+            url,
+            headers={"Authorization": f"Bearer {client_token}"},
+            json=payload,
+            timeout=args.timeout,
+        )
+        response_payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        response_payload = {"status": "error", "message": str(exc), "url": url}
+        if args.json:
+            _print_json(response_payload)
+        else:
+            print(f"Flow push failed: {exc}")
+        return 1
+
+    if response.status_code >= 400:
+        if args.json:
+            _print_json(response_payload)
+        else:
+            print(f"Flow push failed: HTTP {response.status_code}")
+            print(
+                response_payload.get("message")
+                or response_payload.get("error")
+                or "Request failed."
+            )
+        return 1
+
+    if args.json:
+        _print_json(response_payload)
+    else:
+        print(
+            f"Flow push ok: {response_payload.get('imported_count', 0)} flows -> "
+            f"{args.url.rstrip('/')}"
+        )
+        for flow in response_payload.get("flows", []):
+            print(f"- {flow.get('flow_id')}: {flow.get('title') or flow.get('name')}")
+    return 0
+
+
 def cmd_flow_init(args: argparse.Namespace) -> int:
     template = TEMPLATES[args.template]
     path = Path(args.path)
@@ -361,6 +476,18 @@ def build_parser() -> argparse.ArgumentParser:
     flow_run_suite.add_argument("--exclude-tag", action="append", default=[])
     flow_run_suite.add_argument("--json", action="store_true")
     flow_run_suite.set_defaults(func=cmd_flow_run_suite)
+
+    flow_push = flow_sub.add_parser("push")
+    flow_push.add_argument("path", nargs="?", default=".")
+    flow_push.add_argument("--url", default=DEFAULT_RENDER_URL)
+    flow_push.add_argument("--client-token")
+    flow_push.add_argument("--client-token-file")
+    flow_push.add_argument("--tag", action="append", default=[])
+    flow_push.add_argument("--exclude-tag", action="append", default=[])
+    flow_push.add_argument("--timeout", type=float, default=30)
+    flow_push.add_argument("--dry-run", action="store_true")
+    flow_push.add_argument("--json", action="store_true")
+    flow_push.set_defaults(func=cmd_flow_push)
 
     flow_init = flow_sub.add_parser("init")
     flow_init.add_argument("path")

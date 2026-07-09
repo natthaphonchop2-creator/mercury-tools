@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import httpx
 import pytest
 
 from mercury_tools.cli import main
@@ -167,6 +168,65 @@ def test_flow_cli_lists_and_runs_suite(tmp_path: Path, capsys) -> None:
 
     assert main(["flow", "run-suite", str(tmp_path), "--dry-run"]) == 0
     assert "Flow suite planned: 1 selected / 1 discovered" in capsys.readouterr().out
+
+
+def test_flow_cli_push_dry_run_uses_workspace_selection(tmp_path: Path, capsys) -> None:
+    flows = tmp_path / "flows"
+    flows.mkdir()
+    (tmp_path / "config.yaml").write_text(
+        "flows: flows/**/*.yaml\nincludeTags: [accounting]\n",
+        encoding="utf-8",
+    )
+    (flows / "company.yaml").write_text(COMPANY_HEALTH_TEMPLATE, encoding="utf-8")
+
+    assert main(["flow", "push", str(tmp_path), "--dry-run"]) == 0
+
+    assert "Flow push planned: 1 flows" in capsys.readouterr().out
+
+
+def test_flow_cli_push_posts_import_payload(tmp_path: Path, monkeypatch, capsys) -> None:
+    flows = tmp_path / "flows"
+    flows.mkdir()
+    (tmp_path / "config.yaml").write_text("flows: flows/**/*.yaml\n", encoding="utf-8")
+    (flows / "company.yaml").write_text(COMPANY_HEALTH_TEMPLATE, encoding="utf-8")
+
+    captured: dict = {}
+
+    def fake_post(url, *, headers, json, timeout):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["json"] = json
+        captured["timeout"] = timeout
+        return httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "imported_count": 1,
+                "flows": [{"flow_id": "flow-1", "title": "Company Health Check"}],
+            },
+        )
+
+    monkeypatch.setattr("mercury_tools.cli.httpx.post", fake_post)
+
+    assert (
+        main(
+            [
+                "flow",
+                "push",
+                str(tmp_path),
+                "--url",
+                "https://mercury.example.com",
+                "--client-token",
+                "mc_" + "a" * 24 + "." + "b" * 24,
+            ]
+        )
+        == 0
+    )
+
+    assert captured["url"] == "https://mercury.example.com/api/flows/import"
+    assert captured["headers"]["Authorization"].startswith("Bearer mc_")
+    assert captured["json"]["flows"][0]["metadata"]["relative_path"] == "flows/company.yaml"
+    assert "Flow push ok: 1 flows" in capsys.readouterr().out
 
 
 def test_flow_workspace_run_suite_rejects_invalid_selected_flow(tmp_path: Path) -> None:

@@ -74,13 +74,16 @@ def test_connect_page_and_status(monkeypatch) -> None:
     assert status.json()["mcp_endpoint"] == "https://mercury.example.com/mcp"
     assert status.json()["invite_required"] is True
     assert status.json()["pages"]["connectors"] == "/connectors"
+    assert status.json()["pages"]["knowledge"] == "/knowledge"
     assert status.json()["pages"]["flows"] == "/flows"
     assert "run_flow" in status.json()["flow_tools"]
+    assert "save_workspace_flow" in status.json()["flow_tools"]
     assert "list_workspace_flows" in status.json()["flow_tools"]
     assert "run_workspace_flow" in status.json()["flow_tools"]
     assert status.json()["dashboard"] == "/api/dashboard"
     assert status.json()["connector_credentials"] == "/api/connectors/credentials"
     assert status.json()["flow_validate"] == "/api/flows/validate"
+    assert status.json()["flow_import"] == "/api/flows/import"
 
 
 def test_product_console_exposes_separate_pages(monkeypatch) -> None:
@@ -93,6 +96,7 @@ def test_product_console_exposes_separate_pages(monkeypatch) -> None:
         ("/connect", "connect"),
         ("/workspace", "workspace"),
         ("/connectors", "connectors"),
+        ("/knowledge", "knowledge"),
         ("/skills", "skills"),
         ("/flows", "flows"),
         ("/audit", "audit"),
@@ -262,3 +266,66 @@ def test_workspace_flow_validate_and_dry_run_use_client_token(monkeypatch) -> No
     assert dry_run.status_code == 200
     assert dry_run.json()["status"] == "planned"
     assert save.status_code == 503
+
+
+def test_workspace_flow_import_saves_batch(monkeypatch) -> None:
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
+    monkeypatch.setenv("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("MERCURY_CONNECT_INVITE_CODE", "invite-demo")
+    monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
+
+    from mercury_tools.mcp import server
+
+    saved: list[dict] = []
+
+    class FakeStore:
+        def upsert_connection(self, connect_request, token_payload):
+            return {"workspace": {"id": "workspace-1"}, "member": {"id": "member-1"}}
+
+        def save_flow(self, *, token_payload, title, flow_yaml, metadata):
+            row = {
+                "flow_id": f"flow-{len(saved) + 1}",
+                "title": title,
+                "name": title,
+                "status": "draft",
+                "command_count": 3,
+                "metadata": metadata,
+                "yaml": flow_yaml,
+            }
+            saved.append(row)
+            return row
+
+    monkeypatch.setattr(server, "_product_store", lambda _settings=None: FakeStore())
+
+    client = TestClient(create_http_app(require_auth=True), raise_server_exceptions=False)
+    token = client.post(
+        "/api/connect",
+        json={
+            "invite_code": "invite-demo",
+            "email": "user@example.com",
+            "company": "Demo Co",
+            "host_app": "codex",
+        },
+    ).json()["token"]
+
+    response = client.post(
+        "/api/flows/import",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "workspace": {"selected_count": 1},
+            "flows": [
+                {
+                    "title": "Company Health Check",
+                    "flow_yaml": COMPANY_HEALTH_TEMPLATE,
+                    "metadata": {"relative_path": "company-health.yaml"},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["imported_count"] == 1
+    assert response.json()["flows"][0]["flow_id"] == "flow-1"
+    assert "yaml" not in response.json()["flows"][0]
+    assert saved[0]["metadata"]["source"] == "flow-import"

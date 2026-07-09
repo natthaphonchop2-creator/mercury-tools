@@ -364,6 +364,42 @@ def run_workspace_flow_tool(client_token: str, flow_id: str, dry_run: bool = Tru
         return payload
 
 
+@mcp.tool(name="save_workspace_flow")
+def save_workspace_flow_tool(
+    client_token: str,
+    title: str,
+    flow_yaml: str,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Save one Mercury flow into the connected workspace."""
+    try:
+        settings = load_settings()
+        if not settings.supabase_configured:
+            raise RuntimeError("Supabase is required to save workspace flows.")
+        token_payload = _client_token_payload_from_value(client_token)
+        flow = _product_store(settings).save_flow(
+            token_payload=token_payload,
+            title=title,
+            flow_yaml=flow_yaml,
+            metadata=metadata or {"source": "mcp"},
+        )
+        payload = redact_json({"status": "ok", "flow": _public_flow_summary(flow)})
+        _audit(
+            "save_workspace_flow",
+            {"client_token": client_token, "title": title, "flow_yaml_length": len(flow_yaml)},
+            {"status": "ok", "flow_id": flow["flow_id"]},
+        )
+        return payload
+    except (PermissionError, FlowValidationError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit(
+            "save_workspace_flow",
+            {"client_token": client_token, "title": title, "flow_yaml_length": len(flow_yaml)},
+            payload,
+        )
+        return payload
+
+
 @mcp.resource("mercury://wiki/index")
 def wiki_index() -> str:
     """Return the Mercury LLM Wiki index prompt resource."""
@@ -434,285 +470,6 @@ def connector_setup_guide_th() -> str:
     return get_prompt("connector_setup_guide_th")
 
 
-CONNECT_HTML = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Mercury Connect</title>
-  <style>
-    :root {
-      color-scheme: dark;
-      --bg: #121a26;
-      --panel: #192331;
-      --panel-2: #101823;
-      --line: #2e4051;
-      --text: #f4f7fb;
-      --muted: #91a0ae;
-      --teal: #42c6bb;
-      --gold: #f5bf45;
-      --ok: #54d47f;
-      --danger: #ff7070;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      background:
-        radial-gradient(circle at 78% 16%, rgba(66, 198, 187, .12), transparent 28%),
-        linear-gradient(180deg, #172131 0%, var(--bg) 58%);
-      color: var(--text);
-      font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-    main {
-      width: min(1180px, calc(100vw - 32px));
-      margin: 0 auto;
-      padding: 32px 0 48px;
-    }
-    header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 24px;
-    }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      font-weight: 800;
-      letter-spacing: .02em;
-    }
-    .mark {
-      display: grid;
-      place-items: center;
-      width: 38px;
-      height: 38px;
-      border: 1px solid rgba(66, 198, 187, .6);
-      border-radius: 8px;
-      color: var(--gold);
-      background: rgba(16, 24, 35, .8);
-      font-size: 24px;
-    }
-    .status {
-      display: flex;
-      gap: 10px;
-      color: var(--muted);
-      font-size: 13px;
-    }
-    .status span {
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      padding: 6px 10px;
-      background: rgba(16, 24, 35, .66);
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: 420px 1fr;
-      gap: 18px;
-      align-items: stretch;
-    }
-    section {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: rgba(25, 35, 49, .92);
-      box-shadow: 0 24px 80px rgba(0, 0, 0, .22);
-    }
-    .setup, .output { padding: 22px; }
-    h1, h2, h3, p { margin: 0; }
-    h1 { font-size: 30px; line-height: 1.1; margin-bottom: 10px; }
-    h2 { font-size: 17px; margin-bottom: 14px; }
-    .lead { color: var(--muted); margin-bottom: 22px; }
-    label {
-      display: block;
-      margin: 14px 0 6px;
-      color: #b8c4cf;
-      font-size: 13px;
-      font-weight: 700;
-    }
-    input, select, textarea {
-      width: 100%;
-      border: 1px solid #334657;
-      border-radius: 8px;
-      background: #0f1721;
-      color: var(--text);
-      padding: 11px 12px;
-      font: inherit;
-      outline: none;
-    }
-    input:focus, select:focus, textarea:focus { border-color: var(--teal); }
-    button {
-      width: 100%;
-      border: 0;
-      border-radius: 8px;
-      background: linear-gradient(135deg, var(--gold), #ffad4c);
-      color: #1b160a;
-      padding: 12px 14px;
-      margin-top: 18px;
-      font: 800 14px/1 ui-sans-serif, system-ui;
-      cursor: pointer;
-    }
-    button.secondary {
-      width: auto;
-      margin: 0;
-      padding: 9px 11px;
-      color: var(--text);
-      background: #223142;
-      border: 1px solid #3a4c5d;
-    }
-    .cards {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
-      margin-bottom: 18px;
-    }
-    .card {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 13px;
-      background: rgba(16, 24, 35, .72);
-    }
-    .card b { display: block; color: var(--teal); }
-    .card small { color: var(--muted); }
-    .result { display: none; }
-    .result.active { display: block; }
-    .codebar {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      margin: 18px 0 8px;
-    }
-    pre {
-      overflow: auto;
-      white-space: pre-wrap;
-      border: 1px solid #314455;
-      border-radius: 8px;
-      background: #0b1119;
-      color: #d9e3eb;
-      padding: 14px;
-      min-height: 96px;
-    }
-    .message {
-      min-height: 24px;
-      color: var(--muted);
-      margin-top: 10px;
-    }
-    .message.error { color: var(--danger); }
-    .note {
-      margin-top: 16px;
-      color: var(--muted);
-      font-size: 13px;
-    }
-    @media (max-width: 900px) {
-      header { align-items: flex-start; flex-direction: column; gap: 14px; }
-      .grid { grid-template-columns: 1fr; }
-      .cards { grid-template-columns: 1fr; }
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <header>
-      <div class="brand"><div class="mark">☿</div><div>Mercury Connect<br><span style="color:var(--muted);font-weight:600">Accounting AI MCP setup</span></div></div>
-      <div class="status"><span id="status-supabase">Supabase</span><span id="status-embedding">Host AI mode</span><span id="status-auth">MCP auth</span></div>
-    </header>
-    <div class="grid">
-      <section class="setup">
-        <h1>Connect Mercury to your AI workspace.</h1>
-        <p class="lead">Generate a client token and copy-ready MCP config for Codex, Cursor, Claude, or another MCP host.</p>
-        <form id="connect-form">
-          <label for="invite_code">Invite code</label>
-          <input id="invite_code" name="invite_code" autocomplete="one-time-code" required />
-          <label for="email">Work email</label>
-          <input id="email" name="email" type="email" autocomplete="email" required />
-          <label for="company">Company</label>
-          <input id="company" name="company" autocomplete="organization" required />
-          <label for="host_app">AI host</label>
-          <select id="host_app" name="host_app">
-            <option value="codex">Codex</option>
-            <option value="cursor">Cursor</option>
-            <option value="claude">Claude Desktop</option>
-            <option value="generic">Generic MCP client</option>
-          </select>
-          <button type="submit">Generate connection</button>
-        </form>
-        <div id="message" class="message"></div>
-      </section>
-      <section class="output">
-        <div class="cards">
-          <div class="card"><b>MCP endpoint</b><small id="endpoint-label">checking...</small></div>
-          <div class="card"><b>Knowledge store</b><small>Supabase RAG + citations</small></div>
-          <div class="card"><b>Host AI</b><small>Codex / Cursor / Claude use Mercury tools</small></div>
-          <div class="card"><b>Accounting scope</b><small>FlowAccount, PEAK, Express roadmap</small></div>
-        </div>
-        <div id="empty">
-          <h2>Ready for user onboarding</h2>
-          <p class="lead">Mercury issues a per-user signed token here. Users do not need the server bearer token file.</p>
-        </div>
-        <div id="result" class="result">
-          <div class="codebar"><h2>Codex install</h2><button class="secondary" type="button" data-copy="codex-command">Copy</button></div>
-          <pre id="codex-command"></pre>
-          <div class="codebar"><h2>Remote MCP config</h2><button class="secondary" type="button" data-copy="mcp-config">Copy</button></div>
-          <pre id="mcp-config"></pre>
-          <p class="note">Keep this client token private. Regenerate it if a tester leaves the workspace.</p>
-        </div>
-      </section>
-    </div>
-  </main>
-  <script>
-    const form = document.querySelector('#connect-form');
-    const message = document.querySelector('#message');
-    const result = document.querySelector('#result');
-    const empty = document.querySelector('#empty');
-    const codex = document.querySelector('#codex-command');
-    const config = document.querySelector('#mcp-config');
-
-    async function loadStatus() {
-      const res = await fetch('/api/status');
-      const data = await res.json();
-      document.querySelector('#endpoint-label').textContent = data.mcp_endpoint;
-      document.querySelector('#status-supabase').textContent = data.supabase ? 'Supabase ready' : 'Supabase not ready';
-      document.querySelector('#status-embedding').textContent = data.embedding_provider + ' embeddings';
-      document.querySelector('#status-auth').textContent = data.http_auth_configured ? 'Auth ready' : 'Auth missing';
-    }
-
-    form.addEventListener('submit', async (event) => {
-      event.preventDefault();
-      message.textContent = 'Generating connection...';
-      message.className = 'message';
-      const payload = Object.fromEntries(new FormData(form).entries());
-      const response = await fetch('/api/connect', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(payload)
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        message.textContent = data.message || 'Connection failed.';
-        message.className = 'message error';
-        return;
-      }
-      codex.textContent = data.codex.command;
-      config.textContent = JSON.stringify(data.cursor.config, null, 2);
-      result.classList.add('active');
-      empty.style.display = 'none';
-      message.textContent = 'Connection generated for ' + data.workspace.company + '.';
-    });
-
-    document.addEventListener('click', async (event) => {
-      const id = event.target.getAttribute('data-copy');
-      if (!id) return;
-      await navigator.clipboard.writeText(document.getElementById(id).textContent);
-      event.target.textContent = 'Copied';
-      setTimeout(() => event.target.textContent = 'Copy', 1200);
-    });
-
-    loadStatus().catch(() => {});
-  </script>
-</body>
-</html>"""
-
-
 async def root(request: Request) -> Response:
     page = request.url.path.strip("/") or "connect"
     return HTMLResponse(render_connect_html(page))
@@ -736,6 +493,7 @@ async def status(_: Request) -> Response:
                 "connect": "/connect",
                 "workspace": "/workspace",
                 "connectors": "/connectors",
+                "knowledge": "/knowledge",
                 "skills": "/skills",
                 "flows": "/flows",
                 "audit": "/audit",
@@ -749,11 +507,13 @@ async def status(_: Request) -> Response:
             "skill_upload": "/api/skills/upload",
             "flow_validate": "/api/flows/validate",
             "flow_save": "/api/flows/save",
+            "flow_import": "/api/flows/import",
             "flow_run": "/api/flows/run",
             "flow_tools": [
                 "flow_cheat_sheet",
                 "check_flow_syntax",
                 "run_flow",
+                "save_workspace_flow",
                 "list_workspace_flows",
                 "run_workspace_flow",
             ],
@@ -855,6 +615,71 @@ async def save_workspace_flow(request: Request) -> Response:
             metadata=data.get("metadata") if isinstance(data.get("metadata"), dict) else {},
         )
         return JSONResponse(redact_json({"status": "ok", "flow": flow}))
+    except PermissionError as exc:
+        return _json_error("unauthorized", str(exc), status_code=401)
+    except FlowValidationError as exc:
+        return _json_error("invalid_flow", str(exc), status_code=400)
+    except ValueError as exc:
+        return _json_error("bad_request", str(exc), status_code=400)
+    except RuntimeError as exc:
+        return _json_error("server_error", str(exc), status_code=500)
+
+
+async def import_workspace_flows(request: Request) -> Response:
+    settings = load_settings()
+    try:
+        token_payload = _client_token_payload(request)
+        if not settings.supabase_configured:
+            return _json_error(
+                "service_unavailable",
+                "Supabase is required to import workspace flows.",
+                status_code=503,
+            )
+        data = await request.json()
+        flows = data.get("flows") or []
+        if not isinstance(flows, list) or not flows:
+            raise ValueError("flows must be a non-empty list.")
+        if len(flows) > 50:
+            raise ValueError("A single import may include at most 50 flows.")
+
+        normalized_flows: list[dict[str, Any]] = []
+        for index, item in enumerate(flows):
+            if not isinstance(item, dict):
+                raise ValueError(f"flows[{index}] must be an object.")
+            flow_yaml = str(item.get("flow_yaml") or "")
+            validate_flow_text(flow_yaml)
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            normalized_flows.append(
+                {
+                    "title": str(item.get("title") or "").strip() or None,
+                    "flow_yaml": flow_yaml,
+                    "metadata": {
+                        "source": "flow-import",
+                        **metadata,
+                    },
+                }
+            )
+
+        store = _product_store(settings)
+        saved = [
+            store.save_flow(
+                token_payload=token_payload,
+                title=item["title"],
+                flow_yaml=item["flow_yaml"],
+                metadata=item["metadata"],
+            )
+            for item in normalized_flows
+        ]
+        return JSONResponse(
+            redact_json(
+                {
+                    "status": "ok",
+                    "imported_count": len(saved),
+                    "workspace": data.get("workspace") if isinstance(data.get("workspace"), dict) else {},
+                    "flows": [_public_flow_summary(flow) for flow in saved],
+                }
+            )
+        )
     except PermissionError as exc:
         return _json_error("unauthorized", str(exc), status_code=401)
     except FlowValidationError as exc:
@@ -1100,7 +925,16 @@ def create_http_app(*, require_auth: bool | None = None):
         if allowed_origin and allowed_origin not in mcp.settings.transport_security.allowed_origins:
             mcp.settings.transport_security.allowed_origins.append(allowed_origin)
     app = mcp.streamable_http_app()
-    for page_path in ("/", "/connect", "/workspace", "/connectors", "/skills", "/flows", "/audit"):
+    for page_path in (
+        "/",
+        "/connect",
+        "/workspace",
+        "/connectors",
+        "/knowledge",
+        "/skills",
+        "/flows",
+        "/audit",
+    ):
         app.add_route(page_path, root, methods=["GET"])
     app.add_route("/api/status", status, methods=["GET"])
     app.add_route("/api/connect", connect, methods=["POST"])
@@ -1112,6 +946,7 @@ def create_http_app(*, require_auth: bool | None = None):
     app.add_route("/api/skills/upload", upload_skill, methods=["POST"])
     app.add_route("/api/flows/validate", validate_workspace_flow, methods=["POST"])
     app.add_route("/api/flows/save", save_workspace_flow, methods=["POST"])
+    app.add_route("/api/flows/import", import_workspace_flows, methods=["POST"])
     app.add_route("/api/flows/run", run_workspace_flow, methods=["POST"])
     app.add_route("/healthz", healthz, methods=["GET"])
 

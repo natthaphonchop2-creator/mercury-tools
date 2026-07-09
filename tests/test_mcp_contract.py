@@ -81,14 +81,26 @@ def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:
         def get_flow(self, *, token_payload, flow_id):
             return self.flow if flow_id == self.flow["flow_id"] else None
 
+        def save_flow(self, *, token_payload, title, flow_yaml, metadata):
+            return self.flow
+
     monkeypatch.setattr(server, "_product_store", lambda _settings=None: FakeStore())
 
     listed = server.list_workspace_flows(token)
+    saved = server.save_workspace_flow_tool(
+        token,
+        "Company Health Check",
+        COMPANY_HEALTH_TEMPLATE,
+        metadata={"source": "test"},
+    )
     ran = server.run_workspace_flow_tool(token, "workspace-company-health-12345678", dry_run=True)
 
     assert listed["status"] == "ok"
     assert listed["flow_count"] == 1
     assert "yaml" not in listed["flows"][0]
+    assert saved["status"] == "ok"
+    assert saved["flow"]["flow_id"] == "workspace-company-health-12345678"
+    assert "yaml" not in saved["flow"]
     assert ran["status"] == "planned"
     assert ran["workspace_flow"]["flow_id"] == "workspace-company-health-12345678"
     assert ran["steps"][0]["command"] == "connectorStatus"

@@ -4,51 +4,73 @@
 
 from __future__ import annotations
 
-import re
+from html import escape
 
-CONNECT_HTML = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Mercury Connect</title>
-  <style>
+PAGE_NAMES = ("connect", "workspace", "connectors", "knowledge", "skills", "flows", "audit")
+
+NAV_ITEMS = (
+    ("connect", "MCP Connect", "Host access"),
+    ("workspace", "Workspace", "Company context"),
+    ("connectors", "Connectors", "Accounting systems"),
+    ("knowledge", "Knowledge", "RAG wiki"),
+    ("skills", "Skills", "Agent playbooks"),
+    ("flows", "Flows", "Runbooks"),
+    ("audit", "Audit", "Evidence trail"),
+)
+
+STYLE = """
     :root {
       color-scheme: dark;
       --bg: #111923;
+      --shell: #0e151f;
       --panel: #182331;
       --panel-2: #101720;
-      --line: #2f4354;
+      --line: #314455;
       --line-2: #405467;
       --text: #f5f8fb;
       --muted: #93a1ad;
       --teal: #42c6bb;
       --gold: #f5bf45;
       --ok: #54d47f;
-      --warn: #ffb65c;
       --danger: #ff7070;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       min-height: 100vh;
-      background:
-        radial-gradient(circle at 16% 0%, rgba(66, 198, 187, .12), transparent 28%),
-        linear-gradient(180deg, #172131 0%, var(--bg) 64%);
+      background: var(--bg);
       color: var(--text);
       font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background:
+        linear-gradient(90deg, rgba(66, 198, 187, .06), transparent 28%, transparent 72%, rgba(245, 191, 69, .05)),
+        linear-gradient(180deg, #172131 0%, transparent 220px);
+    }
     main {
-      width: min(1180px, calc(100vw - 32px));
+      position: relative;
+      z-index: 1;
+      width: min(1240px, calc(100vw - 32px));
       margin: 0 auto;
       padding: 24px 0 44px;
     }
+    .shell {
+      display: grid;
+      grid-template-columns: 256px minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
     header {
+      grid-column: 1 / -1;
       display: grid;
       grid-template-columns: minmax(280px, 1fr) auto;
       gap: 18px;
       align-items: start;
-      margin-bottom: 14px;
+      margin-bottom: 4px;
     }
     .brand {
       display: flex;
@@ -65,7 +87,7 @@ CONNECT_HTML = """<!doctype html>
       border-radius: 8px;
       color: var(--gold);
       background: #0f1721;
-      font-size: 25px;
+      font-size: 24px;
       font-weight: 900;
       flex: 0 0 auto;
     }
@@ -75,12 +97,14 @@ CONNECT_HTML = """<!doctype html>
       letter-spacing: .02em;
     }
     .brand span, .status span, .muted { color: var(--muted); }
+    .brand span { overflow-wrap: anywhere; }
     .status {
       display: flex;
       flex-wrap: wrap;
       justify-content: flex-end;
       gap: 8px;
-      max-width: 560px;
+      max-width: 620px;
+      min-width: 0;
     }
     .status span, .pill {
       border: 1px solid var(--line);
@@ -90,47 +114,69 @@ CONNECT_HTML = """<!doctype html>
       color: #c6d0d9;
       font-size: 12px;
       font-weight: 800;
+      max-width: 100%;
+      overflow-wrap: anywhere;
     }
-    .topbar {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      overflow-x: auto;
-      padding: 8px;
-      margin-bottom: 16px;
+    .rail {
+      position: sticky;
+      top: 16px;
       border: 1px solid var(--line);
       border-radius: 8px;
-      background: rgba(16, 23, 32, .66);
+      background: rgba(14, 21, 31, .94);
+      overflow: hidden;
     }
-    .topbar a {
-      color: #cbd6df;
+    .rail-head {
+      padding: 14px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(24, 35, 49, .72);
+    }
+    .rail-head b { display: block; color: var(--teal); }
+    .rail-head span { display: block; color: var(--muted); font-size: 12px; margin-top: 3px; }
+    .nav-list {
+      display: grid;
+      gap: 2px;
+      padding: 8px;
+    }
+    .nav-list a {
+      display: grid;
+      gap: 1px;
+      color: #d5dee6;
       text-decoration: none;
       border: 1px solid transparent;
       border-radius: 8px;
-      padding: 8px 10px;
-      font-size: 13px;
-      font-weight: 850;
-      white-space: nowrap;
+      padding: 10px;
+      min-height: 50px;
     }
-    .topbar a.active {
+    .nav-list a b { font-size: 13px; }
+    .nav-list a span { color: var(--muted); font-size: 12px; }
+    .nav-list a.active {
       color: #151306;
       background: var(--gold);
-      border-color: rgba(245, 191, 69, .7);
+      border-color: rgba(245, 191, 69, .72);
     }
-    .topbar .hint {
-      margin-left: auto;
+    .nav-list a.active span { color: rgba(21, 19, 6, .72); }
+    .rail-note {
+      margin: 0 8px 8px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
       color: var(--muted);
+      background: rgba(16, 23, 32, .66);
       font-size: 12px;
-      white-space: nowrap;
+      overflow-wrap: anywhere;
     }
-    .page { display: none; }
-    .page.active { display: block; }
+    .content {
+      min-width: 0;
+    }
+    .page {
+      display: grid;
+      gap: 14px;
+    }
     .page-head {
       border: 1px solid var(--line);
       border-radius: 8px;
       background: rgba(24, 35, 49, .92);
       padding: 20px;
-      margin-bottom: 14px;
     }
     .page-head h1 {
       max-width: 760px;
@@ -139,7 +185,7 @@ CONNECT_HTML = """<!doctype html>
       line-height: 1.12;
     }
     .page-head p {
-      max-width: 780px;
+      max-width: 820px;
       color: var(--muted);
       margin: 0;
     }
@@ -152,22 +198,22 @@ CONNECT_HTML = """<!doctype html>
     }
     .page-grid {
       display: grid;
-      grid-template-columns: minmax(320px, 410px) minmax(0, 1fr);
+      grid-template-columns: minmax(320px, 430px) minmax(0, 1fr);
       gap: 14px;
       align-items: start;
       min-width: 0;
     }
     .page-grid.reverse {
-      grid-template-columns: minmax(0, 1fr) minmax(320px, 410px);
+      grid-template-columns: minmax(0, 1fr) minmax(320px, 430px);
     }
     .panel {
       border: 1px solid var(--line);
       border-radius: 8px;
       background: rgba(24, 35, 49, .94);
-      box-shadow: 0 20px 64px rgba(0, 0, 0, .2);
+      box-shadow: 0 18px 58px rgba(0, 0, 0, .18);
       min-width: 0;
+      padding: 18px;
     }
-    .panel { padding: 18px; }
     .stack { display: grid; gap: 12px; min-width: 0; }
     .surface { display: grid; gap: 14px; min-width: 0; }
     .console-grid {
@@ -228,12 +274,12 @@ CONNECT_HTML = """<!doctype html>
       font: inherit;
       outline: none;
     }
-    textarea { min-height: 160px; resize: vertical; }
+    textarea { min-height: 170px; resize: vertical; }
     input:focus, select:focus, textarea:focus { border-color: var(--teal); }
     button {
       border: 0;
       border-radius: 8px;
-      background: linear-gradient(135deg, var(--gold), #ffad4c);
+      background: var(--gold);
       color: #1b160a;
       padding: 11px 13px;
       font: 850 13px/1 ui-sans-serif, system-ui;
@@ -289,7 +335,7 @@ CONNECT_HTML = """<!doctype html>
       color: #d9e3eb;
       padding: 13px;
       min-height: 84px;
-      max-height: 220px;
+      max-height: 260px;
       min-width: 0;
       overflow-wrap: anywhere;
       word-break: break-word;
@@ -305,263 +351,298 @@ CONNECT_HTML = """<!doctype html>
     @media (max-width: 980px) {
       header { grid-template-columns: 1fr; }
       .status { justify-content: flex-start; }
-      .topbar .hint { display: none; }
+      .shell { grid-template-columns: 1fr; }
+      .rail { position: static; }
+      .nav-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .page-grid, .page-grid.reverse, .cards-2 { grid-template-columns: 1fr; }
       .console-grid { grid-template-columns: 1fr; }
       .two { grid-template-columns: 1fr; }
     }
-  </style>
-</head>
-<body>
-  <main>
-    <header>
-      <div class="brand">
-        <div class="mark">☿</div>
-        <div><b>Mercury Connect</b><span>MCP control plane for accounting AI hosts</span></div>
-      </div>
-      <div class="status">
-        <span id="status-supabase">Supabase</span>
-        <span id="status-embedding">Embeddings</span>
-        <span id="status-auth">MCP auth</span>
-        <span id="status-endpoint">Endpoint</span>
-      </div>
-    </header>
+    @media (max-width: 620px) {
+      main { width: min(100vw - 20px, 1240px); padding-top: 14px; }
+      header { gap: 10px; }
+      .brand { align-items: flex-start; }
+      .brand span {
+        display: block;
+        max-width: calc(100vw - 94px);
+        line-height: 1.35;
+      }
+      .status {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        width: 100%;
+        max-width: none;
+        justify-content: stretch;
+      }
+      .status span {
+        width: 100%;
+        text-align: center;
+        font-size: 11px;
+      }
+      .nav-list { grid-template-columns: 1fr; }
+      .page-head h1 { font-size: 24px; }
+    }
+"""
 
-    <nav class="topbar" aria-label="Mercury sections">
-      <a href="/connect" data-nav="connect">Connect</a>
-      <a href="/workspace" data-nav="workspace">Workspace</a>
-      <a href="/connectors" data-nav="connectors">Connectors</a>
-      <a href="/skills" data-nav="skills">Skills</a>
-      <a href="/flows" data-nav="flows">Flows</a>
-      <a href="/audit" data-nav="audit">Audit</a>
-      <span class="hint">Mercury stays MCP-first. The AI host still does the conversation.</span>
-    </nav>
+PAGE_CONTENT: dict[str, str] = {
+    "connect": """
+      <section class="page" data-page="connect">
+        <div class="page-head">
+          <span class="eyebrow">MCP Connect</span>
+          <h1>Connect an AI host to Mercury.</h1>
+          <p>Create a signed workspace token for Codex, Cursor, Claude Desktop, or another MCP client. Mercury supplies tools, context, and audit evidence; the host AI keeps the conversation.</p>
+        </div>
+        <div class="page-grid">
+          <div class="stack">
+            <section class="panel">
+              <h2>Generate host connection</h2>
+              <p class="lead">Use this when a new user, company, or AI host needs access to Mercury.</p>
+              <form id="connect-form">
+                <label for="invite_code">Invite code</label>
+                <input id="invite_code" name="invite_code" type="password" autocomplete="one-time-code" required />
+                <label for="email">Work email</label>
+                <input id="email" name="email" type="email" autocomplete="email" required />
+                <label for="company">Company</label>
+                <input id="company" name="company" autocomplete="organization" required />
+                <label for="host_app">AI host</label>
+                <select id="host_app" name="host_app">
+                  <option value="codex">Codex</option>
+                  <option value="cursor">Cursor</option>
+                  <option value="claude">Claude Desktop</option>
+                  <option value="generic">Generic MCP client</option>
+                </select>
+                <button class="full" type="submit">Generate MCP connection</button>
+              </form>
+              <div id="connect-message" class="message"></div>
+            </section>
 
-    <!-- PAGE:connect:start -->
-    <section class="page" data-page="connect">
-      <div class="page-head">
-        <span class="eyebrow">Mercury Control Plane</span>
-        <h1>Connect an AI host to Mercury.</h1>
-        <p>Create a signed workspace token, then use Mercury as a remote MCP server from Codex, Cursor, Claude Desktop, or another MCP client.</p>
-      </div>
-      <div class="page-grid">
-        <div class="stack">
+            <section class="panel">
+              <h2>Restore workspace</h2>
+              <p class="lead">Paste an existing Mercury client token to load this workspace on another browser or machine.</p>
+              <form id="restore-form">
+                <label for="restore_token">Mercury client token</label>
+                <input id="restore_token" name="token" type="password" autocomplete="off" />
+                <button class="full" type="submit">Load workspace</button>
+              </form>
+              <div id="restore-message" class="message"></div>
+            </section>
+          </div>
+
+          <div class="surface">
+            <section id="install-panel" class="panel hidden">
+              <div class="codebar"><h2>Codex install</h2><button class="secondary" type="button" data-copy="codex-command">Copy</button></div>
+              <pre id="codex-command"></pre>
+              <div class="codebar"><h2>MCP client config</h2><button class="secondary" type="button" data-copy="mcp-config">Copy</button></div>
+              <pre id="mcp-config"></pre>
+              <button id="forget-token" class="danger" type="button">Forget local token</button>
+            </section>
+
+            <section class="panel">
+              <h2>Mercury boundary</h2>
+              <div class="flow">
+                <div><b>Host AI</b><br><span class="muted">Codex, Cursor, Claude, or a customer agent owns the chat and model runtime.</span></div>
+                <div><b>Mercury MCP</b><br><span class="muted">Mercury exposes accounting tools, RAG context, skills, flows, and audit records.</span></div>
+                <div><b>Accounting systems</b><br><span class="muted">FlowAccount, PEAK, Express, and future systems are connector targets.</span></div>
+              </div>
+            </section>
+          </div>
+        </div>
+      </section>
+    """,
+    "workspace": """
+      <section class="page" data-page="workspace">
+        <div class="page-head">
+          <span class="eyebrow">Workspace</span>
+          <h1>Set the company context used by the AI host.</h1>
+          <p>A workspace is the product boundary for one company: members, selected AI host, connector profiles, skills, flows, and audit state.</p>
+        </div>
+        <div class="page-grid">
+          <div class="surface">
+            <section class="panel">
+              <div class="row">
+                <div>
+                  <h2>Workspace status</h2>
+                  <p class="lead" id="workspace-subtitle">Generate or restore a Mercury connection first.</p>
+                </div>
+                <button id="refresh-dashboard" class="secondary" type="button">Refresh</button>
+              </div>
+              <div class="console-grid">
+                <div class="card"><b>Company</b><span id="company-card">not connected</span></div>
+                <div class="card"><b>AI host</b><span id="host-card">not connected</span></div>
+                <div class="card"><b>Status</b><span id="workspace-status">waiting</span></div>
+              </div>
+            </section>
+            <section class="panel">
+              <h2>Workspace model</h2>
+              <div class="cards-2">
+                <div class="card"><b>Scope</b><span>one company context per client token</span></div>
+                <div class="card"><b>Runtime</b><span>host AI calls Mercury tools through MCP</span></div>
+                <div class="card"><b>Storage</b><span>Supabase product state and audit metadata</span></div>
+                <div class="card"><b>Secrets</b><span>never returned in dashboard or MCP output</span></div>
+              </div>
+            </section>
+          </div>
           <section class="panel">
-            <h2>Generate connection</h2>
-            <p class="lead">This creates access for a host AI. Mercury is not replacing the chat surface.</p>
-            <form id="connect-form">
-              <label for="invite_code">Invite code</label>
-              <input id="invite_code" name="invite_code" type="password" autocomplete="one-time-code" required />
-              <label for="email">Work email</label>
-              <input id="email" name="email" type="email" autocomplete="email" required />
-              <label for="company">Company</label>
-              <input id="company" name="company" autocomplete="organization" required />
-              <label for="host_app">AI host</label>
-              <select id="host_app" name="host_app">
-                <option value="codex">Codex</option>
-                <option value="cursor">Cursor</option>
-                <option value="claude">Claude Desktop</option>
-                <option value="generic">Generic MCP client</option>
+            <div class="row"><h2>Team access</h2><span class="pill">workspace scoped</span></div>
+            <form id="team-form">
+              <label for="member_email">Member email</label>
+              <input id="member_email" name="email" type="email" autocomplete="email" />
+              <label for="member_role">Role</label>
+              <select id="member_role" name="role">
+                <option value="member">Member</option>
+                <option value="admin">Admin</option>
+                <option value="viewer">Viewer</option>
               </select>
-              <button class="full" type="submit">Generate MCP connection</button>
+              <button class="full" type="submit">Invite member</button>
+              <div id="team-message" class="message"></div>
             </form>
-            <div id="connect-message" class="message"></div>
-          </section>
-
-          <section class="panel">
-            <h2>Restore workspace</h2>
-            <p class="lead">Paste an existing Mercury client token to load this workspace on another browser or machine.</p>
-            <form id="restore-form">
-              <label for="restore_token">Mercury client token</label>
-              <input id="restore_token" name="token" type="password" autocomplete="off" />
-              <button class="full" type="submit">Load workspace</button>
-            </form>
-            <div id="restore-message" class="message"></div>
+            <h3 style="margin-top:16px">Members</h3>
+            <div id="member-list" class="list"><div class="item"><small>No members loaded yet.</small></div></div>
           </section>
         </div>
-
-        <div class="surface">
-          <section id="install-panel" class="panel hidden">
-            <div class="codebar"><h2>Codex install</h2><button class="secondary" type="button" data-copy="codex-command">Copy</button></div>
-            <pre id="codex-command"></pre>
-            <div class="codebar"><h2>Remote MCP config</h2><button class="secondary" type="button" data-copy="mcp-config">Copy</button></div>
-            <pre id="mcp-config"></pre>
-            <button id="forget-token" class="danger" type="button">Forget local token</button>
+      </section>
+    """,
+    "connectors": """
+      <section class="page" data-page="connectors">
+        <div class="page-head">
+          <span class="eyebrow">Connector Setup</span>
+          <h1>Connect the accounting program Mercury may reference.</h1>
+          <p>This page stores the selected accounting program, environment, company label, and encrypted credential metadata. Connector tools remain permissioned through the AI host.</p>
+        </div>
+        <div class="page-grid">
+          <section class="panel">
+            <div class="row"><h2>Accounting program</h2><span class="pill">program profile</span></div>
+            <form id="connector-form">
+              <label for="connector_id">Program</label>
+              <select id="connector_id" name="connector_id">
+                <option value="flowaccount">FlowAccount</option>
+                <option value="peak">PEAK Accounting</option>
+                <option value="express">Express Account</option>
+              </select>
+              <label for="environment">Environment</label>
+              <select id="environment" name="environment">
+                <option value="production">Production</option>
+                <option value="sandbox">Sandbox</option>
+                <option value="local">Local gateway</option>
+              </select>
+              <label for="connector_company_name">Company name in accounting program</label>
+              <input id="connector_company_name" name="company_name" />
+              <button class="full" type="submit">Save connector profile</button>
+              <div id="connector-message" class="message"></div>
+            </form>
           </section>
 
+          <div class="surface">
+            <section class="panel">
+              <h2>Configured profiles</h2>
+              <div id="connector-list" class="list"><div class="item"><small>No connector profile yet.</small></div></div>
+            </section>
+            <section class="panel">
+              <div class="row"><h2>Encrypted credential vault</h2><span class="pill">server-side only</span></div>
+              <form id="credential-form">
+                <div class="two">
+                  <div>
+                    <label for="credential_client_id">Client id / API key</label>
+                    <input id="credential_client_id" name="client_id" type="password" autocomplete="off" />
+                  </div>
+                  <div>
+                    <label for="credential_client_secret">Client secret</label>
+                    <input id="credential_client_secret" name="client_secret" type="password" autocomplete="off" />
+                  </div>
+                </div>
+                <button class="full" type="submit">Save encrypted credentials</button>
+                <div id="credential-message" class="message"></div>
+              </form>
+            </section>
+          </div>
+        </div>
+      </section>
+    """,
+    "knowledge": """
+      <section class="page" data-page="knowledge">
+        <div class="page-head">
+          <span class="eyebrow">Knowledge</span>
+          <h1>Maintain the cited accounting wiki behind Mercury tools.</h1>
+          <p>Knowledge is not a chat page. It is the RAG source layer that MCP tools use to return context packs, citations, and prompt-ready evidence to the host AI.</p>
+        </div>
+        <div class="page-grid">
           <section class="panel">
-            <h2>What this console controls</h2>
+            <h2>LLM Wiki store</h2>
+            <div class="cards-2">
+              <div class="card"><b>Search tool</b><span>search_knowledge</span></div>
+              <div class="card"><b>Context tool</b><span>retrieve_context_pack</span></div>
+              <div class="card"><b>Database</b><span>Supabase Postgres + pgvector</span></div>
+              <div class="card"><b>Citations</b><span>source, URI, chunk id, effective date metadata</span></div>
+            </div>
+          </section>
+          <section class="panel">
+            <h2>Knowledge responsibilities</h2>
             <div class="flow">
-              <div><b>1. AI host</b><br><span class="muted">Codex, Cursor, or Claude keeps the chat and model runtime.</span></div>
-              <div><b>2. Mercury MCP</b><br><span class="muted">Mercury provides accounting skills, RAG context, connector metadata, and audit trails.</span></div>
-              <div><b>3. Accounting systems</b><br><span class="muted">FlowAccount, PEAK, and Express are connector targets, not separate web-app modules.</span></div>
+              <div><b>Ingest</b><br><span class="muted">Markdown, connector docs, official references, and reviewed accounting notes become chunks.</span></div>
+              <div><b>Retrieve</b><br><span class="muted">Host agents ask Mercury for context packs before answering accounting tasks.</span></div>
+              <div><b>Audit</b><br><span class="muted">MCP calls are logged with sanitized input hashes and output summaries.</span></div>
             </div>
           </section>
         </div>
-      </div>
-    </section>
-    <!-- PAGE:connect:end -->
+      </section>
+    """,
+    "skills": """
+      <section class="page" data-page="skills">
+        <div class="page-head">
+          <span class="eyebrow">Skills</span>
+          <h1>Choose the accounting playbooks your AI host may use.</h1>
+          <p>Skills are instruction packs with workflow rules, required evidence, output schemas, and accountant review points. They are invoked through Mercury MCP tools.</p>
+        </div>
+        <div class="page-grid reverse">
+          <section class="panel">
+            <div class="row"><h2>Skill library</h2><span class="pill">workspace scoped</span></div>
+            <div id="skills-list" class="list"><div class="item"><small>No skills loaded yet.</small></div></div>
+          </section>
 
-    <!-- PAGE:workspace:start -->
-    <section class="page" data-page="workspace">
-      <div class="page-head">
-        <span class="eyebrow">Workspace</span>
-        <h1>Manage the Mercury workspace used by the AI host.</h1>
-        <p>Keep workspace identity, member access, and host context separate from connector credentials.</p>
-      </div>
-      <div class="page-grid">
-        <div class="surface">
+          <section class="panel">
+            <h2>Upload a workspace skill</h2>
+            <p class="lead">Upload Markdown instructions. Mercury stores it as a draft skill and indexes it into the RAG wiki with citations.</p>
+            <form id="upload-form">
+              <div class="two">
+                <div>
+                  <label for="skill_title">Skill title</label>
+                  <input id="skill_title" name="title" placeholder="Monthly Shopee/TikTok report" />
+                </div>
+                <div>
+                  <label for="skill_category">Category</label>
+                  <input id="skill_category" name="category" placeholder="reporting" />
+                </div>
+              </div>
+              <label for="skill_markdown">Skill Markdown</label>
+              <textarea id="skill_markdown" name="markdown" placeholder="# Skill name&#10;&#10;Goal, inputs, workflow, output schema..."></textarea>
+              <button class="full" type="submit">Upload and enable skill</button>
+              <div id="upload-message" class="message"></div>
+            </form>
+          </section>
+        </div>
+      </section>
+    """,
+    "flows": """
+      <section class="page" data-page="flows">
+        <div class="page-head">
+          <span class="eyebrow">Mercury Flows</span>
+          <h1>Build repeatable accounting agent runbooks.</h1>
+          <p>Flows are YAML runbooks for MCP hosts. They package connector state checks, RAG retrieval, skill execution, validation steps, and report handoffs without turning Mercury into the chat surface.</p>
+        </div>
+        <div class="page-grid reverse">
           <section class="panel">
             <div class="row">
               <div>
-                <h2>Workspace status</h2>
-                <p class="lead" id="workspace-subtitle">Generate a connection to create or load a workspace.</p>
+                <h2>Flow editor</h2>
+                <p class="lead">Validate and dry-run before a host agent uses the workflow.</p>
               </div>
-              <button id="refresh-dashboard" class="secondary" type="button">Refresh</button>
+              <span class="pill">dry-run first</span>
             </div>
-            <div class="console-grid">
-              <div class="card"><b>Company</b><span id="company-card">not connected</span></div>
-              <div class="card"><b>AI host</b><span id="host-card">not connected</span></div>
-              <div class="card"><b>Status</b><span id="workspace-status">waiting</span></div>
-            </div>
-          </section>
-        </div>
-        <section class="panel">
-          <div class="row"><h2>Team workspace</h2><span class="pill">invite preview</span></div>
-          <form id="team-form">
-            <label for="member_email">Member email</label>
-            <input id="member_email" name="email" type="email" autocomplete="email" />
-            <label for="member_role">Role</label>
-            <select id="member_role" name="role">
-              <option value="member">Member</option>
-              <option value="admin">Admin</option>
-              <option value="viewer">Viewer</option>
-            </select>
-            <button class="full" type="submit">Invite member</button>
-            <div id="team-message" class="message"></div>
-          </form>
-          <h3 style="margin-top:16px">Members</h3>
-          <div id="member-list" class="list"><div class="item"><small>No members loaded yet.</small></div></div>
-        </section>
-      </div>
-    </section>
-    <!-- PAGE:workspace:end -->
-
-    <!-- PAGE:connectors:start -->
-    <section class="page" data-page="connectors">
-      <div class="page-head">
-        <span class="eyebrow">Connector Setup</span>
-        <h1>Set the accounting program that Mercury can reference.</h1>
-        <p>Connector setup stores profile and encrypted credential metadata for MCP tools. The host AI still asks permission before using sensitive capabilities.</p>
-      </div>
-      <div class="page-grid">
-        <section class="panel">
-          <div class="row"><h2>Accounting connector</h2><span class="pill">program profile</span></div>
-          <form id="connector-form">
-            <label for="connector_id">Program</label>
-            <select id="connector_id" name="connector_id">
-              <option value="flowaccount">FlowAccount</option>
-              <option value="peak">PEAK Accounting</option>
-              <option value="express">Express Account</option>
-            </select>
-            <label for="environment">Environment</label>
-            <select id="environment" name="environment">
-              <option value="production">Production</option>
-              <option value="sandbox">Sandbox</option>
-              <option value="local">Local gateway</option>
-            </select>
-            <label for="connector_company_name">Company name in accounting program</label>
-            <input id="connector_company_name" name="company_name" />
-            <button class="full" type="submit">Save connector profile</button>
-            <div id="connector-message" class="message"></div>
-          </form>
-        </section>
-
-        <div class="surface">
-          <section class="panel">
-            <h2>Configured profiles</h2>
-            <div id="connector-list" class="list"><div class="item"><small>No connector profile yet.</small></div></div>
-          </section>
-          <section class="panel">
-            <div class="row"><h2>Encrypted credential vault</h2><span class="pill">server-side only</span></div>
-            <form id="credential-form">
-              <div class="two">
-                <div>
-                  <label for="credential_client_id">Client id / API key</label>
-                  <input id="credential_client_id" name="client_id" type="password" autocomplete="off" />
-                </div>
-                <div>
-                  <label for="credential_client_secret">Client secret</label>
-                  <input id="credential_client_secret" name="client_secret" type="password" autocomplete="off" />
-                </div>
-              </div>
-              <button class="full" type="submit">Save encrypted credentials</button>
-              <div id="credential-message" class="message"></div>
-            </form>
-          </section>
-        </div>
-      </div>
-    </section>
-    <!-- PAGE:connectors:end -->
-
-    <!-- PAGE:skills:start -->
-    <section class="page" data-page="skills">
-      <div class="page-head">
-        <span class="eyebrow">Skills</span>
-        <h1>Choose the accounting workflows your AI host may use.</h1>
-        <p>Skills are instruction packs and RAG-indexed context. They are invoked by the host agent through Mercury MCP tools.</p>
-      </div>
-      <div class="page-grid reverse">
-        <section class="panel">
-          <div class="row"><h2>Skill marketplace</h2><span class="pill">workspace scoped</span></div>
-          <div id="skills-list" class="list"><div class="item"><small>No skills loaded yet.</small></div></div>
-        </section>
-
-        <section class="panel">
-          <h2>Upload a workspace skill</h2>
-          <p class="lead">Upload Markdown instructions. Mercury stores it as a draft skill and indexes it into the RAG wiki with citations.</p>
-          <form id="upload-form">
-            <div class="two">
-              <div>
-                <label for="skill_title">Skill title</label>
-                <input id="skill_title" name="title" placeholder="Monthly Shopee/TikTok report" />
-              </div>
-              <div>
-                <label for="skill_category">Category</label>
-                <input id="skill_category" name="category" placeholder="reporting" />
-              </div>
-            </div>
-            <label for="skill_markdown">Skill Markdown</label>
-            <textarea id="skill_markdown" name="markdown" placeholder="# Skill name&#10;&#10;Goal, inputs, workflow, output schema..."></textarea>
-            <button class="full" type="submit">Upload and enable skill</button>
-            <div id="upload-message" class="message"></div>
-          </form>
-        </section>
-      </div>
-    </section>
-    <!-- PAGE:skills:end -->
-
-    <!-- PAGE:flows:start -->
-    <section class="page" data-page="flows">
-      <div class="page-head">
-        <span class="eyebrow">Mercury Flows</span>
-        <h1>Build repeatable accounting agent workflows.</h1>
-        <p>Flows are YAML runbooks for MCP hosts. They package connector state, cited RAG context, skills, checks, and report handoffs without turning Mercury into the chat surface.</p>
-      </div>
-      <div class="page-grid reverse">
-        <section class="panel">
-          <div class="row">
-            <div>
-              <h2>Flow editor</h2>
-              <p class="lead">Validate and dry-run before a host agent uses the workflow.</p>
-            </div>
-            <span class="pill">dry-run first</span>
-          </div>
-          <form id="flow-form">
-            <label for="flow_title">Flow title</label>
-            <input id="flow_title" name="title" value="Company Health Check" />
-            <label for="flow_yaml">Flow YAML</label>
-            <textarea id="flow_yaml" name="flow_yaml">name: Company Health Check
+            <form id="flow-form">
+              <label for="flow_title">Flow title</label>
+              <input id="flow_title" name="title" value="Company Health Check" />
+              <label for="flow_yaml">Flow YAML</label>
+              <textarea id="flow_yaml" name="flow_yaml">name: Company Health Check
 description: Read-only Mercury flow for a Thai accounting health-check handoff.
 tags: [accounting, read-only, flowaccount]
 env:
@@ -593,62 +674,62 @@ onFlowStart:
     sections:
       - "Use the retrieved citations and skill package to answer in Thai."
       - "Do not expose raw tax IDs, emails, bearer tokens, or API keys."</textarea>
-            <div class="two" style="margin-top:12px">
-              <button id="flow-validate" class="secondary" type="button">Validate</button>
-              <button id="flow-run" class="secondary" type="button">Dry-run</button>
-            </div>
-            <button class="full" type="submit">Save flow to workspace</button>
-            <div id="flow-message" class="message"></div>
-          </form>
-          <div class="codebar"><h2>Flow result</h2><span class="pill">sanitized</span></div>
-          <pre id="flow-result">No flow action yet.</pre>
-        </section>
+              <div class="two" style="margin-top:12px">
+                <button id="flow-validate" class="secondary" type="button">Validate</button>
+                <button id="flow-run" class="secondary" type="button">Dry-run</button>
+              </div>
+              <button class="full" type="submit">Save flow to workspace</button>
+              <div id="flow-message" class="message"></div>
+            </form>
+            <div class="codebar"><h2>Flow result</h2><span class="pill">sanitized</span></div>
+            <pre id="flow-result">No flow action yet.</pre>
+          </section>
 
-        <div class="surface">
+          <div class="surface">
+            <section class="panel">
+              <div class="row"><h2>Saved flows</h2><span class="pill">workspace scoped</span></div>
+              <div id="flow-list" class="list"><div class="item"><small>No workspace flows saved yet.</small></div></div>
+            </section>
+            <section class="panel">
+              <h2>Flow boundary</h2>
+              <div class="cards-2">
+                <div class="card"><b>Purpose</b><span>repeatable AI-agent runbooks</span></div>
+                <div class="card"><b>Execution</b><span>MCP tool calls and context handoffs</span></div>
+                <div class="card"><b>Writes</b><span>blocked unless future approval flow allows them</span></div>
+                <div class="card"><b>Owner</b><span>workspace, not local machine config</span></div>
+              </div>
+            </section>
+          </div>
+        </div>
+      </section>
+    """,
+    "audit": """
+      <section class="page" data-page="audit">
+        <div class="page-head">
+          <span class="eyebrow">Audit</span>
+          <h1>Review usage signals without exposing raw secrets.</h1>
+          <p>Mercury keeps audit events for MCP calls, setup changes, connector profiles, skill toggles, uploads, and flow activity.</p>
+        </div>
+        <div class="page-grid">
           <section class="panel">
-            <div class="row"><h2>Saved flows</h2><span class="pill">workspace scoped</span></div>
-            <div id="flow-list" class="list"><div class="item"><small>No workspace flows saved yet.</small></div></div>
+            <h2>Usage and audit</h2>
+            <div id="event-list" class="list"><div class="item"><small>No events yet.</small></div></div>
           </section>
           <section class="panel">
-            <h2>Flow boundary</h2>
+            <h2>Runtime boundary</h2>
             <div class="cards-2">
-              <div class="card"><b>Purpose</b><span>repeatable AI-agent runbooks</span></div>
-              <div class="card"><b>Execution</b><span>MCP tool calls and context handoffs</span></div>
-              <div class="card"><b>Writes</b><span>blocked unless future approval flow allows them</span></div>
-              <div class="card"><b>Owner</b><span>workspace, not local machine config</span></div>
+              <div class="card"><b>MCP endpoint</b><span id="audit-endpoint">loading</span></div>
+              <div class="card"><b>Credential policy</b><span>raw secrets are not returned to clients</span></div>
+              <div class="card"><b>Default mode</b><span>read-oriented tools and context packs</span></div>
+              <div class="card"><b>Host model</b><span>chosen by Codex, Cursor, Claude, or the user's agent</span></div>
             </div>
           </section>
         </div>
-      </div>
-    </section>
-    <!-- PAGE:flows:end -->
+      </section>
+    """,
+}
 
-    <!-- PAGE:audit:start -->
-    <section class="page" data-page="audit">
-      <div class="page-head">
-        <span class="eyebrow">Audit</span>
-        <h1>Review usage signals without exposing raw secrets.</h1>
-        <p>Mercury keeps audit events for MCP calls, setup changes, connector profiles, skill toggles, and uploads.</p>
-      </div>
-      <div class="page-grid">
-        <section class="panel">
-          <h2>Usage and audit</h2>
-          <div id="event-list" class="list"><div class="item"><small>No events yet.</small></div></div>
-        </section>
-        <section class="panel">
-          <h2>Runtime boundary</h2>
-          <div class="cards-2">
-            <div class="card"><b>MCP endpoint</b><span id="audit-endpoint">loading</span></div>
-            <div class="card"><b>Credential policy</b><span>raw secrets are not returned to clients</span></div>
-            <div class="card"><b>Default mode</b><span>read-oriented tools and context packs</span></div>
-            <div class="card"><b>Host model</b><span>chosen by Codex, Cursor, Claude, or the user's agent</span></div>
-          </div>
-        </section>
-      </div>
-    </section>
-    <!-- PAGE:audit:end -->
-  </main>
-  <script>
+SCRIPT = """
     const state = {
       token: localStorage.getItem('mercury_client_token') || '',
       endpoint: '',
@@ -671,20 +752,11 @@ onFlowStart:
       node.className = 'message' + (kind ? ' ' + kind : '');
     };
     const authHeaders = () => ({ 'Authorization': 'Bearer ' + state.token });
-    const pageNames = ['connect', 'workspace', 'connectors', 'skills', 'flows', 'audit'];
 
-    function pageFromPath() {
-      const page = location.pathname.replace(/^\\//, '') || 'connect';
-      return pageNames.includes(page) ? page : 'connect';
-    }
-
-    function setPage(page) {
-      const nextPage = pageNames.includes(page) ? page : 'connect';
-      document.querySelectorAll('[data-page]').forEach((node) => {
-        node.classList.toggle('active', node.getAttribute('data-page') === nextPage);
-      });
+    function setActiveNavigation() {
+      const page = document.body.getAttribute('data-page') || 'connect';
       document.querySelectorAll('[data-nav]').forEach((node) => {
-        node.classList.toggle('active', node.getAttribute('data-nav') === nextPage);
+        node.classList.toggle('active', node.getAttribute('data-nav') === page);
       });
     }
 
@@ -746,18 +818,18 @@ onFlowStart:
       $('#connector-list').innerHTML = profiles.length ? profiles.map((item) => `
         <div class="item">
           <strong>${item.display_name || item.connector_id} <span class="pill">${item.environment}</span></strong>
-          <small>${item.company_name || 'company not set'} · ${item.status}</small>
+          <small>${item.company_name || 'company not set'} - ${item.status}</small>
         </div>
       `).join('') : '<div class="item"><small>No connector profile yet.</small></div>';
 
       const members = data.members || [];
       $('#member-list').innerHTML = members.length ? members.map((item) => {
         const label = item.email_hash ? 'member ' + item.email_hash : (item.email === '[REDACTED_EMAIL]' ? 'member email hidden' : (item.email || 'workspace member'));
-        const domain = item.email_domain ? ' · ' + item.email_domain : '';
+        const domain = item.email_domain ? ' - ' + item.email_domain : '';
         return `
           <div class="item">
             <strong>${label}</strong>
-            <small>${item.role || 'member'} · ${item.status || 'active'}${domain}</small>
+            <small>${item.role || 'member'} - ${item.status || 'active'}${domain}</small>
           </div>
         `;
       }).join('') : '<div class="item"><small>No members loaded yet.</small></div>';
@@ -768,7 +840,7 @@ onFlowStart:
           <div class="row">
             <div>
               <strong>${item.title}</strong>
-              <small>${item.category} · ${item.summary}</small>
+              <small>${item.category} - ${item.summary}</small>
             </div>
             <button class="secondary" type="button" data-skill="${item.skill_id}" data-enabled="${item.enabled ? 'false' : 'true'}">${item.enabled ? 'Disable' : 'Enable'}</button>
           </div>
@@ -781,7 +853,7 @@ onFlowStart:
           <div class="row">
             <div>
               <strong>${item.title || item.name}</strong>
-              <small>${item.flow_id} · ${item.command_count || 0} commands · ${item.status || 'draft'}</small>
+              <small>${item.flow_id} - ${item.command_count || 0} commands - ${item.status || 'draft'}</small>
             </div>
             <button class="secondary" type="button" data-flow-load="${item.flow_id}">Load</button>
           </div>
@@ -792,7 +864,7 @@ onFlowStart:
       $('#event-list').innerHTML = events.length ? events.map((item) => `
         <div class="item">
           <strong>${item.event_type}</strong>
-          <small>${item.created_at} · ${item.status}</small>
+          <small>${item.created_at} - ${item.status}</small>
         </div>
       `).join('') : '<div class="item"><small>No events yet.</small></div>';
     }
@@ -1016,27 +1088,70 @@ onFlowStart:
       setTimeout(() => event.target.textContent = 'Copy', 1200);
     });
 
-    setPage(pageFromPath());
+    setActiveNavigation();
     loadStatus().then(() => {
       if (state.token) renderInstallFromToken(state.token);
     }).catch(() => {});
     loadDashboard().catch(() => {});
-  </script>
-</body>
-</html>"""
+"""
 
-PAGE_NAMES = ("connect", "workspace", "connectors", "skills", "flows", "audit")
-PAGE_BLOCK_PATTERN = re.compile(
-    r"\n    <!-- PAGE:(?P<name>[a-z]+):start -->.*?\n    <!-- PAGE:(?P=name):end -->",
-    re.DOTALL,
-)
+
+def _nav(active_page: str) -> str:
+    items = []
+    for key, label, hint in NAV_ITEMS:
+        active = " active" if key == active_page else ""
+        items.append(
+            f'<a href="/{key}" data-nav="{key}" class="{active.strip()}"><b>{escape(label)}</b><span>{escape(hint)}</span></a>'
+        )
+    return "\n".join(items)
 
 
 def render_connect_html(active_page: str = "connect") -> str:
-    """Render one Mercury Console page instead of shipping every section at once."""
+    """Render one focused Mercury Console page."""
     page = active_page if active_page in PAGE_NAMES else "connect"
+    title = "Mercury Connect" if page == "connect" else f"Mercury {page.title()}"
+    body = PAGE_CONTENT[page]
 
-    def keep_active(match: re.Match[str]) -> str:
-        return match.group(0) if match.group("name") == page else ""
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{escape(title)}</title>
+  <style>{STYLE}</style>
+</head>
+<body data-page="{escape(page)}">
+  <main>
+    <div class="shell">
+      <header>
+        <div class="brand">
+          <div class="mark">Mx</div>
+          <div><b>Mercury Connect</b><span>Remote MCP control plane for accounting AI hosts</span></div>
+        </div>
+        <div class="status">
+          <span id="status-supabase">Supabase</span>
+          <span id="status-embedding">Embeddings</span>
+          <span id="status-auth">MCP auth</span>
+          <span id="status-endpoint">Endpoint</span>
+        </div>
+      </header>
 
-    return PAGE_BLOCK_PATTERN.sub(keep_active, CONNECT_HTML)
+      <aside class="rail" aria-label="Mercury console navigation">
+        <div class="rail-head">
+          <b>Operator Console</b>
+          <span>Configure tools. The AI host remains the chat surface.</span>
+        </div>
+        <nav class="nav-list">
+          {_nav(page)}
+        </nav>
+        <p class="rail-note">Mercury is MCP-first: setup, context, tools, and audit are separated by workspace.</p>
+      </aside>
+
+      <div class="content">
+        {body}
+      </div>
+    </div>
+  </main>
+  <script>{SCRIPT}</script>
+</body>
+</html>"""
