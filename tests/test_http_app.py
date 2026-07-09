@@ -68,11 +68,32 @@ def test_connect_page_and_status(monkeypatch) -> None:
 
     assert page.status_code == 200
     assert "Mercury Connect" in page.text
+    assert 'data-page="connect"' in page.text
     assert status.status_code == 200
     assert status.json()["mcp_endpoint"] == "https://mercury.example.com/mcp"
     assert status.json()["invite_required"] is True
+    assert status.json()["pages"]["connectors"] == "/connectors"
     assert status.json()["dashboard"] == "/api/dashboard"
     assert status.json()["connector_credentials"] == "/api/connectors/credentials"
+
+
+def test_product_console_exposes_separate_pages(monkeypatch) -> None:
+    monkeypatch.setenv("MERCURY_CONNECT_INVITE_CODE", "invite-demo")
+    monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
+
+    client = TestClient(create_http_app(require_auth=True), raise_server_exceptions=False)
+
+    for path, page_name in (
+        ("/connect", "connect"),
+        ("/workspace", "workspace"),
+        ("/connectors", "connectors"),
+        ("/skills", "skills"),
+        ("/audit", "audit"),
+    ):
+        response = client.get(path)
+
+        assert response.status_code == 200
+        assert f'data-page="{page_name}"' in response.text
 
 
 def test_connect_api_rejects_bad_invite(monkeypatch) -> None:

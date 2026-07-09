@@ -580,6 +580,13 @@ async def status(_: Request) -> Response:
             "mcp_path": settings.mcp_path,
             "mcp_endpoint": settings.mcp_endpoint,
             "health": "/healthz",
+            "pages": {
+                "connect": "/connect",
+                "workspace": "/workspace",
+                "connectors": "/connectors",
+                "skills": "/skills",
+                "audit": "/audit",
+            },
             "connect": "/api/connect",
             "dashboard": "/api/dashboard",
             "connector_setup": "/api/connectors/setup",
@@ -861,7 +868,8 @@ def create_http_app(*, require_auth: bool | None = None):
         if allowed_origin and allowed_origin not in mcp.settings.transport_security.allowed_origins:
             mcp.settings.transport_security.allowed_origins.append(allowed_origin)
     app = mcp.streamable_http_app()
-    app.add_route("/", root, methods=["GET"])
+    for page_path in ("/", "/connect", "/workspace", "/connectors", "/skills", "/audit"):
+        app.add_route(page_path, root, methods=["GET"])
     app.add_route("/api/status", status, methods=["GET"])
     app.add_route("/api/connect", connect, methods=["POST"])
     app.add_route("/api/dashboard", dashboard, methods=["GET"])

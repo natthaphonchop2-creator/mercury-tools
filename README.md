@@ -12,8 +12,9 @@ v1 is remote-first and read-oriented:
 - Hybrid search over curated knowledge
 - Context packs with citations for host agents
 - Redacted MCP audit events
-- Mercury Connect product console for workspace setup, connector profiles, skill
-  enablement, skill uploads, and usage events
+- Mercury Connect control plane for workspace setup, connector profiles, skill
+  enablement, skill uploads, and usage events. The AI host remains Codex,
+  Cursor, Claude, or another MCP client.
 
 ## Quick Start
 
@@ -93,6 +94,15 @@ https://mercury-tools-mcp.onrender.com/
 Mercury Connect issues per-user signed MCP tokens from an invite code and
 generates copy-ready MCP config for Codex, Cursor, Claude, or generic MCP hosts.
 Users should not use the server bearer token file directly.
+
+The browser console is split into focused control-plane pages instead of one
+large dashboard:
+
+- `/connect` creates or restores a host MCP connection
+- `/workspace` shows workspace identity and team access
+- `/connectors` saves accounting connector profiles and encrypted credentials
+- `/skills` enables or uploads workspace skills
+- `/audit` reviews usage and audit events
 
 Mercury Connect also exposes product APIs:
 
