@@ -20,6 +20,7 @@ from mercury_tools.rag.models import SearchFilters
 from mercury_tools.safety.redaction import redact_json
 
 _TEMPLATE_PATTERN = re.compile(r"\$\{([^}]+)\}|\{\{\s*([^}]+?)\s*\}\}")
+_TEMPLATE_EXACT_PATTERN = re.compile(r"^\s*(?:\$\{([^}]+)\}|\{\{\s*([^}]+?)\s*\}\})\s*$")
 
 
 def _get_path(data: dict[str, Any], path: str) -> Any:
@@ -34,6 +35,11 @@ def _get_path(data: dict[str, Any], path: str) -> Any:
 
 def _interpolate(value: Any, variables: dict[str, Any]) -> Any:
     if isinstance(value, str):
+        exact_match = _TEMPLATE_EXACT_PATTERN.match(value)
+        if exact_match:
+            key = (exact_match.group(1) or exact_match.group(2) or "").strip()
+            return _get_path(variables, key)
+
         def replace(match: re.Match[str]) -> str:
             key = (match.group(1) or match.group(2) or "").strip()
             replacement = _get_path(variables, key)
@@ -161,6 +167,35 @@ def _condition_pair(value: Any, *, label: str) -> tuple[Any, Any]:
             return value["value"], value["not_equals"]
         raise FlowValidationError(f"when.{label} requires expected.")
     raise FlowValidationError(f"when.{label} must be a mapping or two-item list.")
+
+
+def _assert_pair(value: Any, *, label: str) -> tuple[Any, Any]:
+    if isinstance(value, list) and len(value) == 2:
+        return value[0], value[1]
+    if isinstance(value, dict):
+        if "value" not in value:
+            raise FlowValidationError(f"assert {label} requires value.")
+        for key in ("expected", "equals", "notEquals", "not_equals", "contains", "item"):
+            if key in value:
+                return value["value"], value[key]
+        raise FlowValidationError(f"assert {label} requires expected.")
+    raise FlowValidationError(f"assert {label} must be a mapping or two-item list.")
+
+
+def _value_count(value: Any) -> int:
+    if isinstance(value, str | list | tuple | set | dict):
+        return len(value)
+    raise FlowValidationError("assert minCount value must be countable.")
+
+
+def _contains(value: Any, expected: Any) -> bool:
+    if isinstance(value, str):
+        return str(expected) in value
+    if isinstance(value, dict):
+        return expected in value
+    if isinstance(value, list | tuple | set):
+        return expected in value
+    raise FlowValidationError("assert contains value must be string, mapping, or collection.")
 
 
 def _condition_matches(raw: Any) -> bool:
@@ -621,17 +656,57 @@ class MercuryFlowRunner:
 
     @staticmethod
     def _assert(args: dict[str, Any]) -> dict[str, Any]:
-        if "exists" in args and not args["exists"]:
-            raise FlowValidationError("assert exists failed.")
+        assertions: list[str] = []
+        if "exists" in args:
+            assertions.append("exists")
+            if not _as_bool(args["exists"]):
+                raise FlowValidationError("assert exists failed.")
+        if "notExists" in args or "not_exists" in args:
+            assertions.append("notExists")
+            value = args.get("notExists", args.get("not_exists"))
+            if _as_bool(value):
+                raise FlowValidationError("assert notExists failed.")
+        if "equals" in args:
+            assertions.append("equals")
+            left, right = _assert_pair(args["equals"], label="equals")
+            if str(left) != str(right):
+                raise FlowValidationError(f"assert equals failed: {left!r} != {right!r}.")
+        if "notEquals" in args or "not_equals" in args:
+            assertions.append("notEquals")
+            raw = args.get("notEquals", args.get("not_equals"))
+            left, right = _assert_pair(raw, label="notEquals")
+            if str(left) == str(right):
+                raise FlowValidationError(f"assert notEquals failed: {left!r} == {right!r}.")
+        if "contains" in args:
+            assertions.append("contains")
+            value, expected = _assert_pair(args["contains"], label="contains")
+            if not _contains(value, expected):
+                raise FlowValidationError(f"assert contains failed: expected {expected!r}.")
+        if "status" in args:
+            assertions.append("status")
+            raw_status = args["status"]
+            if isinstance(raw_status, dict):
+                status_value = raw_status.get("value", raw_status.get("status"))
+                expected_status = raw_status.get("expected", "ok")
+            else:
+                status_value = raw_status
+                expected_status = "ok"
+            if str(status_value).lower() != str(expected_status).lower():
+                raise FlowValidationError(
+                    f"assert status failed: {status_value!r} != {expected_status!r}."
+                )
         if "minCount" in args or "min_count" in args:
+            assertions.append("minCount")
             raw = args.get("minCount") or args.get("min_count")
             if not isinstance(raw, dict):
                 raise FlowValidationError("assert minCount must be a mapping.")
             value = raw.get("value")
             count = int(raw.get("count") or 1)
-            if not isinstance(value, list) or len(value) < count:
+            if _value_count(value) < count:
                 raise FlowValidationError(f"assert minCount failed: expected at least {count}.")
-        return {"status": "ok"}
+        if not assertions:
+            raise FlowValidationError("assert requires at least one assertion.")
+        return {"status": "ok", "assertions": assertions}
 
 
 def create_default_runner(*, dry_run: bool = False) -> MercuryFlowRunner:

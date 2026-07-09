@@ -52,7 +52,8 @@ Commands:
 - getDocument: fetch one indexed document. Args: documentId, saveAs.
 - runSkill: package an accounting skill. Args: skillId, inputs, evidenceMode, saveAs.
 - emitReport: create a structured handoff artifact. Args: title, sections, metadata.
-- assert: fail the flow on missing required values. Args: exists or minCount.
+- assert: fail the flow when required data checks do not pass.
+  Args: exists, notExists, equals, notEquals, contains, status, minCount, saveAs.
 - repeat: repeat a small command group. Args: times, while, maxIterations, commands, saveAs.
 - runFlow: call another flow file relative to the current flow.
   Args: file/path, env, label, commands, saveAs.
@@ -69,6 +70,25 @@ Conditional execution:
 - Supported conditions: true, exists, notExists, equals, notEquals.
 - Multiple conditions are ANDed.
 - Mercury does not evaluate arbitrary JavaScript in v1.
+
+Assertions:
+- Use assert to validate connector, RAG, skill, or report outputs before the
+  host AI consumes them.
+- Supported assertions: exists, notExists, equals, notEquals, contains, status,
+  minCount.
+- Exact template references such as ${rows} preserve list/dict values so
+  minCount can count real collections.
+
+Example:
+- assert:
+    exists: "${connectorState.status}"
+    status:
+      value: "${connectorState.status}"
+      expected: ok
+    minCount:
+      value: "${context.context}"
+      count: 2
+    saveAs: validation
 
 Repeat blocks:
 - repeat runs a small command group multiple times.

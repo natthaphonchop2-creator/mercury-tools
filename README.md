@@ -114,9 +114,10 @@ Mercury Connect issues per-user signed MCP tokens from an invite code and
 generates copy-ready MCP config for Codex, Cursor, Claude, or generic MCP hosts.
 Users should not use the server bearer token file directly.
 
-The browser setup console is split into focused pages instead of one large
-dashboard. It is not the main Mercury chat surface; Codex, Cursor, Claude, or
-another MCP host remains the user-facing AI:
+The browser setup console is split into focused setup sections instead of one
+large dashboard. It is not the main Mercury chat surface or a replacement for
+the AI host; Codex, Cursor, Claude, or another MCP host remains the
+user-facing AI:
 
 - `/` is the Start page and setup map
 - `/connect` creates or restores a host MCP connection
@@ -252,6 +253,23 @@ Like Maestro's `when` blocks, Mercury commands can run conditionally. v1 keeps
 this deterministic for accounting workflows: `true`, `exists`, `notExists`,
 `equals`, and `notEquals` are supported, and multiple conditions are ANDed.
 Arbitrary JavaScript evaluation is intentionally not enabled in Mercury v1.
+
+Like Maestro's assertion commands, Mercury `assert` fails a flow when required
+conditions are not met. The assertions are adapted for accounting data and MCP
+tool output instead of mobile UI selectors: `exists`, `notExists`, `equals`,
+`notEquals`, `contains`, `status`, and `minCount` are supported.
+
+```yaml
+- assert:
+    exists: "${connectorState.status}"
+    status:
+      value: "${connectorState.status}"
+      expected: ok
+    minCount:
+      value: "${context.context}"
+      count: 2
+    saveAs: validation
+```
 
 Like Maestro's `repeat`, Mercury can run a small command group more than once.
 Use `times` for a fixed loop, or `while` with Mercury's deterministic conditions.

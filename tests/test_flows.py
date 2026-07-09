@@ -140,6 +140,117 @@ name: Bad Condition
         )
 
 
+def test_flow_runner_asserts_data_conditions() -> None:
+    result = MercuryFlowRunner().run_text(
+        """
+name: Assert Data
+env:
+  connector_status: ok
+  company_name: Thai Nutra sandbox
+  rows:
+    - invoice
+    - vat
+  summary:
+    revenue: 104100
+---
+- assert:
+    exists: "${company_name}"
+    equals:
+      value: "${connector_status}"
+      expected: ok
+    notEquals:
+      value: "${connector_status}"
+      expected: failed
+    contains:
+      value: "${company_name}"
+      expected: Nutra
+    status:
+      value: "${connector_status}"
+      expected: ok
+    minCount:
+      value: "${rows}"
+      count: 2
+    saveAs: checks
+"""
+    )
+
+    payload = result.as_dict()
+
+    assert payload["status"] == "ok"
+    assert payload["variables"]["checks"]["status"] == "ok"
+    assert payload["variables"]["checks"]["assertions"] == [
+        "exists",
+        "equals",
+        "notEquals",
+        "contains",
+        "status",
+        "minCount",
+    ]
+
+
+def test_flow_runner_assert_not_exists_and_dict_contains() -> None:
+    result = MercuryFlowRunner().run_text(
+        """
+name: Assert Absent
+env:
+  optional_value: ""
+  payload:
+    connector: flowaccount
+---
+- assert:
+    notExists: "${optional_value}"
+    contains:
+      value: "${payload}"
+      expected: connector
+    saveAs: checks
+"""
+    )
+
+    payload = result.as_dict()
+
+    assert payload["variables"]["checks"]["assertions"] == ["notExists", "contains"]
+
+
+def test_flow_runner_assert_equals_failure_reports_values() -> None:
+    with pytest.raises(FlowValidationError, match="assert equals failed"):
+        MercuryFlowRunner().run_text(
+            """
+name: Assert Failure
+---
+- assert:
+    equals:
+      value: production
+      expected: sandbox
+"""
+        )
+
+
+def test_flow_runner_assert_status_failure() -> None:
+    with pytest.raises(FlowValidationError, match="assert status failed"):
+        MercuryFlowRunner().run_text(
+            """
+name: Status Failure
+---
+- assert:
+    status:
+      value: failed
+      expected: ok
+"""
+        )
+
+
+def test_flow_runner_assert_requires_condition() -> None:
+    with pytest.raises(FlowValidationError, match="assert requires at least one assertion"):
+        MercuryFlowRunner().run_text(
+            """
+name: Empty Assert
+---
+- assert:
+    saveAs: empty
+"""
+        )
+
+
 def test_flow_cli_run_json_handles_yaml_true_condition_key(tmp_path: Path, capsys) -> None:
     path = tmp_path / "condition.yaml"
     path.write_text(
@@ -277,7 +388,7 @@ name: Repeat While
 
     assert repeated["iterations"] == 2
     assert repeated["stopped_reason"] == "while condition evaluated false"
-    assert repeated["while"]["notEquals"]["value"] == "2"
+    assert repeated["while"]["notEquals"]["value"] == 2
     assert [item["iteration"] for item in repeated["iteration_history"]] == [1, 2]
 
 
