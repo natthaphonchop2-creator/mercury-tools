@@ -20,6 +20,7 @@ from mercury_tools.connectors.catalog import connector_by_id, list_connector_sum
 from mercury_tools.connectors.setup import required_missing_fields, validate_connector_read_only
 from mercury_tools.db.product import (
     SupabaseProductStore,
+    public_connector_profile,
     public_connector_profiles,
     slugify,
 )
@@ -2163,7 +2164,9 @@ async def setup_connector(request: Request) -> Response:
             company_name=str(data.get("company_name") or "").strip(),
             metadata={"source": "connect-ui"},
         )
-        return JSONResponse(redact_json({"status": "ok", "profile": profile}))
+        return JSONResponse(
+            redact_json({"status": "ok", "profile": public_connector_profile(profile)})
+        )
     except PermissionError as exc:
         return _json_error("unauthorized", str(exc), status_code=401)
     except ValueError as exc:

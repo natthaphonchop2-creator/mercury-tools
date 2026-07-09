@@ -81,6 +81,15 @@ SERVER_ONLY_CONNECTOR_PROFILE_KEYS = {
     "server_vault",
     "vault_record",
 }
+PRESERVED_CONNECTOR_CREDENTIAL_METADATA_KEYS = {
+    "credential_storage",
+    "credential_fields",
+    "credential_fingerprints",
+    "credentials_configured",
+    "credentials_configured_at",
+    "configured_at",
+    "server_vault",
+}
 
 
 def slugify(value: str, *, fallback: str = "workspace") -> str:
@@ -252,6 +261,14 @@ def _strip_server_only_connector_data(value: Any) -> Any:
     if isinstance(value, list):
         return [_strip_server_only_connector_data(item) for item in value]
     return value
+
+
+def _preserved_connector_credential_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: metadata[key]
+        for key in PRESERVED_CONNECTOR_CREDENTIAL_METADATA_KEYS
+        if key in metadata
+    }
 
 
 def public_connector_profile(profile: dict[str, Any]) -> dict[str, Any]:
@@ -713,6 +730,12 @@ class SupabaseProductStore:
             raise ValueError(
                 f"Unsupported environment for {canonical_connector_id}: {environment}"
             )
+        profile_id = stable_id(
+            "connector",
+            context["workspace"]["workspace_key"],
+            canonical_connector_id,
+            environment,
+        )
         existing_profile: dict[str, Any] | None = None
         for row in self._fallback_state_events(context["workspace"]["workspace_key"]):
             summary = row.get("output_summary") or {}
@@ -727,13 +750,21 @@ class SupabaseProductStore:
                 and profile.get("environment") == environment
             ):
                 existing_profile = profile
+        private_profile = self._fallback_private_connector_profiles.get(profile_id)
+        existing_metadata = (
+            private_profile or existing_profile or {}
+        ).get("metadata") or {}
+        merged_metadata = {
+            **existing_metadata,
+            "required_secret_fields": connector.required_secret_fields,
+            "preset": connector.preset_for_environment(environment),
+            "credential_storage": "host_or_user_vault",
+            "storage": "audit_fallback",
+            **(metadata or {}),
+            **_preserved_connector_credential_metadata(existing_metadata),
+        }
         profile = {
-            "id": stable_id(
-                "connector",
-                context["workspace"]["workspace_key"],
-                canonical_connector_id,
-                environment,
-            ),
+            "id": profile_id,
             "workspace_id": context["workspace"]["id"],
             "connector_id": canonical_connector_id,
             "environment": environment,
@@ -743,17 +774,13 @@ class SupabaseProductStore:
                 if company_name is not None
                 else (existing_profile or {}).get("company_name")
             ),
-            "status": connector_profile_status_from_metadata(metadata),
-            "metadata": {
-                "required_secret_fields": connector.required_secret_fields,
-                "preset": connector.preset_for_environment(environment),
-                "credential_storage": "host_or_user_vault",
-                "storage": "audit_fallback",
-                **(metadata or {}),
-            },
+            "status": connector_profile_status_from_metadata(merged_metadata),
+            "metadata": merged_metadata,
             "created_at": now_utc(),
             "updated_at": now_utc(),
         }
+        self._fallback_private_connector_profiles[profile_id] = profile
+        public_profile = public_connector_profile(profile)
         self._fallback_record_state_event(
             workspace_key=context["workspace"]["workspace_key"],
             client_jti=str(token_payload.get("jti") or ""),
@@ -763,7 +790,7 @@ class SupabaseProductStore:
                 "environment": environment,
             },
             summary={
-                "profile": profile,
+                "profile": public_profile,
                 "event_summary": {
                     "connector_id": canonical_connector_id,
                     "environment": environment,
@@ -771,7 +798,7 @@ class SupabaseProductStore:
                 },
             },
         )
-        return profile
+        return _strip_server_only_connector_data(dict(profile))
 
     def start_connector_setup(
         self,
@@ -1548,17 +1575,36 @@ class SupabaseProductStore:
             raise ValueError(
                 f"Unsupported environment for {canonical_connector_id}: {environment}"
             )
+        existing_rows = self._request(
+            "GET",
+            "mercury_connector_profiles",
+            params={
+                "workspace_id": f"eq.{context['workspace']['id']}",
+                "connector_id": f"eq.{canonical_connector_id}",
+                "environment": f"eq.{environment}",
+                "select": "id,metadata,display_name,company_name",
+                "limit": "1",
+            },
+        )
+        existing_profile = (existing_rows or [None])[0]
+        existing_metadata = (existing_profile or {}).get("metadata") or {}
         merged_metadata = {
+            **existing_metadata,
             "required_secret_fields": connector.required_secret_fields,
             "preset": connector.preset_for_environment(environment),
             "credential_storage": "host_or_user_vault",
             **(metadata or {}),
+            **_preserved_connector_credential_metadata(existing_metadata),
         }
         payload = {
             "workspace_id": context["workspace"]["id"],
             "connector_id": canonical_connector_id,
             "environment": environment,
-            "display_name": display_name or connector.name,
+            "display_name": (
+                display_name
+                if display_name is not None
+                else (existing_profile or {}).get("display_name") or connector.name
+            ),
             "status": connector_profile_status_from_metadata(merged_metadata),
             "metadata": merged_metadata,
         }
@@ -1583,7 +1629,7 @@ class SupabaseProductStore:
                 "status": row["status"],
             },
         )
-        return row
+        return _strip_server_only_connector_data(dict(row))
 
     def record_uploaded_skill(
         self,

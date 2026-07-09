@@ -606,6 +606,78 @@ def test_product_table_credentials_store_server_vault_on_profile_not_audit() -> 
     assert server_vault["ciphertext"] not in str(public_profile)
 
 
+def test_product_table_validation_preserves_private_credential_vault_metadata() -> None:
+    from mercury_tools.db.product import public_connector_profile
+
+    store = StoreForSetup()
+    token_payload = {
+        "sub": "owner@example.com",
+        "company": "Demo Co",
+        "host_app": "codex",
+        "iat": 0,
+        "exp": 99999,
+        "jti": "token-jti",
+    }
+    store.start_connector_setup(
+        token_payload=token_payload,
+        connector_id="flowaccount",
+        environment="production",
+    )
+    store.set_connector_credentials(
+        token_payload=token_payload,
+        connector_id="flowaccount",
+        environment="production",
+        credentials={
+            "client_id": "demo-client-id",
+            "client_secret": "super-secret-value",
+        },
+    )
+    credential_metadata = store.profile_patches[-1]["metadata"]
+    server_vault = credential_metadata["server_vault"]
+
+    ready_profile = store.set_connector_profile(
+        token_payload=token_payload,
+        connector_id="flowaccount",
+        environment="production",
+        company_name="Demo Books",
+        metadata={
+            "setup_state": "ready",
+            "enabled_capabilities": ["company.info.read"],
+            "validation": {"token_status": 200, "company_info_status": 200},
+        },
+    )
+    stored_profile = next(iter(store.profiles.values()))
+    stored_metadata = stored_profile["metadata"]
+    public_profile = public_connector_profile(stored_profile)
+
+    assert ready_profile["status"] == "connected_read_only"
+    assert stored_profile["status"] == "connected_read_only"
+    assert stored_metadata["server_vault"]["ciphertext"] == server_vault["ciphertext"]
+    assert stored_metadata["credential_storage"] == "encrypted_server_vault"
+    assert stored_metadata["credential_fields"] == ["client_id", "client_secret"]
+    assert stored_metadata["credential_fingerprints"] == credential_metadata[
+        "credential_fingerprints"
+    ]
+    assert stored_metadata["credentials_configured"] is True
+    assert (
+        stored_metadata["credentials_configured_at"]
+        == credential_metadata["credentials_configured_at"]
+    )
+    assert stored_metadata["setup_state"] == "ready"
+    assert stored_metadata["validation"] == {
+        "token_status": 200,
+        "company_info_status": 200,
+    }
+    assert "'server_vault':" not in str(ready_profile)
+    assert "'server_vault':" not in str(public_profile)
+    assert server_vault["ciphertext"] not in str(ready_profile)
+    assert server_vault["ciphertext"] not in str(public_profile)
+    assert "super-secret-value" not in str(ready_profile)
+    assert "demo-client-id" not in str(public_profile)
+    assert "'server_vault':" not in str(store.audit_events)
+    assert server_vault["ciphertext"] not in str(store.audit_events)
+
+
 def test_start_connector_setup_resume_without_company_name_preserves_label() -> None:
     store = StoreForSetup()
     token_payload = {
