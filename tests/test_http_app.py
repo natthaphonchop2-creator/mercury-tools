@@ -73,6 +73,7 @@ def test_connect_page_and_status(monkeypatch) -> None:
     assert status.json()["mcp_endpoint"] == "https://mercury.example.com/mcp"
     assert status.json()["invite_required"] is True
     assert status.json()["pages"]["connectors"] == "/connectors"
+    assert "run_flow" in status.json()["flow_tools"]
     assert status.json()["dashboard"] == "/api/dashboard"
     assert status.json()["connector_credentials"] == "/api/connectors/credentials"
 

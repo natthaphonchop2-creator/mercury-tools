@@ -1,0 +1,33 @@
+name: Company Health Check
+description: Read-only Mercury flow for a Thai accounting health-check handoff.
+tags: [accounting, read-only, flowaccount]
+env:
+  jurisdiction: TH
+  connector: flowaccount
+onFlowStart:
+  - connectorStatus:
+      saveAs: connector
+---
+- retrieveContextPack:
+    query: "company health check revenue VAT cash flow accounting Thailand"
+    task: "company_health_check_th"
+    filters:
+      jurisdiction: "${jurisdiction}"
+      connector: "${connector}"
+      review_status: reviewed
+    maxChunks: 8
+    saveAs: context
+- runSkill:
+    skillId: company-health-check-th
+    inputs:
+      task: "Prepare a concise Thai company health-check answer."
+      connector: "${connector}"
+      context_query: "{{ context.query }}"
+    evidenceMode: true
+    saveAs: skill
+- emitReport:
+    title: "Company health-check context pack"
+    sections:
+      - "Connector status is available in {{ connector.status }}."
+      - "Use skill {{ skill.skill_id }} and the cited context pack to answer in Thai."
+      - "Do not expose raw tax IDs, emails, bearer tokens, or API keys."

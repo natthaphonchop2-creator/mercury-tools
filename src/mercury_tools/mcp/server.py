@@ -15,6 +15,9 @@ from starlette.responses import HTMLResponse, JSONResponse, Response
 from mercury_tools.config import load_settings
 from mercury_tools.db.product import SupabaseProductStore, slugify
 from mercury_tools.db.supabase import SupabaseRagStore
+from mercury_tools.flows.parser import FlowValidationError, validate_flow_text
+from mercury_tools.flows.runner import create_default_runner
+from mercury_tools.flows.templates import FLOW_CHEAT_SHEET
 from mercury_tools.mercury_runtime import connector_status as read_connector_status
 from mercury_tools.mercury_runtime import skill_markdown
 from mercury_tools.product import (
@@ -219,6 +222,53 @@ def run_accounting_skill(
     return payload
 
 
+@mcp.tool()
+def flow_cheat_sheet() -> dict[str, Any]:
+    """Return Mercury Flow command syntax and examples."""
+    payload = {"status": "ok", "cheat_sheet": FLOW_CHEAT_SHEET}
+    _audit("flow_cheat_sheet", {}, {"status": "ok"})
+    return payload
+
+
+@mcp.tool()
+def check_flow_syntax(flow_yaml: str) -> dict[str, Any]:
+    """Validate a Mercury YAML flow without executing it."""
+    try:
+        payload = validate_flow_text(flow_yaml)
+        _audit(
+            "check_flow_syntax",
+            {"flow_yaml_length": len(flow_yaml)},
+            {"status": "ok", "command_count": payload["flow"]["command_count"]},
+        )
+        return payload
+    except FlowValidationError as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit("check_flow_syntax", {"flow_yaml_length": len(flow_yaml)}, payload)
+        return payload
+
+
+@mcp.tool()
+def run_flow(flow_yaml: str, dry_run: bool = False) -> dict[str, Any]:
+    """Run a Mercury YAML flow or return an execution plan when dry_run is true."""
+    try:
+        result = create_default_runner(dry_run=dry_run).run_text(flow_yaml)
+        payload = redact_json(result.as_dict())
+        _audit(
+            "run_flow",
+            {"flow_yaml_length": len(flow_yaml), "dry_run": dry_run},
+            {
+                "status": payload["status"],
+                "step_count": len(payload["steps"]),
+                "dry_run": dry_run,
+            },
+        )
+        return payload
+    except (FlowValidationError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc), "dry_run": dry_run}
+        _audit("run_flow", {"flow_yaml_length": len(flow_yaml), "dry_run": dry_run}, payload)
+        return payload
+
+
 @mcp.resource("mercury://wiki/index")
 def wiki_index() -> str:
     """Return the Mercury LLM Wiki index prompt resource."""
@@ -241,6 +291,12 @@ def wiki_document(document_id: str) -> str:
 def skill_resource(skill_id: str) -> str:
     """Return bundled Mercury skill markdown if available locally."""
     return skill_markdown(skill_id) or "Skill not found."
+
+
+@mcp.resource("mercury://flows/cheat-sheet")
+def flows_cheat_sheet_resource() -> str:
+    """Return Mercury Flow syntax and examples."""
+    return FLOW_CHEAT_SHEET
 
 
 @mcp.resource("mercury://connectors")
@@ -594,6 +650,7 @@ async def status(_: Request) -> Response:
             "team_invite": "/api/team/invite",
             "skill_enable": "/api/skills/enable",
             "skill_upload": "/api/skills/upload",
+            "flow_tools": ["flow_cheat_sheet", "check_flow_syntax", "run_flow"],
             "http_auth_configured": settings.http_auth_configured,
             "invite_required": bool(settings.connect_invite_code),
         }

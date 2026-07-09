@@ -15,6 +15,8 @@ v1 is remote-first and read-oriented:
 - Mercury Connect control plane for workspace setup, connector profiles, skill
   enablement, skill uploads, and usage events. The AI host remains Codex,
   Cursor, Claude, or another MCP client.
+- Mercury Flows: Maestro-inspired YAML workflows for accounting agents, with
+  CLI validation/execution and MCP tool access.
 
 ## Quick Start
 
@@ -31,6 +33,14 @@ project, then ingest the seed wiki:
 uv run mercury-tools doctor
 uv run mercury-tools ingest wiki --path ./wiki
 uv run mercury-tools search "vat input tax" --json
+```
+
+Create and test a Mercury Flow:
+
+```bash
+uv run mercury-tools flow init ./my-flow.yaml --template company-health
+uv run mercury-tools flow validate ./my-flow.yaml
+uv run mercury-tools flow run ./my-flow.yaml --dry-run
 ```
 
 Start the remote MCP server locally:
@@ -127,6 +137,58 @@ Connector credentials are accepted through the Connect UI and encrypted before
 they are stored in the event-backed vault. Dashboard responses show only field
 names, fingerprints, and configuration status; raw credentials are not returned.
 
+## Mercury Flows
+
+Mercury Flows follow the same product idea that makes Maestro easy: readable
+YAML files interpreted at runtime, instead of hard-coded automation scripts.
+For Mercury, the commands are accounting-agent commands rather than UI taps.
+
+Example:
+
+```yaml
+name: Company Health Check
+tags: [accounting, read-only, flowaccount]
+env:
+  jurisdiction: TH
+  connector: flowaccount
+---
+- retrieveContextPack:
+    query: "company health check revenue VAT cash flow accounting Thailand"
+    task: "company_health_check_th"
+    filters:
+      jurisdiction: "${jurisdiction}"
+      connector: "${connector}"
+    maxChunks: 8
+    saveAs: context
+- runSkill:
+    skillId: company-health-check-th
+    inputs:
+      context_query: "{{ context.query }}"
+    evidenceMode: true
+    saveAs: skill
+- emitReport:
+    title: "Company health-check context pack"
+    sections:
+      - "Use skill {{ skill.skill_id }} and the cited context pack to answer."
+```
+
+Flow CLI:
+
+- `mercury-tools flow init <path> --template company-health`
+- `mercury-tools flow validate <path>`
+- `mercury-tools flow run <path> --dry-run`
+- `mercury-tools flow cheat-sheet`
+
+Flow MCP tools:
+
+- `flow_cheat_sheet`
+- `check_flow_syntax`
+- `run_flow`
+
+Supported flow commands are read-oriented: `connectorStatus`, `searchKnowledge`,
+`retrieveContextPack`, `getDocument`, `runSkill`, `emitReport`, `assert`, and
+`runFlow`. Production accounting writes remain out of scope for v1.
+
 ## Environment
 
 Required for live RAG:
@@ -153,12 +215,16 @@ Tools:
 - `get_document`
 - `connector_status`
 - `run_accounting_skill`
+- `flow_cheat_sheet`
+- `check_flow_syntax`
+- `run_flow`
 
 Resources:
 
 - `mercury://wiki/index`
 - `mercury://wiki/doc/{document_id}`
 - `mercury://skills/{skill_id}`
+- `mercury://flows/cheat-sheet`
 - `mercury://connectors`
 - `mercury://audit/{event_id}`
 

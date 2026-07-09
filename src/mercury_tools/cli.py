@@ -9,6 +9,9 @@ from typing import Any
 
 from mercury_tools.config import load_settings
 from mercury_tools.db.supabase import SupabaseRagStore
+from mercury_tools.flows.parser import FlowValidationError, validate_flow_path
+from mercury_tools.flows.runner import create_default_runner
+from mercury_tools.flows.templates import FLOW_CHEAT_SHEET, TEMPLATES
 from mercury_tools.rag.embeddings import create_embedding_provider
 from mercury_tools.rag.ingest import ingest_wiki
 from mercury_tools.rag.models import SearchFilters
@@ -150,6 +153,77 @@ def cmd_remote_verify(args: argparse.Namespace) -> int:
     return 0 if result.ready else 1
 
 
+def cmd_flow_validate(args: argparse.Namespace) -> int:
+    path = Path(args.path)
+    try:
+        payload = validate_flow_path(path)
+    except FlowValidationError as exc:
+        payload = {"status": "error", "message": str(exc), "path": str(path)}
+        if args.json:
+            _print_json(payload)
+        else:
+            print(f"Flow invalid: {exc}")
+        return 1
+    if args.json:
+        _print_json(payload)
+    else:
+        flow = payload["flow"]
+        print(f"Flow valid: {flow['name']}")
+        print(f"commands: {flow['command_count']}")
+        if flow["tags"]:
+            print("tags: " + ", ".join(flow["tags"]))
+    return 0
+
+
+def cmd_flow_run(args: argparse.Namespace) -> int:
+    path = Path(args.path)
+    try:
+        result = create_default_runner(dry_run=args.dry_run).run_path(path)
+    except (FlowValidationError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc), "path": str(path)}
+        if args.json:
+            _print_json(payload)
+        else:
+            print(f"Flow failed: {exc}")
+        return 1
+    payload = result.as_dict()
+    if args.json:
+        _print_json(payload)
+    else:
+        print(f"Flow {payload['status']}: {payload['flow']['name']}")
+        for step in payload["steps"]:
+            saved = f" -> {step['saved_as']}" if step.get("saved_as") else ""
+            print(f"- {step['index']}. {step['command']} [{step['status']}]{saved}")
+        if payload["artifacts"]:
+            print("artifacts:")
+            for artifact in payload["artifacts"]:
+                print(f"- {artifact.get('title', 'artifact')}")
+    return 0
+
+
+def cmd_flow_init(args: argparse.Namespace) -> int:
+    template = TEMPLATES[args.template]
+    path = Path(args.path)
+    if path.exists() and not args.force:
+        print(f"Refusing to overwrite existing file: {path}")
+        return 1
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(template, encoding="utf-8")
+    if args.json:
+        _print_json({"status": "ok", "path": str(path), "template": args.template})
+    else:
+        print(f"Created Mercury flow: {path}")
+    return 0
+
+
+def cmd_flow_cheat_sheet(args: argparse.Namespace) -> int:
+    if args.json:
+        _print_json({"status": "ok", "cheat_sheet": FLOW_CHEAT_SHEET})
+    else:
+        print(FLOW_CHEAT_SHEET)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mercury-tools")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -197,6 +271,30 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--timeout", type=float, default=20)
     verify.add_argument("--json", action="store_true")
     verify.set_defaults(func=cmd_remote_verify)
+
+    flow = sub.add_parser("flow")
+    flow_sub = flow.add_subparsers(dest="flow_command", required=True)
+    flow_validate = flow_sub.add_parser("validate")
+    flow_validate.add_argument("path")
+    flow_validate.add_argument("--json", action="store_true")
+    flow_validate.set_defaults(func=cmd_flow_validate)
+
+    flow_run = flow_sub.add_parser("run")
+    flow_run.add_argument("path")
+    flow_run.add_argument("--dry-run", action="store_true")
+    flow_run.add_argument("--json", action="store_true")
+    flow_run.set_defaults(func=cmd_flow_run)
+
+    flow_init = flow_sub.add_parser("init")
+    flow_init.add_argument("path")
+    flow_init.add_argument("--template", choices=sorted(TEMPLATES), default="company-health")
+    flow_init.add_argument("--force", action="store_true")
+    flow_init.add_argument("--json", action="store_true")
+    flow_init.set_defaults(func=cmd_flow_init)
+
+    flow_cheat = flow_sub.add_parser("cheat-sheet")
+    flow_cheat.add_argument("--json", action="store_true")
+    flow_cheat.set_defaults(func=cmd_flow_cheat_sheet)
     return parser
 
 

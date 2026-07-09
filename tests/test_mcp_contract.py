@@ -18,3 +18,18 @@ def test_hash_embedding_dimension() -> None:
 
     assert len(vector) == 1536
     assert all(isinstance(value, float) for value in vector)
+
+
+def test_mcp_flow_tools_validate_and_dry_run() -> None:
+    from mercury_tools.flows.templates import COMPANY_HEALTH_TEMPLATE
+    from mercury_tools.mcp.server import check_flow_syntax, flow_cheat_sheet, run_flow
+
+    assert "Mercury Flow" in flow_cheat_sheet()["cheat_sheet"]
+
+    syntax = check_flow_syntax(COMPANY_HEALTH_TEMPLATE)
+    assert syntax["status"] == "ok"
+    assert syntax["flow"]["command_count"] == 3
+
+    result = run_flow(COMPANY_HEALTH_TEMPLATE, dry_run=True)
+    assert result["status"] == "planned"
+    assert result["steps"][0]["command"] == "connectorStatus"
