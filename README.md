@@ -101,8 +101,7 @@ Verify the current contest Render deployment:
 
 ```bash
 uv run mercury-tools remote verify \
-  --url https://mercury-tools-mcp.onrender.com \
-  --token-file ~/.mercury-tools/render-mcp-token.txt
+  --url https://mercury-tools-mcp.onrender.com
 ```
 
 Mercury is MCP/plugin-first. The hosted root page is only a minimal server
@@ -123,8 +122,9 @@ The product API layer exists for host integrations and secure onboarding:
 - `POST /api/flows/run`
 
 These APIs require a Mercury client token (`mc_...`) issued by a secure
-host/admin onboarding path, not by a browser UX. The server bearer token is for
-MCP/admin compatibility, not normal users.
+host/admin onboarding path, not by a browser UX. The contest MCP endpoint is
+public/read-oriented so the GitHub marketplace plugin can connect without a
+manual token step.
 Flow execution APIs are for MCP/CLI/agent integrations and are not surfaced as
 browser-console workflows.
 Connector credentials are not stored in Supabase in v1; connector profiles store
@@ -400,7 +400,7 @@ Required for live RAG:
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `MERCURY_TOOLS_EMBEDDING_PROVIDER=hash` for the Codex/host-AI demo mode
-- `MERCURY_TOOLS_HTTP_BEARER_TOKEN` for remote MCP auth
+- `MERCURY_TOOLS_HTTP_REQUIRE_AUTH=false` for the public contest MCP endpoint
 - `MERCURY_CONNECT_INVITE_CODE` for server-side client-token issuance
 - `MERCURY_CONNECT_SIGNING_SECRET` for per-user client tokens
 
@@ -457,6 +457,6 @@ uv run mcp run src/mercury_tools/mcp/server.py
 ## Mercury Finance Codex Plugin
 
 See `docs/JUDGE_QUICKSTART.md` for the contest install flow. The plugin
-connects Codex to the hosted Mercury Tools MCP server and keeps connector
-credentials out of Git. Mercury should be used from Codex or another MCP host,
-not from a browser UI.
+is installed from the GitHub marketplace and connects Codex to the hosted
+Mercury Tools MCP server. Connector credentials stay out of Git. Mercury should
+be used from Codex or another MCP host, not from a browser UI.

@@ -17,11 +17,11 @@ codex plugin marketplace add natthaphonchop2-creator/mercury-tools \
   --sparse plugins/mercury-finance
 ```
 
-Install `Mercury Finance` from the plugin list, then configure the remote MCP
-server with the token provided by the Mercury demo owner or secure host setup
-path.
+Install `Mercury Finance` from the plugin list. The plugin includes its hosted MCP server config,
+so judges should see Mercury tools after installing the plugin and starting a
+fresh chat/thread.
 
-MCP endpoint:
+Fallback manual MCP endpoint if the host does not import plugin MCP config:
 
 ```text
 https://mercury-tools-mcp.onrender.com/mcp

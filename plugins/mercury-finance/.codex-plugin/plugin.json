@@ -1,13 +1,40 @@
 {
   "name": "mercury-finance",
-  "display_name": "Mercury Finance",
+  "version": "0.1.0+codex.20260709170308",
   "description": "Accounting AI for ERP connectors, VAT, reports, audit context, and Mercury Flows.",
-  "version": "0.1.0",
-  "category": "Finance",
-  "capabilities": ["Interactive", "Read"],
-  "starter_prompts": [
-    "Prepare a Thai VAT context pack",
-    "Connect FlowAccount and validate read-only access",
-    "Run a company health check flow"
-  ]
+  "author": {
+    "name": "Mercury Agent",
+    "url": "https://github.com/natthaphonchop2-creator/mercury-tools"
+  },
+  "homepage": "https://github.com/natthaphonchop2-creator/mercury-tools",
+  "repository": "https://github.com/natthaphonchop2-creator/mercury-tools",
+  "license": "MIT",
+  "keywords": [
+    "accounting",
+    "finance",
+    "erp",
+    "mcp",
+    "rag"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Mercury Finance",
+    "shortDescription": "Accounting AI tools for ERP connectors and finance workflows.",
+    "longDescription": "Mercury Finance connects Codex to hosted accounting tools for ERP/API connector knowledge, Thai finance workflows, VAT context packs, invoice review, management reporting, and auditable Mercury Flows.",
+    "developerName": "Mercury Agent",
+    "category": "Finance",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/natthaphonchop2-creator/mercury-tools",
+    "defaultPrompt": [
+      "Prepare a Thai VAT context pack",
+      "Connect FlowAccount endpoint docs",
+      "Run a company health check flow"
+    ],
+    "brandColor": "#42C6BB"
+  }
 }

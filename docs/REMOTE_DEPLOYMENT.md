@@ -13,13 +13,10 @@ This guide turns Mercury Tools into a cloud-hosted Streamable HTTP MCP server.
 - Supabase project ref: `vbnlkqvauqwnjbxngkas`
 - Supabase URL: `https://vbnlkqvauqwnjbxngkas.supabase.co`
 
-The MCP endpoint requires `Authorization: Bearer <MERCURY_TOOLS_HTTP_BEARER_TOKEN>`.
-The demo bearer token is intentionally not stored in Git; on the development
-machine it is saved outside the repo at:
-
-```text
-~/.mercury-tools/render-mcp-token.txt
-```
+The contest MCP endpoint is public/read-oriented so judges can install the
+GitHub marketplace plugin and use Mercury tools without manually managing a
+bearer token. Private deployments can enable bearer auth later with
+`MERCURY_TOOLS_HTTP_REQUIRE_AUTH=true`.
 
 ## 1. Prepare Supabase
 
@@ -40,13 +37,14 @@ Required environment variables for the MCP service:
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `MERCURY_TOOLS_EMBEDDING_PROVIDER=hash`
-- `MERCURY_TOOLS_HTTP_BEARER_TOKEN`
+- `MERCURY_TOOLS_HTTP_REQUIRE_AUTH=false` for the contest/demo MCP endpoint
 - `MERCURY_CONNECT_INVITE_CODE`
 - `MERCURY_CONNECT_SIGNING_SECRET`
 
 Do not expose the Supabase service role key to MCP clients.
-Do not give normal users the server bearer token file. Issue scoped client
-tokens only through a secure host/admin onboarding path.
+Do not expose raw connector credentials through MCP outputs. For private
+customer environments, enable MCP auth or put the service behind the host
+platform's authentication layer.
 
 Mercury Tools v1 does not need to call an LLM by itself. In contest/demo mode it
 uses deterministic local `hash` embeddings and serves cited context packs to the
@@ -103,8 +101,7 @@ Expected response:
   "embedding_provider": "hash",
   "embedding_configured": true,
   "mcp_path": "/mcp",
-  "http_auth_required": true,
-  "http_auth_configured": true
+  "http_auth_required": false
 }
 ```
 
@@ -151,8 +148,8 @@ https://mercury-tools-mcp.onrender.com/
 ```
 
 This page is not the Mercury chat/runtime surface, not a setup gateway, and not
-a product dashboard. The resulting client token is signed and time-limited, so
-users do not need access to the server bearer token file.
+a product dashboard. Users install the GitHub marketplace plugin and let the
+host AI client call the MCP endpoint.
 
 If `0002_mercury_product_layer.sql` is not applied yet, client-token issuance
 still works, but product persistence runs in degraded mode. After `0002` is
@@ -175,17 +172,14 @@ You can verify the deployed service from this repo with:
 
 ```bash
 uv run mercury-tools remote verify \
-  --url https://mercury-tools-mcp.onrender.com \
-  --token-file ~/.mercury-tools/render-mcp-token.txt
+  --url https://mercury-tools-mcp.onrender.com
 ```
 
 The command exits with code `0` only when:
 
 - `/healthz` is reachable.
 - Supabase env vars and the selected embedding provider are configured on Render.
-- MCP HTTP bearer auth is configured.
-- unauthenticated MCP requests are rejected.
-- authenticated MCP requests reach the MCP endpoint.
+- The MCP endpoint is reachable with the configured public/private auth mode.
 
 ## 4. MCP client connection
 
@@ -195,22 +189,16 @@ Remote MCP endpoint:
 https://your-service.example.com/mcp
 ```
 
-Send this header:
-
-```text
-Authorization: Bearer <MERCURY_TOOLS_HTTP_BEARER_TOKEN>
-```
-
 Client configuration differs by host app. The important contract is:
 
 - transport: Streamable HTTP
 - URL: deployed `/mcp` endpoint
-- auth header: bearer token
+- auth: none for the contest public demo endpoint; bearer/OAuth for private deployments
 
 ## 5. Security rules
 
 - Keep connector credentials outside Supabase.
 - Keep Supabase service role key server-side only.
-- Use a long random `MERCURY_TOOLS_HTTP_BEARER_TOKEN`.
-- Rotate the bearer token before sharing a demo build.
+- Keep the contest public endpoint read-oriented.
+- Use bearer/OAuth before enabling private customer data or production mutations.
 - Keep production accounting write tools disabled until tenant auth and approval workflows exist.

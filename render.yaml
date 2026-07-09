@@ -13,7 +13,7 @@ services:
       - key: MERCURY_TOOLS_MCP_PATH
         value: /mcp
       - key: MERCURY_TOOLS_HTTP_REQUIRE_AUTH
-        value: "true"
+        value: "false"
       - key: MERCURY_CONNECT_INVITE_CODE
         sync: false
       - key: MERCURY_CONNECT_SIGNING_SECRET

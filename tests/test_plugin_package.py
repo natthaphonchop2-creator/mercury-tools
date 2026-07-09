@@ -56,10 +56,15 @@ EXPECTED_SKILLS = {
 def test_marketplace_points_to_plugin_folder() -> None:
     data = json.loads((ROOT / ".agents/plugins/marketplace.json").read_text())
     plugins = data["plugins"]
-    mercury = next(item for item in plugins if item["id"] == "mercury-finance")
+    mercury = next(item for item in plugins if item["name"] == "mercury-finance")
 
+    assert data["name"] == "mercury-tools"
+    assert data["interface"]["displayName"] == "Mercury Tools"
     assert mercury["source"]["path"] == "./plugins/mercury-finance"
-    assert mercury["name"] == "Mercury Finance"
+    assert mercury["source"]["source"] == "local"
+    assert mercury["policy"]["installation"] == "AVAILABLE"
+    assert mercury["policy"]["authentication"] == "ON_INSTALL"
+    assert mercury["category"] == "Finance"
 
 
 def test_plugin_declares_remote_mcp_without_secret_values() -> None:
@@ -70,8 +75,11 @@ def test_plugin_declares_remote_mcp_without_secret_values() -> None:
     serialized = json.dumps({"plugin": plugin, "mcp": mcp})
 
     assert plugin["name"] == "mercury-finance"
-    assert "Mercury Finance" in plugin["display_name"]
+    assert plugin["skills"] == "./skills/"
+    assert plugin["mcpServers"] == "./.mcp.json"
+    assert plugin["interface"]["displayName"] == "Mercury Finance"
     assert "https://mercury-tools-mcp.onrender.com/mcp" in serialized
+    assert "bearer_token_env_var" not in serialized
     assert "SUPABASE_SERVICE_ROLE_KEY" not in serialized
     assert "client_secret" not in serialized
 
@@ -82,6 +90,8 @@ def test_judge_quickstart_mentions_plugin_and_no_secrets() -> None:
     assert "Mercury Finance" in text
     assert "codex plugin marketplace add" in text
     assert "https://mercury-tools-mcp.onrender.com/mcp" in text
+    assert "hosted MCP server config" in text
+    assert "token provided by the Mercury demo owner" not in text
     assert "SUPABASE_SERVICE_ROLE_KEY" not in text
     assert "client_secret =" not in text
 
@@ -141,8 +151,8 @@ def test_plugin_package_has_no_embedded_secret_env_names_or_values() -> None:
         )
     )
 
-    assert "MERCURY_TOOLS_MCP_TOKEN" in serialized
-    assert env_names == {"MERCURY_TOOLS_MCP_TOKEN"}
+    assert "MERCURY_TOOLS_MCP_TOKEN" not in serialized
+    assert env_names == set()
     assert "SUPABASE_SERVICE_ROLE_KEY" not in serialized
     assert "FLOWACCOUNT_CLIENT_SECRET" not in serialized
     assert "PEAK_CLIENT_SECRET" not in serialized

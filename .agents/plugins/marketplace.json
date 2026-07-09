@@ -1,13 +1,20 @@
 {
+  "name": "mercury-tools",
+  "interface": {
+    "displayName": "Mercury Tools"
+  },
   "plugins": [
     {
-      "id": "mercury-finance",
-      "name": "Mercury Finance",
-      "description": "Accounting AI for ERP connectors, VAT, reports, audit context, and Mercury Flows.",
+      "name": "mercury-finance",
       "source": {
-        "type": "path",
+        "source": "local",
         "path": "./plugins/mercury-finance"
-      }
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Finance"
     }
   ]
 }
