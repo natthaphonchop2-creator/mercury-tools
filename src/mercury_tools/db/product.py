@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 
 from mercury_tools.config import Settings, require_supabase
 from mercury_tools.connectors.catalog import connector_by_id, list_connector_summaries
@@ -18,6 +18,11 @@ from mercury_tools.connectors.setup import required_missing_fields, resolve_setu
 from mercury_tools.flows.parser import parse_flow_text
 from mercury_tools.product import ConnectRequest, normalize_host_app
 from mercury_tools.safety.redaction import redact_json
+from mercury_tools.workspaces.public import (
+    new_public_workspace_id,
+    public_workspace_connect_request,
+    public_workspace_token_payload,
+)
 
 SKILL_CATALOG_SEED: list[dict[str, Any]] = [
     {
@@ -264,6 +269,32 @@ def encrypt_connector_credentials(
     }
 
 
+def decrypt_connector_credentials(
+    settings: Settings,
+    *,
+    workspace_key_value: str,
+    vault_record: dict[str, Any],
+) -> dict[str, str]:
+    ciphertext = str(vault_record.get("ciphertext") or "")
+    if not ciphertext:
+        raise ValueError("Connector credential vault is empty.")
+    try:
+        plaintext = Fernet(vault_key(settings, workspace_key_value)).decrypt(
+            ciphertext.encode("ascii")
+        )
+    except (InvalidToken, ValueError) as exc:
+        raise ValueError("Connector credential vault cannot be decrypted.") from exc
+    decoded = json.loads(plaintext)
+    if decoded.get("connector_id") != vault_record.get("connector_id"):
+        raise ValueError("Connector credential vault does not match connector.")
+    if decoded.get("environment") != vault_record.get("environment"):
+        raise ValueError("Connector credential vault does not match environment.")
+    credentials = decoded.get("credentials")
+    if not isinstance(credentials, dict):
+        raise ValueError("Connector credential vault payload is invalid.")
+    return {str(key): str(value) for key, value in credentials.items()}
+
+
 def _strip_server_only_connector_data(value: Any) -> Any:
     if isinstance(value, dict):
         return {
@@ -481,7 +512,21 @@ class SupabaseProductStore:
         for row in self._fallback_state_events(key):
             summary = row.get("output_summary") or {}
             event_type = str(summary.get("event_type") or "")
-            if event_type in {"connector.profile_configured", "connector.credentials_configured"}:
+            if event_type == "connect.token_issued":
+                saved_workspace = summary.get("workspace") or {}
+                if saved_workspace.get("name"):
+                    context["workspace"] = {
+                        **context["workspace"],
+                        **{
+                            field: saved_workspace[field]
+                            for field in ("id", "workspace_key", "name", "plan", "status")
+                            if field in saved_workspace
+                        },
+                    }
+            elif event_type in {
+                "connector.profile_configured",
+                "connector.credentials_configured",
+            }:
                 profile = summary.get("profile") or {}
                 profile_key = f"{profile.get('connector_id')}:{profile.get('environment')}"
                 connector_profiles[profile_key] = public_connector_profile(profile)
@@ -1183,6 +1228,88 @@ class SupabaseProductStore:
             if is_product_schema_error(exc):
                 return len(SKILL_CATALOG_SEED)
             raise
+
+    def create_public_workspace(self, company_name: str | None = None) -> dict[str, Any]:
+        workspace_id = new_public_workspace_id()
+        request = public_workspace_connect_request(workspace_id, company_name)
+        token_payload = public_workspace_token_payload(workspace_id)
+        persisted = self.upsert_connection(request, token_payload)
+        workspace = {
+            **persisted["workspace"],
+            "name": request.company,
+        }
+        return {
+            "status": "ok",
+            "public_mode": True,
+            "workspace_id": workspace_id,
+            "workspace": workspace,
+        }
+
+    def public_dashboard(self, workspace_id: str) -> dict[str, Any]:
+        payload = self.dashboard(public_workspace_token_payload(workspace_id))
+        if payload.get("status") == "unregistered":
+            return {
+                "status": "not_found",
+                "public_mode": True,
+                "workspace_id": workspace_id,
+            }
+        return {
+            **payload,
+            "public_mode": True,
+            "workspace_id": workspace_id,
+        }
+
+    def get_connector_credentials(
+        self,
+        *,
+        workspace_id: str,
+        connector_id: str,
+        environment: str,
+    ) -> dict[str, str]:
+        connector = connector_by_id(connector_id)
+        if not connector:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        token_payload = public_workspace_token_payload(workspace_id)
+        context = self.workspace_for_token(token_payload)
+        if not context:
+            raise ValueError("Public workspace was not found.")
+
+        profile: dict[str, Any] | None = None
+        try:
+            rows = self._request(
+                "GET",
+                "mercury_connector_profiles",
+                params={
+                    "workspace_id": f"eq.{context['workspace']['id']}",
+                    "connector_id": f"eq.{connector.connector_id}",
+                    "environment": f"eq.{environment}",
+                    "select": "id,connector_id,environment,metadata",
+                    "limit": "1",
+                },
+            )
+            if rows:
+                profile = rows[0]
+        except RuntimeError as exc:
+            if not is_product_schema_error(exc):
+                raise
+            profile_id = stable_id(
+                "connector",
+                context["workspace"]["workspace_key"],
+                connector.connector_id,
+                environment,
+            )
+            profile = self._fallback_private_connector_profiles.get(profile_id)
+
+        if not profile:
+            raise ValueError("Connector credentials are not configured.")
+        vault_record = (profile.get("metadata") or {}).get("server_vault")
+        if not isinstance(vault_record, dict):
+            raise ValueError("Connector credential vault is not configured.")
+        return decrypt_connector_credentials(
+            self.settings,
+            workspace_key_value=context["workspace"]["workspace_key"],
+            vault_record=vault_record,
+        )
 
     def upsert_connection(
         self,

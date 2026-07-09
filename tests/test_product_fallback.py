@@ -3,6 +3,7 @@ from mercury_tools.db.product import SupabaseProductStore
 from mercury_tools.flows.runner import MercuryFlowRunner
 from mercury_tools.flows.templates import COMPANY_HEALTH_TEMPLATE
 from mercury_tools.product import ConnectRequest
+from mercury_tools.workspaces.public import public_workspace_token_payload
 
 
 class AuditFallbackStore(SupabaseProductStore):
@@ -47,6 +48,51 @@ def token_payload() -> dict:
         "jti": "client-jti",
         "scope": ["mcp:read"],
     }
+
+
+def test_product_store_creates_public_workspace_and_resolves_dashboard() -> None:
+    store = AuditFallbackStore()
+
+    created = store.create_public_workspace("Public Demo Co")
+    dashboard = store.public_dashboard(created["workspace_id"])
+
+    assert created["workspace_id"].startswith("mw_")
+    assert created["workspace"]["name"] == "Public Demo Co"
+    assert dashboard["status"] == "ok"
+    assert dashboard["public_mode"] is True
+    assert dashboard["workspace_id"] == created["workspace_id"]
+    assert dashboard["workspace"]["name"] == "Public Demo Co"
+
+
+def test_product_store_public_workspace_connector_vault_round_trip() -> None:
+    store = AuditFallbackStore()
+    created = store.create_public_workspace("Public Demo Co")
+    workspace_id = created["workspace_id"]
+    payload = public_workspace_token_payload(workspace_id)
+
+    store.set_connector_credentials(
+        token_payload=payload,
+        connector_id="flowaccount",
+        environment="sandbox",
+        credentials={
+            "client_id": "demo-client-id",
+            "client_secret": "super-secret-value",
+        },
+    )
+    credentials = store.get_connector_credentials(
+        workspace_id=workspace_id,
+        connector_id="flowaccount",
+        environment="sandbox",
+    )
+    dashboard = store.public_dashboard(workspace_id)
+
+    assert credentials == {
+        "client_id": "demo-client-id",
+        "client_secret": "super-secret-value",
+    }
+    assert "super-secret-value" not in str(dashboard)
+    assert "demo-client-id" not in str(dashboard)
+    assert "ciphertext" not in str(dashboard)
 
 
 def test_product_store_uses_audit_fallback_for_workspace_and_dashboard() -> None:

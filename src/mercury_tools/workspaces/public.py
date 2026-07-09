@@ -29,7 +29,7 @@ def public_workspace_token_payload(workspace_id: str) -> dict[str, Any]:
     subject_hash = hashlib.sha256(normalized.encode()).hexdigest()[:20]
     return {
         "sub": f"public-{subject_hash}@workspace.invalid",
-        "company": "Mercury Public Workspace",
+        "company": normalized,
         "host_app": "generic",
         "iat": now,
         "exp": now + PUBLIC_WORKSPACE_TTL_SECONDS,
