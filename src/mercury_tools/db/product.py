@@ -707,6 +707,32 @@ class SupabaseProductStore:
         )
         return profile
 
+    def start_connector_setup(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        environment: str,
+        company_name: str | None = None,
+    ) -> dict[str, Any]:
+        manifest = connector_by_id(connector_id)
+        if not manifest:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        if environment not in manifest.environments:
+            raise ValueError(f"Unsupported environment for {connector_id}: {environment}")
+        return self.set_connector_profile(
+            token_payload=token_payload,
+            connector_id=manifest.connector_id,
+            environment=environment,
+            company_name=company_name or "",
+            metadata={
+                "setup_state": "awaiting_credentials",
+                "required_secret_fields": manifest.required_secret_fields,
+                "preset": manifest.preset,
+                "capabilities": manifest.capabilities,
+            },
+        )
+
     def set_connector_credentials(
         self,
         *,
