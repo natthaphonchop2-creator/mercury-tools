@@ -164,6 +164,84 @@ If the host app requires MCP auth configuration during install, the plugin must
 direct the user to Mercury Connect to obtain a scoped `mc_...` client token. The
 repository plugin files must remain safe to publish publicly.
 
+## Product Environment
+
+Mercury's contest product runtime should be an online MCP server.
+
+The plugin is the install and discovery package. The product backend is the
+hosted Mercury Tools MCP service. The host AI app, such as Codex, Cursor, or
+Claude, remains the chat surface and model runtime.
+
+### Render Runtime
+
+Public runtime details that may appear in docs:
+
+```text
+Render service: mercury-tools-mcp
+Public base URL: https://mercury-tools-mcp.onrender.com
+MCP endpoint: https://mercury-tools-mcp.onrender.com/mcp
+Health endpoint: https://mercury-tools-mcp.onrender.com/healthz
+Mercury Connect: https://mercury-tools-mcp.onrender.com/connect
+```
+
+Required Render secret names, not values:
+
+```text
+SUPABASE_URL
+SUPABASE_SERVICE_ROLE_KEY
+MERCURY_TOOLS_HTTP_BEARER_TOKEN
+MERCURY_CONNECT_INVITE_CODE
+MERCURY_CONNECT_SIGNING_SECRET
+MERCURY_TOOLS_EMBEDDING_PROVIDER
+```
+
+The plugin, quickstart, and marketplace files must not include any Render
+secret values.
+
+### Supabase Data Layer
+
+Public data-layer details that may appear in docs:
+
+```text
+Supabase project ref: vbnlkqvauqwnjbxngkas
+Supabase URL: https://vbnlkqvauqwnjbxngkas.supabase.co
+Purpose: RAG, citations, audit events, product workspace state, flow run history
+```
+
+Migrations:
+
+```text
+supabase/migrations/0001_mercury_tools_rag.sql
+supabase/migrations/0002_mercury_product_layer.sql
+```
+
+Primary table groups:
+
+```text
+knowledge_sources
+knowledge_documents
+knowledge_chunks
+mcp_audit_events
+product workspace/member/token/connector/skill/flow tables
+```
+
+Supabase service role keys, database passwords, JWT secrets, and raw connector
+credentials must remain server-side only.
+
+### Product Boundary
+
+Mercury v1 is not a local LLM, not a local-only CLI, and not a web app-first
+product. It is an online MCP product with:
+
+- hosted MCP tools on Render
+- Supabase-backed RAG and audit storage
+- Codex plugin packaging for install/discovery
+- Mercury Connect for scoped client token issuance
+- host AI apps as the user-facing conversation surface
+
+The old local Hermes-style CLI is only a shell and should not carry product
+logic, connector state, or local RAG.
+
 ## Available MCP Tools
 
 The plugin should expose user-facing skills that guide the host agent toward
@@ -272,6 +350,7 @@ language.
 ## Non-Goals
 
 - Do not rebuild the Mercury product as a web app.
+- Do not make Mercury depend on a local-only MCP server for the judge demo.
 - Do not make the judge clone the repo manually.
 - Do not embed credentials in plugin files.
 - Do not move RAG, audit, or flow execution into the plugin package.
@@ -287,4 +366,6 @@ language.
 - The skill list is visible and maps to the existing MCP tools.
 - A judge can run at least one prompt that uses Mercury Tools MCP without
   cloning the repository locally.
+- The product environment is documented with public Render and Supabase
+  identifiers, while secret names are documented without secret values.
 - No secrets are committed.
