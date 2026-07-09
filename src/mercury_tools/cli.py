@@ -14,7 +14,11 @@ from mercury_tools.db.supabase import SupabaseRagStore
 from mercury_tools.flows.parser import FlowValidationError, validate_flow_path
 from mercury_tools.flows.runner import create_default_runner
 from mercury_tools.flows.templates import FLOW_CHEAT_SHEET, TEMPLATES
-from mercury_tools.flows.workspace import discover_workspace_flows, run_workspace_flows
+from mercury_tools.flows.workspace import (
+    create_workspace_scaffold,
+    discover_workspace_flows,
+    run_workspace_flows,
+)
 from mercury_tools.rag.embeddings import create_embedding_provider
 from mercury_tools.rag.ingest import ingest_wiki
 from mercury_tools.rag.models import SearchFilters
@@ -393,6 +397,36 @@ def cmd_flow_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_flow_init_workspace(args: argparse.Namespace) -> int:
+    try:
+        payload = create_workspace_scaffold(
+            Path(args.path),
+            connector=args.connector,
+            jurisdiction=args.jurisdiction,
+            month=args.month,
+            force=args.force,
+        )
+    except FlowValidationError as exc:
+        error = {"status": "error", "message": str(exc), "path": args.path}
+        if args.json:
+            _print_json(error)
+        else:
+            print(f"Workspace init failed: {exc}")
+        return 1
+    if args.json:
+        _print_json({"status": "ok", "workspace": payload})
+    else:
+        print(f"Created Mercury flow workspace: {payload['root']}")
+        for item in payload["created"]:
+            print(f"- created {item}")
+        for item in payload["overwritten"]:
+            print(f"- overwritten {item}")
+        print("Next:")
+        print(f"  mercury-tools flow list {payload['root']}")
+        print(f"  mercury-tools flow run-suite {payload['root']} --dry-run")
+    return 0
+
+
 def cmd_flow_cheat_sheet(args: argparse.Namespace) -> int:
     if args.json:
         _print_json({"status": "ok", "cheat_sheet": FLOW_CHEAT_SHEET})
@@ -495,6 +529,15 @@ def build_parser() -> argparse.ArgumentParser:
     flow_init.add_argument("--force", action="store_true")
     flow_init.add_argument("--json", action="store_true")
     flow_init.set_defaults(func=cmd_flow_init)
+
+    flow_init_workspace = flow_sub.add_parser("init-workspace")
+    flow_init_workspace.add_argument("path")
+    flow_init_workspace.add_argument("--connector", default="flowaccount")
+    flow_init_workspace.add_argument("--jurisdiction", default="TH")
+    flow_init_workspace.add_argument("--month")
+    flow_init_workspace.add_argument("--force", action="store_true")
+    flow_init_workspace.add_argument("--json", action="store_true")
+    flow_init_workspace.set_defaults(func=cmd_flow_init_workspace)
 
     flow_cheat = flow_sub.add_parser("cheat-sheet")
     flow_cheat.add_argument("--json", action="store_true")

@@ -50,6 +50,12 @@ Commands:
 Template variables:
 - ${jurisdiction} reads from env.
 - {{ context.query }} reads a previous step saved with saveAs: context.
+
+Workspace quickstart:
+- mercury-tools flow init-workspace ./my-mercury-flows
+- mercury-tools flow list ./my-mercury-flows
+- mercury-tools flow run-suite ./my-mercury-flows --dry-run
+- mercury-tools flow push ./my-mercury-flows --dry-run
 """
 
 

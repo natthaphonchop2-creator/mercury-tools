@@ -38,6 +38,9 @@ uv run mercury-tools search "vat input tax" --json
 Create and test a Mercury Flow:
 
 ```bash
+uv run mercury-tools flow init-workspace ./my-mercury-flows
+uv run mercury-tools flow list ./my-mercury-flows
+uv run mercury-tools flow run-suite ./my-mercury-flows --dry-run
 uv run mercury-tools flow init ./my-flow.yaml --template company-health
 uv run mercury-tools flow validate ./my-flow.yaml
 uv run mercury-tools flow run ./my-flow.yaml --dry-run
@@ -183,6 +186,7 @@ env:
 
 Flow CLI:
 
+- `mercury-tools flow init-workspace <path> --connector flowaccount --month YYYY-MM`
 - `mercury-tools flow init <path> --template company-health`
 - `mercury-tools flow validate <path>`
 - `mercury-tools flow run <path> --dry-run`
@@ -209,6 +213,13 @@ execution:
 This mirrors Maestro's workspace model at the Mercury layer: config, folder
 architecture, tag-based discovery, and interpreted execution are separated from
 the host AI conversation.
+
+`flow init-workspace` creates a runnable starter workspace with:
+
+- `config.yaml`
+- `flows/company-health.yaml`
+- `flows/vat-summary.yaml`
+- `README.md`
 
 Flow MCP tools:
 

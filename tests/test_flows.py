@@ -94,6 +94,35 @@ def test_flow_cli_init_refuses_overwrite(tmp_path: Path) -> None:
     assert main(["flow", "init", str(path), "--template", "vat-summary"]) == 1
 
 
+def test_flow_cli_init_workspace_creates_runnable_suite(tmp_path: Path, capsys) -> None:
+    workspace = tmp_path / "workspace"
+
+    assert main(["flow", "init-workspace", str(workspace), "--month", "2026-08"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Created Mercury flow workspace" in output
+    assert (workspace / "config.yaml").exists()
+    assert (workspace / "flows" / "company-health.yaml").exists()
+    assert (workspace / "flows" / "vat-summary.yaml").exists()
+    assert (workspace / "README.md").exists()
+    assert 'month: "2026-08"' in (workspace / "config.yaml").read_text(encoding="utf-8")
+
+    assert main(["flow", "list", str(workspace)]) == 0
+    assert "2 discovered, 2 selected" in capsys.readouterr().out
+
+    assert main(["flow", "run-suite", str(workspace), "--dry-run"]) == 0
+    assert "Flow suite planned: 2 selected / 2 discovered" in capsys.readouterr().out
+
+
+def test_flow_cli_init_workspace_refuses_overwrite(tmp_path: Path, capsys) -> None:
+    workspace = tmp_path / "workspace"
+
+    assert main(["flow", "init-workspace", str(workspace)]) == 0
+    assert main(["flow", "init-workspace", str(workspace)]) == 1
+
+    assert "Workspace init failed" in capsys.readouterr().out
+
+
 def test_flow_workspace_discovers_and_filters_by_config(tmp_path: Path) -> None:
     flows = tmp_path / "flows"
     flows.mkdir()

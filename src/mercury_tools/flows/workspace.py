@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ import yaml
 from mercury_tools.flows.models import FlowRunResult
 from mercury_tools.flows.parser import FlowValidationError, parse_flow_path
 from mercury_tools.flows.runner import MercuryFlowRunner, create_default_runner
+from mercury_tools.flows.templates import COMPANY_HEALTH_TEMPLATE, VAT_SUMMARY_TEMPLATE
 
 CONFIG_NAMES = ("mercury.yaml", "mercury.yml", "config.yaml", "config.yml")
 DEFAULT_FLOW_PATTERNS = ("*.yaml", "*.yml", "flows/**/*.yaml", "flows/**/*.yml")
@@ -125,6 +127,107 @@ class FlowSuiteRun:
             "workspace": self.workspace.as_dict(),
             "results": [result.as_dict() for result in self.results],
         }
+
+
+def _render_starter_flow(template: str, *, connector: str, jurisdiction: str) -> str:
+    return (
+        template.replace("flowaccount", connector)
+        .replace("jurisdiction: TH", f"jurisdiction: {jurisdiction}")
+        .replace("jurisdiction: \"${jurisdiction}\"", 'jurisdiction: "${jurisdiction}"')
+    )
+
+
+def _starter_workspace_files(*, connector: str, jurisdiction: str, month: str) -> dict[str, str]:
+    return {
+        "config.yaml": f"""flows:
+  - "flows/**/*.yaml"
+includeTags: [accounting]
+excludeTags: [disabled]
+env:
+  jurisdiction: {jurisdiction}
+  connector: {connector}
+  month: "{month}"
+execution:
+  sequential: true
+""",
+        "flows/company-health.yaml": _render_starter_flow(
+            COMPANY_HEALTH_TEMPLATE,
+            connector=connector,
+            jurisdiction=jurisdiction,
+        ),
+        "flows/vat-summary.yaml": _render_starter_flow(
+            VAT_SUMMARY_TEMPLATE,
+            connector=connector,
+            jurisdiction=jurisdiction,
+        ),
+        "README.md": f"""# Mercury Flow Workspace
+
+This workspace follows the Mercury Flow layout inspired by Maestro workspaces:
+configuration in `config.yaml`, tagged YAML flows under `flows/`, and runtime
+execution through the Mercury CLI, HTTP API, or MCP tools.
+
+## Commands
+
+```bash
+mercury-tools flow list .
+mercury-tools flow run-suite . --dry-run
+mercury-tools flow push . --dry-run
+```
+
+## Workspace defaults
+
+- connector: `{connector}`
+- jurisdiction: `{jurisdiction}`
+- month: `{month}`
+- discovery: `flows/**/*.yaml`
+- include tags: `accounting`
+- exclude tags: `disabled`
+""",
+    }
+
+
+def create_workspace_scaffold(
+    path: Path,
+    *,
+    connector: str = "flowaccount",
+    jurisdiction: str = "TH",
+    month: str | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    root = path.expanduser().resolve()
+    selected_month = month or date.today().strftime("%Y-%m")
+    files = _starter_workspace_files(
+        connector=connector,
+        jurisdiction=jurisdiction,
+        month=selected_month,
+    )
+    conflicts = [relative for relative in files if (root / relative).exists()]
+    if conflicts and not force:
+        raise FlowValidationError(
+            "Workspace files already exist: " + ", ".join(sorted(conflicts))
+        )
+
+    created: list[str] = []
+    overwritten: list[str] = []
+    root.mkdir(parents=True, exist_ok=True)
+    for relative, content in files.items():
+        target = root / relative
+        existed = target.exists()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        if existed:
+            overwritten.append(relative)
+        else:
+            created.append(relative)
+
+    return {
+        "root": str(root),
+        "connector": connector,
+        "jurisdiction": jurisdiction,
+        "month": selected_month,
+        "created": created,
+        "overwritten": overwritten,
+    }
 
 
 def load_workspace_config(path: Path) -> FlowWorkspaceConfig:
