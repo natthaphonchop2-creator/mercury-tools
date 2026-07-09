@@ -55,6 +55,8 @@ Commands:
 - assert: fail the flow on missing required values. Args: exists or minCount.
 - runFlow: call another flow file relative to the current flow.
   Args: file/path, env, label, commands, saveAs.
+- retry: retry a small file or inline command group on failure.
+  Args: maxRetries 0-3, delayMs, file/path or commands, env, label, saveAs.
 
 Template variables:
 - ${jurisdiction} reads from env.
@@ -87,6 +89,25 @@ Example:
           sections:
             - "Only generated for production runs."
     saveAs: productionReview
+
+Retry blocks:
+- retry can call file: flaky-step.yaml or commands: [...] inline.
+- maxRetries is 0-3 and defaults to 1, matching Maestro's bounded retry model.
+- Use retry around small transient connector/RAG steps, not whole accounting flows.
+- delayMs optionally waits between attempts.
+
+Example:
+- retry:
+    label: FlowAccount invoice context
+    maxRetries: 2
+    delayMs: 500
+    commands:
+      - retrieveContextPack:
+          query: "invoice VAT review"
+          task: invoice_review_th
+          maxChunks: 6
+          saveAs: invoiceContext
+    saveAs: invoiceRetry
 
 Workspace quickstart:
 - mercury-tools flow init-workspace ./my-mercury-flows

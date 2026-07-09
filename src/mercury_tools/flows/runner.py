@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,26 @@ def _interpolate_run_flow_args(args: dict[str, Any], variables: dict[str, Any]) 
     return rendered
 
 
+def _bounded_int(
+    raw: Any,
+    *,
+    label: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if raw is None or raw == "":
+        value = default
+    else:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise FlowValidationError(f"{label} must be an integer.") from exc
+    if value < minimum or value > maximum:
+        raise FlowValidationError(f"{label} must be between {minimum} and {maximum}.")
+    return value
+
+
 def _summary(payload: Any) -> dict[str, Any]:
     redacted = redact_json(payload)
     if isinstance(redacted, dict):
@@ -70,6 +91,10 @@ def _summary(payload: Any) -> dict[str, Any]:
             summary["skill_id"] = redacted["skill_id"]
         if "title" in redacted:
             summary["title"] = redacted["title"]
+        if "attempts" in redacted:
+            summary["attempts"] = redacted["attempts"]
+        if "max_retries" in redacted:
+            summary["max_retries"] = redacted["max_retries"]
         return summary
     if isinstance(redacted, list):
         return {"count": len(redacted)}
@@ -216,11 +241,11 @@ class MercuryFlowRunner:
                     )
                 )
                 continue
-            if command.name == "runFlow":
+            if command.name in {"retry", "runFlow"}:
                 rendered_args = _interpolate_run_flow_args(command.args, variables)
             else:
                 rendered_args = _interpolate(command.args, variables)
-            if self.dry_run and command.name != "runFlow":
+            if self.dry_run and command.name not in {"retry", "runFlow"}:
                 output = self._planned_output(command, rendered_args)
             else:
                 output = self._execute(
@@ -338,36 +363,123 @@ class MercuryFlowRunner:
             }
 
         if command.name == "runFlow":
-            child_env = args.get("env") or {}
-            if not isinstance(child_env, dict):
-                raise FlowValidationError("runFlow env must be a mapping.")
-            child_env = {**parent_env, **child_env}
-            inline_commands = args.get("commands")
-            raw_path = str(args.get("file") or args.get("path") or args.get("value") or "").strip()
-            if inline_commands is not None and raw_path:
-                raise FlowValidationError("runFlow accepts either file/path or commands, not both.")
-            if inline_commands is not None:
-                commands = parse_inline_commands(inline_commands, source="runFlow.commands")
-                if not commands:
-                    raise FlowValidationError("runFlow commands must include at least one command.")
-                label = str(args.get("label") or "Inline Flow").strip() or "Inline Flow"
-                child_flow = MercuryFlow(
-                    name=label,
-                    description="Inline Mercury subflow",
-                    tags=[],
-                    env=child_env,
-                    commands=commands,
-                    path=base_dir / f"{label}.inline.yaml",
-                )
-                return self.run_flow(child_flow, env=child_env).as_dict()
-            if not raw_path:
-                raise FlowValidationError("runFlow requires file/path or commands.")
-            child_path = (base_dir / raw_path).resolve()
-            if not child_path.exists():
-                raise FlowValidationError(f"Nested flow does not exist: {raw_path}")
-            return self.run_path(child_path, env=child_env).as_dict()
+            return self._run_child_flow_command(
+                command_name="runFlow",
+                args=args,
+                base_dir=base_dir,
+                parent_env=parent_env,
+            ).as_dict()
+
+        if command.name == "retry":
+            return self._retry(
+                args=args,
+                base_dir=base_dir,
+                parent_env=parent_env,
+            )
 
         raise FlowValidationError(f"Unsupported command: {command.name}")
+
+    def _run_child_flow_command(
+        self,
+        *,
+        command_name: str,
+        args: dict[str, Any],
+        base_dir: Path,
+        parent_env: dict[str, Any],
+    ) -> FlowRunResult:
+        child_env = args.get("env") or {}
+        if not isinstance(child_env, dict):
+            raise FlowValidationError(f"{command_name} env must be a mapping.")
+        child_env = {**parent_env, **child_env}
+        inline_commands = args.get("commands")
+        raw_path = str(args.get("file") or args.get("path") or args.get("value") or "").strip()
+        if inline_commands is not None and raw_path:
+            raise FlowValidationError(
+                f"{command_name} accepts either file/path or commands, not both."
+            )
+        if inline_commands is not None:
+            commands = parse_inline_commands(inline_commands, source=f"{command_name}.commands")
+            if not commands:
+                raise FlowValidationError(
+                    f"{command_name} commands must include at least one command."
+                )
+            label = str(args.get("label") or "Inline Flow").strip() or "Inline Flow"
+            suffix = "retry" if command_name == "retry" else "inline"
+            child_flow = MercuryFlow(
+                name=label,
+                description=f"Inline Mercury {command_name} flow",
+                tags=[],
+                env=child_env,
+                commands=commands,
+                path=base_dir / f"{label}.{suffix}.yaml",
+            )
+            return self.run_flow(child_flow, env=child_env)
+        if not raw_path:
+            raise FlowValidationError(f"{command_name} requires file/path or commands.")
+        child_path = (base_dir / raw_path).resolve()
+        if not child_path.exists():
+            raise FlowValidationError(f"Nested flow does not exist: {raw_path}")
+        return self.run_path(child_path, env=child_env)
+
+    def _retry(
+        self,
+        *,
+        args: dict[str, Any],
+        base_dir: Path,
+        parent_env: dict[str, Any],
+    ) -> dict[str, Any]:
+        max_retries = _bounded_int(
+            args.get("maxRetries", args.get("max_retries")),
+            label="retry maxRetries",
+            default=1,
+            minimum=0,
+            maximum=3,
+        )
+        delay_ms = _bounded_int(
+            args.get("delayMs", args.get("delay_ms")),
+            label="retry delayMs",
+            default=0,
+            minimum=0,
+            maximum=30000,
+        )
+        attempts_allowed = max_retries + 1
+        attempts: list[dict[str, Any]] = []
+
+        for attempt in range(1, attempts_allowed + 1):
+            try:
+                result = self._run_child_flow_command(
+                    command_name="retry",
+                    args=args,
+                    base_dir=base_dir,
+                    parent_env=parent_env,
+                )
+                return {
+                    "status": result.status,
+                    "attempts": attempt,
+                    "max_retries": max_retries,
+                    "delay_ms": delay_ms,
+                    "result": result.as_dict(),
+                    "attempt_history": attempts,
+                }
+            except Exception as exc:
+                attempts.append(
+                    {
+                        "attempt": attempt,
+                        "status": "error",
+                        "message": str(redact_json(str(exc)))[:300],
+                    }
+                )
+                if attempt >= attempts_allowed:
+                    break
+                if not self.dry_run and delay_ms:
+                    time.sleep(delay_ms / 1000)
+                if self.dry_run:
+                    break
+
+        last = attempts[-1]["message"] if attempts else "unknown error"
+        raise FlowValidationError(
+            f"retry failed after {len(attempts)} attempt(s): {last}"
+        )
 
     def _planned_output(self, command: FlowCommand, args: dict[str, Any]) -> dict[str, Any]:
         output: dict[str, Any] = {

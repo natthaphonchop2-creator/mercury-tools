@@ -12,6 +12,7 @@ SUPPORTED_COMMANDS = {
     "emitReport",
     "getDocument",
     "retrieveContextPack",
+    "retry",
     "runFlow",
     "runSkill",
     "searchKnowledge",

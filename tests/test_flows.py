@@ -224,6 +224,110 @@ name: Inline Execute
     assert payload["variables"]["nested"]["artifacts"][0]["title"] == "Inline done"
 
 
+def test_flow_runner_retries_inline_commands_until_success() -> None:
+    calls = {"count": 0}
+
+    def flaky_skill(skill_id, inputs, evidence_mode):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise FlowValidationError("temporary connector failure")
+        return {
+            "status": "ok",
+            "skill_id": skill_id,
+            "inputs": inputs,
+            "evidence_mode": evidence_mode,
+        }
+
+    result = MercuryFlowRunner(skill_runner=flaky_skill).run_text(
+        """
+name: Retry Success
+---
+- retry:
+    label: Retry Skill
+    maxRetries: 2
+    commands:
+      - runSkill:
+          skillId: invoice-review-th
+          inputs:
+            month: "2026-07"
+          evidenceMode: true
+          saveAs: skill
+    saveAs: retryResult
+"""
+    )
+
+    payload = result.as_dict()
+    retry_result = payload["variables"]["retryResult"]
+
+    assert calls["count"] == 2
+    assert retry_result["status"] == "ok"
+    assert retry_result["attempts"] == 2
+    assert retry_result["max_retries"] == 2
+    assert retry_result["attempt_history"][0]["message"] == "temporary connector failure"
+    assert retry_result["result"]["variables"]["skill"]["skill_id"] == "invoice-review-th"
+    assert payload["steps"][0]["output_summary"]["attempts"] == 2
+
+
+def test_flow_runner_retry_fails_after_exhaustion() -> None:
+    def failing_skill(skill_id, inputs, evidence_mode):
+        raise FlowValidationError("still unavailable")
+
+    with pytest.raises(FlowValidationError, match="retry failed after 2 attempt"):
+        MercuryFlowRunner(skill_runner=failing_skill).run_text(
+            """
+name: Retry Failure
+---
+- retry:
+    maxRetries: 1
+    commands:
+      - runSkill:
+          skillId: connector-setup-guide-th
+"""
+        )
+
+
+def test_flow_runner_retry_dry_run_plans_child_flow_once() -> None:
+    result = MercuryFlowRunner(dry_run=True).run_text(
+        """
+name: Retry Dry Run
+---
+- retry:
+    label: Planned Retry
+    maxRetries: 3
+    commands:
+      - emitReport:
+          title: "Planned child report"
+    saveAs: retryPlan
+"""
+    )
+
+    payload = result.as_dict()
+    retry_plan = payload["variables"]["retryPlan"]
+
+    assert payload["status"] == "planned"
+    assert payload["steps"][0]["command"] == "retry"
+    assert payload["steps"][0]["status"] == "planned"
+    assert retry_plan["attempts"] == 1
+    assert retry_plan["max_retries"] == 3
+    assert retry_plan["result"]["status"] == "planned"
+    assert retry_plan["result"]["artifacts"][0]["title"] == "Planned child report"
+
+
+def test_flow_runner_rejects_retry_too_many_retries() -> None:
+    with pytest.raises(FlowValidationError, match="retry maxRetries must be between 0 and 3"):
+        MercuryFlowRunner(dry_run=True).run_text(
+            """
+name: Bad Retry
+---
+- retry:
+    maxRetries: 4
+    commands:
+      - emitReport:
+          title: "bad"
+"""
+        )
+
+
 def test_flow_runner_rejects_run_flow_with_file_and_commands() -> None:
     with pytest.raises(FlowValidationError, match="either file/path or commands"):
         MercuryFlowRunner(dry_run=True).run_text(

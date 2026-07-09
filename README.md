@@ -258,6 +258,25 @@ list. Inline `commands` are useful for small conditional accounting handoffs;
 `label` names the grouped subflow in reports, and `env` inherits parent values
 with per-subflow overrides.
 
+Like Maestro's `retry`, Mercury can retry a small inline command group or flow
+file when a transient connector/RAG step fails. `maxRetries` is bounded to `0`
+through `3` and defaults to `1`; optional `delayMs` waits between attempts.
+Keep retry blocks narrow so real accounting-data issues are not hidden.
+
+```yaml
+- retry:
+    label: Invoice context retry
+    maxRetries: 2
+    delayMs: 500
+    commands:
+      - retrieveContextPack:
+          query: "invoice VAT review"
+          task: invoice_review_th
+          maxChunks: 6
+          saveAs: invoiceContext
+    saveAs: invoiceRetry
+```
+
 This mirrors Maestro's workspace model at the Mercury layer: config, folder
 architecture, tag-based discovery, deterministic execution order, output
 reports, and interpreted execution are separated from the host AI conversation.
@@ -293,8 +312,8 @@ workspace. They do not require or expose the Supabase service role key to the
 MCP host.
 
 Supported flow commands are read-oriented: `connectorStatus`, `searchKnowledge`,
-`retrieveContextPack`, `getDocument`, `runSkill`, `emitReport`, `assert`, and
-`runFlow`. Production accounting writes remain out of scope for v1.
+`retrieveContextPack`, `getDocument`, `runSkill`, `emitReport`, `assert`,
+`runFlow`, and `retry`. Production accounting writes remain out of scope for v1.
 
 ## Environment
 
