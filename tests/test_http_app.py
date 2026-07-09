@@ -70,10 +70,10 @@ def test_connect_page_and_status(monkeypatch) -> None:
     assert page.status_code == 200
     assert "Mercury Connect" in page.text
     assert "MCP setup console for accounting AI hosts" in page.text
-    assert "The AI host remains the product surface." in page.text
+    assert "not the chat app" in page.text
     assert 'data-page="start"' in page.text
-    assert "Prepare the accounting tool layer for an AI host." in page.text
-    assert "not a chat web app" in page.text
+    assert "Mercury is the accounting agent tool layer" in page.text
+    assert "Setup sections" in page.text
     assert 'id="connect-form"' not in page.text
     assert status.status_code == 200
     assert status.json()["mcp_endpoint"] == "https://mercury.example.com/mcp"
@@ -84,6 +84,7 @@ def test_connect_page_and_status(monkeypatch) -> None:
     assert status.json()["pages"]["connectors"] == "/connectors"
     assert status.json()["pages"]["knowledge"] == "/knowledge"
     assert status.json()["pages"]["flows"] == "/flows"
+    assert status.json()["pages"]["mcp_api"] == "/mcp-api"
     assert "run_flow" in status.json()["flow_tools"]
     assert "save_workspace_flow" in status.json()["flow_tools"]
     assert "list_workspace_flows" in status.json()["flow_tools"]
@@ -109,6 +110,7 @@ def test_product_console_exposes_separate_pages(monkeypatch) -> None:
         ("/knowledge", "knowledge"),
         ("/skills", "skills"),
         ("/flows", "flows"),
+        ("/mcp-api", "mcp_api"),
         ("/audit", "audit"),
     ):
         response = client.get(path)

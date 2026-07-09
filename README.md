@@ -119,13 +119,14 @@ large dashboard. It is not the main Mercury chat surface or a replacement for
 the AI host; Codex, Cursor, Claude, or another MCP host remains the
 user-facing AI:
 
-- `/` is the Start page and setup map
+- `/` is a system map for Mercury's MCP-first control plane
 - `/connect` creates or restores a host MCP connection
 - `/workspace` shows workspace identity and team access
 - `/connectors` saves accounting connector profiles and encrypted credentials
 - `/knowledge` explains the Supabase RAG/wiki layer used by MCP context tools
 - `/skills` enables or uploads workspace skills
 - `/flows` validates, saves, dry-runs, and shows recent Mercury Flow run history
+- `/mcp-api` documents the host-facing MCP contract and setup-console APIs
 - `/audit` reviews usage and audit events
 
 Mercury Connect also exposes product APIs:

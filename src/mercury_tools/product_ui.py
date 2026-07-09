@@ -6,16 +6,51 @@ from __future__ import annotations
 
 from html import escape
 
-PAGE_NAMES = ("start", "connect", "workspace", "connectors", "knowledge", "skills", "flows", "audit")
+PAGE_NAMES = (
+    "start",
+    "connect",
+    "workspace",
+    "connectors",
+    "knowledge",
+    "skills",
+    "flows",
+    "mcp_api",
+    "audit",
+)
+
+PAGE_PATHS = {
+    "start": "/",
+    "connect": "/connect",
+    "workspace": "/workspace",
+    "connectors": "/connectors",
+    "knowledge": "/knowledge",
+    "skills": "/skills",
+    "flows": "/flows",
+    "mcp_api": "/mcp-api",
+    "audit": "/audit",
+}
+
+PAGE_TITLES = {
+    "start": "Mercury Connect",
+    "connect": "Mercury Host Access",
+    "workspace": "Mercury Workspace",
+    "connectors": "Mercury Programs",
+    "knowledge": "Mercury Wiki",
+    "skills": "Mercury Skills",
+    "flows": "Mercury Flows",
+    "mcp_api": "Mercury MCP/API",
+    "audit": "Mercury Audit",
+}
 
 NAV_ITEMS = (
-    ("start", "Start", "Console map"),
-    ("connect", "Connect", "MCP host access"),
+    ("start", "Overview", "System map"),
+    ("connect", "Host Access", "MCP client setup"),
     ("workspace", "Workspace", "Company context"),
     ("connectors", "Programs", "Accounting systems"),
-    ("knowledge", "Wiki", "RAG context"),
+    ("knowledge", "Wiki/RAG", "Cited context"),
     ("skills", "Skills", "Agent playbooks"),
     ("flows", "Flows", "Runbooks"),
+    ("mcp_api", "MCP/API", "Host interface"),
     ("audit", "Audit", "Evidence trail"),
 )
 
@@ -135,7 +170,7 @@ STYLE = """
     .nav-head span { color: var(--muted); font-size: 12px; text-align: right; }
     .nav-list {
       display: grid;
-      grid-template-columns: repeat(8, minmax(0, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(116px, 1fr));
       gap: 8px;
       padding: 8px;
     }
@@ -206,6 +241,41 @@ STYLE = """
       align-items: start;
       min-width: 0;
     }
+    .section-map {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      min-width: 0;
+    }
+    .section-card {
+      display: grid;
+      gap: 4px;
+      min-height: 106px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 13px;
+      color: #e5edf3;
+      background: rgba(16, 23, 32, .66);
+      text-decoration: none;
+    }
+    .section-card:hover,
+    .section-card:focus {
+      border-color: rgba(66, 198, 187, .78);
+    }
+    .section-card small {
+      color: var(--gold);
+      font-weight: 900;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+    .section-card b {
+      color: var(--teal);
+      font-size: 15px;
+    }
+    .section-card span {
+      color: var(--muted);
+      font-size: 12px;
+    }
     .gateway-card {
       display: grid;
       gap: 10px;
@@ -228,6 +298,35 @@ STYLE = """
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 10px;
+    }
+    .system-band {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      gap: 10px;
+      align-items: stretch;
+    }
+    .system-node {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 13px;
+      background: rgba(16, 23, 32, .66);
+      min-width: 0;
+    }
+    .system-node b {
+      display: block;
+      color: var(--teal);
+      margin-bottom: 4px;
+    }
+    .system-node span {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .system-arrow {
+      display: grid;
+      place-items: center;
+      color: var(--gold);
+      font-weight: 900;
+      min-width: 24px;
     }
     .panel {
       border: 1px solid var(--line);
@@ -445,6 +544,9 @@ STYLE = """
       .page-grid, .page-grid.reverse, .cards-2 { grid-template-columns: 1fr; }
       .console-grid { grid-template-columns: 1fr; }
       .boundary-line { grid-template-columns: 1fr; }
+      .section-map { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .system-band { grid-template-columns: 1fr; }
+      .system-arrow { min-height: 20px; transform: rotate(90deg); }
       .two { grid-template-columns: 1fr; }
     }
     @media (max-width: 620px) {
@@ -469,6 +571,7 @@ STYLE = """
         font-size: 11px;
       }
       .nav-list { grid-template-columns: 1fr; }
+      .section-map { grid-template-columns: 1fr; }
       .page-head h1 { font-size: 24px; }
     }
 """
@@ -477,38 +580,45 @@ PAGE_CONTENT: dict[str, str] = {
     "start": """
       <section class="page" data-page="start">
         <div class="page-head">
-          <span class="eyebrow">Mercury Setup Console</span>
-          <h1>Prepare the accounting tool layer for an AI host.</h1>
-          <p>The AI host remains the product surface. Mercury is MCP-first: this console only prepares access, accounting programs, wiki context, skills, flows, and audit records.</p>
+          <span class="eyebrow">Mercury Control Plane</span>
+          <h1>Mercury is the accounting agent tool layer, not the chat app.</h1>
+          <p>Use this console to prepare MCP access, accounting connectors, cited wiki context, skills, flows, and audit records. Codex, Cursor, Claude, or a customer agent remains the user-facing AI surface.</p>
         </div>
         <div class="start-layout">
           <section class="panel">
-            <div class="row"><h2>First-time setup path</h2><span class="pill">remote MCP</span></div>
+            <div class="row"><h2>First-time setup path</h2><span class="pill">required order</span></div>
             <div class="steps">
-              <div class="step"><b>Connect AI host</b><span>Create a workspace token for Codex, Cursor, Claude Desktop, or another MCP client.</span></div>
-              <div class="step"><b>Select accounting program</b><span>Choose FlowAccount, PEAK, Express, or a future connector for this company.</span></div>
-              <div class="step"><b>Enable skills and flows</b><span>Turn accounting playbooks into callable MCP tools and repeatable runbooks.</span></div>
-              <div class="step"><b>Keep evidence</b><span>Log setup and tool activity with sanitized audit records.</span></div>
+              <div class="step"><b>Host Access</b><span>Create the workspace token and MCP config for the AI program that owns chat.</span></div>
+              <div class="step"><b>Workspace</b><span>Confirm the company boundary, host app, members, and workspace status.</span></div>
+              <div class="step"><b>Programs</b><span>Select FlowAccount, PEAK, Express, or another accounting system profile.</span></div>
+              <div class="step"><b>Skills, Flows, Wiki</b><span>Enable the accounting playbooks and cited context the host agent can call.</span></div>
+              <div class="step"><b>MCP/API and Audit</b><span>Expose only controlled tools to the host and keep sanitized evidence.</span></div>
             </div>
           </section>
 
           <section class="panel">
-            <h2>Open one setup section</h2>
-            <p class="lead">Each section is its own route. Users do not configure everything from one dashboard screen.</p>
-            <div class="stack">
-              <a class="gateway-card" href="/connect"><b>1. Connect host</b><span>Generate MCP setup instructions for the AI program that will run the conversation.</span></a>
-              <a class="gateway-card" href="/connectors"><b>2. Accounting programs</b><span>Select the accounting system and save connector credentials server-side.</span></a>
-              <a class="gateway-card" href="/skills"><b>3. Skills and flows</b><span>Enable playbooks and YAML runbooks that the host agent can call.</span></a>
-              <a class="gateway-card" href="/audit"><b>4. Audit trail</b><span>Review sanitized setup and tool-call evidence.</span></a>
+            <div class="row"><h2>Setup sections</h2><span class="pill">separate pages</span></div>
+            <p class="lead">Open one responsibility at a time. This page is only the map.</p>
+            <div class="section-map">
+              <a class="section-card" href="/connect"><small>01</small><b>Host Access</b><span>Generate MCP setup instructions for Codex, Cursor, Claude, or another host.</span></a>
+              <a class="section-card" href="/workspace"><small>02</small><b>Workspace</b><span>Company identity, host app, team members, and setup status.</span></a>
+              <a class="section-card" href="/connectors"><small>03</small><b>Programs</b><span>Accounting connector profile and encrypted credential metadata.</span></a>
+              <a class="section-card" href="/knowledge"><small>04</small><b>Wiki/RAG</b><span>Cited accounting knowledge store for context packs.</span></a>
+              <a class="section-card" href="/skills"><small>05</small><b>Skills</b><span>Agent playbooks with evidence and accountant review rules.</span></a>
+              <a class="section-card" href="/flows"><small>06</small><b>Flows</b><span>Repeatable YAML runbooks for accounting agent work.</span></a>
+              <a class="section-card" href="/mcp-api"><small>07</small><b>MCP/API</b><span>Tools, resources, prompts, and product APIs exposed to hosts.</span></a>
+              <a class="section-card" href="/audit"><small>08</small><b>Audit</b><span>Sanitized setup and tool-call evidence.</span></a>
             </div>
           </section>
 
           <section class="panel" style="grid-column:1 / -1">
-            <div class="row"><h2>Mercury product boundary</h2><span class="pill">not a chat web app</span></div>
-            <div class="boundary-line">
-              <div class="card"><b>AI host</b><span>Codex, Cursor, Claude, or a customer agent owns chat, model, and UX.</span></div>
-              <div class="card"><b>Mercury MCP</b><span>Provides accounting tools, wiki context, skills, flows, and audit records.</span></div>
-              <div class="card"><b>Accounting systems</b><span>FlowAccount, PEAK, Express, and future connectors stay behind controlled tools.</span></div>
+            <div class="row"><h2>Runtime shape</h2><span class="pill">MCP-first</span></div>
+            <div class="system-band">
+              <div class="system-node"><b>AI host</b><span>Chat, model choice, user conversation, and final answer.</span></div>
+              <div class="system-arrow">→</div>
+              <div class="system-node"><b>Mercury Tools</b><span>MCP tools, RAG context packs, skill packages, flows, and audit evidence.</span></div>
+              <div class="system-arrow">→</div>
+              <div class="system-node"><b>Accounting systems</b><span>FlowAccount, PEAK, Express, and future connector backends.</span></div>
             </div>
           </section>
         </div>
@@ -833,6 +943,47 @@ onFlowStart:
               </div>
             </section>
           </div>
+        </div>
+      </section>
+    """,
+    "mcp_api": """
+      <section class="page" data-page="mcp_api">
+        <div class="page-head">
+          <span class="eyebrow">MCP/API Interface</span>
+          <h1>Expose Mercury to AI hosts as tools, resources, prompts, and product APIs.</h1>
+          <p>This is the runtime contract. Users should not work inside this console day to day; their AI host calls these Mercury interfaces when accounting context, skills, flows, or audit-safe connector actions are needed.</p>
+        </div>
+        <div class="page-grid">
+          <section class="panel">
+            <div class="row"><h2>MCP contract</h2><span class="pill">host-facing</span></div>
+            <div class="cards-2">
+              <div class="card"><b>Tools</b><span>search_knowledge, retrieve_context_pack, run_accounting_skill, flow tools, connector status</span></div>
+              <div class="card"><b>Resources</b><span>mercury://wiki, mercury://skills, mercury://connectors, mercury://flows, mercury://audit</span></div>
+              <div class="card"><b>Prompts</b><span>Thai accounting report, VAT, invoice review, setup guide, management summary</span></div>
+              <div class="card"><b>Transport</b><span>stdio for local clients, Streamable HTTP for hosted Mercury</span></div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="row"><h2>HTTP product APIs</h2><span class="pill">setup console</span></div>
+            <div class="flow">
+              <div><b>/api/connect</b><br><span class="muted">Issue a workspace-scoped Mercury client token from an invite code.</span></div>
+              <div><b>/api/dashboard</b><br><span class="muted">Return sanitized workspace state for console pages.</span></div>
+              <div><b>/api/connectors/*</b><br><span class="muted">Save connector profile and encrypted credential metadata.</span></div>
+              <div><b>/api/skills/* and /api/flows/*</b><br><span class="muted">Manage workspace playbooks and runbooks used by MCP hosts.</span></div>
+            </div>
+          </section>
+
+          <section class="panel" style="grid-column:1 / -1">
+            <div class="row"><h2>Boundary rule</h2><span class="pill">not web-app-first</span></div>
+            <div class="system-band">
+              <div class="system-node"><b>Console</b><span>Setup, configuration, and verification pages only.</span></div>
+              <div class="system-arrow">→</div>
+              <div class="system-node"><b>MCP runtime</b><span>Actual Mercury interface used by AI hosts and agent products.</span></div>
+              <div class="system-arrow">→</div>
+              <div class="system-node"><b>Host agent</b><span>Owns the user conversation, model, memory policy, and final answer UX.</span></div>
+            </div>
+          </section>
         </div>
       </section>
     """,
@@ -1246,17 +1397,22 @@ def _nav(active_page: str) -> str:
     items = []
     for key, label, hint in NAV_ITEMS:
         active = " active" if key == active_page else ""
-        href = "/" if key == "start" else f"/{key}"
+        href = PAGE_PATHS[key]
         items.append(
             f'<a href="{href}" data-nav="{key}" class="{active.strip()}"><b>{escape(label)}</b><span>{escape(hint)}</span></a>'
         )
     return "\n".join(items)
 
 
+def _normalize_page_name(value: str) -> str:
+    normalized = (value or "start").strip("/").strip().replace("-", "_") or "start"
+    return normalized if normalized in PAGE_NAMES else "start"
+
+
 def render_connect_html(active_page: str = "connect") -> str:
     """Render one focused Mercury setup-console page."""
-    page = active_page if active_page in PAGE_NAMES else "start"
-    title = "Mercury Connect" if page in {"start", "connect"} else f"Mercury {page.title()}"
+    page = _normalize_page_name(active_page)
+    title = PAGE_TITLES[page]
     body = PAGE_CONTENT[page]
 
     return f"""<!doctype html>

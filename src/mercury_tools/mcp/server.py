@@ -44,7 +44,9 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         self.protected_path = protected_path.rstrip("/") or "/"
 
     async def dispatch(self, request: Request, call_next):
-        if request.method == "OPTIONS" or not request.url.path.startswith(self.protected_path):
+        path = request.url.path
+        protected = path == self.protected_path or path.startswith(f"{self.protected_path}/")
+        if request.method == "OPTIONS" or not protected:
             return await call_next(request)
 
         if not is_authorized_bearer(load_settings(), request.headers.get("authorization")):
@@ -513,6 +515,7 @@ async def status(_: Request) -> Response:
                 "knowledge": "/knowledge",
                 "skills": "/skills",
                 "flows": "/flows",
+                "mcp_api": "/mcp-api",
                 "audit": "/audit",
             },
             "connect": "/api/connect",
@@ -968,6 +971,7 @@ def create_http_app(*, require_auth: bool | None = None):
         "/knowledge",
         "/skills",
         "/flows",
+        "/mcp-api",
         "/audit",
     ):
         app.add_route(page_path, root, methods=["GET"])
