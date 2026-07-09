@@ -2393,8 +2393,13 @@ async def upload_skill(request: Request) -> Response:
         return _json_error("service_unavailable", str(exc), status_code=503)
 
 
-async def healthz(_: Request) -> Response:
+async def healthz(request: Request) -> Response:
     settings = load_settings()
+    http_auth_required = getattr(
+        request.app.state,
+        "mercury_http_require_auth",
+        settings.http_require_auth,
+    )
     return JSONResponse(
         {
             "status": "ok",
@@ -2403,7 +2408,7 @@ async def healthz(_: Request) -> Response:
             "embedding_provider": settings.embedding_provider,
             "embedding_configured": settings.embedding_configured,
             "mcp_path": settings.mcp_path,
-            "http_auth_required": settings.http_require_auth,
+            "http_auth_required": http_auth_required,
             "http_auth_configured": settings.http_auth_configured,
         }
     )
@@ -2449,6 +2454,7 @@ def create_http_app(*, require_auth: bool | None = None):
     app.add_route("/healthz", healthz, methods=["GET"])
 
     should_require_auth = settings.http_require_auth if require_auth is None else require_auth
+    app.state.mercury_http_require_auth = should_require_auth
     if should_require_auth:
         if not settings.http_auth_configured:
             raise RuntimeError(
