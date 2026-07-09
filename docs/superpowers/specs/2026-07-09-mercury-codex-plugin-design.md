@@ -264,6 +264,70 @@ The plugin should treat `run_mercury_flow` as the preferred high-level flow
 entrypoint. Lower-level flow tools can remain available but should not be the
 first thing a judge sees.
 
+## ERP Connector Positioning
+
+Mercury should be presented as a connector-first accounting agent layer. The
+product value is not only that it can search accounting knowledge, but that it
+can connect to accounting or ERP systems that expose APIs, map their endpoints
+into accounting capabilities, and let the host AI run safe finance workflows on
+top of those capabilities.
+
+Primary positioning:
+
+```text
+Mercury connects AI agents to accounting and ERP APIs, then turns those
+endpoints into auditable finance workflows.
+```
+
+Supported connector model:
+
+- Existing connectors: FlowAccount first, then PEAK Accounting, Express Account,
+  and other accounting/ERP systems as connector profiles mature.
+- Learnable connectors: a new system can be added by ingesting API docs,
+  defining endpoint metadata, mapping endpoints to Mercury capabilities, and
+  validating the connector against sandbox or read-only production endpoints.
+- Endpoint-to-capability mapping: raw endpoints should be hidden behind
+  business capabilities such as `company.info.read`, `documents.invoice.list`,
+  `tax.vat_summary.read`, or `journal.draft.create_sandbox`.
+- Safety boundary: reads are preferred, production writes are blocked unless a
+  future approval workflow explicitly enables them.
+- Audit boundary: every connector-backed workflow should preserve evidence,
+  citations, status, and sanitized summaries.
+
+Connector learning pipeline:
+
+1. Ingest API documentation into Mercury Wiki.
+2. Create a connector manifest with auth, environments, endpoints, schemas, and
+   supported capabilities.
+3. Validate endpoint reachability and response shape.
+4. Map endpoint responses into normalized accounting objects.
+5. Publish connector capabilities for use by skills and Mercury Flows.
+6. Keep secrets server-side and expose only sanitized connector status to MCP
+   clients.
+
+Tool roles in this model:
+
+| Tool | Product role | ERP connector role |
+| --- | --- | --- |
+| `search_knowledge` | Search accounting, tax, connector, and workflow knowledge. | Finds API docs, endpoint notes, connector rules, and accounting references. |
+| `retrieve_context_pack` | Build a cited answer pack for the host AI. | Combines accounting standards with connector-specific endpoint context. |
+| `get_document` | Fetch a full indexed document. | Opens a connector doc, API reference, workflow guide, or accounting reference by id. |
+| `connector_status` | Show what accounting system is connected and safe to use. | Reports configured ERP/accounting connectors, environment, capabilities, and redacted status. |
+| `run_accounting_skill` | Load a guided accounting workflow package. | Applies a skill to the active connector capabilities without exposing raw API details. |
+| `run_mercury_flow` | Run or dry-run a Mercury workflow. | Executes connector-backed steps such as read invoices, summarize VAT, and prepare reports. |
+| `list_workspace_flows` | Show saved company workflows. | Lists reusable ERP workflows configured for the current workspace. |
+| `save_workspace_flow` | Save a reusable workflow. | Stores a new connector-backed workflow after validation. |
+| `run_workspace_flow` | Run a saved workflow by id. | Runs an approved workspace flow against the connected accounting or ERP system. |
+
+Potential future connector tools, after the demo core is stable:
+
+- `list_connectors`
+- `connector_capabilities`
+- `validate_connector_manifest`
+- `test_connector_endpoint`
+- `ingest_connector_docs`
+- `generate_connector_profile`
+
 ## Starter Prompts
 
 Use up to three short starter prompts in `plugin.json`:
