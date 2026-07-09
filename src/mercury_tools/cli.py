@@ -32,6 +32,20 @@ def _print_json(data: Any) -> None:
     print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+def _env_overrides(args: argparse.Namespace) -> dict[str, str]:
+    pairs = getattr(args, "env", None) or []
+    env: dict[str, str] = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise FlowValidationError(f"Environment override must be KEY=value: {pair}")
+        key, value = pair.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise FlowValidationError(f"Environment override key is empty: {pair}")
+        env[key] = value
+    return env
+
+
 def _embedder(args: argparse.Namespace):
     settings = load_settings()
     return create_embedding_provider(settings, provider=getattr(args, "embedding_provider", None))
@@ -187,7 +201,10 @@ def cmd_flow_validate(args: argparse.Namespace) -> int:
 def cmd_flow_run(args: argparse.Namespace) -> int:
     path = Path(args.path)
     try:
-        result = create_default_runner(dry_run=args.dry_run).run_path(path)
+        result = create_default_runner(dry_run=args.dry_run).run_path(
+            path,
+            env=_env_overrides(args),
+        )
     except (FlowValidationError, RuntimeError, ValueError) as exc:
         payload = {"status": "error", "message": str(exc), "path": str(path)}
         if args.json:
@@ -261,6 +278,7 @@ def cmd_flow_run_suite(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             include_tags=args.tag,
             exclude_tags=args.exclude_tag,
+            env=_env_overrides(args),
         )
     except (FlowValidationError, RuntimeError, ValueError) as exc:
         payload = {"status": "error", "message": str(exc), "path": args.path}
@@ -317,6 +335,14 @@ def cmd_flow_watch(args: argparse.Namespace) -> int:
     path = Path(args.path)
     runs = 0
     last_snapshot: tuple[tuple[str, int, int], ...] | None = None
+    try:
+        env = _env_overrides(args)
+    except FlowValidationError as exc:
+        if args.json:
+            _print_json({"status": "error", "message": str(exc), "path": str(path)})
+        else:
+            print(f"Flow watch failed: {exc}")
+        return 1
     print(f"Watching Mercury flows: {path}")
     print("Press Ctrl+C to stop.")
 
@@ -338,6 +364,7 @@ def cmd_flow_watch(args: argparse.Namespace) -> int:
                         dry_run=args.dry_run,
                         include_tags=args.tag,
                         exclude_tags=args.exclude_tag,
+                        env=env,
                     )
                     payload = suite.as_dict()
                     if args.json:
@@ -584,6 +611,7 @@ def build_parser() -> argparse.ArgumentParser:
     flow_run = flow_sub.add_parser("run")
     flow_run.add_argument("path")
     flow_run.add_argument("--dry-run", action="store_true")
+    flow_run.add_argument("-e", "--env", action="append", default=[])
     flow_run.add_argument("--json", action="store_true")
     flow_run.set_defaults(func=cmd_flow_run)
 
@@ -599,6 +627,7 @@ def build_parser() -> argparse.ArgumentParser:
     flow_run_suite.add_argument("--dry-run", action="store_true")
     flow_run_suite.add_argument("--tag", action="append", default=[])
     flow_run_suite.add_argument("--exclude-tag", action="append", default=[])
+    flow_run_suite.add_argument("-e", "--env", action="append", default=[])
     flow_run_suite.add_argument("--format", choices=["junit"])
     flow_run_suite.add_argument("--output")
     flow_run_suite.add_argument("--allow-failures", action="store_true")
@@ -610,6 +639,7 @@ def build_parser() -> argparse.ArgumentParser:
     flow_watch.add_argument("--dry-run", action="store_true")
     flow_watch.add_argument("--tag", action="append", default=[])
     flow_watch.add_argument("--exclude-tag", action="append", default=[])
+    flow_watch.add_argument("-e", "--env", action="append", default=[])
     flow_watch.add_argument("--interval", type=float, default=1.0)
     flow_watch.add_argument("--max-runs", type=int)
     flow_watch.add_argument("--json", action="store_true")

@@ -50,11 +50,13 @@ Commands:
 Template variables:
 - ${jurisdiction} reads from env.
 - {{ context.query }} reads a previous step saved with saveAs: context.
+- CLI overrides use -e KEY=value or --env KEY=value and take precedence over flow/workspace env.
 
 Workspace quickstart:
 - mercury-tools flow init-workspace ./my-mercury-flows
 - mercury-tools flow list ./my-mercury-flows
 - mercury-tools flow run-suite ./my-mercury-flows --dry-run
+- mercury-tools flow run-suite ./my-mercury-flows --dry-run -e month=2026-09
 - mercury-tools flow watch ./my-mercury-flows --dry-run
 - mercury-tools flow run-suite ./my-mercury-flows --format junit --output reports/junit.xml
 - mercury-tools flow push ./my-mercury-flows --dry-run
@@ -63,6 +65,7 @@ Workspace config keys:
 - flows: glob patterns for YAML flow discovery.
 - includeTags / excludeTags: workspace-level flow selection gates.
 - env: variables available as ${name}.
+- -e / --env: runtime string overrides, useful for CI and host-specific runs.
 - executionOrder.flowsOrder: deterministic ordered flow names or filenames.
 - executionOrder.continueOnFailure: collect failures and continue when true.
 - testOutputDir: writes suite-report.json for the run.

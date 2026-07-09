@@ -88,6 +88,60 @@ def test_flow_cli_validate_and_dry_run(tmp_path: Path, capsys) -> None:
     assert "Flow planned: Company Health Check" in capsys.readouterr().out
 
 
+def test_flow_cli_run_accepts_env_overrides(tmp_path: Path, capsys) -> None:
+    path = tmp_path / "param-flow.yaml"
+    path.write_text(
+        """
+name: Param Flow
+env:
+  month: "2026-01"
+  connector: flowaccount
+---
+- emitReport:
+    title: "Report ${month}"
+    sections:
+      - "Connector ${connector}"
+      - "Scope ${scope}"
+""",
+        encoding="utf-8",
+    )
+
+    assert (
+        main(
+            [
+                "flow",
+                "run",
+                str(path),
+                "--dry-run",
+                "-e",
+                "month=2026-09",
+                "--env",
+                "scope=weekly",
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["variables"]["env"]["month"] == "2026-09"
+    assert payload["variables"]["env"]["scope"] == "weekly"
+    assert payload["artifacts"][0]["title"] == "Report 2026-09"
+    assert payload["artifacts"][0]["sections"] == [
+        "Connector flowaccount",
+        "Scope weekly",
+    ]
+
+
+def test_flow_cli_run_rejects_invalid_env_override(tmp_path: Path, capsys) -> None:
+    path = tmp_path / "company-health.yaml"
+    path.write_text(COMPANY_HEALTH_TEMPLATE, encoding="utf-8")
+
+    assert main(["flow", "run", str(path), "--dry-run", "-e", "month"]) == 1
+
+    assert "Environment override must be KEY=value" in capsys.readouterr().out
+
+
 def test_flow_cli_init_refuses_overwrite(tmp_path: Path) -> None:
     path = tmp_path / "flow.yaml"
 
@@ -200,6 +254,51 @@ env:
     assert payload["status"] == "planned"
     assert payload["workspace"]["selected_count"] == 1
     assert payload["results"][0]["variables"]["env"]["month"] == "2026-07"
+
+
+def test_flow_cli_run_suite_env_overrides_workspace_config(tmp_path: Path, capsys) -> None:
+    flows = tmp_path / "flows"
+    flows.mkdir()
+    (tmp_path / "config.yaml").write_text(
+        """
+flows: flows/**/*.yaml
+env:
+  month: "2026-07"
+  connector: flowaccount
+""",
+        encoding="utf-8",
+    )
+    (flows / "monthly.yaml").write_text(
+        """
+name: Monthly Report
+---
+- emitReport:
+    title: "Month ${month}"
+    metadata:
+      connector: "${connector}"
+""",
+        encoding="utf-8",
+    )
+
+    assert (
+        main(
+            [
+                "flow",
+                "run-suite",
+                str(tmp_path),
+                "--dry-run",
+                "-e",
+                "month=2026-10",
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["workspace"]["config"]["env"]["month"] == "2026-10"
+    assert payload["results"][0]["variables"]["env"]["month"] == "2026-10"
+    assert payload["results"][0]["artifacts"][0]["title"] == "Month 2026-10"
 
 
 def test_flow_workspace_respects_execution_order(tmp_path: Path) -> None:

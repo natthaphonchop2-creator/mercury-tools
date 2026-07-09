@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -458,6 +458,7 @@ def run_workspace_flows(
     dry_run: bool = False,
     include_tags: list[str] | None = None,
     exclude_tags: list[str] | None = None,
+    env: dict[str, Any] | None = None,
     runner: MercuryFlowRunner | None = None,
 ) -> FlowSuiteRun:
     workspace = discover_workspace_flows(
@@ -465,6 +466,14 @@ def run_workspace_flows(
         include_tags=include_tags,
         exclude_tags=exclude_tags,
     )
+    if env:
+        workspace = FlowWorkspace(
+            config=replace(
+                workspace.config,
+                env={**workspace.config.env, **env},
+            ),
+            records=workspace.records,
+        )
     invalid = [record for record in workspace.selected if record.status == "invalid"]
     if invalid:
         first = invalid[0]

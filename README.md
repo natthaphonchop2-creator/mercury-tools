@@ -41,6 +41,7 @@ Create and test a Mercury Flow:
 uv run mercury-tools flow init-workspace ./my-mercury-flows
 uv run mercury-tools flow list ./my-mercury-flows
 uv run mercury-tools flow run-suite ./my-mercury-flows --dry-run
+uv run mercury-tools flow run-suite ./my-mercury-flows --dry-run -e month=2026-09
 uv run mercury-tools flow watch ./my-mercury-flows --dry-run
 uv run mercury-tools flow run-suite ./my-mercury-flows --format junit --output reports/junit.xml
 uv run mercury-tools flow init ./my-flow.yaml --template company-health
@@ -192,9 +193,9 @@ Flow CLI:
 - `mercury-tools flow init-workspace <path> --connector flowaccount --month YYYY-MM`
 - `mercury-tools flow init <path> --template company-health`
 - `mercury-tools flow validate <path>`
-- `mercury-tools flow run <path> --dry-run`
+- `mercury-tools flow run <path> --dry-run -e month=2026-09`
 - `mercury-tools flow list <workspace> --tag accounting`
-- `mercury-tools flow run-suite <workspace> --dry-run --exclude-tag disabled`
+- `mercury-tools flow run-suite <workspace> --dry-run --exclude-tag disabled -e month=2026-09`
 - `mercury-tools flow run-suite <workspace> --format junit --output reports/junit.xml`
 - `mercury-tools flow watch <workspace> --dry-run`
 - `mercury-tools flow push <workspace> --url https://mercury-tools-mcp.onrender.com --client-token <mc_...>`
@@ -219,6 +220,10 @@ executionOrder:
     - company-health
     - vat-summary
 ```
+
+Like Maestro's `-e KEY=value` runtime parameters, Mercury accepts `-e` or
+`--env` on `flow run`, `flow run-suite`, and `flow watch`. These values are
+strings and override flow/workspace `env` values for that run.
 
 This mirrors Maestro's workspace model at the Mercury layer: config, folder
 architecture, tag-based discovery, deterministic execution order, output
