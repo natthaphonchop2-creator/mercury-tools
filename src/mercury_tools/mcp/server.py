@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -19,7 +20,7 @@ from mercury_tools.connectors.catalog import connector_by_id, list_connector_sum
 from mercury_tools.connectors.setup import required_missing_fields, validate_connector_read_only
 from mercury_tools.db.product import SupabaseProductStore, slugify
 from mercury_tools.db.supabase import SupabaseRagStore
-from mercury_tools.flows.parser import FlowValidationError, validate_flow_text
+from mercury_tools.flows.parser import FlowValidationError, parse_flow_text, validate_flow_text
 from mercury_tools.flows.runner import create_default_runner
 from mercury_tools.flows.templates import FLOW_CHEAT_SHEET
 from mercury_tools.flows.workspace import discover_workspace_flows, workspace_manifest
@@ -44,6 +45,9 @@ mcp = FastMCP("Mercury Tools")
 
 MAX_MCP_FLOW_FILES = 50
 MAX_MCP_FLOW_FILE_CHARS = 500_000
+CONNECTOR_ENV_KEYS = ("connector", "connector_id", "accounting_connector", "erp_connector")
+ENVIRONMENT_ENV_KEYS = ("environment", "connector_environment", "connector_env")
+CAPABILITY_KEYS = ("required_capabilities", "requiredCapabilities", "capabilities")
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -332,26 +336,166 @@ def _fallback_dashboard(token_payload: dict[str, Any], *, reason: str) -> dict[s
 
 
 def _profile_enabled_capabilities(profile: dict[str, Any]) -> list[Any]:
-    metadata = profile.get("metadata") or {}
-    return list(metadata.get("enabled_capabilities") or profile.get("enabled_capabilities") or [])
+    metadata = profile.get("metadata") if isinstance(profile.get("metadata"), dict) else {}
+    raw = metadata.get("enabled_capabilities") or profile.get("enabled_capabilities") or []
+    if isinstance(raw, str):
+        return [raw] if raw.strip() else []
+    if isinstance(raw, list | tuple | set):
+        return [item for item in raw if str(item).strip()]
+    return []
 
 
-def _workspace_connector_ready(dashboard_payload: dict[str, Any]) -> bool:
-    if "connector_profiles" not in dashboard_payload:
-        return True
-    profiles = dashboard_payload.get("connector_profiles") or []
+def _clean_selector(value: Any) -> str | None:
+    if value is None:
+        return None
+    clean = str(value).strip().lower()
+    return clean or None
+
+
+def _first_mapping_value(mapping: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        selected = _clean_selector(mapping.get(key))
+        if selected:
+            return selected
+    return None
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        clean = value.strip()
+        return [clean] if clean else []
+    if isinstance(value, list | tuple | set):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _workspace_flow_from_dashboard(
+    dashboard_payload: dict[str, Any],
+    flow_id: str,
+) -> dict[str, Any] | None:
+    for flow in dashboard_payload.get("flows") or []:
+        if isinstance(flow, dict) and str(flow.get("flow_id") or "") == flow_id:
+            return flow
+    return None
+
+
+def _saved_flow_env(flow: dict[str, Any] | None) -> dict[str, Any]:
+    if not flow:
+        return {}
+    env = dict(_mapping(flow.get("env")))
+    flow_yaml = flow.get("yaml")
+    if isinstance(flow_yaml, str) and flow_yaml.strip():
+        with suppress(FlowValidationError):
+            env.update(parse_flow_text(flow_yaml).env)
+    return env
+
+
+def _connector_from_flow_tags(flow: dict[str, Any] | None) -> str | None:
+    if not flow:
+        return None
+    for tag in flow.get("tags") or []:
+        connector_id = _clean_selector(tag)
+        if connector_id and connector_by_id(connector_id):
+            return connector_id
+    return None
+
+
+def _required_capabilities_from_sources(
+    *,
+    metadata: dict[str, Any],
+    env: dict[str, Any],
+) -> list[str]:
+    for source in (env, metadata):
+        for key in CAPABILITY_KEYS:
+            capabilities = _string_list(source.get(key))
+            if capabilities:
+                return capabilities
+    return []
+
+
+def _workspace_flow_readiness_selection(
+    dashboard_payload: dict[str, Any],
+    *,
+    flow_id: str,
+    env_overrides: dict[str, str],
+) -> dict[str, Any]:
+    flow = _workspace_flow_from_dashboard(dashboard_payload, flow_id)
+    metadata = _mapping((flow or {}).get("metadata"))
+    metadata_env = _mapping(metadata.get("env"))
+    flow_env = _saved_flow_env(flow)
+    effective_env = {**metadata_env, **flow_env, **env_overrides}
+    return {
+        "connector_id": (
+            _first_mapping_value(effective_env, CONNECTOR_ENV_KEYS)
+            or _first_mapping_value(metadata, CONNECTOR_ENV_KEYS)
+            or _connector_from_flow_tags(flow)
+        ),
+        "environment": (
+            _first_mapping_value(effective_env, ENVIRONMENT_ENV_KEYS)
+            or _first_mapping_value(metadata, ENVIRONMENT_ENV_KEYS)
+        ),
+        "required_capabilities": _required_capabilities_from_sources(
+            metadata=metadata,
+            env=effective_env,
+        ),
+    }
+
+
+def _workspace_connector_ready(
+    dashboard_payload: dict[str, Any],
+    *,
+    connector_id: str | None = None,
+    environment: str | None = None,
+    required_capabilities: list[str] | None = None,
+) -> bool:
+    profiles = dashboard_payload.get("connector_profiles")
+    if not isinstance(profiles, list) or not profiles:
+        return False
+    selected_connector = _clean_selector(connector_id)
+    selected_environment = _clean_selector(environment)
+    required = {str(capability).strip() for capability in required_capabilities or [] if str(capability).strip()}
     for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        profile_connector = _clean_selector(profile.get("connector_id"))
+        profile_environment = _clean_selector(profile.get("environment"))
+        if selected_connector and profile_connector != selected_connector:
+            continue
+        if selected_environment and profile_environment != selected_environment:
+            continue
         metadata = profile.get("metadata") or {}
-        enabled_capabilities = _profile_enabled_capabilities(profile)
-        if metadata.get("setup_state") == "ready":
-            return bool(enabled_capabilities)
-        if profile.get("status") in {"ready", "connected_read_only"}:
-            return bool(enabled_capabilities)
+        setup_state = _clean_selector(metadata.get("setup_state")) if isinstance(metadata, dict) else None
+        status = _clean_selector(profile.get("status"))
+        if setup_state != "ready" and status not in {"ready", "connected_read_only"}:
+            continue
+        enabled_capabilities = {str(item).strip() for item in _profile_enabled_capabilities(profile)}
+        if not enabled_capabilities:
+            continue
+        if required and not required.issubset(enabled_capabilities):
+            continue
+        return True
     return False
 
 
-def workspace_connector_ready(dashboard_payload: dict[str, Any]) -> bool:
-    return _workspace_connector_ready(dashboard_payload)
+def workspace_connector_ready(
+    dashboard_payload: dict[str, Any],
+    *,
+    connector_id: str | None = None,
+    environment: str | None = None,
+    required_capabilities: list[str] | None = None,
+) -> bool:
+    return _workspace_connector_ready(
+        dashboard_payload,
+        connector_id=connector_id,
+        environment=environment,
+        required_capabilities=required_capabilities,
+    )
 
 
 def _connector_setup_block_payload() -> dict[str, Any]:
@@ -1063,7 +1207,17 @@ def run_workspace_flow_tool(
         token_payload = _client_token_payload_from_value(client_token)
         store = _product_store(settings)
         dashboard_payload = store.dashboard(token_payload)
-        if not workspace_connector_ready(dashboard_payload):
+        readiness_selection = _workspace_flow_readiness_selection(
+            dashboard_payload,
+            flow_id=flow_id,
+            env_overrides=env_overrides,
+        )
+        if not readiness_selection["connector_id"] or not workspace_connector_ready(
+            dashboard_payload,
+            connector_id=readiness_selection["connector_id"],
+            environment=readiness_selection["environment"],
+            required_capabilities=readiness_selection["required_capabilities"],
+        ):
             payload = _connector_setup_block_payload()
             _audit(
                 "run_workspace_flow",
@@ -1072,6 +1226,8 @@ def run_workspace_flow_tool(
                     "flow_id": flow_id,
                     "dry_run": dry_run,
                     "env_keys": _env_keys(env_overrides),
+                    "connector_id": readiness_selection["connector_id"],
+                    "environment": readiness_selection["environment"],
                 },
                 payload,
             )
@@ -1487,6 +1643,7 @@ async def run_workspace_flow(request: Request) -> Response:
         flow_id = str(data.get("flow_id") or "").strip()
         flow_title = str(data.get("title") or "").strip()
         flow: dict[str, Any] | None = None
+        store: SupabaseProductStore | None = None
         if flow_id and not flow_yaml:
             if not settings.supabase_configured:
                 return _json_error(
@@ -1494,7 +1651,21 @@ async def run_workspace_flow(request: Request) -> Response:
                     "Supabase is required to load saved workspace flows.",
                     status_code=503,
                 )
-            flow = _product_store(settings).get_flow(token_payload=token_payload, flow_id=flow_id)
+            store = _product_store(settings)
+            dashboard_payload = store.dashboard(token_payload)
+            readiness_selection = _workspace_flow_readiness_selection(
+                dashboard_payload,
+                flow_id=flow_id,
+                env_overrides=env_overrides,
+            )
+            if not readiness_selection["connector_id"] or not workspace_connector_ready(
+                dashboard_payload,
+                connector_id=readiness_selection["connector_id"],
+                environment=readiness_selection["environment"],
+                required_capabilities=readiness_selection["required_capabilities"],
+            ):
+                return JSONResponse(redact_json(_connector_setup_block_payload()))
+            flow = store.get_flow(token_payload=token_payload, flow_id=flow_id)
             if not flow:
                 return _json_error("not_found", f"Workspace flow not found: {flow_id}", status_code=404)
             flow_yaml = str(flow.get("yaml") or "")
@@ -1505,7 +1676,7 @@ async def run_workspace_flow(request: Request) -> Response:
             payload["workspace_flow"] = _public_flow_summary(flow)
         if settings.supabase_configured:
             try:
-                payload["run_record"] = _product_store(settings).record_flow_run(
+                payload["run_record"] = (store or _product_store(settings)).record_flow_run(
                     token_payload=token_payload,
                     flow_id=flow_id or None,
                     title=flow_title or str(payload.get("flow", {}).get("name") or ""),

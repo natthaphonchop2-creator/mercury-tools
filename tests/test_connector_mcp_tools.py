@@ -3,8 +3,10 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+from starlette.testclient import TestClient
 
 from mercury_tools.config import Settings
+from mercury_tools.flows.templates import COMPANY_HEALTH_TEMPLATE
 from mercury_tools.product import ConnectRequest, create_client_token
 
 
@@ -496,6 +498,62 @@ def test_validate_connector_connection_http_error_is_sanitized(
     assert_values_absent(payload, ["demo-client-id", "super-secret-value"])
 
 
+def ready_connector_profile(
+    *,
+    connector_id: str = "flowaccount",
+    environment: str = "production",
+    capabilities: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "connector_id": connector_id,
+        "environment": environment,
+        "status": "ready",
+        "metadata": {
+            "setup_state": "ready",
+            "enabled_capabilities": (
+                ["company.info.read"] if capabilities is None else capabilities
+            ),
+        },
+    }
+
+
+def test_workspace_connector_ready_blocks_missing_or_empty_profiles() -> None:
+    from mercury_tools.mcp.server import workspace_connector_ready
+
+    assert workspace_connector_ready({"workspace": {"name": "Demo Co"}}) is False
+    assert workspace_connector_ready({"connector_profiles": []}) is False
+
+
+def test_workspace_connector_ready_blocks_ready_profile_without_capabilities() -> None:
+    from mercury_tools.mcp.server import workspace_connector_ready
+
+    profile = ready_connector_profile(capabilities=[])
+
+    assert workspace_connector_ready({"connector_profiles": [profile]}) is False
+
+
+def test_workspace_connector_ready_uses_selected_connector_and_environment() -> None:
+    from mercury_tools.mcp.server import workspace_connector_ready
+
+    dashboard = {"connector_profiles": [ready_connector_profile()]}
+
+    assert workspace_connector_ready(
+        dashboard,
+        connector_id="flowaccount",
+        environment="production",
+    )
+    assert not workspace_connector_ready(
+        dashboard,
+        connector_id="peak",
+        environment="production",
+    )
+    assert not workspace_connector_ready(
+        dashboard,
+        connector_id="flowaccount",
+        environment="sandbox",
+    )
+
+
 def test_run_workspace_flow_requires_ready_connector(monkeypatch) -> None:
     from mercury_tools.mcp import server
 
@@ -503,6 +561,13 @@ def test_run_workspace_flow_requires_ready_connector(monkeypatch) -> None:
         def dashboard(self, token_payload):
             return {
                 "workspace": {"name": "Demo Co"},
+                "flows": [
+                    {
+                        "flow_id": "workspace-revenue",
+                        "title": "Revenue",
+                        "yaml": COMPANY_HEALTH_TEMPLATE,
+                    }
+                ],
                 "connector_profiles": [
                     {
                         "connector_id": "flowaccount",
@@ -525,5 +590,82 @@ def test_run_workspace_flow_requires_ready_connector(monkeypatch) -> None:
         dry_run=False,
     )
 
+    assert payload["status"] == "blocked"
+    assert "connector credential setup" in payload["message"]
+
+
+def test_run_workspace_flow_blocks_selected_connector_mismatch(monkeypatch) -> None:
+    from mercury_tools.mcp import server
+
+    class FakeStore:
+        def dashboard(self, token_payload):
+            return {
+                "workspace": {"name": "Demo Co"},
+                "flows": [
+                    {
+                        "flow_id": "workspace-revenue",
+                        "title": "Revenue",
+                        "yaml": COMPANY_HEALTH_TEMPLATE,
+                    }
+                ],
+                "connector_profiles": [ready_connector_profile()],
+            }
+
+        def get_flow(self, *, token_payload, flow_id):
+            raise AssertionError("connector mismatch should not load the flow")
+
+    configure_product_env(monkeypatch)
+    monkeypatch.setattr(server, "_product_store", lambda settings=None: FakeStore())
+
+    payload = server.run_workspace_flow_tool(
+        client_token=make_client_token(),
+        flow_id="workspace-revenue",
+        dry_run=False,
+        env={"connector": "peak"},
+    )
+
+    assert payload["status"] == "blocked"
+    assert "connector credential setup" in payload["message"]
+
+
+def test_http_workspace_flow_run_requires_ready_connector(monkeypatch) -> None:
+    from mercury_tools.mcp import server
+
+    class FakeStore:
+        def dashboard(self, token_payload):
+            return {
+                "workspace": {"name": "Demo Co"},
+                "flows": [
+                    {
+                        "flow_id": "workspace-revenue",
+                        "title": "Revenue",
+                        "yaml": COMPANY_HEALTH_TEMPLATE,
+                    }
+                ],
+                "connector_profiles": [
+                    {
+                        "connector_id": "flowaccount",
+                        "environment": "production",
+                        "status": "credentials_configured",
+                        "metadata": {"setup_state": "credentials_received"},
+                    }
+                ],
+            }
+
+        def get_flow(self, *, token_payload, flow_id):
+            raise AssertionError("blocked HTTP connector setup should not load the flow")
+
+    configure_product_env(monkeypatch)
+    monkeypatch.setattr(server, "_product_store", lambda settings=None: FakeStore())
+
+    client = TestClient(server.create_http_app(require_auth=True), raise_server_exceptions=False)
+    response = client.post(
+        "/api/flows/run",
+        headers={"Authorization": f"Bearer {make_client_token()}"},
+        json={"flow_id": "workspace-revenue", "dry_run": False},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
     assert payload["status"] == "blocked"
     assert "connector credential setup" in payload["message"]

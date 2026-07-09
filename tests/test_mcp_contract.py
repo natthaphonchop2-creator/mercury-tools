@@ -238,6 +238,17 @@ def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:
         def dashboard(self, _token_payload):
             return {
                 "workspace": {"name": "Demo Co", "workspace_key": "demo"},
+                "connector_profiles": [
+                    {
+                        "connector_id": "flowaccount",
+                        "environment": "production",
+                        "status": "ready",
+                        "metadata": {
+                            "setup_state": "ready",
+                            "enabled_capabilities": ["company.info.read"],
+                        },
+                    }
+                ],
                 "flows": [self.flow],
             }
 
@@ -286,7 +297,7 @@ def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:
         token,
         "workspace-company-health-12345678",
         dry_run=True,
-        env={"connector": "peak"},
+        env={"connector": "flowaccount"},
     )
 
     assert listed["status"] == "ok"
@@ -298,7 +309,7 @@ def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:
     assert ran["status"] == "planned"
     assert ran["workspace_flow"]["flow_id"] == "workspace-company-health-12345678"
     assert ran["steps"][0]["command"] == "connectorStatus"
-    assert ran["variables"]["env"]["connector"] == "peak"
+    assert ran["variables"]["env"]["connector"] == "flowaccount"
     assert ran["run_record"]["env_keys"] == ["connector"]
     assert audit_events
     assert all(token not in str(event["input_payload"]) for event in audit_events)
