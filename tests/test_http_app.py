@@ -124,6 +124,27 @@ def test_product_console_exposes_separate_pages(monkeypatch) -> None:
             assert 'id="connect-form"' not in response.text
 
 
+def test_flows_page_is_read_only_control_plane(monkeypatch) -> None:
+    monkeypatch.setenv("MERCURY_CONNECT_INVITE_CODE", "invite-demo")
+    monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
+
+    client = TestClient(create_http_app(require_auth=True), raise_server_exceptions=False)
+
+    response = client.get("/flows")
+
+    assert response.status_code == 200
+    assert "MCP/CLI only" in response.text
+    assert "not browser UX" in response.text
+    assert 'id="flow-form"' not in response.text
+    assert 'id="flow_yaml"' not in response.text
+    assert 'id="flow-run"' not in response.text
+    assert 'id="flow-validate"' not in response.text
+    assert 'data-flow-load="' not in response.text
+    assert "/api/flows/run" not in response.text
+    assert "/api/flows/save" not in response.text
+    assert "/api/flows/validate" not in response.text
+
+
 def test_connect_api_rejects_bad_invite(monkeypatch) -> None:
     monkeypatch.setenv("MERCURY_CONNECT_INVITE_CODE", "invite-demo")
     monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")

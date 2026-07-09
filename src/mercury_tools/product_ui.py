@@ -866,65 +866,22 @@ PAGE_CONTENT: dict[str, str] = {
       <section class="page" data-page="flows">
         <div class="page-head">
           <span class="eyebrow">Mercury Flows</span>
-          <h1>Build repeatable accounting agent runbooks.</h1>
-          <p>Flows are YAML runbooks for MCP hosts. They package connector state checks, RAG retrieval, skill execution, validation steps, and report handoffs without turning Mercury into the chat surface.</p>
+          <h1>Review the runbooks exposed to AI hosts.</h1>
+          <p>Flows are not operated from this browser console. Create, validate, push, and run flows through the Mercury CLI or MCP tools used by Codex, Cursor, Claude, or another host agent.</p>
         </div>
-        <div class="page-grid reverse">
+        <div class="page-grid">
           <section class="panel">
-            <div class="row">
-              <div>
-                <h2>Flow editor</h2>
-                <p class="lead">Validate and dry-run before a host agent uses the workflow.</p>
-              </div>
-              <span class="pill">dry-run first</span>
+            <div class="row"><h2>Host execution path</h2><span class="pill">MCP/CLI only</span></div>
+            <div class="flow">
+              <div><b>Author locally</b><br><span class="muted">Use files in a repo or generated workspace, not a browser text editor.</span></div>
+              <div><b>Validate and dry-run</b><br><span class="muted">Use mercury-tools flow validate, flow run, flow run-suite, or MCP run_flow/run_flow_files.</span></div>
+              <div><b>Expose to host agent</b><br><span class="muted">Codex, Cursor, Claude, or a customer agent calls Mercury flow tools during the conversation.</span></div>
+              <div><b>Keep evidence</b><br><span class="muted">This console only displays sanitized registry and run history.</span></div>
             </div>
-            <form id="flow-form">
-              <label for="flow_title">Flow title</label>
-              <input id="flow_title" name="title" value="Company Health Check" />
-              <label for="flow_yaml">Flow YAML</label>
-              <textarea id="flow_yaml" name="flow_yaml">name: Company Health Check
-description: Read-only Mercury flow for a Thai accounting health-check handoff.
-tags: [accounting, read-only, flowaccount]
-env:
-  jurisdiction: TH
-  connector: flowaccount
-onFlowStart:
-  - connectorStatus:
-      saveAs: connector
----
-- retrieveContextPack:
-    query: "company health check revenue VAT cash flow accounting Thailand"
-    task: "company_health_check_th"
-    filters:
-      jurisdiction: "${jurisdiction}"
-      connector: "${connector}"
-      review_status: reviewed
-    maxChunks: 8
-    saveAs: context
-- runSkill:
-    skillId: company-health-check-th
-    inputs:
-      task: "Prepare a concise Thai company health-check answer."
-      connector: "${connector}"
-      context_query: "{{ context.query }}"
-    evidenceMode: true
-    saveAs: skill
-- emitReport:
-    title: "Company health-check context pack"
-    sections:
-      - "Use the retrieved citations and skill package to answer in Thai."
-      - "Do not expose raw tax IDs, emails, bearer tokens, or API keys."</textarea>
-              <label for="flow_env_json">Runtime env JSON optional</label>
-              <textarea id="flow_env_json" class="compact-textarea" placeholder='{"month":"2026-07","connector":"flowaccount"}'></textarea>
-              <div class="two" style="margin-top:12px">
-                <button id="flow-validate" class="secondary" type="button">Validate</button>
-                <button id="flow-run" class="secondary" type="button">Dry-run</button>
-              </div>
-              <button class="full" type="submit">Save flow to workspace</button>
-              <div id="flow-message" class="message"></div>
-            </form>
-            <div class="codebar"><h2>Flow result</h2><span class="pill">sanitized</span></div>
-            <pre id="flow-result">No flow action yet.</pre>
+            <div class="codebar"><h2>CLI handoff</h2><span class="pill">copy reference</span></div>
+            <pre>mercury-tools flow validate ./flows/company-health.yaml
+mercury-tools flow run-suite ./flows --dry-run -e month=2026-09
+mercury-tools flow push ./flows --url https://mercury-tools-mcp.onrender.com --client-token &lt;mc_...&gt;</pre>
           </section>
 
           <div class="surface">
@@ -940,9 +897,9 @@ onFlowStart:
               <h2>Flow boundary</h2>
               <div class="cards-2">
                 <div class="card"><b>Purpose</b><span>repeatable AI-agent runbooks</span></div>
-                <div class="card"><b>Execution</b><span>MCP tool calls and context handoffs</span></div>
+                <div class="card"><b>Execution</b><span>MCP tool calls or CLI, not browser UX</span></div>
                 <div class="card"><b>Writes</b><span>blocked unless future approval flow allows them</span></div>
-                <div class="card"><b>Owner</b><span>workspace, not local machine config</span></div>
+                <div class="card"><b>Owner</b><span>workspace and host agent, not the console page</span></div>
               </div>
             </section>
           </div>
@@ -1093,16 +1050,6 @@ SCRIPT = """
       }, null, 2);
     }
 
-    function parseFlowEnv() {
-      const raw = ($('#flow_env_json').value || '').trim();
-      if (!raw) return {};
-      const parsed = JSON.parse(raw);
-      if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
-        throw new Error('Runtime env JSON must be an object.');
-      }
-      return parsed;
-    }
-
     function renderDashboard(data) {
       const workspace = data.workspace || {};
       const member = data.member || {};
@@ -1147,13 +1094,8 @@ SCRIPT = """
       state.flows = data.flows || [];
       $('#flow-list').innerHTML = state.flows.length ? state.flows.map((item) => `
         <div class="item">
-          <div class="row">
-            <div>
-              <strong>${item.title || item.name}</strong>
-              <small>${item.flow_id} - ${item.command_count || 0} commands - ${item.status || 'draft'}</small>
-            </div>
-            <button class="secondary" type="button" data-flow-load="${item.flow_id}">Load</button>
-          </div>
+          <strong>${item.title || item.name}</strong>
+          <small>${item.flow_id} - ${item.command_count || 0} commands - ${item.status || 'draft'}</small>
         </div>
       `).join('') : '<div class="item"><small>No workspace flows saved yet.</small></div>';
 
@@ -1320,68 +1262,6 @@ SCRIPT = """
         await loadDashboard();
       } catch (error) {
         message('#upload-message', error.message, 'error');
-      }
-    });
-
-    $('#flow-list').addEventListener('click', (event) => {
-      const flowId = event.target.getAttribute('data-flow-load');
-      if (!flowId) return;
-      const flow = state.flows.find((item) => item.flow_id === flowId);
-      if (!flow) return;
-      $('#flow_title').value = flow.title || flow.name || '';
-      $('#flow_yaml').value = flow.yaml || '';
-      message('#flow-message', 'Loaded ' + flowId + '.', 'ok');
-    });
-
-    $('#flow-validate').addEventListener('click', async () => {
-      try {
-        message('#flow-message', 'Validating flow...');
-        const data = await authFetch('/api/flows/validate', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ flow_yaml: $('#flow_yaml').value })
-        });
-        $('#flow-result').textContent = JSON.stringify(data, null, 2);
-        message('#flow-message', 'Flow syntax is valid.', 'ok');
-      } catch (error) {
-        $('#flow-result').textContent = error.message;
-        message('#flow-message', error.message, 'error');
-      }
-    });
-
-    $('#flow-run').addEventListener('click', async () => {
-      try {
-        message('#flow-message', 'Running dry-run...');
-        const data = await authFetch('/api/flows/run', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ flow_yaml: $('#flow_yaml').value, dry_run: true, env: parseFlowEnv() })
-        });
-        $('#flow-result').textContent = JSON.stringify(data, null, 2);
-        message('#flow-message', 'Dry-run plan is ready.', 'ok');
-        await loadDashboard();
-      } catch (error) {
-        $('#flow-result').textContent = error.message;
-        message('#flow-message', error.message, 'error');
-      }
-    });
-
-    $('#flow-form').addEventListener('submit', async (event) => {
-      event.preventDefault();
-      try {
-        message('#flow-message', 'Saving flow...');
-        const payload = Object.fromEntries(new FormData(event.target).entries());
-        const data = await authFetch('/api/flows/save', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify(payload)
-        });
-        $('#flow-result').textContent = JSON.stringify(data, null, 2);
-        message('#flow-message', 'Saved ' + data.flow.flow_id + '.', 'ok');
-        await loadDashboard();
-      } catch (error) {
-        $('#flow-result').textContent = error.message;
-        message('#flow-message', error.message, 'error');
       }
     });
 
