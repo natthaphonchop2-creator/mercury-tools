@@ -60,6 +60,26 @@ manifest.
 - `retrieve_workspace_context_pack` stays inside the selected ERP documentation.
 - `run_mercury_flow` blocks production-changing capabilities before connector dispatch.
 
+## Verified Contest Build
+
+Verification snapshot: **2026-07-10**
+
+- Runtime commit: `c77eb1fea010e60ee8a07d7435789e1f628e5237`
+- Render deploy: `dep-d982bppo3t8c738i6sl0` (`live`)
+- Hosted MCP: `https://mercury-tools-mcp.onrender.com/mcp`
+- MCP contract: 22 tools; public stateful schemas use opaque `workspace_id` routing
+- Public HTTP surface: legacy dashboard, upload, invite, and compatibility APIs disabled
+- Local quality gate: 192 tests passed, 1 skipped; Ruff and plugin validation passed
+- GitHub CI: passed on pull request #2
+- Marketplace install: `mercury-finance` installed and enabled from the GitHub branch in an isolated Codex home
+- Production smoke: 22 tools, 9 bundled skills, 4 connectors, public workspace creation, accounting skill execution, flow planning, and setup metadata all passed
+- RAG evidence: production retrieval returned 8 FlowAccount results from `FlowAccount Endpoint Data Dictionary`
+- Supabase: hybrid-search endpoint terms are active; product and RAG tables use RLS with anonymous and authenticated DML denied
+
+The verified runtime is deployed manually from pull request #2. Before the
+judge handoff, merge that pull request so the `--ref main` install command and
+Render auto-deploy both follow the same release commit.
+
 ## Contest Boundary
 
 This build intentionally has no login or private tenant isolation. Use contest,
