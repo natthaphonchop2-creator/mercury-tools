@@ -162,6 +162,51 @@ def flow_summary_from_yaml(
     }
 
 
+def flow_run_summary(
+    *,
+    flow_id: str | None,
+    title: str | None,
+    result_payload: dict[str, Any],
+    dry_run: bool,
+) -> dict[str, Any]:
+    flow = result_payload.get("flow") or {}
+    flow_title = str(title or flow.get("name") or flow_id or "Mercury Flow").strip()
+    created_at = now_utc()
+    run_basis = json.dumps(
+        {
+            "flow_id": flow_id,
+            "title": flow_title,
+            "status": result_payload.get("status"),
+            "dry_run": dry_run,
+            "created_at": created_at,
+        },
+        sort_keys=True,
+    )
+    artifacts = []
+    for artifact in (result_payload.get("artifacts") or [])[:8]:
+        if not isinstance(artifact, dict):
+            continue
+        artifacts.append(
+            {
+                "title": artifact.get("title") or artifact.get("message") or "artifact",
+                "status": artifact.get("status") or result_payload.get("status"),
+            }
+        )
+    return redact_json(
+        {
+            "run_id": "flow_run_" + hashlib.sha256(run_basis.encode("utf-8")).hexdigest()[:16],
+            "flow_id": flow_id,
+            "title": flow_title,
+            "status": result_payload.get("status"),
+            "dry_run": dry_run,
+            "step_count": len(result_payload.get("steps") or []),
+            "artifact_count": len(result_payload.get("artifacts") or []),
+            "artifacts": artifacts,
+            "created_at": created_at,
+        }
+    )
+
+
 def email_hash(email: str) -> str:
     return hashlib.sha256(email.strip().lower().encode("utf-8")).hexdigest()[:16]
 
@@ -388,6 +433,7 @@ class SupabaseProductStore:
             context["member"]["id"]: context["member"],
         }
         flows: dict[str, dict[str, Any]] = {}
+        flow_runs: list[dict[str, Any]] = []
         events: list[dict[str, Any]] = []
 
         for row in self._fallback_state_events(key):
@@ -418,6 +464,10 @@ class SupabaseProductStore:
                 flow = summary.get("flow") or {}
                 if flow.get("flow_id"):
                     flows[str(flow["flow_id"])] = flow
+            elif event_type == "flow.run_completed":
+                run = summary.get("flow_run") or {}
+                if run.get("run_id"):
+                    flow_runs.append(run)
 
             events.append(
                 {
@@ -443,6 +493,11 @@ class SupabaseProductStore:
                 key=lambda item: str(item.get("updated_at") or ""),
                 reverse=True,
             ),
+            "flow_runs": sorted(
+                flow_runs,
+                key=lambda item: str(item.get("created_at") or ""),
+                reverse=True,
+            )[:12],
             "events": list(reversed(events[-12:])),
         }
 
@@ -497,6 +552,52 @@ class SupabaseProductStore:
             },
         )
         return flow
+
+    def record_flow_run(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        flow_id: str | None,
+        title: str | None,
+        result_payload: dict[str, Any],
+        dry_run: bool,
+    ) -> dict[str, Any]:
+        context = self.workspace_for_token(token_payload)
+        if not context:
+            raise ValueError("Workspace is not registered for this client token.")
+        run = flow_run_summary(
+            flow_id=flow_id,
+            title=title,
+            result_payload=result_payload,
+            dry_run=dry_run,
+        )
+        self.record_event(
+            workspace_id=context["workspace"]["id"],
+            member_id=(context.get("member") or {}).get("id"),
+            event_type="flow.run_completed",
+            input_payload={
+                "flow_id": flow_id,
+                "title": title,
+                "dry_run": dry_run,
+                "status": result_payload.get("status"),
+            },
+            summary={
+                "flow_run": run,
+                "event_summary": {
+                    "run_id": run["run_id"],
+                    "flow_id": run.get("flow_id"),
+                    "title": run["title"],
+                    "status": run["status"],
+                    "dry_run": dry_run,
+                },
+            },
+            status=str(result_payload.get("status") or "ok"),
+            metadata={
+                "workspace_key": context["workspace"]["workspace_key"],
+                "client_jti": str(token_payload.get("jti") or ""),
+            },
+        )
+        return run
 
     def _fallback_set_skill_enabled(
         self,
@@ -1148,6 +1249,17 @@ class SupabaseProductStore:
                 "limit": "12",
             },
         )
+        flow_run_events = self._request(
+            "GET",
+            "mercury_product_events",
+            params={
+                "workspace_id": f"eq.{workspace_id}",
+                "event_type": "eq.flow.run_completed",
+                "select": "id,created_at,event_type,summary,status,metadata",
+                "order": "created_at.desc",
+                "limit": "12",
+            },
+        )
         return {
             "status": "ok",
             **context,
@@ -1163,6 +1275,15 @@ class SupabaseProductStore:
                 for skill in catalog or []
             ],
             "flows": flows,
+            "flow_runs": [
+                {
+                    **((row.get("summary") or {}).get("flow_run") or {}),
+                    "event_id": row.get("id"),
+                    "event_status": row.get("status"),
+                }
+                for row in flow_run_events or []
+                if ((row.get("summary") or {}).get("flow_run") or {}).get("run_id")
+            ],
             "events": events or [],
         }
 

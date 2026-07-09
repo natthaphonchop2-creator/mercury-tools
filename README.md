@@ -125,7 +125,7 @@ user-facing AI:
 - `/connectors` saves accounting connector profiles and encrypted credentials
 - `/knowledge` explains the Supabase RAG/wiki layer used by MCP context tools
 - `/skills` enables or uploads workspace skills
-- `/flows` validates, saves, and dry-runs Mercury Flow YAML for the workspace
+- `/flows` validates, saves, dry-runs, and shows recent Mercury Flow run history
 - `/audit` reviews usage and audit events
 
 Mercury Connect also exposes product APIs:
@@ -145,6 +145,9 @@ These APIs require a Mercury client token (`mc_...`) generated from the Connect
 page. The server bearer token is for MCP/admin compatibility, not normal users.
 Connector credentials are not stored in Supabase in v1; connector profiles store
 the selected program, environment, company label, and required secret fields.
+Flow run history stores sanitized summaries only: status, flow title/id, step
+count, artifact count, and artifact titles. It does not store raw connector
+secrets, full variables, or raw accounting payloads.
 
 If the dedicated product tables from `0002_mercury_product_layer.sql` have not
 been applied yet, Mercury falls back to an event-sourced product state stored in

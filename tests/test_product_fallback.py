@@ -1,5 +1,6 @@
 from mercury_tools.config import Settings
 from mercury_tools.db.product import SupabaseProductStore
+from mercury_tools.flows.runner import MercuryFlowRunner
 from mercury_tools.flows.templates import COMPANY_HEALTH_TEMPLATE
 from mercury_tools.product import ConnectRequest
 
@@ -211,3 +212,36 @@ def test_product_store_audit_fallback_records_workspace_flow() -> None:
     assert dashboard["flows"][0]["flow_id"] == flow["flow_id"]
     assert fetched is not None
     assert fetched["yaml"] == COMPANY_HEALTH_TEMPLATE
+
+
+def test_product_store_audit_fallback_records_flow_runs() -> None:
+    store = AuditFallbackStore()
+    request = ConnectRequest(
+        email="owner@example.com",
+        company="Demo Co",
+        host_app="codex",
+        invite_code="invite",
+    )
+    store.upsert_connection(request, token_payload())
+    flow = store.save_flow(
+        token_payload=token_payload(),
+        title="Company Health Check",
+        flow_yaml=COMPANY_HEALTH_TEMPLATE,
+        metadata={"source": "test"},
+    )
+    result = MercuryFlowRunner(dry_run=True).run_text(COMPANY_HEALTH_TEMPLATE).as_dict()
+
+    run = store.record_flow_run(
+        token_payload=token_payload(),
+        flow_id=flow["flow_id"],
+        title=flow["title"],
+        result_payload=result,
+        dry_run=True,
+    )
+    dashboard = store.dashboard(token_payload())
+
+    assert run["flow_id"] == flow["flow_id"]
+    assert run["status"] == "planned"
+    assert run["step_count"] == 4
+    assert dashboard["flow_runs"][0]["run_id"] == run["run_id"]
+    assert dashboard["events"][0]["event_type"] == "flow.run_completed"

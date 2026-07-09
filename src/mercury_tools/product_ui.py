@@ -820,6 +820,10 @@ onFlowStart:
               <div id="flow-list" class="list"><div class="item"><small>No workspace flows saved yet.</small></div></div>
             </section>
             <section class="panel">
+              <div class="row"><h2>Recent flow runs</h2><span class="pill">artifact history</span></div>
+              <div id="flow-run-list" class="list"><div class="item"><small>No flow runs yet.</small></div></div>
+            </section>
+            <section class="panel">
               <h2>Flow boundary</h2>
               <div class="cards-2">
                 <div class="card"><b>Purpose</b><span>repeatable AI-agent runbooks</span></div>
@@ -988,6 +992,18 @@ SCRIPT = """
           </div>
         </div>
       `).join('') : '<div class="item"><small>No workspace flows saved yet.</small></div>';
+
+      const flowRuns = data.flow_runs || [];
+      $('#flow-run-list').innerHTML = flowRuns.length ? flowRuns.map((item) => {
+        const artifacts = item.artifact_count ? ' - ' + item.artifact_count + ' artifacts' : '';
+        const mode = item.dry_run ? 'dry-run' : 'run';
+        return `
+          <div class="item">
+            <strong>${item.title || item.flow_id || item.run_id} <span class="pill">${item.status}</span></strong>
+            <small>${mode} - ${item.step_count || 0} steps${artifacts} - ${item.created_at || ''}</small>
+          </div>
+        `;
+      }).join('') : '<div class="item"><small>No flow runs yet.</small></div>';
 
       const events = data.events || [];
       $('#event-list').innerHTML = events.length ? events.map((item) => `
@@ -1178,6 +1194,7 @@ SCRIPT = """
         });
         $('#flow-result').textContent = JSON.stringify(data, null, 2);
         message('#flow-message', 'Dry-run plan is ready.', 'ok');
+        await loadDashboard();
       } catch (error) {
         $('#flow-result').textContent = error.message;
         message('#flow-message', error.message, 'error');

@@ -167,6 +167,7 @@ After `0002` is applied, the same page persists:
 - enabled workspace skills
 - uploaded skill drafts
 - product usage/audit events
+- sanitized Mercury Flow run history
 
 In v1, connector profiles intentionally do not store raw accounting API keys or
 client secrets. Store those in a proper host/user secret vault until Mercury has

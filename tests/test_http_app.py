@@ -280,6 +280,66 @@ def test_workspace_flow_validate_and_dry_run_use_client_token(monkeypatch) -> No
     assert save.status_code == 503
 
 
+def test_workspace_flow_run_records_history_when_supabase_available(monkeypatch) -> None:
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
+    monkeypatch.setenv("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("MERCURY_CONNECT_INVITE_CODE", "invite-demo")
+    monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
+
+    from mercury_tools.mcp import server
+
+    recorded: list[dict] = []
+
+    class FakeStore:
+        def upsert_connection(self, connect_request, token_payload):
+            return {"workspace": {"id": "workspace-1"}, "member": {"id": "member-1"}}
+
+        def record_flow_run(self, *, token_payload, flow_id, title, result_payload, dry_run):
+            row = {
+                "run_id": "flow_run_1",
+                "flow_id": flow_id,
+                "title": title,
+                "status": result_payload["status"],
+                "dry_run": dry_run,
+                "step_count": len(result_payload["steps"]),
+                "artifact_count": len(result_payload["artifacts"]),
+                "created_at": "2026-07-09T00:00:00+00:00",
+            }
+            recorded.append(row)
+            return row
+
+    monkeypatch.setattr(server, "_product_store", lambda _settings=None: FakeStore())
+
+    client = TestClient(create_http_app(require_auth=True), raise_server_exceptions=False)
+    token = client.post(
+        "/api/connect",
+        json={
+            "invite_code": "invite-demo",
+            "email": "user@example.com",
+            "company": "Demo Co",
+            "host_app": "codex",
+        },
+    ).json()["token"]
+
+    response = client.post(
+        "/api/flows/run",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "title": "Company Health Check",
+            "flow_yaml": COMPANY_HEALTH_TEMPLATE,
+            "dry_run": True,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "planned"
+    assert payload["run_record"]["run_id"] == "flow_run_1"
+    assert recorded[0]["title"] == "Company Health Check"
+    assert recorded[0]["step_count"] == 4
+
+
 def test_workspace_flow_import_saves_batch(monkeypatch) -> None:
     monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
     monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")

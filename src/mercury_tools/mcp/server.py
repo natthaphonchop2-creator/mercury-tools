@@ -333,7 +333,8 @@ def run_workspace_flow_tool(client_token: str, flow_id: str, dry_run: bool = Tru
         if not settings.supabase_configured:
             raise RuntimeError("Supabase is required to load saved workspace flows.")
         token_payload = _client_token_payload_from_value(client_token)
-        flow = _product_store(settings).get_flow(token_payload=token_payload, flow_id=flow_id)
+        store = _product_store(settings)
+        flow = store.get_flow(token_payload=token_payload, flow_id=flow_id)
         if not flow:
             return {"status": "not_found", "message": f"Workspace flow not found: {flow_id}"}
         result = create_default_runner(dry_run=dry_run).run_text(str(flow.get("yaml") or ""))
@@ -343,6 +344,16 @@ def run_workspace_flow_tool(client_token: str, flow_id: str, dry_run: bool = Tru
                 "workspace_flow": _public_flow_summary(flow),
             }
         )
+        try:
+            payload["run_record"] = store.record_flow_run(
+                token_payload=token_payload,
+                flow_id=flow_id,
+                title=str(flow.get("title") or flow.get("name") or ""),
+                result_payload=payload,
+                dry_run=dry_run,
+            )
+        except (AttributeError, RuntimeError, ValueError) as exc:
+            payload["run_history"] = {"status": "not_recorded", "message": str(exc)}
         _audit(
             "run_workspace_flow",
             {"client_token": client_token, "flow_id": flow_id, "dry_run": dry_run},
@@ -704,6 +715,8 @@ async def run_workspace_flow(request: Request) -> Response:
         dry_run = bool(data.get("dry_run", True))
         flow_yaml = str(data.get("flow_yaml") or "")
         flow_id = str(data.get("flow_id") or "").strip()
+        flow_title = str(data.get("title") or "").strip()
+        flow: dict[str, Any] | None = None
         if flow_id and not flow_yaml:
             if not settings.supabase_configured:
                 return _json_error(
@@ -715,8 +728,23 @@ async def run_workspace_flow(request: Request) -> Response:
             if not flow:
                 return _json_error("not_found", f"Workspace flow not found: {flow_id}", status_code=404)
             flow_yaml = str(flow.get("yaml") or "")
+            flow_title = str(flow.get("title") or flow.get("name") or flow_title)
         result = create_default_runner(dry_run=dry_run).run_text(flow_yaml)
-        return JSONResponse(redact_json(result.as_dict()))
+        payload = redact_json(result.as_dict())
+        if flow:
+            payload["workspace_flow"] = _public_flow_summary(flow)
+        if settings.supabase_configured:
+            try:
+                payload["run_record"] = _product_store(settings).record_flow_run(
+                    token_payload=token_payload,
+                    flow_id=flow_id or None,
+                    title=flow_title or str(payload.get("flow", {}).get("name") or ""),
+                    result_payload=payload,
+                    dry_run=dry_run,
+                )
+            except (AttributeError, RuntimeError, ValueError) as exc:
+                payload["run_history"] = {"status": "not_recorded", "message": str(exc)}
+        return JSONResponse(redact_json(payload))
     except PermissionError as exc:
         return _json_error("unauthorized", str(exc), status_code=401)
     except (FlowValidationError, RuntimeError, ValueError) as exc:
