@@ -331,6 +331,24 @@ def _fallback_dashboard(token_payload: dict[str, Any], *, reason: str) -> dict[s
     }
 
 
+def _public_connector_credentials_summary(
+    result: dict[str, Any],
+    *,
+    connector_id: str,
+    environment: str,
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "status": "credentials_received",
+        "connector_id": str(result.get("connector_id") or connector_id),
+        "environment": str(result.get("environment") or environment),
+        "credential_fields": sorted(str(field) for field in result.get("credential_fields") or []),
+    }
+    setup_state = result.get("setup_state") or result.get("status")
+    if setup_state:
+        summary["setup_state"] = str(setup_state)
+    return summary
+
+
 def _json_error(error: str, message: str, *, status_code: int) -> JSONResponse:
     return JSONResponse({"error": error, "message": message}, status_code=status_code)
 
@@ -453,6 +471,8 @@ def submit_connector_credentials(
 ) -> dict[str, Any]:
     """Store connector credentials server-side after checking required fields."""
     try:
+        settings = load_settings()
+        token_payload = _client_token_payload_from_value(client_token)
         manifest = connector_by_id(connector_id)
         if not manifest:
             raise ValueError(f"Unknown connector: {connector_id}")
@@ -470,21 +490,23 @@ def submit_connector_credentials(
             )
             return payload
 
-        settings = load_settings()
-        token_payload = _client_token_payload_from_value(client_token)
         result = _product_store(settings).set_connector_credentials(
             token_payload=token_payload,
             connector_id=connector_id,
             environment=environment,
             credentials={str(key): str(value) for key, value in credentials.items()},
         )
-        payload = redact_json({"status": "credentials_received", "result": result})
+        payload = _public_connector_credentials_summary(
+            result,
+            connector_id=connector_id,
+            environment=environment,
+        )
         _audit(
             "submit_connector_credentials",
             {**_client_token_audit_ref(client_token), "connector_id": connector_id},
             {
                 "status": "credentials_received",
-                "credential_fields": result["credential_fields"],
+                "credential_fields": payload["credential_fields"],
             },
         )
         return payload

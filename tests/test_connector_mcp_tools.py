@@ -20,7 +20,6 @@ def make_client_token() -> str:
             host_app="codex",
             invite_code="invite",
         ),
-        now=1783536613,
     )
 
 
@@ -116,6 +115,24 @@ def test_submit_connector_credentials_reports_missing_required_fields(monkeypatc
     assert "Required connector credentials are missing" in payload["message"]
 
 
+def test_submit_connector_credentials_validates_token_before_missing_fields(monkeypatch) -> None:
+    from mercury_tools.mcp.server import submit_connector_credentials
+
+    configure_product_env(monkeypatch)
+
+    payload = submit_connector_credentials(
+        client_token="not-a-token",
+        connector_id="flowaccount",
+        environment="production",
+        credentials={"client_id": "demo-client-id"},
+    )
+
+    assert payload["status"] == "error"
+    assert "client token" in payload["message"]
+    assert "missing_fields" not in payload
+    assert "credential_fields" not in payload
+
+
 def test_submit_connector_credentials_stores_only_field_names(monkeypatch) -> None:
     from mercury_tools.mcp import server
 
@@ -141,6 +158,7 @@ def test_submit_connector_credentials_stores_only_field_names(monkeypatch) -> No
                 "environment": environment,
                 "credential_fields": sorted(credentials),
                 "credential_fingerprints": {"client_secret": "abc123"},
+                "ciphertext": "encrypted-secret-derived-value",
             }
 
     monkeypatch.setattr(server, "_product_store", lambda settings: FakeStore())
@@ -156,7 +174,15 @@ def test_submit_connector_credentials_stores_only_field_names(monkeypatch) -> No
     )
 
     assert payload["status"] == "credentials_received"
-    assert payload["result"]["credential_fields"] == ["client_id", "client_secret"]
+    assert payload["connector_id"] == "flowaccount"
+    assert payload["environment"] == "production"
+    assert payload["credential_fields"] == ["client_id", "client_secret"]
+    assert payload["setup_state"] == "credentials_configured"
+    assert "result" not in payload
+    assert "credential_fingerprints" not in str(payload)
+    assert "abc123" not in str(payload)
+    assert "ciphertext" not in str(payload)
+    assert "encrypted-secret-derived-value" not in str(payload)
     assert "super-secret-value" not in str(payload)
     assert "demo-client-id" not in str(payload)
 
