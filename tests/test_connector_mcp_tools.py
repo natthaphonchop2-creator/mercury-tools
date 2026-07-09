@@ -645,6 +645,150 @@ def test_workspace_connector_ready_blocks_capabilities_outside_manifest() -> Non
     )
 
 
+def test_retrieve_workspace_context_pack_uses_active_connector(monkeypatch) -> None:
+    from mercury_tools.mcp import server
+    from mercury_tools.mcp.server import retrieve_workspace_context_pack
+
+    configure_product_env(monkeypatch)
+    captured: dict[str, Any] = {}
+    audit_events: list[dict[str, Any]] = []
+
+    class FakeStore:
+        def dashboard(self, token_payload):
+            assert token_payload["sub"] == "owner@example.com"
+            return {
+                "connector_profiles": [
+                    {
+                        "connector_id": "flowaccount",
+                        "environment": "production",
+                        "status": "ready",
+                        "metadata": {
+                            "setup_state": "ready",
+                            "enabled_capabilities": ["documents.invoice.list"],
+                        },
+                    }
+                ]
+            }
+
+    class FakeService:
+        def context_pack(self, query, *, task=None, filters=None, max_chunks=12):
+            captured["query"] = query
+            captured["task"] = task
+            captured["filters"] = filters
+            captured["max_chunks"] = max_chunks
+            return type(
+                "Pack",
+                (),
+                {
+                    "results": [],
+                    "as_dict": lambda self: {
+                        "query": query,
+                        "task": task,
+                        "context": [],
+                        "connector_context": "service value should not win",
+                    },
+                },
+            )()
+
+    def fake_audit(tool_name, input_payload, output_summary):
+        audit_events.append(
+            {
+                "tool_name": tool_name,
+                "input_payload": input_payload,
+                "output_summary": output_summary,
+            }
+        )
+
+    monkeypatch.setattr(server, "_product_store", lambda settings=None: FakeStore())
+    monkeypatch.setattr(server, "_service", lambda: FakeService())
+    monkeypatch.setattr(server, "_audit", fake_audit)
+
+    token = make_client_token()
+    payload = retrieve_workspace_context_pack(
+        client_token=token,
+        query="สรุปรายได้อาทิตย์นี้",
+        task="weekly_revenue",
+        max_chunks=7,
+    )
+
+    assert payload["status"] == "ok"
+    assert captured["query"] == "สรุปรายได้อาทิตย์นี้"
+    assert captured["task"] == "weekly_revenue"
+    assert captured["max_chunks"] == 7
+    assert captured["filters"].connector == "flowaccount"
+    assert captured["filters"].review_status == "reviewed"
+    assert payload["connector_context"]["connector_id"] == "flowaccount"
+    assert payload["connector_context"]["environment"] == "production"
+    assert token not in str(audit_events)
+    assert audit_events[-1]["tool_name"] == "retrieve_workspace_context_pack"
+    assert audit_events[-1]["input_payload"]["client_token_hash"]
+    assert audit_events[-1]["output_summary"]["connector_id"] == "flowaccount"
+
+
+def test_retrieve_workspace_context_pack_requires_setup_without_ready_available_connector(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+    from mercury_tools.mcp.server import retrieve_workspace_context_pack
+
+    configure_product_env(monkeypatch)
+    audit_events: list[dict[str, Any]] = []
+
+    class FakeStore:
+        def dashboard(self, token_payload):
+            assert token_payload["sub"] == "owner@example.com"
+            return {
+                "connector_profiles": [
+                    {
+                        "connector_id": "peak",
+                        "environment": "production",
+                        "status": "ready",
+                        "metadata": {
+                            "setup_state": "ready",
+                            "enabled_capabilities": ["company.info.read"],
+                        },
+                    },
+                    {
+                        "connector_id": "flowaccount",
+                        "environment": "production",
+                        "status": "credentials_configured",
+                        "metadata": {"setup_state": "credentials_received"},
+                    },
+                ]
+            }
+
+    class FakeService:
+        def context_pack(self, *args, **kwargs):
+            raise AssertionError("setup-required workspace should not hit RAG")
+
+    def fake_audit(tool_name, input_payload, output_summary):
+        audit_events.append(
+            {
+                "tool_name": tool_name,
+                "input_payload": input_payload,
+                "output_summary": output_summary,
+            }
+        )
+
+    monkeypatch.setattr(server, "_product_store", lambda settings=None: FakeStore())
+    monkeypatch.setattr(server, "_service", lambda: FakeService())
+    monkeypatch.setattr(server, "_audit", fake_audit)
+
+    token = make_client_token()
+    payload = retrieve_workspace_context_pack(
+        client_token=token,
+        query="สรุปรายได้อาทิตย์นี้",
+    )
+
+    assert payload["status"] == "requires_setup"
+    assert payload["next_tool"] == "start_connector_setup"
+    assert payload["next_skill"] == "connector-credential-setup-th"
+    assert "connector credential setup" in payload["message"]
+    assert token not in str(audit_events)
+    assert audit_events[-1]["tool_name"] == "retrieve_workspace_context_pack"
+    assert audit_events[-1]["output_summary"]["status"] == "requires_setup"
+
+
 def test_run_workspace_flow_requires_ready_connector(monkeypatch) -> None:
     from mercury_tools.mcp import server
 

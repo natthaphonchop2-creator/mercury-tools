@@ -631,6 +631,54 @@ def workspace_connector_ready(
     )
 
 
+def _active_workspace_connector_profile(dashboard_payload: dict[str, Any]) -> dict[str, Any] | None:
+    profiles = dashboard_payload.get("connector_profiles")
+    if not isinstance(profiles, list):
+        return None
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        connector_id = _clean_selector(profile.get("connector_id"))
+        environment = _clean_selector(profile.get("environment"))
+        if not connector_id or not environment:
+            continue
+        if _workspace_connector_ready(
+            {"connector_profiles": [profile]},
+            connector_id=connector_id,
+            environment=environment,
+        ):
+            return profile
+    return None
+
+
+def _connector_context_from_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    metadata = _mapping(profile.get("metadata"))
+    context = {
+        "connector_id": str(profile.get("connector_id") or "").strip().lower(),
+        "environment": str(profile.get("environment") or "").strip().lower(),
+        "status": str(profile.get("status") or metadata.get("setup_state") or "ready"),
+        "enabled_capabilities": sorted(
+            str(item).strip() for item in _profile_enabled_capabilities(profile)
+        ),
+    }
+    setup_state = metadata.get("setup_state")
+    if setup_state:
+        context["setup_state"] = str(setup_state)
+    return context
+
+
+def _workspace_context_setup_required_payload() -> dict[str, Any]:
+    return {
+        "status": "requires_setup",
+        "message": (
+            "connector credential setup is required before retrieving workspace-specific "
+            "accounting context."
+        ),
+        "next_tool": "start_connector_setup",
+        "next_skill": "connector-credential-setup-th",
+    }
+
+
 def _connector_setup_block_payload() -> dict[str, Any]:
     return {
         "status": "blocked",
@@ -717,6 +765,70 @@ def retrieve_context_pack(
     payload = redact_json(pack.as_dict())
     _audit("retrieve_context_pack", {"query": query, "task": task}, {"count": len(pack.results)})
     return payload
+
+
+@mcp.tool()
+def retrieve_workspace_context_pack(
+    client_token: str,
+    query: str,
+    task: str | None = None,
+    max_chunks: int = 12,
+) -> dict[str, Any]:
+    """Return a cited context pack filtered to the workspace's ready connector."""
+    audit_input = {
+        **_client_token_audit_ref(client_token),
+        "query": query,
+        "task": task,
+        "max_chunks": max_chunks,
+    }
+    try:
+        settings = load_settings()
+        token_payload = _client_token_payload_from_value(client_token)
+        dashboard_payload = _product_store(settings).dashboard(token_payload)
+        profile = _active_workspace_connector_profile(dashboard_payload)
+        if profile is None:
+            payload = redact_json(_workspace_context_setup_required_payload())
+            _audit(
+                "retrieve_workspace_context_pack",
+                audit_input,
+                {"status": "requires_setup"},
+            )
+            return payload
+        connector_context = _connector_context_from_profile(profile)
+        pack = _service().context_pack(
+            query,
+            task=task,
+            filters=_filters(
+                {
+                    "connector": connector_context["connector_id"],
+                    "review_status": "reviewed",
+                }
+            ),
+            max_chunks=max_chunks,
+        )
+        payload = pack.as_dict()
+        payload.update(
+            {
+                "status": "ok",
+                "connector_context": connector_context,
+            }
+        )
+        payload = redact_json(payload)
+        _audit(
+            "retrieve_workspace_context_pack",
+            audit_input,
+            {
+                "status": "ok",
+                "connector_id": connector_context["connector_id"],
+                "environment": connector_context["environment"],
+                "count": len(pack.results),
+            },
+        )
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit("retrieve_workspace_context_pack", audit_input, payload)
+        return payload
 
 
 @mcp.tool()
