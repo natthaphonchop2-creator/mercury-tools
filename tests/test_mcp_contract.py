@@ -297,7 +297,7 @@ def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:
         token,
         "workspace-company-health-12345678",
         dry_run=True,
-        env={"connector": "flowaccount"},
+        env={"connector": "flowaccount", "environment": "production"},
     )
 
     assert listed["status"] == "ok"
@@ -310,7 +310,8 @@ def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:
     assert ran["workspace_flow"]["flow_id"] == "workspace-company-health-12345678"
     assert ran["steps"][0]["command"] == "connectorStatus"
     assert ran["variables"]["env"]["connector"] == "flowaccount"
-    assert ran["run_record"]["env_keys"] == ["connector"]
+    assert ran["variables"]["env"]["environment"] == "production"
+    assert ran["run_record"]["env_keys"] == ["connector", "environment"]
     assert audit_events
     assert all(token not in str(event["input_payload"]) for event in audit_events)
     assert all("client_token_hash" in event["input_payload"] for event in audit_events)

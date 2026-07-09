@@ -14,6 +14,7 @@ description: Retrieve cited accounting context and package a skill for the host 
 tags: [accounting, read-only]
 env:
   jurisdiction: TH
+  environment: production
 ---
 - connectorStatus:
     saveAs: connectorState
@@ -183,6 +184,7 @@ description: Read-only Mercury flow for a Thai accounting health-check handoff.
 tags: [accounting, read-only, flowaccount]
 env:
   jurisdiction: TH
+  environment: production
   connector: flowaccount
 onFlowStart:
   - connectorStatus:
@@ -219,6 +221,7 @@ description: Read-only Mercury flow for VAT summary context and skill packaging.
 tags: [accounting, read-only, vat, flowaccount]
 env:
   jurisdiction: TH
+  environment: production
   connector: flowaccount
 ---
 - retrieveContextPack:

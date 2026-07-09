@@ -554,6 +554,14 @@ def test_workspace_connector_ready_uses_selected_connector_and_environment() -> 
     )
 
 
+def test_workspace_connector_ready_blocks_selected_connector_without_environment() -> None:
+    from mercury_tools.mcp.server import workspace_connector_ready
+
+    dashboard = {"connector_profiles": [ready_connector_profile()]}
+
+    assert not workspace_connector_ready(dashboard, connector_id="flowaccount")
+
+
 def test_run_workspace_flow_requires_ready_connector(monkeypatch) -> None:
     from mercury_tools.mcp import server
 
@@ -594,6 +602,52 @@ def test_run_workspace_flow_requires_ready_connector(monkeypatch) -> None:
     assert "connector credential setup" in payload["message"]
 
 
+def test_run_workspace_flow_blocks_selected_connector_without_environment(monkeypatch) -> None:
+    from mercury_tools.mcp import server
+
+    connector_flow_missing_environment = """name: FlowAccount Missing Environment
+tags: [accounting, read-only, flowaccount]
+env:
+  connector: flowaccount
+---
+- connectorStatus:
+    saveAs: connectorState
+- emitReport:
+    title: "Connector handoff"
+    sections:
+      - "Ready"
+"""
+
+    class FakeStore:
+        def dashboard(self, token_payload):
+            return {
+                "workspace": {"name": "Demo Co"},
+                "flows": [
+                    {
+                        "flow_id": "workspace-missing-env",
+                        "title": "Missing Environment",
+                        "yaml": connector_flow_missing_environment,
+                    }
+                ],
+                "connector_profiles": [ready_connector_profile()],
+            }
+
+        def get_flow(self, *, token_payload, flow_id):
+            raise AssertionError("missing environment should block before loading the flow")
+
+    configure_product_env(monkeypatch)
+    monkeypatch.setattr(server, "_product_store", lambda settings=None: FakeStore())
+
+    payload = server.run_workspace_flow_tool(
+        client_token=make_client_token(),
+        flow_id="workspace-missing-env",
+        dry_run=False,
+    )
+
+    assert payload["status"] == "blocked"
+    assert "connector credential setup" in payload["message"]
+
+
 def test_run_workspace_flow_blocks_selected_connector_mismatch(monkeypatch) -> None:
     from mercury_tools.mcp import server
 
@@ -621,7 +675,7 @@ def test_run_workspace_flow_blocks_selected_connector_mismatch(monkeypatch) -> N
         client_token=make_client_token(),
         flow_id="workspace-revenue",
         dry_run=False,
-        env={"connector": "peak"},
+        env={"connector": "peak", "environment": "production"},
     )
 
     assert payload["status"] == "blocked"

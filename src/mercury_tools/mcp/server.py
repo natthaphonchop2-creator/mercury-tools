@@ -553,6 +553,8 @@ def _workspace_connector_ready(
         return False
     selected_connector = _clean_selector(connector_id)
     selected_environment = _clean_selector(environment)
+    if not selected_connector or not selected_environment:
+        return False
     required = {str(capability).strip() for capability in required_capabilities or [] if str(capability).strip()}
     for profile in profiles:
         if not isinstance(profile, dict):

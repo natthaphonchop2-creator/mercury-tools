@@ -104,3 +104,38 @@ DONE
 ### Concerns
 
 - The only warning is the existing Starlette `TestClient` deprecation warning triggered by the test import.
+
+## Critical Environment Gate Fix
+
+### Status
+
+DONE
+
+### Summary
+
+- Changed connector readiness to require both an explicit selected connector and an explicit selected environment before accepting a ready connector profile.
+- Connector-backed saved MCP flows with `connector` selected but no `environment` now return the existing connector setup blocked payload before loading/executing the saved flow.
+- Connector-backed raw HTTP `flow_yaml` with `connector` selected but no `environment` now returns the existing connector setup blocked payload before execution or run-history recording.
+- Updated built-in FlowAccount cheat-sheet/company-health/VAT templates to declare `environment: production`.
+- Updated MCP/HTTP callers that intentionally execute connector-backed built-in FlowAccount flows to pass or inherit explicit production environment.
+- Non-connector raw HTTP flows remain ungated and continue to run without connector readiness.
+
+### Regression Evidence
+
+- RED: `uv run pytest tests/test_connector_mcp_tools.py::test_workspace_connector_ready_blocks_selected_connector_without_environment tests/test_connector_mcp_tools.py::test_run_workspace_flow_blocks_selected_connector_without_environment tests/test_http_app.py::test_workspace_flow_run_blocks_raw_yaml_with_connector_missing_environment -v`
+  - Result: 3 failed before the gate fix, proving the reviewed missing-environment execution path.
+- GREEN: `uv run pytest tests/test_connector_mcp_tools.py::test_workspace_connector_ready_blocks_selected_connector_without_environment tests/test_connector_mcp_tools.py::test_run_workspace_flow_blocks_selected_connector_without_environment tests/test_http_app.py::test_workspace_flow_run_blocks_raw_yaml_with_connector_missing_environment -v`
+  - Result: 3 passed, 1 existing Starlette `TestClient` deprecation warning.
+
+### Verification
+
+- `uv run pytest tests/test_connector_mcp_tools.py tests/test_mcp_contract.py tests/test_http_app.py tests/test_flows.py -v`
+  - Result: 85 passed, 1 existing Starlette `TestClient` deprecation warning.
+- `uv run pytest -m "not integration"`
+  - Result: 120 passed, 1 deselected, 1 existing Starlette `TestClient` deprecation warning.
+- `uv run ruff check .`
+  - Result: all checks passed.
+
+### Concerns
+
+- The only warning is the existing Starlette `TestClient` deprecation warning triggered by the test import.
