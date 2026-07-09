@@ -2,6 +2,8 @@ import json
 import re
 from pathlib import Path
 
+from mercury_tools.db.product import SKILL_CATALOG_SEED
+
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = ROOT / "plugins/mercury-finance"
 
@@ -67,6 +69,15 @@ EXPECTED_SKILLS = {
         "run_mercury_flow",
     ],
 }
+
+
+def test_product_catalog_contains_every_bundled_plugin_skill() -> None:
+    bundled = {
+        path.parent.name for path in (PLUGIN_ROOT / "skills").glob("*/SKILL.md")
+    }
+    catalog = {row["skill_id"] for row in SKILL_CATALOG_SEED}
+
+    assert catalog == bundled
 
 
 def test_contest_plugin_uses_public_workspace_contract() -> None:

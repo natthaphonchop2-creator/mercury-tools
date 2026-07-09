@@ -76,6 +76,26 @@ SKILL_CATALOG_SEED: list[dict[str, Any]] = [
         "tags": ["setup", "connector", "thai"],
     },
     {
+        "skill_id": "connector-credential-setup-th",
+        "title": "Connector Credential Setup TH",
+        "category": "setup",
+        "summary": "นำผู้ใช้เชื่อม ERP ทีละขั้นและหยุดรอจนแต่ละขั้นตรวจสอบสำเร็จ",
+        "status": "available",
+        "version": "0.1.0",
+        "required_connectors": [],
+        "tags": ["setup", "credentials", "connector", "thai"],
+    },
+    {
+        "skill_id": "flowaccount-connector-setup-th",
+        "title": "FlowAccount Connector Setup TH",
+        "category": "setup",
+        "summary": "เชื่อมและตรวจสอบ FlowAccount แบบ guided setup โดยไม่เปิดเผย credential",
+        "status": "available",
+        "version": "0.1.0",
+        "required_connectors": ["flowaccount"],
+        "tags": ["setup", "connector", "flowaccount", "thai"],
+    },
+    {
         "skill_id": "peak-connector-setup-th",
         "title": "PEAK Connector Setup TH",
         "category": "setup",
@@ -87,6 +107,16 @@ SKILL_CATALOG_SEED: list[dict[str, Any]] = [
         "version": "0.1.0",
         "required_connectors": ["peak"],
         "tags": ["setup", "connector", "peak", "thai"],
+    },
+    {
+        "skill_id": "mercury-flow-runner",
+        "title": "Mercury Flow Runner",
+        "category": "automation",
+        "summary": "วางแผน บันทึก และรัน workflow บัญชีแบบ read-only พร้อม capability gate",
+        "status": "available",
+        "version": "0.1.0",
+        "required_connectors": [],
+        "tags": ["flow", "workflow", "automation", "read-only"],
     },
 ]
 
@@ -1237,6 +1267,7 @@ class SupabaseProductStore:
         request = public_workspace_connect_request(workspace_id, company_name)
         token_payload = public_workspace_token_payload(workspace_id)
         persisted = self.upsert_connection(request, token_payload)
+        self.seed_skill_catalog()
         workspace = {
             **persisted["workspace"],
             "name": request.company,

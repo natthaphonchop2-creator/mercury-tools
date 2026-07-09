@@ -64,6 +64,23 @@ def test_product_store_creates_public_workspace_and_resolves_dashboard() -> None
     assert dashboard["workspace"]["name"] == "Public Demo Co"
 
 
+def test_public_workspace_creation_seeds_bundled_skill_catalog() -> None:
+    class SeedTrackingStore(AuditFallbackStore):
+        def __init__(self):
+            super().__init__()
+            self.seed_calls = 0
+
+        def seed_skill_catalog(self) -> int:
+            self.seed_calls += 1
+            return 0
+
+    store = SeedTrackingStore()
+
+    store.create_public_workspace("Public Demo Co")
+
+    assert store.seed_calls == 1
+
+
 def test_product_store_public_workspace_connector_vault_round_trip() -> None:
     store = AuditFallbackStore()
     created = store.create_public_workspace("Public Demo Co")
