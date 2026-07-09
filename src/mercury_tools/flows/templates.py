@@ -36,6 +36,14 @@ env:
     title: "Company health check handoff"
     sections:
       - "Use skill {{ skill.skill_id }} with the retrieved cited context."
+- emitReport:
+    when:
+      equals:
+        value: "${environment}"
+        expected: production
+    title: "Production-only review"
+    sections:
+      - "Run this handoff only for production workspace checks."
 
 Commands:
 - connectorStatus: read sanitized connector state.
@@ -51,6 +59,12 @@ Template variables:
 - ${jurisdiction} reads from env.
 - {{ context.query }} reads a previous step saved with saveAs: context.
 - CLI overrides use -e KEY=value or --env KEY=value and take precedence over flow/workspace env.
+
+Conditional execution:
+- Add when: to any command to skip it unless the condition passes.
+- Supported conditions: true, exists, notExists, equals, notEquals.
+- Multiple conditions are ANDed.
+- Mercury does not evaluate arbitrary JavaScript in v1.
 
 Workspace quickstart:
 - mercury-tools flow init-workspace ./my-mercury-flows

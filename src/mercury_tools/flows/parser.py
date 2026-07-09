@@ -19,12 +19,28 @@ class FlowValidationError(ValueError):
     """Raised when a Mercury Flow cannot be parsed or validated."""
 
 
+def _string_key(value: Any) -> str:
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return str(value)
+
+
+def _normalize_yaml_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {_string_key(key): _normalize_yaml_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalize_yaml_value(item) for item in value]
+    return value
+
+
 def _ensure_mapping(value: Any, *, label: str) -> dict[str, Any]:
     if value is None:
         return {}
     if not isinstance(value, dict):
         raise FlowValidationError(f"{label} must be a mapping.")
-    return {str(key): val for key, val in value.items()}
+    return _normalize_yaml_value(value)
 
 
 def _string_list(value: Any, *, label: str) -> list[str]:
@@ -49,7 +65,7 @@ def _parse_command(raw: Any, *, source: str, index: int) -> FlowCommand:
         if raw_args is None:
             args = {}
         elif isinstance(raw_args, dict):
-            args = {str(key): value for key, value in raw_args.items()}
+            args = _normalize_yaml_value(raw_args)
         else:
             args = {"value": raw_args}
     else:

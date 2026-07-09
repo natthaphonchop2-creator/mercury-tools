@@ -183,6 +183,14 @@ env:
     evidenceMode: true
     saveAs: skill
 - emitReport:
+    when:
+      equals:
+        value: "${connector}"
+        expected: flowaccount
+    title: "FlowAccount-only handoff"
+    sections:
+      - "This step runs only when the selected connector is FlowAccount."
+- emitReport:
     title: "Company health-check context pack"
     sections:
       - "Use skill {{ skill.skill_id }} and the cited context pack to answer."
@@ -224,6 +232,11 @@ executionOrder:
 Like Maestro's `-e KEY=value` runtime parameters, Mercury accepts `-e` or
 `--env` on `flow run`, `flow run-suite`, and `flow watch`. These values are
 strings and override flow/workspace `env` values for that run.
+
+Like Maestro's `when` blocks, Mercury commands can run conditionally. v1 keeps
+this deterministic for accounting workflows: `true`, `exists`, `notExists`,
+`equals`, and `notEquals` are supported, and multiple conditions are ANDed.
+Arbitrary JavaScript evaluation is intentionally not enabled in Mercury v1.
 
 This mirrors Maestro's workspace model at the Mercury layer: config, folder
 architecture, tag-based discovery, deterministic execution order, output

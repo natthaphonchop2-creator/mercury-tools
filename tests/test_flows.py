@@ -77,6 +77,90 @@ def test_flow_runner_executes_with_injected_services() -> None:
     assert payload["variables"]["skill"]["skill_id"] == "company-health-check-th"
 
 
+def test_flow_runner_supports_when_conditions() -> None:
+    result = MercuryFlowRunner(dry_run=True).run_text(
+        """
+name: Conditional Flow
+env:
+  environment: sandbox
+  connector_status: ready
+  optional_value: ""
+---
+- emitReport:
+    when:
+      equals:
+        value: "${environment}"
+        expected: production
+    title: "Production {{ missing.value }}"
+- emitReport:
+    when:
+      notEquals:
+        value: "${environment}"
+        expected: production
+    title: "Sandbox branch"
+- emitReport:
+    when:
+      exists: "${connector_status}"
+      true: "yes"
+    title: "Connector present"
+- emitReport:
+    when:
+      notExists: "${optional_value}"
+    title: "Optional value absent"
+""",
+    )
+
+    payload = result.as_dict()
+
+    assert [step["status"] for step in payload["steps"]] == [
+        "skipped",
+        "planned",
+        "planned",
+        "planned",
+    ]
+    assert payload["steps"][0]["output_summary"]["when"]["equals"]["value"] == "sandbox"
+    assert [artifact["title"] for artifact in payload["artifacts"]] == [
+        "Sandbox branch",
+        "Connector present",
+        "Optional value absent",
+    ]
+
+
+def test_flow_runner_rejects_unknown_when_condition() -> None:
+    with pytest.raises(FlowValidationError, match="Unsupported when condition"):
+        MercuryFlowRunner(dry_run=True).run_text(
+            """
+name: Bad Condition
+---
+- emitReport:
+    when:
+      visible: "not a Mercury condition"
+    title: "Should not run"
+"""
+        )
+
+
+def test_flow_cli_run_json_handles_yaml_true_condition_key(tmp_path: Path, capsys) -> None:
+    path = tmp_path / "condition.yaml"
+    path.write_text(
+        """
+name: True Condition
+---
+- emitReport:
+    when:
+      true: yes
+    title: "Runs"
+""",
+        encoding="utf-8",
+    )
+
+    assert main(["flow", "run", str(path), "--dry-run", "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["steps"][0]["status"] == "planned"
+    assert payload["flow"]["commands"][0]["args"]["when"]["true"] is True
+
+
 def test_flow_cli_validate_and_dry_run(tmp_path: Path, capsys) -> None:
     path = tmp_path / "company-health.yaml"
     path.write_text(COMPANY_HEALTH_TEMPLATE, encoding="utf-8")

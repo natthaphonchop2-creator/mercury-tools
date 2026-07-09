@@ -72,6 +72,82 @@ def _filters(raw: dict[str, Any] | None) -> SearchFilters:
     )
 
 
+def _is_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, list | dict | tuple | set):
+        return bool(value)
+    return True
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        return value != 0
+    if isinstance(value, str):
+        clean = value.strip().lower()
+        if clean in {"true", "1", "yes", "y", "on"}:
+            return True
+        if clean in {"", "false", "0", "no", "n", "off", "none", "null"}:
+            return False
+    return bool(value)
+
+
+def _condition_pair(value: Any, *, label: str) -> tuple[Any, Any]:
+    if isinstance(value, list) and len(value) == 2:
+        return value[0], value[1]
+    if isinstance(value, dict):
+        if "value" not in value:
+            raise FlowValidationError(f"when.{label} requires value.")
+        if "expected" in value:
+            return value["value"], value["expected"]
+        if "equals" in value:
+            return value["value"], value["equals"]
+        if "notEquals" in value:
+            return value["value"], value["notEquals"]
+        if "not_equals" in value:
+            return value["value"], value["not_equals"]
+        raise FlowValidationError(f"when.{label} requires expected.")
+    raise FlowValidationError(f"when.{label} must be a mapping or two-item list.")
+
+
+def _condition_matches(raw: Any) -> bool:
+    if raw is None:
+        return True
+    if isinstance(raw, bool | str | int | float):
+        return _as_bool(raw)
+    if not isinstance(raw, dict):
+        raise FlowValidationError("when must be a boolean, string, number, or mapping.")
+
+    for key, value in raw.items():
+        condition = str(key)
+        if condition.lower() == "true":
+            condition = "true"
+        if condition == "true":
+            if not _as_bool(value):
+                return False
+        elif condition == "exists":
+            if not _is_present(value):
+                return False
+        elif condition in {"notExists", "not_exists"}:
+            if _is_present(value):
+                return False
+        elif condition == "equals":
+            left, right = _condition_pair(value, label=condition)
+            if str(left) != str(right):
+                return False
+        elif condition in {"notEquals", "not_equals"}:
+            left, right = _condition_pair(value, label=condition)
+            if str(left) == str(right):
+                return False
+        else:
+            raise FlowValidationError(f"Unsupported when condition: {condition}")
+    return True
+
+
 class MercuryFlowRunner:
     """Executes Mercury YAML flows one command at a time."""
 
@@ -110,6 +186,21 @@ class MercuryFlowRunner:
         base_dir = flow.path.parent if flow.path else Path.cwd()
 
         for sequence, command in enumerate(flow.all_commands(), start=1):
+            rendered_when = _interpolate(command.args.get("when"), variables)
+            if not _condition_matches(rendered_when):
+                steps.append(
+                    FlowStepResult(
+                        index=sequence,
+                        command=command.name,
+                        status="skipped",
+                        source=command.source,
+                        output_summary={
+                            "reason": "when condition evaluated false",
+                            "when": redact_json(rendered_when),
+                        },
+                    )
+                )
+                continue
             rendered_args = _interpolate(command.args, variables)
             if self.dry_run:
                 output = self._planned_output(command, rendered_args)
