@@ -536,7 +536,7 @@ git commit -m "Add gated connector setup state"
 - Produces MCP tool: `list_connectors() -> dict[str, Any]`
 - Produces MCP tool: `start_connector_setup(client_token: str, connector_id: str, environment: str, company_name: str | None = None) -> dict[str, Any]`
 - Produces MCP tool: `submit_connector_credentials(client_token: str, connector_id: str, environment: str, credentials: dict[str, Any]) -> dict[str, Any]`
-- Produces MCP tool: `validate_connector_connection(client_token: str, connector_id: str, environment: str) -> dict[str, Any]`
+- Produces MCP tool: `validate_connector_connection(client_token: str, connector_id: str, environment: str, credentials: dict[str, Any]) -> dict[str, Any]`
 
 - [ ] **Step 1: Write failing MCP tool tests**
 
@@ -1354,8 +1354,9 @@ FileNotFoundError for .agents/plugins/marketplace.json
 
 - [ ] **Step 3: Create marketplace and plugin files**
 
+File: `.agents/plugins/marketplace.json`
+
 ```json
-// .agents/plugins/marketplace.json
 {
   "plugins": [
     {
@@ -1371,8 +1372,9 @@ FileNotFoundError for .agents/plugins/marketplace.json
 }
 ```
 
+File: `plugins/mercury-finance/.codex-plugin/plugin.json`
+
 ```json
-// plugins/mercury-finance/.codex-plugin/plugin.json
 {
   "name": "mercury-finance",
   "display_name": "Mercury Finance",
@@ -1388,8 +1390,9 @@ FileNotFoundError for .agents/plugins/marketplace.json
 }
 ```
 
+File: `plugins/mercury-finance/.mcp.json`
+
 ```json
-// plugins/mercury-finance/.mcp.json
 {
   "mcpServers": {
     "mercury-tools": {
