@@ -520,8 +520,22 @@ def ready_connector_profile(
 def test_workspace_connector_ready_blocks_missing_or_empty_profiles() -> None:
     from mercury_tools.mcp.server import workspace_connector_ready
 
-    assert workspace_connector_ready({"workspace": {"name": "Demo Co"}}) is False
-    assert workspace_connector_ready({"connector_profiles": []}) is False
+    assert (
+        workspace_connector_ready(
+            {"workspace": {"name": "Demo Co"}},
+            connector_id="flowaccount",
+            environment="production",
+        )
+        is False
+    )
+    assert (
+        workspace_connector_ready(
+            {"connector_profiles": []},
+            connector_id="flowaccount",
+            environment="production",
+        )
+        is False
+    )
 
 
 def test_workspace_connector_ready_blocks_ready_profile_without_capabilities() -> None:
@@ -529,7 +543,31 @@ def test_workspace_connector_ready_blocks_ready_profile_without_capabilities() -
 
     profile = ready_connector_profile(capabilities=[])
 
-    assert workspace_connector_ready({"connector_profiles": [profile]}) is False
+    assert (
+        workspace_connector_ready(
+            {"connector_profiles": [profile]},
+            connector_id="flowaccount",
+            environment="production",
+        )
+        is False
+    )
+
+
+def test_workspace_connector_ready_accepts_flowaccount_required_capability() -> None:
+    from mercury_tools.mcp.server import workspace_connector_ready
+
+    dashboard = {
+        "connector_profiles": [
+            ready_connector_profile(capabilities=["company.info.read", "contacts.list"])
+        ]
+    }
+
+    assert workspace_connector_ready(
+        dashboard,
+        connector_id="flowaccount",
+        environment="production",
+        required_capabilities=["company.info.read"],
+    )
 
 
 def test_workspace_connector_ready_uses_selected_connector_and_environment() -> None:
@@ -560,6 +598,51 @@ def test_workspace_connector_ready_blocks_selected_connector_without_environment
     dashboard = {"connector_profiles": [ready_connector_profile()]}
 
     assert not workspace_connector_ready(dashboard, connector_id="flowaccount")
+
+
+def test_workspace_connector_ready_blocks_setup_targets_even_if_profile_claims_ready() -> None:
+    from mercury_tools.mcp.server import workspace_connector_ready
+
+    for connector_id, environment in (
+        ("peak", "production"),
+        ("express", "local"),
+        ("custom", "production"),
+    ):
+        dashboard = {
+            "connector_profiles": [
+                ready_connector_profile(
+                    connector_id=connector_id,
+                    environment=environment,
+                    capabilities=["company.info.read", "made.up.capability"],
+                )
+            ]
+        }
+
+        assert not workspace_connector_ready(
+            dashboard,
+            connector_id=connector_id,
+            environment=environment,
+            required_capabilities=["company.info.read"],
+        )
+
+
+def test_workspace_connector_ready_blocks_capabilities_outside_manifest() -> None:
+    from mercury_tools.mcp.server import workspace_connector_ready
+
+    dashboard = {
+        "connector_profiles": [
+            ready_connector_profile(
+                capabilities=["company.info.read", "made.up.capability"],
+            )
+        ]
+    }
+
+    assert not workspace_connector_ready(
+        dashboard,
+        connector_id="flowaccount",
+        environment="production",
+        required_capabilities=["company.info.read"],
+    )
 
 
 def test_run_workspace_flow_requires_ready_connector(monkeypatch) -> None:
@@ -667,6 +750,45 @@ def test_run_workspace_flow_blocks_selected_connector_mismatch(monkeypatch) -> N
 
         def get_flow(self, *, token_payload, flow_id):
             raise AssertionError("connector mismatch should not load the flow")
+
+    configure_product_env(monkeypatch)
+    monkeypatch.setattr(server, "_product_store", lambda settings=None: FakeStore())
+
+    payload = server.run_workspace_flow_tool(
+        client_token=make_client_token(),
+        flow_id="workspace-revenue",
+        dry_run=False,
+        env={"connector": "peak", "environment": "production"},
+    )
+
+    assert payload["status"] == "blocked"
+    assert "connector credential setup" in payload["message"]
+
+
+def test_run_workspace_flow_blocks_peak_setup_target_claiming_ready(monkeypatch) -> None:
+    from mercury_tools.mcp import server
+
+    class FakeStore:
+        def dashboard(self, token_payload):
+            return {
+                "workspace": {"name": "Demo Co"},
+                "flows": [
+                    {
+                        "flow_id": "workspace-revenue",
+                        "title": "Revenue",
+                        "yaml": COMPANY_HEALTH_TEMPLATE,
+                    }
+                ],
+                "connector_profiles": [
+                    ready_connector_profile(
+                        connector_id="peak",
+                        capabilities=["company.info.read", "made.up.capability"],
+                    )
+                ],
+            }
+
+        def get_flow(self, *, token_payload, flow_id):
+            raise AssertionError("PEAK setup target should not load the flow")
 
     configure_product_env(monkeypatch)
     monkeypatch.setattr(server, "_product_store", lambda settings=None: FakeStore())

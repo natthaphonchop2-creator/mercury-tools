@@ -352,6 +352,18 @@ def _profile_enabled_capabilities(profile: dict[str, Any]) -> list[Any]:
     return []
 
 
+def _manifest_has_read_only_validation_adapter(manifest: Any) -> bool:
+    validation = getattr(manifest, "validation", None)
+    method = str(getattr(validation, "method", "") or "").strip().lower()
+    endpoint = str(getattr(validation, "read_only_endpoint", "") or "").strip()
+    return bool(
+        getattr(validation, "read_only", False)
+        and method
+        and method != "manual"
+        and endpoint
+    )
+
+
 def _clean_selector(value: Any) -> str | None:
     if value is None:
         return None
@@ -555,7 +567,30 @@ def _workspace_connector_ready(
     selected_environment = _clean_selector(environment)
     if not selected_connector or not selected_environment:
         return False
+    manifest = connector_by_id(selected_connector)
+    if not manifest:
+        return False
+    if _clean_selector(manifest.status) != "available":
+        return False
+    manifest_environments = {
+        str(item).strip().lower()
+        for item in manifest.environments
+        if str(item).strip()
+    }
+    if selected_environment not in manifest_environments:
+        return False
+    if not _manifest_has_read_only_validation_adapter(manifest):
+        return False
+    manifest_capabilities = {
+        str(capability).strip()
+        for capability in manifest.capabilities
+        if str(capability).strip()
+    }
+    if not manifest_capabilities:
+        return False
     required = {str(capability).strip() for capability in required_capabilities or [] if str(capability).strip()}
+    if required and not required.issubset(manifest_capabilities):
+        return False
     for profile in profiles:
         if not isinstance(profile, dict):
             continue
@@ -572,6 +607,8 @@ def _workspace_connector_ready(
             continue
         enabled_capabilities = {str(item).strip() for item in _profile_enabled_capabilities(profile)}
         if not enabled_capabilities:
+            continue
+        if not enabled_capabilities.issubset(manifest_capabilities):
             continue
         if required and not required.issubset(enabled_capabilities):
             continue

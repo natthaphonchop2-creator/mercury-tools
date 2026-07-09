@@ -533,7 +533,7 @@ def test_workspace_flow_run_records_history_when_supabase_available(monkeypatch)
             return {"workspace": {"id": "workspace-1"}, "member": {"id": "member-1"}}
 
         def dashboard(self, token_payload):
-            return {"connector_profiles": [ready_connector_profile("peak")]}
+            return {"connector_profiles": [ready_connector_profile()]}
 
         def record_flow_run(
             self, *, token_payload, flow_id, title, result_payload, dry_run, env_keys
@@ -572,14 +572,14 @@ def test_workspace_flow_run_records_history_when_supabase_available(monkeypatch)
             "title": "Company Health Check",
             "flow_yaml": COMPANY_HEALTH_TEMPLATE,
             "dry_run": True,
-            "env": {"connector": "peak", "environment": "production"},
+            "env": {"connector": "flowaccount", "environment": "production"},
         },
     )
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "planned"
-    assert payload["variables"]["env"]["connector"] == "peak"
+    assert payload["variables"]["env"]["connector"] == "flowaccount"
     assert payload["variables"]["env"]["environment"] == "production"
     assert payload["run_record"]["run_id"] == "flow_run_1"
     assert payload["run_record"]["env_keys"] == ["connector", "environment"]

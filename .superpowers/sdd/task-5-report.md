@@ -139,3 +139,33 @@ DONE
 ### Concerns
 
 - The only warning is the existing Starlette `TestClient` deprecation warning triggered by the test import.
+
+## Final Review Critical Connector Manifest Fix
+
+### Status
+
+DONE
+
+### Summary
+
+- Changed `workspace_connector_ready` to validate the selected connector against the connector catalog before trusting any ready profile metadata.
+- Readiness now rejects missing manifests, non-`available` manifests, unsupported environments, manifests without a read-only validation adapter, empty manifest capabilities, and profile capabilities outside the manifest.
+- Required capabilities must be present in both the manifest and the matched profile's enabled capabilities.
+- FlowAccount ready profiles still pass when connector, environment, and required capabilities match.
+- PEAK, Express, and custom/unknown setup targets remain blocked even if a profile claims `ready` and includes arbitrary capabilities.
+- Converted the generic HTTP run-history positive test from PEAK to FlowAccount.
+
+### Verification
+
+- `uv run pytest tests/test_connector_mcp_tools.py::test_workspace_connector_ready_accepts_flowaccount_required_capability tests/test_connector_mcp_tools.py::test_workspace_connector_ready_blocks_setup_targets_even_if_profile_claims_ready tests/test_connector_mcp_tools.py::test_workspace_connector_ready_blocks_capabilities_outside_manifest tests/test_connector_mcp_tools.py::test_run_workspace_flow_blocks_peak_setup_target_claiming_ready tests/test_http_app.py::test_workspace_flow_run_records_history_when_supabase_available -v`
+  - Result: 5 passed, 1 existing Starlette `TestClient` deprecation warning.
+- `uv run pytest tests/test_connector_mcp_tools.py tests/test_mcp_contract.py tests/test_http_app.py -v`
+  - Result: 44 passed, 1 existing Starlette `TestClient` deprecation warning.
+- `uv run pytest -m "not integration"`
+  - Result: 124 passed, 1 deselected, 1 existing Starlette `TestClient` deprecation warning.
+- `uv run ruff check .`
+  - Result: all checks passed.
+
+### Concerns
+
+- The only warning is the existing Starlette `TestClient` deprecation warning triggered by the test import.
