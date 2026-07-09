@@ -305,6 +305,79 @@ Connector learning pipeline:
 6. Keep secrets server-side and expose only sanitized connector status to MCP
    clients.
 
+## ERP Knowledge Routing
+
+Mercury should separate connector knowledge from connector credentials.
+
+Documents that can be stored in Mercury Wiki:
+
+- public API documentation
+- private ERP API documentation provided by the user
+- endpoint lists and request/response examples
+- connector setup guides
+- endpoint-to-capability mapping notes
+- accounting workflow notes for each ERP/accounting system
+
+Documents must be indexed with connector-aware metadata:
+
+```text
+connector_id: flowaccount | peak | express | custom-erp
+program_name: FlowAccount | PEAK Accounting | Express Account | ...
+doc_type: api_reference | setup_guide | endpoint_map | workflow | accounting_reference
+jurisdiction: TH | GLOBAL | ...
+environment: production | sandbox | local | gateway | generic
+review_status: draft | reviewed | official
+source_uri: URL or uploaded document path
+```
+
+Secrets that must never be stored in the knowledge base:
+
+- API keys
+- client secrets
+- bearer tokens
+- refresh tokens
+- database passwords
+- raw user credential files
+
+Credentials belong in server-side connector profiles only. The host AI should
+know that a connector is configured, which environment it is using, and which
+capabilities are enabled, but it should not receive raw credentials.
+
+When a user asks a question, Mercury should route context in this order:
+
+1. Identify the active workspace from the Mercury client token.
+2. Read the selected accounting/ERP connector profile.
+3. Use `connector_id`, `environment`, and enabled capabilities as search
+   filters.
+4. Retrieve only the relevant ERP docs, endpoint maps, accounting references,
+   and workflow guides.
+5. Return a context pack with citations and sanitized connector status.
+6. Let the host AI answer or run a safe Mercury Flow using that context.
+
+If the workspace has no selected connector, Mercury should return setup
+guidance and available connector choices instead of guessing which ERP docs to
+use.
+
+Example routing:
+
+```text
+User asks: "สรุปรายได้อาทิตย์นี้"
+Workspace connector: flowaccount / production
+Mercury reads:
+- FlowAccount connector profile
+- FlowAccount invoice endpoint docs
+- revenue/reporting workflow notes
+- Thai accounting/tax knowledge where relevant
+Mercury avoids:
+- PEAK docs
+- Express docs
+- unrelated connector setup docs
+- raw credentials
+```
+
+This makes Mercury feel like one finance agent while still keeping knowledge
+separated by ERP program underneath.
+
 Tool roles in this model:
 
 | Tool | Product role | ERP connector role |
