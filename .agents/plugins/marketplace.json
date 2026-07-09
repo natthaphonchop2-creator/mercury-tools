@@ -1,0 +1,13 @@
+{
+  "plugins": [
+    {
+      "id": "mercury-finance",
+      "name": "Mercury Finance",
+      "description": "Accounting AI for ERP connectors, VAT, reports, audit context, and Mercury Flows.",
+      "source": {
+        "type": "path",
+        "path": "./plugins/mercury-finance"
+      }
+    }
+  ]
+}
