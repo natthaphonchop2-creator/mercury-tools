@@ -96,6 +96,8 @@ mercury-tools/
           SKILL.md
         connector-setup-guide-th/
           SKILL.md
+        connector-credential-setup-th/
+          SKILL.md
         mercury-flow-runner/
           SKILL.md
       assets/
@@ -358,6 +360,10 @@ If the workspace has no selected connector, Mercury should return setup
 guidance and available connector choices instead of guessing which ERP docs to
 use.
 
+If the workspace has a selected connector but missing credentials, Mercury
+should invoke the connector credential setup skill before any connector-backed
+accounting workflow runs.
+
 Example routing:
 
 ```text
@@ -377,6 +383,91 @@ Mercury avoids:
 
 This makes Mercury feel like one finance agent while still keeping knowledge
 separated by ERP program underneath.
+
+## Connector Credential Setup Skill
+
+Mercury needs a dedicated gated setup skill:
+
+```text
+connector-credential-setup-th
+```
+
+This skill should behave like a step-by-step process skill. It must not proceed
+to the next step until the current step is complete and validated.
+
+Core rule:
+
+```text
+No connector-backed accounting workflow can run until the selected connector
+has valid credentials, a selected environment, and at least one validated
+read-only capability.
+```
+
+The skill flow:
+
+1. Select accounting or ERP program.
+   - FlowAccount
+   - PEAK Accounting
+   - Express Account
+   - Custom ERP/API
+2. Select environment.
+   - production
+   - sandbox/test
+   - local/gateway where applicable
+3. Show what Mercury already knows from the connector preset.
+   - API base URL
+   - token URL
+   - grant type
+   - scope
+   - supported capabilities
+4. Ask only for the required missing credential fields.
+   - Example for FlowAccount: `client_id`, `client_secret`
+   - Preset values such as grant type and scope should not be repeatedly asked
+     if the connector manifest already defines them.
+5. Collect secrets only through Mercury Connect or a secure host input path.
+   The skill must not ask the user to paste API keys or client secrets into
+   normal chat.
+6. Validate credential shape before calling the ERP API.
+7. Test the connection using the safest available endpoint.
+   - Prefer token check and read-only company/profile endpoint.
+   - Never perform production writes during setup.
+8. Store credentials server-side in the encrypted connector profile.
+9. Publish sanitized connector status.
+   - program name
+   - company name if returned by API
+   - environment
+   - enabled capabilities
+   - validation status
+10. Unlock connector-backed skills and flows only after validation succeeds.
+
+If a step fails, the skill stays on that step, explains the exact missing or
+invalid item, and asks only for the next required correction. It should not
+restart the whole setup unless the user explicitly chooses a different program
+or environment.
+
+Setup state should be represented as explicit statuses:
+
+```text
+not_started
+program_selected
+environment_selected
+awaiting_credentials
+credentials_received
+validation_failed
+connected_read_only
+ready
+```
+
+The MCP server should use these states to decide whether to run a workflow,
+return setup guidance, or ask the host app to continue the credential setup
+skill.
+
+Credential setup is separate from RAG ingestion:
+
+- API documentation goes to Mercury Wiki.
+- API credentials go to encrypted connector profiles.
+- MCP outputs expose only sanitized status and capability names.
+- Audit logs store hashes, status, and summaries, not raw secrets.
 
 Tool roles in this model:
 
@@ -400,6 +491,9 @@ Potential future connector tools, after the demo core is stable:
 - `test_connector_endpoint`
 - `ingest_connector_docs`
 - `generate_connector_profile`
+- `start_connector_setup`
+- `submit_connector_credentials`
+- `validate_connector_connection`
 
 ## Starter Prompts
 
@@ -447,6 +541,14 @@ The skill should avoid over-showing raw audit paths unless asked.
 
 Guide users through Mercury Connect and connector-profile setup. It must not ask
 users to paste secrets into normal chat.
+
+### `connector-credential-setup-th`
+
+Guide connector setup as a gated state-machine workflow. It should select the
+ERP/accounting program, identify preset connector values, request only missing
+credential fields through a secure input path, validate the connection with
+read-only endpoints, and unlock accounting skills only after validation
+succeeds.
 
 ### `mercury-flow-runner`
 
@@ -503,6 +605,8 @@ language.
 - The skill list is visible and maps to the existing MCP tools.
 - A judge can run at least one prompt that uses Mercury Tools MCP without
   cloning the repository locally.
+- A user with no connector configured is routed into the gated connector
+  credential setup skill before any connector-backed workflow runs.
 - The product environment is documented with public Render and Supabase
   identifiers, while secret names are documented without secret values.
 - No secrets are committed.
