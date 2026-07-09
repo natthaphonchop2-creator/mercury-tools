@@ -1,0 +1,11 @@
+flows:
+  - "*.yaml"
+includeTags:
+  - accounting
+excludeTags:
+  - disabled
+env:
+  jurisdiction: TH
+  connector: flowaccount
+execution:
+  sequential: true

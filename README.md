@@ -41,6 +41,8 @@ Create and test a Mercury Flow:
 uv run mercury-tools flow init ./my-flow.yaml --template company-health
 uv run mercury-tools flow validate ./my-flow.yaml
 uv run mercury-tools flow run ./my-flow.yaml --dry-run
+uv run mercury-tools flow list ./examples/flows
+uv run mercury-tools flow run-suite ./examples/flows --dry-run
 ```
 
 Start the remote MCP server locally:
@@ -112,6 +114,7 @@ large dashboard:
 - `/workspace` shows workspace identity and team access
 - `/connectors` saves accounting connector profiles and encrypted credentials
 - `/skills` enables or uploads workspace skills
+- `/flows` validates, saves, and dry-runs Mercury Flow YAML for the workspace
 - `/audit` reviews usage and audit events
 
 Mercury Connect also exposes product APIs:
@@ -122,6 +125,9 @@ Mercury Connect also exposes product APIs:
 - `POST /api/connectors/credentials`
 - `POST /api/skills/enable`
 - `POST /api/skills/upload`
+- `POST /api/flows/validate`
+- `POST /api/flows/save`
+- `POST /api/flows/run`
 
 These APIs require a Mercury client token (`mc_...`) generated from the Connect
 page. The server bearer token is for MCP/admin compatibility, not normal users.
@@ -177,7 +183,28 @@ Flow CLI:
 - `mercury-tools flow init <path> --template company-health`
 - `mercury-tools flow validate <path>`
 - `mercury-tools flow run <path> --dry-run`
+- `mercury-tools flow list <workspace> --tag accounting`
+- `mercury-tools flow run-suite <workspace> --dry-run --exclude-tag disabled`
 - `mercury-tools flow cheat-sheet`
+
+Workspace config:
+
+```yaml
+# config.yaml or mercury.yaml
+flows:
+  - "flows/**/*.yaml"
+includeTags: [accounting]
+excludeTags: [disabled]
+env:
+  jurisdiction: TH
+  connector: flowaccount
+execution:
+  sequential: true
+```
+
+This mirrors Maestro's workspace model at the Mercury layer: config, folder
+architecture, tag-based discovery, and interpreted execution are separated from
+the host AI conversation.
 
 Flow MCP tools:
 

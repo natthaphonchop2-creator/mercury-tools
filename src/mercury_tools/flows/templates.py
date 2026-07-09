@@ -16,7 +16,7 @@ env:
   jurisdiction: TH
 ---
 - connectorStatus:
-    saveAs: connector
+    saveAs: connectorState
 - retrieveContextPack:
     query: "FlowAccount company health check VAT revenue"
     task: "company_health_check_th"
@@ -29,7 +29,7 @@ env:
     skillId: company-health-check-th
     inputs:
       context: "{{ context.query }}"
-      connector_status: "{{ connector.status }}"
+      connector_status: "{{ connectorState.status }}"
     evidenceMode: true
     saveAs: skill
 - emitReport:
@@ -61,7 +61,7 @@ env:
   connector: flowaccount
 onFlowStart:
   - connectorStatus:
-      saveAs: connector
+      saveAs: connectorState
 ---
 - retrieveContextPack:
     query: "company health check revenue VAT cash flow accounting Thailand"
@@ -83,7 +83,7 @@ onFlowStart:
 - emitReport:
     title: "Company health-check context pack"
     sections:
-      - "Connector status is available in {{ connector.status }}."
+      - "Connector status is available in {{ connectorState.status }}."
       - "Use skill {{ skill.skill_id }} and the cited context pack to answer in Thai."
       - "Do not expose raw tax IDs, emails, bearer tokens, or API keys."
 """

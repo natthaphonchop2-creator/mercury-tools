@@ -12,6 +12,7 @@ from mercury_tools.db.supabase import SupabaseRagStore
 from mercury_tools.flows.parser import FlowValidationError, validate_flow_path
 from mercury_tools.flows.runner import create_default_runner
 from mercury_tools.flows.templates import FLOW_CHEAT_SHEET, TEMPLATES
+from mercury_tools.flows.workspace import discover_workspace_flows, run_workspace_flows
 from mercury_tools.rag.embeddings import create_embedding_provider
 from mercury_tools.rag.ingest import ingest_wiki
 from mercury_tools.rag.models import SearchFilters
@@ -201,6 +202,67 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_flow_list(args: argparse.Namespace) -> int:
+    try:
+        workspace = discover_workspace_flows(
+            Path(args.path),
+            include_tags=args.tag,
+            exclude_tags=args.exclude_tag,
+        )
+    except FlowValidationError as exc:
+        payload = {"status": "error", "message": str(exc), "path": args.path}
+        if args.json:
+            _print_json(payload)
+        else:
+            print(f"Workspace invalid: {exc}")
+        return 1
+    payload = {"status": "ok", "workspace": workspace.as_dict()}
+    if args.json:
+        _print_json(payload)
+    else:
+        config = workspace.config
+        source = config.config_path.name if config.config_path else "default discovery"
+        print(f"Flow workspace: {config.root}")
+        print(f"config: {source}")
+        print(f"flows: {len(workspace.records)} discovered, {len(workspace.selected)} selected")
+        for record in workspace.records:
+            marker = "*" if record.selected else "-"
+            tags = ", ".join(record.tags) if record.tags else "no tags"
+            label = record.name or record.error or record.path.name
+            relative_path = record.path.relative_to(config.root)
+            print(f"{marker} {relative_path} [{record.status}] {label} ({tags})")
+    return 0
+
+
+def cmd_flow_run_suite(args: argparse.Namespace) -> int:
+    try:
+        suite = run_workspace_flows(
+            Path(args.path),
+            dry_run=args.dry_run,
+            include_tags=args.tag,
+            exclude_tags=args.exclude_tag,
+        )
+    except (FlowValidationError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc), "path": args.path}
+        if args.json:
+            _print_json(payload)
+        else:
+            print(f"Flow suite failed: {exc}")
+        return 1
+    payload = suite.as_dict()
+    if args.json:
+        _print_json(payload)
+    else:
+        print(
+            f"Flow suite {payload['status']}: "
+            f"{payload['workspace']['selected_count']} selected / "
+            f"{payload['workspace']['flow_count']} discovered"
+        )
+        for result in payload["results"]:
+            print(f"- {result['flow']['name']}: {result['status']} ({len(result['steps'])} steps)")
+    return 0
+
+
 def cmd_flow_init(args: argparse.Namespace) -> int:
     template = TEMPLATES[args.template]
     path = Path(args.path)
@@ -284,6 +346,21 @@ def build_parser() -> argparse.ArgumentParser:
     flow_run.add_argument("--dry-run", action="store_true")
     flow_run.add_argument("--json", action="store_true")
     flow_run.set_defaults(func=cmd_flow_run)
+
+    flow_list = flow_sub.add_parser("list")
+    flow_list.add_argument("path", nargs="?", default=".")
+    flow_list.add_argument("--tag", action="append", default=[])
+    flow_list.add_argument("--exclude-tag", action="append", default=[])
+    flow_list.add_argument("--json", action="store_true")
+    flow_list.set_defaults(func=cmd_flow_list)
+
+    flow_run_suite = flow_sub.add_parser("run-suite")
+    flow_run_suite.add_argument("path", nargs="?", default=".")
+    flow_run_suite.add_argument("--dry-run", action="store_true")
+    flow_run_suite.add_argument("--tag", action="append", default=[])
+    flow_run_suite.add_argument("--exclude-tag", action="append", default=[])
+    flow_run_suite.add_argument("--json", action="store_true")
+    flow_run_suite.set_defaults(func=cmd_flow_run_suite)
 
     flow_init = flow_sub.add_parser("init")
     flow_init.add_argument("path")
