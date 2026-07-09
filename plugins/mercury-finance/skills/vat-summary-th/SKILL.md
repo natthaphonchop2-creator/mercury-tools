@@ -5,7 +5,7 @@ description: Use when the user asks for Thai VAT output tax, input tax, filing c
 
 # VAT Summary TH
 
-Use `connector_status` first. If connector setup is incomplete, route to `connector-credential-setup-th`.
+Use `workspace_connector_status` with `client_token` first. If connector setup is incomplete, route to `connector-credential-setup-th`.
 
 Use `retrieve_workspace_context_pack` for company, tax period, chart of accounts, invoice, and evidence context. Use `run_mercury_flow` only for an approved VAT summary flow.
 

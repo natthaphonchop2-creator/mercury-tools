@@ -18,7 +18,11 @@ from starlette.responses import HTMLResponse, JSONResponse, Response
 from mercury_tools.config import load_settings
 from mercury_tools.connectors.catalog import connector_by_id, list_connector_summaries
 from mercury_tools.connectors.setup import required_missing_fields, validate_connector_read_only
-from mercury_tools.db.product import SupabaseProductStore, slugify
+from mercury_tools.db.product import (
+    SupabaseProductStore,
+    public_connector_profiles,
+    slugify,
+)
 from mercury_tools.db.supabase import SupabaseRagStore
 from mercury_tools.flows.parser import (
     FlowValidationError,
@@ -263,6 +267,12 @@ def _client_token_audit_ref(client_token: str) -> dict[str, str]:
         "client_token_prefix": token[:3],
         "client_token_hash": sha256_text(token)[:16],
     }
+
+
+def _client_token_audit_ref_optional(client_token: str | None) -> dict[str, str]:
+    if not isinstance(client_token, str) or not client_token:
+        return {}
+    return _client_token_audit_ref(client_token)
 
 
 def _client_token_payload(request: Request) -> dict[str, Any]:
@@ -510,6 +520,39 @@ def _raw_flow_readiness_selection(
             env=effective_env,
         ),
     }
+
+
+def _raw_mcp_connector_setup_block(
+    flow: Any,
+    *,
+    env_overrides: dict[str, str],
+    client_token: str | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    readiness_selection = _raw_flow_readiness_selection(
+        flow,
+        env_overrides=env_overrides,
+    )
+    if not readiness_selection["connector_backed"]:
+        return None, readiness_selection
+
+    block_payload = _connector_setup_block_payload()
+    if not isinstance(client_token, str) or not client_token.strip():
+        return block_payload, readiness_selection
+
+    settings = load_settings()
+    token_payload = _client_token_payload_from_value(client_token)
+    if not settings.supabase_configured:
+        return block_payload, readiness_selection
+
+    dashboard_payload = _product_store(settings).dashboard(token_payload)
+    if not readiness_selection["connector_id"] or not workspace_connector_ready(
+        dashboard_payload,
+        connector_id=readiness_selection["connector_id"],
+        environment=readiness_selection["environment"],
+        required_capabilities=readiness_selection["required_capabilities"],
+    ):
+        return block_payload, readiness_selection
+    return None, readiness_selection
 
 
 def _required_capabilities_from_sources(
@@ -1021,6 +1064,58 @@ def connector_status() -> dict[str, Any]:
 
 
 @mcp.tool()
+def workspace_connector_status(client_token: str) -> dict[str, Any]:
+    """Read sanitized token-scoped connector status for the hosted workspace."""
+    audit_input = _client_token_audit_ref_optional(client_token)
+    try:
+        if not isinstance(client_token, str):
+            raise PermissionError("Mercury client token must be a string.")
+        settings = load_settings()
+        token_payload = _client_token_payload_from_value(client_token)
+        dashboard_payload = _product_store(settings).dashboard(token_payload)
+        public_profiles = public_connector_profiles(
+            dashboard_payload.get("connector_profiles") or []
+        )
+        active_profile = _active_workspace_connector_profile(dashboard_payload)
+        active_context = (
+            _connector_context_from_profile(active_profile)
+            if active_profile is not None
+            else None
+        )
+        payload: dict[str, Any] = {
+            "status": "ok" if active_context else "requires_setup",
+            "workspace": {
+                "name": (dashboard_payload.get("workspace") or {}).get("name"),
+                "host_app": token_payload.get("host_app"),
+            },
+            "connector_profiles": public_profiles,
+            "active_connector": active_context,
+            "setup_required": active_context is None,
+            "next_tool": "start_connector_setup" if active_context is None else None,
+            "next_skill": (
+                "connector-credential-setup-th" if active_context is None else None
+            ),
+        }
+        payload = redact_json(payload)
+        _audit(
+            "workspace_connector_status",
+            audit_input,
+            {
+                "status": payload["status"],
+                "profile_count": len(public_profiles),
+                "active_connector": (
+                    active_context.get("connector_id") if active_context else None
+                ),
+            },
+        )
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit("workspace_connector_status", audit_input, payload)
+        return payload
+
+
+@mcp.tool()
 def run_accounting_skill(
     skill_id: str,
     inputs: dict[str, Any],
@@ -1141,15 +1236,41 @@ def run_flow(
     flow_yaml: str,
     dry_run: bool = False,
     env: dict[str, Any] | None = None,
+    client_token: str | None = None,
 ) -> dict[str, Any]:
     """Run a Mercury YAML flow or return an execution plan when dry_run is true."""
     try:
         env_overrides = _env_overrides_from_payload(env)
-        result = create_default_runner(dry_run=dry_run).run_text(flow_yaml, env=env_overrides)
+        parsed_flow = parse_flow_text(flow_yaml)
+        block_payload, readiness_selection = _raw_mcp_connector_setup_block(
+            parsed_flow,
+            env_overrides=env_overrides,
+            client_token=client_token,
+        )
+        if block_payload:
+            payload = redact_json(block_payload)
+            _audit(
+                "run_flow",
+                {
+                    **_client_token_audit_ref_optional(client_token),
+                    "flow_yaml_length": len(flow_yaml),
+                    "dry_run": dry_run,
+                    "env_keys": _env_keys(env_overrides),
+                    "connector_id": readiness_selection["connector_id"],
+                    "environment": readiness_selection["environment"],
+                },
+                payload,
+            )
+            return payload
+        result = create_default_runner(dry_run=dry_run).run_flow(
+            parsed_flow,
+            env=env_overrides,
+        )
         payload = redact_json(result.as_dict())
         _audit(
             "run_flow",
             {
+                **_client_token_audit_ref_optional(client_token),
                 "flow_yaml_length": len(flow_yaml),
                 "dry_run": dry_run,
                 "env_keys": _env_keys(env_overrides),
@@ -1161,12 +1282,13 @@ def run_flow(
             },
         )
         return payload
-    except (FlowValidationError, RuntimeError, ValueError) as exc:
+    except (PermissionError, FlowValidationError, RuntimeError, ValueError) as exc:
         payload = {"status": "error", "message": str(exc), "dry_run": dry_run}
         safe_env_keys = _env_keys(env) if isinstance(env, dict) else []
         _audit(
             "run_flow",
             {
+                **_client_token_audit_ref_optional(client_token),
                 "flow_yaml_length": len(flow_yaml),
                 "dry_run": dry_run,
                 "env_keys": safe_env_keys,
@@ -1182,6 +1304,7 @@ def run_flow_files(
     config_yaml: str | None = None,
     dry_run: bool = False,
     env: dict[str, Any] | None = None,
+    client_token: str | None = None,
     include_tags: list[str] | str | None = None,
     exclude_tags: list[str] | str | None = None,
     continue_on_failure: bool = True,
@@ -1266,6 +1389,58 @@ def run_flow_files(
                         )
 
             for selected_path in selected_paths:
+                parsed_flow = parse_flow_text(
+                    selected_path.read_text(encoding="utf-8"),
+                    path=selected_path,
+                )
+                block_payload, readiness_selection = _raw_mcp_connector_setup_block(
+                    parsed_flow,
+                    env_overrides=env_overrides,
+                    client_token=client_token,
+                )
+                if block_payload:
+                    payload = redact_json(
+                        {
+                            **block_payload,
+                            "dry_run": dry_run,
+                            "config_yaml_present": bool(config_yaml),
+                            "flow_count": len(normalized_files),
+                            "selected_count": len(selected_paths),
+                            "skipped_count": len(
+                                [
+                                    item
+                                    for item in file_records
+                                    if not item.get("selected")
+                                ]
+                            ),
+                            "env_keys": _env_keys(env_overrides),
+                            "include_tags": sorted(include),
+                            "exclude_tags": sorted(exclude),
+                            "flows": file_records,
+                            "results": results,
+                        }
+                    )
+                    _audit(
+                        "run_flow_files",
+                        {
+                            **_client_token_audit_ref_optional(client_token),
+                            "flow_count": len(normalized_files),
+                            "selected_count": len(selected_paths),
+                            "dry_run": dry_run,
+                            "config_yaml_present": bool(config_yaml),
+                            "env_keys": _env_keys(env_overrides),
+                            "connector_id": readiness_selection["connector_id"],
+                            "environment": readiness_selection["environment"],
+                        },
+                        {
+                            "status": payload["status"],
+                            "result_count": len(payload["results"]),
+                            "dry_run": dry_run,
+                        },
+                    )
+                    return payload
+
+            for selected_path in selected_paths:
                 relative_path = selected_path.relative_to(root).as_posix()
                 try:
                     result = runner.run_path(selected_path, env=env_overrides).as_dict()
@@ -1299,6 +1474,7 @@ def run_flow_files(
         _audit(
             "run_flow_files",
             {
+                **_client_token_audit_ref_optional(client_token),
                 "flow_count": len(normalized_files),
                 "selected_count": payload["selected_count"],
                 "dry_run": dry_run,
@@ -1315,11 +1491,12 @@ def run_flow_files(
             },
         )
         return payload
-    except (FlowValidationError, RuntimeError, ValueError) as exc:
+    except (PermissionError, FlowValidationError, RuntimeError, ValueError) as exc:
         payload = {"status": "error", "message": str(exc), "dry_run": dry_run}
         _audit(
             "run_flow_files",
             {
+                **_client_token_audit_ref_optional(client_token),
                 "flow_count": len(normalized_files),
                 "dry_run": dry_run,
                 "config_yaml_present": bool(config_yaml),
@@ -1372,7 +1549,12 @@ def run_mercury_flow(
             }
             _audit("run_mercury_flow", {"selected_modes": modes, "dry_run": dry_run}, payload)
             return payload
-        payload = run_flow(flow_yaml or "", dry_run=dry_run, env=env)
+        payload = run_flow(
+            flow_yaml or "",
+            dry_run=dry_run,
+            env=env,
+            client_token=client_token,
+        )
         payload["entrypoint"] = "run_mercury_flow"
         payload["input_mode"] = "flow_yaml"
         return payload
@@ -1383,6 +1565,7 @@ def run_mercury_flow(
             config_yaml=config_yaml,
             dry_run=dry_run,
             env=env,
+            client_token=client_token,
             include_tags=include_tags,
             exclude_tags=exclude_tags,
             continue_on_failure=continue_on_failure,

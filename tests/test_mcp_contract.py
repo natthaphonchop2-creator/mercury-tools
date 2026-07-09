@@ -38,9 +38,16 @@ def test_mcp_flow_tools_validate_and_dry_run() -> None:
     assert syntax["status"] == "ok"
     assert syntax["flow"]["command_count"] == 3
 
-    result = run_flow(COMPANY_HEALTH_TEMPLATE, dry_run=True)
+    result = run_flow(
+        """name: Local Dry Run
+---
+- emitReport:
+    title: "Local"
+""",
+        dry_run=True,
+    )
     assert result["status"] == "planned"
-    assert result["steps"][0]["command"] == "connectorStatus"
+    assert result["steps"][0]["command"] == "emitReport"
 
     parameterized = run_flow(
         """name: Env Override Smoke

@@ -13,22 +13,22 @@ EXPECTED_SKILLS = {
         "validate_connector_connection",
     ],
     "company-health-check-th": [
-        "connector_status",
+        "workspace_connector_status",
         "retrieve_workspace_context_pack",
         "run_mercury_flow",
     ],
     "vat-summary-th": [
-        "connector_status",
+        "workspace_connector_status",
         "retrieve_workspace_context_pack",
         "run_mercury_flow",
     ],
     "invoice-review-th": [
-        "connector_status",
+        "workspace_connector_status",
         "retrieve_workspace_context_pack",
         "run_mercury_flow",
     ],
     "management-report-th": [
-        "connector_status",
+        "workspace_connector_status",
         "retrieve_workspace_context_pack",
         "run_mercury_flow",
     ],
@@ -38,7 +38,7 @@ EXPECTED_SKILLS = {
         "validate_connector_connection",
     ],
     "mercury-flow-runner": [
-        "connector_status",
+        "workspace_connector_status",
         "list_workspace_flows",
         "save_workspace_flow",
         "run_workspace_flow",
@@ -101,6 +101,22 @@ def test_skill_files_are_compact_and_route_to_mcp_tools() -> None:
         assert len(skill.splitlines()) < 80
         for tool_name in tool_names:
             assert tool_name in skill
+
+
+def test_hosted_workflow_skills_use_token_scoped_connector_status() -> None:
+    hosted_skill_names = [
+        "company-health-check-th",
+        "vat-summary-th",
+        "invoice-review-th",
+        "management-report-th",
+        "mercury-flow-runner",
+    ]
+
+    for skill_name in hosted_skill_names:
+        skill = (PLUGIN_ROOT / f"skills/{skill_name}/SKILL.md").read_text()
+        assert "workspace_connector_status" in skill
+        assert "client_token" in skill
+        assert "Use `connector_status`" not in skill
 
 
 def test_plugin_package_has_no_embedded_secret_env_names_or_values() -> None:

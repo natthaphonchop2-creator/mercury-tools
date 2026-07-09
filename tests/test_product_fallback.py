@@ -183,14 +183,21 @@ def test_product_store_audit_fallback_encrypts_connector_credentials() -> None:
     dashboard = store.dashboard(token_payload())
     serialized_events = str(store.events)
     profile = dashboard["connector_profiles"][0]
+    private_profile = next(iter(store._fallback_private_connector_profiles.values()))
+    server_vault = private_profile["metadata"]["server_vault"]
 
     assert result["status"] == "credentials_configured"
     assert profile["status"] == "credentials_configured"
     assert profile["metadata"]["credentials_configured"] is True
     assert "client_id" in result["credential_fields"]
+    assert "ciphertext" in server_vault
+    assert "'server_vault':" not in str(profile)
+    assert server_vault["ciphertext"] not in str(profile)
     assert "super-secret-value" not in serialized_events
     assert "demo-client-id" not in serialized_events
-    assert "ciphertext" in serialized_events
+    assert "'server_vault':" not in serialized_events
+    assert "'vault_record':" not in serialized_events
+    assert "ciphertext" not in serialized_events
 
 
 def test_product_store_audit_fallback_records_uploaded_skill() -> None:

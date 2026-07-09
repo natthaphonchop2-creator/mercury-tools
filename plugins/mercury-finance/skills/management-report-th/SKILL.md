@@ -5,7 +5,7 @@ description: Use when the user asks for Thai management reports, owner summaries
 
 # Management Report TH
 
-Use `connector_status` first. If connector setup is incomplete, route to `connector-credential-setup-th`.
+Use `workspace_connector_status` with `client_token` first. If connector setup is incomplete, route to `connector-credential-setup-th`.
 
 Use `retrieve_workspace_context_pack` for period, company, KPI, VAT, cash, receivable, payable, and evidence context. Use `run_mercury_flow` for approved management-report flows.
 

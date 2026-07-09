@@ -110,6 +110,47 @@ def test_validate_flowaccount_uses_token_and_company_info(monkeypatch) -> None:
     ]
 
 
+def test_validate_flowaccount_uses_sandbox_token_and_company_info_urls(
+    monkeypatch,
+) -> None:
+    manifest = connector_by_id("flowaccount")
+    assert manifest is not None
+    calls: list[tuple[str, str]] = []
+
+    class FakeResponse:
+        def __init__(self, status_code: int, payload: dict):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = str(payload)
+
+        def json(self):
+            return self._payload
+
+    def fake_post(url, data=None, timeout=60):
+        calls.append(("POST", url))
+        return FakeResponse(200, {"access_token": "secret-token", "token_type": "Bearer"})
+
+    def fake_get(url, headers=None, timeout=60):
+        calls.append(("GET", url))
+        return FakeResponse(200, {"companyName": "Sandbox Books"})
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    monkeypatch.setattr("httpx.get", fake_get)
+
+    result = validate_connector_read_only(
+        manifest,
+        credentials={"client_id": "cid", "client_secret": "csecret"},
+        environment="sandbox",
+    )
+
+    assert result["status"] == "connected_read_only"
+    assert result["company_name"] == "Sandbox Books"
+    assert calls == [
+        ("POST", "https://openapi.flowaccount.com/test/token"),
+        ("GET", "https://openapi.flowaccount.com/test/company/info"),
+    ]
+
+
 def test_validate_flowaccount_http_error_returns_sanitized_validation_failed(
     monkeypatch,
 ) -> None:
@@ -341,6 +382,8 @@ class StoreForSetup(SupabaseProductStore):
         self.rows: list[dict] = []
         self.profiles: dict[tuple[str, str, str], dict] = {}
         self.profile_payloads: list[dict] = []
+        self.profile_patches: list[dict] = []
+        self.audit_events: list[dict] = []
 
     def _request(self, method: str, path: str, **kwargs):
         if path == "mercury_client_tokens" and method == "GET":
@@ -399,6 +442,29 @@ class StoreForSetup(SupabaseProductStore):
             self.profiles[key] = row
             self.rows.append(row)
             return [row]
+        if path == "mercury_connector_profiles" and method == "GET":
+            params = kwargs.get("params") or {}
+            workspace_id = str(params.get("workspace_id") or "").removeprefix("eq.")
+            connector_id = str(params.get("connector_id") or "").removeprefix("eq.")
+            environment = str(params.get("environment") or "").removeprefix("eq.")
+            return [
+                profile
+                for key, profile in self.profiles.items()
+                if key == (workspace_id, connector_id, environment)
+            ]
+        if path == "mercury_connector_profiles" and method == "PATCH":
+            params = kwargs.get("params") or {}
+            profile_id = str(params.get("id") or "").removeprefix("eq.")
+            patch = kwargs["json"]
+            self.profile_patches.append(patch)
+            for key, profile in self.profiles.items():
+                if profile["id"] != profile_id:
+                    continue
+                row = {**profile, **patch}
+                self.profiles[key] = row
+                self.rows.append(row)
+                return [row]
+            raise RuntimeError(f"unknown connector profile id {profile_id}")
         if path == "mercury_product_events" and method == "POST":
             row = {
                 **kwargs["json"][0],
@@ -407,6 +473,16 @@ class StoreForSetup(SupabaseProductStore):
             }
             self.rows.append(row)
             return [row]
+        if path == "mcp_audit_events" and method == "POST":
+            row = {
+                **kwargs["json"][0],
+                "id": f"audit-{len(self.audit_events) + 1}",
+                "created_at": "2026-07-09T00:00:00+00:00",
+            }
+            self.audit_events.append(row)
+            return [row]
+        if path == "mcp_audit_events" and method == "GET":
+            return list(self.audit_events)
         raise RuntimeError(f"unexpected request {method} {path}")
 
 
@@ -439,6 +515,95 @@ def test_start_connector_setup_stores_setup_metadata() -> None:
         "documents.invoice.get",
         "tax.vat_summary.read",
     ]
+
+
+def test_start_connector_setup_stores_environment_specific_preset() -> None:
+    store = StoreForSetup()
+    profile = store.start_connector_setup(
+        token_payload={
+            "sub": "owner@example.com",
+            "company": "Demo Co",
+            "host_app": "codex",
+            "iat": 0,
+            "exp": 99999,
+            "jti": "token-jti",
+        },
+        connector_id="flowaccount",
+        environment="sandbox",
+    )
+
+    assert profile["metadata"]["preset"]["api_base_url"] == (
+        "https://openapi.flowaccount.com/test"
+    )
+    assert profile["metadata"]["preset"]["token_url"] == (
+        "https://openapi.flowaccount.com/test/token"
+    )
+
+
+def test_ready_connector_profile_metadata_sets_connected_read_only_status() -> None:
+    store = StoreForSetup()
+    profile = store.set_connector_profile(
+        token_payload={
+            "sub": "owner@example.com",
+            "company": "Demo Co",
+            "host_app": "codex",
+            "iat": 0,
+            "exp": 99999,
+            "jti": "token-jti",
+        },
+        connector_id="flowaccount",
+        environment="production",
+        metadata={
+            "setup_state": "ready",
+            "enabled_capabilities": ["company.info.read"],
+        },
+    )
+
+    assert profile["status"] == "connected_read_only"
+    assert store.profile_payloads[-1]["status"] == "connected_read_only"
+
+
+def test_product_table_credentials_store_server_vault_on_profile_not_audit() -> None:
+    from mercury_tools.db.product import public_connector_profile
+
+    store = StoreForSetup()
+    token_payload = {
+        "sub": "owner@example.com",
+        "company": "Demo Co",
+        "host_app": "codex",
+        "iat": 0,
+        "exp": 99999,
+        "jti": "token-jti",
+    }
+    store.start_connector_setup(
+        token_payload=token_payload,
+        connector_id="flowaccount",
+        environment="production",
+    )
+
+    result = store.set_connector_credentials(
+        token_payload=token_payload,
+        connector_id="flowaccount",
+        environment="production",
+        credentials={
+            "client_id": "demo-client-id",
+            "client_secret": "super-secret-value",
+        },
+    )
+    patched_metadata = store.profile_patches[-1]["metadata"]
+    server_vault = patched_metadata["server_vault"]
+    public_profile = public_connector_profile(next(iter(store.profiles.values())))
+
+    assert result["status"] == "credentials_configured"
+    assert server_vault["fields"] == ["client_id", "client_secret"]
+    assert "ciphertext" in server_vault
+    assert "super-secret-value" not in str(server_vault)
+    assert "demo-client-id" not in str(server_vault)
+    assert "'server_vault':" not in str(store.audit_events)
+    assert "'vault_record':" not in str(store.audit_events)
+    assert server_vault["ciphertext"] not in str(store.audit_events)
+    assert "'server_vault':" not in str(public_profile)
+    assert server_vault["ciphertext"] not in str(public_profile)
 
 
 def test_start_connector_setup_resume_without_company_name_preserves_label() -> None:

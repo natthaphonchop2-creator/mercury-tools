@@ -252,12 +252,13 @@ def validate_connector_read_only(
     if missing:
         return {"status": "awaiting_credentials", "missing_fields": missing}
 
+    preset = manifest.preset_for_environment(environment)
     try:
         token_response = httpx.post(
-            manifest.preset["token_url"],
+            preset["token_url"],
             data={
-                "grant_type": manifest.preset["grant_type"],
-                "scope": manifest.preset["scope"],
+                "grant_type": preset["grant_type"],
+                "scope": preset["scope"],
                 "client_id": str(credentials["client_id"]),
                 "client_secret": str(credentials["client_secret"]),
             },
@@ -297,7 +298,7 @@ def validate_connector_read_only(
             extra_sensitive_values=(access_token,),
         )
 
-    info_url = f"{manifest.preset['api_base_url'].rstrip('/')}/company/info"
+    info_url = f"{preset['api_base_url'].rstrip('/')}/company/info"
     try:
         info_response = httpx.get(
             info_url,

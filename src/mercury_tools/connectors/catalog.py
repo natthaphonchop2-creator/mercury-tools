@@ -20,10 +20,18 @@ class ConnectorManifest:
     environments: list[str]
     required_secret_fields: list[str]
     preset: dict[str, str] = field(default_factory=dict)
+    environment_presets: dict[str, dict[str, str]] = field(default_factory=dict)
     capabilities: list[str] = field(default_factory=list)
     validation: ConnectorValidation = field(
         default_factory=lambda: ConnectorValidation(method="manual")
     )
+
+    def preset_for_environment(self, environment: str) -> dict[str, str]:
+        selected = environment.strip().lower()
+        return {
+            **self.preset,
+            **self.environment_presets.get(selected, {}),
+        }
 
     def summary(self) -> dict[str, Any]:
         data = asdict(self)
@@ -44,6 +52,16 @@ CONNECTOR_CATALOG: list[ConnectorManifest] = [
             "scope": "flowaccount-api",
             "api_base_url": "https://openapi.flowaccount.com/v1",
             "token_url": "https://openapi.flowaccount.com/token",
+        },
+        environment_presets={
+            "production": {
+                "api_base_url": "https://openapi.flowaccount.com/v1",
+                "token_url": "https://openapi.flowaccount.com/token",
+            },
+            "sandbox": {
+                "api_base_url": "https://openapi.flowaccount.com/test",
+                "token_url": "https://openapi.flowaccount.com/test/token",
+            },
         },
         capabilities=[
             "company.info.read",

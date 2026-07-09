@@ -5,7 +5,7 @@ description: Use when the user asks for company health, revenue, VAT, cash flow,
 
 # Company Health Check TH
 
-Use `connector_status` first. If connector setup is incomplete, route to `connector-credential-setup-th`.
+Use `workspace_connector_status` with `client_token` first. If connector setup is incomplete, route to `connector-credential-setup-th`.
 
 Use `retrieve_workspace_context_pack` for accounting context and `run_mercury_flow` for approved health-check flows.
 

@@ -74,6 +74,13 @@ SKILL_CATALOG_SEED: list[dict[str, Any]] = [
 
 PRODUCT_STATE_TOOL = "mercury_product_state"
 PRODUCT_FALLBACK_LIMIT = 500
+SERVER_ONLY_CONNECTOR_PROFILE_KEYS = {
+    "ciphertext",
+    "credential_vault",
+    "encrypted_credentials",
+    "server_vault",
+    "vault_record",
+}
 
 
 def slugify(value: str, *, fallback: str = "workspace") -> str:
@@ -235,6 +242,43 @@ def encrypt_connector_credentials(
     }
 
 
+def _strip_server_only_connector_data(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _strip_server_only_connector_data(item)
+            for key, item in value.items()
+            if str(key) not in SERVER_ONLY_CONNECTOR_PROFILE_KEYS
+        }
+    if isinstance(value, list):
+        return [_strip_server_only_connector_data(item) for item in value]
+    return value
+
+
+def public_connector_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    return redact_json(_strip_server_only_connector_data(dict(profile)))
+
+
+def public_connector_profiles(profiles: Any) -> list[dict[str, Any]]:
+    if not isinstance(profiles, list):
+        return []
+    return [
+        public_connector_profile(profile)
+        for profile in profiles
+        if isinstance(profile, dict)
+    ]
+
+
+def public_product_event(row: dict[str, Any]) -> dict[str, Any]:
+    return redact_json(_strip_server_only_connector_data(dict(row)))
+
+
+def connector_profile_status_from_metadata(metadata: dict[str, Any] | None) -> str:
+    setup_state = str((metadata or {}).get("setup_state") or "").strip().lower()
+    if setup_state in {"ready", "connected_read_only"}:
+        return "connected_read_only"
+    return "requires_credentials"
+
+
 def is_product_schema_error(exc: RuntimeError) -> bool:
     text = str(exc).lower()
     return "mercury_" in text and (
@@ -271,6 +315,7 @@ class SupabaseProductStore:
             "Authorization": f"Bearer {settings.supabase_service_role_key}",
             "Content-Type": "application/json",
         }
+        self._fallback_private_connector_profiles: dict[str, dict[str, Any]] = {}
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = f"{self.base_url}/{path.lstrip('/')}"
@@ -409,7 +454,7 @@ class SupabaseProductStore:
             if event_type in {"connector.profile_configured", "connector.credentials_configured"}:
                 profile = summary.get("profile") or {}
                 profile_key = f"{profile.get('connector_id')}:{profile.get('environment')}"
-                connector_profiles[profile_key] = profile
+                connector_profiles[profile_key] = public_connector_profile(profile)
             elif event_type in {"skill.enabled", "skill.disabled"}:
                 skill_id = str(summary.get("skill_id") or "")
                 if skill_id in skills:
@@ -441,7 +486,9 @@ class SupabaseProductStore:
                     "id": row.get("id"),
                     "created_at": row.get("created_at"),
                     "event_type": event_type,
-                    "summary": summary.get("event_summary") or {},
+                    "summary": _strip_server_only_connector_data(
+                        summary.get("event_summary") or {}
+                    ),
                     "status": row.get("status"),
                     "metadata": {"storage": "audit_fallback"},
                 }
@@ -465,7 +512,7 @@ class SupabaseProductStore:
                 key=lambda item: str(item.get("created_at") or ""),
                 reverse=True,
             )[:12],
-            "events": list(reversed(events[-12:])),
+            "events": [public_product_event(event) for event in reversed(events[-12:])],
         }
 
     def _fallback_flows_for_workspace_key(self, workspace_key_value: str) -> list[dict[str, Any]]:
@@ -696,10 +743,10 @@ class SupabaseProductStore:
                 if company_name is not None
                 else (existing_profile or {}).get("company_name")
             ),
-            "status": "requires_credentials",
+            "status": connector_profile_status_from_metadata(metadata),
             "metadata": {
                 "required_secret_fields": connector.required_secret_fields,
-                "preset": connector.preset,
+                "preset": connector.preset_for_environment(environment),
                 "credential_storage": "host_or_user_vault",
                 "storage": "audit_fallback",
                 **(metadata or {}),
@@ -752,7 +799,7 @@ class SupabaseProductStore:
             metadata={
                 "setup_state": setup_state,
                 "required_secret_fields": manifest.required_secret_fields,
-                "preset": manifest.preset,
+                "preset": manifest.preset_for_environment(environment),
                 "capabilities": manifest.capabilities,
             },
         )
@@ -843,13 +890,17 @@ class SupabaseProductStore:
             environment=environment,
             credentials=credentials,
         )
-        public_metadata = {
+        profile_metadata = {
             **(profile.get("metadata") or {}),
             "credential_storage": "encrypted_server_vault",
             "credential_fields": vault_record["fields"],
             "credential_fingerprints": vault_record["fingerprints"],
             "credentials_configured": True,
             "credentials_configured_at": vault_record["configured_at"],
+        }
+        server_metadata = {
+            **profile_metadata,
+            "server_vault": vault_record,
         }
         rows = self._request(
             "PATCH",
@@ -858,9 +909,16 @@ class SupabaseProductStore:
             headers={**self.headers, "Prefer": "return=representation"},
             json={
                 "status": "credentials_configured",
-                "metadata": public_metadata,
+                "metadata": server_metadata,
                 "updated_at": now_utc(),
             },
+        )
+        event_profile = public_connector_profile(
+            {
+                **(rows[0] if rows else profile),
+                "status": "credentials_configured",
+                "metadata": server_metadata,
+            }
         )
         self._fallback_record_state_event(
             workspace_key=context["workspace"]["workspace_key"],
@@ -872,12 +930,7 @@ class SupabaseProductStore:
                 "credential_fields": vault_record["fields"],
             },
             summary={
-                "profile": {
-                    **(rows[0] if rows else profile),
-                    "status": "credentials_configured",
-                    "metadata": public_metadata,
-                },
-                "vault_record": vault_record,
+                "profile": event_profile,
                 "event_summary": {
                     "connector_id": canonical_connector_id,
                     "environment": environment,
@@ -930,7 +983,7 @@ class SupabaseProductStore:
             "status": "credentials_configured",
             "metadata": {
                 "required_secret_fields": connector.required_secret_fields,
-                "preset": connector.preset,
+                "preset": connector.preset_for_environment(environment),
                 "credential_storage": "encrypted_server_vault",
                 "credential_fields": vault_record["fields"],
                 "credential_fingerprints": vault_record["fingerprints"],
@@ -941,6 +994,14 @@ class SupabaseProductStore:
             "created_at": now_utc(),
             "updated_at": now_utc(),
         }
+        private_profile = {
+            **profile,
+            "metadata": {
+                **profile["metadata"],
+                "server_vault": vault_record,
+            },
+        }
+        self._fallback_private_connector_profiles[profile["id"]] = private_profile
         self._fallback_record_state_event(
             workspace_key=context["workspace"]["workspace_key"],
             client_jti=str(token_payload.get("jti") or ""),
@@ -951,8 +1012,7 @@ class SupabaseProductStore:
                 "credential_fields": vault_record["fields"],
             },
             summary={
-                "profile": profile,
-                "vault_record": vault_record,
+                "profile": public_connector_profile(profile),
                 "event_summary": {
                     "connector_id": canonical_connector_id,
                     "environment": environment,
@@ -1291,7 +1351,7 @@ class SupabaseProductStore:
             "status": "ok",
             **context,
             "connectors": list_connector_summaries(),
-            "connector_profiles": connector_profiles or [],
+            "connector_profiles": public_connector_profiles(connector_profiles or []),
             "members": members or [],
             "skills": [
                 {
@@ -1311,7 +1371,11 @@ class SupabaseProductStore:
                 for row in flow_run_events or []
                 if ((row.get("summary") or {}).get("flow_run") or {}).get("run_id")
             ],
-            "events": events or [],
+            "events": [
+                public_product_event(event)
+                for event in events or []
+                if isinstance(event, dict)
+            ],
         }
 
     def set_skill_enabled(
@@ -1486,7 +1550,7 @@ class SupabaseProductStore:
             )
         merged_metadata = {
             "required_secret_fields": connector.required_secret_fields,
-            "preset": connector.preset,
+            "preset": connector.preset_for_environment(environment),
             "credential_storage": "host_or_user_vault",
             **(metadata or {}),
         }
@@ -1495,7 +1559,7 @@ class SupabaseProductStore:
             "connector_id": canonical_connector_id,
             "environment": environment,
             "display_name": display_name or connector.name,
-            "status": "requires_credentials",
+            "status": connector_profile_status_from_metadata(merged_metadata),
             "metadata": merged_metadata,
         }
         if company_name is not None:

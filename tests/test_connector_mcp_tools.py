@@ -517,6 +517,102 @@ def ready_connector_profile(
     }
 
 
+CONNECTOR_RAW_FLOW = """name: FlowAccount Raw
+tags: [accounting, flowaccount]
+env:
+  connector: flowaccount
+  environment: production
+  required_capabilities: [company.info.read]
+---
+- emitReport:
+    title: "FlowAccount raw"
+"""
+
+
+NON_CONNECTOR_RAW_FLOW = """name: Local Raw
+---
+- emitReport:
+    title: "Local raw"
+"""
+
+
+def test_run_flow_blocks_connector_backed_raw_yaml_without_client_token() -> None:
+    from mercury_tools.mcp import server
+
+    payload = server.run_flow(CONNECTOR_RAW_FLOW, dry_run=True)
+
+    assert payload["status"] == "blocked"
+    assert "connector credential setup" in payload["message"]
+
+
+def test_run_flow_preserves_non_connector_raw_yaml_without_client_token() -> None:
+    from mercury_tools.mcp import server
+
+    payload = server.run_flow(NON_CONNECTOR_RAW_FLOW, dry_run=True)
+
+    assert payload["status"] == "planned"
+    assert payload["artifacts"][0]["title"] == "Local raw"
+
+
+def test_run_flow_blocks_connector_backed_raw_yaml_when_workspace_unready(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    configure_product_env(monkeypatch)
+
+    class FakeStore:
+        def dashboard(self, token_payload):
+            assert token_payload["sub"] == "owner@example.com"
+            return {
+                "connector_profiles": [
+                    {
+                        "connector_id": "flowaccount",
+                        "environment": "production",
+                        "status": "credentials_configured",
+                        "metadata": {"setup_state": "credentials_received"},
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(server, "_product_store", lambda settings=None: FakeStore())
+
+    payload = server.run_flow(
+        CONNECTOR_RAW_FLOW,
+        dry_run=True,
+        client_token=make_client_token(),
+    )
+
+    assert payload["status"] == "blocked"
+    assert "connector credential setup" in payload["message"]
+
+
+def test_run_flow_files_blocks_connector_backed_raw_yaml_without_client_token() -> None:
+    from mercury_tools.mcp import server
+
+    payload = server.run_flow_files(
+        {"flows/flowaccount.yaml": CONNECTOR_RAW_FLOW},
+        dry_run=True,
+    )
+
+    assert payload["status"] == "blocked"
+    assert payload["selected_count"] == 1
+    assert "connector credential setup" in payload["message"]
+
+
+def test_run_mercury_flow_blocks_connector_backed_flow_yaml_without_client_token() -> None:
+    from mercury_tools.mcp import server
+
+    payload = server.run_mercury_flow(
+        flow_yaml=CONNECTOR_RAW_FLOW,
+        dry_run=True,
+    )
+
+    assert payload["status"] == "blocked"
+    assert payload["entrypoint"] == "run_mercury_flow"
+    assert payload["input_mode"] == "flow_yaml"
+
+
 def test_workspace_connector_ready_blocks_missing_or_empty_profiles() -> None:
     from mercury_tools.mcp.server import workspace_connector_ready
 
@@ -787,6 +883,93 @@ def test_retrieve_workspace_context_pack_requires_setup_without_ready_available_
     assert token not in str(audit_events)
     assert audit_events[-1]["tool_name"] == "retrieve_workspace_context_pack"
     assert audit_events[-1]["output_summary"]["status"] == "requires_setup"
+
+
+def test_workspace_connector_status_returns_token_scoped_sanitized_profiles(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    configure_product_env(monkeypatch)
+    audit_events: list[dict[str, Any]] = []
+
+    class FakeStore:
+        def dashboard(self, token_payload):
+            assert token_payload["sub"] == "owner@example.com"
+            return {
+                "workspace": {"name": "Demo Co"},
+                "connector_profiles": [
+                    {
+                        "connector_id": "flowaccount",
+                        "environment": "production",
+                        "status": "connected_read_only",
+                        "metadata": {
+                            "setup_state": "ready",
+                            "enabled_capabilities": ["company.info.read"],
+                            "server_vault": {
+                                "ciphertext": "encrypted-secret-derived-value"
+                            },
+                        },
+                    }
+                ],
+            }
+
+    def fake_audit(tool_name, input_payload, output_summary):
+        audit_events.append(
+            {
+                "tool_name": tool_name,
+                "input_payload": input_payload,
+                "output_summary": output_summary,
+            }
+        )
+
+    monkeypatch.setattr(server, "_product_store", lambda settings=None: FakeStore())
+    monkeypatch.setattr(server, "_audit", fake_audit)
+
+    token = make_client_token()
+    payload = server.workspace_connector_status(client_token=token)
+
+    assert payload["status"] == "ok"
+    assert payload["setup_required"] is False
+    assert payload["active_connector"]["connector_id"] == "flowaccount"
+    assert payload["connector_profiles"][0]["status"] == "connected_read_only"
+    assert "server_vault" not in str(payload)
+    assert "ciphertext" not in str(payload)
+    assert "encrypted-secret-derived-value" not in str(payload)
+    assert token not in str(audit_events)
+    assert audit_events[-1]["tool_name"] == "workspace_connector_status"
+    assert audit_events[-1]["input_payload"]["client_token_hash"]
+
+
+def test_workspace_connector_status_requires_setup_without_ready_profile(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    configure_product_env(monkeypatch)
+
+    class FakeStore:
+        def dashboard(self, token_payload):
+            return {
+                "workspace": {"name": "Demo Co"},
+                "connector_profiles": [
+                    {
+                        "connector_id": "flowaccount",
+                        "environment": "production",
+                        "status": "credentials_configured",
+                        "metadata": {"setup_state": "credentials_received"},
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(server, "_product_store", lambda settings=None: FakeStore())
+
+    payload = server.workspace_connector_status(client_token=make_client_token())
+
+    assert payload["status"] == "requires_setup"
+    assert payload["setup_required"] is True
+    assert payload["next_tool"] == "start_connector_setup"
+    assert payload["next_skill"] == "connector-credential-setup-th"
 
 
 def test_run_workspace_flow_requires_ready_connector(monkeypatch) -> None:

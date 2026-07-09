@@ -5,7 +5,7 @@ description: Use when the user asks to list, save, approve, or run Mercury Flows
 
 # Mercury Flow Runner
 
-Use `connector_status` before running a flow that needs live accounting data. If connector setup is incomplete, route to `connector-credential-setup-th`.
+Use `workspace_connector_status` with `client_token` before running a flow that needs live accounting data. If connector setup is incomplete, route to `connector-credential-setup-th`.
 
 Use `list_workspace_flows` to find existing flows. Use `save_workspace_flow` only after the user approves the flow name, purpose, and allowed actions.
 

@@ -5,7 +5,7 @@ description: Use when the user asks to review invoices, tax invoices, receipts, 
 
 # Invoice Review TH
 
-Use `connector_status` first. If connector setup is incomplete, route to `connector-credential-setup-th`.
+Use `workspace_connector_status` with `client_token` first. If connector setup is incomplete, route to `connector-credential-setup-th`.
 
 Use `retrieve_workspace_context_pack` for invoice, customer, vendor, VAT, and evidence context. Use `run_mercury_flow` for approved invoice review or exception-check flows.
 
