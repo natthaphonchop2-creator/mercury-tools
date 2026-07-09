@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "mercury-tools": {
+      "type": "http",
+      "url": "https://mercury-tools-mcp.onrender.com/mcp",
+      "bearer_token_env_var": "MERCURY_TOOLS_MCP_TOKEN"
+    }
+  }
+}

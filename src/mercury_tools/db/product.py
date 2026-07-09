@@ -13,6 +13,8 @@ import httpx
 from cryptography.fernet import Fernet
 
 from mercury_tools.config import Settings, require_supabase
+from mercury_tools.connectors.catalog import connector_by_id, list_connector_summaries
+from mercury_tools.connectors.setup import required_missing_fields, resolve_setup_state
 from mercury_tools.flows.parser import parse_flow_text
 from mercury_tools.product import ConnectRequest, normalize_host_app
 from mercury_tools.safety.redaction import redact_json
@@ -70,40 +72,24 @@ SKILL_CATALOG_SEED: list[dict[str, Any]] = [
     },
 ]
 
-CONNECTOR_CATALOG: list[dict[str, Any]] = [
-    {
-        "connector_id": "flowaccount",
-        "name": "FlowAccount",
-        "status": "available",
-        "environments": ["production", "sandbox"],
-        "required_secret_fields": ["client_id", "client_secret"],
-        "preset": {
-            "grant_type": "client_credentials",
-            "scope": "flowaccount-api",
-            "api_base_url": "https://openapi.flowaccount.com/v1",
-            "token_url": "https://openapi.flowaccount.com/token",
-        },
-    },
-    {
-        "connector_id": "peak",
-        "name": "PEAK Accounting",
-        "status": "setup_target",
-        "environments": ["production", "sandbox"],
-        "required_secret_fields": ["client_id", "client_secret"],
-        "preset": {},
-    },
-    {
-        "connector_id": "express",
-        "name": "Express Account",
-        "status": "setup_target",
-        "environments": ["local", "gateway"],
-        "required_secret_fields": ["gateway_url", "api_key"],
-        "preset": {},
-    },
-]
-
 PRODUCT_STATE_TOOL = "mercury_product_state"
 PRODUCT_FALLBACK_LIMIT = 500
+SERVER_ONLY_CONNECTOR_PROFILE_KEYS = {
+    "ciphertext",
+    "credential_vault",
+    "encrypted_credentials",
+    "server_vault",
+    "vault_record",
+}
+PRESERVED_CONNECTOR_CREDENTIAL_METADATA_KEYS = {
+    "credential_storage",
+    "credential_fields",
+    "credential_fingerprints",
+    "credentials_configured",
+    "credentials_configured_at",
+    "configured_at",
+    "server_vault",
+}
 
 
 def slugify(value: str, *, fallback: str = "workspace") -> str:
@@ -220,13 +206,6 @@ def email_domain(email: str) -> str:
     return parts[1] if len(parts) == 2 else ""
 
 
-def connector_by_id(connector_id: str) -> dict[str, Any] | None:
-    return next(
-        (item for item in CONNECTOR_CATALOG if item["connector_id"] == connector_id),
-        None,
-    )
-
-
 def vault_key(settings: Settings, workspace_key_value: str) -> bytes:
     material = f"{settings.connect_signing_secret}:vault:{workspace_key_value}".encode()
     return base64.urlsafe_b64encode(hashlib.sha256(material).digest())
@@ -272,6 +251,51 @@ def encrypt_connector_credentials(
     }
 
 
+def _strip_server_only_connector_data(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _strip_server_only_connector_data(item)
+            for key, item in value.items()
+            if str(key) not in SERVER_ONLY_CONNECTOR_PROFILE_KEYS
+        }
+    if isinstance(value, list):
+        return [_strip_server_only_connector_data(item) for item in value]
+    return value
+
+
+def _preserved_connector_credential_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: metadata[key]
+        for key in PRESERVED_CONNECTOR_CREDENTIAL_METADATA_KEYS
+        if key in metadata
+    }
+
+
+def public_connector_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    return redact_json(_strip_server_only_connector_data(dict(profile)))
+
+
+def public_connector_profiles(profiles: Any) -> list[dict[str, Any]]:
+    if not isinstance(profiles, list):
+        return []
+    return [
+        public_connector_profile(profile)
+        for profile in profiles
+        if isinstance(profile, dict)
+    ]
+
+
+def public_product_event(row: dict[str, Any]) -> dict[str, Any]:
+    return redact_json(_strip_server_only_connector_data(dict(row)))
+
+
+def connector_profile_status_from_metadata(metadata: dict[str, Any] | None) -> str:
+    setup_state = str((metadata or {}).get("setup_state") or "").strip().lower()
+    if setup_state in {"ready", "connected_read_only"}:
+        return "connected_read_only"
+    return "requires_credentials"
+
+
 def is_product_schema_error(exc: RuntimeError) -> bool:
     text = str(exc).lower()
     return "mercury_" in text and (
@@ -308,6 +332,7 @@ class SupabaseProductStore:
             "Authorization": f"Bearer {settings.supabase_service_role_key}",
             "Content-Type": "application/json",
         }
+        self._fallback_private_connector_profiles: dict[str, dict[str, Any]] = {}
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = f"{self.base_url}/{path.lstrip('/')}"
@@ -446,7 +471,7 @@ class SupabaseProductStore:
             if event_type in {"connector.profile_configured", "connector.credentials_configured"}:
                 profile = summary.get("profile") or {}
                 profile_key = f"{profile.get('connector_id')}:{profile.get('environment')}"
-                connector_profiles[profile_key] = profile
+                connector_profiles[profile_key] = public_connector_profile(profile)
             elif event_type in {"skill.enabled", "skill.disabled"}:
                 skill_id = str(summary.get("skill_id") or "")
                 if skill_id in skills:
@@ -478,7 +503,9 @@ class SupabaseProductStore:
                     "id": row.get("id"),
                     "created_at": row.get("created_at"),
                     "event_type": event_type,
-                    "summary": summary.get("event_summary") or {},
+                    "summary": _strip_server_only_connector_data(
+                        summary.get("event_summary") or {}
+                    ),
                     "status": row.get("status"),
                     "metadata": {"storage": "audit_fallback"},
                 }
@@ -488,7 +515,7 @@ class SupabaseProductStore:
             "status": "ok",
             "storage": "audit_fallback",
             **context,
-            "connectors": CONNECTOR_CATALOG,
+            "connectors": list_connector_summaries(),
             "connector_profiles": list(connector_profiles.values()),
             "members": list(members.values()),
             "skills": sorted(skills.values(), key=lambda item: (item["category"], item["title"])),
@@ -502,7 +529,7 @@ class SupabaseProductStore:
                 key=lambda item: str(item.get("created_at") or ""),
                 reverse=True,
             )[:12],
-            "events": list(reversed(events[-12:])),
+            "events": [public_product_event(event) for event in reversed(events[-12:])],
         }
 
     def _fallback_flows_for_workspace_key(self, workspace_key_value: str) -> list[dict[str, Any]]:
@@ -690,57 +717,119 @@ class SupabaseProductStore:
         token_payload: dict[str, Any],
         connector_id: str,
         environment: str,
-        company_name: str,
+        company_name: str | None,
         display_name: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         context = self._fallback_workspace_for_token(token_payload)
-        connector = next(
-            (item for item in CONNECTOR_CATALOG if item["connector_id"] == connector_id),
-            None,
-        )
+        connector = connector_by_id(connector_id)
         if not connector:
             raise ValueError(f"Unknown connector: {connector_id}")
-        if environment not in connector["environments"]:
-            raise ValueError(f"Unsupported environment for {connector_id}: {environment}")
+        canonical_connector_id = connector.connector_id
+        if environment not in connector.environments:
+            raise ValueError(
+                f"Unsupported environment for {canonical_connector_id}: {environment}"
+            )
+        profile_id = stable_id(
+            "connector",
+            context["workspace"]["workspace_key"],
+            canonical_connector_id,
+            environment,
+        )
+        existing_profile: dict[str, Any] | None = None
+        for row in self._fallback_state_events(context["workspace"]["workspace_key"]):
+            summary = row.get("output_summary") or {}
+            if summary.get("event_type") not in {
+                "connector.profile_configured",
+                "connector.credentials_configured",
+            }:
+                continue
+            profile = summary.get("profile") or {}
+            if (
+                profile.get("connector_id") == canonical_connector_id
+                and profile.get("environment") == environment
+            ):
+                existing_profile = profile
+        private_profile = self._fallback_private_connector_profiles.get(profile_id)
+        existing_metadata = (
+            private_profile or existing_profile or {}
+        ).get("metadata") or {}
+        merged_metadata = {
+            **existing_metadata,
+            "required_secret_fields": connector.required_secret_fields,
+            "preset": connector.preset_for_environment(environment),
+            "credential_storage": "host_or_user_vault",
+            "storage": "audit_fallback",
+            **(metadata or {}),
+            **_preserved_connector_credential_metadata(existing_metadata),
+        }
         profile = {
-            "id": stable_id(
-                "connector",
-                context["workspace"]["workspace_key"],
-                connector_id,
-                environment,
-            ),
+            "id": profile_id,
             "workspace_id": context["workspace"]["id"],
-            "connector_id": connector_id,
+            "connector_id": canonical_connector_id,
             "environment": environment,
-            "display_name": display_name or connector["name"],
-            "company_name": company_name,
-            "status": "requires_credentials",
-            "metadata": {
-                "required_secret_fields": connector["required_secret_fields"],
-                "preset": connector["preset"],
-                "credential_storage": "host_or_user_vault",
-                "storage": "audit_fallback",
-                **(metadata or {}),
-            },
+            "display_name": display_name or connector.name,
+            "company_name": (
+                company_name
+                if company_name is not None
+                else (existing_profile or {}).get("company_name")
+            ),
+            "status": connector_profile_status_from_metadata(merged_metadata),
+            "metadata": merged_metadata,
             "created_at": now_utc(),
             "updated_at": now_utc(),
         }
+        self._fallback_private_connector_profiles[profile_id] = profile
+        public_profile = public_connector_profile(profile)
         self._fallback_record_state_event(
             workspace_key=context["workspace"]["workspace_key"],
             client_jti=str(token_payload.get("jti") or ""),
             event_type="connector.profile_configured",
-            input_payload={"connector_id": connector_id, "environment": environment},
+            input_payload={
+                "connector_id": canonical_connector_id,
+                "environment": environment,
+            },
             summary={
-                "profile": profile,
+                "profile": public_profile,
                 "event_summary": {
-                    "connector_id": connector_id,
+                    "connector_id": canonical_connector_id,
                     "environment": environment,
                     "status": profile["status"],
                 },
             },
         )
-        return profile
+        return _strip_server_only_connector_data(dict(profile))
+
+    def start_connector_setup(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        environment: str,
+        company_name: str | None = None,
+    ) -> dict[str, Any]:
+        manifest = connector_by_id(connector_id)
+        if not manifest:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        if environment not in manifest.environments:
+            raise ValueError(f"Unsupported environment for {connector_id}: {environment}")
+        setup_state = resolve_setup_state(
+            has_program=True,
+            has_environment=bool(environment),
+            missing_fields=required_missing_fields(manifest, {}),
+        )
+        return self.set_connector_profile(
+            token_payload=token_payload,
+            connector_id=manifest.connector_id,
+            environment=environment,
+            company_name=company_name,
+            metadata={
+                "setup_state": setup_state,
+                "required_secret_fields": manifest.required_secret_fields,
+                "preset": manifest.preset_for_environment(environment),
+                "capabilities": manifest.capabilities,
+            },
+        )
 
     def set_connector_credentials(
         self,
@@ -753,9 +842,12 @@ class SupabaseProductStore:
         connector = connector_by_id(connector_id)
         if not connector:
             raise ValueError(f"Unknown connector: {connector_id}")
-        if environment not in connector["environments"]:
-            raise ValueError(f"Unsupported environment for {connector_id}: {environment}")
-        required_fields = list(connector["required_secret_fields"])
+        canonical_connector_id = connector.connector_id
+        if environment not in connector.environments:
+            raise ValueError(
+                f"Unsupported environment for {canonical_connector_id}: {environment}"
+            )
+        required_fields = list(connector.required_secret_fields)
         missing = [
             field
             for field in required_fields
@@ -767,7 +859,7 @@ class SupabaseProductStore:
         try:
             return self._set_connector_credentials_product_tables(
                 token_payload=token_payload,
-                connector_id=connector_id,
+                connector_id=canonical_connector_id,
                 environment=environment,
                 credentials=credentials,
             )
@@ -775,7 +867,7 @@ class SupabaseProductStore:
             if is_product_schema_error(exc):
                 return self._fallback_set_connector_credentials(
                     token_payload=token_payload,
-                    connector_id=connector_id,
+                    connector_id=canonical_connector_id,
                     environment=environment,
                     credentials=credentials,
                 )
@@ -795,13 +887,14 @@ class SupabaseProductStore:
         connector = connector_by_id(connector_id)
         if not connector:
             raise ValueError(f"Unknown connector: {connector_id}")
+        canonical_connector_id = connector.connector_id
 
         rows = self._request(
             "GET",
             "mercury_connector_profiles",
             params={
                 "workspace_id": f"eq.{context['workspace']['id']}",
-                "connector_id": f"eq.{connector_id}",
+                "connector_id": f"eq.{canonical_connector_id}",
                 "environment": f"eq.{environment}",
                 "select": "id,metadata,display_name,company_name",
                 "limit": "1",
@@ -812,7 +905,7 @@ class SupabaseProductStore:
         else:
             profile = self._set_connector_profile_product_tables(
                 token_payload=token_payload,
-                connector_id=connector_id,
+                connector_id=canonical_connector_id,
                 environment=environment,
                 company_name=str(context["workspace"].get("name") or ""),
             )
@@ -820,17 +913,21 @@ class SupabaseProductStore:
         vault_record = encrypt_connector_credentials(
             self.settings,
             workspace_key_value=context["workspace"]["workspace_key"],
-            connector_id=connector_id,
+            connector_id=canonical_connector_id,
             environment=environment,
             credentials=credentials,
         )
-        public_metadata = {
+        profile_metadata = {
             **(profile.get("metadata") or {}),
             "credential_storage": "encrypted_server_vault",
             "credential_fields": vault_record["fields"],
             "credential_fingerprints": vault_record["fingerprints"],
             "credentials_configured": True,
             "credentials_configured_at": vault_record["configured_at"],
+        }
+        server_metadata = {
+            **profile_metadata,
+            "server_vault": vault_record,
         }
         rows = self._request(
             "PATCH",
@@ -839,28 +936,30 @@ class SupabaseProductStore:
             headers={**self.headers, "Prefer": "return=representation"},
             json={
                 "status": "credentials_configured",
-                "metadata": public_metadata,
+                "metadata": server_metadata,
                 "updated_at": now_utc(),
             },
+        )
+        event_profile = public_connector_profile(
+            {
+                **(rows[0] if rows else profile),
+                "status": "credentials_configured",
+                "metadata": server_metadata,
+            }
         )
         self._fallback_record_state_event(
             workspace_key=context["workspace"]["workspace_key"],
             client_jti=str(token_payload.get("jti") or ""),
             event_type="connector.credentials_configured",
             input_payload={
-                "connector_id": connector_id,
+                "connector_id": canonical_connector_id,
                 "environment": environment,
                 "credential_fields": vault_record["fields"],
             },
             summary={
-                "profile": {
-                    **(rows[0] if rows else profile),
-                    "status": "credentials_configured",
-                    "metadata": public_metadata,
-                },
-                "vault_record": vault_record,
+                "profile": event_profile,
                 "event_summary": {
-                    "connector_id": connector_id,
+                    "connector_id": canonical_connector_id,
                     "environment": environment,
                     "credential_fields": vault_record["fields"],
                     "status": "credentials_configured",
@@ -869,7 +968,7 @@ class SupabaseProductStore:
         )
         return {
             "status": "credentials_configured",
-            "connector_id": connector_id,
+            "connector_id": canonical_connector_id,
             "environment": environment,
             "credential_fields": vault_record["fields"],
             "credential_fingerprints": vault_record["fingerprints"],
@@ -888,10 +987,11 @@ class SupabaseProductStore:
         connector = connector_by_id(connector_id)
         if not connector:
             raise ValueError(f"Unknown connector: {connector_id}")
+        canonical_connector_id = connector.connector_id
         vault_record = encrypt_connector_credentials(
             self.settings,
             workspace_key_value=context["workspace"]["workspace_key"],
-            connector_id=connector_id,
+            connector_id=canonical_connector_id,
             environment=environment,
             credentials=credentials,
         )
@@ -899,18 +999,18 @@ class SupabaseProductStore:
             "id": stable_id(
                 "connector",
                 context["workspace"]["workspace_key"],
-                connector_id,
+                canonical_connector_id,
                 environment,
             ),
             "workspace_id": context["workspace"]["id"],
-            "connector_id": connector_id,
+            "connector_id": canonical_connector_id,
             "environment": environment,
-            "display_name": connector["name"],
+            "display_name": connector.name,
             "company_name": context["workspace"]["name"],
             "status": "credentials_configured",
             "metadata": {
-                "required_secret_fields": connector["required_secret_fields"],
-                "preset": connector["preset"],
+                "required_secret_fields": connector.required_secret_fields,
+                "preset": connector.preset_for_environment(environment),
                 "credential_storage": "encrypted_server_vault",
                 "credential_fields": vault_record["fields"],
                 "credential_fingerprints": vault_record["fingerprints"],
@@ -921,20 +1021,27 @@ class SupabaseProductStore:
             "created_at": now_utc(),
             "updated_at": now_utc(),
         }
+        private_profile = {
+            **profile,
+            "metadata": {
+                **profile["metadata"],
+                "server_vault": vault_record,
+            },
+        }
+        self._fallback_private_connector_profiles[profile["id"]] = private_profile
         self._fallback_record_state_event(
             workspace_key=context["workspace"]["workspace_key"],
             client_jti=str(token_payload.get("jti") or ""),
             event_type="connector.credentials_configured",
             input_payload={
-                "connector_id": connector_id,
+                "connector_id": canonical_connector_id,
                 "environment": environment,
                 "credential_fields": vault_record["fields"],
             },
             summary={
-                "profile": profile,
-                "vault_record": vault_record,
+                "profile": public_connector_profile(profile),
                 "event_summary": {
-                    "connector_id": connector_id,
+                    "connector_id": canonical_connector_id,
                     "environment": environment,
                     "credential_fields": vault_record["fields"],
                     "status": "credentials_configured",
@@ -943,7 +1050,7 @@ class SupabaseProductStore:
         )
         return {
             "status": "credentials_configured",
-            "connector_id": connector_id,
+            "connector_id": canonical_connector_id,
             "environment": environment,
             "credential_fields": vault_record["fields"],
             "credential_fingerprints": vault_record["fingerprints"],
@@ -1191,7 +1298,7 @@ class SupabaseProductStore:
                 "member": {"email": token_payload.get("sub")},
                 "skills": [],
                 "flows": [],
-                "connectors": CONNECTOR_CATALOG,
+                "connectors": list_connector_summaries(),
                 "connector_profiles": [],
                 "events": [],
             }
@@ -1270,8 +1377,8 @@ class SupabaseProductStore:
         return {
             "status": "ok",
             **context,
-            "connectors": CONNECTOR_CATALOG,
-            "connector_profiles": connector_profiles or [],
+            "connectors": list_connector_summaries(),
+            "connector_profiles": public_connector_profiles(connector_profiles or []),
             "members": members or [],
             "skills": [
                 {
@@ -1291,7 +1398,11 @@ class SupabaseProductStore:
                 for row in flow_run_events or []
                 if ((row.get("summary") or {}).get("flow_run") or {}).get("run_id")
             ],
-            "events": events or [],
+            "events": [
+                public_product_event(event)
+                for event in events or []
+                if isinstance(event, dict)
+            ],
         }
 
     def set_skill_enabled(
@@ -1414,14 +1525,18 @@ class SupabaseProductStore:
         token_payload: dict[str, Any],
         connector_id: str,
         environment: str,
-        company_name: str,
+        company_name: str | None = None,
         display_name: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        connector = connector_by_id(connector_id)
+        if not connector:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        canonical_connector_id = connector.connector_id
         try:
             return self._set_connector_profile_product_tables(
                 token_payload=token_payload,
-                connector_id=connector_id,
+                connector_id=canonical_connector_id,
                 environment=environment,
                 company_name=company_name,
                 display_name=display_name,
@@ -1431,7 +1546,7 @@ class SupabaseProductStore:
             if is_product_schema_error(exc):
                 return self._fallback_set_connector_profile(
                     token_payload=token_payload,
-                    connector_id=connector_id,
+                    connector_id=canonical_connector_id,
                     environment=environment,
                     company_name=company_name,
                     display_name=display_name,
@@ -1445,52 +1560,76 @@ class SupabaseProductStore:
         token_payload: dict[str, Any],
         connector_id: str,
         environment: str,
-        company_name: str,
+        company_name: str | None,
         display_name: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         context = self.workspace_for_token(token_payload)
         if not context:
             raise ValueError("Workspace is not registered for this client token.")
-        connector = next(
-            (item for item in CONNECTOR_CATALOG if item["connector_id"] == connector_id),
-            None,
-        )
+        connector = connector_by_id(connector_id)
         if not connector:
             raise ValueError(f"Unknown connector: {connector_id}")
-        if environment not in connector["environments"]:
-            raise ValueError(f"Unsupported environment for {connector_id}: {environment}")
+        canonical_connector_id = connector.connector_id
+        if environment not in connector.environments:
+            raise ValueError(
+                f"Unsupported environment for {canonical_connector_id}: {environment}"
+            )
+        existing_rows = self._request(
+            "GET",
+            "mercury_connector_profiles",
+            params={
+                "workspace_id": f"eq.{context['workspace']['id']}",
+                "connector_id": f"eq.{canonical_connector_id}",
+                "environment": f"eq.{environment}",
+                "select": "id,metadata,display_name,company_name",
+                "limit": "1",
+            },
+        )
+        existing_profile = (existing_rows or [None])[0]
+        existing_metadata = (existing_profile or {}).get("metadata") or {}
         merged_metadata = {
-            "required_secret_fields": connector["required_secret_fields"],
-            "preset": connector["preset"],
+            **existing_metadata,
+            "required_secret_fields": connector.required_secret_fields,
+            "preset": connector.preset_for_environment(environment),
             "credential_storage": "host_or_user_vault",
             **(metadata or {}),
+            **_preserved_connector_credential_metadata(existing_metadata),
         }
+        payload = {
+            "workspace_id": context["workspace"]["id"],
+            "connector_id": canonical_connector_id,
+            "environment": environment,
+            "display_name": (
+                display_name
+                if display_name is not None
+                else (existing_profile or {}).get("display_name") or connector.name
+            ),
+            "status": connector_profile_status_from_metadata(merged_metadata),
+            "metadata": merged_metadata,
+        }
+        if company_name is not None:
+            payload["company_name"] = company_name
         row = self._upsert_one(
             "mercury_connector_profiles",
-            {
-                "workspace_id": context["workspace"]["id"],
-                "connector_id": connector_id,
-                "environment": environment,
-                "display_name": display_name or connector["name"],
-                "company_name": company_name,
-                "status": "requires_credentials",
-                "metadata": merged_metadata,
-            },
+            payload,
             on_conflict="workspace_id,connector_id,environment",
         )
         self.record_event(
             workspace_id=context["workspace"]["id"],
             member_id=context["member"]["id"],
             event_type="connector.profile_configured",
-            input_payload={"connector_id": connector_id, "environment": environment},
+            input_payload={
+                "connector_id": canonical_connector_id,
+                "environment": environment,
+            },
             summary={
-                "connector_id": connector_id,
+                "connector_id": canonical_connector_id,
                 "environment": environment,
                 "status": row["status"],
             },
         )
-        return row
+        return _strip_server_only_connector_data(dict(row))
 
     def record_uploaded_skill(
         self,

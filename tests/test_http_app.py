@@ -19,6 +19,25 @@ def _clear_live_env(monkeypatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
+def ready_connector_profile(connector_id: str = "flowaccount") -> dict:
+    return {
+        "connector_id": connector_id,
+        "environment": "production",
+        "status": "ready",
+        "metadata": {
+            "setup_state": "ready",
+            "enabled_capabilities": ["company.info.read"],
+            "credential_storage": "encrypted_server_vault",
+            "credential_fields": ["client_id", "client_secret"],
+            "credential_fingerprints": {
+                "client_id": "client-id-fp",
+                "client_secret": "client-secret-fp",
+            },
+            "credentials_configured": True,
+        },
+    }
+
+
 def test_remote_http_app_exposes_healthz(monkeypatch) -> None:
     monkeypatch.setenv("MERCURY_TOOLS_MCP_PATH", "/mcp")
     monkeypatch.setenv("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", "false")
@@ -269,6 +288,14 @@ def test_workspace_flow_validate_and_dry_run_use_client_token(monkeypatch) -> No
     monkeypatch.setenv("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", "true")
     monkeypatch.setenv("MERCURY_CONNECT_INVITE_CODE", "invite-demo")
     monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
+    local_report_flow = (
+        "name: Local Report\n"
+        "---\n"
+        "- emitReport:\n"
+        "    title: Local Report\n"
+        "    sections:\n"
+        "      - Ready\n"
+    )
 
     client = TestClient(create_http_app(require_auth=True), raise_server_exceptions=False)
     token = client.post(
@@ -289,7 +316,7 @@ def test_workspace_flow_validate_and_dry_run_use_client_token(monkeypatch) -> No
     dry_run = client.post(
         "/api/flows/run",
         headers={"Authorization": f"Bearer {token}"},
-        json={"flow_yaml": COMPANY_HEALTH_TEMPLATE, "dry_run": True},
+        json={"flow_yaml": local_report_flow, "dry_run": True},
     )
     save = client.post(
         "/api/flows/save",
@@ -304,7 +331,131 @@ def test_workspace_flow_validate_and_dry_run_use_client_token(monkeypatch) -> No
     assert save.status_code == 503
 
 
-def test_workspace_flow_run_records_history_when_supabase_available(monkeypatch) -> None:
+def test_workspace_flow_run_blocks_connector_backed_raw_yaml_when_unready(monkeypatch) -> None:
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
+    monkeypatch.setenv("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("MERCURY_CONNECT_INVITE_CODE", "invite-demo")
+    monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
+
+    from mercury_tools.mcp import server
+
+    class FakeStore:
+        def upsert_connection(self, connect_request, token_payload):
+            return {"workspace": {"id": "workspace-1"}, "member": {"id": "member-1"}}
+
+        def dashboard(self, token_payload):
+            return {
+                "workspace": {"name": "Demo Co"},
+                "connector_profiles": [
+                    {
+                        "connector_id": "flowaccount",
+                        "environment": "production",
+                        "status": "credentials_configured",
+                        "metadata": {"setup_state": "credentials_received"},
+                    }
+                ],
+            }
+
+        def record_flow_run(self, **kwargs):
+            raise AssertionError("blocked connector setup should not record a run")
+
+    monkeypatch.setattr(server, "_product_store", lambda _settings=None: FakeStore())
+
+    client = TestClient(create_http_app(require_auth=True), raise_server_exceptions=False)
+    token = client.post(
+        "/api/connect",
+        json={
+            "invite_code": "invite-demo",
+            "email": "user@example.com",
+            "company": "Demo Co",
+            "host_app": "codex",
+        },
+    ).json()["token"]
+
+    response = client.post(
+        "/api/flows/run",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "flow_id": "raw-company-health",
+            "title": "Company Health Check",
+            "flow_yaml": COMPANY_HEALTH_TEMPLATE,
+            "dry_run": False,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "blocked"
+    assert "connector credential setup" in payload["message"]
+
+
+def test_workspace_flow_run_blocks_raw_yaml_with_connector_missing_environment(monkeypatch) -> None:
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
+    monkeypatch.setenv("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("MERCURY_CONNECT_INVITE_CODE", "invite-demo")
+    monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
+
+    from mercury_tools.mcp import server
+
+    connector_flow_missing_environment = (
+        "name: FlowAccount Missing Environment\n"
+        "tags: [accounting, read-only, flowaccount]\n"
+        "env:\n"
+        "  connector: flowaccount\n"
+        "---\n"
+        "- connectorStatus:\n"
+        "    saveAs: connectorState\n"
+        "- emitReport:\n"
+        "    title: Connector handoff\n"
+        "    sections:\n"
+        "      - Ready\n"
+    )
+
+    class FakeStore:
+        def upsert_connection(self, connect_request, token_payload):
+            return {"workspace": {"id": "workspace-1"}, "member": {"id": "member-1"}}
+
+        def dashboard(self, token_payload):
+            return {
+                "workspace": {"name": "Demo Co"},
+                "connector_profiles": [ready_connector_profile()],
+            }
+
+        def record_flow_run(self, **kwargs):
+            raise AssertionError("missing environment should block before recording a run")
+
+    monkeypatch.setattr(server, "_product_store", lambda _settings=None: FakeStore())
+
+    client = TestClient(create_http_app(require_auth=True), raise_server_exceptions=False)
+    token = client.post(
+        "/api/connect",
+        json={
+            "invite_code": "invite-demo",
+            "email": "user@example.com",
+            "company": "Demo Co",
+            "host_app": "codex",
+        },
+    ).json()["token"]
+
+    response = client.post(
+        "/api/flows/run",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "title": "Missing Environment",
+            "flow_yaml": connector_flow_missing_environment,
+            "dry_run": False,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "blocked"
+    assert "connector credential setup" in payload["message"]
+
+
+def test_workspace_flow_run_allows_non_connector_raw_yaml_without_readiness(monkeypatch) -> None:
     monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
     monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
     monkeypatch.setenv("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", "true")
@@ -353,22 +504,95 @@ def test_workspace_flow_run_records_history_when_supabase_available(monkeypatch)
         "/api/flows/run",
         headers={"Authorization": f"Bearer {token}"},
         json={
+            "title": "Local Report",
+            "flow_yaml": (
+                "name: Local Report\n"
+                "---\n"
+                "- emitReport:\n"
+                "    title: Local Report\n"
+                "    sections:\n"
+                "      - Ready\n"
+            ),
+            "dry_run": False,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["run_record"]["run_id"] == "flow_run_1"
+    assert recorded[0]["step_count"] == 1
+
+
+def test_workspace_flow_run_records_history_when_supabase_available(monkeypatch) -> None:
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
+    monkeypatch.setenv("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("MERCURY_CONNECT_INVITE_CODE", "invite-demo")
+    monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
+
+    from mercury_tools.mcp import server
+
+    recorded: list[dict] = []
+
+    class FakeStore:
+        def upsert_connection(self, connect_request, token_payload):
+            return {"workspace": {"id": "workspace-1"}, "member": {"id": "member-1"}}
+
+        def dashboard(self, token_payload):
+            return {"connector_profiles": [ready_connector_profile()]}
+
+        def record_flow_run(
+            self, *, token_payload, flow_id, title, result_payload, dry_run, env_keys
+        ):
+            row = {
+                "run_id": "flow_run_1",
+                "flow_id": flow_id,
+                "title": title,
+                "status": result_payload["status"],
+                "dry_run": dry_run,
+                "env_keys": env_keys,
+                "step_count": len(result_payload["steps"]),
+                "artifact_count": len(result_payload["artifacts"]),
+                "created_at": "2026-07-09T00:00:00+00:00",
+            }
+            recorded.append(row)
+            return row
+
+    monkeypatch.setattr(server, "_product_store", lambda _settings=None: FakeStore())
+
+    client = TestClient(create_http_app(require_auth=True), raise_server_exceptions=False)
+    token = client.post(
+        "/api/connect",
+        json={
+            "invite_code": "invite-demo",
+            "email": "user@example.com",
+            "company": "Demo Co",
+            "host_app": "codex",
+        },
+    ).json()["token"]
+
+    response = client.post(
+        "/api/flows/run",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
             "title": "Company Health Check",
             "flow_yaml": COMPANY_HEALTH_TEMPLATE,
             "dry_run": True,
-            "env": {"connector": "peak"},
+            "env": {"connector": "flowaccount", "environment": "production"},
         },
     )
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "planned"
-    assert payload["variables"]["env"]["connector"] == "peak"
+    assert payload["variables"]["env"]["connector"] == "flowaccount"
+    assert payload["variables"]["env"]["environment"] == "production"
     assert payload["run_record"]["run_id"] == "flow_run_1"
-    assert payload["run_record"]["env_keys"] == ["connector"]
+    assert payload["run_record"]["env_keys"] == ["connector", "environment"]
     assert recorded[0]["title"] == "Company Health Check"
     assert recorded[0]["step_count"] == 4
-    assert recorded[0]["env_keys"] == ["connector"]
+    assert recorded[0]["env_keys"] == ["connector", "environment"]
 
 
 def test_workspace_flow_import_saves_batch(monkeypatch) -> None:

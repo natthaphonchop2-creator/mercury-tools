@@ -1,0 +1,13 @@
+{
+  "name": "mercury-finance",
+  "display_name": "Mercury Finance",
+  "description": "Accounting AI for ERP connectors, VAT, reports, audit context, and Mercury Flows.",
+  "version": "0.1.0",
+  "category": "Finance",
+  "capabilities": ["Interactive", "Read"],
+  "starter_prompts": [
+    "Prepare a Thai VAT context pack",
+    "Connect FlowAccount and validate read-only access",
+    "Run a company health check flow"
+  ]
+}

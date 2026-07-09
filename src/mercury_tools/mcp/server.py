@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -15,9 +16,21 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
 from mercury_tools.config import load_settings
-from mercury_tools.db.product import SupabaseProductStore, slugify
+from mercury_tools.connectors.catalog import connector_by_id, list_connector_summaries
+from mercury_tools.connectors.setup import required_missing_fields, validate_connector_read_only
+from mercury_tools.db.product import (
+    SupabaseProductStore,
+    public_connector_profile,
+    public_connector_profiles,
+    slugify,
+)
 from mercury_tools.db.supabase import SupabaseRagStore
-from mercury_tools.flows.parser import FlowValidationError, validate_flow_text
+from mercury_tools.flows.parser import (
+    FlowValidationError,
+    parse_flow_text,
+    parse_inline_commands,
+    validate_flow_text,
+)
 from mercury_tools.flows.runner import create_default_runner
 from mercury_tools.flows.templates import FLOW_CHEAT_SHEET
 from mercury_tools.flows.workspace import discover_workspace_flows, workspace_manifest
@@ -42,6 +55,11 @@ mcp = FastMCP("Mercury Tools")
 
 MAX_MCP_FLOW_FILES = 50
 MAX_MCP_FLOW_FILE_CHARS = 500_000
+CONNECTOR_ENV_KEYS = ("connector", "connector_id", "accounting_connector", "erp_connector")
+ENVIRONMENT_ENV_KEYS = ("environment", "connector_environment", "connector_env")
+CAPABILITY_KEYS = ("required_capabilities", "requiredCapabilities", "capabilities")
+CONNECTOR_BACKED_COMMANDS = {"connectorStatus"}
+CONNECTOR_TAGS = {"connector", "connectors", "connector-backed", "accounting-connector", "erp-connector"}
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -252,6 +270,12 @@ def _client_token_audit_ref(client_token: str) -> dict[str, str]:
     }
 
 
+def _client_token_audit_ref_optional(client_token: str | None) -> dict[str, str]:
+    if not isinstance(client_token, str) or not client_token:
+        return {}
+    return _client_token_audit_ref(client_token)
+
+
 def _client_token_payload(request: Request) -> dict[str, Any]:
     settings = load_settings()
     authorization = request.headers.get("authorization") or ""
@@ -329,6 +353,424 @@ def _fallback_dashboard(token_payload: dict[str, Any], *, reason: str) -> dict[s
     }
 
 
+def _profile_enabled_capabilities(profile: dict[str, Any]) -> list[Any]:
+    metadata = profile.get("metadata") if isinstance(profile.get("metadata"), dict) else {}
+    raw = metadata.get("enabled_capabilities") or profile.get("enabled_capabilities") or []
+    if isinstance(raw, str):
+        return [raw] if raw.strip() else []
+    if isinstance(raw, list | tuple | set):
+        return [item for item in raw if str(item).strip()]
+    return []
+
+
+def _profile_has_public_encrypted_credentials(profile: dict[str, Any]) -> bool:
+    metadata = profile.get("metadata") if isinstance(profile.get("metadata"), dict) else {}
+    if _clean_selector(metadata.get("credential_storage")) != "encrypted_server_vault":
+        return False
+    if metadata.get("credentials_configured") is not True:
+        return False
+    credential_fields = [
+        str(field).strip()
+        for field in metadata.get("credential_fields") or []
+        if str(field).strip()
+    ]
+    credential_fingerprints = metadata.get("credential_fingerprints")
+    if not credential_fields or not isinstance(credential_fingerprints, dict):
+        return False
+    return all(str(credential_fingerprints.get(field) or "").strip() for field in credential_fields)
+
+
+def _manifest_has_read_only_validation_adapter(manifest: Any) -> bool:
+    validation = getattr(manifest, "validation", None)
+    method = str(getattr(validation, "method", "") or "").strip().lower()
+    endpoint = str(getattr(validation, "read_only_endpoint", "") or "").strip()
+    return bool(
+        getattr(validation, "read_only", False)
+        and method
+        and method != "manual"
+        and endpoint
+    )
+
+
+def _clean_selector(value: Any) -> str | None:
+    if value is None:
+        return None
+    clean = str(value).strip().lower()
+    return clean or None
+
+
+def _first_mapping_value(mapping: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        selected = _clean_selector(mapping.get(key))
+        if selected:
+            return selected
+    return None
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        clean = value.strip()
+        return [clean] if clean else []
+    if isinstance(value, list | tuple | set):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _workspace_flow_from_dashboard(
+    dashboard_payload: dict[str, Any],
+    flow_id: str,
+) -> dict[str, Any] | None:
+    for flow in dashboard_payload.get("flows") or []:
+        if isinstance(flow, dict) and str(flow.get("flow_id") or "") == flow_id:
+            return flow
+    return None
+
+
+def _saved_flow_env(flow: dict[str, Any] | None) -> dict[str, Any]:
+    if not flow:
+        return {}
+    env = dict(_mapping(flow.get("env")))
+    flow_yaml = flow.get("yaml")
+    if isinstance(flow_yaml, str) and flow_yaml.strip():
+        with suppress(FlowValidationError):
+            env.update(parse_flow_text(flow_yaml).env)
+    return env
+
+
+def _connector_from_flow_tags(flow: dict[str, Any] | None) -> str | None:
+    if not flow:
+        return None
+    return _connector_from_tags(flow.get("tags") or [])
+
+
+def _connector_from_tags(tags: Any) -> str | None:
+    for tag in tags or []:
+        connector_id = _clean_selector(tag)
+        if connector_id and connector_by_id(connector_id):
+            return connector_id
+        if connector_id:
+            for separator in (":", "="):
+                if separator not in connector_id:
+                    continue
+                key, value = connector_id.split(separator, 1)
+                if key.strip() in CONNECTOR_ENV_KEYS and connector_by_id(value.strip()):
+                    return value.strip()
+    return None
+
+
+def _has_connector_tag(tags: Any) -> bool:
+    for tag in tags or []:
+        value = _clean_selector(tag)
+        if value and (value in CONNECTOR_TAGS or connector_by_id(value)):
+            return True
+    return False
+
+
+def _known_connector_from_mapping(mapping: dict[str, Any]) -> str | None:
+    selected = _first_mapping_value(mapping, CONNECTOR_ENV_KEYS)
+    if selected and connector_by_id(selected):
+        return selected
+    return None
+
+
+def _iter_flow_commands(commands: list[Any]) -> list[Any]:
+    all_commands: list[Any] = []
+    pending = list(commands)
+    while pending:
+        command = pending.pop(0)
+        all_commands.append(command)
+        inline_commands = _mapping(getattr(command, "args", {})).get("commands")
+        if inline_commands is None:
+            continue
+        with suppress(FlowValidationError):
+            pending.extend(
+                parse_inline_commands(
+                    inline_commands,
+                    source=f"{getattr(command, 'name', 'command')}.commands",
+                )
+            )
+    return all_commands
+
+
+def _flow_has_connector_backed_command(flow: Any) -> bool:
+    return any(
+        getattr(command, "name", "") in CONNECTOR_BACKED_COMMANDS
+        for command in _iter_flow_commands(flow.all_commands())
+    )
+
+
+def _connector_from_flow_commands(flow: Any) -> str | None:
+    for command in _iter_flow_commands(flow.all_commands()):
+        selected = _known_connector_from_mapping(_mapping(getattr(command, "args", {})))
+        if selected:
+            return selected
+    return None
+
+
+def _raw_flow_readiness_selection(
+    flow: Any,
+    *,
+    env_overrides: dict[str, str],
+) -> dict[str, Any]:
+    effective_env = {**_mapping(getattr(flow, "env", {})), **env_overrides}
+    connector_id = (
+        _first_mapping_value(effective_env, CONNECTOR_ENV_KEYS)
+        or _connector_from_tags(getattr(flow, "tags", []))
+        or _connector_from_flow_commands(flow)
+    )
+    connector_backed = bool(
+        connector_id
+        or _has_connector_tag(getattr(flow, "tags", []))
+        or _flow_has_connector_backed_command(flow)
+    )
+    return {
+        "connector_backed": connector_backed,
+        "connector_id": connector_id,
+        "environment": _first_mapping_value(effective_env, ENVIRONMENT_ENV_KEYS),
+        "required_capabilities": _required_capabilities_from_sources(
+            metadata={},
+            env=effective_env,
+        ),
+    }
+
+
+def _raw_mcp_connector_setup_block(
+    flow: Any,
+    *,
+    env_overrides: dict[str, str],
+    client_token: str | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    readiness_selection = _raw_flow_readiness_selection(
+        flow,
+        env_overrides=env_overrides,
+    )
+    if not readiness_selection["connector_backed"]:
+        return None, readiness_selection
+
+    block_payload = _connector_setup_block_payload()
+    if not isinstance(client_token, str) or not client_token.strip():
+        return block_payload, readiness_selection
+
+    settings = load_settings()
+    token_payload = _client_token_payload_from_value(client_token)
+    if not settings.supabase_configured:
+        return block_payload, readiness_selection
+
+    dashboard_payload = _product_store(settings).dashboard(token_payload)
+    if not readiness_selection["connector_id"] or not workspace_connector_ready(
+        dashboard_payload,
+        connector_id=readiness_selection["connector_id"],
+        environment=readiness_selection["environment"],
+        required_capabilities=readiness_selection["required_capabilities"],
+    ):
+        return block_payload, readiness_selection
+    return None, readiness_selection
+
+
+def _required_capabilities_from_sources(
+    *,
+    metadata: dict[str, Any],
+    env: dict[str, Any],
+) -> list[str]:
+    for source in (env, metadata):
+        for key in CAPABILITY_KEYS:
+            capabilities = _string_list(source.get(key))
+            if capabilities:
+                return capabilities
+    return []
+
+
+def _workspace_flow_readiness_selection(
+    dashboard_payload: dict[str, Any],
+    *,
+    flow_id: str,
+    env_overrides: dict[str, str],
+) -> dict[str, Any]:
+    flow = _workspace_flow_from_dashboard(dashboard_payload, flow_id)
+    metadata = _mapping((flow or {}).get("metadata"))
+    metadata_env = _mapping(metadata.get("env"))
+    flow_env = _saved_flow_env(flow)
+    effective_env = {**metadata_env, **flow_env, **env_overrides}
+    return {
+        "connector_id": (
+            _first_mapping_value(effective_env, CONNECTOR_ENV_KEYS)
+            or _first_mapping_value(metadata, CONNECTOR_ENV_KEYS)
+            or _connector_from_flow_tags(flow)
+        ),
+        "environment": (
+            _first_mapping_value(effective_env, ENVIRONMENT_ENV_KEYS)
+            or _first_mapping_value(metadata, ENVIRONMENT_ENV_KEYS)
+        ),
+        "required_capabilities": _required_capabilities_from_sources(
+            metadata=metadata,
+            env=effective_env,
+        ),
+    }
+
+
+def _workspace_connector_ready(
+    dashboard_payload: dict[str, Any],
+    *,
+    connector_id: str | None = None,
+    environment: str | None = None,
+    required_capabilities: list[str] | None = None,
+) -> bool:
+    profiles = dashboard_payload.get("connector_profiles")
+    if not isinstance(profiles, list) or not profiles:
+        return False
+    selected_connector = _clean_selector(connector_id)
+    selected_environment = _clean_selector(environment)
+    if not selected_connector or not selected_environment:
+        return False
+    manifest = connector_by_id(selected_connector)
+    if not manifest:
+        return False
+    if _clean_selector(manifest.status) != "available":
+        return False
+    manifest_environments = {
+        str(item).strip().lower()
+        for item in manifest.environments
+        if str(item).strip()
+    }
+    if selected_environment not in manifest_environments:
+        return False
+    if not _manifest_has_read_only_validation_adapter(manifest):
+        return False
+    manifest_capabilities = {
+        str(capability).strip()
+        for capability in manifest.capabilities
+        if str(capability).strip()
+    }
+    if not manifest_capabilities:
+        return False
+    required = {str(capability).strip() for capability in required_capabilities or [] if str(capability).strip()}
+    if required and not required.issubset(manifest_capabilities):
+        return False
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        profile_connector = _clean_selector(profile.get("connector_id"))
+        profile_environment = _clean_selector(profile.get("environment"))
+        if selected_connector and profile_connector != selected_connector:
+            continue
+        if selected_environment and profile_environment != selected_environment:
+            continue
+        metadata = profile.get("metadata") or {}
+        setup_state = _clean_selector(metadata.get("setup_state")) if isinstance(metadata, dict) else None
+        if setup_state != "ready":
+            continue
+        if not _profile_has_public_encrypted_credentials(profile):
+            continue
+        enabled_capabilities = {str(item).strip() for item in _profile_enabled_capabilities(profile)}
+        if not enabled_capabilities:
+            continue
+        if not enabled_capabilities.issubset(manifest_capabilities):
+            continue
+        if required and not required.issubset(enabled_capabilities):
+            continue
+        return True
+    return False
+
+
+def workspace_connector_ready(
+    dashboard_payload: dict[str, Any],
+    *,
+    connector_id: str | None = None,
+    environment: str | None = None,
+    required_capabilities: list[str] | None = None,
+) -> bool:
+    return _workspace_connector_ready(
+        dashboard_payload,
+        connector_id=connector_id,
+        environment=environment,
+        required_capabilities=required_capabilities,
+    )
+
+
+def _active_workspace_connector_profile(dashboard_payload: dict[str, Any]) -> dict[str, Any] | None:
+    profiles = dashboard_payload.get("connector_profiles")
+    if not isinstance(profiles, list):
+        return None
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        connector_id = _clean_selector(profile.get("connector_id"))
+        environment = _clean_selector(profile.get("environment"))
+        if not connector_id or not environment:
+            continue
+        if _workspace_connector_ready(
+            {"connector_profiles": [profile]},
+            connector_id=connector_id,
+            environment=environment,
+        ):
+            return profile
+    return None
+
+
+def _connector_context_from_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    metadata = _mapping(profile.get("metadata"))
+    context = {
+        "connector_id": str(profile.get("connector_id") or "").strip().lower(),
+        "environment": str(profile.get("environment") or "").strip().lower(),
+        "status": str(profile.get("status") or metadata.get("setup_state") or "ready"),
+        "enabled_capabilities": sorted(
+            str(item).strip() for item in _profile_enabled_capabilities(profile)
+        ),
+    }
+    setup_state = metadata.get("setup_state")
+    if setup_state:
+        context["setup_state"] = str(setup_state)
+    return context
+
+
+def _workspace_context_setup_required_payload() -> dict[str, Any]:
+    return {
+        "status": "requires_setup",
+        "message": (
+            "connector credential setup is required before retrieving workspace-specific "
+            "accounting context."
+        ),
+        "next_tool": "start_connector_setup",
+        "next_skill": "connector-credential-setup-th",
+    }
+
+
+def _connector_setup_block_payload() -> dict[str, Any]:
+    return {
+        "status": "blocked",
+        "message": (
+            "connector credential setup is required before running connector-backed "
+            "accounting workflows."
+        ),
+        "next_tool": "start_connector_setup",
+        "next_skill": "connector-credential-setup-th",
+    }
+
+
+def _public_connector_credentials_summary(
+    result: dict[str, Any],
+    *,
+    connector_id: str,
+    environment: str,
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "status": "credentials_received",
+        "connector_id": str(result.get("connector_id") or connector_id),
+        "environment": str(result.get("environment") or environment),
+        "credential_fields": sorted(str(field) for field in result.get("credential_fields") or []),
+    }
+    setup_state = result.get("setup_state") or result.get("status")
+    if setup_state:
+        summary["setup_state"] = str(setup_state)
+    return summary
+
+
 def _json_error(error: str, message: str, *, status_code: int) -> JSONResponse:
     return JSONResponse({"error": error, "message": message}, status_code=status_code)
 
@@ -388,6 +830,70 @@ def retrieve_context_pack(
 
 
 @mcp.tool()
+def retrieve_workspace_context_pack(
+    client_token: str,
+    query: str,
+    task: str | None = None,
+    max_chunks: int = 12,
+) -> dict[str, Any]:
+    """Return a cited context pack filtered to the workspace's ready connector."""
+    audit_input = {
+        **_client_token_audit_ref(client_token),
+        "query": query,
+        "task": task,
+        "max_chunks": max_chunks,
+    }
+    try:
+        settings = load_settings()
+        token_payload = _client_token_payload_from_value(client_token)
+        dashboard_payload = _product_store(settings).dashboard(token_payload)
+        profile = _active_workspace_connector_profile(dashboard_payload)
+        if profile is None:
+            payload = redact_json(_workspace_context_setup_required_payload())
+            _audit(
+                "retrieve_workspace_context_pack",
+                audit_input,
+                {"status": "requires_setup"},
+            )
+            return payload
+        connector_context = _connector_context_from_profile(profile)
+        pack = _service().context_pack(
+            query,
+            task=task,
+            filters=_filters(
+                {
+                    "connector": connector_context["connector_id"],
+                    "review_status": "reviewed",
+                }
+            ),
+            max_chunks=max_chunks,
+        )
+        payload = pack.as_dict()
+        payload.update(
+            {
+                "status": "ok",
+                "connector_context": connector_context,
+            }
+        )
+        payload = redact_json(payload)
+        _audit(
+            "retrieve_workspace_context_pack",
+            audit_input,
+            {
+                "status": "ok",
+                "connector_id": connector_context["connector_id"],
+                "environment": connector_context["environment"],
+                "count": len(pack.results),
+            },
+        )
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit("retrieve_workspace_context_pack", audit_input, payload)
+        return payload
+
+
+@mcp.tool()
 def get_document(document_id: str) -> dict[str, Any]:
     """Fetch one indexed knowledge document by UUID or document URI."""
     document = SupabaseRagStore(load_settings()).get_document(document_id)
@@ -397,11 +903,242 @@ def get_document(document_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def list_connectors() -> dict[str, Any]:
+    """List Mercury accounting and ERP connector options without secrets."""
+    payload = redact_json({"status": "ok", "connectors": list_connector_summaries()})
+    _audit("list_connectors", {}, {"count": len(payload["connectors"])})
+    return payload
+
+
+@mcp.tool()
+def start_connector_setup(
+    client_token: str,
+    connector_id: str,
+    environment: str,
+    company_name: str | None = None,
+) -> dict[str, Any]:
+    """Start gated connector setup for one workspace."""
+    try:
+        settings = load_settings()
+        token_payload = _client_token_payload_from_value(client_token)
+        profile = _product_store(settings).start_connector_setup(
+            token_payload=token_payload,
+            connector_id=connector_id,
+            environment=environment,
+            company_name=company_name,
+        )
+        payload = redact_json({"status": "ok", "profile": profile})
+        _audit(
+            "start_connector_setup",
+            {**_client_token_audit_ref(client_token), "connector_id": connector_id},
+            {
+                "status": "ok",
+                "connector_id": connector_id,
+                "environment": environment,
+            },
+        )
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit(
+            "start_connector_setup",
+            {**_client_token_audit_ref(client_token), "connector_id": connector_id},
+            payload,
+        )
+        return payload
+
+
+@mcp.tool()
+def submit_connector_credentials(
+    client_token: str,
+    connector_id: str,
+    environment: str,
+    credentials: dict[str, Any],
+) -> dict[str, Any]:
+    """Store connector credentials server-side after checking required fields."""
+    try:
+        settings = load_settings()
+        token_payload = _client_token_payload_from_value(client_token)
+        manifest = connector_by_id(connector_id)
+        if not manifest:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        missing = required_missing_fields(manifest, credentials)
+        if missing:
+            payload = {
+                "status": "awaiting_credentials",
+                "missing_fields": missing,
+                "message": "Required connector credentials are missing.",
+            }
+            _audit(
+                "submit_connector_credentials",
+                {**_client_token_audit_ref(client_token), "connector_id": connector_id},
+                payload,
+            )
+            return payload
+
+        result = _product_store(settings).set_connector_credentials(
+            token_payload=token_payload,
+            connector_id=connector_id,
+            environment=environment,
+            credentials={str(key): str(value) for key, value in credentials.items()},
+        )
+        payload = _public_connector_credentials_summary(
+            result,
+            connector_id=connector_id,
+            environment=environment,
+        )
+        _audit(
+            "submit_connector_credentials",
+            {**_client_token_audit_ref(client_token), "connector_id": connector_id},
+            {
+                "status": "credentials_received",
+                "credential_fields": payload["credential_fields"],
+            },
+        )
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit(
+            "submit_connector_credentials",
+            {**_client_token_audit_ref(client_token), "connector_id": connector_id},
+            payload,
+        )
+        return payload
+
+
+@mcp.tool()
+def validate_connector_connection(
+    client_token: str,
+    connector_id: str,
+    environment: str,
+    credentials: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate one connector through read-only API calls and return sanitized status."""
+    try:
+        settings = load_settings()
+        token_payload = _client_token_payload_from_value(client_token)
+        manifest = connector_by_id(connector_id)
+        if not manifest:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        if environment not in manifest.environments:
+            raise ValueError(f"Unsupported environment for {manifest.connector_id}: {environment}")
+        result = validate_connector_read_only(
+            manifest,
+            credentials=credentials,
+            environment=environment,
+        )
+        result.setdefault("connector_id", manifest.connector_id)
+        result.setdefault("environment", environment)
+        if result["status"] == "connected_read_only":
+            store = _product_store(settings)
+            store.set_connector_credentials(
+                token_payload=token_payload,
+                connector_id=manifest.connector_id,
+                environment=environment,
+                credentials={str(key): str(value) for key, value in credentials.items()},
+            )
+            store.set_connector_profile(
+                token_payload=token_payload,
+                connector_id=manifest.connector_id,
+                environment=environment,
+                company_name=result.get("company_name"),
+                metadata={
+                    "setup_state": "ready",
+                    "enabled_capabilities": result.get("enabled_capabilities") or [],
+                    "validation": result.get("validation") or {},
+                },
+            )
+            result["status"] = "ready"
+        payload = result
+        payload = redact_json(payload)
+        validation = result.get("validation")
+        if isinstance(validation, dict):
+            payload["validation"] = {
+                "token_status": validation.get("token_status"),
+                "company_info_status": validation.get("company_info_status"),
+            }
+        _audit(
+            "validate_connector_connection",
+            {
+                **_client_token_audit_ref(client_token),
+                "connector_id": connector_id,
+                "environment": environment,
+                "credential_fields": sorted(str(key) for key in credentials),
+            },
+            {
+                "status": payload["status"],
+                "connector_id": payload.get("connector_id"),
+            },
+        )
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit(
+            "validate_connector_connection",
+            {**_client_token_audit_ref(client_token), "connector_id": connector_id},
+            payload,
+        )
+        return payload
+
+
+@mcp.tool()
 def connector_status() -> dict[str, Any]:
     """Read sanitized Mercury connector status from Mercury runtime metadata."""
     payload = read_connector_status()
     _audit("connector_status", {}, {"status": payload.get("status")})
     return payload
+
+
+@mcp.tool()
+def workspace_connector_status(client_token: str) -> dict[str, Any]:
+    """Read sanitized token-scoped connector status for the hosted workspace."""
+    audit_input = _client_token_audit_ref_optional(client_token)
+    try:
+        if not isinstance(client_token, str):
+            raise PermissionError("Mercury client token must be a string.")
+        settings = load_settings()
+        token_payload = _client_token_payload_from_value(client_token)
+        dashboard_payload = _product_store(settings).dashboard(token_payload)
+        public_profiles = public_connector_profiles(
+            dashboard_payload.get("connector_profiles") or []
+        )
+        active_profile = _active_workspace_connector_profile(dashboard_payload)
+        active_context = (
+            _connector_context_from_profile(active_profile)
+            if active_profile is not None
+            else None
+        )
+        payload: dict[str, Any] = {
+            "status": "ok" if active_context else "requires_setup",
+            "workspace": {
+                "name": (dashboard_payload.get("workspace") or {}).get("name"),
+                "host_app": token_payload.get("host_app"),
+            },
+            "connector_profiles": public_profiles,
+            "active_connector": active_context,
+            "setup_required": active_context is None,
+            "next_tool": "start_connector_setup" if active_context is None else None,
+            "next_skill": (
+                "connector-credential-setup-th" if active_context is None else None
+            ),
+        }
+        payload = redact_json(payload)
+        _audit(
+            "workspace_connector_status",
+            audit_input,
+            {
+                "status": payload["status"],
+                "profile_count": len(public_profiles),
+                "active_connector": (
+                    active_context.get("connector_id") if active_context else None
+                ),
+            },
+        )
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit("workspace_connector_status", audit_input, payload)
+        return payload
 
 
 @mcp.tool()
@@ -525,15 +1262,41 @@ def run_flow(
     flow_yaml: str,
     dry_run: bool = False,
     env: dict[str, Any] | None = None,
+    client_token: str | None = None,
 ) -> dict[str, Any]:
     """Run a Mercury YAML flow or return an execution plan when dry_run is true."""
     try:
         env_overrides = _env_overrides_from_payload(env)
-        result = create_default_runner(dry_run=dry_run).run_text(flow_yaml, env=env_overrides)
+        parsed_flow = parse_flow_text(flow_yaml)
+        block_payload, readiness_selection = _raw_mcp_connector_setup_block(
+            parsed_flow,
+            env_overrides=env_overrides,
+            client_token=client_token,
+        )
+        if block_payload:
+            payload = redact_json(block_payload)
+            _audit(
+                "run_flow",
+                {
+                    **_client_token_audit_ref_optional(client_token),
+                    "flow_yaml_length": len(flow_yaml),
+                    "dry_run": dry_run,
+                    "env_keys": _env_keys(env_overrides),
+                    "connector_id": readiness_selection["connector_id"],
+                    "environment": readiness_selection["environment"],
+                },
+                payload,
+            )
+            return payload
+        result = create_default_runner(dry_run=dry_run).run_flow(
+            parsed_flow,
+            env=env_overrides,
+        )
         payload = redact_json(result.as_dict())
         _audit(
             "run_flow",
             {
+                **_client_token_audit_ref_optional(client_token),
                 "flow_yaml_length": len(flow_yaml),
                 "dry_run": dry_run,
                 "env_keys": _env_keys(env_overrides),
@@ -545,12 +1308,13 @@ def run_flow(
             },
         )
         return payload
-    except (FlowValidationError, RuntimeError, ValueError) as exc:
+    except (PermissionError, FlowValidationError, RuntimeError, ValueError) as exc:
         payload = {"status": "error", "message": str(exc), "dry_run": dry_run}
         safe_env_keys = _env_keys(env) if isinstance(env, dict) else []
         _audit(
             "run_flow",
             {
+                **_client_token_audit_ref_optional(client_token),
                 "flow_yaml_length": len(flow_yaml),
                 "dry_run": dry_run,
                 "env_keys": safe_env_keys,
@@ -566,6 +1330,7 @@ def run_flow_files(
     config_yaml: str | None = None,
     dry_run: bool = False,
     env: dict[str, Any] | None = None,
+    client_token: str | None = None,
     include_tags: list[str] | str | None = None,
     exclude_tags: list[str] | str | None = None,
     continue_on_failure: bool = True,
@@ -650,6 +1415,58 @@ def run_flow_files(
                         )
 
             for selected_path in selected_paths:
+                parsed_flow = parse_flow_text(
+                    selected_path.read_text(encoding="utf-8"),
+                    path=selected_path,
+                )
+                block_payload, readiness_selection = _raw_mcp_connector_setup_block(
+                    parsed_flow,
+                    env_overrides=env_overrides,
+                    client_token=client_token,
+                )
+                if block_payload:
+                    payload = redact_json(
+                        {
+                            **block_payload,
+                            "dry_run": dry_run,
+                            "config_yaml_present": bool(config_yaml),
+                            "flow_count": len(normalized_files),
+                            "selected_count": len(selected_paths),
+                            "skipped_count": len(
+                                [
+                                    item
+                                    for item in file_records
+                                    if not item.get("selected")
+                                ]
+                            ),
+                            "env_keys": _env_keys(env_overrides),
+                            "include_tags": sorted(include),
+                            "exclude_tags": sorted(exclude),
+                            "flows": file_records,
+                            "results": results,
+                        }
+                    )
+                    _audit(
+                        "run_flow_files",
+                        {
+                            **_client_token_audit_ref_optional(client_token),
+                            "flow_count": len(normalized_files),
+                            "selected_count": len(selected_paths),
+                            "dry_run": dry_run,
+                            "config_yaml_present": bool(config_yaml),
+                            "env_keys": _env_keys(env_overrides),
+                            "connector_id": readiness_selection["connector_id"],
+                            "environment": readiness_selection["environment"],
+                        },
+                        {
+                            "status": payload["status"],
+                            "result_count": len(payload["results"]),
+                            "dry_run": dry_run,
+                        },
+                    )
+                    return payload
+
+            for selected_path in selected_paths:
                 relative_path = selected_path.relative_to(root).as_posix()
                 try:
                     result = runner.run_path(selected_path, env=env_overrides).as_dict()
@@ -683,6 +1500,7 @@ def run_flow_files(
         _audit(
             "run_flow_files",
             {
+                **_client_token_audit_ref_optional(client_token),
                 "flow_count": len(normalized_files),
                 "selected_count": payload["selected_count"],
                 "dry_run": dry_run,
@@ -699,11 +1517,12 @@ def run_flow_files(
             },
         )
         return payload
-    except (FlowValidationError, RuntimeError, ValueError) as exc:
+    except (PermissionError, FlowValidationError, RuntimeError, ValueError) as exc:
         payload = {"status": "error", "message": str(exc), "dry_run": dry_run}
         _audit(
             "run_flow_files",
             {
+                **_client_token_audit_ref_optional(client_token),
                 "flow_count": len(normalized_files),
                 "dry_run": dry_run,
                 "config_yaml_present": bool(config_yaml),
@@ -756,7 +1575,12 @@ def run_mercury_flow(
             }
             _audit("run_mercury_flow", {"selected_modes": modes, "dry_run": dry_run}, payload)
             return payload
-        payload = run_flow(flow_yaml or "", dry_run=dry_run, env=env)
+        payload = run_flow(
+            flow_yaml or "",
+            dry_run=dry_run,
+            env=env,
+            client_token=client_token,
+        )
         payload["entrypoint"] = "run_mercury_flow"
         payload["input_mode"] = "flow_yaml"
         return payload
@@ -767,6 +1591,7 @@ def run_mercury_flow(
             config_yaml=config_yaml,
             dry_run=dry_run,
             env=env,
+            client_token=client_token,
             include_tags=include_tags,
             exclude_tags=exclude_tags,
             continue_on_failure=continue_on_failure,
@@ -835,6 +1660,32 @@ def run_workspace_flow_tool(
             raise RuntimeError("Supabase is required to load saved workspace flows.")
         token_payload = _client_token_payload_from_value(client_token)
         store = _product_store(settings)
+        dashboard_payload = store.dashboard(token_payload)
+        readiness_selection = _workspace_flow_readiness_selection(
+            dashboard_payload,
+            flow_id=flow_id,
+            env_overrides=env_overrides,
+        )
+        if not readiness_selection["connector_id"] or not workspace_connector_ready(
+            dashboard_payload,
+            connector_id=readiness_selection["connector_id"],
+            environment=readiness_selection["environment"],
+            required_capabilities=readiness_selection["required_capabilities"],
+        ):
+            payload = _connector_setup_block_payload()
+            _audit(
+                "run_workspace_flow",
+                {
+                    **_client_token_audit_ref(client_token),
+                    "flow_id": flow_id,
+                    "dry_run": dry_run,
+                    "env_keys": _env_keys(env_overrides),
+                    "connector_id": readiness_selection["connector_id"],
+                    "environment": readiness_selection["environment"],
+                },
+                payload,
+            )
+            return payload
         flow = store.get_flow(token_payload=token_payload, flow_id=flow_id)
         if not flow:
             return {"status": "not_found", "message": f"Workspace flow not found: {flow_id}"}
@@ -1246,6 +2097,8 @@ async def run_workspace_flow(request: Request) -> Response:
         flow_id = str(data.get("flow_id") or "").strip()
         flow_title = str(data.get("title") or "").strip()
         flow: dict[str, Any] | None = None
+        store: SupabaseProductStore | None = None
+        parsed_raw_flow = None
         if flow_id and not flow_yaml:
             if not settings.supabase_configured:
                 return _json_error(
@@ -1253,18 +2106,55 @@ async def run_workspace_flow(request: Request) -> Response:
                     "Supabase is required to load saved workspace flows.",
                     status_code=503,
                 )
-            flow = _product_store(settings).get_flow(token_payload=token_payload, flow_id=flow_id)
+            store = _product_store(settings)
+            dashboard_payload = store.dashboard(token_payload)
+            readiness_selection = _workspace_flow_readiness_selection(
+                dashboard_payload,
+                flow_id=flow_id,
+                env_overrides=env_overrides,
+            )
+            if not readiness_selection["connector_id"] or not workspace_connector_ready(
+                dashboard_payload,
+                connector_id=readiness_selection["connector_id"],
+                environment=readiness_selection["environment"],
+                required_capabilities=readiness_selection["required_capabilities"],
+            ):
+                return JSONResponse(redact_json(_connector_setup_block_payload()))
+            flow = store.get_flow(token_payload=token_payload, flow_id=flow_id)
             if not flow:
                 return _json_error("not_found", f"Workspace flow not found: {flow_id}", status_code=404)
             flow_yaml = str(flow.get("yaml") or "")
             flow_title = str(flow.get("title") or flow.get("name") or flow_title)
-        result = create_default_runner(dry_run=dry_run).run_text(flow_yaml, env=env_overrides)
+        elif flow_yaml:
+            parsed_raw_flow = parse_flow_text(flow_yaml)
+            readiness_selection = _raw_flow_readiness_selection(
+                parsed_raw_flow,
+                env_overrides=env_overrides,
+            )
+            if readiness_selection["connector_backed"]:
+                if not settings.supabase_configured:
+                    return JSONResponse(redact_json(_connector_setup_block_payload()))
+                store = store or _product_store(settings)
+                dashboard_payload = store.dashboard(token_payload)
+                if not readiness_selection["connector_id"] or not workspace_connector_ready(
+                    dashboard_payload,
+                    connector_id=readiness_selection["connector_id"],
+                    environment=readiness_selection["environment"],
+                    required_capabilities=readiness_selection["required_capabilities"],
+                ):
+                    return JSONResponse(redact_json(_connector_setup_block_payload()))
+        runner = create_default_runner(dry_run=dry_run)
+        result = (
+            runner.run_flow(parsed_raw_flow, env=env_overrides)
+            if parsed_raw_flow is not None
+            else runner.run_text(flow_yaml, env=env_overrides)
+        )
         payload = redact_json(result.as_dict())
         if flow:
             payload["workspace_flow"] = _public_flow_summary(flow)
         if settings.supabase_configured:
             try:
-                payload["run_record"] = _product_store(settings).record_flow_run(
+                payload["run_record"] = (store or _product_store(settings)).record_flow_run(
                     token_payload=token_payload,
                     flow_id=flow_id or None,
                     title=flow_title or str(payload.get("flow", {}).get("name") or ""),
@@ -1299,7 +2189,9 @@ async def setup_connector(request: Request) -> Response:
             company_name=str(data.get("company_name") or "").strip(),
             metadata={"source": "connect-ui"},
         )
-        return JSONResponse(redact_json({"status": "ok", "profile": profile}))
+        return JSONResponse(
+            redact_json({"status": "ok", "profile": public_connector_profile(profile)})
+        )
     except PermissionError as exc:
         return _json_error("unauthorized", str(exc), status_code=401)
     except ValueError as exc:
