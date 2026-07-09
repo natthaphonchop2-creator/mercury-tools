@@ -7,7 +7,7 @@ This guide turns Mercury Tools into a cloud-hosted Streamable HTTP MCP server.
 - GitHub repo: `https://github.com/natthaphonchop2-creator/mercury-tools`
 - Render service: `mercury-tools-mcp`
 - Render URL: `https://mercury-tools-mcp.onrender.com`
-- Mercury Connect: `https://mercury-tools-mcp.onrender.com/`
+- Mercury server landing: `https://mercury-tools-mcp.onrender.com/`
 - MCP endpoint: `https://mercury-tools-mcp.onrender.com/mcp`
 - Health endpoint: `https://mercury-tools-mcp.onrender.com/healthz`
 - Supabase project ref: `vbnlkqvauqwnjbxngkas`
@@ -45,8 +45,8 @@ Required environment variables for the MCP service:
 - `MERCURY_CONNECT_SIGNING_SECRET`
 
 Do not expose the Supabase service role key to MCP clients.
-Do not give normal users the server bearer token file. Send them to Mercury
-Connect and share an invite code for the demo workspace.
+Do not give normal users the server bearer token file. Issue scoped client
+tokens only through a secure host/admin onboarding path.
 
 Mercury Tools v1 does not need to call an LLM by itself. In contest/demo mode it
 uses deterministic local `hash` embeddings and serves cited context packs to the
@@ -143,22 +143,20 @@ MERCURY_CONNECT_INVITE_CODE=<demo invite code>
 MERCURY_CONNECT_SIGNING_SECRET=<long random signing secret>
 ```
 
-Users then open:
+Users connect through their MCP host. The browser root is only a server landing
+page:
 
 ```text
 https://mercury-tools-mcp.onrender.com/
 ```
 
-The first page is a setup gateway, not the Mercury chat/runtime surface and not
-a general product dashboard. Users open
-`/connect` from there, enter the invite code, email, company, and AI host, then
-Mercury generates copy-ready MCP setup instructions. The resulting client token
-is signed and time-limited, so users do not need access to the server bearer
-token file.
+This page is not the Mercury chat/runtime surface, not a setup gateway, and not
+a product dashboard. The resulting client token is signed and time-limited, so
+users do not need access to the server bearer token file.
 
-If `0002_mercury_product_layer.sql` is not applied yet, the Connect page still
-generates MCP client tokens, but dashboard persistence runs in degraded mode.
-After `0002` is applied, the same page persists:
+If `0002_mercury_product_layer.sql` is not applied yet, client-token issuance
+still works, but product persistence runs in degraded mode. After `0002` is
+applied, the product layer persists:
 
 - workspaces
 - workspace members

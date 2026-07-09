@@ -5,21 +5,23 @@ RAG context, audit-safe workflows, and Thai finance reporting.
 
 ## Connect In Codex
 
-Open Mercury Connect:
+Mercury is used from Codex through a plugin and remote MCP server. It is not a
+web app and the hosted website is not the product surface.
 
-```text
-https://mercury-tools-mcp.onrender.com/connect
+Install the plugin marketplace:
+
+```bash
+codex plugin marketplace add natthaphonchop2-creator/mercury-tools \
+  --ref main \
+  --sparse .agents/plugins \
+  --sparse plugins/mercury-finance
 ```
 
-Enter the invite code, email, company name, and choose Codex. Mercury returns
-one copy-paste command that installs the `Mercury Finance` plugin and connects
-Codex to the hosted MCP server.
+Install `Mercury Finance` from the plugin list, then configure the remote MCP
+server with the token provided by the Mercury demo owner or secure host setup
+path.
 
-The generated command includes `codex plugin marketplace add`, `codex plugin add
-mercury-finance`, and `codex mcp add` so judges do not need to assemble the MCP
-setup manually.
-
-Advanced MCP endpoint:
+MCP endpoint:
 
 ```text
 https://mercury-tools-mcp.onrender.com/mcp

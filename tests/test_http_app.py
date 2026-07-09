@@ -87,23 +87,18 @@ def test_connect_page_and_status(monkeypatch) -> None:
     status = client.get("/api/status")
 
     assert page.status_code == 200
-    assert "Mercury Connect" in page.text
-    assert "MCP setup console for accounting AI hosts" in page.text
-    assert "not the chat app" in page.text
-    assert 'data-page="start"' in page.text
-    assert "Mercury is the accounting agent tool layer" in page.text
-    assert "Setup sections" in page.text
+    assert "Mercury Tools MCP Server" in page.text
+    assert "not a web app" in page.text
+    assert "browser setup workflow" in page.text
+    assert "https://mercury.example.com/mcp" in page.text
     assert 'id="connect-form"' not in page.text
     assert status.status_code == 200
     assert status.json()["mcp_endpoint"] == "https://mercury.example.com/mcp"
     assert status.json()["invite_required"] is True
-    assert status.json()["console"]["purpose"] == "setup-console"
-    assert status.json()["console"]["product_surface"] == "mcp-host"
-    assert status.json()["pages"]["start"] == "/"
-    assert status.json()["pages"]["connectors"] == "/connectors"
-    assert status.json()["pages"]["knowledge"] == "/knowledge"
-    assert status.json()["pages"]["flows"] == "/flows"
-    assert status.json()["pages"]["mcp_api"] == "/mcp-api"
+    assert status.json()["surface"] == "mcp-plugin-first"
+    assert status.json()["browser_ui"] == "disabled"
+    assert "pages" not in status.json()
+    assert "console" not in status.json()
     assert "run_flow" in status.json()["flow_tools"]
     assert "run_flow_files" in status.json()["flow_tools"]
     assert "save_workspace_flow" in status.json()["flow_tools"]
@@ -115,7 +110,7 @@ def test_connect_page_and_status(monkeypatch) -> None:
     assert status.json()["flow_import"] == "/api/flows/import"
 
 
-def test_product_console_exposes_separate_pages(monkeypatch) -> None:
+def test_legacy_browser_paths_do_not_expose_setup_console(monkeypatch) -> None:
     monkeypatch.setenv("MERCURY_CONNECT_INVITE_CODE", "invite-demo")
     monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
 
@@ -136,11 +131,12 @@ def test_product_console_exposes_separate_pages(monkeypatch) -> None:
         response = client.get(path)
 
         assert response.status_code == 200
-        assert f'data-page="{page_name}"' in response.text
-        assert response.text.count('<section class="page" data-page=') == 1
+        assert "Mercury Tools MCP Server" in response.text
+        assert "not a web app" in response.text
+        assert f'data-page="{page_name}"' not in response.text
+        assert '<section class="page" data-page=' not in response.text
         assert "history.pushState" not in response.text
-        if page_name != "connect":
-            assert 'id="connect-form"' not in response.text
+        assert 'id="connect-form"' not in response.text
 
 
 def test_flows_page_is_read_only_control_plane(monkeypatch) -> None:
@@ -152,8 +148,8 @@ def test_flows_page_is_read_only_control_plane(monkeypatch) -> None:
     response = client.get("/flows")
 
     assert response.status_code == 200
-    assert "MCP/CLI only" in response.text
-    assert "not browser UX" in response.text
+    assert "Mercury Tools MCP Server" in response.text
+    assert "not a web app" in response.text
     assert 'id="flow-form"' not in response.text
     assert 'id="flow_yaml"' not in response.text
     assert 'id="flow-run"' not in response.text
@@ -222,7 +218,7 @@ def test_connect_api_issues_client_token_for_mcp(monkeypatch) -> None:
     assert authorized.status_code != 401
 
 
-def test_connect_page_presents_single_codex_setup_with_advanced_config(monkeypatch) -> None:
+def test_connect_page_does_not_present_browser_setup_ux(monkeypatch) -> None:
     monkeypatch.setenv("MERCURY_TOOLS_PUBLIC_BASE_URL", "https://mercury.example.com")
     monkeypatch.setenv("MERCURY_TOOLS_MCP_PATH", "/mcp")
     monkeypatch.setenv("MERCURY_CONNECT_INVITE_CODE", "invite-demo")
@@ -232,9 +228,10 @@ def test_connect_page_presents_single_codex_setup_with_advanced_config(monkeypat
     response = client.get("/connect")
 
     assert response.status_code == 200
-    assert "Codex one-command setup" in response.text
-    assert "Advanced MCP client config" in response.text
-    assert "data-copy=\"codex-command\"" in response.text
+    assert "Mercury Tools MCP Server" in response.text
+    assert "Codex one-command setup" not in response.text
+    assert "Advanced MCP client config" not in response.text
+    assert "data-copy=\"codex-command\"" not in response.text
 
 
 def test_product_dashboard_requires_mercury_client_token(monkeypatch) -> None:

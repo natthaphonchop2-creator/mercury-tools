@@ -9,7 +9,7 @@ description: Use when a user wants to connect PEAK Accounting/Open API, validate
 
 Do not proceed to accounting workflows until PEAK credential setup is complete and the safe setup validation has passed.
 
-Do not ask the user to paste ConnectId, ConnectKey, ApplicationCode, UserToken, ClientToken, zip passwords, bearer tokens, or accounting secrets into normal chat. Use Mercury Connect or the host app's secure MCP credential path.
+Do not ask the user to paste ConnectId, ConnectKey, ApplicationCode, UserToken, ClientToken, zip passwords, bearer tokens, or accounting secrets into normal chat. Use the host app's secure MCP credential path or a server-side credential vault flow.
 
 ## What PEAK Requires
 

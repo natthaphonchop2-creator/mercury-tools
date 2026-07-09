@@ -9,7 +9,7 @@ description: Use when a user needs to connect FlowAccount, PEAK Accounting, Expr
 
 Do not proceed to the next setup step until the current step is complete and validated.
 
-Do not ask the user to paste API keys, client secrets, bearer tokens, or refresh tokens into normal chat. Use Mercury Connect or the host app's secure MCP credential path.
+Do not ask the user to paste API keys, client secrets, bearer tokens, or refresh tokens into normal chat. Use the host app's secure MCP credential path or a server-side credential vault flow.
 
 ## Steps
 

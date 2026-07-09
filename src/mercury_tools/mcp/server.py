@@ -43,7 +43,6 @@ from mercury_tools.product import (
     validate_connect_request,
     verify_client_token,
 )
-from mercury_tools.product_ui import render_connect_html
 from mercury_tools.prompts import get_prompt
 from mercury_tools.rag.chunking import chunk_document, sha256_text
 from mercury_tools.rag.embeddings import create_embedding_provider
@@ -1863,8 +1862,56 @@ def connector_setup_guide_th() -> str:
 
 
 async def root(request: Request) -> Response:
-    page = request.url.path.strip("/") or "start"
-    return HTMLResponse(render_connect_html(page))
+    settings = load_settings()
+    body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mercury Tools MCP</title>
+  <style>
+    :root {{ color-scheme: dark; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #111923;
+      color: #f5f8fb;
+      font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    main {{
+      width: min(720px, calc(100vw - 32px));
+      border: 1px solid #314455;
+      border-radius: 8px;
+      background: #182331;
+      padding: 22px;
+    }}
+    h1 {{ margin: 0 0 8px; font-size: 24px; color: #42c6bb; }}
+    p {{ margin: 0 0 14px; color: #c6d0d9; }}
+    code {{
+      display: block;
+      overflow-wrap: anywhere;
+      border: 1px solid #314455;
+      border-radius: 8px;
+      background: #0b1119;
+      color: #f5bf45;
+      padding: 12px;
+    }}
+    .muted {{ color: #93a1ad; font-size: 13px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Mercury Tools MCP Server</h1>
+    <p>Mercury is an MCP/plugin tool layer for accounting agents. This service is not a web app and does not provide a browser setup workflow.</p>
+    <p>MCP endpoint:</p>
+    <code>{settings.mcp_endpoint}</code>
+    <p class="muted">Use a host AI client such as Codex, Cursor, Claude, or another MCP client to connect and run Mercury tools.</p>
+  </main>
+</body>
+</html>"""
+    return HTMLResponse(body)
 
 
 async def status(_: Request) -> Response:
@@ -1881,22 +1928,9 @@ async def status(_: Request) -> Response:
             "mcp_path": settings.mcp_path,
             "mcp_endpoint": settings.mcp_endpoint,
             "health": "/healthz",
-            "console": {
-                "purpose": "setup-console",
-                "product_surface": "mcp-host",
-                "note": "Pages configure Mercury tools and context; Codex, Cursor, Claude, or another host owns chat.",
-            },
-            "pages": {
-                "start": "/",
-                "connect": "/connect",
-                "workspace": "/workspace",
-                "connectors": "/connectors",
-                "knowledge": "/knowledge",
-                "skills": "/skills",
-                "flows": "/flows",
-                "mcp_api": "/mcp-api",
-                "audit": "/audit",
-            },
+            "surface": "mcp-plugin-first",
+            "browser_ui": "disabled",
+            "note": "Mercury is not a web app. Host AI clients call the MCP endpoint.",
             "connect": "/api/connect",
             "dashboard": "/api/dashboard",
             "connector_setup": "/api/connectors/setup",
