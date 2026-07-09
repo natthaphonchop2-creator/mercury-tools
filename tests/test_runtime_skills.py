@@ -9,3 +9,13 @@ def test_bundled_peak_skill_is_available_to_mcp_runtime() -> None:
     assert "ConnectId" in markdown
     assert "GET/POST" in markdown
     assert "validate_connector_connection" in markdown
+
+
+def test_skill_markdown_uses_explicit_runtime_root(tmp_path, monkeypatch) -> None:
+    skill_dir = tmp_path / "plugins" / "mercury-finance" / "skills" / "demo-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Demo Skill\n", encoding="utf-8")
+
+    monkeypatch.setenv("MERCURY_TOOLS_ROOT", str(tmp_path))
+
+    assert skill_markdown("demo-skill") == "# Demo Skill\n"

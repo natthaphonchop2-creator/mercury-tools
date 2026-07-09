@@ -41,13 +41,41 @@ def connector_status() -> dict[str, Any]:
     )
 
 
+def _runtime_roots() -> list[Path]:
+    roots: list[Path] = []
+    explicit_root = os.environ.get("MERCURY_TOOLS_ROOT", "").strip()
+    if explicit_root:
+        roots.append(Path(explicit_root).expanduser())
+    roots.extend([Path.cwd(), Path("/app")])
+    current_file = Path(__file__).resolve()
+    roots.extend(current_file.parents)
+
+    unique_roots: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_roots.append(root)
+    return unique_roots
+
+
 def skill_markdown(skill_id: str) -> str | None:
     base = mercury_agent_path()
-    repo_root = Path(__file__).resolve().parents[2]
-    candidates = [
-        repo_root / "plugins" / "mercury-finance" / "skills" / skill_id / "SKILL.md",
-        repo_root / "skills" / "accounting" / skill_id / "SKILL.md",
-    ]
+    candidates = []
+    for repo_root in _runtime_roots():
+        candidates.extend(
+            [
+                repo_root
+                / "plugins"
+                / "mercury-finance"
+                / "skills"
+                / skill_id
+                / "SKILL.md",
+                repo_root / "skills" / "accounting" / skill_id / "SKILL.md",
+            ]
+        )
     if base:
         candidates.extend(
             [
