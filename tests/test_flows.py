@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from xml.etree import ElementTree
 
 import httpx
 import pytest
@@ -304,6 +305,98 @@ tags: [accounting]
 
     with pytest.raises(FlowValidationError, match="assert exists failed"):
         run_workspace_flows(tmp_path, runner=MercuryFlowRunner())
+
+
+def test_flow_cli_run_suite_writes_junit_and_fails_ci_on_failed_suite(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    flows = tmp_path / "flows"
+    flows.mkdir()
+    (tmp_path / "config.yaml").write_text(
+        """
+flows: flows/**/*.yaml
+includeTags: [accounting]
+executionOrder:
+  continueOnFailure: true
+  flowsOrder:
+    - bad
+    - good
+""",
+        encoding="utf-8",
+    )
+    (flows / "bad.yaml").write_text(
+        """
+name: Bad
+tags: [accounting]
+---
+- assert:
+    exists: false
+""",
+        encoding="utf-8",
+    )
+    (flows / "good.yaml").write_text(
+        """
+name: Good
+tags: [accounting]
+---
+- emitReport:
+    title: "Good report"
+""",
+        encoding="utf-8",
+    )
+    output = tmp_path / "junit.xml"
+
+    assert (
+        main(
+            [
+                "flow",
+                "run-suite",
+                str(tmp_path),
+                "--format",
+                "junit",
+                "--output",
+                str(output),
+            ]
+        )
+        == 1
+    )
+
+    cli_output = capsys.readouterr().out
+    assert "Flow suite failed" in cli_output
+    assert f"junit: {output.resolve()}" in cli_output
+
+    root = ElementTree.parse(output).getroot()
+    assert root.tag == "testsuite"
+    assert root.attrib["tests"] == "2"
+    assert root.attrib["failures"] == "1"
+    assert root.find("./testcase/failure") is not None
+
+
+def test_flow_cli_run_suite_allow_failures_keeps_zero_exit(tmp_path: Path) -> None:
+    flows = tmp_path / "flows"
+    flows.mkdir()
+    (tmp_path / "config.yaml").write_text(
+        """
+flows: flows/**/*.yaml
+includeTags: [accounting]
+executionOrder:
+  continueOnFailure: true
+""",
+        encoding="utf-8",
+    )
+    (flows / "bad.yaml").write_text(
+        """
+name: Bad
+tags: [accounting]
+---
+- assert:
+    exists: false
+""",
+        encoding="utf-8",
+    )
+
+    assert main(["flow", "run-suite", str(tmp_path), "--allow-failures"]) == 0
 
 
 def test_flow_cli_lists_and_runs_suite(tmp_path: Path, capsys) -> None:

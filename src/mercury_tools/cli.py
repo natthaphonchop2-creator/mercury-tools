@@ -13,6 +13,7 @@ import httpx
 from mercury_tools.config import load_settings
 from mercury_tools.db.supabase import SupabaseRagStore
 from mercury_tools.flows.parser import FlowValidationError, validate_flow_path
+from mercury_tools.flows.reports import write_junit_report
 from mercury_tools.flows.runner import create_default_runner
 from mercury_tools.flows.templates import FLOW_CHEAT_SHEET, TEMPLATES
 from mercury_tools.flows.workspace import (
@@ -269,10 +270,19 @@ def cmd_flow_run_suite(args: argparse.Namespace) -> int:
             print(f"Flow suite failed: {exc}")
         return 1
     payload = suite.as_dict()
+    junit_path: Path | None = None
+    if args.format == "junit":
+        junit_path = Path(args.output or "report.xml").expanduser().resolve()
+        write_junit_report(suite, junit_path)
+        payload["junit_report_path"] = str(junit_path)
     if args.json:
         _print_json(payload)
     else:
         _print_suite_payload(payload)
+        if junit_path:
+            print(f"junit: {junit_path}")
+    if payload["status"] == "failed" and not args.allow_failures:
+        return 1
     return 0
 
 
@@ -589,6 +599,9 @@ def build_parser() -> argparse.ArgumentParser:
     flow_run_suite.add_argument("--dry-run", action="store_true")
     flow_run_suite.add_argument("--tag", action="append", default=[])
     flow_run_suite.add_argument("--exclude-tag", action="append", default=[])
+    flow_run_suite.add_argument("--format", choices=["junit"])
+    flow_run_suite.add_argument("--output")
+    flow_run_suite.add_argument("--allow-failures", action="store_true")
     flow_run_suite.add_argument("--json", action="store_true")
     flow_run_suite.set_defaults(func=cmd_flow_run_suite)
 

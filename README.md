@@ -42,6 +42,7 @@ uv run mercury-tools flow init-workspace ./my-mercury-flows
 uv run mercury-tools flow list ./my-mercury-flows
 uv run mercury-tools flow run-suite ./my-mercury-flows --dry-run
 uv run mercury-tools flow watch ./my-mercury-flows --dry-run
+uv run mercury-tools flow run-suite ./my-mercury-flows --format junit --output reports/junit.xml
 uv run mercury-tools flow init ./my-flow.yaml --template company-health
 uv run mercury-tools flow validate ./my-flow.yaml
 uv run mercury-tools flow run ./my-flow.yaml --dry-run
@@ -193,6 +194,7 @@ Flow CLI:
 - `mercury-tools flow run <path> --dry-run`
 - `mercury-tools flow list <workspace> --tag accounting`
 - `mercury-tools flow run-suite <workspace> --dry-run --exclude-tag disabled`
+- `mercury-tools flow run-suite <workspace> --format junit --output reports/junit.xml`
 - `mercury-tools flow watch <workspace> --dry-run`
 - `mercury-tools flow push <workspace> --url https://mercury-tools-mcp.onrender.com --client-token <mc_...>`
 - `mercury-tools flow cheat-sheet`
@@ -231,6 +233,11 @@ reports, and interpreted execution are separated from the host AI conversation.
 When `testOutputDir` is set, `flow run-suite` writes
 `suite-report.json` with the selected flow order, step summaries, artifacts, and
 sanitized variables.
+
+For CI systems, `flow run-suite --format junit --output <path>` writes a JUnit
+XML report. A failed suite exits with code `1` by default; pass
+`--allow-failures` only when a pipeline should collect the report without
+failing the job.
 
 Flow MCP tools:
 
