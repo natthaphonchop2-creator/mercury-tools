@@ -74,3 +74,33 @@ DONE
 ### Concerns
 
 - The only warning is the existing Starlette `TestClient` deprecation warning triggered by the test import.
+
+## Remaining Critical Finding Fix
+
+### Status
+
+DONE
+
+### Summary
+
+- Added connector-backed detection for direct HTTP raw `flow_yaml` runs.
+- Detection covers raw flow env connector keys, connector-id tags, connector marker tags, connectorStatus commands, and inline connectorStatus commands parsed through existing flow command parsing.
+- `/api/flows/run` now checks workspace connector readiness before executing raw connector-backed flow YAML, including requests that also pass `flow_id`.
+- Raw non-connector flows continue to run without connector readiness checks.
+
+### Verification
+
+- `uv run pytest tests/test_http_app.py::test_workspace_flow_run_blocks_connector_backed_raw_yaml_when_unready tests/test_http_app.py::test_workspace_flow_run_allows_non_connector_raw_yaml_without_readiness tests/test_http_app.py::test_workspace_flow_run_records_history_when_supabase_available -v`
+  - Result: 3 passed, 1 warning.
+- `uv run pytest tests/test_connector_mcp_tools.py tests/test_mcp_contract.py tests/test_http_app.py -v`
+  - Result: 37 passed, 1 warning.
+- `uv run ruff check src/mercury_tools/mcp/server.py tests/test_connector_mcp_tools.py tests/test_http_app.py tests/test_mcp_contract.py`
+  - Result: all checks passed.
+- `uv run pytest -m "not integration"`
+  - Result: 117 passed, 1 deselected, 1 warning.
+- `uv run ruff check .`
+  - Result: all checks passed.
+
+### Concerns
+
+- The only warning is the existing Starlette `TestClient` deprecation warning triggered by the test import.

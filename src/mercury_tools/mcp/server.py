@@ -20,7 +20,12 @@ from mercury_tools.connectors.catalog import connector_by_id, list_connector_sum
 from mercury_tools.connectors.setup import required_missing_fields, validate_connector_read_only
 from mercury_tools.db.product import SupabaseProductStore, slugify
 from mercury_tools.db.supabase import SupabaseRagStore
-from mercury_tools.flows.parser import FlowValidationError, parse_flow_text, validate_flow_text
+from mercury_tools.flows.parser import (
+    FlowValidationError,
+    parse_flow_text,
+    parse_inline_commands,
+    validate_flow_text,
+)
 from mercury_tools.flows.runner import create_default_runner
 from mercury_tools.flows.templates import FLOW_CHEAT_SHEET
 from mercury_tools.flows.workspace import discover_workspace_flows, workspace_manifest
@@ -48,6 +53,8 @@ MAX_MCP_FLOW_FILE_CHARS = 500_000
 CONNECTOR_ENV_KEYS = ("connector", "connector_id", "accounting_connector", "erp_connector")
 ENVIRONMENT_ENV_KEYS = ("environment", "connector_environment", "connector_env")
 CAPABILITY_KEYS = ("required_capabilities", "requiredCapabilities", "capabilities")
+CONNECTOR_BACKED_COMMANDS = {"connectorStatus"}
+CONNECTOR_TAGS = {"connector", "connectors", "connector-backed", "accounting-connector", "erp-connector"}
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -399,11 +406,98 @@ def _saved_flow_env(flow: dict[str, Any] | None) -> dict[str, Any]:
 def _connector_from_flow_tags(flow: dict[str, Any] | None) -> str | None:
     if not flow:
         return None
-    for tag in flow.get("tags") or []:
+    return _connector_from_tags(flow.get("tags") or [])
+
+
+def _connector_from_tags(tags: Any) -> str | None:
+    for tag in tags or []:
         connector_id = _clean_selector(tag)
         if connector_id and connector_by_id(connector_id):
             return connector_id
+        if connector_id:
+            for separator in (":", "="):
+                if separator not in connector_id:
+                    continue
+                key, value = connector_id.split(separator, 1)
+                if key.strip() in CONNECTOR_ENV_KEYS and connector_by_id(value.strip()):
+                    return value.strip()
     return None
+
+
+def _has_connector_tag(tags: Any) -> bool:
+    for tag in tags or []:
+        value = _clean_selector(tag)
+        if value and (value in CONNECTOR_TAGS or connector_by_id(value)):
+            return True
+    return False
+
+
+def _known_connector_from_mapping(mapping: dict[str, Any]) -> str | None:
+    selected = _first_mapping_value(mapping, CONNECTOR_ENV_KEYS)
+    if selected and connector_by_id(selected):
+        return selected
+    return None
+
+
+def _iter_flow_commands(commands: list[Any]) -> list[Any]:
+    all_commands: list[Any] = []
+    pending = list(commands)
+    while pending:
+        command = pending.pop(0)
+        all_commands.append(command)
+        inline_commands = _mapping(getattr(command, "args", {})).get("commands")
+        if inline_commands is None:
+            continue
+        with suppress(FlowValidationError):
+            pending.extend(
+                parse_inline_commands(
+                    inline_commands,
+                    source=f"{getattr(command, 'name', 'command')}.commands",
+                )
+            )
+    return all_commands
+
+
+def _flow_has_connector_backed_command(flow: Any) -> bool:
+    return any(
+        getattr(command, "name", "") in CONNECTOR_BACKED_COMMANDS
+        for command in _iter_flow_commands(flow.all_commands())
+    )
+
+
+def _connector_from_flow_commands(flow: Any) -> str | None:
+    for command in _iter_flow_commands(flow.all_commands()):
+        selected = _known_connector_from_mapping(_mapping(getattr(command, "args", {})))
+        if selected:
+            return selected
+    return None
+
+
+def _raw_flow_readiness_selection(
+    flow: Any,
+    *,
+    env_overrides: dict[str, str],
+) -> dict[str, Any]:
+    effective_env = {**_mapping(getattr(flow, "env", {})), **env_overrides}
+    connector_id = (
+        _first_mapping_value(effective_env, CONNECTOR_ENV_KEYS)
+        or _connector_from_tags(getattr(flow, "tags", []))
+        or _connector_from_flow_commands(flow)
+    )
+    connector_backed = bool(
+        connector_id
+        or _has_connector_tag(getattr(flow, "tags", []))
+        or _flow_has_connector_backed_command(flow)
+    )
+    return {
+        "connector_backed": connector_backed,
+        "connector_id": connector_id,
+        "environment": _first_mapping_value(effective_env, ENVIRONMENT_ENV_KEYS),
+        "required_capabilities": _required_capabilities_from_sources(
+            metadata={},
+            env=effective_env,
+        ),
+    }
 
 
 def _required_capabilities_from_sources(
@@ -1644,6 +1738,7 @@ async def run_workspace_flow(request: Request) -> Response:
         flow_title = str(data.get("title") or "").strip()
         flow: dict[str, Any] | None = None
         store: SupabaseProductStore | None = None
+        parsed_raw_flow = None
         if flow_id and not flow_yaml:
             if not settings.supabase_configured:
                 return _json_error(
@@ -1670,7 +1765,30 @@ async def run_workspace_flow(request: Request) -> Response:
                 return _json_error("not_found", f"Workspace flow not found: {flow_id}", status_code=404)
             flow_yaml = str(flow.get("yaml") or "")
             flow_title = str(flow.get("title") or flow.get("name") or flow_title)
-        result = create_default_runner(dry_run=dry_run).run_text(flow_yaml, env=env_overrides)
+        elif flow_yaml:
+            parsed_raw_flow = parse_flow_text(flow_yaml)
+            readiness_selection = _raw_flow_readiness_selection(
+                parsed_raw_flow,
+                env_overrides=env_overrides,
+            )
+            if readiness_selection["connector_backed"]:
+                if not settings.supabase_configured:
+                    return JSONResponse(redact_json(_connector_setup_block_payload()))
+                store = store or _product_store(settings)
+                dashboard_payload = store.dashboard(token_payload)
+                if not readiness_selection["connector_id"] or not workspace_connector_ready(
+                    dashboard_payload,
+                    connector_id=readiness_selection["connector_id"],
+                    environment=readiness_selection["environment"],
+                    required_capabilities=readiness_selection["required_capabilities"],
+                ):
+                    return JSONResponse(redact_json(_connector_setup_block_payload()))
+        runner = create_default_runner(dry_run=dry_run)
+        result = (
+            runner.run_flow(parsed_raw_flow, env=env_overrides)
+            if parsed_raw_flow is not None
+            else runner.run_text(flow_yaml, env=env_overrides)
+        )
         payload = redact_json(result.as_dict())
         if flow:
             payload["workspace_flow"] = _public_flow_summary(flow)
