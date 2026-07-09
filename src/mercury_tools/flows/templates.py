@@ -55,6 +55,7 @@ Workspace quickstart:
 - mercury-tools flow init-workspace ./my-mercury-flows
 - mercury-tools flow list ./my-mercury-flows
 - mercury-tools flow run-suite ./my-mercury-flows --dry-run
+- mercury-tools flow watch ./my-mercury-flows --dry-run
 - mercury-tools flow push ./my-mercury-flows --dry-run
 
 Workspace config keys:

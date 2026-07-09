@@ -125,6 +125,9 @@ def test_flow_cli_init_workspace_creates_runnable_suite(tmp_path: Path, capsys) 
         "flows/vat-summary.yaml",
     ]
 
+    assert main(["flow", "watch", str(workspace), "--dry-run", "--max-runs", "1"]) == 0
+    assert "Run 1:" in capsys.readouterr().out
+
 
 def test_flow_cli_init_workspace_refuses_overwrite(tmp_path: Path, capsys) -> None:
     workspace = tmp_path / "workspace"

@@ -41,6 +41,7 @@ Create and test a Mercury Flow:
 uv run mercury-tools flow init-workspace ./my-mercury-flows
 uv run mercury-tools flow list ./my-mercury-flows
 uv run mercury-tools flow run-suite ./my-mercury-flows --dry-run
+uv run mercury-tools flow watch ./my-mercury-flows --dry-run
 uv run mercury-tools flow init ./my-flow.yaml --template company-health
 uv run mercury-tools flow validate ./my-flow.yaml
 uv run mercury-tools flow run ./my-flow.yaml --dry-run
@@ -192,6 +193,7 @@ Flow CLI:
 - `mercury-tools flow run <path> --dry-run`
 - `mercury-tools flow list <workspace> --tag accounting`
 - `mercury-tools flow run-suite <workspace> --dry-run --exclude-tag disabled`
+- `mercury-tools flow watch <workspace> --dry-run`
 - `mercury-tools flow push <workspace> --url https://mercury-tools-mcp.onrender.com --client-token <mc_...>`
 - `mercury-tools flow cheat-sheet`
 

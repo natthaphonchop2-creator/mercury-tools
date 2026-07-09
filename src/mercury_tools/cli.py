@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -208,6 +209,18 @@ def cmd_flow_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_suite_payload(payload: dict[str, Any]) -> None:
+    print(
+        f"Flow suite {payload['status']}: "
+        f"{payload['workspace']['selected_count']} selected / "
+        f"{payload['workspace']['flow_count']} discovered"
+    )
+    for result in payload["results"]:
+        print(f"- {result['flow']['name']}: {result['status']} ({len(result['steps'])} steps)")
+    if payload.get("report_path"):
+        print(f"report: {payload['report_path']}")
+
+
 def cmd_flow_list(args: argparse.Namespace) -> int:
     try:
         workspace = discover_workspace_flows(
@@ -259,16 +272,82 @@ def cmd_flow_run_suite(args: argparse.Namespace) -> int:
     if args.json:
         _print_json(payload)
     else:
-        print(
-            f"Flow suite {payload['status']}: "
-            f"{payload['workspace']['selected_count']} selected / "
-            f"{payload['workspace']['flow_count']} discovered"
-        )
-        for result in payload["results"]:
-            print(f"- {result['flow']['name']}: {result['status']} ({len(result['steps'])} steps)")
-        if payload.get("report_path"):
-            print(f"report: {payload['report_path']}")
+        _print_suite_payload(payload)
     return 0
+
+
+def _watch_snapshot(
+    path: Path,
+    *,
+    include_tags: list[str],
+    exclude_tags: list[str],
+) -> tuple[tuple[str, int, int], ...]:
+    workspace = discover_workspace_flows(
+        path,
+        include_tags=include_tags,
+        exclude_tags=exclude_tags,
+    )
+    paths = {record.path for record in workspace.records}
+    if workspace.config.config_path:
+        paths.add(workspace.config.config_path)
+    if path.exists() and path.is_file():
+        paths.add(path.expanduser().resolve())
+    snapshot: list[tuple[str, int, int]] = []
+    for item in sorted(paths):
+        try:
+            stat = item.stat()
+        except FileNotFoundError:
+            snapshot.append((str(item), -1, -1))
+        else:
+            snapshot.append((str(item), stat.st_mtime_ns, stat.st_size))
+    return tuple(snapshot)
+
+
+def cmd_flow_watch(args: argparse.Namespace) -> int:
+    path = Path(args.path)
+    runs = 0
+    last_snapshot: tuple[tuple[str, int, int], ...] | None = None
+    print(f"Watching Mercury flows: {path}")
+    print("Press Ctrl+C to stop.")
+
+    try:
+        while True:
+            try:
+                snapshot = _watch_snapshot(
+                    path,
+                    include_tags=args.tag,
+                    exclude_tags=args.exclude_tag,
+                )
+                should_run = last_snapshot is None or snapshot != last_snapshot
+                last_snapshot = snapshot
+                if should_run:
+                    runs += 1
+                    print(f"\nRun {runs}:")
+                    suite = run_workspace_flows(
+                        path,
+                        dry_run=args.dry_run,
+                        include_tags=args.tag,
+                        exclude_tags=args.exclude_tag,
+                    )
+                    payload = suite.as_dict()
+                    if args.json:
+                        _print_json(payload)
+                    else:
+                        _print_suite_payload(payload)
+            except (FlowValidationError, RuntimeError, ValueError) as exc:
+                runs += 1
+                error = {"status": "error", "message": str(exc), "path": str(path)}
+                if args.json:
+                    _print_json(error)
+                else:
+                    print(f"\nRun {runs}: Flow watch failed: {exc}")
+
+            if args.max_runs is not None and runs >= args.max_runs:
+                return 0
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("\nStopped Mercury flow watch.")
+        return 0
 
 
 def _flow_import_payload(
@@ -512,6 +591,16 @@ def build_parser() -> argparse.ArgumentParser:
     flow_run_suite.add_argument("--exclude-tag", action="append", default=[])
     flow_run_suite.add_argument("--json", action="store_true")
     flow_run_suite.set_defaults(func=cmd_flow_run_suite)
+
+    flow_watch = flow_sub.add_parser("watch")
+    flow_watch.add_argument("path", nargs="?", default=".")
+    flow_watch.add_argument("--dry-run", action="store_true")
+    flow_watch.add_argument("--tag", action="append", default=[])
+    flow_watch.add_argument("--exclude-tag", action="append", default=[])
+    flow_watch.add_argument("--interval", type=float, default=1.0)
+    flow_watch.add_argument("--max-runs", type=int)
+    flow_watch.add_argument("--json", action="store_true")
+    flow_watch.set_defaults(func=cmd_flow_watch)
 
     flow_push = flow_sub.add_parser("push")
     flow_push.add_argument("path", nargs="?", default=".")
