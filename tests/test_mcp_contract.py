@@ -35,6 +35,21 @@ def test_mcp_flow_tools_validate_and_dry_run() -> None:
     assert result["status"] == "planned"
     assert result["steps"][0]["command"] == "connectorStatus"
 
+    parameterized = run_flow(
+        """name: Env Override Smoke
+env:
+  month: "2026-01"
+---
+- emitReport:
+    title: "Month ${month}"
+""",
+        dry_run=True,
+        env={"month": "2026-10"},
+    )
+    assert parameterized["status"] == "planned"
+    assert parameterized["variables"]["env"]["month"] == "2026-10"
+    assert parameterized["artifacts"][0]["title"] == "Month 2026-10"
+
 
 def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:
     from mercury_tools.config import Settings
@@ -62,6 +77,7 @@ def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:
     )
 
     class FakeStore:
+        recorded: list[dict] = []
         flow = {
             "flow_id": "workspace-company-health-12345678",
             "title": "Company Health Check",
@@ -84,7 +100,33 @@ def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:
         def save_flow(self, *, token_payload, title, flow_yaml, metadata):
             return self.flow
 
+        def record_flow_run(
+            self, *, token_payload, flow_id, title, result_payload, dry_run, env_keys
+        ):
+            row = {
+                "run_id": "flow_run_1",
+                "flow_id": flow_id,
+                "title": title,
+                "status": result_payload["status"],
+                "dry_run": dry_run,
+                "env_keys": env_keys,
+            }
+            self.recorded.append(row)
+            return row
+
+    audit_events: list[dict] = []
+
+    def fake_audit(tool_name, input_payload, output_summary):
+        audit_events.append(
+            {
+                "tool_name": tool_name,
+                "input_payload": input_payload,
+                "output_summary": output_summary,
+            }
+        )
+
     monkeypatch.setattr(server, "_product_store", lambda _settings=None: FakeStore())
+    monkeypatch.setattr(server, "_audit", fake_audit)
 
     listed = server.list_workspace_flows(token)
     saved = server.save_workspace_flow_tool(
@@ -93,7 +135,12 @@ def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:
         COMPANY_HEALTH_TEMPLATE,
         metadata={"source": "test"},
     )
-    ran = server.run_workspace_flow_tool(token, "workspace-company-health-12345678", dry_run=True)
+    ran = server.run_workspace_flow_tool(
+        token,
+        "workspace-company-health-12345678",
+        dry_run=True,
+        env={"connector": "peak"},
+    )
 
     assert listed["status"] == "ok"
     assert listed["flow_count"] == 1
@@ -104,3 +151,8 @@ def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:
     assert ran["status"] == "planned"
     assert ran["workspace_flow"]["flow_id"] == "workspace-company-health-12345678"
     assert ran["steps"][0]["command"] == "connectorStatus"
+    assert ran["variables"]["env"]["connector"] == "peak"
+    assert ran["run_record"]["env_keys"] == ["connector"]
+    assert audit_events
+    assert all(token not in str(event["input_payload"]) for event in audit_events)
+    assert all("client_token_hash" in event["input_payload"] for event in audit_events)

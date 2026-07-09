@@ -168,16 +168,19 @@ def flow_run_summary(
     title: str | None,
     result_payload: dict[str, Any],
     dry_run: bool,
+    env_keys: list[str] | None = None,
 ) -> dict[str, Any]:
     flow = result_payload.get("flow") or {}
     flow_title = str(title or flow.get("name") or flow_id or "Mercury Flow").strip()
     created_at = now_utc()
+    clean_env_keys = sorted({str(key).strip() for key in (env_keys or []) if str(key).strip()})
     run_basis = json.dumps(
         {
             "flow_id": flow_id,
             "title": flow_title,
             "status": result_payload.get("status"),
             "dry_run": dry_run,
+            "env_keys": clean_env_keys,
             "created_at": created_at,
         },
         sort_keys=True,
@@ -202,6 +205,7 @@ def flow_run_summary(
             "step_count": len(result_payload.get("steps") or []),
             "artifact_count": len(result_payload.get("artifacts") or []),
             "artifacts": artifacts,
+            "env_keys": clean_env_keys,
             "created_at": created_at,
         }
     )
@@ -561,6 +565,7 @@ class SupabaseProductStore:
         title: str | None,
         result_payload: dict[str, Any],
         dry_run: bool,
+        env_keys: list[str] | None = None,
     ) -> dict[str, Any]:
         context = self.workspace_for_token(token_payload)
         if not context:
@@ -570,6 +575,7 @@ class SupabaseProductStore:
             title=title,
             result_payload=result_payload,
             dry_run=dry_run,
+            env_keys=env_keys,
         )
         self.record_event(
             workspace_id=context["workspace"]["id"],
@@ -580,6 +586,7 @@ class SupabaseProductStore:
                 "title": title,
                 "dry_run": dry_run,
                 "status": result_payload.get("status"),
+                "env_keys": run["env_keys"],
             },
             summary={
                 "flow_run": run,

@@ -92,6 +92,33 @@ def _filters(filters: dict[str, Any] | None) -> SearchFilters:
     )
 
 
+def _env_overrides_from_payload(raw: Any) -> dict[str, str]:
+    """Normalize Maestro-style runtime env values without preserving object secrets."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("env must be an object.")
+    env: dict[str, str] = {}
+    for key, value in raw.items():
+        clean_key = str(key).strip()
+        if not clean_key:
+            raise ValueError("env keys cannot be empty.")
+        env[clean_key] = "" if value is None else str(value)
+    return env
+
+
+def _env_keys(env: dict[str, str]) -> list[str]:
+    return sorted(env)
+
+
+def _client_token_audit_ref(client_token: str) -> dict[str, str]:
+    token = client_token.strip()
+    return {
+        "client_token_prefix": token[:3],
+        "client_token_hash": sha256_text(token)[:16],
+    }
+
+
 def _client_token_payload(request: Request) -> dict[str, Any]:
     settings = load_settings()
     authorization = request.headers.get("authorization") or ""
@@ -280,14 +307,23 @@ def check_flow_syntax(flow_yaml: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def run_flow(flow_yaml: str, dry_run: bool = False) -> dict[str, Any]:
+def run_flow(
+    flow_yaml: str,
+    dry_run: bool = False,
+    env: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Run a Mercury YAML flow or return an execution plan when dry_run is true."""
     try:
-        result = create_default_runner(dry_run=dry_run).run_text(flow_yaml)
+        env_overrides = _env_overrides_from_payload(env)
+        result = create_default_runner(dry_run=dry_run).run_text(flow_yaml, env=env_overrides)
         payload = redact_json(result.as_dict())
         _audit(
             "run_flow",
-            {"flow_yaml_length": len(flow_yaml), "dry_run": dry_run},
+            {
+                "flow_yaml_length": len(flow_yaml),
+                "dry_run": dry_run,
+                "env_keys": _env_keys(env_overrides),
+            },
             {
                 "status": payload["status"],
                 "step_count": len(payload["steps"]),
@@ -297,7 +333,16 @@ def run_flow(flow_yaml: str, dry_run: bool = False) -> dict[str, Any]:
         return payload
     except (FlowValidationError, RuntimeError, ValueError) as exc:
         payload = {"status": "error", "message": str(exc), "dry_run": dry_run}
-        _audit("run_flow", {"flow_yaml_length": len(flow_yaml), "dry_run": dry_run}, payload)
+        safe_env_keys = _env_keys(env) if isinstance(env, dict) else []
+        _audit(
+            "run_flow",
+            {
+                "flow_yaml_length": len(flow_yaml),
+                "dry_run": dry_run,
+                "env_keys": safe_env_keys,
+            },
+            payload,
+        )
         return payload
 
 
@@ -319,18 +364,24 @@ def list_workspace_flows(client_token: str) -> dict[str, Any]:
                 "flows": flows,
             }
         )
-        _audit("list_workspace_flows", {"client_token": client_token}, {"flow_count": len(flows)})
+        _audit("list_workspace_flows", _client_token_audit_ref(client_token), {"flow_count": len(flows)})
         return payload
     except (PermissionError, RuntimeError, ValueError) as exc:
         payload = {"status": "error", "message": str(exc)}
-        _audit("list_workspace_flows", {"client_token": client_token}, payload)
+        _audit("list_workspace_flows", _client_token_audit_ref(client_token), payload)
         return payload
 
 
 @mcp.tool(name="run_workspace_flow")
-def run_workspace_flow_tool(client_token: str, flow_id: str, dry_run: bool = True) -> dict[str, Any]:
+def run_workspace_flow_tool(
+    client_token: str,
+    flow_id: str,
+    dry_run: bool = True,
+    env: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Run one saved Mercury workspace flow by id, or return a dry-run plan."""
     try:
+        env_overrides = _env_overrides_from_payload(env)
         settings = load_settings()
         if not settings.supabase_configured:
             raise RuntimeError("Supabase is required to load saved workspace flows.")
@@ -339,7 +390,10 @@ def run_workspace_flow_tool(client_token: str, flow_id: str, dry_run: bool = Tru
         flow = store.get_flow(token_payload=token_payload, flow_id=flow_id)
         if not flow:
             return {"status": "not_found", "message": f"Workspace flow not found: {flow_id}"}
-        result = create_default_runner(dry_run=dry_run).run_text(str(flow.get("yaml") or ""))
+        result = create_default_runner(dry_run=dry_run).run_text(
+            str(flow.get("yaml") or ""),
+            env=env_overrides,
+        )
         payload = redact_json(
             {
                 **result.as_dict(),
@@ -353,12 +407,18 @@ def run_workspace_flow_tool(client_token: str, flow_id: str, dry_run: bool = Tru
                 title=str(flow.get("title") or flow.get("name") or ""),
                 result_payload=payload,
                 dry_run=dry_run,
+                env_keys=_env_keys(env_overrides),
             )
         except (AttributeError, RuntimeError, ValueError) as exc:
             payload["run_history"] = {"status": "not_recorded", "message": str(exc)}
         _audit(
             "run_workspace_flow",
-            {"client_token": client_token, "flow_id": flow_id, "dry_run": dry_run},
+            {
+                **_client_token_audit_ref(client_token),
+                "flow_id": flow_id,
+                "dry_run": dry_run,
+                "env_keys": _env_keys(env_overrides),
+            },
             {
                 "status": payload["status"],
                 "flow_id": flow_id,
@@ -369,9 +429,15 @@ def run_workspace_flow_tool(client_token: str, flow_id: str, dry_run: bool = Tru
         return payload
     except (PermissionError, FlowValidationError, RuntimeError, ValueError) as exc:
         payload = {"status": "error", "message": str(exc), "dry_run": dry_run}
+        safe_env_keys = _env_keys(env) if isinstance(env, dict) else []
         _audit(
             "run_workspace_flow",
-            {"client_token": client_token, "flow_id": flow_id, "dry_run": dry_run},
+            {
+                **_client_token_audit_ref(client_token),
+                "flow_id": flow_id,
+                "dry_run": dry_run,
+                "env_keys": safe_env_keys,
+            },
             payload,
         )
         return payload
@@ -399,7 +465,11 @@ def save_workspace_flow_tool(
         payload = redact_json({"status": "ok", "flow": _public_flow_summary(flow)})
         _audit(
             "save_workspace_flow",
-            {"client_token": client_token, "title": title, "flow_yaml_length": len(flow_yaml)},
+            {
+                **_client_token_audit_ref(client_token),
+                "title": title,
+                "flow_yaml_length": len(flow_yaml),
+            },
             {"status": "ok", "flow_id": flow["flow_id"]},
         )
         return payload
@@ -407,7 +477,11 @@ def save_workspace_flow_tool(
         payload = {"status": "error", "message": str(exc)}
         _audit(
             "save_workspace_flow",
-            {"client_token": client_token, "title": title, "flow_yaml_length": len(flow_yaml)},
+            {
+                **_client_token_audit_ref(client_token),
+                "title": title,
+                "flow_yaml_length": len(flow_yaml),
+            },
             payload,
         )
         return payload
@@ -716,6 +790,7 @@ async def run_workspace_flow(request: Request) -> Response:
         token_payload = _client_token_payload(request)
         data = await request.json()
         dry_run = bool(data.get("dry_run", True))
+        env_overrides = _env_overrides_from_payload(data.get("env"))
         flow_yaml = str(data.get("flow_yaml") or "")
         flow_id = str(data.get("flow_id") or "").strip()
         flow_title = str(data.get("title") or "").strip()
@@ -732,7 +807,7 @@ async def run_workspace_flow(request: Request) -> Response:
                 return _json_error("not_found", f"Workspace flow not found: {flow_id}", status_code=404)
             flow_yaml = str(flow.get("yaml") or "")
             flow_title = str(flow.get("title") or flow.get("name") or flow_title)
-        result = create_default_runner(dry_run=dry_run).run_text(flow_yaml)
+        result = create_default_runner(dry_run=dry_run).run_text(flow_yaml, env=env_overrides)
         payload = redact_json(result.as_dict())
         if flow:
             payload["workspace_flow"] = _public_flow_summary(flow)
@@ -744,6 +819,7 @@ async def run_workspace_flow(request: Request) -> Response:
                     title=flow_title or str(payload.get("flow", {}).get("name") or ""),
                     result_payload=payload,
                     dry_run=dry_run,
+                    env_keys=_env_keys(env_overrides),
                 )
             except (AttributeError, RuntimeError, ValueError) as exc:
                 payload["run_history"] = {"status": "not_recorded", "message": str(exc)}

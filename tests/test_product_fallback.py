@@ -237,11 +237,14 @@ def test_product_store_audit_fallback_records_flow_runs() -> None:
         title=flow["title"],
         result_payload=result,
         dry_run=True,
+        env_keys=["month"],
     )
     dashboard = store.dashboard(token_payload())
 
     assert run["flow_id"] == flow["flow_id"]
     assert run["status"] == "planned"
     assert run["step_count"] == 4
+    assert run["env_keys"] == ["month"]
     assert dashboard["flow_runs"][0]["run_id"] == run["run_id"]
+    assert dashboard["flow_runs"][0]["env_keys"] == ["month"]
     assert dashboard["events"][0]["event_type"] == "flow.run_completed"

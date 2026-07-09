@@ -297,13 +297,16 @@ def test_workspace_flow_run_records_history_when_supabase_available(monkeypatch)
         def upsert_connection(self, connect_request, token_payload):
             return {"workspace": {"id": "workspace-1"}, "member": {"id": "member-1"}}
 
-        def record_flow_run(self, *, token_payload, flow_id, title, result_payload, dry_run):
+        def record_flow_run(
+            self, *, token_payload, flow_id, title, result_payload, dry_run, env_keys
+        ):
             row = {
                 "run_id": "flow_run_1",
                 "flow_id": flow_id,
                 "title": title,
                 "status": result_payload["status"],
                 "dry_run": dry_run,
+                "env_keys": env_keys,
                 "step_count": len(result_payload["steps"]),
                 "artifact_count": len(result_payload["artifacts"]),
                 "created_at": "2026-07-09T00:00:00+00:00",
@@ -331,15 +334,19 @@ def test_workspace_flow_run_records_history_when_supabase_available(monkeypatch)
             "title": "Company Health Check",
             "flow_yaml": COMPANY_HEALTH_TEMPLATE,
             "dry_run": True,
+            "env": {"connector": "peak"},
         },
     )
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "planned"
+    assert payload["variables"]["env"]["connector"] == "peak"
     assert payload["run_record"]["run_id"] == "flow_run_1"
+    assert payload["run_record"]["env_keys"] == ["connector"]
     assert recorded[0]["title"] == "Company Health Check"
     assert recorded[0]["step_count"] == 4
+    assert recorded[0]["env_keys"] == ["connector"]
 
 
 def test_workspace_flow_import_saves_batch(monkeypatch) -> None:

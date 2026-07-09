@@ -147,8 +147,9 @@ page. The server bearer token is for MCP/admin compatibility, not normal users.
 Connector credentials are not stored in Supabase in v1; connector profiles store
 the selected program, environment, company label, and required secret fields.
 Flow run history stores sanitized summaries only: status, flow title/id, step
-count, artifact count, and artifact titles. It does not store raw connector
-secrets, full variables, or raw accounting payloads.
+count, artifact count, artifact titles, and runtime env key names. It does not
+store raw connector secrets, runtime env values, full variables, or raw
+accounting payloads.
 
 If the dedicated product tables from `0002_mercury_product_layer.sql` have not
 been applied yet, Mercury falls back to an event-sourced product state stored in
@@ -229,6 +230,21 @@ Flow CLI:
 - `mercury-tools flow watch <workspace> --dry-run`
 - `mercury-tools flow push <workspace> --url https://mercury-tools-mcp.onrender.com --client-token <mc_...>`
 - `mercury-tools flow cheat-sheet`
+
+MCP and HTTP flow runs also accept runtime env overrides. Values are coerced to
+strings, matching Maestro-style `-e KEY=value` behavior. Audit and run history
+record only the env key names:
+
+```json
+{
+  "flow_yaml": "name: Monthly VAT\n---\n- emitReport:\n    title: \"VAT ${month}\"",
+  "dry_run": true,
+  "env": {
+    "month": "2026-09",
+    "connector": "flowaccount"
+  }
+}
+```
 
 Workspace config:
 

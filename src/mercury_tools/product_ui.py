@@ -461,6 +461,7 @@ STYLE = """
       outline: none;
     }
     textarea { min-height: 170px; resize: vertical; }
+    textarea.compact-textarea { min-height: 74px; }
     input:focus, select:focus, textarea:focus { border-color: var(--teal); }
     button {
       border: 0;
@@ -913,6 +914,8 @@ onFlowStart:
     sections:
       - "Use the retrieved citations and skill package to answer in Thai."
       - "Do not expose raw tax IDs, emails, bearer tokens, or API keys."</textarea>
+              <label for="flow_env_json">Runtime env JSON optional</label>
+              <textarea id="flow_env_json" class="compact-textarea" placeholder='{"month":"2026-07","connector":"flowaccount"}'></textarea>
               <div class="two" style="margin-top:12px">
                 <button id="flow-validate" class="secondary" type="button">Validate</button>
                 <button id="flow-run" class="secondary" type="button">Dry-run</button>
@@ -1090,6 +1093,16 @@ SCRIPT = """
       }, null, 2);
     }
 
+    function parseFlowEnv() {
+      const raw = ($('#flow_env_json').value || '').trim();
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+        throw new Error('Runtime env JSON must be an object.');
+      }
+      return parsed;
+    }
+
     function renderDashboard(data) {
       const workspace = data.workspace || {};
       const member = data.member || {};
@@ -1147,11 +1160,12 @@ SCRIPT = """
       const flowRuns = data.flow_runs || [];
       $('#flow-run-list').innerHTML = flowRuns.length ? flowRuns.map((item) => {
         const artifacts = item.artifact_count ? ' - ' + item.artifact_count + ' artifacts' : '';
+        const envKeys = item.env_keys && item.env_keys.length ? ' - env: ' + item.env_keys.join(', ') : '';
         const mode = item.dry_run ? 'dry-run' : 'run';
         return `
           <div class="item">
             <strong>${item.title || item.flow_id || item.run_id} <span class="pill">${item.status}</span></strong>
-            <small>${mode} - ${item.step_count || 0} steps${artifacts} - ${item.created_at || ''}</small>
+            <small>${mode} - ${item.step_count || 0} steps${artifacts}${envKeys} - ${item.created_at || ''}</small>
           </div>
         `;
       }).join('') : '<div class="item"><small>No flow runs yet.</small></div>';
@@ -1341,7 +1355,7 @@ SCRIPT = """
         const data = await authFetch('/api/flows/run', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ flow_yaml: $('#flow_yaml').value, dry_run: true })
+          body: JSON.stringify({ flow_yaml: $('#flow_yaml').value, dry_run: true, env: parseFlowEnv() })
         });
         $('#flow-result').textContent = JSON.stringify(data, null, 2);
         message('#flow-message', 'Dry-run plan is ready.', 'ok');
