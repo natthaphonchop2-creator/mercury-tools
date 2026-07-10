@@ -64,8 +64,8 @@ manifest.
 
 Verification snapshot: **2026-07-10**
 
-- Runtime commit: `c77eb1fea010e60ee8a07d7435789e1f628e5237`
-- Render deploy: `dep-d982bppo3t8c738i6sl0` (`live`)
+- Runtime commit: `c6b7abcf456010ad20071376e451072df9229430`
+- Render deploy: `dep-d984cei8qa3s73errsc0` (`live`)
 - Hosted MCP: `https://mercury-tools-mcp.onrender.com/mcp`
 - MCP contract: 22 tools; public stateful schemas use opaque `workspace_id` routing
 - Public HTTP surface: legacy dashboard, upload, invite, and compatibility APIs disabled
