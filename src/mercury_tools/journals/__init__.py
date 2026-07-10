@@ -5,9 +5,11 @@ from mercury_tools.journals.models import (
     PreparedJournal,
     prepare_general_journal,
 )
+from mercury_tools.journals.service import FlowAccountJournalService
 
 __all__ = [
     "JournalValidationError",
     "PreparedJournal",
+    "FlowAccountJournalService",
     "prepare_general_journal",
 ]
