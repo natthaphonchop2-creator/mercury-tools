@@ -42,6 +42,25 @@ enables read capabilities only.
 See [docs/JUDGE_QUICKSTART.md](docs/JUDGE_QUICKSTART.md) for the demo sequence
 and explicit contest security boundary.
 
+## Knowledge Boundaries
+
+Mercury separates three cited knowledge domains:
+
+- ERP endpoint dictionaries for FlowAccount and PEAK request routing.
+- Source-backed Thai accounting summaries for TFRS 9, TFRS 15, TFRS 16,
+  TAS 2, TAS 7, TAS 12, TAS 16, and TFRS for NPAEs.
+- Thai VAT and withholding-tax workflow guidance sourced from the Revenue
+  Department.
+
+Domain routing prevents accounting-standard questions from being filled with
+unrelated endpoint chunks. Hybrid results below the v1 relevance threshold are
+returned as `no_relevant_knowledge`. A ready workspace can retrieve both its
+selected ERP context and relevant accounting or tax context in one cited pack.
+
+Mercury stores original summaries and source links, not complete copyrighted
+standards. The host LLM produces the response, and professional accounting or
+tax judgment remains required before filing, posting, or issuing an opinion.
+
 ## Local Development
 
 ```bash
