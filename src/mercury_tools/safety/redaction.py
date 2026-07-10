@@ -13,7 +13,7 @@ KEY_VALUE_RE = re.compile(
 )
 EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 THAI_TAX_ID_RE = re.compile(r"\b\d{13}\b")
-SAFE_SECRET_SCHEMA_KEYS = {"required_secret_fields"}
+SAFE_SECRET_SCHEMA_KEYS = {"required_secret_fields", "token_url"}
 
 
 def redact_text(value: str) -> str:

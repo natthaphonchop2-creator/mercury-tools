@@ -134,6 +134,9 @@ def test_start_connector_setup_returns_redacted_profile(monkeypatch) -> None:
                 "status": "requires_credentials",
                 "metadata": {
                     "required_secret_fields": ["client_id", "client_secret"],
+                    "preset": {
+                        "token_url": "https://openapi.flowaccount.com/v1/token",
+                    },
                     "client_secret": "super-secret-value",
                 },
             }
@@ -155,6 +158,9 @@ def test_start_connector_setup_returns_redacted_profile(monkeypatch) -> None:
         "client_secret",
     ]
     assert payload["profile"]["metadata"]["client_secret"] == "[REDACTED]"
+    assert payload["profile"]["metadata"]["preset"]["token_url"] == (
+        "https://openapi.flowaccount.com/v1/token"
+    )
     assert "super-secret-value" not in str(payload)
 
 

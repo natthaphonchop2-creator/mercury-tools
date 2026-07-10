@@ -25,9 +25,13 @@ def test_redaction_keeps_connector_schema_field_names() -> None:
     payload = redact_json(
         {
             "required_secret_fields": ["client_id", "client_secret"],
+            "token_url": "https://openapi.flowaccount.com/v1/token",
+            "access_token": "raw-token",
             "client_secret": "raw-value",
         }
     )
 
     assert payload["required_secret_fields"] == ["client_id", "client_secret"]
+    assert payload["token_url"] == "https://openapi.flowaccount.com/v1/token"
+    assert payload["access_token"] == "[REDACTED]"
     assert payload["client_secret"] == "[REDACTED]"
