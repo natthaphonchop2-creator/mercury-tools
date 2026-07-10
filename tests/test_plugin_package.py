@@ -280,3 +280,15 @@ def test_marketplace_lists_private_plugin_separately() -> None:
         "authentication": "ON_INSTALL",
     }
     assert private["category"] == "Finance"
+
+
+def test_private_journal_docs_keep_secrets_out_of_git() -> None:
+    text = (ROOT / "docs/PRIVATE_JOURNAL_MCP.md").read_text()
+
+    assert "MERCURY_PRIVATE_MCP_TOKEN" in text
+    assert "preview_flowaccount_journal" in text
+    assert "create_flowaccount_journal_draft" in text
+    assert "approve_flowaccount_journal" in text
+    assert "POST /journal-entries/draft" in text
+    assert "POST /journal-entries/{id}/approve" in text
+    assert "actual-token" not in text

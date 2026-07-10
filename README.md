@@ -42,6 +42,18 @@ enables read capabilities only.
 See [docs/JUDGE_QUICKSTART.md](docs/JUDGE_QUICKSTART.md) for the demo sequence
 and explicit contest security boundary.
 
+## Private FlowAccount Journals
+
+Company operators can enable a separate authenticated MCP at `/private-mcp`.
+It previews one balanced General Journal Voucher, creates a FlowAccount draft,
+and approves that exact draft only after a second confirmation. The private
+route is absent unless `MERCURY_PRIVATE_MCP_TOKEN` is configured, and its three
+write tools never appear on the public MCP.
+
+See [docs/PRIVATE_JOURNAL_MCP.md](docs/PRIVATE_JOURNAL_MCP.md) for setup,
+confirmation gates, duplicate protection, and the marketplace shipping entry
+example.
+
 ## Knowledge Boundaries
 
 Mercury separates three cited knowledge domains:
@@ -397,8 +409,9 @@ authentication and must not be treated as private tenant isolation.
 
 Supported flow commands are read-oriented: `connectorStatus`, `searchKnowledge`,
 `retrieveContextPack`, `getDocument`, `runSkill`, `emitReport`, `assert`,
-`repeat`, `runFlow`, and `retry`. Production accounting writes remain out of
-scope for v1.
+`repeat`, `runFlow`, and `retry`. Production accounting writes remain outside
+the public flow runner; the authenticated private journal MCP is a separate
+surface.
 
 ## Environment
 
@@ -410,6 +423,7 @@ Required for live RAG:
 - `MERCURY_TOOLS_HTTP_REQUIRE_AUTH=false` for the public contest MCP endpoint
 - `MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API=false` so only MCP, health, and status routes are exposed
 - `MERCURY_CREDENTIAL_VAULT_SECRET` for encrypted connector credential records
+- `MERCURY_PRIVATE_MCP_TOKEN` to opt into the authenticated private journal MCP
 
 `OPENAI_API_KEY` is optional and only needed when
 `MERCURY_TOOLS_EMBEDDING_PROVIDER=openai`.
@@ -444,6 +458,12 @@ Tools:
 - `list_workspace_flows`
 - `run_workspace_flow`
 
+Private tools, available only at authenticated `/private-mcp`:
+
+- `preview_flowaccount_journal`
+- `create_flowaccount_journal_draft`
+- `approve_flowaccount_journal`
+
 Resources:
 
 - `mercury://wiki/index`
@@ -475,3 +495,6 @@ See `docs/JUDGE_QUICKSTART.md` for the contest install flow. The plugin
 is installed from the GitHub marketplace and connects Codex to the hosted
 Mercury Tools MCP server. Connector credentials stay out of Git. Mercury should
 be used from Codex or another MCP host, not from a browser UI.
+
+`Mercury Finance Private` is a separate marketplace plugin for authenticated
+company journal writes. Installing it does not weaken the public contest MCP.

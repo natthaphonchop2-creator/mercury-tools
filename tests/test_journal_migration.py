@@ -36,4 +36,5 @@ def test_private_journal_migration_has_state_and_lookup_guards() -> None:
     ):
         assert f"'{status}'" in sql
     assert "connector_write_requests_dedupe_idx" in sql
+    assert "connector_write_requests_profile_idx" in sql
     assert "connector_write_requests_record_idx" in sql

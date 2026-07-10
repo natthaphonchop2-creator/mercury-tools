@@ -88,5 +88,9 @@ Render auto-deploy both follow the same release commit.
 This build intentionally has no login or private tenant isolation. Use contest,
 UAT, sandbox, or disposable demo credentials only. Credential values are
 encrypted server-side and never returned, but `workspace_id` is routing state,
-not authorization. Production mutations remain blocked. OAuth/private tenancy
-is the post-contest hardening phase.
+not authorization. Production mutations remain blocked on the public MCP.
+
+The separately packaged **Mercury Finance Private** plugin uses an authenticated
+`/private-mcp` route for company-owned FlowAccount journal writes. Its bearer
+token is not distributed to judges and its write tools are not listed by the
+public contest MCP.

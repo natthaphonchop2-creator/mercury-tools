@@ -16,6 +16,10 @@ services:
         value: "false"
       - key: MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API
         value: "false"
+      - key: MERCURY_PRIVATE_MCP_PATH
+        value: /private-mcp
+      - key: MERCURY_PRIVATE_MCP_TOKEN
+        sync: false
       - key: MERCURY_CREDENTIAL_VAULT_SECRET
         sync: false
       - key: MERCURY_TOOLS_PUBLIC_BASE_URL

@@ -34,6 +34,9 @@ create table if not exists public.connector_write_requests (
 create index if not exists connector_write_requests_workspace_idx
   on public.connector_write_requests (workspace_id, created_at desc);
 
+create index if not exists connector_write_requests_profile_idx
+  on public.connector_write_requests (connector_profile_id);
+
 create index if not exists connector_write_requests_record_idx
   on public.connector_write_requests (workspace_id, flowaccount_record_id)
   where flowaccount_record_id is not null;
