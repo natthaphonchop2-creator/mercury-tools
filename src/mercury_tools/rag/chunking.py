@@ -36,6 +36,13 @@ def first_heading(body: str, fallback: str) -> str:
 def document_from_markdown(path: Path, *, root: Path | None = None) -> KnowledgeDocument:
     raw = path.read_text(encoding="utf-8")
     metadata, body = parse_frontmatter(raw)
+    doc_type = str(metadata.get("doc_type") or metadata.get("type") or "wiki")
+    review_status = str(metadata.get("review_status") or "draft")
+    if doc_type in {"accounting_standard", "tax"} and review_status == "reviewed":
+        if not metadata.get("source_url"):
+            raise ValueError("reviewed regulated document requires source_url")
+        if not metadata.get("source_verified_at"):
+            raise ValueError("reviewed regulated document requires source_verified_at")
     relative = path.relative_to(root) if root else path.name
     slug = str(relative.with_suffix("")).replace("\\", "/")
     document_uri = str(metadata.get("document_uri") or f"mercury://wiki/{slug}")
@@ -53,8 +60,8 @@ def document_from_markdown(path: Path, *, root: Path | None = None) -> Knowledge
         source_url=metadata.get("source_url"),
         jurisdiction=metadata.get("jurisdiction"),
         connector=metadata.get("connector"),
-        doc_type=str(metadata.get("doc_type") or metadata.get("type") or "wiki"),
-        review_status=str(metadata.get("review_status") or "draft"),
+        doc_type=doc_type,
+        review_status=review_status,
         effective_date=metadata.get("effective_date"),
         metadata=metadata,
     )

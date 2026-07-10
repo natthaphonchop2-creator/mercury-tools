@@ -13,6 +13,7 @@ jurisdiction: TH
 connector: flowaccount
 review_status: reviewed
 source_url: https://example.test/vat
+source_verified_at: "2026-07-10"
 ---
 
 # VAT Test
@@ -30,4 +31,3 @@ Input VAT content.
     assert chunks[0].citation["source_title"] == "VAT Test"
     assert chunks[0].citation["source_url"] == "https://example.test/vat"
     assert chunks[0].metadata["connector"] == "flowaccount"
-
