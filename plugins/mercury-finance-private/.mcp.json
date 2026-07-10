@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "mercury-finance-public-context": {
+      "type": "http",
+      "url": "https://mercury-tools-mcp.onrender.com/mcp"
+    },
+    "mercury-finance-private": {
+      "type": "http",
+      "url": "https://mercury-tools-mcp.onrender.com/private-mcp",
+      "bearer_token_env_var": "MERCURY_PRIVATE_MCP_TOKEN"
+    }
+  }
+}

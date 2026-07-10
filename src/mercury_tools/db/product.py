@@ -118,6 +118,19 @@ SKILL_CATALOG_SEED: list[dict[str, Any]] = [
         "required_connectors": [],
         "tags": ["flow", "workflow", "automation", "read-only"],
     },
+    {
+        "skill_id": "flowaccount-journal-posting-th",
+        "title": "FlowAccount Journal Posting TH",
+        "category": "accounting",
+        "summary": (
+            "เตรียม ตรวจสมดุล สร้างร่าง และอนุมัติรายการสมุดรายวัน "
+            "FlowAccount โดยแยกการยืนยันแต่ละขั้น"
+        ),
+        "status": "available",
+        "version": "0.1.0",
+        "required_connectors": ["flowaccount"],
+        "tags": ["flowaccount", "journal", "write", "private", "thai"],
+    },
 ]
 
 PRODUCT_STATE_TOOL = "mercury_product_state"

@@ -6,6 +6,7 @@ from mercury_tools.db.product import SKILL_CATALOG_SEED
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = ROOT / "plugins/mercury-finance"
+PRIVATE_PLUGIN_ROOT = ROOT / "plugins/mercury-finance-private"
 
 EXPECTED_SKILLS = {
     "flowaccount-connector-setup-th": [
@@ -73,7 +74,9 @@ EXPECTED_SKILLS = {
 
 def test_product_catalog_contains_every_bundled_plugin_skill() -> None:
     bundled = {
-        path.parent.name for path in (PLUGIN_ROOT / "skills").glob("*/SKILL.md")
+        path.parent.name
+        for root in (PLUGIN_ROOT, PRIVATE_PLUGIN_ROOT)
+        for path in (root / "skills").glob("*/SKILL.md")
     }
     catalog = {row["skill_id"] for row in SKILL_CATALOG_SEED}
 
@@ -228,3 +231,52 @@ def test_plugin_package_has_no_embedded_secret_env_names_or_values() -> None:
     assert "PEAK_CLIENT_SECRET" not in serialized
     assert "sk-" not in serialized
     assert "service_role" not in serialized
+
+
+def test_private_plugin_declares_write_capability_and_bearer_env() -> None:
+    plugin = json.loads(
+        (PRIVATE_PLUGIN_ROOT / ".codex-plugin/plugin.json").read_text()
+    )
+    mcp = json.loads((PRIVATE_PLUGIN_ROOT / ".mcp.json").read_text())
+    server = mcp["mcpServers"]["mercury-finance-private"]
+    serialized = json.dumps({"plugin": plugin, "mcp": mcp})
+
+    assert plugin["name"] == "mercury-finance-private"
+    assert plugin["interface"]["capabilities"] == ["Interactive", "Read", "Write"]
+    assert server["url"] == "https://mercury-tools-mcp.onrender.com/private-mcp"
+    assert server["bearer_token_env_var"] == "MERCURY_PRIVATE_MCP_TOKEN"
+    assert "private-token" not in serialized
+    assert "client_secret" not in serialized
+
+
+def test_private_skill_stops_between_preview_draft_and_approval() -> None:
+    skill = (
+        PRIVATE_PLUGIN_ROOT / "skills/flowaccount-journal-posting-th/SKILL.md"
+    ).read_text()
+    ordered = [
+        "preview_flowaccount_journal",
+        "wait for explicit confirmation",
+        "create_flowaccount_journal_draft",
+        "wait for a new explicit confirmation",
+        "approve_flowaccount_journal",
+    ]
+
+    assert "Use when" in skill
+    assert len(skill.splitlines()) < 80
+    positions = [skill.index(item) for item in ordered]
+    assert positions == sorted(positions)
+    assert "outcome_unknown" in skill
+
+
+def test_marketplace_lists_private_plugin_separately() -> None:
+    data = json.loads((ROOT / ".agents/plugins/marketplace.json").read_text())
+    private = next(
+        item for item in data["plugins"] if item["name"] == "mercury-finance-private"
+    )
+
+    assert private["source"]["path"] == "./plugins/mercury-finance-private"
+    assert private["policy"] == {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL",
+    }
+    assert private["category"] == "Finance"
