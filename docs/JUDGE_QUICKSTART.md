@@ -64,12 +64,12 @@ manifest.
 
 Verification snapshot: **2026-07-10**
 
-- Runtime commit: `7b1845bc1e3260aa51e41207711dc543c2d6aa4e`
-- Render deploy: `dep-d985hj58nd3s73bp0fvg` (`live`)
+- Runtime commit: `31c3ca2651886545bf5d94fc07e69fb8e16cdfee`
+- Render deploy: `dep-d988majtqb8s73f80me0` (`live`)
 - Hosted MCP: `https://mercury-tools-mcp.onrender.com/mcp`
 - MCP contract: 22 tools; public stateful schemas use opaque `workspace_id` routing
 - Public HTTP surface: legacy dashboard, upload, invite, and compatibility APIs disabled
-- Local quality gate: 209 tests passed, 1 skipped; Ruff and plugin validation passed
+- Local quality gate: 242 tests passed, 1 skipped; Ruff and both plugin validations passed
 - GitHub CI: passed on pull request #2
 - Marketplace install: `mercury-finance` installed and enabled from the GitHub branch in an isolated Codex home
 - Production smoke: 22 tools, 9 bundled skills, 4 connectors, public workspace creation, accounting skill execution, flow planning, and setup metadata all passed
@@ -78,6 +78,11 @@ Verification snapshot: **2026-07-10**
 - Abstention evidence: an unsupported `QZX-9999` accounting-standard query returned
   `no_relevant_knowledge` instead of unrelated context
 - Supabase: hybrid-search endpoint terms are active; product and RAG tables use RLS with anonymous and authenticated DML denied
+- Private boundary smoke: unauthenticated `/private-mcp` returned `401`; authenticated
+  discovery returned exactly the three journal tools and the public MCP returned none of them
+- FlowAccount production smoke: the 4,236.00 baht marketplace journal preview
+  resolved three chart-of-account lines and balanced debit/credit; no draft was
+  created and the audit row has no FlowAccount record ID
 
 The verified runtime is deployed manually from pull request #2. Before the
 judge handoff, merge that pull request so the `--ref main` install command and
