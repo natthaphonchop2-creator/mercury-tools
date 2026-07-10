@@ -13,7 +13,7 @@ metadata:
   support_openchat: https://line.me/ti/g2/Ph-aVSDpdApaBmeN152QvR6-5bPFMZXAISefhQ?utm_source=invitation&utm_medium=link_copy&utm_campaign=default
   production_api_gateway: https://openapi.flowaccount.com/v1
   sandbox_api_gateway: https://openapi.flowaccount.com/test
-  production_token_url: https://openapi.flowaccount.com/token
+  production_token_url: https://openapi.flowaccount.com/v1/token
   sandbox_token_url: https://openapi.flowaccount.com/test/token
   grant_type: client_credentials
   scope: flowaccount-api

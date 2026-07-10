@@ -199,12 +199,12 @@ CONNECTOR_CATALOG: list[ConnectorManifest] = [
             "grant_type": "client_credentials",
             "scope": "flowaccount-api",
             "api_base_url": "https://openapi.flowaccount.com/v1",
-            "token_url": "https://openapi.flowaccount.com/token",
+            "token_url": "https://openapi.flowaccount.com/v1/token",
         },
         environment_presets={
             "production": {
                 "api_base_url": "https://openapi.flowaccount.com/v1",
-                "token_url": "https://openapi.flowaccount.com/token",
+                "token_url": "https://openapi.flowaccount.com/v1/token",
             },
             "sandbox": {
                 "api_base_url": "https://openapi.flowaccount.com/test",
@@ -214,7 +214,7 @@ CONNECTOR_CATALOG: list[ConnectorManifest] = [
         capabilities=FLOWACCOUNT_CAPABILITIES,
         validation=ConnectorValidation(
             method="oauth_client_credentials",
-            token_url="https://openapi.flowaccount.com/token",
+            token_url="https://openapi.flowaccount.com/v1/token",
             healthcheck_endpoint="/company/info",
             safe_probe=True,
         ),

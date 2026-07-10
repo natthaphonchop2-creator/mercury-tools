@@ -105,7 +105,7 @@ def test_validate_flowaccount_uses_token_and_company_info(monkeypatch) -> None:
     assert "secret-token" not in str(result)
     assert "csecret" not in str(result)
     assert calls == [
-        ("POST", "https://openapi.flowaccount.com/token"),
+        ("POST", "https://openapi.flowaccount.com/v1/token"),
         ("GET", "https://openapi.flowaccount.com/v1/company/info"),
     ]
 
@@ -736,6 +736,12 @@ def test_start_connector_setup_stores_setup_metadata() -> None:
     assert profile["metadata"]["setup_state"] == "awaiting_credentials"
     assert profile["metadata"]["required_secret_fields"] == ["client_id", "client_secret"]
     assert profile["metadata"]["preset"]["grant_type"] == "client_credentials"
+    assert profile["metadata"]["preset"]["api_base_url"] == (
+        "https://openapi.flowaccount.com/v1"
+    )
+    assert profile["metadata"]["preset"]["token_url"] == (
+        "https://openapi.flowaccount.com/v1/token"
+    )
     assert profile["metadata"]["capabilities"] == connector_by_id("flowaccount").capabilities
     assert "documents.invoice.create" in profile["metadata"]["capabilities"]
     assert "documents.expense.create" in profile["metadata"]["capabilities"]

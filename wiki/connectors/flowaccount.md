@@ -30,7 +30,7 @@ post-contest development; it does not enable those operations.
 - Grant type: `client_credentials`
 - Scope: `flowaccount-api`
 - Production API gateway: `https://openapi.flowaccount.com/v1`
-- Production token URL: `https://openapi.flowaccount.com/token`
+- Production token URL: `https://openapi.flowaccount.com/v1/token`
 - Sandbox API gateway: `https://openapi.flowaccount.com/test`
 - Sandbox token URL: `https://openapi.flowaccount.com/test/token`
 - Official docs: `https://developers.flowaccount.com/`

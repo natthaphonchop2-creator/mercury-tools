@@ -302,7 +302,7 @@ def test_flowaccount_public_summary_keeps_setup_field_names_and_urls() -> None:
     manifest = connector_by_id("flowaccount")
     summary = manifest.public_summary()
     assert summary["required_secret_fields"] == ["client_id", "client_secret"]
-    assert summary["preset"]["token_url"] == "https://openapi.flowaccount.com/token"
+    assert summary["preset"]["token_url"] == "https://openapi.flowaccount.com/v1/token"
     assert "credential_values" not in summary
 
 

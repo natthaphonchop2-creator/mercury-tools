@@ -36,7 +36,7 @@ def test_flowaccount_manifest_has_presets_and_capabilities() -> None:
     assert manifest.preset["grant_type"] == "client_credentials"
     assert manifest.preset["scope"] == "flowaccount-api"
     assert manifest.preset["api_base_url"] == "https://openapi.flowaccount.com/v1"
-    assert manifest.preset["token_url"] == "https://openapi.flowaccount.com/token"
+    assert manifest.preset["token_url"] == "https://openapi.flowaccount.com/v1/token"
     assert "company.info.read" in manifest.capabilities
     assert "documents.invoice.list" in manifest.capabilities
     assert "documents.invoice.create" in manifest.capabilities
@@ -111,8 +111,8 @@ def test_flowaccount_public_summary_keeps_setup_field_names_and_urls() -> None:
     summary = manifest.public_summary()
 
     assert summary["required_secret_fields"] == ["client_id", "client_secret"]
-    assert summary["preset"]["token_url"] == "https://openapi.flowaccount.com/token"
-    assert summary["validation"]["token_url"] == "https://openapi.flowaccount.com/token"
+    assert summary["preset"]["token_url"] == "https://openapi.flowaccount.com/v1/token"
+    assert summary["validation"]["token_url"] == "https://openapi.flowaccount.com/v1/token"
     assert "documents.invoice.list" in summary["read_capabilities"]
     assert "documents.invoice.create" in summary["blocked_capabilities"]
     assert "credential_values" not in summary

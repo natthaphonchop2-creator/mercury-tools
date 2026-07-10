@@ -20,7 +20,7 @@ Do not skip or reorder these steps. If validation fails, stay on step 6.
 ## Known Presets
 
 - Grant type: `client_credentials`; scope: `flowaccount-api`.
-- Production: `https://openapi.flowaccount.com/v1` and `https://openapi.flowaccount.com/token`.
+- Production: `https://openapi.flowaccount.com/v1` and `https://openapi.flowaccount.com/v1/token`.
 - Sandbox: `https://openapi.flowaccount.com/test` and `https://openapi.flowaccount.com/test/token`.
 - Official docs: `https://developers.flowaccount.com/`.
 

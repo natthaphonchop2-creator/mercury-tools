@@ -79,7 +79,9 @@ def test_list_connectors_exposes_setup_targets_without_secrets() -> None:
         item for item in payload["connectors"] if item["connector_id"] == "flowaccount"
     )
     assert flowaccount["required_secret_fields"] == ["client_id", "client_secret"]
-    assert flowaccount["preset"]["token_url"] == "https://openapi.flowaccount.com/token"
+    assert flowaccount["preset"]["token_url"] == (
+        "https://openapi.flowaccount.com/v1/token"
+    )
 
 
 def test_connector_capabilities_returns_public_policy() -> None:
@@ -386,7 +388,7 @@ def test_validate_connector_connection_stores_credentials_before_ready(
         }
     ]
     assert calls == [
-        ("POST", "https://openapi.flowaccount.com/token"),
+        ("POST", "https://openapi.flowaccount.com/v1/token"),
         ("GET", "https://openapi.flowaccount.com/v1/company/info"),
     ]
     assert "super-secret-value" not in str(payload)

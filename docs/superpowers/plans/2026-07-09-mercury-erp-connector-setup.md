@@ -114,7 +114,7 @@ def test_flowaccount_manifest_has_presets_and_capabilities() -> None:
     assert manifest.preset["grant_type"] == "client_credentials"
     assert manifest.preset["scope"] == "flowaccount-api"
     assert manifest.preset["api_base_url"] == "https://openapi.flowaccount.com/v1"
-    assert manifest.preset["token_url"] == "https://openapi.flowaccount.com/token"
+    assert manifest.preset["token_url"] == "https://openapi.flowaccount.com/v1/token"
     assert "company.info.read" in manifest.capabilities
     assert "documents.invoice.list" in manifest.capabilities
     assert manifest.validation.read_only is True
@@ -222,7 +222,7 @@ CONNECTOR_CATALOG: list[ConnectorManifest] = [
             "grant_type": "client_credentials",
             "scope": "flowaccount-api",
             "api_base_url": "https://openapi.flowaccount.com/v1",
-            "token_url": "https://openapi.flowaccount.com/token",
+            "token_url": "https://openapi.flowaccount.com/v1/token",
         },
         capabilities=[
             "company.info.read",
@@ -234,7 +234,7 @@ CONNECTOR_CATALOG: list[ConnectorManifest] = [
         ],
         validation=ConnectorValidation(
             method="oauth_client_credentials",
-            token_url="https://openapi.flowaccount.com/token",
+            token_url="https://openapi.flowaccount.com/v1/token",
             read_only_endpoint="/company/info",
             read_only=True,
         ),
@@ -786,7 +786,7 @@ def test_validate_flowaccount_uses_token_and_company_info(monkeypatch) -> None:
     assert result["enabled_capabilities"] == manifest.capabilities
     assert "secret-token" not in str(result)
     assert calls == [
-        ("POST", "https://openapi.flowaccount.com/token"),
+        ("POST", "https://openapi.flowaccount.com/v1/token"),
         ("GET", "https://openapi.flowaccount.com/v1/company/info"),
     ]
 ```
