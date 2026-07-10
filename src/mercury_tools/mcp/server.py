@@ -53,7 +53,7 @@ from mercury_tools.prompts import get_prompt
 from mercury_tools.rag.chunking import chunk_document, sha256_text
 from mercury_tools.rag.embeddings import create_embedding_provider
 from mercury_tools.rag.models import KnowledgeDocument, SearchFilters, SearchResult
-from mercury_tools.rag.routing import apply_connector_routing
+from mercury_tools.rag.routing import apply_knowledge_routing
 from mercury_tools.rag.service import RagService
 from mercury_tools.safety.redaction import redact_json
 from mercury_tools.workspaces import (
@@ -854,7 +854,9 @@ def search_knowledge(
     mode: str = "hybrid",
 ) -> dict[str, Any]:
     """Search Mercury accounting knowledge and return citation-bearing chunks."""
-    applied_filters, inferred_connector = apply_connector_routing(query, filters)
+    applied_filters, inferred_connector, inferred_domain = apply_knowledge_routing(
+        query, filters
+    )
     results = _service().search(
         query,
         filters=_filters(applied_filters),
@@ -865,6 +867,7 @@ def search_knowledge(
         "query": query,
         "applied_filters": applied_filters,
         "inferred_connector": inferred_connector,
+        "inferred_domain": inferred_domain,
         "results": _serialize_search_results(results),
     }
     payload = redact_json(payload)
@@ -884,7 +887,9 @@ def retrieve_context_pack(
     max_chunks: int = 12,
 ) -> dict[str, Any]:
     """Return a context pack with citations for the host agent to answer with."""
-    applied_filters, inferred_connector = apply_connector_routing(query, filters)
+    applied_filters, inferred_connector, inferred_domain = apply_knowledge_routing(
+        query, filters
+    )
     pack = _service().context_pack(
         query,
         task=task,
@@ -896,6 +901,7 @@ def retrieve_context_pack(
         {
             "applied_filters": applied_filters,
             "inferred_connector": inferred_connector,
+            "inferred_domain": inferred_domain,
         }
     )
     payload = redact_json(payload)

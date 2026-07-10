@@ -41,8 +41,13 @@ def test_search_knowledge_applies_inferred_connector_and_returns_metadata(monkey
     payload = server.search_knowledge("FlowAccount invoice endpoint")
 
     assert captured["filters"].connector == "flowaccount"
-    assert payload["applied_filters"] == {"connector": "flowaccount"}
+    assert captured["filters"].doc_type == "endpoint_dictionary"
+    assert payload["applied_filters"] == {
+        "connector": "flowaccount",
+        "doc_type": "endpoint_dictionary",
+    }
     assert payload["inferred_connector"] == "flowaccount"
+    assert payload["inferred_domain"] == "connector_endpoint"
     assert payload["results"][0]["metadata"] == {
         "connector": "flowaccount",
         "doc_type": "endpoint_dictionary",
@@ -71,6 +76,30 @@ def test_retrieve_context_pack_preserves_explicit_connector_filter(monkeypatch) 
     assert payload["applied_filters"] == {
         "connector": "peak",
         "review_status": "reviewed",
+        "doc_type": "endpoint_dictionary",
     }
     assert payload["inferred_connector"] is None
+    assert payload["inferred_domain"] == "connector_endpoint"
     assert payload["context"][0]["metadata"]["connector"] == "peak"
+
+
+def test_search_knowledge_routes_standard_without_connector_filter(monkeypatch) -> None:
+    from mercury_tools.mcp import server
+
+    captured = {}
+
+    class FakeService:
+        def search(self, query, *, filters, top_k, mode):
+            captured.update(query=query, filters=filters, top_k=top_k, mode=mode)
+            return []
+
+    monkeypatch.setattr(server, "_service", lambda: FakeService())
+    monkeypatch.setattr(server, "_audit", lambda *args, **kwargs: None)
+
+    payload = server.search_knowledge("FlowAccount ใช้ TFRS 15 อย่างไร")
+
+    assert captured["filters"].connector is None
+    assert captured["filters"].doc_type == "accounting_standard"
+    assert payload["applied_filters"] == {"doc_type": "accounting_standard"}
+    assert payload["inferred_connector"] == "flowaccount"
+    assert payload["inferred_domain"] == "accounting_standard"

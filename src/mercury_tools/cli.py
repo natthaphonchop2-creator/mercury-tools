@@ -25,7 +25,7 @@ from mercury_tools.flows.workspace import (
 from mercury_tools.rag.embeddings import create_embedding_provider
 from mercury_tools.rag.ingest import ingest_wiki
 from mercury_tools.rag.models import SearchFilters
-from mercury_tools.rag.routing import apply_connector_routing
+from mercury_tools.rag.routing import apply_knowledge_routing
 from mercury_tools.rag.service import RagService
 from mercury_tools.remote import DEFAULT_RENDER_URL, DEFAULT_TOKEN_FILE, read_token, verify_remote
 
@@ -106,7 +106,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         }.items()
         if value is not None
     }
-    applied_filters, inferred_connector = apply_connector_routing(
+    applied_filters, inferred_connector, inferred_domain = apply_knowledge_routing(
         args.query,
         raw_filters,
     )
@@ -139,6 +139,7 @@ def cmd_search(args: argparse.Namespace) -> int:
                 "query": args.query,
                 "applied_filters": applied_filters,
                 "inferred_connector": inferred_connector,
+                "inferred_domain": inferred_domain,
                 "results": payload,
             }
         )
