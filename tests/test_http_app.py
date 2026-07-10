@@ -16,6 +16,8 @@ def _clear_live_env(monkeypatch) -> None:
         "MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API",
         "MERCURY_CONNECT_INVITE_CODE",
         "MERCURY_CONNECT_SIGNING_SECRET",
+        "MERCURY_PRIVATE_MCP_PATH",
+        "MERCURY_PRIVATE_MCP_TOKEN",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API", "true")

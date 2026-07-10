@@ -4,13 +4,15 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
+import hmac
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
+from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
@@ -86,6 +88,37 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if not is_authorized_bearer(load_settings(), request.headers.get("authorization")):
             return JSONResponse(
                 {"error": "unauthorized", "message": "Valid bearer token is required."},
+                status_code=401,
+            )
+        return await call_next(request)
+
+
+class PrivateBearerAuthMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, *, protected_path: str):
+        super().__init__(app)
+        self.protected_path = protected_path.rstrip("/") or "/"
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        protected = path == self.protected_path or path.startswith(
+            f"{self.protected_path}/"
+        )
+        if request.method == "OPTIONS" or not protected:
+            return await call_next(request)
+
+        authorization = request.headers.get("authorization") or ""
+        supplied = (
+            authorization.removeprefix("Bearer ").strip()
+            if authorization.startswith("Bearer ")
+            else ""
+        )
+        expected = load_settings().private_mcp_bearer_token
+        if not supplied or not expected or not hmac.compare_digest(supplied, expected):
+            return JSONResponse(
+                {
+                    "error": "unauthorized",
+                    "message": "Valid private bearer token is required.",
+                },
                 status_code=401,
             )
         return await call_next(request)
@@ -2697,6 +2730,12 @@ async def healthz(request: Request) -> Response:
             "embedding_provider": settings.embedding_provider,
             "embedding_configured": settings.embedding_configured,
             "mcp_path": settings.mcp_path,
+            "private_mcp": (
+                "enabled" if settings.private_mcp_configured else "disabled"
+            ),
+            "private_mcp_path": (
+                settings.private_mcp_path if settings.private_mcp_configured else None
+            ),
             "http_auth_required": http_auth_required,
             "http_auth_configured": settings.http_auth_configured,
             "legacy_http_api": (
@@ -2717,7 +2756,45 @@ def create_http_app(*, require_auth: bool | None = None):
             mcp.settings.transport_security.allowed_hosts.append(allowed_host)
         if allowed_origin and allowed_origin not in mcp.settings.transport_security.allowed_origins:
             mcp.settings.transport_security.allowed_origins.append(allowed_origin)
-    app = mcp.streamable_http_app()
+    public_app = mcp.streamable_http_app()
+    private_app = None
+    if settings.private_mcp_configured:
+        from mercury_tools.mcp.private_server import private_mcp
+
+        private_mcp.settings.streamable_http_path = settings.private_mcp_path
+        if settings.public_base_url:
+            public_url = urlparse(settings.public_base_url)
+            allowed_host = public_url.netloc
+            allowed_origin = f"{public_url.scheme}://{public_url.netloc}"
+            if (
+                allowed_host
+                and allowed_host
+                not in private_mcp.settings.transport_security.allowed_hosts
+            ):
+                private_mcp.settings.transport_security.allowed_hosts.append(allowed_host)
+            if (
+                allowed_origin
+                and allowed_origin
+                not in private_mcp.settings.transport_security.allowed_origins
+            ):
+                private_mcp.settings.transport_security.allowed_origins.append(
+                    allowed_origin
+                )
+        private_app = private_mcp.streamable_http_app()
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        async with public_app.router.lifespan_context(public_app):
+            if private_app is None:
+                yield
+            else:
+                async with private_app.router.lifespan_context(private_app):
+                    yield
+
+    routes = [*public_app.routes]
+    if private_app is not None:
+        routes.extend(private_app.routes)
+    app = Starlette(routes=routes, lifespan=lifespan)
     app.add_route("/", root, methods=["GET"])
     app.add_route("/api/status", status, methods=["GET"])
     app.add_route("/healthz", healthz, methods=["GET"])
@@ -2752,6 +2829,11 @@ def create_http_app(*, require_auth: bool | None = None):
 
     should_require_auth = settings.http_require_auth if require_auth is None else require_auth
     app.state.mercury_http_require_auth = should_require_auth
+    if private_app is not None:
+        app.add_middleware(
+            PrivateBearerAuthMiddleware,
+            protected_path=settings.private_mcp_path,
+        )
     if should_require_auth:
         if not settings.http_auth_configured:
             raise RuntimeError(
