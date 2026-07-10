@@ -54,7 +54,7 @@ from mercury_tools.rag.chunking import chunk_document, sha256_text
 from mercury_tools.rag.embeddings import create_embedding_provider
 from mercury_tools.rag.models import KnowledgeDocument, SearchFilters, SearchResult
 from mercury_tools.rag.routing import apply_knowledge_routing
-from mercury_tools.rag.service import RagService
+from mercury_tools.rag.service import MIN_RELEVANCE_SCORE, RagService
 from mercury_tools.safety.redaction import redact_json
 from mercury_tools.workspaces import (
     normalize_public_workspace_id,
@@ -864,10 +864,12 @@ def search_knowledge(
         mode=mode,
     )
     payload = {
+        "status": "ok" if results else "no_relevant_knowledge",
         "query": query,
         "applied_filters": applied_filters,
         "inferred_connector": inferred_connector,
         "inferred_domain": inferred_domain,
+        "minimum_score": MIN_RELEVANCE_SCORE,
         "results": _serialize_search_results(results),
     }
     payload = redact_json(payload)
@@ -899,9 +901,11 @@ def retrieve_context_pack(
     payload = pack.as_dict()
     payload.update(
         {
+            "status": "ok" if pack.results else "no_relevant_knowledge",
             "applied_filters": applied_filters,
             "inferred_connector": inferred_connector,
             "inferred_domain": inferred_domain,
+            "minimum_score": MIN_RELEVANCE_SCORE,
         }
     )
     payload = redact_json(payload)

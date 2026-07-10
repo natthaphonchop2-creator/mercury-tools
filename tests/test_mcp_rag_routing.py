@@ -103,3 +103,23 @@ def test_search_knowledge_routes_standard_without_connector_filter(monkeypatch) 
     assert payload["applied_filters"] == {"doc_type": "accounting_standard"}
     assert payload["inferred_connector"] == "flowaccount"
     assert payload["inferred_domain"] == "accounting_standard"
+    assert payload["status"] == "no_relevant_knowledge"
+    assert payload["minimum_score"] == 0.20
+    assert payload["results"] == []
+
+
+def test_retrieve_context_pack_reports_no_relevant_knowledge(monkeypatch) -> None:
+    from mercury_tools.mcp import server
+
+    class FakeService:
+        def context_pack(self, query, *, task, filters, max_chunks):
+            return ContextPack(query=query, task=task, results=[])
+
+    monkeypatch.setattr(server, "_service", lambda: FakeService())
+    monkeypatch.setattr(server, "_audit", lambda *args, **kwargs: None)
+
+    payload = server.retrieve_context_pack("มาตรฐานที่ไม่มีใน Mercury")
+
+    assert payload["status"] == "no_relevant_knowledge"
+    assert payload["minimum_score"] == 0.20
+    assert payload["context"] == []
