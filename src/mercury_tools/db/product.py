@@ -1345,6 +1345,64 @@ class SupabaseProductStore:
             vault_record=vault_record,
         )
 
+    def get_private_connector_context(
+        self,
+        workspace_id: str,
+        connector_id: str,
+    ) -> dict[str, Any]:
+        """Return one ready connector profile and its decrypted server credentials."""
+
+        connector = connector_by_id(connector_id)
+        if not connector:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        token_payload = public_workspace_token_payload(workspace_id)
+        context = self.workspace_for_token(token_payload)
+        if not context:
+            raise ValueError("Workspace was not found.")
+
+        rows = self._request(
+            "GET",
+            "mercury_connector_profiles",
+            params={
+                "workspace_id": f"eq.{context['workspace']['id']}",
+                "connector_id": f"eq.{connector.connector_id}",
+                "select": "id,connector_id,environment,status,metadata",
+                "order": "updated_at.desc",
+            },
+        )
+        ready = [
+            row
+            for row in rows or []
+            if str((row.get("metadata") or {}).get("setup_state") or "").lower()
+            == "ready"
+            and isinstance((row.get("metadata") or {}).get("server_vault"), dict)
+        ]
+        if len(ready) != 1:
+            raise ValueError(
+                f"Exactly one ready {connector.name} connector profile is required."
+            )
+
+        profile = ready[0]
+        environment = str(profile.get("environment") or "").strip().lower()
+        if environment not in connector.environments:
+            raise ValueError(
+                f"Unsupported environment for {connector.connector_id}: {environment}"
+            )
+        credentials = decrypt_connector_credentials(
+            self.settings,
+            workspace_key_value=context["workspace"]["workspace_key"],
+            vault_record=profile["metadata"]["server_vault"],
+        )
+        return {
+            "workspace_uuid": context["workspace"]["id"],
+            "workspace_key": context["workspace"]["workspace_key"],
+            "connector_profile_id": profile["id"],
+            "connector_id": connector.connector_id,
+            "environment": environment,
+            "preset": connector.preset_for_environment(environment),
+            "credentials": credentials,
+        }
+
     def upsert_connection(
         self,
         request: ConnectRequest,
