@@ -52,8 +52,8 @@ from mercury_tools.product import (
 from mercury_tools.prompts import get_prompt
 from mercury_tools.rag.chunking import chunk_document, sha256_text
 from mercury_tools.rag.embeddings import create_embedding_provider
-from mercury_tools.rag.models import KnowledgeDocument, SearchFilters, SearchResult
-from mercury_tools.rag.routing import apply_knowledge_routing
+from mercury_tools.rag.models import ContextPack, KnowledgeDocument, SearchFilters, SearchResult
+from mercury_tools.rag.routing import apply_knowledge_routing, infer_knowledge_domain
 from mercury_tools.rag.service import MIN_RELEVANCE_SCORE, RagService
 from mercury_tools.safety.redaction import redact_json
 from mercury_tools.workspaces import (
@@ -141,6 +141,21 @@ def _serialize_search_results(results: list[SearchResult]) -> list[dict[str, Any
             "source_path": result.source_path,
         }
         for result in results
+    ]
+
+
+def _merge_search_results(
+    *result_sets: list[SearchResult],
+    max_chunks: int,
+) -> list[SearchResult]:
+    by_chunk: dict[str, SearchResult] = {}
+    for results in result_sets:
+        for result in results:
+            current = by_chunk.get(result.chunk_id)
+            if current is None or result.score > current.score:
+                by_chunk[result.chunk_id] = result
+    return sorted(by_chunk.values(), key=lambda result: result.score, reverse=True)[
+        :max_chunks
     ]
 
 
@@ -944,22 +959,66 @@ def retrieve_workspace_context_pack(
             )
             return payload
         connector_context = _connector_context_from_profile(profile)
-        pack = _service().context_pack(
-            query,
-            task=task,
-            filters=_filters(
-                {
-                    "connector": connector_context["connector_id"],
-                    "review_status": "reviewed",
-                }
-            ),
-            max_chunks=max_chunks,
-        )
+        connector_id = connector_context["connector_id"]
+        domain = infer_knowledge_domain(query)
+        service = _service()
+        retrieval_scopes = [f"connector:{connector_id}"]
+        if domain in {"accounting_standard", "tax"}:
+            connector_limit = max(1, max_chunks // 2)
+            knowledge_limit = max(1, max_chunks - connector_limit)
+            connector_pack = service.context_pack(
+                query,
+                task=task,
+                filters=_filters(
+                    {
+                        "connector": connector_id,
+                        "review_status": "reviewed",
+                    }
+                ),
+                max_chunks=connector_limit,
+            )
+            knowledge_pack = service.context_pack(
+                query,
+                task=task,
+                filters=_filters(
+                    {
+                        "jurisdiction": "TH",
+                        "doc_type": domain,
+                        "review_status": "reviewed",
+                    }
+                ),
+                max_chunks=knowledge_limit,
+            )
+            pack = ContextPack(
+                query=query,
+                task=task,
+                results=_merge_search_results(
+                    connector_pack.results,
+                    knowledge_pack.results,
+                    max_chunks=max_chunks,
+                ),
+            )
+            retrieval_scopes.append(f"{domain}:TH")
+        else:
+            pack = service.context_pack(
+                query,
+                task=task,
+                filters=_filters(
+                    {
+                        "connector": connector_id,
+                        "review_status": "reviewed",
+                    }
+                ),
+                max_chunks=max_chunks,
+            )
         payload = pack.as_dict()
         payload.update(
             {
-                "status": "ok",
+                "status": "ok" if pack.results else "no_relevant_knowledge",
                 "connector_context": connector_context,
+                "inferred_domain": domain,
+                "minimum_score": MIN_RELEVANCE_SCORE,
+                "retrieval_scopes": retrieval_scopes,
             }
         )
         payload = redact_json(payload)
@@ -968,7 +1027,7 @@ def retrieve_workspace_context_pack(
             audit_input,
             {
                 "status": "ok",
-                "connector_id": connector_context["connector_id"],
+                "connector_id": connector_id,
                 "environment": connector_context["environment"],
                 "count": len(pack.results),
             },

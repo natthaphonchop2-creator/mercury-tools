@@ -9,6 +9,7 @@ from mercury_tools.config import Settings
 from mercury_tools.connectors.catalog import connector_by_id
 from mercury_tools.flows.templates import COMPANY_HEALTH_TEMPLATE
 from mercury_tools.product import ConnectRequest, create_client_token
+from mercury_tools.rag.models import ContextPack, SearchResult
 
 
 def make_client_token() -> str:
@@ -59,6 +60,29 @@ def assert_key_fragments_absent(payload: dict[str, Any], fragments: list[str]) -
     collect_keys(payload)
     for fragment in fragments:
         assert all(fragment not in key for key in keys)
+
+
+def rag_result(
+    chunk_id: str,
+    *,
+    doc_type: str,
+    score: float,
+    connector: str | None = None,
+) -> SearchResult:
+    return SearchResult(
+        chunk_id=chunk_id,
+        document_id=f"document-{chunk_id}",
+        document_uri=f"mercury://wiki/{doc_type}/{chunk_id}",
+        chunk_uri=f"mercury://wiki/{doc_type}/{chunk_id}#chunk-0",
+        text=f"{doc_type} context",
+        score=score,
+        source_title=f"{doc_type} source",
+        source_uri=f"mercury://wiki/{doc_type}/{chunk_id}",
+        source_url="https://example.com/source",
+        source_path=f"wiki/{doc_type}/{chunk_id}.md",
+        citation={"heading": "Context"},
+        metadata={"doc_type": doc_type, "connector": connector},
+    )
 
 
 def test_list_connectors_exposes_setup_targets_without_secrets() -> None:
@@ -994,7 +1018,9 @@ def test_retrieve_workspace_context_pack_uses_active_connector(monkeypatch) -> N
         max_chunks=7,
     )
 
-    assert payload["status"] == "ok"
+    assert payload["status"] == "no_relevant_knowledge"
+    assert payload["minimum_score"] == 0.20
+    assert payload["retrieval_scopes"] == ["connector:flowaccount"]
     assert captured["query"] == "สรุปรายได้อาทิตย์นี้"
     assert captured["task"] == "weekly_revenue"
     assert captured["max_chunks"] == 7
@@ -1006,6 +1032,136 @@ def test_retrieve_workspace_context_pack_uses_active_connector(monkeypatch) -> N
     assert audit_events[-1]["tool_name"] == "retrieve_workspace_context_pack"
     assert audit_events[-1]["input_payload"]["workspace_id_hash"]
     assert audit_events[-1]["output_summary"]["connector_id"] == "flowaccount"
+
+
+def test_workspace_vat_context_merges_connector_and_tax_scopes(monkeypatch) -> None:
+    from mercury_tools.mcp import server
+
+    configure_product_env(monkeypatch)
+    calls: list[dict[str, Any]] = []
+
+    class FakeStore:
+        def public_dashboard(self, workspace_id):
+            assert workspace_id == make_workspace_id()
+            return {
+                "connector_profiles": [
+                    ready_connector_profile(
+                        capabilities=["documents.invoice.list"],
+                    )
+                ]
+            }
+
+    class FakeService:
+        def context_pack(self, query, *, task=None, filters=None, max_chunks=12):
+            calls.append(
+                {
+                    "query": query,
+                    "task": task,
+                    "filters": filters,
+                    "max_chunks": max_chunks,
+                }
+            )
+            if filters.doc_type == "tax":
+                results = [
+                    rag_result("tax-1", doc_type="tax", score=0.91),
+                    rag_result("shared", doc_type="tax", score=0.70),
+                ]
+            else:
+                results = [
+                    rag_result(
+                        "connector-1",
+                        doc_type="endpoint_dictionary",
+                        score=0.95,
+                        connector="flowaccount",
+                    ),
+                    rag_result(
+                        "shared",
+                        doc_type="endpoint_dictionary",
+                        score=0.60,
+                        connector="flowaccount",
+                    ),
+                ]
+            return ContextPack(query=query, task=task, results=results)
+
+    monkeypatch.setattr(server, "_product_store", lambda settings=None: FakeStore())
+    monkeypatch.setattr(server, "_service", lambda: FakeService())
+    monkeypatch.setattr(server, "_audit", lambda *args, **kwargs: None)
+
+    payload = server.retrieve_workspace_context_pack(
+        workspace_id=make_workspace_id(),
+        query="สรุป VAT ภาษีซื้อ ภาษีขาย",
+        task="vat_summary_th",
+        max_chunks=4,
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["retrieval_scopes"] == ["connector:flowaccount", "tax:TH"]
+    assert len(calls) == 2
+    assert calls[0]["filters"].connector == "flowaccount"
+    assert calls[0]["filters"].review_status == "reviewed"
+    assert calls[0]["max_chunks"] == 2
+    assert calls[1]["filters"].connector is None
+    assert calls[1]["filters"].jurisdiction == "TH"
+    assert calls[1]["filters"].doc_type == "tax"
+    assert calls[1]["filters"].review_status == "reviewed"
+    assert calls[1]["max_chunks"] == 2
+    assert [row["chunk_id"] for row in payload["context"]] == [
+        "connector-1",
+        "tax-1",
+        "shared",
+    ]
+
+
+def test_workspace_standard_context_does_not_filter_standard_by_connector(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    configure_product_env(monkeypatch)
+    filters_seen: list[Any] = []
+
+    class FakeStore:
+        def public_dashboard(self, workspace_id):
+            return {
+                "connector_profiles": [
+                    ready_connector_profile(
+                        connector_id="peak",
+                        capabilities=["documents.invoice.list"],
+                    )
+                ]
+            }
+
+    class FakeService:
+        def context_pack(self, query, *, task=None, filters=None, max_chunks=12):
+            del max_chunks
+            filters_seen.append(filters)
+            return ContextPack(
+                query=query,
+                task=task,
+                results=[
+                    rag_result(
+                        f"row-{len(filters_seen)}",
+                        doc_type=filters.doc_type or "endpoint_dictionary",
+                        score=0.90,
+                        connector=filters.connector,
+                    )
+                ],
+            )
+
+    monkeypatch.setattr(server, "_product_store", lambda settings=None: FakeStore())
+    monkeypatch.setattr(server, "_service", lambda: FakeService())
+    monkeypatch.setattr(server, "_audit", lambda *args, **kwargs: None)
+
+    payload = server.retrieve_workspace_context_pack(
+        workspace_id=make_workspace_id(),
+        query="TFRS 15 การรับรู้รายได้",
+        max_chunks=6,
+    )
+
+    assert payload["retrieval_scopes"] == ["connector:peak", "accounting_standard:TH"]
+    assert filters_seen[0].connector == "peak"
+    assert filters_seen[1].connector is None
+    assert filters_seen[1].doc_type == "accounting_standard"
 
 
 def test_retrieve_workspace_context_pack_requires_setup_without_ready_available_connector(
