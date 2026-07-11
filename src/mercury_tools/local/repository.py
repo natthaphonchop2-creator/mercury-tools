@@ -15,6 +15,8 @@ _REQUIRED_GITIGNORE_LINES = [
     ".mercury/cache/",
     ".mercury/audit/",
 ]
+_REQUIRED_GITIGNORE_NEGATIONS = {f"!{line}" for line in _REQUIRED_GITIGNORE_LINES}
+_REPOSITORY_CONFIG_KEYS = {"schema_version", "trusted_hosts", "connectors"}
 _PRIVATE_NETWORK_ENVIRONMENTS = {"local", "gateway"}
 _FORBIDDEN_METADATA_HOSTS = {
     "169.254.169.254",
@@ -46,7 +48,9 @@ _OAUTH_SCOPE_PATTERN = re.compile(
     r"^[\x21\x23-\x5b\x5d-\x7e]+(?: [\x21\x23-\x5b\x5d-\x7e]+)*$"
 )
 _HOST_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
-_SENSITIVE_SCOPE_MARKERS = (
+_HEX_INTEGER_HOST_PATTERN = re.compile(r"^0x[0-9a-f]+$")
+_DOTTED_NUMERIC_HOST_PATTERN = re.compile(r"^\d+(?:\.\d+)+$")
+_SENSITIVE_CREDENTIAL_MARKERS = (
     "secret",
     "password",
     "credential",
@@ -171,13 +175,16 @@ def load_repository_config(context: RepositoryContext) -> RepositoryConfig:
         return RepositoryConfig()
 
     payload = json.loads(context.config_path.read_text())
-    if not isinstance(payload, Mapping):
+    if not isinstance(payload, Mapping) or set(payload) != _REPOSITORY_CONFIG_KEYS:
         raise ValueError("invalid_repository_config")
-    trusted_hosts = _load_trusted_hosts(payload.get("trusted_hosts", {}))
+    schema_version = payload["schema_version"]
+    if type(schema_version) is not int or schema_version != 1:
+        raise ValueError("invalid_repository_config")
+    trusted_hosts = _load_trusted_hosts(payload["trusted_hosts"])
     return RepositoryConfig(
-        schema_version=int(payload.get("schema_version", 1)),
+        schema_version=schema_version,
         trusted_hosts=trusted_hosts,
-        connectors=_load_connectors(payload.get("connectors", {}), trusted_hosts),
+        connectors=_load_connectors(payload["connectors"], trusted_hosts),
     )
 
 
@@ -228,11 +235,14 @@ def configure_connector(
 
 def _ensure_gitignore(root: Path) -> None:
     ignore_path = root / ".gitignore"
-    existing = ignore_path.read_text().splitlines() if ignore_path.exists() else []
-    missing = [line for line in _REQUIRED_GITIGNORE_LINES if line not in existing]
-    if not missing:
+    existing_text = ignore_path.read_text() if ignore_path.exists() else ""
+    existing = existing_text.splitlines()
+    managed_lines = set(_REQUIRED_GITIGNORE_LINES) | _REQUIRED_GITIGNORE_NEGATIONS
+    preserved = [line for line in existing if line not in managed_lines]
+    updated_text = "\n".join([*preserved, *_REQUIRED_GITIGNORE_LINES]) + "\n"
+    if existing_text == updated_text:
         return
-    _write_text_atomic(ignore_path, "\n".join([*existing, *missing]) + "\n")
+    _write_text_atomic(ignore_path, updated_text)
 
 
 def _write_config_atomic(path: Path, config: RepositoryConfig) -> None:
@@ -379,7 +389,7 @@ def _validate_oauth_scope(value: str) -> str:
     if any(_looks_like_credential_material(scope) for scope in value.split()):
         raise ValueError("secret_auth_setting_not_allowed")
     normalized = value.casefold()
-    if any(marker in normalized for marker in _SENSITIVE_SCOPE_MARKERS):
+    if any(marker in normalized for marker in _SENSITIVE_CREDENTIAL_MARKERS):
         raise ValueError("secret_auth_setting_not_allowed")
     if len(value) > _MAX_OAUTH_SCOPE_LENGTH or not _OAUTH_SCOPE_PATTERN.fullmatch(value):
         raise ValueError("unsupported_auth_setting")
@@ -476,6 +486,7 @@ def _validate_endpoint_url(url: str, environment: str, allow_private_network: bo
         raise ValueError("invalid_endpoint_url")
     if parsed.params or parsed.query or parsed.fragment:
         raise ValueError("invalid_endpoint_url")
+    _validate_endpoint_path(parsed.path)
 
     host = parsed.hostname.lower().rstrip(".")
     if _is_forbidden_metadata_host(host):
@@ -489,6 +500,16 @@ def _validate_endpoint_url(url: str, environment: str, allow_private_network: bo
     ):
         raise ValueError("https_required")
     return host
+
+
+def _validate_endpoint_path(path: str) -> None:
+    for encoded_segment in path.split("/"):
+        for decoded_segment in unquote(encoded_segment).split("/"):
+            normalized = decoded_segment.casefold()
+            if _looks_like_credential_material(decoded_segment) or any(
+                marker in normalized for marker in _SENSITIVE_CREDENTIAL_MARKERS
+            ):
+                raise ValueError("secret_endpoint_path_not_allowed")
 
 
 def _is_forbidden_metadata_host(host: str) -> bool:
@@ -531,6 +552,8 @@ def _is_valid_trusted_host(host: str) -> bool:
         return False
     if "/" in host or "@" in host:
         return False
+    if _is_legacy_ipv4_numeric_alias(host):
+        return False
     if _is_forbidden_metadata_host(host):
         return False
     try:
@@ -542,3 +565,15 @@ def _is_valid_trusted_host(host: str) -> bool:
     if host == "localhost":
         return True
     return all(_HOST_LABEL_PATTERN.fullmatch(label) for label in host.split("."))
+
+
+def _is_legacy_ipv4_numeric_alias(host: str) -> bool:
+    if "." not in host:
+        return host.isdigit() or bool(_HEX_INTEGER_HOST_PATTERN.fullmatch(host))
+    if not _DOTTED_NUMERIC_HOST_PATTERN.fullmatch(host):
+        return False
+    try:
+        ipaddress.IPv4Address(host)
+    except ValueError:
+        return True
+    return False

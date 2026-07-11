@@ -78,6 +78,38 @@ def test_single_root_is_selected_and_scaffolded(tmp_path: Path) -> None:
         assert stat.S_IMODE(context.mercury_dir.stat().st_mode) == 0o700
 
 
+def test_repository_state_places_required_ignores_after_mercury_negations(
+    tmp_path: Path,
+) -> None:
+    ignore_path = tmp_path / ".gitignore"
+    ignore_path.write_text(
+        "dist/\n"
+        ".mercury/credentials.env\n"
+        "!.mercury/credentials.env\n"
+        ".mercury/cache/\n"
+        "!.mercury/cache/\n"
+        ".mercury/audit/\n"
+        "!.mercury/**\n"
+        "docs/\n"
+    )
+
+    ensure_repository_state(tmp_path)
+    first_result = ignore_path.read_text()
+
+    assert first_result.splitlines() == [
+        "dist/",
+        "!.mercury/**",
+        "docs/",
+        ".mercury/credentials.env",
+        ".mercury/cache/",
+        ".mercury/audit/",
+    ]
+
+    ensure_repository_state(tmp_path)
+
+    assert ignore_path.read_text() == first_result
+
+
 def test_multiple_roots_require_explicit_selection(tmp_path: Path) -> None:
     roots = (tmp_path / "a", tmp_path / "b")
     for root in roots:
@@ -119,6 +151,59 @@ def test_custom_connector_configuration_pins_driver_and_host(tmp_path: Path) -> 
     assert config.trusted_hosts["custom-books"]["production"] == (
         "api.example-books.com",
     )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://api.example-books.com/v1",
+        "https://api.example-books.com/v1/token",
+        "https://api.example-books.com/oauth/token",
+        "https://api.example-books.com/v1/customer%20records",
+    ],
+)
+def test_connector_configuration_preserves_safe_endpoint_paths(
+    tmp_path: Path,
+    base_url: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+
+    config = configure_connector(
+        context,
+        connector_id="custom-books",
+        environment="production",
+        driver_id="api_key_header",
+        base_url=base_url,
+        auth_settings={"key_name": "X-API-Key"},
+    )
+
+    assert config.connectors["custom-books"]["production"]["base_url"] == base_url
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://api.example-books.com/ghp_secret",
+        "https://api.example-books.com/%67hp_secret",
+        "https://api.example-books.com/v1/client_secret-value",
+        "https://api.example-books.com/v1/%61ccess_token",
+    ],
+)
+def test_connector_configuration_rejects_credential_material_in_decoded_path_segments(
+    tmp_path: Path,
+    base_url: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+
+    with pytest.raises(ValueError, match="secret_endpoint_path_not_allowed"):
+        configure_connector(
+            context,
+            connector_id="custom-books",
+            environment="production",
+            driver_id="api_key_header",
+            base_url=base_url,
+            auth_settings={"key_name": "X-API-Key"},
+        )
 
 
 def test_connector_configuration_pins_oauth_token_host(tmp_path: Path) -> None:
@@ -380,6 +465,46 @@ def test_connector_configuration_rejects_malformed_or_out_of_range_ports(
         )
 
 
+@pytest.mark.parametrize(
+    "host",
+    [
+        "0xa9fea9fe",
+        "2852039166",
+        "0251.0376.0251.0376",
+    ],
+)
+def test_connector_configuration_rejects_legacy_ipv4_numeric_aliases(
+    tmp_path: Path,
+    host: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+
+    with pytest.raises(ValueError, match="invalid_endpoint_url"):
+        configure_connector(
+            context,
+            connector_id="custom-books",
+            environment="production",
+            driver_id="api_key_header",
+            base_url=f"https://{host}/v1",
+            auth_settings={"key_name": "X-API-Key"},
+        )
+
+
+def test_connector_configuration_preserves_canonical_public_ipv4(tmp_path: Path) -> None:
+    context = ensure_repository_state(tmp_path)
+
+    config = configure_connector(
+        context,
+        connector_id="custom-books",
+        environment="production",
+        driver_id="api_key_header",
+        base_url="https://93.184.216.34/v1",
+        auth_settings={"key_name": "X-API-Key"},
+    )
+
+    assert config.trusted_hosts["custom-books"]["production"] == ("93.184.216.34",)
+
+
 def test_internet_urls_require_https_unless_private_network_is_enabled(
     tmp_path: Path,
 ) -> None:
@@ -436,6 +561,51 @@ def test_load_repository_config_rejects_non_boolean_private_network_policy(
     )
 
     with pytest.raises(ValueError, match="invalid_network_policy"):
+        load_repository_config(context)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"schema_version": 1, "trusted_hosts": {}},
+        {"schema_version": 1, "connectors": {}},
+        {"trusted_hosts": {}, "connectors": {}},
+        {
+            "schema_version": 1,
+            "trusted_hosts": {},
+            "connectors": {},
+            "unknown": "field",
+        },
+    ],
+)
+def test_load_repository_config_requires_exact_top_level_schema(
+    tmp_path: Path,
+    payload: dict[str, object],
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    context.config_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="invalid_repository_config"):
+        load_repository_config(context)
+
+
+@pytest.mark.parametrize("schema_version", [True, 1.0, "1", None, 2])
+def test_load_repository_config_requires_exact_integer_schema_version_one(
+    tmp_path: Path,
+    schema_version: object,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    context.config_path.write_text(
+        json.dumps(
+            {
+                "schema_version": schema_version,
+                "trusted_hosts": {},
+                "connectors": {},
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="invalid_repository_config"):
         load_repository_config(context)
 
 
