@@ -50,6 +50,16 @@ def _replace_profile_index(context, transform) -> None:
     )
 
 
+def _replace_credential_values(context, replacements: dict[str, str]) -> None:
+    assignments = _credential_assignments(context)
+    for name, value in replacements.items():
+        assert name in assignments
+        assignments[name] = json.dumps(value)
+    context.credentials_path.write_text(
+        "".join(f"{name}={assignments[name]}\n" for name in sorted(assignments))
+    )
+
+
 def test_store_rejects_a_context_with_a_non_repository_credential_path(tmp_path: Path) -> None:
     context = ensure_repository_state(tmp_path)
     forged_context = replace(context, credentials_path=tmp_path / "outside.env")
@@ -456,6 +466,56 @@ def test_clear_all_rejects_filters(tmp_path: Path) -> None:
         store.clear(connector_id="flowaccount", clear_all=True)
 
 
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "status",
+        "load",
+        "save",
+        "profile-clear",
+        "environment-clear",
+        "connector-clear",
+        "clear-all",
+    ],
+)
+def test_operations_reject_an_unindexed_foreign_key_without_modifying_the_file(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    store = CredentialStore(context)
+    store.save(
+        "flowaccount",
+        "production",
+        {"client_id": "valid-id", "client_secret": "valid-secret"},
+        FIELDS,
+    )
+    foreign_value = "unindexed-value-must-not-leak"
+    with context.credentials_path.open("a") as handle:
+        handle.write(f'MERCURY_FOREIGN_PRODUCTION_TOKEN="{foreign_value}"\n')
+    original = context.credentials_path.read_bytes()
+
+    with pytest.raises(ValueError, match="^invalid_credential_file$") as error:
+        if operation == "status":
+            store.status("flowaccount", "production", FIELDS)
+        elif operation == "load":
+            store.load("flowaccount", "production", FIELDS)
+        elif operation == "save":
+            store.save("flowaccount", "production", {"client_id": "replacement"}, FIELDS)
+        elif operation == "profile-clear":
+            store.clear("flowaccount", "production")
+        elif operation == "environment-clear":
+            store.clear(environment="production")
+        elif operation == "connector-clear":
+            store.clear(connector_id="flowaccount")
+        else:
+            store.clear(clear_all=True)
+
+    assert foreign_value not in str(error.value)
+    assert context.credentials_path.exists()
+    assert context.credentials_path.read_bytes() == original
+
+
 @pytest.mark.parametrize("separator", ["\u2028", "\u2029"])
 def test_save_rejects_unicode_line_separators_without_replacing_valid_credentials(
     tmp_path: Path,
@@ -491,15 +551,13 @@ def test_load_uses_dotenv_without_mutating_process_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     context = ensure_repository_state(tmp_path)
+    store = CredentialStore(context)
     name = credential_env_name("flowaccount", "production", "client_id")
-    context.credentials_path.write_text(f'{name}="stored-value"\n')
+    fields = (CredentialField("client_id", secret=False, label="Client ID"),)
+    store.save("flowaccount", "production", {"client_id": "stored-value"}, fields)
     monkeypatch.delenv(name, raising=False)
 
-    loaded = CredentialStore(context).load(
-        "flowaccount",
-        "production",
-        (CredentialField("client_id", secret=False, label="Client ID"),),
-    )
+    loaded = store.load("flowaccount", "production", fields)
 
     assert loaded == {"client_id": "stored-value"}
     assert name not in os.environ
@@ -510,15 +568,19 @@ def test_load_does_not_interpolate_process_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     context = ensure_repository_state(tmp_path)
-    name = credential_env_name("flowaccount", "production", "client_id")
+    store = CredentialStore(context)
+    fields = (CredentialField("client_id", secret=False, label="Client ID"),)
     monkeypatch.setenv("CREDENTIAL_INTERPOLATION_SOURCE", "environment-value")
-    context.credentials_path.write_text(f'{name}="${{CREDENTIAL_INTERPOLATION_SOURCE}}"\n')
-
-    assert CredentialStore(context).load(
+    store.save(
         "flowaccount",
         "production",
-        (CredentialField("client_id", secret=False, label="Client ID"),),
-    ) == {"client_id": "${CREDENTIAL_INTERPOLATION_SOURCE}"}
+        {"client_id": "${CREDENTIAL_INTERPOLATION_SOURCE}"},
+        fields,
+    )
+
+    assert store.load("flowaccount", "production", fields) == {
+        "client_id": "${CREDENTIAL_INTERPOLATION_SOURCE}"
+    }
 
 
 def test_load_reflects_file_changes_instead_of_a_process_global_cache(tmp_path: Path) -> None:
@@ -532,8 +594,9 @@ def test_load_reflects_file_changes_instead_of_a_process_global_cache(tmp_path: 
     )
     client_id_name = credential_env_name("flowaccount", "production", "client_id")
     client_secret_name = credential_env_name("flowaccount", "production", "client_secret")
-    context.credentials_path.write_text(
-        f'{client_id_name}="new-id"\n{client_secret_name}="new-secret"\n'
+    _replace_credential_values(
+        context,
+        {client_id_name: "new-id", client_secret_name: "new-secret"},
     )
 
     assert CredentialStore(context).load("flowaccount", "production", FIELDS) == {
@@ -664,6 +727,73 @@ def test_store_operations_revalidate_a_replaced_mercury_parent(
     assert outside_credentials.read_text() == (
         'MERCURY_FLOWACCOUNT_PRODUCTION_CLIENT_ID="outside-value"\n'
     )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative POSIX operations")
+def test_root_symlink_swap_cannot_read_or_modify_outside_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository_root = tmp_path / "repository"
+    repository_root.mkdir()
+    context = ensure_repository_state(repository_root)
+    store = CredentialStore(context)
+    store.save(
+        "flowaccount",
+        "production",
+        {"client_id": "inside-id", "client_secret": "inside-secret"},
+        FIELDS,
+    )
+
+    outside_root = tmp_path / "outside"
+    outside_root.mkdir()
+    outside_context = ensure_repository_state(outside_root)
+    CredentialStore(outside_context).save(
+        "flowaccount",
+        "production",
+        {"client_id": "outside-id", "client_secret": "outside-secret"},
+        FIELDS,
+    )
+    outside_original = outside_context.credentials_path.read_bytes()
+    outside_state = outside_context.credentials_path.stat()
+    outside_identity = (outside_state.st_dev, outside_state.st_ino)
+    moved_root = tmp_path / "moved-repository"
+    real_open = os.open
+    real_fdopen = os.fdopen
+    swapped = False
+    outside_read = False
+
+    def race_open(path: str | Path, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        opens_mercury = os.fspath(path) in {
+            os.fspath(context.mercury_dir),
+            ".mercury",
+        }
+        if opens_mercury and not swapped:
+            swapped = True
+            repository_root.rename(moved_root)
+            repository_root.symlink_to(outside_root, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)
+
+    def tracking_fdopen(
+        file_descriptor: int,
+        *args: object,
+        **kwargs: object,
+    ):
+        nonlocal outside_read
+        state = os.fstat(file_descriptor)
+        outside_read |= (state.st_dev, state.st_ino) == outside_identity
+        return real_fdopen(file_descriptor, *args, **kwargs)
+
+    monkeypatch.setattr(credentials_module.os, "open", race_open)
+    monkeypatch.setattr(credentials_module.os, "fdopen", tracking_fdopen)
+
+    with pytest.raises(ValueError, match="^credential_parent_invalid$"):
+        store.save("flowaccount", "production", {"client_id": "replacement"}, FIELDS)
+
+    assert swapped is True
+    assert outside_read is False
+    assert outside_context.credentials_path.read_bytes() == outside_original
 
 
 def test_status_and_repr_never_include_credential_values(tmp_path: Path) -> None:
