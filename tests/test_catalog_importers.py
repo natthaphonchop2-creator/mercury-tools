@@ -882,6 +882,29 @@ def test_import_rejects_multi_layer_encoded_path_field_name_without_echo(
     assert secret not in str(raised.value)
 
 
+def test_import_rejects_raw_in_list_under_multi_layer_encoded_url_without_echo(
+    tmp_path: Path,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    secret = "task-4-import-encoded-url-list-secret-must-not-echo"
+    source_path = tmp_path / "unsafe-encoded-url-list.json"
+    source_path.write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.0",
+                "info": {"version": "1"},
+                "paths": {"/items": {"get": {"responses": {"200": {"description": "OK"}}}}},
+                "%2575rl": [{"raw": f"/v1/ghp_{secret}"}],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="^catalog_credential_path_unsafe$") as raised:
+        import_spec(context, connector_id="custom", source_path=source_path)
+
+    assert secret not in str(raised.value)
+
+
 def test_import_keeps_malformed_encoded_path_like_metadata(tmp_path: Path) -> None:
     context = ensure_repository_state(tmp_path)
     key = "p%61th%"
@@ -903,7 +926,9 @@ def test_import_keeps_malformed_encoded_path_like_metadata(tmp_path: Path) -> No
     assert result.source.sanitization["document"][key] == value
 
 
-def test_import_only_inspects_direct_raw_under_encoded_url(tmp_path: Path) -> None:
+def test_import_inspects_list_items_under_encoded_url_without_inspecting_metadata(
+    tmp_path: Path,
+) -> None:
     context = ensure_repository_state(tmp_path)
     source_path = tmp_path / "encoded-url-metadata.json"
     source_path.write_text(
@@ -912,20 +937,24 @@ def test_import_only_inspects_direct_raw_under_encoded_url(tmp_path: Path) -> No
                 "openapi": "3.0.0",
                 "info": {"version": "1"},
                 "paths": {"/items": {"get": {"responses": {"200": {"description": "OK"}}}}},
-                "%2575rl": {
-                    "raw": "/safe",
-                    "metadata": {
-                        "ghp_documentation_field": "ordinary metadata",
-                        "client_secret_like_text": "ordinary metadata",
+                "%2575rl": [
+                    {
+                        "raw": "/safe",
+                        "metadata": {
+                            "ghp_documentation_field": "ordinary metadata",
+                            "client_secret_like_text": "ordinary metadata",
+                        },
                     },
-                },
+                ],
             }
         )
     )
 
     result = import_spec(context, connector_id="custom", source_path=source_path)
 
-    metadata = result.source.sanitization["document"]["%2575rl"]["metadata"]
+    url_item = result.source.sanitization["document"]["%2575rl"][0]
+    assert url_item["raw"] == "/safe"
+    metadata = url_item["metadata"]
     assert metadata["ghp_documentation_field"] == "ordinary metadata"
     assert metadata["client_secret_like_text"] == "ordinary metadata"
 

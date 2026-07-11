@@ -613,6 +613,23 @@ def test_catalog_source_rejects_encoded_path_field_names_without_echo(
     assert secret not in str(raised.value)
 
 
+def test_catalog_source_rejects_raw_in_list_under_multi_layer_encoded_url_without_echo() -> None:
+    secret = "task-4-encoded-url-list-secret-must-not-echo"
+
+    with pytest.raises(ValidationError, match="catalog_credential_path_unsafe") as raised:
+        CatalogSource.from_document(
+            uri="https://example.test/openapi.json",
+            connector_id="flowaccount",
+            document={
+                "openapi": "3.0.0",
+                "%2575rl": [{"raw": f"/v1/ghp_{secret}"}],
+            },
+            report={"status": "imported"},
+        )
+
+    assert secret not in str(raised.value)
+
+
 def test_catalog_source_keeps_malformed_encoded_path_like_metadata() -> None:
     key = "p%61th%"
     value = "/v1/ghp_task-4-malformed-field-metadata"
@@ -627,24 +644,28 @@ def test_catalog_source_keeps_malformed_encoded_path_like_metadata() -> None:
     assert source.sanitization["document"][key] == value
 
 
-def test_catalog_source_only_inspects_direct_raw_under_encoded_url() -> None:
+def test_catalog_source_inspects_list_items_under_encoded_url_without_inspecting_metadata() -> None:
     source = CatalogSource.from_document(
         uri="https://example.test/openapi.json",
         connector_id="flowaccount",
         document={
             "openapi": "3.0.0",
-            "%2575rl": {
-                "raw": "/safe",
-                "metadata": {
-                    "ghp_documentation_field": "ordinary metadata",
-                    "client_secret_like_text": "ordinary metadata",
+            "%2575rl": [
+                {
+                    "raw": "/safe",
+                    "metadata": {
+                        "ghp_documentation_field": "ordinary metadata",
+                        "client_secret_like_text": "ordinary metadata",
+                    },
                 },
-            },
+            ],
         },
         report={"status": "imported"},
     )
 
-    metadata = source.sanitization["document"]["%2575rl"]["metadata"]
+    url_item = source.sanitization["document"]["%2575rl"][0]
+    assert url_item["raw"] == "/safe"
+    metadata = url_item["metadata"]
     assert metadata["ghp_documentation_field"] == "ordinary metadata"
     assert metadata["client_secret_like_text"] == "ordinary metadata"
 

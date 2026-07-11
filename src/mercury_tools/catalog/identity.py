@@ -292,7 +292,7 @@ def _inspect_credential_paths(
             )
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         for item in value:
-            _inspect_credential_paths(item)
+            _inspect_credential_paths(item, parent_key=parent_key)
 
 
 def _inspect_path_value(value: Any) -> None:
