@@ -19,11 +19,13 @@ _ROOT_GITIGNORE_LINES = [
 _MERCURY_GITIGNORE_LINES = ["credentials.env", "cache/", "audit/"]
 _REPOSITORY_CONFIG_KEYS = {"schema_version", "trusted_hosts", "connectors"}
 _PRIVATE_NETWORK_ENVIRONMENTS = {"local", "gateway"}
-_FORBIDDEN_METADATA_IPS = {
-    "100.100.100.200",
-    "169.254.169.254",
-    "fd00:ec2::254",
-}
+_FORBIDDEN_METADATA_IPS = frozenset(
+    {
+        ipaddress.ip_address("100.100.100.200"),
+        ipaddress.ip_address("169.254.169.254"),
+        ipaddress.ip_address("fd00:ec2::254"),
+    }
+)
 _FORBIDDEN_METADATA_HOSTNAMES = {
     "instance-data.ec2.internal",
     "metadata",
@@ -555,13 +557,18 @@ def _validate_endpoint_path(path: str) -> None:
 
 
 def _is_forbidden_metadata_host(host: str) -> bool:
-    if host in _FORBIDDEN_METADATA_IPS or host in _FORBIDDEN_METADATA_HOSTNAMES:
+    if host in _FORBIDDEN_METADATA_HOSTNAMES:
         return True
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return address.is_link_local
+    mapped_address = address.ipv4_mapped if address.version == 6 else None
+    addresses = (address, mapped_address) if mapped_address is not None else (address,)
+    return any(
+        candidate in _FORBIDDEN_METADATA_IPS or candidate.is_link_local
+        for candidate in addresses
+    )
 
 
 def _is_private_network_host(host: str) -> bool:

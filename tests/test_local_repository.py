@@ -660,6 +660,60 @@ def test_connector_configuration_rejects_metadata_targets_even_with_private_netw
         )
 
 
+@pytest.mark.parametrize("environment", ["local", "gateway"])
+@pytest.mark.parametrize(
+    "host",
+    [
+        "fd00:0ec2:0:0:0:0:0:0254",
+        "fd00:0ec2:0000:0000:0000:0000:0000:0254",
+    ],
+)
+def test_connector_configuration_rejects_expanded_metadata_ipv6_targets(
+    tmp_path: Path,
+    environment: str,
+    host: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+
+    with pytest.raises(ValueError, match="^forbidden_metadata_host$"):
+        configure_connector(
+            context,
+            connector_id=f"{environment}-expanded-metadata",
+            environment=environment,
+            driver_id="api_key_header",
+            base_url=f"http://[{host}]/v1",
+            auth_settings={"key_name": "X-API-Key", "allow_private_network": True},
+        )
+
+
+@pytest.mark.parametrize("environment", ["local", "gateway"])
+@pytest.mark.parametrize(
+    "host",
+    [
+        "::ffff:169.254.169.254",
+        "::ffff:a9fe:a9fe",
+        "::ffff:100.100.100.200",
+        "::ffff:6464:64c8",
+    ],
+)
+def test_connector_configuration_rejects_ipv4_mapped_metadata_targets(
+    tmp_path: Path,
+    environment: str,
+    host: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+
+    with pytest.raises(ValueError, match="^forbidden_metadata_host$"):
+        configure_connector(
+            context,
+            connector_id=f"{environment}-mapped-metadata",
+            environment=environment,
+            driver_id="api_key_header",
+            base_url=f"https://[{host}]/v1",
+            auth_settings={"key_name": "X-API-Key", "allow_private_network": True},
+        )
+
+
 @pytest.mark.parametrize("allow_private_network", ["false", 0, 1, None])
 def test_load_repository_config_rejects_non_boolean_private_network_policy(
     tmp_path: Path,
