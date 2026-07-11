@@ -11,6 +11,20 @@ from mercury_tools.catalog.search import (
 )
 
 
+def _query_tokens(count: int) -> tuple[str, ...]:
+    return tuple(f"term{index:02d}" for index in range(1, count + 1))
+
+
+def _bucket_four_action(action_factory, operation_id: str, overlap_tokens: tuple[str, ...]):
+    return action_factory(
+        connector_id=f"connector-{operation_id}",
+        operation_id=operation_id,
+        capability=f"capability.{operation_id}",
+        aliases_th=(),
+        aliases_en=overlap_tokens,
+    )
+
+
 def test_exact_action_id_and_capability_beat_aliases_and_keywords(action_factory) -> None:
     exact = action_factory(
         operation_id="exact",
@@ -190,6 +204,51 @@ def test_ambiguity_follows_bucket_and_bucket_four_score_rules(action_factory) ->
     assert near_result.ambiguous is True
     assert clear_result.matches[0].score - clear_result.matches[1].score >= 0.05
     assert clear_result.ambiguous is False
+
+
+def test_top_k_one_preserves_ambiguity_from_the_full_ranked_top_two(action_factory) -> None:
+    query_tokens = _query_tokens(20)
+    first = _bucket_four_action(action_factory, "first", query_tokens)
+    second = _bucket_four_action(action_factory, "second", query_tokens)
+
+    result = search_actions([first, second], " ".join(query_tokens), top_k=1)
+
+    assert len(result.matches) == 1
+    assert result.ambiguous is True
+
+
+def test_bucket_four_gap_of_exactly_point_zero_five_is_not_ambiguous(action_factory) -> None:
+    query_tokens = _query_tokens(20)
+    first = _bucket_four_action(action_factory, "first", query_tokens[:17])
+    second = _bucket_four_action(action_factory, "second", query_tokens[:16])
+
+    result = search_actions([first, second], " ".join(query_tokens))
+
+    assert [match.score for match in result.matches] == [0.85, 0.8]
+    assert result.ambiguous is False
+
+
+def test_bucket_four_gap_below_point_zero_five_is_ambiguous(action_factory) -> None:
+    query_tokens = _query_tokens(21)
+    first = _bucket_four_action(action_factory, "first", query_tokens[:17])
+    second = _bucket_four_action(action_factory, "second", query_tokens[:16])
+
+    result = search_actions([first, second], " ".join(query_tokens))
+
+    assert result.ambiguous is True
+
+
+def test_top_k_limits_the_returned_match_count(action_factory) -> None:
+    query_tokens = _query_tokens(20)
+    actions = [
+        _bucket_four_action(action_factory, "first", query_tokens),
+        _bucket_four_action(action_factory, "second", query_tokens),
+        _bucket_four_action(action_factory, "third", query_tokens),
+    ]
+
+    result = search_actions(actions, " ".join(query_tokens), top_k=1)
+
+    assert len(result.matches) == 1
 
 
 @pytest.mark.parametrize(

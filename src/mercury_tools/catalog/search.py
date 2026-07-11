@@ -6,6 +6,7 @@ import math
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from fractions import Fraction
 
 from mercury_tools.catalog.models import CatalogAction, HttpMethod, RiskTier
 
@@ -31,6 +32,7 @@ class CatalogSearchResponse:
 class _RankedAction:
     match: CatalogMatch
     semantic_score: float
+    token_overlap: Fraction | None = None
 
 
 def search_actions(
@@ -68,7 +70,7 @@ def search_actions(
         )
     )
     matches = tuple(item.match for item in ranked[:top_k])
-    return CatalogSearchResponse(matches=matches, ambiguous=_is_ambiguous(matches))
+    return CatalogSearchResponse(matches=matches, ambiguous=_is_ambiguous(ranked))
 
 
 def _normalize_query(query: str) -> str:
@@ -156,13 +158,20 @@ def _rank_action(
     keyword_overlap = _overlap_score(query_tokens, keyword_tokens)
     if keyword_overlap > 0.0:
         return _ranked(
-            action, 3, keyword_overlap, "connector_or_capability_keyword", semantic_score
+            action, 3, float(keyword_overlap), "connector_or_capability_keyword", semantic_score
         )
 
     token_overlap = _overlap_score(query_tokens, _search_tokens(action))
     if token_overlap == 0.0 and semantic_score == 0.0:
         return None
-    return _ranked(action, 4, token_overlap, "token_overlap", semantic_score)
+    return _ranked(
+        action,
+        4,
+        float(token_overlap),
+        "token_overlap",
+        semantic_score,
+        token_overlap=token_overlap,
+    )
 
 
 def _ranked(
@@ -171,6 +180,7 @@ def _ranked(
     score: float,
     reason: str,
     semantic_score: float,
+    token_overlap: Fraction | None = None,
 ) -> _RankedAction:
     return _RankedAction(
         match=CatalogMatch(
@@ -180,6 +190,7 @@ def _ranked(
             reasons=(reason,),
         ),
         semantic_score=semantic_score,
+        token_overlap=token_overlap,
     )
 
 
@@ -203,16 +214,21 @@ def _search_tokens(action: CatalogAction) -> frozenset[str]:
     )
 
 
-def _overlap_score(query_tokens: frozenset[str], candidate_tokens: frozenset[str]) -> float:
+def _overlap_score(query_tokens: frozenset[str], candidate_tokens: frozenset[str]) -> Fraction:
     if not query_tokens:
-        return 0.0
-    return len(query_tokens & candidate_tokens) / len(query_tokens)
+        return Fraction()
+    return Fraction(len(query_tokens & candidate_tokens), len(query_tokens))
 
 
-def _is_ambiguous(matches: tuple[CatalogMatch, ...]) -> bool:
-    if len(matches) < 2:
+def _is_ambiguous(ranked: list[_RankedAction]) -> bool:
+    if len(ranked) < 2:
         return False
-    first, second = matches[:2]
-    if first.rank_bucket == second.rank_bucket and first.rank_bucket <= 3:
+    first, second = ranked[:2]
+    if first.match.rank_bucket == second.match.rank_bucket and first.match.rank_bucket <= 3:
         return True
-    return first.rank_bucket == second.rank_bucket == 4 and first.score - second.score < 0.05
+    return (
+        first.match.rank_bucket == second.match.rank_bucket == 4
+        and first.token_overlap is not None
+        and second.token_overlap is not None
+        and first.token_overlap - second.token_overlap < Fraction(1, 20)
+    )
