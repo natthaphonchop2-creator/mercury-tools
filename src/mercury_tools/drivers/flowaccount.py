@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import unquote, unquote_plus
 
@@ -11,7 +10,7 @@ import httpx
 
 from mercury_tools.catalog.models import CatalogAction
 from mercury_tools.drivers.base import ConnectorAuthError
-from mercury_tools.drivers.generic import _GenericDriver
+from mercury_tools.drivers.generic import _expires_at, _GenericDriver
 from mercury_tools.drivers.models import (
     AuthContext,
     ConnectionProbe,
@@ -244,18 +243,12 @@ def _nonzero_provider_code(value: Any) -> bool:
         return True
     if isinstance(value, int | float):
         return value != 0
-    if isinstance(value, str) and value.strip():
+    if isinstance(value, str):
         try:
             return float(value) != 0
         except ValueError:
             return True
-    return False
-
-
-def _expires_at(value: Any) -> datetime | None:
-    if isinstance(value, bool) or not isinstance(value, int | float) or value < 0:
-        return None
-    return datetime.now(UTC) + timedelta(seconds=value)
+    return True
 
 
 def _company_name(payload: Mapping[str, Any], sensitive_values: tuple[str, ...]) -> str | None:

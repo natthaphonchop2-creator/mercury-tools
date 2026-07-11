@@ -10,7 +10,8 @@ import httpx
 import pytest
 
 from mercury_tools.drivers.base import ConnectorAuthError, DriverConfigurationError
-from mercury_tools.drivers.flowaccount import FlowAccountDriver
+from mercury_tools.drivers.flowaccount import FlowAccountDriver, _flowaccount_body_failed
+from mercury_tools.drivers.peak import PeakDriver
 from mercury_tools.drivers.registry import DriverRegistry, build_generic_registry
 from mercury_tools.local.repository import RepositoryConfig
 
@@ -263,6 +264,58 @@ async def test_flowaccount_nonblank_nonnumeric_provider_codes_are_failures(
     assert calls == expected_calls
 
 
+@pytest.mark.parametrize("field", ["code", "resCode"])
+@pytest.mark.parametrize("value", [{"nested": "zero"}, [0], (0,), object()])
+def test_flowaccount_rejects_structured_provider_codes(field: str, value: object) -> None:
+    assert _flowaccount_body_failed({field: value})
+
+
+@pytest.mark.parametrize("field", ["code", "resCode"])
+@pytest.mark.parametrize("value", [None, False, 0, 0.0, "0", " 0.0 "])
+def test_flowaccount_preserves_zero_provider_codes_as_success(field: str, value: object) -> None:
+    assert not _flowaccount_body_failed({field: value})
+
+
+@pytest.mark.parametrize("field", ["code", "resCode"])
+@pytest.mark.parametrize("value", [True, 1, -1, 0.5, "", "not-a-code"])
+def test_flowaccount_rejects_nonzero_and_nonnumeric_provider_codes(
+    field: str,
+    value: object,
+) -> None:
+    assert _flowaccount_body_failed({field: value})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "token_payload",
+    [
+        '{"access_token":"safe-token","expires_in":NaN}',
+        '{"access_token":"safe-token","expires_in":Infinity}',
+        '{"access_token":"safe-token","expires_in":-Infinity}',
+        '{"access_token":"safe-token","expires_in":' + str(10**1000) + "}",
+    ],
+)
+async def test_flowaccount_ignores_nonfinite_and_out_of_range_expiry_values(
+    token_payload: str,
+) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                content=token_payload,
+                headers={"Content-Type": "application/json"},
+            )
+        )
+    ) as client:
+        auth = await FlowAccountDriver().prepare_auth(
+            environment="production",
+            credentials={"client_id": "client-id", "client_secret": "client-secret"},
+            client=client,
+        )
+
+    assert auth.expires_at is None
+
+
 def test_flowaccount_interprets_http_200_provider_body_failure_and_redacts_response(
     action_factory,
 ) -> None:
@@ -376,6 +429,84 @@ def test_registry_for_repository_revalidates_manual_config_before_loading_driver
         DriverRegistry.for_repository(config)
 
     assert "opaque.example.test" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://api.example.test/%ZZ",
+        "https://api.example.test:",
+        "https://api.example.test/path with-space",
+        "https://api.example.test/path\\segment",
+        "https://api.example.test/path\x00segment",
+    ],
+)
+def test_registry_rejects_invalid_endpoints_before_constructing_provider_drivers(
+    endpoint: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constructed: list[str] = []
+
+    def unexpected_flowaccount_constructor(self: object) -> None:
+        constructed.append("flowaccount")
+
+    def unexpected_peak_constructor(self: object) -> None:
+        constructed.append("peak")
+
+    monkeypatch.setattr(FlowAccountDriver, "__init__", unexpected_flowaccount_constructor)
+    monkeypatch.setattr(PeakDriver, "__init__", unexpected_peak_constructor)
+    config = RepositoryConfig(
+        trusted_hosts={"custom": {"production": ("api.example.test",)}},
+        connectors={
+            "custom": {
+                "production": {
+                    "driver_id": "bearer",
+                    "base_url": endpoint,
+                    "auth_settings": {},
+                    "network_policy": {"allow_private_network": False},
+                }
+            }
+        },
+    )
+
+    with pytest.raises(DriverConfigurationError, match="^repository_connector_invalid$"):
+        DriverRegistry.for_repository(config)
+
+    assert constructed == []
+
+
+@pytest.mark.parametrize(
+    ("client_id_name", "client_secret_name"),
+    [
+        ("application", "APPLICATION"),
+        ("grant_type", "application_secret"),
+        ("application_id", "SCOPE"),
+    ],
+)
+def test_registry_for_repository_rejects_colliding_oauth_form_parameter_names(
+    client_id_name: str,
+    client_secret_name: str,
+) -> None:
+    config = RepositoryConfig(
+        trusted_hosts={"custom": {"production": ("api.example.test", "auth.example.test")}},
+        connectors={
+            "custom": {
+                "production": {
+                    "driver_id": "oauth_client_credentials",
+                    "base_url": "https://api.example.test/v1",
+                    "auth_settings": {
+                        "token_url": "https://auth.example.test/token",
+                        "client_id_name": client_id_name,
+                        "client_secret_name": client_secret_name,
+                    },
+                    "network_policy": {"allow_private_network": False},
+                }
+            }
+        },
+    )
+
+    with pytest.raises(DriverConfigurationError, match="^repository_connector_invalid$"):
+        DriverRegistry.for_repository(config)
 
 
 def test_registry_for_repository_allows_only_environment_specific_oauth_token_urls() -> None:

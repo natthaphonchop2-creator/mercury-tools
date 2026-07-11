@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import mimetypes
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -30,6 +31,7 @@ from mercury_tools.safety.redaction import redact_json
 _REDACTED = "[REDACTED]"
 _JSON_DECODE_FAILED = object()
 _INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_MAX_EXPIRY_SECONDS = 60 * 60 * 24 * 366 * 100
 
 
 class _GenericDriver:
@@ -285,8 +287,10 @@ class GenericOAuthClientCredentialsDriver(_GenericDriver):
         if set(configured_token_urls) != set(self._environments):
             raise DriverConfigurationError("oauth_environment_mismatch")
         self._token_urls = immutable_mapping(configured_token_urls)
-        self._client_id_name = _oauth_parameter_name(client_id_name)
-        self._client_secret_name = _oauth_parameter_name(client_secret_name)
+        self._client_id_name, self._client_secret_name = _oauth_parameter_names(
+            client_id_name,
+            client_secret_name,
+        )
         if grant_type != "client_credentials":
             raise DriverConfigurationError("oauth_configuration_invalid")
         self._grant_type = grant_type
@@ -325,7 +329,11 @@ class GenericOAuthClientCredentialsDriver(_GenericDriver):
         if not response.is_success or not isinstance(payload, Mapping):
             raise ConnectorAuthError("oauth_token_failed")
         token = payload.get("access_token")
-        if not isinstance(token, str) or not token:
+        if (
+            not isinstance(token, str)
+            or not token
+            or _credential_token_collision(token, values.values())
+        ):
             raise ConnectorAuthError("oauth_token_failed")
         expires_at = _expires_at(payload.get("expires_in"))
         return AuthContext(
@@ -446,11 +454,15 @@ def _redact_path(value: Any, components: list[str]) -> None:
 
 
 def _expires_at(value: Any) -> datetime | None:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    if isinstance(value, int | float) and value >= 0:
-        return datetime.now(UTC) + timedelta(seconds=value)
-    return None
+    try:
+        seconds = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(seconds) or not 0 <= seconds <= _MAX_EXPIRY_SECONDS:
+        return None
+    return datetime.now(UTC) + timedelta(seconds=seconds)
 
 
 def _is_multipart_form_data(content_type: str) -> bool:
@@ -493,6 +505,15 @@ def _reversibly_decoded_values(value: str) -> tuple[str, ...]:
         if not pending:
             break
     return tuple(values)
+
+
+def _credential_token_collision(token: str, credential_values: Iterable[str]) -> bool:
+    token_variants = set(_reversibly_decoded_values(token))
+    return any(
+        token_variants.intersection(_reversibly_decoded_values(value))
+        for value in credential_values
+        if isinstance(value, str)
+    )
 
 
 @dataclass(frozen=True)
@@ -648,6 +669,18 @@ def _oauth_parameter_name(value: str) -> str:
     if not isinstance(value, str) or not _OAUTH_PARAMETER_NAME.fullmatch(value):
         raise DriverConfigurationError("oauth_configuration_invalid")
     return value
+
+
+def _oauth_parameter_names(client_id_name: str, client_secret_name: str) -> tuple[str, str]:
+    validated_client_id_name = _oauth_parameter_name(client_id_name)
+    validated_client_secret_name = _oauth_parameter_name(client_secret_name)
+    normalized = {
+        validated_client_id_name.casefold(),
+        validated_client_secret_name.casefold(),
+    }
+    if len(normalized) != 2 or normalized.intersection({"grant_type", "scope"}):
+        raise DriverConfigurationError("oauth_configuration_invalid")
+    return validated_client_id_name, validated_client_secret_name
 
 
 def _oauth_scope(value: str | None) -> str | None:

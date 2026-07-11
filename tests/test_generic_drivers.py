@@ -176,6 +176,53 @@ def test_oauth_factory_rejects_malformed_token_urls(token_url: str) -> None:
     assert "opaque-url-secret" not in str(error.value)
 
 
+@pytest.mark.parametrize(
+    ("client_id_name", "client_secret_name"),
+    [
+        ("application", "APPLICATION"),
+        ("grant_type", "application_secret"),
+        ("application_id", "GRANT_TYPE"),
+        ("scope", "application_secret"),
+        ("application_id", "SCOPE"),
+    ],
+)
+def test_oauth_constructor_rejects_colliding_form_parameter_names(
+    client_id_name: str,
+    client_secret_name: str,
+) -> None:
+    with pytest.raises(DriverConfigurationError, match="^oauth_configuration_invalid$"):
+        GenericOAuthClientCredentialsDriver(
+            connector_id="custom",
+            environments={"production": "https://erp.example.test"},
+            token_urls={"production": "https://auth.example.test/token"},
+            client_id_name=client_id_name,
+            client_secret_name=client_secret_name,
+        )
+
+
+@pytest.mark.parametrize(
+    ("client_id_name", "client_secret_name"),
+    [
+        ("application", "APPLICATION"),
+        ("Grant_Type", "application_secret"),
+        ("application_id", "Scope"),
+    ],
+)
+def test_oauth_factory_rejects_colliding_form_parameter_names(
+    client_id_name: str,
+    client_secret_name: str,
+) -> None:
+    with pytest.raises(DriverConfigurationError, match="^oauth_configuration_invalid$"):
+        build_generic_registry().create(
+            "oauth_client_credentials",
+            connector_id="custom",
+            environments={"production": "https://erp.example.test"},
+            token_urls={"production": "https://auth.example.test/token"},
+            client_id_name=client_id_name,
+            client_secret_name=client_secret_name,
+        )
+
+
 def test_api_key_factory_does_not_treat_an_explicit_blank_key_name_as_default() -> None:
     registry = build_generic_registry()
     environments = {"production": "https://erp.example.test"}
@@ -298,6 +345,75 @@ async def test_oauth_client_credentials_keeps_client_secret_out_of_exceptions_an
             )
 
     assert secret not in str(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "access_token",
+    [
+        "client secret+/%",
+        quote_plus("client secret+/%", safe=""),
+        quote(quote_plus("client secret+/%", safe=""), safe=""),
+    ],
+)
+async def test_oauth_rejects_tokens_equivalent_to_submitted_credentials_before_auth_context(
+    access_token: str,
+) -> None:
+    calls: list[str] = []
+    driver = GenericOAuthClientCredentialsDriver(
+        connector_id="custom",
+        environments={"production": "https://erp.example.test"},
+        token_urls={"production": "https://auth.example.test/token"},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(200, json={"access_token": access_token})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(ConnectorAuthError, match="^oauth_token_failed$"):
+            await driver.prepare_auth(
+                environment="production",
+                credentials={"client_id": "client-id", "client_secret": "client secret+/%"},
+                client=client,
+            )
+
+    assert calls == ["https://auth.example.test/token"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "token_payload",
+    [
+        '{"access_token":"safe-token","expires_in":NaN}',
+        '{"access_token":"safe-token","expires_in":Infinity}',
+        '{"access_token":"safe-token","expires_in":-Infinity}',
+        '{"access_token":"safe-token","expires_in":' + str(10**1000) + "}",
+    ],
+)
+async def test_oauth_ignores_nonfinite_and_out_of_range_expiry_values(token_payload: str) -> None:
+    driver = GenericOAuthClientCredentialsDriver(
+        connector_id="custom",
+        environments={"production": "https://erp.example.test"},
+        token_urls={"production": "https://auth.example.test/token"},
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                content=token_payload,
+                headers={"Content-Type": "application/json"},
+            )
+        )
+    ) as client:
+        auth = await driver.prepare_auth(
+            environment="production",
+            credentials={"client_id": "client-id", "client_secret": "client-secret"},
+            client=client,
+        )
+
+    assert auth.expires_at is None
 
 
 @pytest.mark.asyncio

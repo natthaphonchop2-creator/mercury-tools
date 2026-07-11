@@ -329,3 +329,65 @@ def test_peak_interprets_any_nested_rescode_failure_without_provider_payload_lea
     assert result.status == "failed"
     assert result.summary == "provider_response_failed"
     assert "provider-token" not in json.dumps(result.public_dict())
+
+
+def test_peak_fails_closed_when_rescode_is_beyond_the_depth_bound(action_factory) -> None:
+    payload: dict[str, object] = {"resCode": "400"}
+    for _ in range(9):
+        payload = {"next": payload}
+
+    result = PeakDriver().interpret_response(
+        action=action_factory(),
+        response=httpx.Response(200, json=payload),
+        dispatched=True,
+    )
+
+    assert result.status == "failed"
+    assert result.summary == "provider_response_failed"
+
+
+def test_peak_fails_closed_when_mapping_traversal_exceeds_node_bound(action_factory) -> None:
+    payload = {"items": [{"index": index} for index in range(129)]}
+
+    result = PeakDriver().interpret_response(
+        action=action_factory(),
+        response=httpx.Response(200, json=payload),
+        dispatched=True,
+    )
+
+    assert result.status == "failed"
+    assert result.summary == "provider_response_failed"
+
+
+def test_peak_does_not_traverse_rows_beneath_a_successful_provider_node(action_factory) -> None:
+    payload = {
+        "PeakInvoices": {
+            "resCode": "200",
+            "rows": [{"resCode": "400", "id": index} for index in range(256)],
+        }
+    }
+
+    result = PeakDriver().interpret_response(
+        action=action_factory(),
+        response=httpx.Response(200, json=payload),
+        dispatched=True,
+    )
+
+    assert result.status == "succeeded"
+
+
+def test_peak_does_not_traverse_rows_beneath_a_successful_root_provider_node(
+    action_factory,
+) -> None:
+    payload = {
+        "resCode": "200",
+        "rows": [{"resCode": "400", "id": index} for index in range(256)],
+    }
+
+    result = PeakDriver().interpret_response(
+        action=action_factory(),
+        response=httpx.Response(200, json=payload),
+        dispatched=True,
+    )
+
+    assert result.status == "succeeded"

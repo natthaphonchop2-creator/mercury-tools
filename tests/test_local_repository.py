@@ -1155,3 +1155,48 @@ def test_normalize_repository_config_returns_a_validated_copy_for_manually_const
     assert normalized.connectors["custom-books"]["local"]["base_url"] == (
         "http://127.0.0.1:8080/v1"
     )
+
+
+@pytest.mark.parametrize(
+    ("setting", "endpoint"),
+    [
+        ("base_url", "https://api.example.test/%ZZ"),
+        ("base_url", "https://api.example.test:"),
+        ("base_url", "https://api.example.test/path with-space"),
+        ("base_url", "https://api.example.test/path\\segment"),
+        ("base_url", "https://api.example.test/path\x00segment"),
+        ("token_url", "https://auth.example.test/%ZZ"),
+        ("token_url", "https://auth.example.test:"),
+        ("token_url", "https://auth.example.test/path with-space"),
+        ("token_url", "https://auth.example.test/path\\segment"),
+        ("token_url", "https://auth.example.test/path\x00segment"),
+    ],
+)
+def test_normalize_repository_config_rejects_raw_invalid_endpoint_syntax(
+    setting: str,
+    endpoint: str,
+) -> None:
+    auth_settings: dict[str, str] = {"token_url": "https://auth.example.test/token"}
+    base_url = "https://api.example.test/v1"
+    if setting == "base_url":
+        base_url = endpoint
+    else:
+        auth_settings["token_url"] = endpoint
+    config = RepositoryConfig(
+        trusted_hosts={
+            "custom": {"production": ("api.example.test", "auth.example.test")}
+        },
+        connectors={
+            "custom": {
+                "production": {
+                    "driver_id": "oauth_client_credentials",
+                    "base_url": base_url,
+                    "auth_settings": auth_settings,
+                    "network_policy": {"allow_private_network": False},
+                }
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match="^invalid_endpoint_url$"):
+        repository_module.normalize_repository_config(config)

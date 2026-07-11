@@ -62,6 +62,7 @@ _OAUTH_SCOPE_PATTERN = re.compile(
 _HOST_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _HEX_INTEGER_HOST_PATTERN = re.compile(r"^0x[0-9a-f]+$")
 _LEGACY_IPV4_COMPONENT_PATTERN = re.compile(r"^(?:\d+|0x[0-9a-f]+)$")
+_INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _SENSITIVE_CREDENTIAL_MARKERS = (
     "secret",
     "password",
@@ -856,6 +857,15 @@ def _normalize_network_policy(
 def _validate_endpoint_url(url: str, environment: str, allow_private_network: bool) -> str:
     if not isinstance(url, str):
         raise ValueError("invalid_endpoint_url")
+    if (
+        any(
+            character.isspace() or ord(character) <= 0x20 or ord(character) == 0x7F
+            for character in url
+        )
+        or "\\" in url
+        or _INVALID_PERCENT_ESCAPE.search(url) is not None
+    ):
+        raise ValueError("invalid_endpoint_url")
     try:
         parsed = urlparse(url)
     except ValueError as exc:
@@ -868,7 +878,7 @@ def _validate_endpoint_url(url: str, environment: str, allow_private_network: bo
         parsed_port = parsed.port
     except ValueError as exc:
         raise ValueError("invalid_endpoint_url") from exc
-    if parsed_port is not None and not 0 <= parsed_port <= 65535:
+    if parsed.netloc.endswith(":") or parsed_port is not None and not 0 <= parsed_port <= 65535:
         raise ValueError("invalid_endpoint_url")
     if parsed.params or parsed.query or parsed.fragment:
         raise ValueError("invalid_endpoint_url")

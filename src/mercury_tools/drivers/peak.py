@@ -298,25 +298,47 @@ def _reversibly_decoded_values(value: str) -> set[str]:
 
 
 def _peak_response_failed(payload: Any) -> bool:
-    return any(
+    nodes, truncated = _peak_response_nodes(payload)
+    return truncated or any(
         "resCode" in node and not peak_success(node)
-        for node in _peak_response_nodes(payload)
+        for node in nodes
     )
 
 
-def _peak_response_nodes(payload: Any) -> tuple[Mapping[str, Any], ...]:
+def _peak_response_nodes(payload: Any) -> tuple[tuple[Mapping[str, Any], ...], bool]:
     nodes: list[Mapping[str, Any]] = []
     pending: list[tuple[Any, int]] = [(payload, 0)]
-    while pending and len(nodes) < 128:
+    while pending:
         value, depth = pending.pop()
         if isinstance(value, Mapping):
+            if len(nodes) >= 128:
+                return tuple(nodes), True
             nodes.append(value)
-            if depth < 8:
+            if "resCode" in value:
+                if depth > 0:
+                    continue
+                # A root envelope may carry direct provider nodes beside its own code.
+                # Its other children are response rows and are not provider responses.
+                children = [
+                    value[key]
+                    for key in sorted(value, key=str, reverse=True)
+                    if isinstance(value[key], Mapping) and "resCode" in value[key]
+                ]
+            else:
                 children = [value[key] for key in sorted(value, key=str, reverse=True)]
-                pending.extend((child, depth + 1) for child in children)
-        elif isinstance(value, list | tuple) and depth < 8:
-            pending.extend((child, depth + 1) for child in reversed(value))
-    return tuple(nodes)
+        elif isinstance(value, list | tuple):
+            children = list(reversed(value))
+        else:
+            continue
+        traversable_children = [
+            child for child in children if isinstance(child, Mapping | list | tuple)
+        ]
+        if depth >= 8:
+            if traversable_children:
+                return tuple(nodes), True
+            continue
+        pending.extend((child, depth + 1) for child in traversable_children)
+    return tuple(nodes), False
 
 
 __all__ = [
