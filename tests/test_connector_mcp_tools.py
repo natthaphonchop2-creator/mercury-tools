@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import parse_qs
 
 import httpx
 from starlette.testclient import TestClient
@@ -60,6 +61,33 @@ def assert_key_fragments_absent(payload: dict[str, Any], fragments: list[str]) -
     collect_keys(payload)
     for fragment in fragments:
         assert all(fragment not in key for key in keys)
+
+
+def install_flowaccount_healthcheck_transport(monkeypatch, server, post, get=None) -> None:
+    original = server.validate_connector_connection_healthcheck
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            assert post is not None
+            data = {key: values[-1] for key, values in parse_qs(request.content.decode()).items()}
+            response = post(str(request.url), data=data, timeout=60)
+        else:
+            assert get is not None
+            headers = {"Authorization": request.headers["Authorization"]}
+            response = get(str(request.url), headers=headers, timeout=60)
+        return httpx.Response(response.status_code, json=response.json())
+
+    transport = httpx.MockTransport(handler)
+
+    def validate(manifest, *, credentials, environment):
+        return original(
+            manifest,
+            credentials=credentials,
+            environment=environment,
+            transport=transport,
+        )
+
+    monkeypatch.setattr(server, "validate_connector_connection_healthcheck", validate)
 
 
 def rag_result(
@@ -367,8 +395,7 @@ def test_validate_connector_connection_stores_credentials_before_ready(
             return payload
 
     store = FakeStore()
-    monkeypatch.setattr("httpx.post", fake_post)
-    monkeypatch.setattr("httpx.get", fake_get)
+    install_flowaccount_healthcheck_transport(monkeypatch, server, fake_post, fake_get)
     monkeypatch.setattr(server, "_product_store", lambda settings: store)
     monkeypatch.setattr(server, "_audit", lambda *args, **kwargs: None)
 
@@ -462,8 +489,7 @@ def test_validate_connector_connection_token_failure_sanitizes_provider_echoes(
     def fake_get(url, headers=None, timeout=60):
         raise AssertionError("company info should not be called after token failure")
 
-    monkeypatch.setattr("httpx.post", fake_post)
-    monkeypatch.setattr("httpx.get", fake_get)
+    install_flowaccount_healthcheck_transport(monkeypatch, server, fake_post, fake_get)
     monkeypatch.setattr(server, "_audit", lambda *args, **kwargs: None)
 
     payload = server.validate_connector_connection(
@@ -477,17 +503,7 @@ def test_validate_connector_connection_token_failure_sanitizes_provider_echoes(
     )
 
     assert payload["status"] == "validation_failed"
-    provider_response = payload["provider_response"]
-    assert_key_fragments_absent(
-        provider_response,
-        [
-            "client_id",
-            "client_secret",
-            "access_token",
-            "credential_fingerprints",
-            "ciphertext",
-        ],
-    )
+    assert "provider_response" not in payload
     assert_values_absent(
         payload,
         [
@@ -538,8 +554,7 @@ def test_validate_connector_connection_company_info_failure_sanitizes_provider_e
             },
         )
 
-    monkeypatch.setattr("httpx.post", fake_post)
-    monkeypatch.setattr("httpx.get", fake_get)
+    install_flowaccount_healthcheck_transport(monkeypatch, server, fake_post, fake_get)
     monkeypatch.setattr(server, "_audit", lambda *args, **kwargs: None)
 
     payload = server.validate_connector_connection(
@@ -553,16 +568,7 @@ def test_validate_connector_connection_company_info_failure_sanitizes_provider_e
     )
 
     assert payload["status"] == "validation_failed"
-    provider_response = payload["provider_response"]
-    assert_key_fragments_absent(
-        provider_response,
-        [
-            "client_id",
-            "client_secret",
-            "credential_fingerprints",
-            "ciphertext",
-        ],
-    )
+    assert "provider_response" not in payload
     assert_values_absent(
         payload,
         [
@@ -587,7 +593,7 @@ def test_validate_connector_connection_http_error_is_sanitized(
             "read failed with demo-client-id and super-secret-value"
         )
 
-    monkeypatch.setattr("httpx.post", fake_post)
+    install_flowaccount_healthcheck_transport(monkeypatch, server, fake_post)
     monkeypatch.setattr(server, "_audit", lambda *args, **kwargs: None)
 
     payload = server.validate_connector_connection(

@@ -1,3 +1,6 @@
+import inspect
+import json
+
 import httpx
 import pytest
 
@@ -9,6 +12,7 @@ from mercury_tools.connectors.setup import (
     required_missing_fields,
     resolve_setup_state,
     validate_connector_connection_healthcheck,
+    validate_connector_connection_healthcheck_async,
 )
 from mercury_tools.db.product import SupabaseProductStore
 
@@ -34,6 +38,32 @@ def assert_key_fragments_absent(payload: dict, fragments: list[str]) -> None:
     collect_keys(payload)
     for fragment in fragments:
         assert all(fragment not in key for key in keys)
+
+
+def legacy_mock_transport(post=None, get=None) -> httpx.MockTransport:
+    """Adapt existing setup assertions to the provider-driver mock transport seam."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        callback = post if request.method == "POST" else get
+        assert callback is not None
+        parameter_names = inspect.signature(callback).parameters
+        kwargs: dict[str, object] = {}
+        if "data" in parameter_names:
+            pairs = httpx.QueryParams(request.content.decode())
+            kwargs["data"] = {key: pairs.get(key) for key in pairs}
+        if "json" in parameter_names:
+            kwargs["json"] = json.loads(request.content)
+        if "headers" in parameter_names:
+            kwargs["headers"] = request.headers
+        if "timeout" in parameter_names:
+            kwargs["timeout"] = 60
+        response = callback(str(request.url), **kwargs)
+        try:
+            return httpx.Response(response.status_code, json=response.json())
+        except ValueError:
+            return httpx.Response(response.status_code, content=b"{")
+
+    return httpx.MockTransport(handler)
 
 
 def test_setup_states_are_ordered_and_explicit() -> None:
@@ -90,13 +120,11 @@ def test_validate_flowaccount_uses_token_and_company_info(monkeypatch) -> None:
         assert timeout == 60
         return FakeResponse(200, {"companyName": "Demo Books"})
 
-    monkeypatch.setattr("httpx.post", fake_post)
-    monkeypatch.setattr("httpx.get", fake_get)
-
     result = validate_connector_connection_healthcheck(
         manifest,
         credentials={"client_id": "cid", "client_secret": "csecret"},
         environment="production",
+        transport=legacy_mock_transport(post=fake_post, get=fake_get),
     )
 
     assert result["status"] == "connected"
@@ -134,13 +162,11 @@ def test_validate_flowaccount_uses_sandbox_token_and_company_info_urls(
         calls.append(("GET", url))
         return FakeResponse(200, {"companyName": "Sandbox Books"})
 
-    monkeypatch.setattr("httpx.post", fake_post)
-    monkeypatch.setattr("httpx.get", fake_get)
-
     result = validate_connector_connection_healthcheck(
         manifest,
         credentials={"client_id": "cid", "client_secret": "csecret"},
         environment="sandbox",
+        transport=legacy_mock_transport(post=fake_post, get=fake_get),
     )
 
     assert result["status"] == "connected"
@@ -219,13 +245,11 @@ def test_validate_peak_uses_hmac_client_token_and_user_read(monkeypatch) -> None
             },
         )
 
-    monkeypatch.setattr("httpx.post", fake_post)
-    monkeypatch.setattr("httpx.get", fake_get)
-
     result = validate_connector_connection_healthcheck(
         manifest,
         credentials=credentials,
         environment="uat",
+        transport=legacy_mock_transport(post=fake_post, get=fake_get),
     )
 
     assert result["status"] == "connected"
@@ -279,9 +303,6 @@ def test_validate_peak_token_failure_sanitizes_provider_echoes(monkeypatch) -> N
     def fake_get(url, headers=None, timeout=60):
         raise AssertionError("read endpoint must not run after token failure")
 
-    monkeypatch.setattr("httpx.post", fake_post)
-    monkeypatch.setattr("httpx.get", fake_get)
-
     result = validate_connector_connection_healthcheck(
         manifest,
         credentials={
@@ -291,6 +312,7 @@ def test_validate_peak_token_failure_sanitizes_provider_echoes(monkeypatch) -> N
             "user_token": "user-token-value",
         },
         environment="uat",
+        transport=legacy_mock_transport(post=fake_post, get=fake_get),
     )
 
     assert result["status"] == "validation_failed"
@@ -318,8 +340,6 @@ def test_validate_flowaccount_http_error_returns_sanitized_validation_failed(
             "network failed for client-id-leak and client-secret-leak"
         )
 
-    monkeypatch.setattr("httpx.post", fake_post)
-
     result = validate_connector_connection_healthcheck(
         manifest,
         credentials={
@@ -327,6 +347,7 @@ def test_validate_flowaccount_http_error_returns_sanitized_validation_failed(
             "client_secret": "client-secret-leak",
         },
         environment="production",
+        transport=legacy_mock_transport(post=fake_post),
     )
 
     assert result["status"] == "validation_failed"
@@ -352,8 +373,6 @@ def test_validate_flowaccount_invalid_json_returns_sanitized_validation_failed(
     def fake_post(url, data=None, timeout=60):
         return FakeResponse()
 
-    monkeypatch.setattr("httpx.post", fake_post)
-
     result = validate_connector_connection_healthcheck(
         manifest,
         credentials={
@@ -361,13 +380,56 @@ def test_validate_flowaccount_invalid_json_returns_sanitized_validation_failed(
             "client_secret": "client-secret-leak",
         },
         environment="production",
+        transport=legacy_mock_transport(post=fake_post),
     )
 
     assert result["status"] == "validation_failed"
     assert result["http_status"] == 200
-    assert result["error_type"] == "ValueError"
+    assert result["error_type"] == "JSONDecodeError"
     assert "Traceback" not in str(result)
     assert_values_absent(result, ["client-id-leak", "client-secret-leak"])
+
+
+@pytest.mark.asyncio
+async def test_async_healthcheck_preserves_compatibility_result_shape() -> None:
+    manifest = connector_by_id("flowaccount")
+    assert manifest is not None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/token"):
+            return httpx.Response(200, json={"access_token": "access-token"})
+        return httpx.Response(200, json={"companyName": "Async Books"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await validate_connector_connection_healthcheck_async(
+            manifest,
+            credentials={"client_id": "client-id", "client_secret": "client-secret"},
+            environment="production",
+            client=client,
+        )
+
+    assert result == {
+        "status": "connected",
+        "connector_id": "flowaccount",
+        "environment": "production",
+        "company_name": "Async Books",
+        "enabled_capabilities": manifest.capabilities,
+        "validation": {"token_status": 200, "company_info_status": 200},
+    }
+
+
+@pytest.mark.asyncio
+async def test_sync_healthcheck_in_active_loop_requires_async_path() -> None:
+    manifest = connector_by_id("flowaccount")
+    assert manifest is not None
+
+    with pytest.raises(RuntimeError, match="^connector_healthcheck_async_required$"):
+        validate_connector_connection_healthcheck(
+            manifest,
+            credentials={"client_id": "client-id", "client_secret": "client-secret"},
+            environment="production",
+            transport=httpx.MockTransport(lambda request: httpx.Response(500)),
+        )
 
 
 def test_validate_flowaccount_token_failure_sanitizes_provider_response_keys(
@@ -399,8 +461,6 @@ def test_validate_flowaccount_token_failure_sanitizes_provider_response_keys(
     def fake_post(url, data=None, timeout=60):
         return FakeResponse()
 
-    monkeypatch.setattr("httpx.post", fake_post)
-
     result = validate_connector_connection_healthcheck(
         manifest,
         credentials={
@@ -408,6 +468,7 @@ def test_validate_flowaccount_token_failure_sanitizes_provider_response_keys(
             "client_secret": "super-secret-value",
         },
         environment="production",
+        transport=legacy_mock_transport(post=fake_post),
     )
 
     assert result["status"] == "validation_failed"
@@ -485,9 +546,6 @@ def test_validate_flowaccount_company_info_body_failure_returns_sanitized_valida
             },
         )
 
-    monkeypatch.setattr("httpx.post", fake_post)
-    monkeypatch.setattr("httpx.get", fake_get)
-
     result = validate_connector_connection_healthcheck(
         manifest,
         credentials={
@@ -495,16 +553,13 @@ def test_validate_flowaccount_company_info_body_failure_returns_sanitized_valida
             "client_secret": "super-secret-value",
         },
         environment="production",
+        transport=legacy_mock_transport(post=fake_post, get=fake_get),
     )
 
     assert result["status"] == "validation_failed"
     assert result["http_status"] == 200
     assert result["message"].startswith("Company info request failed.")
-    assert "provider_response" in result
-    assert_key_fragments_absent(
-        result["provider_response"],
-        ["client_id", "client_secret", "access_token"],
-    )
+    assert "provider_response" not in result
     assert_values_absent(
         result,
         ["demo-client-id", "super-secret-value", "secret-token"],

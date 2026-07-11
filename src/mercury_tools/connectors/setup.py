@@ -1,28 +1,13 @@
 from __future__ import annotations
 
-import hashlib
-import hmac
-from datetime import UTC, datetime
+import asyncio
+from collections.abc import Mapping
 from typing import Any, Literal
 
 import httpx
 
 from mercury_tools.connectors.catalog import ConnectorManifest
-from mercury_tools.safety.redaction import redact_json
-
-_SENSITIVE_VALIDATION_KEYS = {
-    "access_token",
-    "api_key",
-    "apikey",
-    "authorization",
-    "ciphertext",
-    "client_id",
-    "client_secret",
-    "credential_fingerprints",
-    "id_token",
-    "password",
-    "refresh_token",
-}
+from mercury_tools.drivers.models import ConnectionProbe, to_jsonable
 
 ConnectorSetupStatus = Literal[
     "not_started",
@@ -46,6 +31,29 @@ CONNECTOR_SETUP_STATES: list[ConnectorSetupStatus] = [
     "ready",
 ]
 
+_HEALTHCHECK_MESSAGES = {
+    "token_request_failed": "Token request failed before a valid response was received.",
+    "token_response_invalid": "Token response was not valid JSON.",
+    "flowaccount_token_failed": "Token request failed.",
+    "company_info_request_failed": (
+        "Company info request failed before a valid response was received."
+    ),
+    "company_info_response_invalid": "Company info response was not valid JSON.",
+    "company_info_failed": "Company info request failed.",
+    "peak_client_token_request_failed": (
+        "PEAK ClientToken request failed before a valid response was received."
+    ),
+    "peak_client_token_response_invalid": "PEAK ClientToken response was not valid JSON.",
+    "peak_client_token_failed": "PEAK ClientToken request failed.",
+    "peak_user_request_failed": "PEAK user request failed before a valid response was received.",
+    "peak_user_response_invalid": "PEAK user response was not valid JSON.",
+    "peak_user_failed": "PEAK user request failed.",
+    "credential_missing": "Connector credentials are incomplete.",
+    "credential_blank": "Connector credentials are incomplete.",
+    "credential_invalid": "Connector credentials are invalid.",
+    "credential_undeclared": "Connector credentials are invalid.",
+}
+
 
 def required_missing_fields(
     manifest: ConnectorManifest,
@@ -58,405 +66,16 @@ def required_missing_fields(
     ]
 
 
-def _flowaccount_company_name(payload: dict[str, Any]) -> str | None:
-    for key in ("companyName", "company_name", "name"):
-        value = payload.get(key)
-        if value:
-            return str(value)
-    return None
-
-
-def _peak_timestamp() -> str:
-    return datetime.now(tz=UTC).strftime("%Y%m%d%H%M%S")
-
-
-def _peak_signature(timestamp: str, connect_id: str) -> str:
-    return hmac.new(
-        connect_id.encode("utf-8"),
-        timestamp.encode("utf-8"),
-        hashlib.sha1,
-    ).hexdigest()
-
-
-def _peak_headers(
-    *,
-    connect_id: str,
-    client_token: str = "",
-    user_token: str = "",
-) -> dict[str, str]:
-    timestamp = _peak_timestamp()
-    return {
-        "Client-Token": client_token,
-        "User-Token": user_token,
-        "Time-Stamp": timestamp,
-        "Time-Signature": _peak_signature(timestamp, connect_id),
-        "Content-Type": "application/json",
-    }
-
-
-def _peak_node(payload: Any, node_name: str) -> dict[str, Any]:
-    if not isinstance(payload, dict):
-        return {}
-    node = payload.get(node_name)
-    if isinstance(node, dict):
-        return node
-    return payload
-
-
-def _peak_success(node: dict[str, Any]) -> bool:
-    return str(node.get("resCode") or "").strip() == "200"
-
-
-def _is_false_provider_flag(value: Any) -> bool:
-    if value is False:
-        return True
-    if isinstance(value, str):
-        return value.strip().lower() in {"false", "failed", "failure", "error"}
-    return False
-
-
-def _is_nonzero_provider_code(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, bool):
-        return value is not False
-    if isinstance(value, int | float):
-        return value != 0
-    if isinstance(value, str):
-        clean = value.strip()
-        if not clean:
-            return False
-        try:
-            return float(clean) != 0
-        except ValueError:
-            return False
-    return False
-
-
-def _provider_body_failure(payload: dict[str, Any]) -> str | None:
-    if _is_false_provider_flag(payload.get("status")):
-        return "Provider response reported status=false."
-    if _is_false_provider_flag(payload.get("success")):
-        return "Provider response reported success=false."
-    for key in ("code", "resCode"):
-        if _is_nonzero_provider_code(payload.get(key)):
-            return f"Provider response reported nonzero {key}."
-    if payload.get("error"):
-        return "Provider response reported an error."
-    return None
-
-
-def _collect_sensitive_values(value: Any, collected: list[str]) -> None:
-    if isinstance(value, dict):
-        for item in value.values():
-            _collect_sensitive_values(item, collected)
-        return
-    if isinstance(value, list | tuple | set):
-        for item in value:
-            _collect_sensitive_values(item, collected)
-        return
-    if value is None:
-        return
-
-    text = str(value)
-    if text.strip():
-        collected.append(text)
-
-
-def _collect_values_from_sensitive_keys(value: Any, collected: list[str]) -> None:
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if _is_sensitive_validation_key(key):
-                _collect_sensitive_values(item, collected)
-            else:
-                _collect_values_from_sensitive_keys(item, collected)
-        return
-    if isinstance(value, list | tuple | set):
-        for item in value:
-            _collect_values_from_sensitive_keys(item, collected)
-
-
-def _sensitive_values(
-    credentials: dict[str, Any],
-    extra_sensitive_values: tuple[Any, ...] = (),
-    provider_response: Any | None = None,
-) -> tuple[str, ...]:
-    values: list[str] = []
-    _collect_sensitive_values(credentials, values)
-    for item in extra_sensitive_values:
-        _collect_sensitive_values(item, values)
-    if provider_response is not None:
-        _collect_values_from_sensitive_keys(provider_response, values)
-
-    return tuple(dict.fromkeys(sorted(values, key=len, reverse=True)))
-
-
-def _is_sensitive_validation_key(key: Any) -> bool:
-    normalized = str(key).strip().lower().replace("-", "_")
-    return normalized in _SENSITIVE_VALIDATION_KEYS or any(
-        marker in normalized
-        for marker in (
-            "api_key",
-            "apikey",
-            "authorization",
-            "ciphertext",
-            "client_id",
-            "client_secret",
-            "credential",
-            "fingerprint",
-            "password",
-            "secret",
-            "token",
-        )
-    )
-
-
-def _mask_sensitive_text(text: str, sensitive_values: tuple[str, ...]) -> str:
-    masked = text
-    for value in sensitive_values:
-        masked = masked.replace(value, "[REDACTED]")
-    return str(redact_json(masked))
-
-
-def _sanitize_validation_failure_key(
-    key: Any,
-    sensitive_values: tuple[str, ...],
-) -> Any:
-    if _is_sensitive_validation_key(key):
-        return "[REDACTED_KEY]"
-
-    key_text = str(key)
-    masked_key = _mask_sensitive_text(key_text, sensitive_values)
-    if masked_key != key_text:
-        return masked_key
-    return key
-
-
-def _dedupe_validation_key(key: Any, existing: dict[Any, Any]) -> Any:
-    if key not in existing:
-        return key
-
-    base = str(key)
-    counter = 2
-    candidate = f"{base}_{counter}"
-    while candidate in existing:
-        counter += 1
-        candidate = f"{base}_{counter}"
-    return candidate
-
-
-def _sanitize_validation_failure_value(
-    value: Any,
-    sensitive_values: tuple[str, ...],
-) -> Any:
-    if isinstance(value, dict):
-        redacted: dict[Any, Any] = {}
-        for key, item in value.items():
-            redacted_key = _dedupe_validation_key(
-                _sanitize_validation_failure_key(key, sensitive_values),
-                redacted,
-            )
-            if _is_sensitive_validation_key(key):
-                redacted[redacted_key] = "[REDACTED]"
-            else:
-                redacted[redacted_key] = _sanitize_validation_failure_value(
-                    item,
-                    sensitive_values,
-                )
-        return redact_json(redacted)
-    if isinstance(value, list):
-        return [
-            _sanitize_validation_failure_value(item, sensitive_values)
-            for item in value
-        ]
-    if isinstance(value, tuple):
-        return tuple(
-            _sanitize_validation_failure_value(item, sensitive_values)
-            for item in value
-        )
-    if isinstance(value, str):
-        return _mask_sensitive_text(value, sensitive_values)
-    if value is not None and str(value) in sensitive_values:
-        return "[REDACTED]"
-    return value
-
-
-def _validation_failed(
-    message: str,
-    *,
-    credentials: dict[str, Any],
-    http_status: int | None = None,
-    provider_response: Any | None = None,
-    error: BaseException | None = None,
-    extra_sensitive_values: tuple[Any, ...] = (),
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "status": "validation_failed",
-        "message": message,
-    }
-    if http_status is not None:
-        payload["http_status"] = http_status
-    if provider_response is not None:
-        payload["provider_response"] = provider_response
-    if error is not None:
-        payload["error_type"] = error.__class__.__name__
-        payload["error"] = str(error)
-
-    return _sanitize_validation_failure_value(
-        payload,
-        _sensitive_values(
-            credentials,
-            extra_sensitive_values,
-            provider_response=provider_response,
-        ),
-    )
-
-
-def _validate_peak_endpoint_access(
+async def validate_connector_connection_healthcheck_async(
     manifest: ConnectorManifest,
     *,
-    credentials: dict[str, Any],
+    credentials: Mapping[str, Any],
     environment: str,
+    client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
-    if environment not in manifest.environments:
-        return {
-            "status": "validation_failed",
-            "message": f"Unsupported environment for {manifest.connector_id}: {environment}",
-        }
+    """Validate built-in provider credentials without exposing provider payloads."""
 
-    missing = required_missing_fields(manifest, credentials)
-    if missing:
-        return {"status": "awaiting_credentials", "missing_fields": missing}
-
-    connect_id = str(credentials["connect_id"]).strip()
-    connect_key = str(credentials["connect_key"]).strip()
-    user_token = str(credentials["user_token"]).strip()
-    preset = manifest.preset_for_environment(environment)
-    api_base_url = str(preset["api_base_url"]).rstrip("/")
-    token_url = f"{api_base_url}{preset.get('token_path', '/clienttoken')}"
-
-    try:
-        token_response = httpx.post(
-            token_url,
-            headers=_peak_headers(connect_id=connect_id, user_token=user_token),
-            json={
-                "PeakClientToken": {
-                    "connectId": connect_id,
-                    "password": connect_key,
-                }
-            },
-            timeout=60,
-        )
-    except httpx.HTTPError as exc:
-        return _validation_failed(
-            "PEAK ClientToken request failed before a valid response was received.",
-            credentials=credentials,
-            error=exc,
-        )
-
-    try:
-        token_payload = token_response.json()
-    except ValueError as exc:
-        return _validation_failed(
-            "PEAK ClientToken response was not valid JSON.",
-            credentials=credentials,
-            http_status=token_response.status_code,
-            error=exc,
-        )
-    if not isinstance(token_payload, dict):
-        return _validation_failed(
-            "PEAK ClientToken response JSON was not an object.",
-            credentials=credentials,
-            http_status=token_response.status_code,
-            provider_response=token_payload,
-        )
-
-    token_node = _peak_node(token_payload, "PeakClientToken")
-    client_token = str(token_node.get("token") or "")
-    if token_response.status_code >= 300 or not client_token or not _peak_success(token_node):
-        return _validation_failed(
-            "PEAK ClientToken request failed.",
-            credentials=credentials,
-            http_status=token_response.status_code,
-            provider_response=token_payload,
-            extra_sensitive_values=(client_token,),
-        )
-
-    try:
-        user_response = httpx.get(
-            f"{api_base_url}/user",
-            headers=_peak_headers(
-                connect_id=connect_id,
-                client_token=client_token,
-                user_token=user_token,
-            ),
-            timeout=60,
-        )
-    except httpx.HTTPError as exc:
-        return _validation_failed(
-            "PEAK user request failed before a valid response was received.",
-            credentials=credentials,
-            error=exc,
-            extra_sensitive_values=(client_token,),
-        )
-
-    try:
-        user_payload = user_response.json()
-    except ValueError as exc:
-        return _validation_failed(
-            "PEAK user response was not valid JSON.",
-            credentials=credentials,
-            http_status=user_response.status_code,
-            error=exc,
-            extra_sensitive_values=(client_token,),
-        )
-    if not isinstance(user_payload, dict):
-        return _validation_failed(
-            "PEAK user response JSON was not an object.",
-            credentials=credentials,
-            http_status=user_response.status_code,
-            provider_response=user_payload,
-            extra_sensitive_values=(client_token,),
-        )
-
-    user_node = _peak_node(user_payload, "PeakUser")
-    if user_response.status_code >= 300 or not _peak_success(user_node):
-        return _validation_failed(
-            "PEAK user request failed.",
-            credentials=credentials,
-            http_status=user_response.status_code,
-            provider_response=user_payload,
-            extra_sensitive_values=(client_token,),
-        )
-
-    return {
-        "status": "connected",
-        "connector_id": manifest.connector_id,
-        "environment": environment,
-        "company_name": None,
-        "enabled_capabilities": manifest.capabilities,
-        "validation": {
-            "clienttoken_status": token_response.status_code,
-            "user_status": user_response.status_code,
-            "user_res_code": str(user_node.get("resCode") or ""),
-        },
-    }
-
-
-def validate_connector_connection_healthcheck(
-    manifest: ConnectorManifest,
-    *,
-    credentials: dict[str, Any],
-    environment: str,
-) -> dict[str, Any]:
-    if manifest.connector_id == "peak":
-        return _validate_peak_endpoint_access(
-            manifest,
-            credentials=credentials,
-            environment=environment,
-        )
-
-    if manifest.connector_id != "flowaccount":
+    if manifest.connector_id not in {"flowaccount", "peak"}:
         return {
             "status": "validation_failed",
             "message": (
@@ -469,130 +88,108 @@ def validate_connector_connection_healthcheck(
             "message": f"Unsupported environment for {manifest.connector_id}: {environment}",
         }
 
-    missing = required_missing_fields(manifest, credentials)
+    missing = required_missing_fields(manifest, dict(credentials))
     if missing:
         return {"status": "awaiting_credentials", "missing_fields": missing}
 
-    preset = manifest.preset_for_environment(environment)
-    try:
-        token_response = httpx.post(
-            preset["token_url"],
-            data={
-                "grant_type": preset["grant_type"],
-                "scope": preset["scope"],
-                "client_id": str(credentials["client_id"]),
-                "client_secret": str(credentials["client_secret"]),
-            },
-            timeout=60,
-        )
-    except httpx.HTTPError as exc:
-        return _validation_failed(
-            "Token request failed before a valid response was received.",
-            credentials=credentials,
-            error=exc,
-        )
+    if client is None:
+        async with httpx.AsyncClient(timeout=60) as owned_client:
+            return await validate_connector_connection_healthcheck_async(
+                manifest,
+                credentials=credentials,
+                environment=environment,
+                client=owned_client,
+            )
+
+    driver = _provider_driver(manifest.connector_id)
+    probe = await driver.validate_credentials(
+        environment=environment,
+        credentials={key: str(value) for key, value in credentials.items()},
+        client=client,
+    )
+    return _compatibility_result(manifest, probe)
+
+
+def validate_connector_connection_healthcheck(
+    manifest: ConnectorManifest,
+    *,
+    credentials: Mapping[str, Any],
+    environment: str,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> dict[str, Any]:
+    """Synchronous compatibility wrapper for callers outside an event loop."""
 
     try:
-        token_payload = token_response.json()
-    except ValueError as exc:
-        return _validation_failed(
-            "Token response was not valid JSON.",
-            credentials=credentials,
-            http_status=token_response.status_code,
-            error=exc,
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(
+            _healthcheck_with_transport(
+                manifest,
+                credentials=credentials,
+                environment=environment,
+                transport=transport,
+            )
         )
-    if not isinstance(token_payload, dict):
-        return _validation_failed(
-            "Token response JSON was not an object.",
+    raise RuntimeError("connector_healthcheck_async_required")
+
+
+async def _healthcheck_with_transport(
+    manifest: ConnectorManifest,
+    *,
+    credentials: Mapping[str, Any],
+    environment: str,
+    transport: httpx.AsyncBaseTransport | None,
+) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=60, transport=transport) as client:
+        return await validate_connector_connection_healthcheck_async(
+            manifest,
             credentials=credentials,
-            http_status=token_response.status_code,
-            provider_response=token_payload,
+            environment=environment,
+            client=client,
         )
 
-    access_token = str(token_payload.get("access_token") or "")
-    if token_response.status_code >= 300 or not access_token:
-        return _validation_failed(
-            "Token request failed.",
-            credentials=credentials,
-            http_status=token_response.status_code,
-            provider_response=token_payload,
-            extra_sensitive_values=(access_token,),
-        )
 
-    token_failure = _provider_body_failure(token_payload)
-    if token_failure:
-        return _validation_failed(
-            f"Token request failed. {token_failure}",
-            credentials=credentials,
-            http_status=token_response.status_code,
-            provider_response=token_payload,
-            extra_sensitive_values=(access_token,),
-        )
+def _provider_driver(connector_id: str):
+    if connector_id == "flowaccount":
+        from mercury_tools.drivers.flowaccount import FlowAccountDriver
 
-    info_url = f"{preset['api_base_url'].rstrip('/')}/company/info"
-    try:
-        info_response = httpx.get(
-            info_url,
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=60,
-        )
-    except httpx.HTTPError as exc:
-        return _validation_failed(
-            "Company info request failed before a valid response was received.",
-            credentials=credentials,
-            error=exc,
-            extra_sensitive_values=(access_token,),
-        )
+        return FlowAccountDriver()
+    if connector_id == "peak":
+        from mercury_tools.drivers.peak import PeakDriver
 
-    try:
-        info_payload = info_response.json()
-    except ValueError as exc:
-        return _validation_failed(
-            "Company info response was not valid JSON.",
-            credentials=credentials,
-            http_status=info_response.status_code,
-            error=exc,
-            extra_sensitive_values=(access_token,),
-        )
-    if not isinstance(info_payload, dict):
-        return _validation_failed(
-            "Company info response JSON was not an object.",
-            credentials=credentials,
-            http_status=info_response.status_code,
-            provider_response=info_payload,
-            extra_sensitive_values=(access_token,),
-        )
+        return PeakDriver()
+    raise ValueError("connector_driver_not_found")
 
-    if info_response.status_code >= 300:
-        return _validation_failed(
-            "Company info request failed.",
-            credentials=credentials,
-            http_status=info_response.status_code,
-            provider_response=info_payload,
-            extra_sensitive_values=(access_token,),
-        )
 
-    info_failure = _provider_body_failure(info_payload)
-    if info_failure:
-        return _validation_failed(
-            f"Company info request failed. {info_failure}",
-            credentials=credentials,
-            http_status=info_response.status_code,
-            provider_response=info_payload,
-            extra_sensitive_values=(access_token,),
-        )
+def _compatibility_result(
+    manifest: ConnectorManifest,
+    probe: ConnectionProbe,
+) -> dict[str, Any]:
+    details = to_jsonable(probe.details)
+    if probe.status == "connected":
+        return {
+            "status": "connected",
+            "connector_id": manifest.connector_id,
+            "environment": probe.environment,
+            "company_name": probe.company_name,
+            "enabled_capabilities": list(manifest.capabilities),
+            "validation": details,
+        }
 
-    return {
-        "status": "connected",
-        "connector_id": manifest.connector_id,
-        "environment": environment,
-        "company_name": _flowaccount_company_name(info_payload),
-        "enabled_capabilities": manifest.capabilities,
-        "validation": {
-            "token_status": token_response.status_code,
-            "company_info_status": info_response.status_code,
-        },
+    error = details.get("error") if isinstance(details, dict) else None
+    result: dict[str, Any] = {
+        "status": "validation_failed",
+        "message": _HEALTHCHECK_MESSAGES.get(
+            error if isinstance(error, str) else "",
+            "Connection healthcheck failed.",
+        ),
     }
+    if isinstance(details, dict):
+        if isinstance(details.get("http_status"), int):
+            result["http_status"] = details["http_status"]
+        if isinstance(details.get("error_type"), str):
+            result["error_type"] = details["error_type"]
+    return result
 
 
 def resolve_setup_state(
@@ -631,14 +228,16 @@ def resolve_setup_state(
 def validate_connector_read_only(
     manifest: ConnectorManifest,
     *,
-    credentials: dict[str, Any],
+    credentials: Mapping[str, Any],
     environment: str,
+    transport: httpx.AsyncBaseTransport | None = None,
 ) -> dict[str, Any]:
     """Deprecated alias for connection healthcheck validation."""
     return validate_connector_connection_healthcheck(
         manifest,
         credentials=credentials,
         environment=environment,
+        transport=transport,
     )
 
 
