@@ -19,9 +19,15 @@ _ROOT_GITIGNORE_LINES = [
 _MERCURY_GITIGNORE_LINES = ["credentials.env", "cache/", "audit/"]
 _REPOSITORY_CONFIG_KEYS = {"schema_version", "trusted_hosts", "connectors"}
 _PRIVATE_NETWORK_ENVIRONMENTS = {"local", "gateway"}
-_FORBIDDEN_METADATA_HOSTS = {
+_FORBIDDEN_METADATA_IPS = {
+    "100.100.100.200",
     "169.254.169.254",
+    "fd00:ec2::254",
+}
+_FORBIDDEN_METADATA_HOSTNAMES = {
+    "instance-data.ec2.internal",
     "metadata",
+    "metadata.goog",
     "metadata.google.internal",
 }
 _AUTH_METADATA_KEYS = {
@@ -549,7 +555,7 @@ def _validate_endpoint_path(path: str) -> None:
 
 
 def _is_forbidden_metadata_host(host: str) -> bool:
-    if host in _FORBIDDEN_METADATA_HOSTS:
+    if host in _FORBIDDEN_METADATA_IPS or host in _FORBIDDEN_METADATA_HOSTNAMES:
         return True
     try:
         address = ipaddress.ip_address(host)

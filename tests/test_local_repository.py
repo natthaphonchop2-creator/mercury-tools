@@ -596,8 +596,10 @@ def test_connector_configuration_preserves_canonical_public_ipv4(tmp_path: Path)
     assert config.trusted_hosts["custom-books"]["production"] == ("93.184.216.34",)
 
 
+@pytest.mark.parametrize("environment", ["local", "gateway"])
 def test_internet_urls_require_https_unless_private_network_is_enabled(
     tmp_path: Path,
+    environment: str,
 ) -> None:
     context = ensure_repository_state(tmp_path)
 
@@ -613,15 +615,49 @@ def test_internet_urls_require_https_unless_private_network_is_enabled(
 
     config = configure_connector(
         context,
-        connector_id="local-books",
-        environment="local",
+        connector_id=f"{environment}-books",
+        environment=environment,
         driver_id="api_key_header",
         base_url="http://localhost:8080/v2",
         auth_settings={"key_name": "X-API-Key", "allow_private_network": True},
     )
 
-    assert config.allow_private_network("local-books", "local") is True
-    assert load_repository_config(context).allow_private_network("local-books", "local") is True
+    assert config.allow_private_network(f"{environment}-books", environment) is True
+    assert load_repository_config(context).allow_private_network(
+        f"{environment}-books", environment
+    ) is True
+
+
+@pytest.mark.parametrize("environment", ["local", "gateway"])
+@pytest.mark.parametrize(
+    ("host", "scheme"),
+    [
+        ("169.254.169.254", "http"),
+        ("fd00:ec2::254", "http"),
+        ("100.100.100.200", "https"),
+        ("metadata.google.internal", "https"),
+        ("metadata.goog", "https"),
+        ("instance-data.ec2.internal", "https"),
+    ],
+)
+def test_connector_configuration_rejects_metadata_targets_even_with_private_network_allowed(
+    tmp_path: Path,
+    environment: str,
+    host: str,
+    scheme: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    url_host = f"[{host}]" if ":" in host else host
+
+    with pytest.raises(ValueError, match="^forbidden_metadata_host$"):
+        configure_connector(
+            context,
+            connector_id=f"{environment}-metadata",
+            environment=environment,
+            driver_id="api_key_header",
+            base_url=f"{scheme}://{url_host}/v1",
+            auth_settings={"key_name": "X-API-Key", "allow_private_network": True},
+        )
 
 
 @pytest.mark.parametrize("allow_private_network", ["false", 0, 1, None])
