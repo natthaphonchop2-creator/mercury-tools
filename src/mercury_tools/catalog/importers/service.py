@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
+import queue
 import stat
+import threading
 import time
 from collections.abc import Callable, Mapping
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +33,7 @@ from mercury_tools.safety.network import NetworkPolicy, NetworkPolicyError, Reso
 MAX_SPEC_BYTES = 10 * 1024 * 1024
 REMOTE_IMPORT_DEADLINE_SECONDS = 20.0
 _READ_CHUNK_BYTES = 64 * 1024
-_YAML_MARKERS = ("openapi:", "swagger:", "info:")
+_YAML_MARKERS = {"info", "openapi", "swagger"}
 _monotonic = time.monotonic
 
 
@@ -141,12 +144,17 @@ def _parse_structured_document(text: str) -> dict[str, Any] | None:
         except (json.JSONDecodeError, ValueError):
             raise ValueError("spec_document_invalid") from None
         return value if isinstance(value, dict) else None
-    if not _looks_like_yaml_spec(text):
+    try:
+        root = yaml.compose(text, Loader=yaml.SafeLoader)
+    except yaml.YAMLError:
+        if _contains_yaml_marker_line(text):
+            raise ValueError("spec_document_invalid") from None
+        return None
+    if not _yaml_root_has_marker(root):
         return None
     try:
         if any(isinstance(token, AliasToken) for token in yaml.scan(text)):
             raise ValueError("yaml_alias_forbidden")
-        root = yaml.compose(text, Loader=yaml.SafeLoader)
         _validate_yaml_nodes(root)
         value = yaml.safe_load(text)
     except (TypeError, ValueError, yaml.YAMLError):
@@ -163,18 +171,19 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _looks_like_yaml_spec(text: str) -> bool:
-    for line in text.splitlines():
-        stripped = line.strip().casefold()
-        if (
-            not stripped
-            or stripped.startswith("#")
-            or stripped.startswith("%yaml")
-            or stripped in {"---", "..."}
-        ):
-            continue
-        return stripped.startswith(_YAML_MARKERS)
-    return False
+def _yaml_root_has_marker(node: Node | None) -> bool:
+    if not isinstance(node, MappingNode):
+        return False
+    return any(
+        isinstance(key_node, ScalarNode)
+        and key_node.value.strip().casefold() in _YAML_MARKERS
+        for key_node, _ in node.value
+    )
+
+
+def _contains_yaml_marker_line(text: str) -> bool:
+    markers = tuple(f"{marker}:" for marker in sorted(_YAML_MARKERS))
+    return any(line.strip().casefold().startswith(markers) for line in text.splitlines())
 
 
 def _validate_yaml_nodes(node: Node | None, *, depth: int = 0) -> int:
@@ -225,51 +234,55 @@ def _read_local_source(context: RepositoryContext, source_path: str | Path) -> t
     candidate = Path(os.path.abspath(requested))
     if candidate != root and not candidate.is_relative_to(root):
         raise ValueError("spec_source_outside_root")
-    _reject_symlink_components(root, candidate)
-    try:
-        before_open = os.stat(candidate, follow_symlinks=False)
-    except FileNotFoundError:
-        raise ValueError("spec_source_not_regular") from None
-    except OSError:
-        raise ValueError("spec_source_unreadable") from None
+    parts = candidate.relative_to(root).parts
+    if not parts:
+        raise ValueError("spec_source_not_regular")
 
-    flags = os.O_RDONLY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    directory_flags = _local_open_flags(directory=True)
+    file_flags = _local_open_flags(directory=False)
+    chunks: list[bytes] = []
     try:
-        descriptor = os.open(candidate, flags)
+        with ExitStack() as descriptors:
+            root_descriptor = os.open(root, directory_flags)
+            descriptors.callback(_close_descriptor, root_descriptor)
+            root_identity = _descriptor_identity(root_descriptor)
+            parent_descriptor = root_descriptor
+            for component in parts[:-1]:
+                parent_descriptor = os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=parent_descriptor,
+                )
+                descriptors.callback(_close_descriptor, parent_descriptor)
+            descriptor = os.open(parts[-1], file_flags, dir_fd=parent_descriptor)
+            descriptors.callback(_close_descriptor, descriptor)
+
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise ValueError("spec_source_not_regular")
+            if opened.st_size > MAX_SPEC_BYTES:
+                raise ValueError("spec_source_too_large")
+            size = 0
+            while True:
+                chunk = os.read(
+                    descriptor,
+                    min(_READ_CHUNK_BYTES, MAX_SPEC_BYTES + 1 - size),
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > MAX_SPEC_BYTES:
+                    raise ValueError("spec_source_too_large")
+            _verify_root_identity(root, directory_flags, root_identity)
     except FileNotFoundError:
         raise ValueError("spec_source_not_regular") from None
-    except OSError:
+    except ValueError:
+        raise
+    except OSError as error:
+        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise ValueError("spec_source_symlink") from None
         raise ValueError("spec_source_unreadable") from None
-    try:
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode):
-            raise ValueError("spec_source_not_regular")
-        if (before_open.st_dev, before_open.st_ino) != (opened.st_dev, opened.st_ino):
-            raise ValueError("spec_source_changed")
-        if opened.st_size > MAX_SPEC_BYTES:
-            raise ValueError("spec_source_too_large")
-        chunks: list[bytes] = []
-        size = 0
-        while True:
-            chunk = os.read(descriptor, min(_READ_CHUNK_BYTES, MAX_SPEC_BYTES + 1 - size))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            size += len(chunk)
-            if size > MAX_SPEC_BYTES:
-                raise ValueError("spec_source_too_large")
-        current = os.stat(candidate, follow_symlinks=False)
-        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
-            raise ValueError("spec_source_changed")
-    except OSError:
-        raise ValueError("spec_source_unreadable") from None
-    finally:
-        with suppress(OSError):
-            os.close(descriptor)
     try:
         text = b"".join(chunks).decode("utf-8", errors="strict")
     except UnicodeDecodeError:
@@ -277,18 +290,40 @@ def _read_local_source(context: RepositoryContext, source_path: str | Path) -> t
     return text, candidate.as_uri()
 
 
-def _reject_symlink_components(root: Path, candidate: Path) -> None:
-    current = root
+def _local_open_flags(*, directory: bool) -> int:
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if directory:
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+def _descriptor_identity(descriptor: int) -> tuple[int, int]:
+    status = os.fstat(descriptor)
+    return status.st_dev, status.st_ino
+
+
+def _close_descriptor(descriptor: int) -> None:
+    with suppress(OSError):
+        os.close(descriptor)
+
+
+def _verify_root_identity(
+    root: Path,
+    directory_flags: int,
+    expected: tuple[int, int],
+) -> None:
     try:
-        for part in candidate.relative_to(root).parts:
-            current = current / part
-            status = current.lstat()
-            if stat.S_ISLNK(status.st_mode):
-                raise ValueError("spec_source_symlink")
-    except FileNotFoundError:
-        raise ValueError("spec_source_not_regular") from None
+        current_descriptor = os.open(root, directory_flags)
     except OSError:
-        raise ValueError("spec_source_unreadable") from None
+        raise ValueError("spec_source_changed") from None
+    try:
+        if _descriptor_identity(current_descriptor) != expected:
+            raise ValueError("spec_source_changed")
+    finally:
+        with suppress(OSError):
+            os.close(current_descriptor)
 
 
 def _read_remote_source(
@@ -298,7 +333,11 @@ def _read_remote_source(
 ) -> tuple[str, str]:
     clock = monotonic or _monotonic
     deadline = clock() + REMOTE_IMPORT_DEADLINE_SECONDS
-    target = NetworkPolicy().resolve_https_target(source_url)
+    target = _call_with_deadline(
+        lambda: NetworkPolicy().resolve_https_target(source_url),
+        deadline=deadline,
+        monotonic=clock,
+    )
     remaining = _deadline_remaining(deadline, clock)
     timeout = httpx.Timeout(
         connect=min(5.0, remaining),
@@ -307,39 +346,55 @@ def _read_remote_source(
         pool=min(5.0, remaining),
     )
     headers = {"Accept": "application/json, application/yaml, text/yaml, text/markdown"}
+    client = httpx.Client(
+        follow_redirects=False,
+        timeout=timeout,
+        headers=headers,
+        trust_env=False,
+    )
+    response: httpx.Response | None = None
     try:
-        with httpx.Client(
-            follow_redirects=False,
-            timeout=timeout,
-            headers=headers,
-            trust_env=False,
-        ) as client, client.stream("GET", target.url) as response:
-            _deadline_remaining(deadline, clock)
-            if 300 <= response.status_code < 400:
-                raise ValueError("remote_redirect_forbidden")
-            if not 200 <= response.status_code < 300:
-                raise ValueError("remote_http_error")
-            _verify_response_peer(response, target)
-            chunks: list[bytes] = []
-            size = 0
-            iterator = iter(response.iter_bytes())
-            while True:
-                _deadline_remaining(deadline, clock)
-                try:
-                    chunk = next(iterator)
-                except StopIteration:
-                    break
-                _deadline_remaining(deadline, clock)
-                size += len(chunk)
-                if size > MAX_SPEC_BYTES:
-                    raise ValueError("spec_source_too_large")
-                chunks.append(chunk)
+        request = client.build_request("GET", target.url)
+        response = _call_with_deadline(
+            lambda: client.send(request, stream=True),
+            deadline=deadline,
+            monotonic=clock,
+            on_timeout=client.close,
+        )
+        if 300 <= response.status_code < 400:
+            raise ValueError("remote_redirect_forbidden")
+        if not 200 <= response.status_code < 300:
+            raise ValueError("remote_http_error")
+        _verify_response_peer(response, target)
+        chunks: list[bytes] = []
+        size = 0
+        iterator = iter(response.iter_bytes())
+        while True:
+            try:
+                chunk = _call_with_deadline(
+                    lambda: next(iterator),
+                    deadline=deadline,
+                    monotonic=clock,
+                    on_timeout=response.close,
+                )
+            except StopIteration:
+                break
+            size += len(chunk)
+            if size > MAX_SPEC_BYTES:
+                raise ValueError("spec_source_too_large")
+            chunks.append(chunk)
     except (NetworkPolicyError, ValueError):
         raise
     except httpx.TimeoutException:
         raise ValueError("remote_request_timeout") from None
     except (httpx.HTTPError, OSError):
         raise ValueError("remote_request_failed") from None
+    finally:
+        if response is not None:
+            with suppress(Exception):
+                response.close()
+        with suppress(Exception):
+            client.close()
     try:
         text = b"".join(chunks).decode("utf-8", errors="strict")
     except UnicodeDecodeError:
@@ -366,3 +421,34 @@ def _deadline_remaining(deadline: float, monotonic: Callable[[], float]) -> floa
     if remaining <= 0:
         raise ValueError("remote_import_deadline_exceeded")
     return remaining
+
+
+def _call_with_deadline(
+    operation: Callable[[], Any],
+    *,
+    deadline: float,
+    monotonic: Callable[[], float],
+    on_timeout: Callable[[], Any] | None = None,
+) -> Any:
+    results: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def run() -> None:
+        try:
+            result = (True, operation())
+        except BaseException as error:
+            result = (False, error)
+        with suppress(queue.Full):
+            results.put_nowait(result)
+
+    threading.Thread(target=run, daemon=True).start()
+    try:
+        succeeded, value = results.get(timeout=_deadline_remaining(deadline, monotonic))
+        _deadline_remaining(deadline, monotonic)
+    except (queue.Empty, ValueError):
+        if on_timeout is not None:
+            with suppress(Exception):
+                on_timeout()
+        raise ValueError("remote_import_deadline_exceeded") from None
+    if succeeded:
+        return value
+    raise value

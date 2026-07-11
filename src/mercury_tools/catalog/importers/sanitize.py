@@ -13,13 +13,13 @@ from mercury_tools.safety.redaction import redact_text
 _REDACTED = "[REDACTED]"
 _VALUE_KEYS = {"current", "currentvalue", "default", "example", "examples", "initial"}
 _CONTEXT_VALUE_KEYS = _VALUE_KEYS | {"value", "values"}
-_VALUE_CONTAINERS = {"cookie", "cookies"}
+_VALUE_CONTAINERS = {"cookie", "cookies", "setcookie"}
 _DESCRIPTION_KEYS = {"description", "summary", "title"}
 _IDENTIFIER_FIELDS = {"header", "headername", "key", "name", "parametername"}
 _SENSITIVE_ASSIGNMENT = re.compile(
     r"(?i)\b(?P<key>[a-z0-9_-]*(?:authorization|credential|secret|token|password|"
     r"passwd|pwd|api[_-]?key)[a-z0-9_-]*)\s*[:=]\s*"
-    r"(?P<value>(?!\[REDACTED\])[^\s,;]+)"
+    r"(?P<value>(?!\[REDACTED\])(?:(?:basic|bearer)\s+)?[^\s,;]+)"
 )
 _SENSITIVE_HEADER_TEXT = re.compile(
     r"(?im)\b(?P<key>authorization|proxy-authorization|cookie|set-cookie)"
@@ -48,14 +48,16 @@ def sanitize_spec(value: Any) -> tuple[Any, SanitizationReport]:
 
 
 def _sanitize_spec_fields(value: Any, *, parent_key: str = "") -> Any:
+    parent_is_value_container = _normalized(parent_key) in _VALUE_CONTAINERS
     if isinstance(value, Mapping):
-        context = _normalized(parent_key) in _VALUE_CONTAINERS or _value_record_context(value)
+        cookie_jar = parent_is_value_container and not _named_cookie_record(value)
+        context = parent_is_value_container or _value_record_context(value)
         sanitized: dict[str, Any] = {}
         for key, item in value.items():
             if not isinstance(key, str):
                 raise ValueError("unsupported_canonical_key")
             normalized_key = _normalized(key)
-            if normalized_key in _VALUE_KEYS or (
+            if cookie_jar or normalized_key in _VALUE_KEYS or (
                 context and normalized_key in _CONTEXT_VALUE_KEYS
             ):
                 sanitized[key] = _redact_payload(item)
@@ -64,6 +66,8 @@ def _sanitize_spec_fields(value: Any, *, parent_key: str = "") -> Any:
         return sanitized
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [_sanitize_spec_fields(item, parent_key=parent_key) for item in value]
+    if parent_is_value_container:
+        return _redact_payload(value)
     if isinstance(value, str):
         return _sanitize_string(value)
     return value
@@ -125,6 +129,15 @@ def _value_record_context(value: Mapping[Any, Any]) -> bool:
         ) or catalog_identity._is_sensitive_header_name(normalized):
             return True
     return False
+
+
+def _named_cookie_record(value: Mapping[Any, Any]) -> bool:
+    normalized_keys = {
+        _normalized(key) for key in value if isinstance(key, str)
+    }
+    return bool(normalized_keys & _IDENTIFIER_FIELDS) and bool(
+        normalized_keys & _CONTEXT_VALUE_KEYS
+    )
 
 
 def _relocate_sensitive_property_descriptions(value: Any) -> Any:

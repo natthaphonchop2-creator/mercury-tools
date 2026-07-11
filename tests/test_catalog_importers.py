@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import socket
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,7 @@ from mercury_tools.catalog.importers.sanitize import sanitize_spec
 from mercury_tools.catalog.importers.service import MAX_SPEC_BYTES, import_spec
 from mercury_tools.catalog.models import CatalogAction, CatalogSource
 from mercury_tools.local.repository import ensure_repository_state
-from mercury_tools.safety.network import NetworkPolicy, NetworkPolicyError
+from mercury_tools.safety.network import NetworkPolicy, NetworkPolicyError, ResolvedTarget
 
 FIXTURES = Path(__file__).parent / "fixtures" / "catalog"
 
@@ -337,6 +338,31 @@ def test_markdown_with_document_marker_remains_markdown(tmp_path: Path) -> None:
     assert result.source.source_type == "documentation"
 
 
+def test_yaml_detection_is_key_order_independent_and_uses_format_precedence(
+    tmp_path: Path,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    source_path = tmp_path / "ordered.yaml"
+    source_path.write_text(
+        "paths:\n"
+        "  /items:\n"
+        "    get:\n"
+        "      responses:\n"
+        '        "200": {description: OK}\n'
+        "item: []\n"
+        "info:\n"
+        '  version: "1"\n'
+        "  schema: https://schema.getpostman.com/json/collection/v2.1.0/collection.json\n"
+        'swagger: "2.0"\n'
+        'openapi: "3.0.0"\n'
+    )
+
+    result = import_spec(context, connector_id="custom", source_path=source_path)
+
+    assert result.source.source_type == "openapi3"
+    assert result.actions[0].path_template == "/items"
+
+
 def test_requires_exactly_one_source_and_local_source_inside_root(tmp_path: Path) -> None:
     context = ensure_repository_state(tmp_path)
     inside = _fixture_in_root(tmp_path, "openapi3.json")
@@ -379,6 +405,48 @@ def test_local_source_rejects_symlink_nonregular_oversize_and_invalid_utf8(
     invalid_utf8.write_bytes(b"{\xff}")
     with pytest.raises(ValueError, match="spec_source_invalid_utf8"):
         import_spec(context, connector_id="custom", source_path=invalid_utf8)
+
+
+def test_local_source_reads_from_pinned_directory_during_intermediate_swap(
+    tmp_path_factory,
+    monkeypatch,
+) -> None:
+    root = tmp_path_factory.mktemp("repository")
+    outside = tmp_path_factory.mktemp("outside")
+    context = ensure_repository_state(root)
+    nested = root / "nested"
+    nested.mkdir()
+    source_path = nested / "spec.json"
+    trusted_document = {
+        "openapi": "3.0.0",
+        "info": {"version": "1"},
+        "paths": {"/inside": {"get": {"responses": {"200": {"description": "OK"}}}}},
+    }
+    outside_document = {
+        "openapi": "3.0.0",
+        "info": {"version": "1"},
+        "paths": {"/outside": {"get": {"responses": {"200": {"description": "OK"}}}}},
+    }
+    source_path.write_text(json.dumps(trusted_document))
+    (outside / "spec.json").write_text(json.dumps(outside_document))
+    original_open = os.open
+    swapped = False
+
+    def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        is_final_open = Path(path) == source_path or (path == "spec.json" and dir_fd is not None)
+        if is_final_open and not swapped:
+            swapped = True
+            nested.rename(root / "pinned-nested")
+            nested.symlink_to(outside, target_is_directory=True)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(service.os, "open", swapping_open)
+
+    result = import_spec(context, connector_id="custom", source_path=source_path)
+
+    assert swapped is True
+    assert [action.path_template for action in result.actions] == ["/inside"]
 
 
 @pytest.mark.parametrize(
@@ -762,6 +830,119 @@ def test_remote_import_enforces_total_deadline_during_stream(
         )
 
 
+def test_remote_deadline_bounds_blocking_dns_in_daemon_worker(monkeypatch) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_resolver(_self, _url):
+        if threading.current_thread() is threading.main_thread():
+            raise AssertionError("DNS resolution ran on the importing thread")
+        entered.set()
+        release.wait()
+        return ResolvedTarget(
+            url="https://specs.example.test/openapi.json",
+            hostname="specs.example.test",
+            port=443,
+            addresses=("93.184.216.34",),
+        )
+
+    monkeypatch.setattr(NetworkPolicy, "resolve_https_target", blocking_resolver)
+    monkeypatch.setattr(service, "REMOTE_IMPORT_DEADLINE_SECONDS", 0.05)
+
+    try:
+        with pytest.raises(ValueError, match="^remote_import_deadline_exceeded$"):
+            service._read_remote_source("https://specs.example.test/openapi.json")
+        assert entered.is_set()
+    finally:
+        release.set()
+
+
+def test_remote_deadline_bounds_blocking_request_and_headers(monkeypatch) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_handler(_request: httpx.Request) -> httpx.Response:
+        if threading.current_thread() is threading.main_thread():
+            raise AssertionError("request ran on the importing thread")
+        entered.set()
+        release.wait()
+        return _mock_response(200, json={"openapi": "3.0.0"})
+
+    monkeypatch.setattr(
+        NetworkPolicy,
+        "resolve_https_target",
+        lambda _self, url: ResolvedTarget(
+            url=url,
+            hostname="specs.example.test",
+            port=443,
+            addresses=("93.184.216.34",),
+        ),
+    )
+    original_client = httpx.Client
+
+    def client_factory(**kwargs):
+        return original_client(transport=httpx.MockTransport(blocking_handler), **kwargs)
+
+    monkeypatch.setattr(service.httpx, "Client", client_factory)
+    monkeypatch.setattr(service, "REMOTE_IMPORT_DEADLINE_SECONDS", 0.05)
+
+    try:
+        with pytest.raises(ValueError, match="^remote_import_deadline_exceeded$"):
+            service._read_remote_source("https://specs.example.test/openapi.json")
+        assert entered.is_set()
+    finally:
+        release.set()
+
+
+def test_remote_deadline_bounds_each_blocking_stream_read_and_closes_response(
+    monkeypatch,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+
+    class BlockingStream(httpx.SyncByteStream):
+        def __iter__(self):
+            if threading.current_thread() is threading.main_thread():
+                raise AssertionError("stream read ran on the importing thread")
+            entered.set()
+            release.wait()
+            yield b'{' + b'"openapi":"3.0.0"}'
+
+        def close(self) -> None:
+            closed.set()
+            release.set()
+
+    monkeypatch.setattr(
+        NetworkPolicy,
+        "resolve_https_target",
+        lambda _self, url: ResolvedTarget(
+            url=url,
+            hostname="specs.example.test",
+            port=443,
+            addresses=("93.184.216.34",),
+        ),
+    )
+    original_client = httpx.Client
+
+    def client_factory(**kwargs):
+        transport = httpx.MockTransport(
+            lambda _request: _mock_response(200, stream=BlockingStream())
+        )
+        return original_client(transport=transport, **kwargs)
+
+    monkeypatch.setattr(service.httpx, "Client", client_factory)
+    monkeypatch.setattr(service, "REMOTE_IMPORT_DEADLINE_SECONDS", 0.05)
+
+    try:
+        with pytest.raises(ValueError, match="^remote_import_deadline_exceeded$"):
+            service._read_remote_source("https://specs.example.test/openapi.json")
+        assert entered.is_set()
+        assert closed.is_set()
+    finally:
+        release.set()
+
+
 def test_remote_errors_use_constant_codes_without_url_or_body_echo(
     tmp_path: Path,
     monkeypatch,
@@ -827,14 +1008,14 @@ def test_local_os_errors_use_constant_code_without_path_echo(
     context = ensure_repository_state(tmp_path)
     source_path = tmp_path / "private-spec-name.json"
     source_path.write_text("{}")
-    original_stat = service.os.stat
+    original_open = service.os.open
 
-    def failing_stat(path, *args, **kwargs):
-        if Path(path) == source_path:
+    def failing_open(path, flags, mode=0o777, *, dir_fd=None):
+        if path == source_path.name and dir_fd is not None:
             raise OSError(f"cannot open {source_path}")
-        return original_stat(path, *args, **kwargs)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(service.os, "stat", failing_stat)
+    monkeypatch.setattr(service.os, "open", failing_open)
 
     with pytest.raises(ValueError, match="^spec_source_unreadable$") as error:
         import_spec(context, connector_id="custom", source_path=source_path)

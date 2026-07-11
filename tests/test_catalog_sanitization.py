@@ -145,3 +145,70 @@ def test_free_text_redacts_basic_cookie_and_sensitive_assignments_idempotently()
     assert second == first
     assert second_report == SanitizationReport(redacted_values=0, safe=True)
     validate_credential_safe(first)
+
+
+def test_sensitive_assignments_redact_complete_schemed_values_everywhere() -> None:
+    basic_payload = "dXNlcjpwYXNzd29yZA=="
+    bearer_payload = "eyJhbGciOiJIUzI1NiJ9.raw-signature"
+    document = {
+        "source": f"password=Basic {basic_payload}",
+        "action": f"api_key=Bearer {bearer_payload}",
+        "errors": [
+            f"password: Basic {basic_payload}",
+            f"api_key: Bearer {bearer_payload}",
+        ],
+    }
+
+    first, _ = sanitize_spec(document)
+    second, second_report = sanitize_spec(first)
+
+    serialized = json.dumps(first)
+    assert basic_payload not in serialized
+    assert bearer_payload not in serialized
+    assert first == {
+        "source": "password=[REDACTED]",
+        "action": "api_key=[REDACTED]",
+        "errors": ["password=[REDACTED]", "api_key=[REDACTED]"],
+    }
+    assert second == first
+    assert second_report == SanitizationReport(redacted_values=0, safe=True)
+    validate_credential_safe(first)
+
+
+def test_mapping_shaped_cookie_jars_redact_values_and_preserve_names() -> None:
+    document = {
+        "cookie": {"session": "raw-session"},
+        "cookies": {"csrf": "raw-csrf", "preference": 42},
+        "set-cookie": {"refresh": "raw-refresh"},
+    }
+
+    first, _ = sanitize_spec(document)
+    second, second_report = sanitize_spec(first)
+
+    assert first == {
+        "cookie": {"session": "[REDACTED]"},
+        "cookies": {"csrf": "[REDACTED]", "preference": "[REDACTED]"},
+        "set-cookie": {"refresh": "[REDACTED]"},
+    }
+    assert "raw-" not in json.dumps(first)
+    assert second == first
+    assert second_report == SanitizationReport(redacted_values=0, safe=True)
+    validate_credential_safe(first)
+
+
+def test_scalar_and_sequence_cookie_jars_force_redact_every_value() -> None:
+    document = {
+        "cookie": "session=raw-session",
+        "cookies": ["raw-first", 42, True],
+        "set-cookie": ["refresh=raw-refresh"],
+    }
+
+    sanitized, _ = sanitize_spec(document)
+
+    assert sanitized == {
+        "cookie": "[REDACTED]",
+        "cookies": ["[REDACTED]", "[REDACTED]", "[REDACTED]"],
+        "set-cookie": ["[REDACTED]"],
+    }
+    assert "raw-" not in json.dumps(sanitized)
+    validate_credential_safe(sanitized)
