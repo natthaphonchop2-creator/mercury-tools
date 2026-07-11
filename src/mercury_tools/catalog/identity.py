@@ -268,23 +268,36 @@ def _canonical_value(value: Any) -> Any:
     raise ValueError("unsupported_canonical_value")
 
 
-def _inspect_credential_paths(value: Any, *, parent_key: str = "") -> None:
+def _inspect_credential_paths(
+    value: Any,
+    *,
+    parent_key: str = "",
+    in_path_context: bool = False,
+) -> None:
     if isinstance(value, Mapping):
         for key, item in value.items():
             if not isinstance(key, str):
                 continue
-            decoded_key = _decode_path_value(key)
-            normalized_key = _normalized_name(decoded_key)
-            if decoded_key.lstrip().startswith("/"):
+            normalized_key = _normalized_name(key)
+            decoded_key = _structural_path_key(key, in_path_context=in_path_context)
+            if decoded_key is not None:
                 validate_credential_safe_path(decoded_key)
             if normalized_key in _PATH_VALUE_FIELDS or (
                 normalized_key == "raw" and _normalized_name(parent_key) == "url"
             ):
                 _inspect_path_value(item)
-            _inspect_credential_paths(item, parent_key=decoded_key)
+            _inspect_credential_paths(
+                item,
+                parent_key=key,
+                in_path_context=in_path_context or normalized_key in _PATH_VALUE_FIELDS,
+            )
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         for item in value:
-            _inspect_credential_paths(item, parent_key=parent_key)
+            _inspect_credential_paths(
+                item,
+                parent_key=parent_key,
+                in_path_context=in_path_context,
+            )
 
 
 def _inspect_path_value(value: Any) -> None:
@@ -311,26 +324,46 @@ def _decode_path_value(value: str) -> str:
     decoded = value
     for _ in range(len(value) + 1):
         if not _has_valid_percent_encoding(decoded):
+            return decoded
+        next_decoded = _decode_percent_encoded_utf8(decoded)
+        if next_decoded is None:
             raise ValueError(_CREDENTIAL_PATH_UNSAFE)
-        try:
-            next_decoded = unquote(decoded, encoding="utf-8", errors="strict")
-        except UnicodeDecodeError as error:
-            raise ValueError(_CREDENTIAL_PATH_UNSAFE) from error
         if next_decoded == decoded:
             return decoded
         decoded = next_decoded
     raise ValueError(_CREDENTIAL_PATH_UNSAFE)
 
 
+def _structural_path_key(key: str, *, in_path_context: bool) -> str | None:
+    if in_path_context:
+        return _decode_path_value(key)
+    decoded = key
+    for _ in range(len(key) + 1):
+        if decoded.lstrip().startswith("/"):
+            return decoded
+        if not _has_valid_percent_encoding(decoded):
+            return None
+        next_decoded = _decode_percent_encoded_utf8(decoded)
+        if next_decoded is None or next_decoded == decoded:
+            return None
+        decoded = next_decoded
+    return None
+
+
+def _decode_percent_encoded_utf8(value: str) -> str | None:
+    try:
+        return unquote(value, encoding="utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None
+
+
 def _has_valid_percent_encoding(value: str) -> bool:
-    for index, character in enumerate(value):
-        if character != "%":
-            continue
-        if index + 2 >= len(value) or any(
-            digit not in "0123456789abcdefABCDEF" for digit in value[index + 1 : index + 3]
-        ):
-            return False
-    return True
+    return any(
+        character == "%"
+        and index + 2 < len(value)
+        and all(digit in "0123456789abcdefABCDEF" for digit in value[index + 1 : index + 3])
+        for index, character in enumerate(value)
+    )
 
 
 def _path_segment_has_credential(segment: str) -> bool:

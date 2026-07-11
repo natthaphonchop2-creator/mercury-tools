@@ -8,6 +8,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -848,6 +849,31 @@ def test_import_rejects_encoded_structural_endpoint_path_key_without_echo(
                 "openapi": "3.0.0",
                 "info": {"version": "1"},
                 "paths": {f"%2Fv1%2Fclient_secret%3D{secret}": {}},
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="^catalog_credential_path_unsafe$") as raised:
+        import_spec(context, connector_id="custom", source_path=source_path)
+
+    assert secret not in str(raised.value)
+
+
+def test_import_rejects_deeply_encoded_structural_endpoint_path_key_without_echo(
+    tmp_path: Path,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    secret = "task-4-import-deep-structural-secret-must-not-echo"
+    encoded_path = f"/v1/client_secret={secret}"
+    for _ in range(4):
+        encoded_path = quote(encoded_path, safe="")
+    source_path = tmp_path / "unsafe-deeply-encoded-path-key.json"
+    source_path.write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.0",
+                "info": {"version": "1"},
+                "paths": {encoded_path: {}},
             }
         )
     )

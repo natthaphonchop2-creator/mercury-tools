@@ -10,6 +10,7 @@ from mercury_tools.catalog.identity import (
     build_source_id,
     build_version_id,
     canonical_json,
+    validate_credential_safe_path,
 )
 from mercury_tools.catalog.models import CatalogSource, HttpMethod, RiskTier
 
@@ -577,6 +578,58 @@ def test_catalog_source_rejects_encoded_structural_endpoint_path_key_without_ech
                 "openapi": "3.0.0",
                 "paths": {f"%2Fv1%2Fclient_secret%3D{secret}": {}},
             },
+            report={"status": "imported"},
+        )
+
+    assert secret not in str(raised.value)
+
+
+def test_invalid_percent_decoded_utf8_path_error_has_no_exception_chain() -> None:
+    with pytest.raises(ValueError, match="^catalog_credential_path_unsafe$") as raised:
+        validate_credential_safe_path("/v1/%FF")
+
+    assert type(raised.value) is ValueError
+    error: BaseException | None = raised.value
+    while error is not None:
+        assert "%FF" not in str(error)
+        assert "b'\\xff'" not in repr(error)
+        assert error.__cause__ is None
+        error = error.__context__
+
+
+def test_catalog_paths_allow_stable_literal_percent_after_decoding(action_factory) -> None:
+    encoded_path = "/rates/100%25"
+
+    validate_credential_safe_path(encoded_path)
+    validate_credential_safe_path(encoded_path)
+    action = action_factory(path_template=encoded_path)
+
+    assert action.path_template == encoded_path
+
+
+@pytest.mark.parametrize("key", ["rate%", "rate%25"])
+def test_catalog_source_allows_non_path_mapping_keys_with_percent(key: str) -> None:
+    source = CatalogSource.from_document(
+        uri="https://example.test/openapi.json",
+        connector_id="flowaccount",
+        document={"openapi": "3.0.0", key: {"description": "ordinary metadata"}},
+        report={"status": "imported"},
+    )
+
+    assert key in source.sanitization["document"]
+
+
+def test_catalog_source_rejects_deeply_encoded_structural_path_key_without_echo() -> None:
+    secret = "task-4-deep-structural-secret-must-not-echo"
+    encoded_path = f"/v1/client_secret={secret}"
+    for _ in range(4):
+        encoded_path = quote(encoded_path, safe="")
+
+    with pytest.raises(ValidationError, match="catalog_credential_path_unsafe") as raised:
+        CatalogSource.from_document(
+            uri="https://example.test/openapi.json",
+            connector_id="flowaccount",
+            document={"openapi": "3.0.0", "paths": {encoded_path: {}}},
             report={"status": "imported"},
         )
 
