@@ -25,14 +25,18 @@ _DOTENV_ASSIGNMENT = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]+$")
 _SIMPLE_COMPONENT = re.compile(r"^[a-z][a-z0-9]*$")
 _SIMPLE_FIELD = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
-_PROFILE_METADATA_PREFIX = "MERCURY__PROFILE_"
+_PROFILE_METADATA_PREFIX = "_MERCURY_PROFILE_INDEX_"
 _HASH_LENGTH = 12
 
 
 @dataclass
 class _CredentialDocument:
     values: dict[str, str]
-    profiles: dict[tuple[str, str], set[str]]
+    profiles: dict[tuple[str, str], dict[str, str]]
+
+
+class _DuplicateIndexKeyError(ValueError):
+    pass
 
 
 class CredentialStore:
@@ -103,11 +107,11 @@ class CredentialStore:
 
         document = self._read()
         profile = (connector_id, environment)
-        profile_names = set(document.profiles.get(profile, set()))
+        profile_fields = dict(document.profiles.get(profile, {}))
         owners = {
             name: stored_profile
-            for stored_profile, stored_names in document.profiles.items()
-            for name in stored_names
+            for stored_profile, stored_fields in document.profiles.items()
+            for name in stored_fields.values()
         }
         for field_name, value in values.items():
             environment_name = field_names[field_name]
@@ -115,12 +119,12 @@ class CredentialStore:
                 raise ValueError("ambiguous_credential_identifier")
             if value:
                 document.values[environment_name] = value
-                profile_names.add(environment_name)
+                profile_fields[field_name] = environment_name
             else:
                 document.values.pop(environment_name, None)
-                profile_names.discard(environment_name)
-        if profile_names:
-            document.profiles[profile] = profile_names
+                profile_fields.pop(field_name, None)
+        if profile_fields:
+            document.profiles[profile] = profile_fields
         else:
             document.profiles.pop(profile, None)
 
@@ -162,25 +166,26 @@ class CredentialStore:
 
         document = self._read()
         names_to_clear: set[str] = set()
-        indexed_names = {
-            name for profile_names in document.profiles.values() for name in profile_names
-        }
-        for profile, profile_names in document.profiles.items():
+        for profile, profile_fields in document.profiles.items():
             if _profile_matches(profile, connector_id, environment):
-                names_to_clear.update(profile_names)
-        for name in document.values.keys() - indexed_names:
-            legacy_profile = _legacy_profile(name)
-            if legacy_profile is not None and _profile_matches(
-                legacy_profile, connector_id, environment
-            ):
-                names_to_clear.add(name)
+                for field_name, indexed_name in profile_fields.items():
+                    recomputed_name = credential_env_name(*profile, field_name)
+                    if indexed_name != recomputed_name:
+                        raise ValueError("invalid_credential_file")
+                    names_to_clear.add(recomputed_name)
 
         for name in names_to_clear:
             document.values.pop(name, None)
         document.profiles = {
             profile: remaining
-            for profile, names in document.profiles.items()
-            if (remaining := names - names_to_clear)
+            for profile, fields in document.profiles.items()
+            if (
+                remaining := {
+                    field_name: name
+                    for field_name, name in fields.items()
+                    if name not in names_to_clear
+                }
+            )
         }
         if names_to_clear:
             self._write(document)
@@ -262,12 +267,15 @@ def _profile_metadata_name(profile: tuple[str, str]) -> str:
     return _PROFILE_METADATA_PREFIX + digest
 
 
-def _profile_metadata_value(profile: tuple[str, str], names: set[str]) -> str:
+def _profile_metadata_value(profile: tuple[str, str], fields: Mapping[str, str]) -> str:
     return json.dumps(
         {
             "connector_id": profile[0],
             "environment": profile[1],
-            "names": sorted(names),
+            "fields": [
+                {"field_name": field_name, "env_name": fields[field_name]}
+                for field_name in sorted(fields)
+            ],
         },
         ensure_ascii=True,
         separators=(",", ":"),
@@ -283,15 +291,6 @@ def _profile_matches(
     return (connector_id is None or profile[0] == connector_id) and (
         environment is None or profile[1] == environment
     )
-
-
-def _legacy_profile(name: str) -> tuple[str, str] | None:
-    if name.startswith(_PROFILE_METADATA_PREFIX) or "__H_" in name:
-        return None
-    parts = name.split("_")
-    if len(parts) < 4 or parts[0] != "MERCURY":
-        return None
-    return parts[1].lower(), parts[2].lower()
 
 
 def _reject_control_or_format_characters(value: str) -> None:
@@ -356,53 +355,83 @@ def _parse_dotenv_text(text: str) -> _CredentialDocument:
     values: dict[str, str] = {}
     metadata: dict[str, str] = {}
     for name, value in parsed.items():
-        if name is None or value is None or not name.startswith("MERCURY_"):
+        if name is None or value is None:
             raise ValueError("invalid_credential_file")
         _reject_control_or_format_characters(name)
         _reject_control_or_format_characters(value)
-        target = metadata if name.startswith(_PROFILE_METADATA_PREFIX) else values
+        if name.startswith(_PROFILE_METADATA_PREFIX):
+            target = metadata
+        elif name.startswith("MERCURY_"):
+            target = values
+        else:
+            raise ValueError("invalid_credential_file")
         target[name] = value
 
-    profiles: dict[tuple[str, str], set[str]] = {}
+    profiles: dict[tuple[str, str], dict[str, str]] = {}
     indexed_names: set[str] = set()
     for metadata_name, metadata_value in metadata.items():
-        profile, names = _parse_profile_metadata(metadata_name, metadata_value)
+        profile, fields = _parse_profile_metadata(metadata_name, metadata_value)
+        names = set(fields.values())
         if profile in profiles or indexed_names.intersection(names):
             raise ValueError("ambiguous_credential_identifier")
         if not names.issubset(values):
             raise ValueError("invalid_credential_file")
-        profiles[profile] = names
+        profiles[profile] = fields
         indexed_names.update(names)
     return _CredentialDocument(values=values, profiles=profiles)
 
 
-def _parse_profile_metadata(name: str, value: str) -> tuple[tuple[str, str], set[str]]:
+def _parse_profile_metadata(
+    name: str, value: str
+) -> tuple[tuple[str, str], dict[str, str]]:
     try:
-        payload = json.loads(value)
-    except (TypeError, json.JSONDecodeError) as exc:
+        payload = json.loads(value, object_pairs_hook=_reject_duplicate_index_keys)
+    except (TypeError, json.JSONDecodeError, _DuplicateIndexKeyError) as exc:
         raise ValueError("invalid_credential_file") from exc
     if not isinstance(payload, dict) or set(payload) != {
         "connector_id",
         "environment",
-        "names",
+        "fields",
     }:
         raise ValueError("invalid_credential_file")
     connector_id = payload["connector_id"]
     environment = payload["environment"]
-    names = payload["names"]
+    entries = payload["fields"]
     _validate_identifier(connector_id)
     _validate_identifier(environment)
-    if (
-        not isinstance(names, list)
-        or not names
-        or any(not isinstance(item, str) or not item.startswith("MERCURY_") for item in names)
-        or len(names) != len(set(names))
-    ):
+    if not isinstance(entries, list) or not entries:
         raise ValueError("invalid_credential_file")
+    fields: dict[str, str] = {}
+    indexed_names: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"field_name", "env_name"}:
+            raise ValueError("invalid_credential_file")
+        field_name = entry["field_name"]
+        environment_name = entry["env_name"]
+        if not isinstance(field_name, str) or not isinstance(environment_name, str):
+            raise ValueError("invalid_credential_file")
+        expected_name = credential_env_name(connector_id, environment, field_name)
+        if (
+            environment_name != expected_name
+            or field_name in fields
+            or environment_name in indexed_names
+        ):
+            raise ValueError("ambiguous_credential_identifier")
+        fields[field_name] = environment_name
+        indexed_names.add(environment_name)
     profile = (connector_id, environment)
     if name != _profile_metadata_name(profile):
         raise ValueError("invalid_credential_file")
-    return profile, set(names)
+    return profile, fields
+
+
+def _reject_duplicate_index_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise _DuplicateIndexKeyError()
+        value[key] = item
+    return value
 
 
 def _validate_dotenv_assignments(text: str) -> None:
@@ -422,13 +451,14 @@ def _validate_dotenv_assignments(text: str) -> None:
 
 def _serialize_document(document: _CredentialDocument) -> str:
     serialized_values = dict(document.values)
-    for profile, names in document.profiles.items():
-        if not names or not names.issubset(document.values):
+    for profile, fields in document.profiles.items():
+        names = set(fields.values())
+        if not fields or not names.issubset(document.values):
             raise ValueError("invalid_credential_file")
         metadata_name = _profile_metadata_name(profile)
         if metadata_name in serialized_values:
             raise ValueError("ambiguous_credential_identifier")
-        serialized_values[metadata_name] = _profile_metadata_value(profile, names)
+        serialized_values[metadata_name] = _profile_metadata_value(profile, fields)
     return "".join(
         f"{name}={_quote_dotenv(serialized_values[name])}\n" for name in sorted(serialized_values)
     )

@@ -1,11 +1,14 @@
+import errno
 import hashlib
 import ipaddress
 import json
 import os
 import re
+import secrets
 import stat
 import tempfile
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -150,44 +153,358 @@ def resolve_repository_root(
 def ensure_repository_state(root: Path) -> RepositoryContext:
     root = Path(root).expanduser().resolve()
     mercury_dir = root / ".mercury"
-    try:
-        mercury_mode = mercury_dir.lstat().st_mode
-    except FileNotFoundError:
-        pass
-    else:
-        if stat.S_ISLNK(mercury_mode):
-            raise ValueError("repository_mercury_symlink")
     catalog_dir = mercury_dir / "catalog"
     cache_dir = mercury_dir / "cache"
     audit_dir = mercury_dir / "audit"
 
-    for directory in (
-        mercury_dir,
-        catalog_dir / "sources",
-        catalog_dir / "actions",
-        cache_dir,
-        audit_dir,
-    ):
-        directory.mkdir(parents=True, exist_ok=True)
     if os.name == "posix":
-        mercury_dir.chmod(0o700)
-
-    config_path = mercury_dir / "config.json"
-    if not config_path.exists():
-        _write_config_atomic(config_path, RepositoryConfig())
-
-    _ensure_gitignore(root)
+        _bootstrap_repository_posix(root)
+    else:
+        _bootstrap_repository_path(root)
 
     return RepositoryContext(
         repository_id="repo_" + hashlib.sha256(str(root).encode()).hexdigest()[:16],
         root=root,
         mercury_dir=mercury_dir,
-        config_path=config_path,
+        config_path=mercury_dir / "config.json",
         credentials_path=mercury_dir / "credentials.env",
         catalog_dir=catalog_dir,
         cache_dir=cache_dir,
         audit_dir=audit_dir,
     )
+
+
+def _bootstrap_repository_posix(root: Path) -> None:
+    root_fd = _open_repository_root_fd(root)
+    try:
+        _ensure_directory_entry(root_fd, ".mercury", error="repository_mercury_symlink")
+        mercury_fd = _open_repository_mercury_fd(root_fd)
+        try:
+            os.fchmod(mercury_fd, 0o700)
+            catalog_fd = _ensure_open_directory_fd(mercury_fd, "catalog")
+            try:
+                for name in ("sources", "actions"):
+                    child_fd = _ensure_open_directory_fd(catalog_fd, name)
+                    os.close(child_fd)
+            finally:
+                os.close(catalog_fd)
+            for name in ("cache", "audit"):
+                child_fd = _ensure_open_directory_fd(mercury_fd, name)
+                os.close(child_fd)
+
+            _ensure_repository_config_at(mercury_fd)
+            _ensure_gitignore_rules_at(root_fd, ".gitignore", _ROOT_GITIGNORE_LINES)
+            _ensure_gitignore_rules_at(
+                mercury_fd,
+                ".gitignore",
+                _MERCURY_GITIGNORE_LINES,
+            )
+            _validate_open_directory_entry(
+                root_fd,
+                ".mercury",
+                mercury_fd,
+                error="repository_mercury_symlink",
+            )
+        finally:
+            os.close(mercury_fd)
+        _validate_root_descriptor(root, root_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _bootstrap_repository_path(root: Path) -> None:
+    root_identity = _path_directory_identity(root, "repository_root_invalid")
+    mercury_dir = root / ".mercury"
+    try:
+        mercury_identity = _path_directory_identity(
+            mercury_dir,
+            "repository_mercury_symlink",
+        )
+    except FileNotFoundError:
+        _validate_path_identity(root, root_identity, "repository_root_invalid")
+        mercury_dir.mkdir()
+        mercury_identity = _path_directory_identity(
+            mercury_dir,
+            "repository_mercury_symlink",
+        )
+
+    for directory in (
+        mercury_dir / "catalog" / "sources",
+        mercury_dir / "catalog" / "actions",
+        mercury_dir / "cache",
+        mercury_dir / "audit",
+    ):
+        _validate_path_identity(root, root_identity, "repository_root_invalid")
+        _validate_path_identity(
+            mercury_dir,
+            mercury_identity,
+            "repository_mercury_symlink",
+        )
+        directory.mkdir(parents=True, exist_ok=True)
+
+    config_path = mercury_dir / "config.json"
+    _validate_path_identity(root, root_identity, "repository_root_invalid")
+    _validate_path_identity(
+        mercury_dir,
+        mercury_identity,
+        "repository_mercury_symlink",
+    )
+    if not config_path.exists():
+        _write_config_atomic(config_path, RepositoryConfig())
+
+    _validate_path_identity(root, root_identity, "repository_root_invalid")
+    _validate_path_identity(
+        mercury_dir,
+        mercury_identity,
+        "repository_mercury_symlink",
+    )
+    _ensure_gitignore(root)
+    _validate_path_identity(root, root_identity, "repository_root_invalid")
+    _validate_path_identity(
+        mercury_dir,
+        mercury_identity,
+        "repository_mercury_symlink",
+    )
+
+
+def _open_repository_root_fd(root: Path) -> int:
+    try:
+        state = os.lstat(root)
+        if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
+            raise ValueError("repository_root_invalid")
+        fd = os.open(
+            root,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError("repository_root_invalid") from exc
+    opened = os.fstat(fd)
+    if (opened.st_dev, opened.st_ino) != (state.st_dev, state.st_ino):
+        os.close(fd)
+        raise ValueError("repository_root_invalid")
+    return fd
+
+
+def _open_repository_mercury_fd(root_fd: int) -> int:
+    try:
+        fd = os.open(
+            ".mercury",
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=root_fd,
+        )
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise ValueError("repository_mercury_symlink") from exc
+        raise ValueError("repository_directory_invalid") from exc
+    try:
+        _validate_open_directory_entry(
+            root_fd,
+            ".mercury",
+            fd,
+            error="repository_mercury_symlink",
+        )
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _ensure_open_directory_fd(parent_fd: int, name: str) -> int:
+    _ensure_directory_entry(parent_fd, name, error="repository_directory_invalid")
+    try:
+        fd = os.open(
+            name,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        raise ValueError("repository_directory_invalid") from exc
+    try:
+        os.fchmod(fd, 0o700)
+        _validate_open_directory_entry(
+            parent_fd,
+            name,
+            fd,
+            error="repository_directory_invalid",
+        )
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _ensure_directory_entry(parent_fd: int, name: str, *, error: str) -> None:
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise ValueError(error) from exc
+    try:
+        state = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError(error) from exc
+    if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
+        raise ValueError(error)
+
+
+def _validate_open_directory_entry(
+    parent_fd: int,
+    name: str,
+    opened_fd: int,
+    *,
+    error: str,
+) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError(error) from exc
+    opened = os.fstat(opened_fd)
+    if (
+        stat.S_ISLNK(current.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+    ):
+        raise ValueError(error)
+
+
+def _validate_root_descriptor(root: Path, root_fd: int) -> None:
+    try:
+        current = os.lstat(root)
+    except OSError as exc:
+        raise ValueError("repository_root_invalid") from exc
+    opened = os.fstat(root_fd)
+    if (
+        stat.S_ISLNK(current.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+    ):
+        raise ValueError("repository_root_invalid")
+
+
+def _ensure_repository_config_at(mercury_fd: int) -> None:
+    state = _regular_file_state_at(mercury_fd, "config.json")
+    if state is None:
+        _write_text_atomic_at(
+            mercury_fd,
+            "config.json",
+            json.dumps(_config_payload(RepositoryConfig()), indent=2) + "\n",
+        )
+
+
+def _ensure_gitignore_rules_at(
+    directory_fd: int,
+    name: str,
+    required_lines: Sequence[str],
+) -> None:
+    existing_text = _read_optional_text_at(directory_fd, name)
+    existing = existing_text.splitlines()
+    managed_lines = set(required_lines) | {f"!{line}" for line in required_lines}
+    preserved = [line for line in existing if line not in managed_lines]
+    updated_text = "\n".join([*preserved, *required_lines]) + "\n"
+    if existing_text != updated_text:
+        _write_text_atomic_at(directory_fd, name, updated_text)
+
+
+def _read_optional_text_at(directory_fd: int, name: str) -> str:
+    state = _regular_file_state_at(directory_fd, name)
+    if state is None:
+        return ""
+    try:
+        fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_fd,
+        )
+    except OSError as exc:
+        raise ValueError("repository_file_invalid") from exc
+    try:
+        opened = os.fstat(fd)
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise ValueError("repository_file_invalid")
+        with os.fdopen(fd, "r", encoding="utf-8", newline="", closefd=False) as handle:
+            return handle.read()
+    finally:
+        os.close(fd)
+
+
+def _regular_file_state_at(directory_fd: int, name: str) -> os.stat_result | None:
+    try:
+        state = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError("repository_file_invalid") from exc
+    if stat.S_ISLNK(state.st_mode) or not stat.S_ISREG(state.st_mode):
+        raise ValueError("repository_file_invalid")
+    return state
+
+
+def _write_text_atomic_at(directory_fd: int, name: str, text: str) -> None:
+    existing = _regular_file_state_at(directory_fd, name)
+    mode = stat.S_IMODE(existing.st_mode) if existing is not None else 0o644
+    temporary_name = f".{name}.{secrets.token_hex(12)}.tmp"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    fd = os.open(temporary_name, flags, mode, dir_fd=directory_fd)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n", closefd=False) as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.close(fd)
+        fd = -1
+        _regular_file_state_at(directory_fd, name)
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        with suppress(FileNotFoundError):
+            os.unlink(temporary_name, dir_fd=directory_fd)
+
+
+def _path_directory_identity(path: Path, error: str) -> tuple[int, int]:
+    try:
+        state = path.lstat()
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise ValueError(error) from exc
+    if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
+        raise ValueError(error)
+    return state.st_dev, state.st_ino
+
+
+def _validate_path_identity(path: Path, expected: tuple[int, int], error: str) -> None:
+    if _path_directory_identity(path, error) != expected:
+        raise ValueError(error)
 
 
 def load_repository_config(context: RepositoryContext) -> RepositoryConfig:

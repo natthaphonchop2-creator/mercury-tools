@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import stat
 from dataclasses import replace
@@ -17,6 +18,36 @@ FIELDS = (
     CredentialField("client_id", secret=False, label="Client ID"),
     CredentialField("client_secret", secret=True, label="Client Secret"),
 )
+
+
+def _credential_assignments(context) -> dict[str, str]:
+    return {
+        name: value
+        for line in context.credentials_path.read_text().splitlines()
+        if line
+        for name, value in [line.split("=", 1)]
+    }
+
+
+def _replace_profile_index(context, transform) -> None:
+    assignments = _credential_assignments(context)
+    metadata_names = []
+    for name, value in assignments.items():
+        try:
+            payload = json.loads(json.loads(value))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and {"connector_id", "environment"} <= set(payload):
+            metadata_names.append(name)
+    assert len(metadata_names) == 1
+    metadata_name = metadata_names[0]
+    payload = json.loads(json.loads(assignments[metadata_name]))
+    assignments[metadata_name] = json.dumps(
+        json.dumps(transform(payload), ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    )
+    context.credentials_path.write_text(
+        "".join(f"{name}={assignments[name]}\n" for name in sorted(assignments))
+    )
 
 
 def test_store_rejects_a_context_with_a_non_repository_credential_path(tmp_path: Path) -> None:
@@ -214,6 +245,143 @@ def test_credential_environment_names_reject_unsafe_identifiers_without_echoing(
 def test_credential_environment_names_reject_control_characters() -> None:
     with pytest.raises(ValueError, match="^credential_control_character$"):
         credential_env_name("flowaccount", "production", "client\u200bsecret")
+
+
+@pytest.mark.parametrize(
+    ("connector_id", "field_name"),
+    [("_profile", "client_id"), ("flowaccount", "_profile_index")],
+)
+def test_reserved_namespace_shaped_identifiers_remain_credentials(
+    tmp_path: Path,
+    connector_id: str,
+    field_name: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    store = CredentialStore(context)
+    fields = (CredentialField(field_name, secret=True, label="Credential"),)
+
+    store.save(connector_id, "production", {field_name: "stored-value"}, fields)
+
+    environment_name = credential_env_name(connector_id, "production", field_name)
+    assert environment_name.startswith("MERCURY_")
+    assert store.load(connector_id, "production", fields) == {field_name: "stored-value"}
+    assert any(
+        not name.startswith("MERCURY_") for name in _credential_assignments(context)
+    )
+
+
+def test_profile_index_records_exact_field_ownership_without_values(tmp_path: Path) -> None:
+    context = ensure_repository_state(tmp_path)
+    CredentialStore(context).save(
+        "flowaccount",
+        "production",
+        {"client_id": "public-id", "client_secret": "private-value"},
+        FIELDS,
+    )
+
+    assignments = _credential_assignments(context)
+    metadata_values = [
+        value for name, value in assignments.items() if not name.startswith("MERCURY_")
+    ]
+    assert len(metadata_values) == 1
+    payload = json.loads(json.loads(metadata_values[0]))
+    assert payload == {
+        "connector_id": "flowaccount",
+        "environment": "production",
+        "fields": [
+            {
+                "env_name": credential_env_name("flowaccount", "production", "client_id"),
+                "field_name": "client_id",
+            },
+            {
+                "env_name": credential_env_name(
+                    "flowaccount", "production", "client_secret"
+                ),
+                "field_name": "client_secret",
+            },
+        ],
+    }
+    assert "public-id" not in metadata_values[0]
+    assert "private-value" not in metadata_values[0]
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        pytest.param(
+            lambda payload: {
+                **payload,
+                **(
+                    {
+                        "fields": [
+                            {
+                                **payload["fields"][0],
+                                "env_name": credential_env_name(
+                                    "peak", "production", "client_id"
+                                ),
+                            },
+                            *payload["fields"][1:],
+                        ]
+                    }
+                    if "fields" in payload
+                    else {
+                        "names": [
+                            credential_env_name("peak", "production", "client_id"),
+                            *payload["names"][1:],
+                        ]
+                    }
+                ),
+            },
+            id="foreign-peak-key",
+        ),
+        pytest.param(
+            lambda payload: {
+                **payload,
+                "fields": [
+                    {**payload["fields"][0], "field_name": "wrong_field"},
+                    *payload["fields"][1:],
+                ],
+            },
+            id="wrong-field-name",
+        ),
+        pytest.param(
+            lambda payload: {
+                **payload,
+                "fields": [*payload["fields"], payload["fields"][0]],
+            },
+            id="duplicate-env-key",
+        ),
+        pytest.param(
+            lambda payload: {**payload, "unknown": []},
+            id="unknown-index-field",
+        ),
+    ],
+)
+def test_clear_rejects_tampered_profile_index_before_deleting_anything(
+    tmp_path: Path,
+    tamper,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    store = CredentialStore(context)
+    store.save(
+        "flowaccount",
+        "production",
+        {"client_id": "flow-id", "client_secret": "flow-secret"},
+        FIELDS,
+    )
+    peak_name = credential_env_name("peak", "production", "client_id")
+    with context.credentials_path.open("a") as handle:
+        handle.write(f'{peak_name}="peak-value"\n')
+    _replace_profile_index(context, tamper)
+    original = context.credentials_path.read_bytes()
+
+    with pytest.raises(
+        ValueError,
+        match="^(invalid_credential_file|ambiguous_credential_identifier)$",
+    ):
+        store.clear("flowaccount", "production")
+
+    assert context.credentials_path.read_bytes() == original
 
 
 def test_clear_profile_uses_collision_safe_profile_matching(tmp_path: Path) -> None:

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import mercury_tools.local.repository as repository_module
 from mercury_tools.local.repository import (
     RepositoryContext,
     configure_connector,
@@ -84,6 +85,45 @@ def test_repository_state_rejects_a_preexisting_symlinked_mercury_directory(
     outside = tmp_path / "outside"
     outside.mkdir()
     (tmp_path / ".mercury").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="^repository_mercury_symlink$"):
+        ensure_repository_state(tmp_path)
+
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative POSIX bootstrap")
+@pytest.mark.parametrize("preexisting", [False, True])
+def test_repository_bootstrap_rejects_mercury_symlink_swap_before_descriptor_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preexisting: bool,
+) -> None:
+    mercury_dir = tmp_path / ".mercury"
+    if preexisting:
+        mercury_dir.mkdir()
+    moved_mercury = tmp_path / "moved-mercury"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_open = getattr(repository_module, "_open_repository_mercury_fd", None)
+
+    def race_open(root_fd: int) -> int:
+        mercury_dir.rename(moved_mercury)
+        mercury_dir.symlink_to(outside, target_is_directory=True)
+        if real_open is not None:
+            return real_open(root_fd)
+        return os.open(
+            ".mercury",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+
+    monkeypatch.setattr(
+        repository_module,
+        "_open_repository_mercury_fd",
+        race_open,
+        raising=False,
+    )
 
     with pytest.raises(ValueError, match="^repository_mercury_symlink$"):
         ensure_repository_state(tmp_path)
