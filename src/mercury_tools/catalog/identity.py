@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 _REDACTED = "[REDACTED]"
+_CREDENTIAL_PATH_UNSAFE = "catalog_credential_path_unsafe"
 _SENSITIVE_KEYS = {
     "accesstoken",
     "apikey",
@@ -187,17 +188,10 @@ def validate_credential_safe_path(value: str) -> None:
     """Reject one credential-bearing URI or endpoint path with a constant error."""
     if not isinstance(value, str):
         return
-    path = _path_component(value)
-    for encoded_segment in path.split("/"):
-        decoded = encoded_segment
-        for _ in range(3):
-            next_decoded = unquote(decoded)
-            if next_decoded == decoded:
-                break
-            decoded = next_decoded
-        for segment in decoded.split("/"):
-            if _path_segment_has_credential(segment):
-                raise ValueError("catalog_credential_path_unsafe")
+    path = _decode_path_value(_path_component(value))
+    for segment in path.split("/"):
+        if _path_segment_has_credential(segment):
+            raise ValueError(_CREDENTIAL_PATH_UNSAFE)
 
 
 def deep_freeze(value: Any) -> Any:
@@ -279,14 +273,15 @@ def _inspect_credential_paths(value: Any, *, parent_key: str = "") -> None:
         for key, item in value.items():
             if not isinstance(key, str):
                 continue
-            normalized_key = _normalized_name(key)
-            if key.lstrip().startswith("/"):
-                validate_credential_safe_path(key)
+            decoded_key = _decode_path_value(key)
+            normalized_key = _normalized_name(decoded_key)
+            if decoded_key.lstrip().startswith("/"):
+                validate_credential_safe_path(decoded_key)
             if normalized_key in _PATH_VALUE_FIELDS or (
                 normalized_key == "raw" and _normalized_name(parent_key) == "url"
             ):
                 _inspect_path_value(item)
-            _inspect_credential_paths(item, parent_key=key)
+            _inspect_credential_paths(item, parent_key=decoded_key)
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         for item in value:
             _inspect_credential_paths(item, parent_key=parent_key)
@@ -309,6 +304,33 @@ def _path_component(value: str) -> str:
     except ValueError:
         return value.split("?", 1)[0].split("#", 1)[0]
     return parsed.path
+
+
+def _decode_path_value(value: str) -> str:
+    """Decode percent-encoded path material until it is stable within a finite bound."""
+    decoded = value
+    for _ in range(len(value) + 1):
+        if not _has_valid_percent_encoding(decoded):
+            raise ValueError(_CREDENTIAL_PATH_UNSAFE)
+        try:
+            next_decoded = unquote(decoded, encoding="utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise ValueError(_CREDENTIAL_PATH_UNSAFE) from error
+        if next_decoded == decoded:
+            return decoded
+        decoded = next_decoded
+    raise ValueError(_CREDENTIAL_PATH_UNSAFE)
+
+
+def _has_valid_percent_encoding(value: str) -> bool:
+    for index, character in enumerate(value):
+        if character != "%":
+            continue
+        if index + 2 >= len(value) or any(
+            digit not in "0123456789abcdefABCDEF" for digit in value[index + 1 : index + 3]
+        ):
+            return False
+    return True
 
 
 def _path_segment_has_credential(segment: str) -> bool:

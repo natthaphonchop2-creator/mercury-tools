@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
+from urllib.parse import quote
 
 import pytest
 from pydantic import ValidationError
@@ -550,12 +551,45 @@ def test_catalog_source_rejects_structural_endpoint_path_key_without_echo() -> N
     assert secret not in str(raised.value)
 
 
+def test_direct_catalog_action_rejects_deeply_encoded_credential_path_without_echo(
+    action_factory,
+) -> None:
+    secret = "task-4-deeply-encoded-secret-must-not-echo"
+    unsafe_path = f"/v1/client_secret={secret}"
+    encoded_path = unsafe_path
+    for _ in range(4):
+        encoded_path = quote(encoded_path, safe="")
+
+    with pytest.raises(ValidationError, match="catalog_credential_path_unsafe") as raised:
+        action_factory(path_template=encoded_path)
+
+    assert secret not in str(raised.value)
+
+
+def test_catalog_source_rejects_encoded_structural_endpoint_path_key_without_echo() -> None:
+    secret = "task-4-encoded-structural-secret-must-not-echo"
+
+    with pytest.raises(ValidationError, match="catalog_credential_path_unsafe") as raised:
+        CatalogSource.from_document(
+            uri="https://example.test/openapi.json",
+            connector_id="flowaccount",
+            document={
+                "openapi": "3.0.0",
+                "paths": {f"%2Fv1%2Fclient_secret%3D{secret}": {}},
+            },
+            report={"status": "imported"},
+        )
+
+    assert secret not in str(raised.value)
+
+
 @pytest.mark.parametrize(
     "path",
     [
         "/contacts/{contact_id}",
         "/oauth/token",
         "/v1",
+        "/v1/items%2Fdetail",
         "/tokens/{token_id}",
         "/token/refresh",
     ],
