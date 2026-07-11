@@ -1,0 +1,43 @@
+swagger: "2.0"
+info:
+  title: Example Ledger
+  version: "2.0.0"
+host: api.example.test
+basePath: /v2
+schemes: [https]
+securityDefinitions:
+  booksKey:
+    type: apiKey
+    in: header
+    name: X-API-Key
+security:
+  - booksKey: []
+paths:
+  /expenses:
+    post:
+      operationId: createExpense
+      summary: Create expense
+      description: Creates one expense record.
+      consumes: [application/json]
+      parameters:
+        - name: body
+          in: body
+          required: true
+          schema:
+            type: object
+            required: [client_secret, amount]
+            properties:
+              client_secret:
+                type: string
+                description: Credential field supplied during setup
+                default: fake-client-secret
+              amount:
+                type: number
+                example: 1250
+      responses:
+        "201":
+          description: Created
+x-cookie:
+  name: Cookie
+  value: session=fake-cookie
+x-contact: finance@example.com

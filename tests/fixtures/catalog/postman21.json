@@ -1,0 +1,59 @@
+{
+  "info": {
+    "name": "Example ERP",
+    "version": "1.2.0",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "https://api.example.test"
+    },
+    {
+      "key": "access_token",
+      "value": "real-postman-variable-token"
+    }
+  ],
+  "item": [
+    {
+      "name": "Create customer",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer real-token",
+            "type": "text"
+          },
+          {
+            "key": "Cookie",
+            "value": "session=real-cookie",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"name\":\"Sample\",\"email\":\"secret@example.com\",\"password\":\"fake-password\"}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/customers?api_key=fake-query-key",
+          "host": ["{{baseUrl}}"],
+          "path": ["customers"],
+          "query": [
+            {
+              "key": "api_key",
+              "value": "fake-query-key"
+            }
+          ]
+        },
+        "description": "Creates one customer from a recorded request."
+      },
+      "response": []
+    }
+  ]
+}

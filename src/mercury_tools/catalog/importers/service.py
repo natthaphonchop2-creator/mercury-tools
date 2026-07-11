@@ -1,0 +1,299 @@
+from __future__ import annotations
+
+import json
+import os
+import stat
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+import httpx
+import yaml
+from pydantic import BaseModel, ConfigDict
+from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
+from yaml.tokens import AliasToken
+
+from mercury_tools.catalog.importers.markdown import has_explicit_endpoints, parse_markdown
+from mercury_tools.catalog.importers.openapi import (
+    parse_openapi,
+    security_driver_suggestion,
+)
+from mercury_tools.catalog.importers.postman import parse_postman
+from mercury_tools.catalog.importers.sanitize import SanitizationReport, sanitize_spec
+from mercury_tools.catalog.local_store import LocalCatalogStore
+from mercury_tools.catalog.models import CatalogAction, CatalogSource
+from mercury_tools.local.repository import RepositoryContext
+from mercury_tools.safety.network import NetworkPolicy, ResolvedTarget
+
+MAX_SPEC_BYTES = 10 * 1024 * 1024
+_READ_CHUNK_BYTES = 64 * 1024
+_YAML_MARKERS = ("openapi:", "swagger:", "info:")
+
+
+class ImportResult(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    source: CatalogSource
+    actions: tuple[CatalogAction, ...]
+    sanitization: SanitizationReport
+
+
+def import_spec(
+    context: RepositoryContext,
+    *,
+    connector_id: str,
+    source_path: str | Path | None = None,
+    source_url: str | None = None,
+) -> ImportResult:
+    if (source_path is None) == (source_url is None):
+        raise ValueError("exactly_one_spec_source_required")
+    raw, uri = _read_spec_source(
+        context,
+        source_path=source_path,
+        source_url=source_url,
+    )
+    structured = _parse_structured_document(raw)
+    if isinstance(structured, dict):
+        source_format = _detect_structured_format(structured)
+        raw_suggestion = security_driver_suggestion(structured) if source_format in {0, 1} else {}
+        sanitized, report = sanitize_spec(structured)
+        if not isinstance(sanitized, dict):
+            raise ValueError("spec_document_invalid")
+        safe_suggestion, _ = sanitize_spec(raw_suggestion)
+        suggestion = safe_suggestion if isinstance(safe_suggestion, dict) else {}
+        source = _build_source(uri, connector_id, sanitized, report, suggestion)
+        if source_format in {0, 1}:
+            actions = parse_openapi(sanitized, source, connector_id)
+        else:
+            actions = parse_postman(sanitized, source, connector_id)
+    else:
+        if not has_explicit_endpoints(raw):
+            raise ValueError("unknown_spec_format")
+        sanitized, report = sanitize_spec({"version": "unknown", "content": raw})
+        if not isinstance(sanitized, dict) or not isinstance(sanitized.get("content"), str):
+            raise ValueError("spec_document_invalid")
+        source = _build_source(uri, connector_id, sanitized, report, {})
+        actions = parse_markdown(sanitized["content"], source, connector_id)
+
+    LocalCatalogStore(context).write_import(source, actions)
+    return ImportResult(source=source, actions=tuple(actions), sanitization=report)
+
+
+def _build_source(
+    uri: str,
+    connector_id: str,
+    document: dict[str, Any],
+    report: SanitizationReport,
+    driver_suggestion: dict[str, Any],
+) -> CatalogSource:
+    base = CatalogSource.from_document(
+        uri=uri,
+        connector_id=connector_id,
+        document=document,
+        report=report.model_dump(mode="json"),
+    )
+    if not driver_suggestion:
+        return base
+    values = base.model_dump(mode="python")
+    values["driver_suggestion"] = driver_suggestion
+    return CatalogSource.model_validate(values)
+
+
+def _detect_structured_format(document: dict[str, Any]) -> int:
+    info = document.get("info")
+    postman_schema = info.get("schema") if isinstance(info, Mapping) else None
+    markers = (
+        isinstance(document.get("openapi"), str)
+        and document["openapi"].startswith("3."),
+        document.get("swagger") == "2.0",
+        isinstance(postman_schema, str)
+        and "/v2.1.0/" in postman_schema.casefold(),
+    )
+    matched = [index for index, present in enumerate(markers) if present]
+    if len(matched) > 1:
+        raise ValueError("ambiguous_spec_format")
+    if not matched:
+        raise ValueError("unknown_spec_format")
+    return matched[0]
+
+
+def _parse_structured_document(text: str) -> dict[str, Any] | None:
+    stripped = text.lstrip()
+    if stripped.startswith(("{", "[")):
+        try:
+            value = json.loads(text, object_pairs_hook=_unique_json_object)
+        except (json.JSONDecodeError, ValueError):
+            raise ValueError("spec_document_invalid") from None
+        return value if isinstance(value, dict) else None
+    if not _looks_like_yaml_spec(text):
+        return None
+    try:
+        if any(isinstance(token, AliasToken) for token in yaml.scan(text)):
+            raise ValueError("yaml_alias_forbidden")
+        root = yaml.compose(text, Loader=yaml.SafeLoader)
+        _validate_yaml_nodes(root)
+        value = yaml.safe_load(text)
+    except (TypeError, ValueError, yaml.YAMLError):
+        raise ValueError("spec_document_invalid") from None
+    return value if isinstance(value, dict) else None
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate_json_key")
+        result[key] = value
+    return result
+
+
+def _looks_like_yaml_spec(text: str) -> bool:
+    for line in text.splitlines():
+        stripped = line.strip().casefold()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return stripped.startswith(_YAML_MARKERS)
+    return False
+
+
+def _validate_yaml_nodes(node: Node | None, *, depth: int = 0) -> int:
+    if node is None:
+        return 0
+    if depth > 100:
+        raise ValueError("yaml_nesting_too_deep")
+    count = 1
+    if isinstance(node, MappingNode):
+        keys: set[str] = set()
+        for key_node, value_node in node.value:
+            if not isinstance(key_node, ScalarNode):
+                raise ValueError("yaml_key_invalid")
+            key = f"{key_node.tag}:{key_node.value}"
+            if key in keys:
+                raise ValueError("duplicate_yaml_key")
+            keys.add(key)
+            count += _validate_yaml_nodes(value_node, depth=depth + 1)
+    elif isinstance(node, SequenceNode):
+        for item in node.value:
+            count += _validate_yaml_nodes(item, depth=depth + 1)
+    if count > 100_000:
+        raise ValueError("yaml_document_too_complex")
+    return count
+
+
+def _read_spec_source(
+    context: RepositoryContext,
+    *,
+    source_path: str | Path | None,
+    source_url: str | None,
+) -> tuple[str, str]:
+    if source_path is not None:
+        return _read_local_source(context, source_path)
+    if source_url is None:
+        raise ValueError("exactly_one_spec_source_required")
+    return _read_remote_source(source_url)
+
+
+def _read_local_source(context: RepositoryContext, source_path: str | Path) -> tuple[str, str]:
+    root = context.root.resolve(strict=True)
+    requested = Path(source_path).expanduser()
+    if not requested.is_absolute():
+        requested = root / requested
+    candidate = Path(os.path.abspath(requested))
+    if candidate != root and not candidate.is_relative_to(root):
+        raise ValueError("spec_source_outside_root")
+    _reject_symlink_components(root, candidate)
+    before_open = os.stat(candidate, follow_symlinks=False)
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(candidate, flags)
+    except FileNotFoundError:
+        raise ValueError("spec_source_not_regular") from None
+    except OSError:
+        raise ValueError("spec_source_symlink") from None
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("spec_source_not_regular")
+        if (before_open.st_dev, before_open.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError("spec_source_changed")
+        if opened.st_size > MAX_SPEC_BYTES:
+            raise ValueError("spec_source_too_large")
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            chunk = os.read(descriptor, min(_READ_CHUNK_BYTES, MAX_SPEC_BYTES + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > MAX_SPEC_BYTES:
+                raise ValueError("spec_source_too_large")
+        current = os.stat(candidate, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError("spec_source_changed")
+    finally:
+        os.close(descriptor)
+    try:
+        text = b"".join(chunks).decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise ValueError("spec_source_invalid_utf8") from None
+    return text, candidate.as_uri()
+
+
+def _reject_symlink_components(root: Path, candidate: Path) -> None:
+    current = root
+    try:
+        for part in candidate.relative_to(root).parts:
+            current = current / part
+            status = current.lstat()
+            if stat.S_ISLNK(status.st_mode):
+                raise ValueError("spec_source_symlink")
+    except FileNotFoundError:
+        raise ValueError("spec_source_not_regular") from None
+
+
+def _read_remote_source(source_url: str) -> tuple[str, str]:
+    target = NetworkPolicy().resolve_https_target(source_url)
+    timeout = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0)
+    headers = {"Accept": "application/json, application/yaml, text/yaml, text/markdown"}
+    with httpx.Client(
+        follow_redirects=False,
+        timeout=timeout,
+        headers=headers,
+        trust_env=False,
+    ) as client, client.stream("GET", source_url) as response:
+        if 300 <= response.status_code < 400:
+            raise ValueError("remote_redirect_forbidden")
+        response.raise_for_status()
+        _verify_response_peer(response, target)
+        chunks: list[bytes] = []
+        size = 0
+        for chunk in response.iter_bytes():
+            size += len(chunk)
+            if size > MAX_SPEC_BYTES:
+                raise ValueError("spec_source_too_large")
+            chunks.append(chunk)
+    try:
+        text = b"".join(chunks).decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise ValueError("spec_source_invalid_utf8") from None
+    return text, target.url
+
+
+def _verify_response_peer(response: httpx.Response, target: ResolvedTarget) -> None:
+    stream = response.extensions.get("network_stream")
+    if stream is None or not hasattr(stream, "get_extra_info"):
+        return
+    peer = stream.get_extra_info("server_addr")
+    if isinstance(peer, tuple) and peer and isinstance(peer[0], str):
+        target.verify_peer(peer[0])
