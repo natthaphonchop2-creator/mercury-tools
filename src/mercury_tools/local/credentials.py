@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import errno
+import hashlib
+import json
 import os
 import re
-import tempfile
+import secrets
+import stat
 import unicodedata
-from collections.abc import Mapping, Sequence
-from contextlib import suppress
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
 
@@ -17,15 +22,40 @@ from mercury_tools.drivers.models import CredentialField, CredentialStatus
 from mercury_tools.local.repository import RepositoryContext
 
 _DOTENV_ASSIGNMENT = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]+$")
+_SIMPLE_COMPONENT = re.compile(r"^[a-z][a-z0-9]*$")
+_SIMPLE_FIELD = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
+_PROFILE_METADATA_PREFIX = "MERCURY__PROFILE_"
+_HASH_LENGTH = 12
+
+
+@dataclass
+class _CredentialDocument:
+    values: dict[str, str]
+    profiles: dict[tuple[str, str], set[str]]
 
 
 class CredentialStore:
     """Store credentials only in one repository's ``.mercury/credentials.env`` file."""
 
     def __init__(self, context: RepositoryContext) -> None:
-        if context.credentials_path != context.root / ".mercury" / "credentials.env":
+        try:
+            resolved_root = context.root.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError("credential_parent_invalid") from exc
+        expected_parent = resolved_root / ".mercury"
+        expected_path = expected_parent / "credentials.env"
+        if (
+            context.root != resolved_root
+            or context.mercury_dir != expected_parent
+            or context.credentials_path != expected_path
+        ):
             raise ValueError("invalid_credentials_path")
         self._context = context
+        self._root = resolved_root
+        self._parent = expected_parent
+        with _validated_parent_fd(self._root, self._parent):
+            pass
 
     def status(
         self,
@@ -34,11 +64,11 @@ class CredentialStore:
         fields: Sequence[CredentialField],
     ) -> CredentialStatus:
         field_names = _field_environment_names(connector_id, environment, fields)
-        stored_values = _read_dotenv(self._context.credentials_path)
+        document = self._read()
         present_fields = tuple(
             field_name
             for field_name, environment_name in field_names.items()
-            if stored_values.get(environment_name, "") != ""
+            if document.values.get(environment_name, "") != ""
         )
         present = set(present_fields)
         required_fields = tuple(field_names)
@@ -66,19 +96,35 @@ class CredentialStore:
             raise ValueError("invalid_credential_values")
         if any(not isinstance(name, str) or name not in field_names for name in values):
             raise ValueError("undeclared_credential_field")
-
-        stored_values = _read_dotenv(self._context.credentials_path)
-        for field_name, value in values.items():
+        for value in values.values():
             if not isinstance(value, str):
                 raise ValueError("invalid_credential_value")
             _reject_control_or_format_characters(value)
-            environment_name = field_names[field_name]
-            if value:
-                stored_values[environment_name] = value
-            else:
-                stored_values.pop(environment_name, None)
 
-        _atomic_write(self._context.credentials_path, _serialize_dotenv(stored_values))
+        document = self._read()
+        profile = (connector_id, environment)
+        profile_names = set(document.profiles.get(profile, set()))
+        owners = {
+            name: stored_profile
+            for stored_profile, stored_names in document.profiles.items()
+            for name in stored_names
+        }
+        for field_name, value in values.items():
+            environment_name = field_names[field_name]
+            if owners.get(environment_name, profile) != profile:
+                raise ValueError("ambiguous_credential_identifier")
+            if value:
+                document.values[environment_name] = value
+                profile_names.add(environment_name)
+            else:
+                document.values.pop(environment_name, None)
+                profile_names.discard(environment_name)
+        if profile_names:
+            document.profiles[profile] = profile_names
+        else:
+            document.profiles.pop(profile, None)
+
+        self._write(document)
         return self.status(connector_id, environment, fields)
 
     def load(
@@ -88,11 +134,11 @@ class CredentialStore:
         fields: Sequence[CredentialField],
     ) -> dict[str, str]:
         field_names = _field_environment_names(connector_id, environment, fields)
-        stored_values = _read_dotenv(self._context.credentials_path)
+        document = self._read()
         return {
-            field_name: stored_values[environment_name]
+            field_name: document.values[environment_name]
             for field_name, environment_name in field_names.items()
-            if stored_values.get(environment_name, "") != ""
+            if document.values.get(environment_name, "") != ""
         }
 
     def clear(
@@ -104,31 +150,62 @@ class CredentialStore:
         if clear_all:
             if connector_id is not None or environment is not None:
                 raise ValueError("credential_clear_scope_ambiguous")
-            _reject_symlink(self._context.credentials_path)
-            if not self._context.credentials_path.exists():
-                return 0
-            values = _read_dotenv(self._context.credentials_path)
-            self._context.credentials_path.unlink()
-            return len(values)
-
-        if connector_id is None or environment is None:
+            document = self._read()
+            _unlink_credentials(self._root, self._parent)
+            return len(document.values)
+        if connector_id is None and environment is None:
             raise ValueError("credential_clear_scope_required")
-        profile_prefix = _credential_profile_prefix(connector_id, environment)
-        stored_values = _read_dotenv(self._context.credentials_path)
-        names_to_clear = [name for name in stored_values if name.startswith(profile_prefix)]
+        if connector_id is not None:
+            _validate_identifier(connector_id)
+        if environment is not None:
+            _validate_identifier(environment)
+
+        document = self._read()
+        names_to_clear: set[str] = set()
+        indexed_names = {
+            name for profile_names in document.profiles.values() for name in profile_names
+        }
+        for profile, profile_names in document.profiles.items():
+            if _profile_matches(profile, connector_id, environment):
+                names_to_clear.update(profile_names)
+        for name in document.values.keys() - indexed_names:
+            legacy_profile = _legacy_profile(name)
+            if legacy_profile is not None and _profile_matches(
+                legacy_profile, connector_id, environment
+            ):
+                names_to_clear.add(name)
+
         for name in names_to_clear:
-            del stored_values[name]
+            document.values.pop(name, None)
+        document.profiles = {
+            profile: remaining
+            for profile, names in document.profiles.items()
+            if (remaining := names - names_to_clear)
+        }
         if names_to_clear:
-            _atomic_write(self._context.credentials_path, _serialize_dotenv(stored_values))
+            self._write(document)
         return len(names_to_clear)
+
+    def _read(self) -> _CredentialDocument:
+        return _read_document(self._root, self._parent)
+
+    def _write(self, document: _CredentialDocument) -> None:
+        text = _serialize_document(document)
+        if _parse_dotenv_text(text) != document:
+            raise ValueError("invalid_credential_file")
+        _atomic_write(self._root, self._parent, text)
 
 
 def credential_env_name(connector_id: str, environment: str, field: str) -> str:
-    return _credential_profile_prefix(connector_id, environment) + _normalize_identifier(field)
-
-
-def _credential_profile_prefix(connector_id: str, environment: str) -> str:
-    return f"MERCURY_{_normalize_identifier(connector_id)}_{_normalize_identifier(environment)}_"
+    parts = (connector_id, environment, field)
+    for part in parts:
+        _validate_identifier(part)
+    normalized = tuple(_normalize_identifier(part) for part in parts)
+    readable_name = "MERCURY_" + "_".join(normalized)
+    if _is_unambiguous_legacy_tuple(connector_id, environment, field):
+        return readable_name
+    digest = hashlib.sha256(_tuple_bytes(parts)).hexdigest().upper()[:_HASH_LENGTH]
+    return f"{readable_name}__H_{digest}"
 
 
 def _field_environment_names(
@@ -154,46 +231,178 @@ def _field_environment_names(
     return field_names
 
 
-def _normalize_identifier(value: str) -> str:
+def _validate_identifier(value: str) -> None:
     if not isinstance(value, str) or not value:
         raise ValueError("invalid_credential_identifier")
     _reject_control_or_format_characters(value)
-    normalized = "".join(
-        character if character.isascii() and character.isalnum() else "_" for character in value
-    ).upper()
-    if not any(character.isalnum() for character in normalized):
+    if not value.isascii() or _SAFE_IDENTIFIER.fullmatch(value) is None:
         raise ValueError("invalid_credential_identifier")
-    return normalized
+    if not any(character.isalnum() for character in value):
+        raise ValueError("invalid_credential_identifier")
+
+
+def _normalize_identifier(value: str) -> str:
+    return "".join(character if character.isalnum() else "_" for character in value).upper()
+
+
+def _is_unambiguous_legacy_tuple(connector_id: str, environment: str, field: str) -> bool:
+    return (
+        _SIMPLE_COMPONENT.fullmatch(connector_id) is not None
+        and _SIMPLE_COMPONENT.fullmatch(environment) is not None
+        and _SIMPLE_FIELD.fullmatch(field) is not None
+    )
+
+
+def _tuple_bytes(parts: tuple[str, ...]) -> bytes:
+    return json.dumps(parts, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+
+
+def _profile_metadata_name(profile: tuple[str, str]) -> str:
+    digest = hashlib.sha256(_tuple_bytes(profile)).hexdigest().upper()
+    return _PROFILE_METADATA_PREFIX + digest
+
+
+def _profile_metadata_value(profile: tuple[str, str], names: set[str]) -> str:
+    return json.dumps(
+        {
+            "connector_id": profile[0],
+            "environment": profile[1],
+            "names": sorted(names),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _profile_matches(
+    profile: tuple[str, str],
+    connector_id: str | None,
+    environment: str | None,
+) -> bool:
+    return (connector_id is None or profile[0] == connector_id) and (
+        environment is None or profile[1] == environment
+    )
+
+
+def _legacy_profile(name: str) -> tuple[str, str] | None:
+    if name.startswith(_PROFILE_METADATA_PREFIX) or "__H_" in name:
+        return None
+    parts = name.split("_")
+    if len(parts) < 4 or parts[0] != "MERCURY":
+        return None
+    return parts[1].lower(), parts[2].lower()
 
 
 def _reject_control_or_format_characters(value: str) -> None:
     if any(
         ord(character) < 32
         or ord(character) == 127
-        or unicodedata.category(character) in {"Cc", "Cf"}
+        or unicodedata.category(character) in {"Cc", "Cf", "Zl", "Zp"}
         for character in value
     ):
         raise ValueError("credential_control_character")
 
 
-def _read_dotenv(path: Path) -> dict[str, str]:
-    _reject_symlink(path)
-    if not path.exists():
-        return {}
+def _read_document(root: Path, parent: Path) -> _CredentialDocument:
+    with _validated_parent_fd(root, parent) as parent_fd:
+        file_descriptor = _open_credentials_for_read(parent_fd)
+        if file_descriptor is None:
+            return _CredentialDocument(values={}, profiles={})
+        try:
+            with os.fdopen(file_descriptor, "r", encoding="utf-8", newline="") as handle:
+                text = handle.read()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ValueError("invalid_credential_file") from exc
+    return _parse_dotenv_text(text)
+
+
+def _open_credentials_for_read(parent_fd: int) -> int | None:
+    state = _credential_file_state(parent_fd)
+    if state is None:
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
+        file_descriptor = os.open("credentials.env", flags, dir_fd=parent_fd)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError("credential_path_symlink") from exc
         raise ValueError("invalid_credential_file") from exc
+    if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+        os.close(file_descriptor)
+        raise ValueError("invalid_credential_file")
+    return file_descriptor
+
+
+def _credential_file_state(parent_fd: int) -> os.stat_result | None:
+    try:
+        state = os.stat("credentials.env", dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError("invalid_credential_file") from exc
+    if stat.S_ISLNK(state.st_mode):
+        raise ValueError("credential_path_symlink")
+    if not stat.S_ISREG(state.st_mode):
+        raise ValueError("invalid_credential_file")
+    return state
+
+
+def _parse_dotenv_text(text: str) -> _CredentialDocument:
+    if any(unicodedata.category(character) in {"Zl", "Zp"} for character in text):
+        raise ValueError("invalid_credential_file")
     _validate_dotenv_assignments(text)
     parsed = dotenv_values(stream=StringIO(text), interpolate=False)
     values: dict[str, str] = {}
+    metadata: dict[str, str] = {}
     for name, value in parsed.items():
         if name is None or value is None or not name.startswith("MERCURY_"):
             raise ValueError("invalid_credential_file")
         _reject_control_or_format_characters(name)
         _reject_control_or_format_characters(value)
-        values[name] = value
-    return values
+        target = metadata if name.startswith(_PROFILE_METADATA_PREFIX) else values
+        target[name] = value
+
+    profiles: dict[tuple[str, str], set[str]] = {}
+    indexed_names: set[str] = set()
+    for metadata_name, metadata_value in metadata.items():
+        profile, names = _parse_profile_metadata(metadata_name, metadata_value)
+        if profile in profiles or indexed_names.intersection(names):
+            raise ValueError("ambiguous_credential_identifier")
+        if not names.issubset(values):
+            raise ValueError("invalid_credential_file")
+        profiles[profile] = names
+        indexed_names.update(names)
+    return _CredentialDocument(values=values, profiles=profiles)
+
+
+def _parse_profile_metadata(name: str, value: str) -> tuple[tuple[str, str], set[str]]:
+    try:
+        payload = json.loads(value)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid_credential_file") from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "connector_id",
+        "environment",
+        "names",
+    }:
+        raise ValueError("invalid_credential_file")
+    connector_id = payload["connector_id"]
+    environment = payload["environment"]
+    names = payload["names"]
+    _validate_identifier(connector_id)
+    _validate_identifier(environment)
+    if (
+        not isinstance(names, list)
+        or not names
+        or any(not isinstance(item, str) or not item.startswith("MERCURY_") for item in names)
+        or len(names) != len(set(names))
+    ):
+        raise ValueError("invalid_credential_file")
+    profile = (connector_id, environment)
+    if name != _profile_metadata_name(profile):
+        raise ValueError("invalid_credential_file")
+    return profile, set(names)
 
 
 def _validate_dotenv_assignments(text: str) -> None:
@@ -211,8 +420,18 @@ def _validate_dotenv_assignments(text: str) -> None:
         seen_names.add(name)
 
 
-def _serialize_dotenv(values: Mapping[str, str]) -> str:
-    return "".join(f"{name}={_quote_dotenv(values[name])}\n" for name in sorted(values))
+def _serialize_document(document: _CredentialDocument) -> str:
+    serialized_values = dict(document.values)
+    for profile, names in document.profiles.items():
+        if not names or not names.issubset(document.values):
+            raise ValueError("invalid_credential_file")
+        metadata_name = _profile_metadata_name(profile)
+        if metadata_name in serialized_values:
+            raise ValueError("ambiguous_credential_identifier")
+        serialized_values[metadata_name] = _profile_metadata_value(profile, names)
+    return "".join(
+        f"{name}={_quote_dotenv(serialized_values[name])}\n" for name in sorted(serialized_values)
+    )
 
 
 def _quote_dotenv(value: str) -> str:
@@ -221,23 +440,86 @@ def _quote_dotenv(value: str) -> str:
     return f'"{escaped}"'
 
 
-def _atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
-    _reject_symlink(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+def _atomic_write(root: Path, parent: Path, text: str, mode: int = 0o600) -> None:
+    with _validated_parent_fd(root, parent) as parent_fd:
+        _credential_file_state(parent_fd)
+        temporary_name = f".credentials.env.{secrets.token_hex(12)}"
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        file_descriptor = os.open(temporary_name, flags, mode, dir_fd=parent_fd)
+        try:
+            if os.name == "posix":
+                os.fchmod(file_descriptor, mode)
+            with os.fdopen(
+                file_descriptor, "w", encoding="utf-8", newline="\n", closefd=False
+            ) as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.close(file_descriptor)
+            file_descriptor = -1
+            _credential_file_state(parent_fd)
+            os.replace(
+                temporary_name,
+                "credentials.env",
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.fsync(parent_fd)
+        finally:
+            if file_descriptor >= 0:
+                os.close(file_descriptor)
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_name, dir_fd=parent_fd)
+
+
+def _unlink_credentials(root: Path, parent: Path) -> None:
+    with _validated_parent_fd(root, parent) as parent_fd:
+        if _credential_file_state(parent_fd) is not None:
+            os.unlink("credentials.env", dir_fd=parent_fd)
+            os.fsync(parent_fd)
+
+
+@contextmanager
+def _validated_parent_fd(root: Path, parent: Path) -> Iterator[int]:
+    file_descriptor = -1
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if os.name == "posix":
-            os.chmod(temporary_name, mode)
-        os.replace(temporary_name, path)
+        root_state = os.lstat(root)
+        if stat.S_ISLNK(root_state.st_mode) or not stat.S_ISDIR(root_state.st_mode):
+            raise ValueError("credential_parent_invalid")
+        resolved_root = root.resolve(strict=True)
+        expected_parent = resolved_root / ".mercury"
+        if resolved_root != root or parent != expected_parent:
+            raise ValueError("credential_parent_invalid")
+        parent_state = os.lstat(parent)
+        if stat.S_ISLNK(parent_state.st_mode) or not stat.S_ISDIR(parent_state.st_mode):
+            raise ValueError("credential_parent_invalid")
+        if parent.resolve(strict=True) != expected_parent:
+            raise ValueError("credential_parent_invalid")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        file_descriptor = os.open(parent, flags)
+        opened_state = os.fstat(file_descriptor)
+        current_state = os.lstat(parent)
+        if (opened_state.st_dev, opened_state.st_ino) != (
+            current_state.st_dev,
+            current_state.st_ino,
+        ):
+            raise ValueError("credential_parent_invalid")
+        yield file_descriptor
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError("credential_parent_invalid") from exc
     finally:
-        with suppress(FileNotFoundError):
-            os.unlink(temporary_name)
-
-
-def _reject_symlink(path: Path) -> None:
-    if path.is_symlink():
-        raise ValueError("credential_path_symlink")
+        if file_descriptor >= 0:
+            os.close(file_descriptor)

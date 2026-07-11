@@ -150,6 +150,13 @@ def resolve_repository_root(
 def ensure_repository_state(root: Path) -> RepositoryContext:
     root = Path(root).expanduser().resolve()
     mercury_dir = root / ".mercury"
+    try:
+        mercury_mode = mercury_dir.lstat().st_mode
+    except FileNotFoundError:
+        pass
+    else:
+        if stat.S_ISLNK(mercury_mode):
+            raise ValueError("repository_mercury_symlink")
     catalog_dir = mercury_dir / "catalog"
     cache_dir = mercury_dir / "cache"
     audit_dir = mercury_dir / "audit"

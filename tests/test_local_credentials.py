@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from dataclasses import replace
@@ -7,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import mercury_tools.local.credentials as credentials_module
 from mercury_tools.drivers.models import CredentialField
 from mercury_tools.local.credentials import CredentialStore, credential_env_name
 from mercury_tools.local.repository import ensure_repository_state
@@ -160,32 +162,160 @@ def test_save_rejects_undeclared_fields_without_leaking_values(tmp_path: Path) -
     assert unexpected_value not in str(error.value)
 
 
-def test_ambiguous_declared_field_names_are_rejected(tmp_path: Path) -> None:
+def test_lossy_declared_field_names_remain_isolated(tmp_path: Path) -> None:
     store = CredentialStore(ensure_repository_state(tmp_path))
-    ambiguous_fields = (
+    lossy_fields = (
         CredentialField("client-id", secret=False, label="Client ID"),
         CredentialField("client_id", secret=True, label="Client Secret"),
     )
 
-    with pytest.raises(ValueError, match="^ambiguous_credential_identifier$"):
+    store.save(
+        "flowaccount",
+        "production",
+        {"client-id": "hyphen-value", "client_id": "underscore-value"},
+        lossy_fields,
+    )
+
+    assert store.load("flowaccount", "production", lossy_fields) == {
+        "client-id": "hyphen-value",
+        "client_id": "underscore-value",
+    }
+
+
+def test_simple_credential_environment_name_preserves_the_legacy_key() -> None:
+    assert credential_env_name("flowaccount", "production", "client_id") == (
+        "MERCURY_FLOWACCOUNT_PRODUCTION_CLIENT_ID"
+    )
+
+
+def test_credential_environment_names_isolate_lossy_and_cross_boundary_inputs() -> None:
+    assert credential_env_name("flow-account", "sandbox", "client_id") != credential_env_name(
+        "flow_account", "sandbox", "client_id"
+    )
+    assert credential_env_name("alpha_beta", "gamma", "client_id") != credential_env_name(
+        "alpha", "beta_gamma", "client_id"
+    )
+    assert credential_env_name("flowaccount", "production", "client-id") != credential_env_name(
+        "flowaccount", "production", "client_id"
+    )
+
+
+@pytest.mark.parametrize("value", ["", "caf\u00e9", "\u2028"])
+def test_credential_environment_names_reject_unsafe_identifiers_without_echoing(
+    value: str,
+) -> None:
+    with pytest.raises(ValueError) as error:
+        credential_env_name(value, "production", "client_id")
+
+    if value:
+        assert value not in str(error.value)
+
+
+def test_credential_environment_names_reject_control_characters() -> None:
+    with pytest.raises(ValueError, match="^credential_control_character$"):
+        credential_env_name("flowaccount", "production", "client\u200bsecret")
+
+
+def test_clear_profile_uses_collision_safe_profile_matching(tmp_path: Path) -> None:
+    store = CredentialStore(ensure_repository_state(tmp_path))
+    store.save(
+        "flow-account",
+        "production",
+        {"client_id": "hyphen-id", "client_secret": "hyphen-secret"},
+        FIELDS,
+    )
+    store.save(
+        "flow_account",
+        "production",
+        {"client_id": "underscore-id", "client_secret": "underscore-secret"},
+        FIELDS,
+    )
+
+    assert store.clear("flow-account", "production") == 2
+    assert store.load("flow-account", "production", FIELDS) == {}
+    assert store.load("flow_account", "production", FIELDS) == {
+        "client_id": "underscore-id",
+        "client_secret": "underscore-secret",
+    }
+
+
+def test_clear_connector_removes_all_environments_for_only_that_connector(tmp_path: Path) -> None:
+    store = CredentialStore(ensure_repository_state(tmp_path))
+    for connector_id, environment in (
+        ("flow-account", "production"),
+        ("flow-account", "sandbox"),
+        ("flow_account", "production"),
+        ("peak", "production"),
+    ):
+        store.save(
+            connector_id,
+            environment,
+            {"client_id": f"{connector_id}-{environment}-id", "client_secret": "stored-value"},
+            FIELDS,
+        )
+
+    assert store.clear(connector_id="flow-account") == 4
+    assert store.load("flow-account", "production", FIELDS) == {}
+    assert store.load("flow-account", "sandbox", FIELDS) == {}
+    assert store.status("flow_account", "production", FIELDS).configured is True
+    assert store.status("peak", "production", FIELDS).configured is True
+
+
+def test_clear_environment_removes_that_environment_across_connectors(tmp_path: Path) -> None:
+    store = CredentialStore(ensure_repository_state(tmp_path))
+    for connector_id, environment in (
+        ("flowaccount", "production"),
+        ("flowaccount", "sandbox"),
+        ("peak", "production"),
+    ):
+        store.save(
+            connector_id,
+            environment,
+            {"client_id": f"{connector_id}-{environment}-id", "client_secret": "stored-value"},
+            FIELDS,
+        )
+
+    assert store.clear(environment="production") == 4
+    assert store.load("flowaccount", "production", FIELDS) == {}
+    assert store.status("flowaccount", "sandbox", FIELDS).configured is True
+    assert store.load("peak", "production", FIELDS) == {}
+
+
+def test_clear_all_rejects_filters(tmp_path: Path) -> None:
+    store = CredentialStore(ensure_repository_state(tmp_path))
+
+    with pytest.raises(ValueError, match="^credential_clear_scope_ambiguous$"):
+        store.clear(connector_id="flowaccount", clear_all=True)
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029"])
+def test_save_rejects_unicode_line_separators_without_replacing_valid_credentials(
+    tmp_path: Path,
+    separator: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    store = CredentialStore(context)
+    store.save(
+        "flowaccount",
+        "production",
+        {"client_id": "valid-id", "client_secret": "valid-value"},
+        FIELDS,
+    )
+    original = context.credentials_path.read_bytes()
+
+    with pytest.raises(ValueError, match="^credential_control_character$"):
         store.save(
             "flowaccount",
             "production",
-            {"client-id": "id", "client_id": "secret"},
-            ambiguous_fields,
+            {"client_secret": f"invalid{separator}value"},
+            FIELDS,
         )
 
-
-def test_credential_environment_names_reject_control_characters_and_normalize(
-    tmp_path: Path,
-) -> None:
-    del tmp_path
-
-    assert credential_env_name("flow-account", "sandbox", "client-id") == (
-        "MERCURY_FLOW_ACCOUNT_SANDBOX_CLIENT_ID"
-    )
-    with pytest.raises(ValueError, match="^credential_control_character$"):
-        credential_env_name("flowaccount", "production", "client\u200bsecret")
+    assert context.credentials_path.read_bytes() == original
+    assert store.load("flowaccount", "production", FIELDS) == {
+        "client_id": "valid-id",
+        "client_secret": "valid-value",
+    }
 
 
 def test_load_uses_dotenv_without_mutating_process_environment(
@@ -303,6 +433,69 @@ def test_load_rejects_a_dangling_credentials_symlink(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="^credential_path_symlink$"):
         CredentialStore(context).status("flowaccount", "production", FIELDS)
+
+
+def test_load_maps_a_no_follow_race_to_the_symlink_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    context.credentials_path.write_text(
+        'MERCURY_FLOWACCOUNT_PRODUCTION_CLIENT_ID="stored-value"\n'
+    )
+    real_open = os.open
+
+    def race_open(path: str | Path, flags: int, *args: object, **kwargs: object) -> int:
+        if path == "credentials.env":
+            raise OSError(errno.ELOOP, "symlink race")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(credentials_module.os, "open", race_open)
+
+    with pytest.raises(ValueError, match="^credential_path_symlink$"):
+        CredentialStore(context).load("flowaccount", "production", FIELDS)
+
+
+def test_store_construction_rejects_a_symlinked_mercury_parent(tmp_path: Path) -> None:
+    context = ensure_repository_state(tmp_path)
+    original_mercury = tmp_path / "original-mercury"
+    context.mercury_dir.rename(original_mercury)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    context.mercury_dir.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="^credential_parent_invalid$"):
+        CredentialStore(context)
+
+
+@pytest.mark.parametrize("operation", ["status", "load", "save", "clear"])
+def test_store_operations_revalidate_a_replaced_mercury_parent(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    store = CredentialStore(context)
+    original_mercury = tmp_path / "original-mercury"
+    context.mercury_dir.rename(original_mercury)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_credentials = outside / "credentials.env"
+    outside_credentials.write_text('MERCURY_FLOWACCOUNT_PRODUCTION_CLIENT_ID="outside-value"\n')
+    context.mercury_dir.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="^credential_parent_invalid$"):
+        if operation == "status":
+            store.status("flowaccount", "production", FIELDS)
+        elif operation == "load":
+            store.load("flowaccount", "production", FIELDS)
+        elif operation == "save":
+            store.save("flowaccount", "production", {"client_id": "new-value"}, FIELDS)
+        else:
+            store.clear("flowaccount", "production")
+
+    assert outside_credentials.read_text() == (
+        'MERCURY_FLOWACCOUNT_PRODUCTION_CLIENT_ID="outside-value"\n'
+    )
 
 
 def test_status_and_repr_never_include_credential_values(tmp_path: Path) -> None:

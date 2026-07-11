@@ -78,6 +78,19 @@ def test_single_root_is_selected_and_scaffolded(tmp_path: Path) -> None:
         assert stat.S_IMODE(context.mercury_dir.stat().st_mode) == 0o700
 
 
+def test_repository_state_rejects_a_preexisting_symlinked_mercury_directory(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / ".mercury").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="^repository_mercury_symlink$"):
+        ensure_repository_state(tmp_path)
+
+    assert list(outside.iterdir()) == []
+
+
 def test_repository_state_places_required_ignores_after_mercury_negations(
     tmp_path: Path,
 ) -> None:
