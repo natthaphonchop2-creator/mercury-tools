@@ -110,6 +110,73 @@ def test_repository_state_places_required_ignores_after_mercury_negations(
     assert ignore_path.read_text() == first_result
 
 
+def test_repository_state_places_required_nested_ignores_after_local_negations(
+    tmp_path: Path,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    nested_ignore_path = context.mercury_dir / ".gitignore"
+    nested_ignore_path.write_text(
+        "catalog/\n"
+        "credentials.env\n"
+        "!credentials.env\n"
+        "cache/\n"
+        "!cache/\n"
+        "audit/\n"
+        "!audit/\n"
+    )
+
+    ensure_repository_state(tmp_path)
+    first_result = nested_ignore_path.read_text()
+
+    assert first_result.splitlines() == [
+        "catalog/",
+        "credentials.env",
+        "cache/",
+        "audit/",
+    ]
+
+    ensure_repository_state(tmp_path)
+
+    assert nested_ignore_path.read_text() == first_result
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes required")
+def test_repository_state_preserves_existing_atomic_replacement_modes_and_sets_new_ignores_to_0644(
+    tmp_path: Path,
+) -> None:
+    existing_root = tmp_path / "existing"
+    existing_root.mkdir()
+    context = ensure_repository_state(existing_root)
+    root_ignore_path = existing_root / ".gitignore"
+    nested_ignore_path = context.mercury_dir / ".gitignore"
+    root_ignore_path.write_text("dist/\n")
+    nested_ignore_path.write_text("catalog/\n")
+    root_ignore_path.chmod(0o640)
+    nested_ignore_path.chmod(0o600)
+    context.config_path.chmod(0o640)
+
+    ensure_repository_state(existing_root)
+    configure_connector(
+        context,
+        connector_id="custom-books",
+        environment="production",
+        driver_id="api_key_header",
+        base_url="https://api.example-books.com/v2",
+        auth_settings={"key_name": "X-API-Key"},
+    )
+
+    assert stat.S_IMODE(root_ignore_path.stat().st_mode) == 0o640
+    assert stat.S_IMODE(nested_ignore_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(context.config_path.stat().st_mode) == 0o640
+
+    new_root = tmp_path / "new"
+    new_root.mkdir()
+    new_context = ensure_repository_state(new_root)
+
+    assert stat.S_IMODE((new_root / ".gitignore").stat().st_mode) == 0o644
+    assert stat.S_IMODE((new_context.mercury_dir / ".gitignore").stat().st_mode) == 0o644
+
+
 def test_multiple_roots_require_explicit_selection(tmp_path: Path) -> None:
     roots = (tmp_path / "a", tmp_path / "b")
     for root in roots:
@@ -490,6 +557,30 @@ def test_connector_configuration_rejects_legacy_ipv4_numeric_aliases(
         )
 
 
+@pytest.mark.parametrize(
+    "host",
+    [
+        "0xa9.0xfe.0xa9.0xfe",
+        "0xa9.254.0251.0xfe",
+    ],
+)
+def test_connector_configuration_rejects_mixed_legacy_ipv4_aliases(
+    tmp_path: Path,
+    host: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+
+    with pytest.raises(ValueError, match="^invalid_endpoint_url$"):
+        configure_connector(
+            context,
+            connector_id="custom-books",
+            environment="production",
+            driver_id="api_key_header",
+            base_url=f"https://{host}/v1",
+            auth_settings={"key_name": "X-API-Key"},
+        )
+
+
 def test_connector_configuration_preserves_canonical_public_ipv4(tmp_path: Path) -> None:
     context = ensure_repository_state(tmp_path)
 
@@ -587,6 +678,52 @@ def test_load_repository_config_requires_exact_top_level_schema(
 
     with pytest.raises(ValueError, match="invalid_repository_config"):
         load_repository_config(context)
+
+
+@pytest.mark.parametrize(
+    "config_text",
+    [
+        "{not valid JSON",
+        (
+            '{"schema_version": 1, "trusted_hosts": {}, '
+            '"connectors": {"client_secret": "sensitive-overwritten-value"}, '
+            '"connectors": {}}'
+        ),
+        (
+            '{"schema_version": 1, '
+            '"trusted_hosts": {"custom-books": {"production": ['
+            '"api.example-books.com"]}}, "connectors": {"custom-books": {'
+            '"production": {"driver_id": "api_key_header", '
+            '"base_url": "https://api.example-books.com/v1", '
+            '"auth_settings": {"client_secret": "sensitive-overwritten-value"}, '
+            '"auth_settings": {"key_name": "X-API-Key"}, '
+            '"network_policy": {"allow_private_network": false}}}}}'
+        ),
+    ],
+)
+def test_load_repository_config_rejects_parse_and_duplicate_key_errors_without_echoing_values(
+    tmp_path: Path,
+    config_text: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    context.config_path.write_text(config_text)
+
+    with pytest.raises(ValueError, match="^invalid_repository_config$") as error:
+        load_repository_config(context)
+
+    assert str(error.value) == "invalid_repository_config"
+
+
+def test_load_repository_config_rejects_invalid_utf8_without_echoing_bytes(
+    tmp_path: Path,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    context.config_path.write_bytes(b'{"client_secret": "\xff"}')
+
+    with pytest.raises(ValueError, match="^invalid_repository_config$") as error:
+        load_repository_config(context)
+
+    assert str(error.value) == "invalid_repository_config"
 
 
 @pytest.mark.parametrize("schema_version", [True, 1.0, "1", None, 2])

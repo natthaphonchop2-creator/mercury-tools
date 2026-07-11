@@ -3,6 +3,7 @@ import ipaddress
 import json
 import os
 import re
+import stat
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -10,12 +11,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-_REQUIRED_GITIGNORE_LINES = [
+_ROOT_GITIGNORE_LINES = [
     ".mercury/credentials.env",
     ".mercury/cache/",
     ".mercury/audit/",
 ]
-_REQUIRED_GITIGNORE_NEGATIONS = {f"!{line}" for line in _REQUIRED_GITIGNORE_LINES}
+_MERCURY_GITIGNORE_LINES = ["credentials.env", "cache/", "audit/"]
 _REPOSITORY_CONFIG_KEYS = {"schema_version", "trusted_hosts", "connectors"}
 _PRIVATE_NETWORK_ENVIRONMENTS = {"local", "gateway"}
 _FORBIDDEN_METADATA_HOSTS = {
@@ -49,7 +50,7 @@ _OAUTH_SCOPE_PATTERN = re.compile(
 )
 _HOST_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _HEX_INTEGER_HOST_PATTERN = re.compile(r"^0x[0-9a-f]+$")
-_DOTTED_NUMERIC_HOST_PATTERN = re.compile(r"^\d+(?:\.\d+)+$")
+_LEGACY_IPV4_COMPONENT_PATTERN = re.compile(r"^(?:\d+|0x[0-9a-f]+)$")
 _SENSITIVE_CREDENTIAL_MARKERS = (
     "secret",
     "password",
@@ -102,6 +103,10 @@ class RepositoryConfig:
             return False
         value = policy.get("allow_private_network", False)
         return value if isinstance(value, bool) else False
+
+
+class _DuplicateConfigKeyError(ValueError):
+    pass
 
 
 def root_paths(root_uris: Sequence[str]) -> tuple[Path, ...]:
@@ -174,7 +179,13 @@ def load_repository_config(context: RepositoryContext) -> RepositoryConfig:
     if not context.config_path.exists():
         return RepositoryConfig()
 
-    payload = json.loads(context.config_path.read_text())
+    try:
+        payload = json.loads(
+            context.config_path.read_text(),
+            object_pairs_hook=_reject_duplicate_config_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, _DuplicateConfigKeyError) as exc:
+        raise ValueError("invalid_repository_config") from exc
     if not isinstance(payload, Mapping) or set(payload) != _REPOSITORY_CONFIG_KEYS:
         raise ValueError("invalid_repository_config")
     schema_version = payload["schema_version"]
@@ -234,12 +245,16 @@ def configure_connector(
 
 
 def _ensure_gitignore(root: Path) -> None:
-    ignore_path = root / ".gitignore"
+    _ensure_gitignore_rules(root / ".gitignore", _ROOT_GITIGNORE_LINES)
+    _ensure_gitignore_rules(root / ".mercury" / ".gitignore", _MERCURY_GITIGNORE_LINES)
+
+
+def _ensure_gitignore_rules(ignore_path: Path, required_lines: Sequence[str]) -> None:
     existing_text = ignore_path.read_text() if ignore_path.exists() else ""
     existing = existing_text.splitlines()
-    managed_lines = set(_REQUIRED_GITIGNORE_LINES) | _REQUIRED_GITIGNORE_NEGATIONS
+    managed_lines = set(required_lines) | {f"!{line}" for line in required_lines}
     preserved = [line for line in existing if line not in managed_lines]
-    updated_text = "\n".join([*preserved, *_REQUIRED_GITIGNORE_LINES]) + "\n"
+    updated_text = "\n".join([*preserved, *required_lines]) + "\n"
     if existing_text == updated_text:
         return
     _write_text_atomic(ignore_path, updated_text)
@@ -251,6 +266,7 @@ def _write_config_atomic(path: Path, config: RepositoryConfig) -> None:
 
 def _write_text_atomic(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    existing_mode = _existing_file_mode(path)
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -265,11 +281,31 @@ def _write_text_atomic(path: Path, text: str) -> None:
             temporary_file.write(text)
             temporary_file.flush()
             os.fsync(temporary_file.fileno())
+        if os.name == "posix":
+            temporary_path.chmod(existing_mode if existing_mode is not None else 0o644)
         os.replace(temporary_path, path)
     except Exception:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
         raise
+
+
+def _existing_file_mode(path: Path) -> int | None:
+    if os.name != "posix":
+        return None
+    try:
+        return stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        return None
+
+
+def _reject_duplicate_config_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    object_value: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in object_value:
+            raise _DuplicateConfigKeyError()
+        object_value[key] = value
+    return object_value
 
 
 def _config_payload(config: RepositoryConfig) -> dict[str, Any]:
@@ -552,8 +588,6 @@ def _is_valid_trusted_host(host: str) -> bool:
         return False
     if "/" in host or "@" in host:
         return False
-    if _is_legacy_ipv4_numeric_alias(host):
-        return False
     if _is_forbidden_metadata_host(host):
         return False
     try:
@@ -562,6 +596,8 @@ def _is_valid_trusted_host(host: str) -> bool:
         pass
     else:
         return True
+    if _is_legacy_ipv4_numeric_alias(host):
+        return False
     if host == "localhost":
         return True
     return all(_HOST_LABEL_PATTERN.fullmatch(label) for label in host.split("."))
@@ -570,10 +606,4 @@ def _is_valid_trusted_host(host: str) -> bool:
 def _is_legacy_ipv4_numeric_alias(host: str) -> bool:
     if "." not in host:
         return host.isdigit() or bool(_HEX_INTEGER_HOST_PATTERN.fullmatch(host))
-    if not _DOTTED_NUMERIC_HOST_PATTERN.fullmatch(host):
-        return False
-    try:
-        ipaddress.IPv4Address(host)
-    except ValueError:
-        return True
-    return False
+    return all(_LEGACY_IPV4_COMPONENT_PATTERN.fullmatch(component) for component in host.split("."))
