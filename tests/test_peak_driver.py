@@ -219,6 +219,68 @@ async def test_peak_http_200_user_rescode_failure_is_not_success_and_is_redacted
     assert "client-token" not in json.dumps(probe.public_dict())
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_node", ["PeakClientToken", "PeakUser"])
+async def test_peak_auth_requires_exact_response_nodes_without_top_level_fallback(
+    missing_node: str,
+) -> None:
+    credentials = {
+        "connect_id": "connect-id",
+        "connect_key": "connect-key",
+        "application_code": "application-code",
+        "user_token": "user-token",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/clienttoken"):
+            if missing_node == "PeakClientToken":
+                return httpx.Response(200, json={"resCode": "200", "token": "safe-token"})
+            return httpx.Response(
+                200,
+                json={"PeakClientToken": {"resCode": "200", "token": "safe-token"}},
+            )
+        return httpx.Response(200, json={"resCode": "200"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        probe = await PeakDriver().validate_credentials(
+            environment="production",
+            credentials=credentials,
+            client=client,
+        )
+
+    assert probe.status == "failed"
+    assert probe.details["error"] in {"peak_client_token_failed", "peak_user_failed"}
+
+
+@pytest.mark.asyncio
+async def test_peak_rejects_issued_client_tokens_equivalent_to_submitted_credentials_before_probe(
+) -> None:
+    credentials = {
+        "connect_id": "connect-id",
+        "connect_key": "connect-key",
+        "application_code": "application-code",
+        "user_token": "user token",
+    }
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={"PeakClientToken": {"resCode": "200", "token": quote_plus("user token")}},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        probe = await PeakDriver().validate_credentials(
+            environment="production",
+            credentials=credentials,
+            client=client,
+        )
+
+    assert probe.details["error"] == "peak_client_token_failed"
+    assert calls == ["/api/v1/clienttoken"]
+
+
 def test_peak_interprets_http_200_rescode_failure_and_sanitizes_sensitive_response(
     action_factory,
 ) -> None:
@@ -247,3 +309,23 @@ def test_peak_interprets_http_200_rescode_failure_and_sanitizes_sensitive_respon
             "token": "[REDACTED]",
         }
     }
+
+
+def test_peak_interprets_any_nested_rescode_failure_without_provider_payload_leaks(
+    action_factory,
+) -> None:
+    result = PeakDriver().interpret_response(
+        action=action_factory(),
+        response=httpx.Response(
+            200,
+            json={
+                "resCode": "200",
+                "PeakInvoices": {"resCode": "400", "token": "provider-token"},
+            },
+        ),
+        dispatched=True,
+    )
+
+    assert result.status == "failed"
+    assert result.summary == "provider_response_failed"
+    assert "provider-token" not in json.dumps(result.public_dict())

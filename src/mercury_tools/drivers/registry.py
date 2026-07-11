@@ -71,12 +71,20 @@ class DriverRegistry:
         environments: Mapping[str, str],
         key_name: str | None = None,
         token_urls: Mapping[str, str] | None = None,
+        client_id_name: str | None = None,
+        client_secret_name: str | None = None,
+        grant_type: str | None = None,
+        scope: str | None = None,
     ) -> ConnectorDriver:
         return self.get_factory(driver_id).create(
             connector_id=connector_id,
             environments=environments,
             key_name=key_name,
             token_urls=token_urls,
+            client_id_name=client_id_name,
+            client_secret_name=client_secret_name,
+            grant_type=grant_type,
+            scope=scope,
         )
 
     def summaries(self) -> tuple[Mapping[str, Any], ...]:
@@ -121,8 +129,17 @@ class DriverRegistry:
     def for_repository(cls, config: RepositoryConfig) -> DriverRegistry:
         """Build a complete registry from validated repository-local configuration."""
 
-        if not _repository_config_shape_valid(config):
-            raise DriverConfigurationError("repository_connector_invalid")
+        from mercury_tools.local.repository import normalize_repository_config
+
+        try:
+            config = normalize_repository_config(config)
+        except ValueError as exc:
+            code = (
+                "repository_trusted_hosts_mismatch"
+                if str(exc) == "invalid_trusted_hosts"
+                else "repository_connector_invalid"
+            )
+            raise DriverConfigurationError(code) from None
 
         # Provider imports intentionally remain local so build_generic_registry()
         # keeps the Task 7 generic-only import boundary.
@@ -180,6 +197,10 @@ def _register_repository_connector(
     base_urls: dict[str, str] = {}
     token_urls: dict[str, str] = {}
     key_name: str | None = None
+    client_id_name: str | None = None
+    client_secret_name: str | None = None
+    grant_type: str | None = None
+    scope: str | None = None
     for environment, record in environments.items():
         if not isinstance(environment, str) or not environment or not isinstance(record, Mapping):
             raise DriverConfigurationError("repository_connector_invalid")
@@ -204,12 +225,19 @@ def _register_repository_connector(
             raise DriverConfigurationError("repository_connector_invalid")
         if configured_driver_id is None:
             configured_driver_id = driver_id
-            configured_auth_settings = auth_settings
+            configured_auth_settings = _shared_auth_settings(driver_id, auth_settings)
             candidate_key_name = auth_settings.get("key_name")
             if candidate_key_name is not None and not isinstance(candidate_key_name, str):
                 raise DriverConfigurationError("repository_connector_invalid")
             key_name = candidate_key_name
-        elif configured_driver_id != driver_id or configured_auth_settings != auth_settings:
+            client_id_name = auth_settings.get("client_id_name")
+            client_secret_name = auth_settings.get("client_secret_name")
+            grant_type = auth_settings.get("grant_type")
+            scope = auth_settings.get("scope")
+        elif (
+            configured_driver_id != driver_id
+            or configured_auth_settings != _shared_auth_settings(driver_id, auth_settings)
+        ):
             raise DriverConfigurationError("repository_connector_mismatch")
 
         required_hosts = _record_hosts(base_url, auth_settings)
@@ -232,6 +260,10 @@ def _register_repository_connector(
             environments=base_urls,
             key_name=key_name,
             token_urls=token_urls or None,
+            client_id_name=client_id_name,
+            client_secret_name=client_secret_name,
+            grant_type=grant_type,
+            scope=scope,
         )
     except (DriverConfigurationError, UnknownDriverError):
         raise DriverConfigurationError("repository_connector_invalid") from None
@@ -263,6 +295,12 @@ def _auth_settings_valid(driver_id: str, auth_settings: Mapping[str, Any]) -> bo
     ):
         return False
     return driver_id != "oauth_client_credentials" or "token_url" in auth_settings
+
+
+def _shared_auth_settings(driver_id: str, auth_settings: Mapping[str, Any]) -> Mapping[str, Any]:
+    if driver_id != "oauth_client_credentials":
+        return auth_settings
+    return {key: value for key, value in auth_settings.items() if key != "token_url"}
 
 
 def _record_hosts(base_url: str, auth_settings: Mapping[str, Any]) -> set[str]:

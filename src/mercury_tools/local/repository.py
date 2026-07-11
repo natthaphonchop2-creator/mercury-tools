@@ -518,6 +518,24 @@ def load_repository_config(context: RepositoryContext) -> RepositoryConfig:
         )
     except (UnicodeDecodeError, json.JSONDecodeError, _DuplicateConfigKeyError) as exc:
         raise ValueError("invalid_repository_config") from exc
+    return _validated_repository_config(payload)
+
+
+def normalize_repository_config(config: RepositoryConfig) -> RepositoryConfig:
+    """Return a validated copy of a repository config supplied in memory."""
+
+    if not isinstance(config, RepositoryConfig):
+        raise ValueError("invalid_repository_config")
+    return _validated_repository_config(
+        {
+            "schema_version": config.schema_version,
+            "trusted_hosts": config.trusted_hosts,
+            "connectors": config.connectors,
+        }
+    )
+
+
+def _validated_repository_config(payload: Any) -> RepositoryConfig:
     if not isinstance(payload, Mapping) or set(payload) != _REPOSITORY_CONFIG_KEYS:
         raise ValueError("invalid_repository_config")
     schema_version = payload["schema_version"]
@@ -861,6 +879,10 @@ def _validate_endpoint_url(url: str, environment: str, allow_private_network: bo
         raise ValueError("forbidden_metadata_host")
     if not _is_valid_trusted_host(host):
         raise ValueError("invalid_endpoint_url")
+    if _is_private_network_host(host) and (
+        not allow_private_network or environment not in _PRIVATE_NETWORK_ENVIRONMENTS
+    ):
+        raise ValueError("private_network_not_allowed")
     if parsed.scheme != "https" and (
         not allow_private_network
         or environment not in _PRIVATE_NETWORK_ENVIRONMENTS

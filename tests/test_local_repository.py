@@ -7,6 +7,7 @@ import pytest
 
 import mercury_tools.local.repository as repository_module
 from mercury_tools.local.repository import (
+    RepositoryConfig,
     RepositoryContext,
     configure_connector,
     ensure_repository_state,
@@ -1031,3 +1032,126 @@ def test_load_repository_config_requires_exact_connector_trusted_hosts(
 
     with pytest.raises(ValueError):
         load_repository_config(context)
+
+
+@pytest.mark.parametrize(
+    ("config", "code"),
+    [
+        (RepositoryConfig(schema_version=2), "invalid_repository_config"),
+        (
+            RepositoryConfig(
+                trusted_hosts={"custom-books": {"production": ("api.example.test",)}},
+                connectors={
+                    "custom-books": {
+                        "production": {
+                            "driver_id": "bearer",
+                            "base_url": "http://api.example.test/v1",
+                            "auth_settings": {},
+                            "network_policy": {"allow_private_network": False},
+                        }
+                    }
+                },
+            ),
+            "https_required",
+        ),
+        (
+            RepositoryConfig(
+                trusted_hosts={"custom-books": {"production": ("metadata.google.internal",)}},
+                connectors={
+                    "custom-books": {
+                        "production": {
+                            "driver_id": "bearer",
+                            "base_url": "https://metadata.google.internal/v1",
+                            "auth_settings": {},
+                            "network_policy": {"allow_private_network": False},
+                        }
+                    }
+                },
+            ),
+            "invalid_trusted_hosts",
+        ),
+        (
+            RepositoryConfig(
+                trusted_hosts={"custom-books": {"production": ("api.example.test",)}},
+                connectors={
+                    "custom-books": {
+                        "production": {
+                            "driver_id": "bearer",
+                            "base_url": "https://api.example.test:invalid/v1",
+                            "auth_settings": {},
+                            "network_policy": {"allow_private_network": False},
+                        }
+                    }
+                },
+            ),
+            "invalid_endpoint_url",
+        ),
+        (
+            RepositoryConfig(
+                trusted_hosts={"custom-books": {"production": ("127.0.0.1",)}},
+                connectors={
+                    "custom-books": {
+                        "production": {
+                            "driver_id": "bearer",
+                            "base_url": "https://127.0.0.1/v1",
+                            "auth_settings": {},
+                            "network_policy": {"allow_private_network": False},
+                        }
+                    }
+                },
+            ),
+            "private_network_not_allowed",
+        ),
+        (
+            RepositoryConfig(
+                trusted_hosts={"custom-books": {"production": ("api.example.test",)}},
+                connectors={
+                    "custom-books": {
+                        "production": {
+                            "driver_id": "bearer",
+                            "base_url": "https://auth.example.test/v1",
+                            "auth_settings": {},
+                            "network_policy": {"allow_private_network": False},
+                        }
+                    }
+                },
+            ),
+            "invalid_trusted_hosts",
+        ),
+    ],
+)
+def test_normalize_repository_config_revalidates_manually_constructed_records(
+    config: RepositoryConfig,
+    code: str,
+) -> None:
+    normalizer = getattr(repository_module, "normalize_repository_config", None)
+    assert callable(normalizer)
+    with pytest.raises(ValueError, match=rf"^{code}$"):
+        normalizer(config)
+
+
+def test_normalize_repository_config_returns_a_validated_copy_for_manually_constructed_records(
+) -> None:
+    config = RepositoryConfig(
+        trusted_hosts={"custom-books": {"local": ["127.0.0.1"]}},  # type: ignore[dict-item]
+        connectors={
+            "custom-books": {
+                "local": {
+                    "driver_id": "bearer",
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "auth_settings": {},
+                    "network_policy": {"allow_private_network": True},
+                }
+            }
+        },
+    )
+
+    normalizer = getattr(repository_module, "normalize_repository_config", None)
+    assert callable(normalizer)
+    normalized = normalizer(config)
+
+    assert normalized is not config
+    assert normalized.trusted_hosts == {"custom-books": {"local": ("127.0.0.1",)}}
+    assert normalized.connectors["custom-books"]["local"]["base_url"] == (
+        "http://127.0.0.1:8080/v1"
+    )

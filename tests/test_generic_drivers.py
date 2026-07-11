@@ -301,6 +301,66 @@ async def test_oauth_client_credentials_keeps_client_secret_out_of_exceptions_an
 
 
 @pytest.mark.asyncio
+async def test_oauth_uses_environment_token_urls_and_configured_form_fields(
+) -> None:
+    driver = GenericOAuthClientCredentialsDriver(
+        connector_id="custom",
+        environments={
+            "production": "https://erp.example.test/v1",
+            "sandbox": "https://sandbox.erp.example.test/v1",
+        },
+        token_urls={
+            "production": "https://auth.example.test/production/token",
+            "sandbox": "https://auth.example.test/sandbox/token",
+        },
+        client_id_name="application_id",
+        client_secret_name="application_secret",
+        grant_type="client_credentials",
+        scope="ledger.read ledger.write",
+    )
+    calls: list[tuple[str, dict[str, str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((str(request.url), dict(httpx.QueryParams(request.content.decode()))))
+        return httpx.Response(200, json={"access_token": f"token-{len(calls)}"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        production = await driver.prepare_auth(
+            environment="production",
+            credentials={"client_id": "client", "client_secret": "secret"},
+            client=client,
+        )
+        sandbox = await driver.prepare_auth(
+            environment="sandbox",
+            credentials={"client_id": "client", "client_secret": "secret"},
+            client=client,
+        )
+
+    assert production.headers == {"Authorization": "Bearer token-1"}
+    assert sandbox.headers == {"Authorization": "Bearer token-2"}
+    assert calls == [
+        (
+            "https://auth.example.test/production/token",
+            {
+                "application_id": "client",
+                "application_secret": "secret",
+                "grant_type": "client_credentials",
+                "scope": "ledger.read ledger.write",
+            },
+        ),
+        (
+            "https://auth.example.test/sandbox/token",
+            {
+                "application_id": "client",
+                "application_secret": "secret",
+                "grant_type": "client_credentials",
+                "scope": "ledger.read ledger.write",
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_probe_replaces_exact_credential_echoes_and_omits_provider_details() -> None:
     secret = "opaque-probe-secret"
     driver = GenericBearerDriver(

@@ -7,6 +7,7 @@ import hmac
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import unquote, unquote_plus
 
 import httpx
 
@@ -147,8 +148,7 @@ class PeakDriver(_GenericDriver):
             payload = response.json()
         except (ValueError, UnicodeDecodeError):
             return result
-        node = _response_node(payload)
-        if isinstance(payload, Mapping) and node is not None and not peak_success(node):
+        if _peak_response_failed(payload):
             return ConnectorResult(
                 status="failed",
                 http_status=response.status_code,
@@ -203,6 +203,7 @@ class PeakDriver(_GenericDriver):
             or not isinstance(client_token, str)
             or not client_token.strip()
             or not peak_success(node)
+            or _credential_token_collision(client_token, values.values())
         ):
             raise _PeakAuthFailure(
                 {"error": "peak_client_token_failed", "clienttoken_status": response.status_code}
@@ -268,23 +269,54 @@ def peak_node(payload: Any, node_name: str) -> dict[str, Any]:
     node = payload.get(node_name)
     if isinstance(node, Mapping):
         return dict(node)
-    return dict(payload)
+    return {}
 
 
 def peak_success(node: Mapping[str, Any]) -> bool:
     return str(node.get("resCode") or "").strip() == "200"
 
 
-def _response_node(payload: Any) -> dict[str, Any] | None:
-    if not isinstance(payload, Mapping):
-        return None
-    for name in ("PeakUser", "PeakClientToken"):
-        node = payload.get(name)
-        if isinstance(node, Mapping):
-            return dict(node)
-    if "resCode" in payload:
-        return dict(payload)
-    return None
+def _credential_token_collision(token: str, credential_values: Any) -> bool:
+    token_variants = _reversibly_decoded_values(token)
+    return any(
+        token_variants.intersection(_reversibly_decoded_values(value))
+        for value in credential_values
+        if isinstance(value, str)
+    )
+
+
+def _reversibly_decoded_values(value: str) -> set[str]:
+    values = {value}
+    pending = {value}
+    for _ in range(2):
+        decoded = {decoded for item in pending for decoded in (unquote(item), unquote_plus(item))}
+        pending = decoded - values
+        values.update(pending)
+        if not pending:
+            break
+    return values
+
+
+def _peak_response_failed(payload: Any) -> bool:
+    return any(
+        "resCode" in node and not peak_success(node)
+        for node in _peak_response_nodes(payload)
+    )
+
+
+def _peak_response_nodes(payload: Any) -> tuple[Mapping[str, Any], ...]:
+    nodes: list[Mapping[str, Any]] = []
+    pending: list[tuple[Any, int]] = [(payload, 0)]
+    while pending and len(nodes) < 128:
+        value, depth = pending.pop()
+        if isinstance(value, Mapping):
+            nodes.append(value)
+            if depth < 8:
+                children = [value[key] for key in sorted(value, key=str, reverse=True)]
+                pending.extend((child, depth + 1) for child in children)
+        elif isinstance(value, list | tuple) and depth < 8:
+            pending.extend((child, depth + 1) for child in reversed(value))
+    return tuple(nodes)
 
 
 __all__ = [

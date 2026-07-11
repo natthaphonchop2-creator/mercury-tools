@@ -194,6 +194,7 @@ class FlowAccountDriver(_GenericDriver):
             or not isinstance(access_token, str)
             or not access_token.strip()
             or _flowaccount_body_failed(payload)
+            or _credential_token_collision(access_token, values.values())
         ):
             raise _FlowAccountAuthFailure(
                 {"error": "flowaccount_token_failed", "http_status": response.status_code}
@@ -247,7 +248,7 @@ def _nonzero_provider_code(value: Any) -> bool:
         try:
             return float(value) != 0
         except ValueError:
-            return False
+            return True
     return False
 
 
@@ -266,20 +267,39 @@ def _company_name(payload: Mapping[str, Any], sensitive_values: tuple[str, ...])
 
 
 def _redact_sensitive_text(value: str, sensitive_values: tuple[str, ...]) -> str:
-    candidates = {value}
-    pending = {value}
-    for _ in range(2):
-        decoded = {decoded for item in pending for decoded in (unquote(item), unquote_plus(item))}
-        pending = decoded - candidates
-        candidates.update(pending)
-        if not pending:
-            break
+    candidates = _reversibly_decoded_values(value)
     if any(
-        secret and any(secret in candidate for candidate in candidates)
+        secret
+        and any(
+            normalized_secret in candidate
+            for normalized_secret in _reversibly_decoded_values(secret)
+            for candidate in candidates
+        )
         for secret in sensitive_values
     ):
         return "[REDACTED]"
     return value
+
+
+def _credential_token_collision(token: str, credential_values: Any) -> bool:
+    token_variants = _reversibly_decoded_values(token)
+    return any(
+        token_variants.intersection(_reversibly_decoded_values(value))
+        for value in credential_values
+        if isinstance(value, str)
+    )
+
+
+def _reversibly_decoded_values(value: str) -> set[str]:
+    values = {value}
+    pending = {value}
+    for _ in range(2):
+        decoded = {decoded for item in pending for decoded in (unquote(item), unquote_plus(item))}
+        pending = decoded - values
+        values.update(pending)
+        if not pending:
+            break
+    return values
 
 
 def _auth_sensitive_values(auth: AuthContext) -> tuple[str, ...]:

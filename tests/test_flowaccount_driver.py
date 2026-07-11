@@ -4,7 +4,7 @@ import json
 import subprocess
 import sys
 from datetime import UTC, datetime
-from urllib.parse import parse_qs, quote_plus
+from urllib.parse import parse_qs, quote, quote_plus
 
 import httpx
 import pytest
@@ -176,6 +176,93 @@ async def test_flowaccount_company_name_redacts_reversibly_encoded_secret_and_to
     assert access_token not in rendered
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "submitted_secret",
+    [
+        quote("client +/ secret%", safe=""),
+        quote_plus("client +/ secret%", safe=""),
+        quote(quote_plus("client +/ secret%", safe=""), safe="").replace("%2B", "%2b"),
+    ],
+)
+async def test_flowaccount_company_redaction_normalizes_both_candidate_and_submitted_credentials(
+    submitted_secret: str,
+) -> None:
+    raw_secret = "client +/ secret%"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/token"):
+            return httpx.Response(200, json={"access_token": "safe-token"})
+        return httpx.Response(200, json={"companyName": f"Books {raw_secret}"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        probe = await FlowAccountDriver().validate_credentials(
+            environment="production",
+            credentials={"client_id": "client-id", "client_secret": submitted_secret},
+            client=client,
+        )
+
+    assert probe.status == "connected"
+    assert probe.company_name == "[REDACTED]"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("access_token", ["client secret", quote_plus("client secret")])
+async def test_flowaccount_rejects_issued_tokens_equivalent_to_submitted_credentials_before_probe(
+    access_token: str,
+) -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.endswith("/token"):
+            return httpx.Response(200, json={"access_token": access_token})
+        return httpx.Response(200, json={"companyName": "Unexpected probe"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        probe = await FlowAccountDriver().validate_credentials(
+            environment="production",
+            credentials={"client_id": "client-id", "client_secret": "client secret"},
+            client=client,
+        )
+
+    assert probe.status == "failed"
+    assert probe.details["error"] == "flowaccount_token_failed"
+    assert calls == ["/v1/token"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("token_payload", "company_payload", "expected_calls"),
+    [
+        ({"access_token": "safe-token", "code": "invalid_client"}, None, ["/v1/token"]),
+        ({"access_token": "safe-token"}, {"resCode": "FAILED"}, ["/v1/token", "/v1/company/info"]),
+    ],
+)
+async def test_flowaccount_nonblank_nonnumeric_provider_codes_are_failures(
+    token_payload: dict[str, str],
+    company_payload: dict[str, str] | None,
+    expected_calls: list[str],
+) -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.endswith("/token"):
+            return httpx.Response(200, json=token_payload)
+        return httpx.Response(200, json=company_payload or {"companyName": "Unexpected probe"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        probe = await FlowAccountDriver().validate_credentials(
+            environment="production",
+            credentials={"client_id": "client-id", "client_secret": "client-secret"},
+            client=client,
+        )
+
+    assert probe.status == "failed"
+    assert calls == expected_calls
+
+
 def test_flowaccount_interprets_http_200_provider_body_failure_and_redacts_response(
     action_factory,
 ) -> None:
@@ -267,6 +354,71 @@ def test_registry_for_repository_builds_builtins_factories_and_trusted_generic_c
     assert json.loads(json.dumps(registry.public_summaries())) == registry.public_summaries()
     with pytest.raises(TypeError):
         summaries[0]["driver_id"] = "changed"  # type: ignore[index]
+
+
+def test_registry_for_repository_revalidates_manual_config_before_loading_drivers() -> None:
+    config = RepositoryConfig(
+        schema_version=2,
+        trusted_hosts={"custom": {"production": ("opaque.example.test",)}},
+        connectors={
+            "custom": {
+                "production": {
+                    "driver_id": "bearer",
+                    "base_url": "https://opaque.example.test/v1",
+                    "auth_settings": {},
+                    "network_policy": {"allow_private_network": False},
+                }
+            }
+        },
+    )
+
+    with pytest.raises(DriverConfigurationError, match="^repository_connector_invalid$") as error:
+        DriverRegistry.for_repository(config)
+
+    assert "opaque.example.test" not in str(error.value)
+
+
+def test_registry_for_repository_allows_only_environment_specific_oauth_token_urls() -> None:
+    config = RepositoryConfig(
+        trusted_hosts={
+            "custom": {
+                "production": ("api.example.test", "auth.example.test"),
+                "sandbox": ("sandbox.example.test", "sandbox-auth.example.test"),
+            }
+        },
+        connectors={
+            "custom": {
+                "production": {
+                    "driver_id": "oauth_client_credentials",
+                    "base_url": "https://api.example.test/v1",
+                    "auth_settings": {
+                        "token_url": "https://auth.example.test/token",
+                        "client_id_name": "application_id",
+                        "client_secret_name": "application_secret",
+                        "grant_type": "client_credentials",
+                        "scope": "ledger.read",
+                    },
+                    "network_policy": {"allow_private_network": False},
+                },
+                "sandbox": {
+                    "driver_id": "oauth_client_credentials",
+                    "base_url": "https://sandbox.example.test/v1",
+                    "auth_settings": {
+                        "token_url": "https://sandbox-auth.example.test/token",
+                        "client_id_name": "application_id",
+                        "client_secret_name": "application_secret",
+                        "grant_type": "client_credentials",
+                        "scope": "ledger.read",
+                    },
+                    "network_policy": {"allow_private_network": False},
+                },
+            }
+        },
+    )
+
+    driver = DriverRegistry.for_repository(config).get("custom")
+
+    assert driver.resolve_base_url("sandbox") == "https://sandbox.example.test/v1"
 
 
 @pytest.mark.parametrize(

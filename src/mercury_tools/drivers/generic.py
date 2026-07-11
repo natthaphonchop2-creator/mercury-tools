@@ -275,12 +275,22 @@ class GenericOAuthClientCredentialsDriver(_GenericDriver):
         connector_id: str,
         environments: Mapping[str, str],
         token_urls: Mapping[str, str],
+        client_id_name: str = "client_id",
+        client_secret_name: str = "client_secret",
+        grant_type: str = "client_credentials",
+        scope: str | None = None,
     ) -> None:
         super().__init__(connector_id=connector_id, environments=environments)
         configured_token_urls = _configured_environments(token_urls)
         if set(configured_token_urls) != set(self._environments):
             raise DriverConfigurationError("oauth_environment_mismatch")
         self._token_urls = immutable_mapping(configured_token_urls)
+        self._client_id_name = _oauth_parameter_name(client_id_name)
+        self._client_secret_name = _oauth_parameter_name(client_secret_name)
+        if grant_type != "client_credentials":
+            raise DriverConfigurationError("oauth_configuration_invalid")
+        self._grant_type = grant_type
+        self._scope = _oauth_scope(scope)
 
     def credential_fields(self, environment: str) -> tuple[CredentialField, ...]:
         self.resolve_base_url(environment)
@@ -301,14 +311,14 @@ class GenericOAuthClientCredentialsDriver(_GenericDriver):
             raise DriverConfigurationError("unsupported_environment")
         values = self._required_credentials(credentials)
         try:
-            response = await client.post(
-                token_url,
-                data={
-                    "grant_type": "client_credentials",
-                    "client_id": values["client_id"],
-                    "client_secret": values["client_secret"],
-                },
-            )
+            form = {
+                "grant_type": self._grant_type,
+                self._client_id_name: values["client_id"],
+                self._client_secret_name: values["client_secret"],
+            }
+            if self._scope is not None:
+                form["scope"] = self._scope
+            response = await client.post(token_url, data=form)
             payload = _response_json(response)
         except (httpx.HTTPError, httpx.InvalidURL, TypeError, ValueError):
             raise ConnectorAuthError("oauth_token_failed") from None
@@ -499,15 +509,32 @@ class GenericDriverFactory:
         environments: Mapping[str, str],
         key_name: str | None = None,
         token_urls: Mapping[str, str] | None = None,
+        client_id_name: str | None = None,
+        client_secret_name: str | None = None,
+        grant_type: str | None = None,
+        scope: str | None = None,
     ) -> _GenericDriver:
         if self.driver_id == "bearer":
-            _require_factory_options(key_name=key_name, token_urls=token_urls)
+            _require_factory_options(
+                key_name=key_name,
+                token_urls=token_urls,
+                client_id_name=client_id_name,
+                client_secret_name=client_secret_name,
+                grant_type=grant_type,
+                scope=scope,
+            )
             return GenericBearerDriver(
                 connector_id=connector_id,
                 environments=environments,
             )
         if self.driver_id in {"api_key_header", "api_key_query"}:
-            if token_urls is not None:
+            if (
+                token_urls is not None
+                or client_id_name is not None
+                or client_secret_name is not None
+                or grant_type is not None
+                or scope is not None
+            ):
                 raise DriverConfigurationError("generic_factory_configuration_invalid")
             placement: Literal["header", "query"] = (
                 "header" if self.driver_id == "api_key_header" else "query"
@@ -525,7 +552,14 @@ class GenericDriverFactory:
                 environments=environments,
             )
         if self.driver_id == "basic":
-            _require_factory_options(key_name=key_name, token_urls=token_urls)
+            _require_factory_options(
+                key_name=key_name,
+                token_urls=token_urls,
+                client_id_name=client_id_name,
+                client_secret_name=client_secret_name,
+                grant_type=grant_type,
+                scope=scope,
+            )
             return GenericBasicDriver(
                 connector_id=connector_id,
                 environments=environments,
@@ -537,6 +571,18 @@ class GenericDriverFactory:
                 connector_id=connector_id,
                 environments=environments,
                 token_urls=token_urls,
+                client_id_name=(
+                    client_id_name if client_id_name is not None else "client_id"
+                ),
+                client_secret_name=(
+                    client_secret_name
+                    if client_secret_name is not None
+                    else "client_secret"
+                ),
+                grant_type=(
+                    grant_type if grant_type is not None else "client_credentials"
+                ),
+                scope=scope,
             )
         raise DriverConfigurationError("generic_factory_not_supported")
 
@@ -595,10 +641,47 @@ def _validate_configured_url(value: str) -> None:
         raise DriverConfigurationError("driver_url_invalid")
 
 
+_OAUTH_PARAMETER_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
+
+
+def _oauth_parameter_name(value: str) -> str:
+    if not isinstance(value, str) or not _OAUTH_PARAMETER_NAME.fullmatch(value):
+        raise DriverConfigurationError("oauth_configuration_invalid")
+    return value
+
+
+def _oauth_scope(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or any(ord(character) <= 0x20 and character != " " for character in value)
+    ):
+        raise DriverConfigurationError("oauth_configuration_invalid")
+    return value
+
+
 def _require_factory_options(
-    *, key_name: str | None, token_urls: Mapping[str, str] | None
+    *,
+    key_name: str | None,
+    token_urls: Mapping[str, str] | None,
+    client_id_name: str | None,
+    client_secret_name: str | None,
+    grant_type: str | None,
+    scope: str | None,
 ) -> None:
-    if key_name is not None or token_urls is not None:
+    if any(
+        value is not None
+        for value in (
+            key_name,
+            token_urls,
+            client_id_name,
+            client_secret_name,
+            grant_type,
+            scope,
+        )
+    ):
         raise DriverConfigurationError("generic_factory_configuration_invalid")
 
 
