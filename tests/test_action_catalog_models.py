@@ -407,6 +407,45 @@ def test_source_ingestion_sanitizes_sensitive_uri_forms(
     assert "task-3-credential-raw-value" not in canonical
 
 
+def test_source_ingestion_sanitizes_parser_rejected_uri_query_without_losing_fragment() -> None:
+    rejected_value = "task-3-malformed-uri-raw-value"
+    uri = (
+        "https://[invalid/v1?%61ccess%5Ftoken="
+        f"{rejected_value}&&scope=documents.read&flag#docs-section"
+    )
+    expected_uri = (
+        "https://[invalid/v1?%61ccess%5Ftoken=[REDACTED]"
+        "&&scope=documents.read&flag#docs-section"
+    )
+
+    source = CatalogSource.from_document(
+        uri=uri,
+        connector_id="flowaccount",
+        document={"openapi": "3.0.0", "server_uri": uri},
+        report={"status": "imported"},
+    )
+
+    dumped = source.model_dump(mode="json")
+    assert source.source_uri == expected_uri
+    assert dumped["sanitization"]["document"]["server_uri"] == expected_uri
+    assert rejected_value not in source.model_dump_json()
+
+
+def test_direct_catalog_action_rejects_parser_rejected_uri_without_echoing_value(
+    action_factory,
+) -> None:
+    rejected_value = "task-3-malformed-uri-raw-value"
+    source_uri = (
+        "https://[invalid/v1?%61ccess%5Ftoken="
+        f"{rejected_value}&&scope=documents.read#docs-section"
+    )
+
+    with pytest.raises(ValidationError, match="catalog_credentials_unsafe") as raised:
+        action_factory(source_uri=source_uri)
+
+    assert rejected_value not in str(raised.value)
+
+
 @pytest.mark.parametrize(
     "examples",
     [

@@ -5,7 +5,7 @@ import re
 from collections.abc import Mapping, Sequence
 from enum import Enum
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 _REDACTED = "[REDACTED]"
 _SENSITIVE_KEYS = {
@@ -299,8 +299,7 @@ def _sanitize_string(value: str) -> tuple[str, bool]:
     try:
         parsed = urlsplit(value)
     except ValueError:
-        sanitized = _sanitize_userinfo(value)
-        return sanitized, sanitized != value
+        return _sanitize_malformed_uri(value)
 
     netloc = parsed.netloc
     changed = False
@@ -324,6 +323,38 @@ def _sanitize_string(value: str) -> tuple[str, bool]:
     sanitized = urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
     sanitized = _sanitize_userinfo(sanitized)
     return sanitized, True
+
+
+def _sanitize_malformed_uri(value: str) -> tuple[str, bool]:
+    before_fragment, fragment_separator, fragment = value.partition("#")
+    prefix, query_separator, query = before_fragment.partition("?")
+    if not query_separator:
+        sanitized = _sanitize_userinfo(value)
+        return sanitized, sanitized != value
+
+    sanitized_query_parts: list[str] = []
+    changed = False
+    for part in re.split(r"([&;])", query):
+        if part in {"&", ";"}:
+            sanitized_query_parts.append(part)
+            continue
+        key, value_separator, item = part.partition("=")
+        if (
+            value_separator
+            and _is_sensitive_key(_normalized_name(unquote(key)))
+            and unquote(item) != _REDACTED
+        ):
+            sanitized_query_parts.append(f"{key}{value_separator}{_REDACTED}")
+            changed = True
+        else:
+            sanitized_query_parts.append(part)
+
+    sanitized = (
+        f"{prefix}{query_separator}{''.join(sanitized_query_parts)}"
+        f"{fragment_separator}{fragment}"
+    )
+    sanitized = _sanitize_userinfo(sanitized)
+    return sanitized, changed or sanitized != value
 
 
 def _sanitize_userinfo(value: str) -> str:
