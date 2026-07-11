@@ -593,6 +593,7 @@ def test_catalog_source_rejects_encoded_structural_endpoint_path_key_without_ech
         ("%65ndpoint", "/v1/client_secret=task-4-encoded-field-secret"),
         ("r%6fute", "/v1/ghp_task-4-encoded-field-secret"),
         ("%75rl", {"raw": "/v1/client_secret=task-4-encoded-field-secret"}),
+        ("%2575rl", {"raw": "/v1/client_secret=task-4-encoded-field-secret"}),
     ],
 )
 def test_catalog_source_rejects_encoded_path_field_names_without_echo(
@@ -610,6 +611,42 @@ def test_catalog_source_rejects_encoded_path_field_names_without_echo(
         )
 
     assert secret not in str(raised.value)
+
+
+def test_catalog_source_keeps_malformed_encoded_path_like_metadata() -> None:
+    key = "p%61th%"
+    value = "/v1/ghp_task-4-malformed-field-metadata"
+
+    source = CatalogSource.from_document(
+        uri="https://example.test/openapi.json",
+        connector_id="flowaccount",
+        document={"openapi": "3.0.0", key: value},
+        report={"status": "imported"},
+    )
+
+    assert source.sanitization["document"][key] == value
+
+
+def test_catalog_source_only_inspects_direct_raw_under_encoded_url() -> None:
+    source = CatalogSource.from_document(
+        uri="https://example.test/openapi.json",
+        connector_id="flowaccount",
+        document={
+            "openapi": "3.0.0",
+            "%2575rl": {
+                "raw": "/safe",
+                "metadata": {
+                    "ghp_documentation_field": "ordinary metadata",
+                    "client_secret_like_text": "ordinary metadata",
+                },
+            },
+        },
+        report={"status": "imported"},
+    )
+
+    metadata = source.sanitization["document"]["%2575rl"]["metadata"]
+    assert metadata["ghp_documentation_field"] == "ordinary metadata"
+    assert metadata["client_secret_like_text"] == "ordinary metadata"
 
 
 def test_invalid_percent_decoded_utf8_path_error_has_no_exception_chain() -> None:

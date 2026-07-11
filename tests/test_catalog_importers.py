@@ -882,6 +882,54 @@ def test_import_rejects_multi_layer_encoded_path_field_name_without_echo(
     assert secret not in str(raised.value)
 
 
+def test_import_keeps_malformed_encoded_path_like_metadata(tmp_path: Path) -> None:
+    context = ensure_repository_state(tmp_path)
+    key = "p%61th%"
+    value = "/v1/ghp_task-4-import-malformed-field-metadata"
+    source_path = tmp_path / "malformed-encoded-path-field.json"
+    source_path.write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.0",
+                "info": {"version": "1"},
+                "paths": {"/items": {"get": {"responses": {"200": {"description": "OK"}}}}},
+                key: value,
+            }
+        )
+    )
+
+    result = import_spec(context, connector_id="custom", source_path=source_path)
+
+    assert result.source.sanitization["document"][key] == value
+
+
+def test_import_only_inspects_direct_raw_under_encoded_url(tmp_path: Path) -> None:
+    context = ensure_repository_state(tmp_path)
+    source_path = tmp_path / "encoded-url-metadata.json"
+    source_path.write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.0",
+                "info": {"version": "1"},
+                "paths": {"/items": {"get": {"responses": {"200": {"description": "OK"}}}}},
+                "%2575rl": {
+                    "raw": "/safe",
+                    "metadata": {
+                        "ghp_documentation_field": "ordinary metadata",
+                        "client_secret_like_text": "ordinary metadata",
+                    },
+                },
+            }
+        )
+    )
+
+    result = import_spec(context, connector_id="custom", source_path=source_path)
+
+    metadata = result.source.sanitization["document"]["%2575rl"]["metadata"]
+    assert metadata["ghp_documentation_field"] == "ordinary metadata"
+    assert metadata["client_secret_like_text"] == "ordinary metadata"
+
+
 def test_import_rejects_deeply_encoded_structural_endpoint_path_key_without_echo(
     tmp_path: Path,
 ) -> None:

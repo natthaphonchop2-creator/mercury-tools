@@ -272,7 +272,6 @@ def _inspect_credential_paths(
     value: Any,
     *,
     parent_key: str = "",
-    in_path_context: bool = False,
 ) -> None:
     if isinstance(value, Mapping):
         for key, item in value.items():
@@ -280,7 +279,7 @@ def _inspect_credential_paths(
                 continue
             decoded_field_key = _decode_field_name(key)
             normalized_key = _normalized_name(decoded_field_key)
-            decoded_key = _structural_path_key(key, in_path_context=in_path_context)
+            decoded_key = _structural_path_key(key)
             if decoded_key is not None:
                 validate_credential_safe_path(decoded_key)
             if normalized_key in _PATH_VALUE_FIELDS or (
@@ -290,15 +289,10 @@ def _inspect_credential_paths(
             _inspect_credential_paths(
                 item,
                 parent_key=decoded_field_key,
-                in_path_context=in_path_context or normalized_key in _PATH_VALUE_FIELDS,
             )
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         for item in value:
-            _inspect_credential_paths(
-                item,
-                parent_key=parent_key,
-                in_path_context=in_path_context,
-            )
+            _inspect_credential_paths(item)
 
 
 def _inspect_path_value(value: Any) -> None:
@@ -339,8 +333,10 @@ def _decode_field_name(value: str) -> str:
     """Decode field names for classification without rejecting unrelated metadata."""
     decoded = value
     for _ in range(len(value) + 1):
-        if not _has_valid_percent_encoding(decoded):
+        if "%" not in decoded:
             return decoded
+        if not _has_only_valid_percent_encoding(decoded):
+            return value
         next_decoded = _decode_percent_encoded_utf8(decoded)
         if next_decoded is None:
             return value
@@ -350,9 +346,7 @@ def _decode_field_name(value: str) -> str:
     return value
 
 
-def _structural_path_key(key: str, *, in_path_context: bool) -> str | None:
-    if in_path_context:
-        return _decode_path_value(key)
+def _structural_path_key(key: str) -> str | None:
     decoded = key
     for _ in range(len(key) + 1):
         if decoded.lstrip().startswith("/"):
@@ -378,6 +372,17 @@ def _has_valid_percent_encoding(value: str) -> bool:
         character == "%"
         and index + 2 < len(value)
         and all(digit in "0123456789abcdefABCDEF" for digit in value[index + 1 : index + 3])
+        for index, character in enumerate(value)
+    )
+
+
+def _has_only_valid_percent_encoding(value: str) -> bool:
+    return all(
+        character != "%"
+        or (
+            index + 2 < len(value)
+            and all(digit in "0123456789abcdefABCDEF" for digit in value[index + 1 : index + 3])
+        )
         for index, character in enumerate(value)
     )
 
