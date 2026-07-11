@@ -213,6 +213,7 @@ async def test_peak_http_200_user_rescode_failure_is_not_success_and_is_redacted
     assert probe.status == "failed"
     assert probe.details == {
         "error": "peak_user_failed",
+        "http_status": 200,
         "clienttoken_status": 200,
         "user_status": 200,
     }
@@ -329,6 +330,30 @@ def test_peak_interprets_any_nested_rescode_failure_without_provider_payload_lea
     assert result.status == "failed"
     assert result.summary == "provider_response_failed"
     assert "provider-token" not in json.dumps(result.public_dict())
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, json={}),
+        httpx.Response(200, json={"PeakInvoices": {"rows": []}}),
+        httpx.Response(200, json=[{"id": 1}]),
+        httpx.Response(200, text="not-json"),
+    ],
+)
+def test_peak_fails_closed_when_success_response_has_no_provider_rescode(
+    response: httpx.Response,
+    action_factory,
+) -> None:
+    result = PeakDriver().interpret_response(
+        action=action_factory(),
+        response=response,
+        dispatched=True,
+    )
+
+    assert result.status == "failed"
+    assert result.http_status == 200
+    assert result.summary == "provider_response_failed"
 
 
 def test_peak_fails_closed_when_rescode_is_beyond_the_depth_bound(action_factory) -> None:

@@ -317,6 +317,7 @@ def test_validate_peak_token_failure_sanitizes_provider_echoes(monkeypatch) -> N
 
     assert result["status"] == "validation_failed"
     assert result["message"] == "PEAK ClientToken request failed."
+    assert result["http_status"] == 200
     assert_values_absent(
         result,
         [

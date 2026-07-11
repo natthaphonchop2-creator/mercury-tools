@@ -106,6 +106,7 @@ class PeakDriver(_GenericDriver):
                 {
                     "error": "peak_user_response_invalid",
                     "error_type": type(exc).__name__,
+                    "http_status": response.status_code,
                     "clienttoken_status": clienttoken_status,
                     "user_status": response.status_code,
                 },
@@ -116,6 +117,7 @@ class PeakDriver(_GenericDriver):
                 environment,
                 {
                     "error": "peak_user_failed",
+                    "http_status": response.status_code,
                     "clienttoken_status": clienttoken_status,
                     "user_status": response.status_code,
                 },
@@ -147,7 +149,7 @@ class PeakDriver(_GenericDriver):
         try:
             payload = response.json()
         except (ValueError, UnicodeDecodeError):
-            return result
+            payload = None
         if _peak_response_failed(payload):
             return ConnectorResult(
                 status="failed",
@@ -193,6 +195,7 @@ class PeakDriver(_GenericDriver):
                 {
                     "error": "peak_client_token_response_invalid",
                     "error_type": type(exc).__name__,
+                    "http_status": response.status_code,
                     "clienttoken_status": response.status_code,
                 }
             ) from None
@@ -206,7 +209,11 @@ class PeakDriver(_GenericDriver):
             or _credential_token_collision(client_token, values.values())
         ):
             raise _PeakAuthFailure(
-                {"error": "peak_client_token_failed", "clienttoken_status": response.status_code}
+                {
+                    "error": "peak_client_token_failed",
+                    "http_status": response.status_code,
+                    "clienttoken_status": response.status_code,
+                }
             )
         return (
             AuthContext(
@@ -299,10 +306,8 @@ def _reversibly_decoded_values(value: str) -> set[str]:
 
 def _peak_response_failed(payload: Any) -> bool:
     nodes, truncated = _peak_response_nodes(payload)
-    return truncated or any(
-        "resCode" in node and not peak_success(node)
-        for node in nodes
-    )
+    provider_nodes = tuple(node for node in nodes if "resCode" in node)
+    return truncated or not provider_nodes or any(not peak_success(node) for node in provider_nodes)
 
 
 def _peak_response_nodes(payload: Any) -> tuple[tuple[Mapping[str, Any], ...], bool]:
