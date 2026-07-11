@@ -8,7 +8,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from mercury_tools.catalog.identity import (
     build_source_id,
     canonical_json,
+    deep_freeze,
     sanitize_document,
+    validate_action_identity,
+    validate_credential_safe,
 )
 
 
@@ -40,7 +43,12 @@ class ObservedState(StrEnum):
 
 
 class CatalogSource(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
 
     source_id: str
     connector_id: str
@@ -52,6 +60,32 @@ class CatalogSource(BaseModel):
     driver_suggestion: dict[str, Any] = Field(default_factory=dict)
     sanitization: dict[str, Any]
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_credentials(cls, value: Any) -> Any:
+        validate_credential_safe(value)
+        return value
+
+    @model_validator(mode="after")
+    def validate_source_integrity(self) -> "CatalogSource":
+        if self.imported_at.tzinfo is None or self.imported_at.utcoffset() is None:
+            raise ValueError("catalog_source_imported_at_naive")
+        if set(self.sanitization) != {"document", "report"}:
+            raise ValueError("catalog_source_sanitization_invalid")
+        expected_hash = hashlib.sha256(
+            canonical_json(self.sanitization).encode("utf-8")
+        ).hexdigest()
+        if self.source_hash != expected_hash:
+            raise ValueError("catalog_source_hash_invalid")
+        expected_id = build_source_id(self.connector_id, self.source_uri, self.source_hash)
+        if self.source_id != expected_id:
+            raise ValueError("catalog_source_id_invalid")
+
+        object.__setattr__(self, "imported_at", self.imported_at.astimezone(UTC))
+        object.__setattr__(self, "driver_suggestion", deep_freeze(self.driver_suggestion))
+        object.__setattr__(self, "sanitization", deep_freeze(self.sanitization))
+        return self
+
     @classmethod
     def from_document(
         cls,
@@ -60,6 +94,7 @@ class CatalogSource(BaseModel):
         document: dict[str, Any],
         report: dict[str, Any],
     ) -> "CatalogSource":
+        sanitized_uri = sanitize_document(uri)
         sanitized_document = sanitize_document(document)
         sanitized_report = sanitize_document(report)
         source_hash = hashlib.sha256(
@@ -68,10 +103,10 @@ class CatalogSource(BaseModel):
             ).encode()
         ).hexdigest()
         return cls(
-            source_id=build_source_id(connector_id, uri, source_hash),
+            source_id=build_source_id(connector_id, sanitized_uri, source_hash),
             connector_id=connector_id,
             source_type=_source_type(document),
-            source_uri=uri,
+            source_uri=sanitized_uri,
             source_hash=source_hash,
             imported_version=_imported_version(document),
             imported_at=datetime.now(UTC),
@@ -83,7 +118,12 @@ class CatalogSource(BaseModel):
 
 
 class CatalogAction(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
 
     action_id: str
     version_id: str
@@ -113,11 +153,43 @@ class CatalogAction(BaseModel):
     observed_state: ObservedState
     description: str = ""
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_credentials(cls, value: Any) -> Any:
+        validate_credential_safe(value)
+        return value
+
     @model_validator(mode="after")
-    def validate_required_confirmations(self) -> "CatalogAction":
+    def validate_action_integrity(self) -> "CatalogAction":
         if self.required_confirmations != int(self.risk_tier):
             raise ValueError("required_confirmations must match risk_tier")
+        if self.method is HttpMethod.GET:
+            valid_risk = self.risk_tier is RiskTier.SAFE_READ
+        elif self.method is HttpMethod.DELETE:
+            valid_risk = self.risk_tier is RiskTier.HIGH_RISK
+        else:
+            valid_risk = self.risk_tier in {
+                RiskTier.STANDARD_WRITE,
+                RiskTier.HIGH_RISK,
+            }
+        if not valid_risk:
+            raise ValueError("method_risk_tier_invalid")
+
+        for field_name in type(self).model_fields:
+            object.__setattr__(self, field_name, deep_freeze(getattr(self, field_name)))
         return self
+
+
+def revalidate_catalog_source(source: CatalogSource) -> CatalogSource:
+    values = {name: getattr(source, name) for name in CatalogSource.model_fields}
+    return CatalogSource.model_validate(values)
+
+
+def revalidate_catalog_action(action: CatalogAction) -> CatalogAction:
+    values = {name: getattr(action, name) for name in CatalogAction.model_fields}
+    validated = CatalogAction.model_validate(values)
+    validate_action_identity(validated)
+    return validated
 
 
 def _source_type(document: dict[str, Any]) -> str:

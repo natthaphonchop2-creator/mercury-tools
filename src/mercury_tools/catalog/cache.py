@@ -7,7 +7,7 @@ from pydantic import ValidationError
 
 from mercury_tools.catalog.identity import canonical_json, validate_action_identity
 from mercury_tools.catalog.local_store import merge_actions
-from mercury_tools.catalog.models import CatalogAction
+from mercury_tools.catalog.models import CatalogAction, revalidate_catalog_action
 from mercury_tools.local.repository import RepositoryContext
 
 _SCHEMA = """
@@ -126,16 +126,22 @@ class CatalogCache:
         seen_action_ids: set[str] = set()
         seen_version_ids: set[str] = set()
         for action in actions:
-            validate_action_identity(action)
-            if action.action_id in seen_action_ids or action.version_id in seen_version_ids:
+            try:
+                validated = revalidate_catalog_action(action)
+            except (AttributeError, TypeError, ValidationError, ValueError):
+                raise ValueError("catalog_cache_action_invalid") from None
+            if (
+                validated.action_id in seen_action_ids
+                or validated.version_id in seen_version_ids
+            ):
                 raise ValueError("catalog_cache_duplicate")
-            seen_action_ids.add(action.action_id)
-            seen_version_ids.add(action.version_id)
+            seen_action_ids.add(validated.action_id)
+            seen_version_ids.add(validated.version_id)
             rows.append(
                 (
-                    action.action_id,
-                    action.version_id,
-                    canonical_json(action.model_dump(mode="json")),
+                    validated.action_id,
+                    validated.version_id,
+                    canonical_json(validated.model_dump(mode="json")),
                 )
             )
         return rows
@@ -151,8 +157,8 @@ def _decode_row(action_id: str, version_id: str, payload: str) -> CatalogAction:
         if payload != canonical_json(action.model_dump(mode="json")):
             raise ValueError("catalog_cache_row_invalid")
         return action
-    except (ValidationError, ValueError, TypeError) as error:
-        raise ValueError("catalog_cache_row_invalid") from error
+    except (ValidationError, ValueError, TypeError):
+        raise ValueError("catalog_cache_row_invalid") from None
 
 
 def _require_real_directory(path: Path) -> None:
