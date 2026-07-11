@@ -33,7 +33,7 @@ def parse_postman(
             continue
         method = method.upper()
         path = _request_path(request.get("url"))
-        schema, examples = _request_schema(request)
+        schema, examples, content_type = _request_schema(request)
         name = item.get("name")
         description = _description(request.get("description"), name)
         operation_id = _operation_id(name, method, path)
@@ -46,6 +46,7 @@ def parse_postman(
                 operation_id=operation_id,
                 confidence="example_derived",
                 description=description,
+                content_type=content_type,
                 input_schema=schema,
                 examples=examples,
             )
@@ -89,9 +90,10 @@ def _path_from_raw(raw: str) -> str:
 
 def _request_schema(
     request: Mapping[str, Any],
-) -> tuple[dict[str, Any], tuple[dict[str, Any], ...]]:
+) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], str]:
     schema = empty_input_schema()
     headers = request.get("header")
+    content_type = _declared_content_type(headers)
     if isinstance(headers, list):
         for header in headers:
             if isinstance(header, Mapping) and isinstance(header.get("key"), str):
@@ -122,17 +124,76 @@ def _request_schema(
                 decoded = json.loads(body["raw"])
             except json.JSONDecodeError:
                 schema["body"] = {"type": "string"}
+                content_type = content_type or _raw_content_type(body) or "text/plain"
             else:
                 schema["body"] = _infer_schema(decoded)
+                content_type = content_type or "application/json"
                 if isinstance(decoded, Mapping):
                     examples = ({"body": dict(decoded)},)
-        elif mode in {"urlencoded", "formdata"} and isinstance(body.get(mode), list):
-            target = "files" if mode == "formdata" else "body"
-            schema[target] = {"type": "object", "properties": {}}
-            for field in body[mode]:
-                if isinstance(field, Mapping) and isinstance(field.get("key"), str):
-                    schema[target]["properties"][field["key"]] = {"type": "string"}
-    return schema, examples
+        elif mode == "urlencoded" and isinstance(body.get("urlencoded"), list):
+            schema["body"] = {"type": "object", "properties": {}}
+            _add_form_properties(body["urlencoded"], schema["body"]["properties"])
+            content_type = "application/x-www-form-urlencoded"
+        elif mode == "formdata" and isinstance(body.get("formdata"), list):
+            schema["body"] = {"type": "object", "properties": {}}
+            schema["files"] = {"type": "object", "properties": {}}
+            for field in body["formdata"]:
+                if not isinstance(field, Mapping) or not isinstance(field.get("key"), str):
+                    continue
+                if field.get("disabled") is True:
+                    continue
+                if field.get("type") == "file":
+                    schema["files"]["properties"][field["key"]] = {
+                        "type": "string",
+                        "format": "binary",
+                    }
+                else:
+                    schema["body"]["properties"][field["key"]] = {"type": "string"}
+            content_type = "multipart/form-data"
+    return schema, examples, content_type or "application/json"
+
+
+def _declared_content_type(headers: Any) -> str:
+    if not isinstance(headers, list):
+        return ""
+    for header in headers:
+        if not isinstance(header, Mapping) or header.get("disabled") is True:
+            continue
+        key = header.get("key")
+        value = header.get("value")
+        if (
+            isinstance(key, str)
+            and key.casefold() == "content-type"
+            and isinstance(value, str)
+            and value != "[REDACTED]"
+        ):
+            return value.strip()
+    return ""
+
+
+def _raw_content_type(body: Mapping[str, Any]) -> str:
+    options = body.get("options")
+    raw = options.get("raw") if isinstance(options, Mapping) else None
+    language = raw.get("language") if isinstance(raw, Mapping) else None
+    if not isinstance(language, str):
+        return ""
+    return {
+        "html": "text/html",
+        "javascript": "application/javascript",
+        "json": "application/json",
+        "text": "text/plain",
+        "xml": "application/xml",
+    }.get(language.casefold(), "")
+
+
+def _add_form_properties(fields: list[Any], properties: dict[str, Any]) -> None:
+    for field in fields:
+        if (
+            isinstance(field, Mapping)
+            and isinstance(field.get("key"), str)
+            and field.get("disabled") is not True
+        ):
+            properties[field["key"]] = {"type": "string"}
 
 
 def _infer_schema(value: Any) -> dict[str, Any]:

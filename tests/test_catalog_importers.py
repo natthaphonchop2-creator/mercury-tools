@@ -5,6 +5,7 @@ import os
 import shutil
 import socket
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -14,11 +15,30 @@ from mercury_tools.catalog.identity import validate_action_identity
 from mercury_tools.catalog.importers import service
 from mercury_tools.catalog.importers.sanitize import sanitize_spec
 from mercury_tools.catalog.importers.service import MAX_SPEC_BYTES, import_spec
-from mercury_tools.catalog.models import CatalogAction
+from mercury_tools.catalog.models import CatalogAction, CatalogSource
 from mercury_tools.local.repository import ensure_repository_state
 from mercury_tools.safety.network import NetworkPolicy, NetworkPolicyError
 
 FIXTURES = Path(__file__).parent / "fixtures" / "catalog"
+
+
+class _VerifiedPeerStream:
+    def __init__(self, address: str = "93.184.216.34") -> None:
+        self.address = address
+
+    def get_extra_info(self, info: str) -> Any:
+        return (self.address, 443) if info == "server_addr" else None
+
+
+def _mock_response(
+    status_code: int,
+    *,
+    peer_address: str = "93.184.216.34",
+    **kwargs: Any,
+) -> httpx.Response:
+    extensions = dict(kwargs.pop("extensions", {}))
+    extensions["network_stream"] = _VerifiedPeerStream(peer_address)
+    return httpx.Response(status_code, extensions=extensions, **kwargs)
 
 
 def _fixture_in_root(tmp_path: Path, filename: str) -> Path:
@@ -184,26 +204,137 @@ def test_markdown_accepts_explicit_table_records(tmp_path: Path) -> None:
     assert result.actions[0].path_template == "/records/{id}"
 
 
-def test_rejects_unknown_and_ambiguous_structured_formats(tmp_path: Path) -> None:
+def test_rejects_unknown_structured_format_and_uses_structured_precedence(
+    tmp_path: Path,
+) -> None:
     context = ensure_repository_state(tmp_path)
     unknown = tmp_path / "unknown.json"
     unknown.write_text('{"name": "not a supported specification"}')
-    ambiguous = tmp_path / "ambiguous.json"
-    ambiguous.write_text(
+    multiple_markers = tmp_path / "multiple-markers.json"
+    multiple_markers.write_text(
         json.dumps(
             {
                 "openapi": "3.0.0",
                 "swagger": "2.0",
                 "info": {"version": "1"},
-                "paths": {},
+                "paths": {
+                    "/items": {
+                        "get": {"responses": {"200": {"description": "OK"}}}
+                    }
+                },
             }
         )
     )
 
     with pytest.raises(ValueError, match="unknown_spec_format"):
         import_spec(context, connector_id="custom", source_path=unknown)
-    with pytest.raises(ValueError, match="ambiguous_spec_format"):
-        import_spec(context, connector_id="custom", source_path=ambiguous)
+    result = import_spec(context, connector_id="custom", source_path=multiple_markers)
+
+    assert result.source.source_type == "openapi3"
+
+
+def test_openapi_precedence_controls_parser_semantics(tmp_path: Path) -> None:
+    context = ensure_repository_state(tmp_path)
+    source_path = tmp_path / "openapi-over-swagger.json"
+    source_path.write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.0",
+                "swagger": "2.0",
+                "info": {"version": "1"},
+                "consumes": ["application/x-www-form-urlencoded"],
+                "paths": {
+                    "/items": {
+                        "post": {
+                            "requestBody": {
+                                "content": {
+                                    "application/xml": {
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {"name": {"type": "string"}},
+                                        }
+                                    }
+                                }
+                            },
+                            "responses": {"200": {"description": "OK"}},
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    result = import_spec(context, connector_id="custom", source_path=source_path)
+
+    assert result.source.source_type == "openapi3"
+    assert result.actions[0].content_type == "application/xml"
+    assert result.actions[0].input_schema["body"]["properties"] == {
+        "name": {"type": "string"}
+    }
+
+
+def test_swagger_precedes_postman_marker(tmp_path: Path) -> None:
+    context = ensure_repository_state(tmp_path)
+    source_path = tmp_path / "swagger-over-postman.json"
+    source_path.write_text(
+        json.dumps(
+            {
+                "swagger": "2.0",
+                "info": {
+                    "version": "1",
+                    "schema": (
+                        "https://schema.getpostman.com/json/collection/"
+                        "v2.1.0/collection.json"
+                    ),
+                },
+                "paths": {
+                    "/items": {
+                        "get": {"responses": {"200": {"description": "OK"}}}
+                    }
+                },
+                "item": [],
+            }
+        )
+    )
+
+    result = import_spec(context, connector_id="custom", source_path=source_path)
+
+    assert result.source.source_type == "swagger2"
+    assert result.actions[0].confidence == "exact"
+
+
+@pytest.mark.parametrize("prefix", ["---\n", "%YAML 1.2\n---\n"])
+def test_yaml_directives_and_document_markers_are_parsed(
+    tmp_path: Path,
+    prefix: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    source_path = tmp_path / "directive.yaml"
+    source_path.write_text(
+        prefix
+        + 'swagger: "2.0"\n'
+        + 'info: {version: "1"}\n'
+        + "paths:\n"
+        + "  /items:\n"
+        + "    get:\n"
+        + "      responses:\n"
+        + '        "200": {description: OK}\n'
+    )
+
+    result = import_spec(context, connector_id="custom", source_path=source_path)
+
+    assert result.source.source_type == "swagger2"
+    assert result.actions[0].path_template == "/items"
+
+
+def test_markdown_with_document_marker_remains_markdown(tmp_path: Path) -> None:
+    context = ensure_repository_state(tmp_path)
+    source_path = tmp_path / "marked.md"
+    source_path.write_text("---\ntitle: Endpoints\n---\nGET /items - List items\n")
+
+    result = import_spec(context, connector_id="custom", source_path=source_path)
+
+    assert result.source.source_type == "documentation"
 
 
 def test_requires_exactly_one_source_and_local_source_inside_root(tmp_path: Path) -> None:
@@ -310,10 +441,99 @@ def test_network_policy_rejects_remote_credential_query_before_dns(monkeypatch) 
 
     monkeypatch.setattr(socket, "getaddrinfo", unexpected_dns)
 
-    with pytest.raises(NetworkPolicyError, match="remote_credential_query_forbidden"):
+    with pytest.raises(NetworkPolicyError, match="remote_query_or_fragment_forbidden"):
         NetworkPolicy().resolve_https_target(
             "https://example.test/openapi.json?api_key=raw-value"
         )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.test/openapi.json?page=1",
+        "https://example.test/openapi.json?",
+        "https://example.test/openapi.json#section",
+    ],
+)
+def test_network_policy_rejects_every_query_or_fragment_before_dns(
+    monkeypatch,
+    url: str,
+) -> None:
+    def unexpected_dns(*_args, **_kwargs):
+        raise AssertionError("query and fragment URLs must be rejected before DNS")
+
+    monkeypatch.setattr(socket, "getaddrinfo", unexpected_dns)
+
+    with pytest.raises(NetworkPolicyError, match="remote_query_or_fragment_forbidden"):
+        NetworkPolicy().resolve_https_target(url)
+
+
+def test_postman_body_modes_normalize_content_type_body_and_files(tmp_path: Path) -> None:
+    context = ensure_repository_state(tmp_path)
+    document = {
+        "info": {
+            "name": "Body modes",
+            "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+        },
+        "item": [
+            {
+                "name": "Multipart",
+                "request": {
+                    "method": "POST",
+                    "url": "https://api.example.test/multipart",
+                    "body": {
+                        "mode": "formdata",
+                        "formdata": [
+                            {"key": "document", "type": "file", "src": "/tmp/demo.pdf"},
+                            {"key": "caption", "type": "text", "value": "Invoice"},
+                        ],
+                    },
+                },
+            },
+            {
+                "name": "Form encoded",
+                "request": {
+                    "method": "POST",
+                    "url": "https://api.example.test/form",
+                    "body": {
+                        "mode": "urlencoded",
+                        "urlencoded": [{"key": "status", "value": "draft"}],
+                    },
+                },
+            },
+            {
+                "name": "Raw text",
+                "request": {
+                    "method": "POST",
+                    "header": [{"key": "Content-Type", "value": "text/plain"}],
+                    "url": "https://api.example.test/raw",
+                    "body": {"mode": "raw", "raw": "plain text"},
+                },
+            },
+        ],
+    }
+    source_path = tmp_path / "postman.json"
+    source_path.write_text(json.dumps(document))
+
+    result = import_spec(context, connector_id="custom", source_path=source_path)
+    actions = {action.path_template: action for action in result.actions}
+
+    multipart = actions["/multipart"]
+    assert multipart.content_type == "multipart/form-data"
+    assert multipart.input_schema["body"] == {
+        "type": "object",
+        "properties": {"caption": {"type": "string"}},
+    }
+    assert multipart.input_schema["files"] == {
+        "type": "object",
+        "properties": {"document": {"type": "string", "format": "binary"}},
+    }
+    form = actions["/form"]
+    assert form.content_type == "application/x-www-form-urlencoded"
+    assert form.input_schema["body"]["properties"] == {"status": {"type": "string"}}
+    raw = actions["/raw"]
+    assert raw.content_type == "text/plain"
+    assert raw.input_schema["body"] == {"type": "string"}
 
 
 @pytest.mark.parametrize(
@@ -404,6 +624,26 @@ def test_imported_source_is_idempotently_sanitized_and_actions_revalidate(
         validate_action_identity(revalidated)
 
 
+def test_source_and_action_validation_errors_do_not_echo_values(tmp_path: Path) -> None:
+    context = ensure_repository_state(tmp_path)
+    source_path = _fixture_in_root(tmp_path, "openapi3.json")
+    result = import_spec(context, connector_id="custom", source_path=source_path)
+    secret = "validation-error-secret-value"
+
+    source_values = result.source.model_dump(mode="python")
+    source_values["driver_suggestion"] = {"password": secret}
+    with pytest.raises(ValueError, match="catalog_credentials_unsafe") as source_error:
+        CatalogSource.model_validate(source_values)
+
+    action_values = result.actions[0].model_dump(mode="python")
+    action_values["examples"] = ({"access_token": secret},)
+    with pytest.raises(ValueError, match="catalog_credentials_unsafe") as action_error:
+        CatalogAction.model_validate(action_values)
+
+    assert secret not in str(source_error.value)
+    assert secret not in str(action_error.value)
+
+
 def test_remote_import_uses_mocked_dns_and_transport_without_auth_headers(
     tmp_path: Path,
     monkeypatch,
@@ -421,7 +661,7 @@ def test_remote_import_uses_mocked_dns_and_transport_without_auth_headers(
     def handler(request: httpx.Request) -> httpx.Response:
         assert "authorization" not in request.headers
         assert "cookie" not in request.headers
-        return httpx.Response(200, json=document)
+        return _mock_response(200, json=document)
 
     original_client = httpx.Client
 
@@ -440,6 +680,165 @@ def test_remote_import_uses_mocked_dns_and_transport_without_auth_headers(
     )
 
     assert result.actions[0].path_template == "/items"
+    assert result.source.source_uri == "https://specs.example.test/openapi.json"
+
+
+def test_remote_import_fails_closed_without_verified_peer_metadata(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    original_client = httpx.Client
+
+    def client_factory(**kwargs):
+        transport = httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"openapi": "3.0.0"})
+        )
+        return original_client(transport=transport, **kwargs)
+
+    monkeypatch.setattr(service.httpx, "Client", client_factory)
+
+    with pytest.raises(NetworkPolicyError, match="remote_peer_unverified"):
+        import_spec(
+            context,
+            connector_id="custom",
+            source_url="https://specs.example.test/openapi.json",
+        )
+
+
+def test_remote_import_enforces_total_deadline_during_stream(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+
+    class FakeClock:
+        now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    class AdvancingStream(httpx.SyncByteStream):
+        def __iter__(self):
+            clock.now += service.REMOTE_IMPORT_DEADLINE_SECONDS + 1
+            yield b'{"openapi":"3.0.0"}'
+
+    clock = FakeClock()
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    original_client = httpx.Client
+
+    def client_factory(**kwargs):
+        timeout = kwargs["timeout"]
+        assert max(timeout.connect, timeout.read, timeout.write, timeout.pool) <= (
+            service.REMOTE_IMPORT_DEADLINE_SECONDS
+        )
+        transport = httpx.MockTransport(
+            lambda _request: _mock_response(200, stream=AdvancingStream())
+        )
+        return original_client(transport=transport, **kwargs)
+
+    monkeypatch.setattr(service.httpx, "Client", client_factory)
+    monkeypatch.setattr(service, "_monotonic", clock)
+
+    with pytest.raises(ValueError, match="remote_import_deadline_exceeded"):
+        import_spec(
+            context,
+            connector_id="custom",
+            source_url="https://specs.example.test/openapi.json",
+        )
+
+
+def test_remote_errors_use_constant_codes_without_url_or_body_echo(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    secret_url = "https://specs.example.test/private-openapi.json"
+    secret_body = "upstream-secret-body"
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    original_client = httpx.Client
+
+    def client_factory(**kwargs):
+        transport = httpx.MockTransport(
+            lambda _request: _mock_response(500, text=secret_body)
+        )
+        return original_client(transport=transport, **kwargs)
+
+    monkeypatch.setattr(service.httpx, "Client", client_factory)
+
+    with pytest.raises(ValueError, match="^remote_http_error$") as error:
+        import_spec(context, connector_id="custom", source_url=secret_url)
+    assert secret_url not in str(error.value)
+    assert secret_body not in str(error.value)
+
+
+def test_remote_network_errors_use_constant_code_without_url_echo(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    secret_url = "https://specs.example.test/private-network-spec.json"
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+    original_client = httpx.Client
+
+    def client_factory(**kwargs):
+        def fail(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError(f"failed for {request.url}", request=request)
+
+        return original_client(transport=httpx.MockTransport(fail), **kwargs)
+
+    monkeypatch.setattr(service.httpx, "Client", client_factory)
+
+    with pytest.raises(ValueError, match="^remote_request_failed$") as error:
+        import_spec(context, connector_id="custom", source_url=secret_url)
+    assert secret_url not in str(error.value)
+
+
+def test_local_os_errors_use_constant_code_without_path_echo(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    source_path = tmp_path / "private-spec-name.json"
+    source_path.write_text("{}")
+    original_stat = service.os.stat
+
+    def failing_stat(path, *args, **kwargs):
+        if Path(path) == source_path:
+            raise OSError(f"cannot open {source_path}")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(service.os, "stat", failing_stat)
+
+    with pytest.raises(ValueError, match="^spec_source_unreadable$") as error:
+        import_spec(context, connector_id="custom", source_path=source_path)
+    assert str(source_path) not in str(error.value)
 
 
 def test_remote_import_rejects_redirect_from_mock_transport(

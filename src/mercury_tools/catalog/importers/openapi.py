@@ -13,8 +13,11 @@ def parse_openapi(
     document: dict[str, Any],
     source: CatalogSource,
     connector_id: str,
+    *,
+    swagger: bool | None = None,
 ) -> list[CatalogAction]:
-    swagger = document.get("swagger") == "2.0"
+    if swagger is None:
+        swagger = document.get("swagger") == "2.0"
     paths = document.get("paths")
     if not isinstance(paths, Mapping):
         raise ValueError("spec_paths_invalid")
@@ -57,8 +60,13 @@ def parse_openapi(
     return sort_actions(actions)
 
 
-def security_driver_suggestion(document: dict[str, Any]) -> dict[str, Any]:
-    swagger = document.get("swagger") == "2.0"
+def security_driver_suggestion(
+    document: dict[str, Any],
+    *,
+    swagger: bool | None = None,
+) -> dict[str, Any]:
+    if swagger is None:
+        swagger = document.get("swagger") == "2.0"
     if swagger:
         definitions = document.get("securityDefinitions", {})
     else:

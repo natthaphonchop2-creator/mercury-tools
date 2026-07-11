@@ -7,24 +7,26 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-from mercury_tools.catalog.identity import sanitize_document
+import mercury_tools.catalog.identity as catalog_identity
 from mercury_tools.safety.redaction import redact_text
 
 _REDACTED = "[REDACTED]"
 _VALUE_KEYS = {"current", "currentvalue", "default", "example", "examples", "initial"}
 _CONTEXT_VALUE_KEYS = _VALUE_KEYS | {"value", "values"}
-_VALUE_CONTAINERS = {
-    "cookie",
-    "cookies",
-    "header",
-    "headers",
-    "variable",
-    "variables",
-}
+_VALUE_CONTAINERS = {"cookie", "cookies"}
 _DESCRIPTION_KEYS = {"description", "summary", "title"}
-_SENSITIVE_PROPERTY = re.compile(
-    r"(?:authorization|credential|secret|token|password|api[_-]?key)",
-    re.IGNORECASE,
+_IDENTIFIER_FIELDS = {"header", "headername", "key", "name", "parametername"}
+_SENSITIVE_ASSIGNMENT = re.compile(
+    r"(?i)\b(?P<key>[a-z0-9_-]*(?:authorization|credential|secret|token|password|"
+    r"passwd|pwd|api[_-]?key)[a-z0-9_-]*)\s*[:=]\s*"
+    r"(?P<value>(?!\[REDACTED\])[^\s,;]+)"
+)
+_SENSITIVE_HEADER_TEXT = re.compile(
+    r"(?im)\b(?P<key>authorization|proxy-authorization|cookie|set-cookie)"
+    r"\s*[:=]\s*(?P<value>(?!\[REDACTED\])[^\r\n]+)"
+)
+_BASIC_CREDENTIAL = re.compile(
+    r"(?i)\bbasic\s+(?!\[REDACTED\])(?:[a-z0-9+/=_-]+)"
 )
 
 
@@ -39,7 +41,7 @@ def sanitize_spec(value: Any) -> tuple[Any, SanitizationReport]:
     """Sanitize one parsed specification and count changed scalar values."""
     specialized = _sanitize_spec_fields(value)
     credential_safe = _relocate_sensitive_property_descriptions(specialized)
-    sanitized = sanitize_document(credential_safe)
+    sanitized = catalog_identity.sanitize_document(credential_safe)
     redacted_values = _count_changed_scalars(value, specialized)
     redacted_values += _count_changed_scalars(credential_safe, sanitized)
     return sanitized, SanitizationReport(redacted_values=redacted_values, safe=True)
@@ -94,30 +96,35 @@ def _sanitize_string(value: str) -> str:
             pass
         else:
             sanitized = _sanitize_spec_fields(decoded)
-            sanitized = sanitize_document(sanitized)
+            sanitized = catalog_identity.sanitize_document(sanitized)
             return json.dumps(sanitized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return redact_text(value)
+    shared = catalog_identity.sanitize_document(value)
+    if not isinstance(shared, str):
+        raise ValueError("unsupported_canonical_value")
+    sanitized = _SENSITIVE_HEADER_TEXT.sub(
+        lambda match: f"{match.group('key')}=[REDACTED]",
+        shared,
+    )
+    sanitized = _SENSITIVE_ASSIGNMENT.sub(
+        lambda match: f"{match.group('key')}=[REDACTED]",
+        sanitized,
+    )
+    sanitized = _BASIC_CREDENTIAL.sub("[REDACTED_TOKEN]", sanitized)
+    return redact_text(sanitized)
 
 
 def _value_record_context(value: Mapping[Any, Any]) -> bool:
-    location = value.get("in")
-    if isinstance(location, str) and location.casefold() in {"header", "cookie"}:
-        return True
-    identifiers = (value.get("key"), value.get("name"))
-    return any(
-        isinstance(item, str)
-        and _normalized(item)
-        in {
-            "authorization",
-            "cookie",
-            "proxyauthorization",
-            "setcookie",
-            "xapikey",
-            "xaccesstoken",
-            "xauthtoken",
-        }
-        for item in identifiers
-    )
+    for key, item in value.items():
+        if not isinstance(key, str) or not isinstance(item, str):
+            continue
+        if _normalized(key) not in _IDENTIFIER_FIELDS:
+            continue
+        normalized = catalog_identity._normalized_name(item)
+        if catalog_identity._is_sensitive_key(
+            normalized
+        ) or catalog_identity._is_sensitive_header_name(normalized):
+            return True
+    return False
 
 
 def _relocate_sensitive_property_descriptions(value: Any) -> Any:
@@ -129,7 +136,9 @@ def _relocate_sensitive_property_descriptions(value: Any) -> Any:
         if isinstance(properties, dict):
             descriptions: list[dict[str, str]] = []
             for name, schema in properties.items():
-                if not isinstance(name, str) or not _SENSITIVE_PROPERTY.search(name):
+                if not isinstance(name, str) or not catalog_identity._is_sensitive_key(
+                    catalog_identity._normalized_name(name)
+                ):
                     continue
                 if isinstance(schema, dict) and isinstance(schema.get("description"), str):
                     descriptions.append(

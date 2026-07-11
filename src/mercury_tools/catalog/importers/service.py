@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import stat
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -23,11 +25,13 @@ from mercury_tools.catalog.importers.sanitize import SanitizationReport, sanitiz
 from mercury_tools.catalog.local_store import LocalCatalogStore
 from mercury_tools.catalog.models import CatalogAction, CatalogSource
 from mercury_tools.local.repository import RepositoryContext
-from mercury_tools.safety.network import NetworkPolicy, ResolvedTarget
+from mercury_tools.safety.network import NetworkPolicy, NetworkPolicyError, ResolvedTarget
 
 MAX_SPEC_BYTES = 10 * 1024 * 1024
+REMOTE_IMPORT_DEADLINE_SECONDS = 20.0
 _READ_CHUNK_BYTES = 64 * 1024
 _YAML_MARKERS = ("openapi:", "swagger:", "info:")
+_monotonic = time.monotonic
 
 
 class ImportResult(BaseModel):
@@ -60,7 +64,11 @@ def import_spec(
     structured = _parse_structured_document(raw)
     if isinstance(structured, dict):
         source_format = _detect_structured_format(structured)
-        raw_suggestion = security_driver_suggestion(structured) if source_format in {0, 1} else {}
+        raw_suggestion = (
+            security_driver_suggestion(structured, swagger=source_format == 1)
+            if source_format in {0, 1}
+            else {}
+        )
         sanitized, report = sanitize_spec(structured)
         if not isinstance(sanitized, dict):
             raise ValueError("spec_document_invalid")
@@ -68,7 +76,12 @@ def import_spec(
         suggestion = safe_suggestion if isinstance(safe_suggestion, dict) else {}
         source = _build_source(uri, connector_id, sanitized, report, suggestion)
         if source_format in {0, 1}:
-            actions = parse_openapi(sanitized, source, connector_id)
+            actions = parse_openapi(
+                sanitized,
+                source,
+                connector_id,
+                swagger=source_format == 1,
+            )
         else:
             actions = parse_postman(sanitized, source, connector_id)
     else:
@@ -114,12 +127,10 @@ def _detect_structured_format(document: dict[str, Any]) -> int:
         isinstance(postman_schema, str)
         and "/v2.1.0/" in postman_schema.casefold(),
     )
-    matched = [index for index, present in enumerate(markers) if present]
-    if len(matched) > 1:
-        raise ValueError("ambiguous_spec_format")
-    if not matched:
-        raise ValueError("unknown_spec_format")
-    return matched[0]
+    for index, present in enumerate(markers):
+        if present:
+            return index
+    raise ValueError("unknown_spec_format")
 
 
 def _parse_structured_document(text: str) -> dict[str, Any] | None:
@@ -155,7 +166,12 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 def _looks_like_yaml_spec(text: str) -> bool:
     for line in text.splitlines():
         stripped = line.strip().casefold()
-        if not stripped or stripped.startswith("#"):
+        if (
+            not stripped
+            or stripped.startswith("#")
+            or stripped.startswith("%yaml")
+            or stripped in {"---", "..."}
+        ):
             continue
         return stripped.startswith(_YAML_MARKERS)
     return False
@@ -199,7 +215,10 @@ def _read_spec_source(
 
 
 def _read_local_source(context: RepositoryContext, source_path: str | Path) -> tuple[str, str]:
-    root = context.root.resolve(strict=True)
+    try:
+        root = context.root.resolve(strict=True)
+    except OSError:
+        raise ValueError("spec_source_unreadable") from None
     requested = Path(source_path).expanduser()
     if not requested.is_absolute():
         requested = root / requested
@@ -207,7 +226,12 @@ def _read_local_source(context: RepositoryContext, source_path: str | Path) -> t
     if candidate != root and not candidate.is_relative_to(root):
         raise ValueError("spec_source_outside_root")
     _reject_symlink_components(root, candidate)
-    before_open = os.stat(candidate, follow_symlinks=False)
+    try:
+        before_open = os.stat(candidate, follow_symlinks=False)
+    except FileNotFoundError:
+        raise ValueError("spec_source_not_regular") from None
+    except OSError:
+        raise ValueError("spec_source_unreadable") from None
 
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
@@ -219,7 +243,7 @@ def _read_local_source(context: RepositoryContext, source_path: str | Path) -> t
     except FileNotFoundError:
         raise ValueError("spec_source_not_regular") from None
     except OSError:
-        raise ValueError("spec_source_symlink") from None
+        raise ValueError("spec_source_unreadable") from None
     try:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
@@ -241,8 +265,11 @@ def _read_local_source(context: RepositoryContext, source_path: str | Path) -> t
         current = os.stat(candidate, follow_symlinks=False)
         if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
             raise ValueError("spec_source_changed")
+    except OSError:
+        raise ValueError("spec_source_unreadable") from None
     finally:
-        os.close(descriptor)
+        with suppress(OSError):
+            os.close(descriptor)
     try:
         text = b"".join(chunks).decode("utf-8", errors="strict")
     except UnicodeDecodeError:
@@ -260,29 +287,59 @@ def _reject_symlink_components(root: Path, candidate: Path) -> None:
                 raise ValueError("spec_source_symlink")
     except FileNotFoundError:
         raise ValueError("spec_source_not_regular") from None
+    except OSError:
+        raise ValueError("spec_source_unreadable") from None
 
 
-def _read_remote_source(source_url: str) -> tuple[str, str]:
+def _read_remote_source(
+    source_url: str,
+    *,
+    monotonic: Callable[[], float] | None = None,
+) -> tuple[str, str]:
+    clock = monotonic or _monotonic
+    deadline = clock() + REMOTE_IMPORT_DEADLINE_SECONDS
     target = NetworkPolicy().resolve_https_target(source_url)
-    timeout = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0)
+    remaining = _deadline_remaining(deadline, clock)
+    timeout = httpx.Timeout(
+        connect=min(5.0, remaining),
+        read=min(15.0, remaining),
+        write=min(5.0, remaining),
+        pool=min(5.0, remaining),
+    )
     headers = {"Accept": "application/json, application/yaml, text/yaml, text/markdown"}
-    with httpx.Client(
-        follow_redirects=False,
-        timeout=timeout,
-        headers=headers,
-        trust_env=False,
-    ) as client, client.stream("GET", source_url) as response:
-        if 300 <= response.status_code < 400:
-            raise ValueError("remote_redirect_forbidden")
-        response.raise_for_status()
-        _verify_response_peer(response, target)
-        chunks: list[bytes] = []
-        size = 0
-        for chunk in response.iter_bytes():
-            size += len(chunk)
-            if size > MAX_SPEC_BYTES:
-                raise ValueError("spec_source_too_large")
-            chunks.append(chunk)
+    try:
+        with httpx.Client(
+            follow_redirects=False,
+            timeout=timeout,
+            headers=headers,
+            trust_env=False,
+        ) as client, client.stream("GET", target.url) as response:
+            _deadline_remaining(deadline, clock)
+            if 300 <= response.status_code < 400:
+                raise ValueError("remote_redirect_forbidden")
+            if not 200 <= response.status_code < 300:
+                raise ValueError("remote_http_error")
+            _verify_response_peer(response, target)
+            chunks: list[bytes] = []
+            size = 0
+            iterator = iter(response.iter_bytes())
+            while True:
+                _deadline_remaining(deadline, clock)
+                try:
+                    chunk = next(iterator)
+                except StopIteration:
+                    break
+                _deadline_remaining(deadline, clock)
+                size += len(chunk)
+                if size > MAX_SPEC_BYTES:
+                    raise ValueError("spec_source_too_large")
+                chunks.append(chunk)
+    except (NetworkPolicyError, ValueError):
+        raise
+    except httpx.TimeoutException:
+        raise ValueError("remote_request_timeout") from None
+    except (httpx.HTTPError, OSError):
+        raise ValueError("remote_request_failed") from None
     try:
         text = b"".join(chunks).decode("utf-8", errors="strict")
     except UnicodeDecodeError:
@@ -293,7 +350,19 @@ def _read_remote_source(source_url: str) -> tuple[str, str]:
 def _verify_response_peer(response: httpx.Response, target: ResolvedTarget) -> None:
     stream = response.extensions.get("network_stream")
     if stream is None or not hasattr(stream, "get_extra_info"):
-        return
-    peer = stream.get_extra_info("server_addr")
+        raise NetworkPolicyError("remote_peer_unverified")
+    try:
+        peer = stream.get_extra_info("server_addr")
+    except Exception:
+        raise NetworkPolicyError("remote_peer_unverified") from None
     if isinstance(peer, tuple) and peer and isinstance(peer[0], str):
         target.verify_peer(peer[0])
+        return
+    raise NetworkPolicyError("remote_peer_unverified")
+
+
+def _deadline_remaining(deadline: float, monotonic: Callable[[], float]) -> float:
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise ValueError("remote_import_deadline_exceeded")
+    return remaining

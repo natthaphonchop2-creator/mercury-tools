@@ -4,7 +4,7 @@ import ipaddress
 import re
 import socket
 from dataclasses import dataclass
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import urlsplit
 
 _METADATA_HOSTS = {
     "instance-data.ec2.internal",
@@ -13,12 +13,6 @@ _METADATA_HOSTS = {
     "metadata.goog",
 }
 _NUMERIC_COMPONENT = re.compile(r"^(?:0x[0-9a-f]+|0[0-7]+|[0-9]+)$", re.IGNORECASE)
-_SENSITIVE_QUERY_KEY = re.compile(
-    r"(?:authorization|credential|secret|token|password|api[_-]?key)",
-    re.IGNORECASE,
-)
-
-
 class NetworkPolicyError(ValueError):
     """A remote specification target failed the import network policy."""
 
@@ -31,7 +25,10 @@ class ResolvedTarget:
     addresses: tuple[str, ...]
 
     def verify_peer(self, address: str) -> None:
-        normalized = str(ipaddress.ip_address(address))
+        try:
+            normalized = str(ipaddress.ip_address(address))
+        except ValueError:
+            raise NetworkPolicyError("remote_peer_unverified") from None
         if normalized not in self.addresses:
             raise NetworkPolicyError("remote_peer_address_mismatch")
 
@@ -50,8 +47,8 @@ class NetworkPolicy:
             raise NetworkPolicyError("https_required")
         if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
             raise NetworkPolicyError("remote_userinfo_forbidden")
-        if any(_SENSITIVE_QUERY_KEY.search(key) for key, _ in parse_qsl(parsed.query)):
-            raise NetworkPolicyError("remote_credential_query_forbidden")
+        if "?" in url or "#" in url:
+            raise NetworkPolicyError("remote_query_or_fragment_forbidden")
         if not hostname:
             raise NetworkPolicyError("remote_hostname_required")
 

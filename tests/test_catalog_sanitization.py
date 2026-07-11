@@ -48,10 +48,14 @@ def test_sanitize_spec_preserves_schema_names_and_descriptions_but_removes_value
             "description": "Credential field supplied during setup",
         }
     ]
-    assert "raw-" not in serialized
+    assert sanitized["headers"][0]["value"] == "raw-header"
+    assert "raw-default" not in serialized
+    assert "raw-example" not in serialized
+    assert "raw-cookie" not in serialized
+    assert "raw-query" not in serialized
     assert "owner@example.com" not in serialized
     assert "user:pass" not in serialized
-    assert report == SanitizationReport(redacted_values=8, safe=True)
+    assert report == SanitizationReport(redacted_values=7, safe=True)
     assert "raw" not in report.model_dump_json()
     validate_credential_safe(sanitized)
 
@@ -90,3 +94,54 @@ def test_sanitize_spec_reuses_task_three_token_and_text_patterns() -> None:
     }
     assert report.redacted_values == 3
     validate_credential_safe(sanitized)
+
+
+@pytest.mark.parametrize(
+    "identifier",
+    [
+        "password",
+        "access_token",
+        "Cookie",
+        "Set-Cookie",
+        "X-Signed-Token",
+        "service_credentials",
+    ],
+)
+def test_record_shaped_sensitive_identifiers_redact_their_value(identifier: str) -> None:
+    document = {"records": [{"key": identifier, "value": "record-secret-value"}]}
+
+    sanitized, _ = sanitize_spec(document)
+
+    assert sanitized["records"][0] == {"key": identifier, "value": "[REDACTED]"}
+    assert "record-secret-value" not in json.dumps(sanitized)
+    validate_credential_safe(sanitized)
+
+
+def test_free_text_redacts_basic_cookie_and_sensitive_assignments_idempotently() -> None:
+    document = {
+        "markdown": (
+            "Authorization: Basic dXNlcjpwYXNz\n"
+            "Cookie: session=raw-cookie; csrftoken=raw-csrf\n"
+            "Set-Cookie: access_token=raw-token; HttpOnly\n"
+            "api_key=raw-api-key password: raw-password signed_token=raw-signed-token"
+        )
+    }
+
+    first, first_report = sanitize_spec(document)
+    second, second_report = sanitize_spec(first)
+
+    serialized = json.dumps(first)
+    for secret in (
+        "dXNlcjpwYXNz",
+        "raw-cookie",
+        "raw-csrf",
+        "raw-token",
+        "raw-api-key",
+        "raw-password",
+        "raw-signed-token",
+    ):
+        assert secret not in serialized
+    assert first_report.redacted_values == 1
+    assert second == first
+    assert second_report == SanitizationReport(redacted_values=0, safe=True)
+    validate_credential_safe(first)
