@@ -6,12 +6,52 @@ from pathlib import Path
 import pytest
 
 from mercury_tools.local.repository import (
+    RepositoryContext,
     configure_connector,
     ensure_repository_state,
     load_repository_config,
     resolve_repository_root,
     root_paths,
 )
+
+
+def _write_connector_config(
+    context: RepositoryContext,
+    *,
+    connector_id: str = "custom-books",
+    environment: str = "production",
+    record_updates: dict[str, object] | None = None,
+    trusted_hosts: list[str] | None = None,
+) -> None:
+    record: dict[str, object] = {
+        "driver_id": "oauth_client_credentials",
+        "base_url": "https://api.example-books.com/v2",
+        "auth_settings": {
+            "client_id_name": "CLIENT_ID",
+            "client_secret_name": "CLIENT_SECRET",
+            "grant_type": "client_credentials",
+            "scope": "flowaccount-api",
+            "token_url": "https://auth.example-books.com/oauth/token",
+        },
+        "network_policy": {"allow_private_network": False},
+    }
+    if record_updates is not None:
+        record.update(record_updates)
+    context.config_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "trusted_hosts": {
+                    connector_id: {
+                        environment: trusted_hosts
+                        if trusted_hosts is not None
+                        else ["api.example-books.com", "auth.example-books.com"],
+                    }
+                },
+                "connectors": {connector_id: {environment: record}},
+            }
+        )
+    )
 
 
 def test_single_root_is_selected_and_scaffolded(tmp_path: Path) -> None:
@@ -159,6 +199,53 @@ def test_connector_configuration_rejects_sensitive_scope_markers(
             driver_id="oauth_client_credentials",
             base_url="https://api.example-books.com/v2",
             auth_settings={"scope": scope},
+        )
+
+
+def test_connector_configuration_rejects_credential_like_oauth_scope(
+    tmp_path: Path,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+
+    with pytest.raises(ValueError, match="secret_auth_setting_not_allowed"):
+        configure_connector(
+            context,
+            connector_id="custom-books",
+            environment="production",
+            driver_id="oauth_client_credentials",
+            base_url="https://api.example-books.com/v2",
+            auth_settings={"scope": "ghp_not_a_scope"},
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("connector_id", "ghp_not_a_connector"),
+        ("environment", "sk-not-an-environment"),
+        ("driver_id", "ghp_not_a_driver"),
+        ("driver_id", "not a driver"),
+    ],
+)
+def test_connector_configuration_rejects_invalid_or_credential_like_identifiers(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    settings = {
+        "connector_id": "custom-books",
+        "environment": "production",
+        "driver_id": "api_key_header",
+    }
+    settings[field] = value
+
+    with pytest.raises(ValueError):
+        configure_connector(
+            context,
+            base_url="https://api.example-books.com/v2",
+            auth_settings={"key_name": "X-API-Key"},
+            **settings,
         )
 
 
@@ -417,4 +504,80 @@ def test_load_repository_config_rejects_malformed_trusted_hosts(
     )
 
     with pytest.raises(ValueError, match="invalid_trusted_hosts"):
+        load_repository_config(context)
+
+
+@pytest.mark.parametrize(
+    "record_updates",
+    [
+        {"base_url": "https://api.example-books.com:invalid/v2"},
+        {"auth_settings": {"authorization_header": "Bearer secret"}},
+        {"auth_settings": {"token_urls": ["https://auth.example-books.com/token"]}},
+        {"auth_settings": {"grant_type": "authorization_code"}},
+        {"auth_settings": {"scope": "ghp_not_a_scope"}},
+        {"network_policy": {"allow_private_network": True, "extra": False}},
+    ],
+)
+def test_load_repository_config_enforces_configure_time_record_constraints(
+    tmp_path: Path,
+    record_updates: dict[str, object],
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    _write_connector_config(context, record_updates=record_updates)
+
+    with pytest.raises(ValueError):
+        load_repository_config(context)
+
+
+@pytest.mark.parametrize(
+    ("connector_id", "environment", "record_updates"),
+    [
+        ("ghp_not_a_connector", "production", {}),
+        ("custom-books", "sk-not-an-environment", {}),
+        ("custom-books", "production", {"driver_id": "ghp_not_a_driver"}),
+    ],
+)
+def test_load_repository_config_rejects_invalid_or_credential_like_identifiers(
+    tmp_path: Path,
+    connector_id: str,
+    environment: str,
+    record_updates: dict[str, object],
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    _write_connector_config(
+        context,
+        connector_id=connector_id,
+        environment=environment,
+        record_updates=record_updates,
+    )
+
+    with pytest.raises(ValueError):
+        load_repository_config(context)
+
+
+def test_load_repository_config_rejects_unknown_connector_record_keys(
+    tmp_path: Path,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    _write_connector_config(context, record_updates={"authorization_header": "Bearer secret"})
+
+    with pytest.raises(ValueError):
+        load_repository_config(context)
+
+
+@pytest.mark.parametrize(
+    "trusted_hosts",
+    [
+        ["api.example-books.com"],
+        ["api.example-books.com", "auth.example-books.com", "extra.example-books.com"],
+    ],
+)
+def test_load_repository_config_requires_exact_connector_trusted_hosts(
+    tmp_path: Path,
+    trusted_hosts: list[str],
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    _write_connector_config(context, trusted_hosts=trusted_hosts)
+
+    with pytest.raises(ValueError):
         load_repository_config(context)

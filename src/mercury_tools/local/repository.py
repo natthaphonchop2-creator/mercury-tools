@@ -29,12 +29,19 @@ _AUTH_METADATA_KEYS = {
     "scope",
     "token_url",
 }
+_CONNECTOR_RECORD_KEYS = {
+    "driver_id",
+    "base_url",
+    "auth_settings",
+    "network_policy",
+}
+_NETWORK_POLICY_KEYS = {"allow_private_network"}
 _AUTH_PARAMETER_NAME_KEYS = {
     "client_id_name",
     "client_secret_name",
     "key_name",
 }
-_AUTH_PARAMETER_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
+_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
 _OAUTH_SCOPE_PATTERN = re.compile(
     r"^[\x21\x23-\x5b\x5d-\x7e]+(?: [\x21\x23-\x5b\x5d-\x7e]+)*$"
 )
@@ -164,10 +171,13 @@ def load_repository_config(context: RepositoryContext) -> RepositoryConfig:
         return RepositoryConfig()
 
     payload = json.loads(context.config_path.read_text())
+    if not isinstance(payload, Mapping):
+        raise ValueError("invalid_repository_config")
+    trusted_hosts = _load_trusted_hosts(payload.get("trusted_hosts", {}))
     return RepositoryConfig(
         schema_version=int(payload.get("schema_version", 1)),
-        trusted_hosts=_load_trusted_hosts(payload.get("trusted_hosts", {})),
-        connectors=_load_connectors(payload.get("connectors", {})),
+        trusted_hosts=trusted_hosts,
+        connectors=_load_connectors(payload.get("connectors", {}), trusted_hosts),
     )
 
 
@@ -179,32 +189,33 @@ def configure_connector(
     base_url: str,
     auth_settings: Mapping[str, Any],
 ) -> RepositoryConfig:
+    if not isinstance(auth_settings, Mapping):
+        raise ValueError("unsupported_auth_setting")
     settings = dict(auth_settings)
     allow_private_network = settings.pop("allow_private_network", False)
-    if not isinstance(allow_private_network, bool):
-        raise ValueError("invalid_network_policy")
-    if allow_private_network and environment not in _PRIVATE_NETWORK_ENVIRONMENTS:
-        raise ValueError("private_network_only_for_local_or_gateway")
-
-    hosts = [_validate_endpoint_url(base_url, environment, allow_private_network)]
-    sanitized_auth_settings = _sanitize_auth_settings(settings)
-    token_url = sanitized_auth_settings.get("token_url")
-    if token_url is not None:
-        host = _validate_endpoint_url(token_url, environment, allow_private_network)
-        if host not in hosts:
-            hosts.append(host)
+    record, hosts = _normalize_connector_record(
+        connector_id,
+        environment,
+        {
+            "driver_id": driver_id,
+            "base_url": base_url,
+            "auth_settings": settings,
+            "network_policy": {"allow_private_network": allow_private_network},
+        },
+    )
 
     current = load_repository_config(context)
     trusted_hosts = _copy_trusted_hosts(current.trusted_hosts)
-    connectors = _copy_connectors(current.connectors)
-
-    trusted_hosts.setdefault(connector_id, {})[environment] = tuple(hosts)
-    connectors.setdefault(connector_id, {})[environment] = {
-        "driver_id": driver_id,
-        "base_url": base_url,
-        "auth_settings": sanitized_auth_settings,
-        "network_policy": {"allow_private_network": allow_private_network},
+    connectors = {
+        configured_connector_id: {
+            configured_environment: dict(config)
+            for configured_environment, config in environments.items()
+        }
+        for configured_connector_id, environments in current.connectors.items()
     }
+
+    trusted_hosts.setdefault(connector_id, {})[environment] = hosts
+    connectors.setdefault(connector_id, {})[environment] = record
 
     updated = RepositoryConfig(
         schema_version=current.schema_version,
@@ -271,17 +282,50 @@ def _load_trusted_hosts(value: Any) -> dict[str, dict[str, tuple[str, ...]]]:
     for connector_id, environments in value.items():
         if not isinstance(environments, Mapping):
             raise ValueError("invalid_trusted_hosts")
-        trusted_hosts[str(connector_id)] = {
-            str(environment): _trusted_host_tuple(hosts)
-            for environment, hosts in environments.items()
-        }
+        normalized_connector_id = _validate_connector_identifier(connector_id)
+        trusted_hosts[normalized_connector_id] = {}
+        for environment, hosts in environments.items():
+            normalized_environment = _validate_connector_identifier(environment)
+            trusted_hosts[normalized_connector_id][normalized_environment] = (
+                _trusted_host_tuple(hosts)
+            )
     return trusted_hosts
 
 
-def _load_connectors(value: Any) -> dict[str, dict[str, dict[str, Any]]]:
+def _load_connectors(
+    value: Any,
+    trusted_hosts: Mapping[str, Mapping[str, tuple[str, ...]]],
+) -> dict[str, dict[str, dict[str, Any]]]:
     if not isinstance(value, Mapping):
         raise ValueError("invalid_connectors")
-    return _copy_connectors(value)
+    connectors: dict[str, dict[str, dict[str, Any]]] = {}
+    for connector_id, environments in value.items():
+        if not isinstance(environments, Mapping):
+            raise ValueError("invalid_connectors")
+        normalized_connector_id = _validate_connector_identifier(connector_id)
+        connectors[normalized_connector_id] = {}
+        for environment, record in environments.items():
+            if not isinstance(record, Mapping):
+                raise ValueError("invalid_connectors")
+            normalized_environment = _validate_connector_identifier(environment)
+            normalized_record, expected_hosts = _normalize_connector_record(
+                normalized_connector_id,
+                normalized_environment,
+                record,
+            )
+            stored_hosts = trusted_hosts.get(normalized_connector_id, {}).get(
+                normalized_environment
+            )
+            if stored_hosts is None or set(stored_hosts) != set(expected_hosts):
+                raise ValueError("invalid_trusted_hosts")
+            connectors[normalized_connector_id][normalized_environment] = normalized_record
+
+    if set(trusted_hosts) != set(connectors):
+        raise ValueError("invalid_trusted_hosts")
+    for connector_id, environments in trusted_hosts.items():
+        if set(environments) != set(connectors[connector_id]):
+            raise ValueError("invalid_trusted_hosts")
+    return connectors
 
 
 def _copy_trusted_hosts(
@@ -296,27 +340,14 @@ def _copy_trusted_hosts(
     }
 
 
-def _copy_connectors(value: Mapping[str, Any]) -> dict[str, dict[str, dict[str, Any]]]:
-    connectors: dict[str, dict[str, dict[str, Any]]] = {}
-    for connector_id, environments in value.items():
-        if not isinstance(environments, Mapping):
-            raise ValueError("invalid_connectors")
-        connectors[str(connector_id)] = {}
-        for environment, config in environments.items():
-            if not isinstance(config, Mapping):
-                raise ValueError("invalid_connectors")
-            _validate_loaded_network_policy(config)
-            connectors[str(connector_id)][str(environment)] = dict(config)
-    return connectors
-
-
 def _sanitize_auth_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(settings, Mapping):
+        raise ValueError("unsupported_auth_setting")
     sanitized: dict[str, Any] = {}
     for key, value in settings.items():
-        normalized_key = str(key)
-        if normalized_key not in _AUTH_METADATA_KEYS:
+        if not isinstance(key, str) or key not in _AUTH_METADATA_KEYS:
             raise ValueError("unsupported_auth_setting")
-        sanitized[normalized_key] = _sanitize_auth_setting(normalized_key, value)
+        sanitized[key] = _sanitize_auth_setting(key, value)
     return sanitized
 
 
@@ -337,7 +368,7 @@ def _sanitize_auth_setting(key: str, value: Any) -> str:
 
 
 def _validate_auth_parameter_name(value: str) -> str:
-    if not _AUTH_PARAMETER_NAME_PATTERN.fullmatch(value):
+    if not _IDENTIFIER_PATTERN.fullmatch(value):
         raise ValueError("unsupported_auth_setting")
     if _looks_like_credential_material(value):
         raise ValueError("secret_auth_setting_not_allowed")
@@ -345,6 +376,8 @@ def _validate_auth_parameter_name(value: str) -> str:
 
 
 def _validate_oauth_scope(value: str) -> str:
+    if any(_looks_like_credential_material(scope) for scope in value.split()):
+        raise ValueError("secret_auth_setting_not_allowed")
     normalized = value.casefold()
     if any(marker in normalized for marker in _SENSITIVE_SCOPE_MARKERS):
         raise ValueError("secret_auth_setting_not_allowed")
@@ -358,7 +391,75 @@ def _looks_like_credential_material(value: str) -> bool:
     return any(normalized.startswith(prefix) for prefix in _CREDENTIAL_VALUE_PREFIXES)
 
 
+def _normalize_connector_record(
+    connector_id: Any,
+    environment: Any,
+    record: Mapping[str, Any],
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    _validate_connector_identifier(connector_id)
+    normalized_environment = _validate_connector_identifier(environment)
+    if not isinstance(record, Mapping) or set(record) != _CONNECTOR_RECORD_KEYS:
+        raise ValueError("invalid_connector_record")
+
+    driver_id = _validate_connector_identifier(record["driver_id"])
+    network_policy = _normalize_network_policy(
+        record["network_policy"],
+        normalized_environment,
+    )
+    base_url = record["base_url"]
+    hosts = [
+        _validate_endpoint_url(
+            base_url,
+            normalized_environment,
+            network_policy["allow_private_network"],
+        )
+    ]
+    auth_settings = _sanitize_auth_settings(record["auth_settings"])
+    token_url = auth_settings.get("token_url")
+    if token_url is not None:
+        token_host = _validate_endpoint_url(
+            token_url,
+            normalized_environment,
+            network_policy["allow_private_network"],
+        )
+        if token_host not in hosts:
+            hosts.append(token_host)
+    return (
+        {
+            "driver_id": driver_id,
+            "base_url": base_url,
+            "auth_settings": auth_settings,
+            "network_policy": network_policy,
+        },
+        tuple(hosts),
+    )
+
+
+def _validate_connector_identifier(value: Any) -> str:
+    if not isinstance(value, str) or not _IDENTIFIER_PATTERN.fullmatch(value):
+        raise ValueError("invalid_connector_identifier")
+    if _looks_like_credential_material(value):
+        raise ValueError("secret_connector_identifier_not_allowed")
+    return value
+
+
+def _normalize_network_policy(
+    policy: Any,
+    environment: str,
+) -> dict[str, bool]:
+    if not isinstance(policy, Mapping) or set(policy) != _NETWORK_POLICY_KEYS:
+        raise ValueError("invalid_network_policy")
+    allow_private_network = policy["allow_private_network"]
+    if not isinstance(allow_private_network, bool):
+        raise ValueError("invalid_network_policy")
+    if allow_private_network and environment not in _PRIVATE_NETWORK_ENVIRONMENTS:
+        raise ValueError("private_network_only_for_local_or_gateway")
+    return {"allow_private_network": allow_private_network}
+
+
 def _validate_endpoint_url(url: str, environment: str, allow_private_network: bool) -> str:
+    if not isinstance(url, str):
+        raise ValueError("invalid_endpoint_url")
     try:
         parsed = urlparse(url)
     except ValueError as exc:
@@ -420,19 +521,9 @@ def _trusted_host_tuple(value: Any) -> tuple[str, ...]:
         if not isinstance(host, str) or not _is_valid_trusted_host(host):
             raise ValueError("invalid_trusted_hosts")
         hosts.append(host)
+    if len(set(hosts)) != len(hosts):
+        raise ValueError("invalid_trusted_hosts")
     return tuple(hosts)
-
-
-def _validate_loaded_network_policy(config: Mapping[str, Any]) -> None:
-    if "network_policy" not in config:
-        return
-    policy = config["network_policy"]
-    if not isinstance(policy, Mapping):
-        raise ValueError("invalid_network_policy")
-    if "allow_private_network" in policy and not isinstance(
-        policy["allow_private_network"], bool
-    ):
-        raise ValueError("invalid_network_policy")
 
 
 def _is_valid_trusted_host(host: str) -> bool:
