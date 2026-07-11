@@ -115,6 +115,18 @@ _SENSITIVE_VALUE_PREFIXES = (
     "xoxp-",
     "ya29.",
 )
+_PATH_ASSIGNMENT = re.compile(
+    r"^(?P<key>[A-Za-z0-9_-]+)[=:](?P<value>.+)$"
+)
+_SENSITIVE_PATH_PREFIX_VALUE = re.compile(
+    r"(?i)^(?:access[_-]?token|api[_-]?(?:key|secret)|auth[_-]?token|"
+    r"client[_-]?secret|consumer[_-]?secret|id[_-]?token|oauth[_-]?token|"
+    r"refresh[_-]?token|signed[_-]?token)-(?=.+)"
+)
+_JWT_PATH_SEGMENT = re.compile(
+    r"^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}$"
+)
+_PATH_VALUE_FIELDS = {"path", "pathtemplate", "sourceuri", "url"}
 
 
 class FrozenDict(dict[str, Any]):
@@ -164,6 +176,28 @@ def validate_credential_safe(value: Any) -> None:
     _, changed = _credential_transform(value)
     if changed:
         raise ValueError("catalog_credentials_unsafe")
+
+
+def validate_credential_safe_paths(value: Any) -> None:
+    """Reject credential material in endpoint paths without retaining the value."""
+    _inspect_credential_paths(value)
+
+
+def validate_credential_safe_path(value: str) -> None:
+    """Reject one credential-bearing URI or endpoint path with a constant error."""
+    if not isinstance(value, str):
+        return
+    path = _path_component(value)
+    for encoded_segment in path.split("/"):
+        decoded = encoded_segment
+        for _ in range(3):
+            next_decoded = unquote(decoded)
+            if next_decoded == decoded:
+                break
+            decoded = next_decoded
+        for segment in decoded.split("/"):
+            if _path_segment_has_credential(segment):
+                raise ValueError("catalog_credential_path_unsafe")
 
 
 def deep_freeze(value: Any) -> Any:
@@ -238,6 +272,61 @@ def _canonical_value(value: Any) -> Any:
     if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
         return [_canonical_value(item) for item in value]
     raise ValueError("unsupported_canonical_value")
+
+
+def _inspect_credential_paths(value: Any, *, parent_key: str = "") -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                continue
+            normalized_key = _normalized_name(key)
+            if key.lstrip().startswith("/"):
+                validate_credential_safe_path(key)
+            if normalized_key in _PATH_VALUE_FIELDS or (
+                normalized_key == "raw" and _normalized_name(parent_key) == "url"
+            ):
+                _inspect_path_value(item)
+            _inspect_credential_paths(item, parent_key=key)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for item in value:
+            _inspect_credential_paths(item, parent_key=parent_key)
+
+
+def _inspect_path_value(value: Any) -> None:
+    if isinstance(value, str):
+        validate_credential_safe_path(value)
+    elif (
+        isinstance(value, Sequence)
+        and not isinstance(value, (str, bytes, bytearray))
+        and all(isinstance(item, str) for item in value)
+    ):
+        validate_credential_safe_path("/" + "/".join(value))
+
+
+def _path_component(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value.split("?", 1)[0].split("#", 1)[0]
+    return parsed.path
+
+
+def _path_segment_has_credential(segment: str) -> bool:
+    candidate = segment.strip()
+    if not candidate or (candidate.startswith("{") and candidate.endswith("}")):
+        return False
+    folded = candidate.casefold()
+    if folded.startswith(_SENSITIVE_VALUE_PREFIXES):
+        return True
+    assignment = _PATH_ASSIGNMENT.fullmatch(candidate)
+    sensitive_assignment = bool(
+        assignment and _is_sensitive_key(_normalized_name(assignment.group("key")))
+    )
+    return bool(
+        sensitive_assignment
+        or _SENSITIVE_PATH_PREFIX_VALUE.match(candidate)
+        or _JWT_PATH_SEGMENT.fullmatch(candidate)
+    )
 
 
 def _credential_transform(value: Any, *, force_redaction: bool = False) -> tuple[Any, bool]:

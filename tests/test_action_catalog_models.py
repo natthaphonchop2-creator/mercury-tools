@@ -508,6 +508,68 @@ def test_direct_catalog_actions_allow_safe_parameter_metadata_and_relative_urls(
 
 
 @pytest.mark.parametrize(
+    ("field", "unsafe_value"),
+    [
+        ("path_template", "/v1/%67hp_task-4-secret-must-not-echo"),
+        ("path_template", "/v1/access_token=task-4-secret-must-not-echo"),
+        (
+            "path_template",
+            "/download/eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0YXNrLTQifQ.signature",
+        ),
+        (
+            "source_uri",
+            "https://example.test/v1/sk-live-task-4-secret-must-not-echo/openapi.json",
+        ),
+    ],
+)
+def test_direct_catalog_action_rejects_credential_bearing_paths_without_echo(
+    action_factory,
+    field: str,
+    unsafe_value: str,
+) -> None:
+    with pytest.raises(ValidationError, match="catalog_credential_path_unsafe") as raised:
+        action_factory(**{field: unsafe_value})
+
+    assert "task-4-secret-must-not-echo" not in str(raised.value)
+
+
+def test_catalog_source_rejects_structural_endpoint_path_key_without_echo() -> None:
+    secret = "task-4-structural-secret-must-not-echo"
+
+    with pytest.raises(ValidationError, match="catalog_credential_path_unsafe") as raised:
+        CatalogSource.from_document(
+            uri="https://example.test/openapi.json",
+            connector_id="flowaccount",
+            document={
+                "openapi": "3.0.0",
+                "paths": {f"/v1/api_key:{secret}": {}},
+            },
+            report={"status": "imported"},
+        )
+
+    assert secret not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/contacts/{contact_id}",
+        "/oauth/token",
+        "/v1",
+        "/tokens/{token_id}",
+        "/token/refresh",
+    ],
+)
+def test_catalog_paths_preserve_parameter_templates_and_token_endpoint_nouns(
+    action_factory,
+    path: str,
+) -> None:
+    action = action_factory(path_template=path)
+
+    assert action.path_template == path
+
+
+@pytest.mark.parametrize(
     "source_uri",
     [
         "https://user:task-3-credential-raw-value@example.test/v1?"

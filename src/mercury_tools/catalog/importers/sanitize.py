@@ -39,6 +39,7 @@ class SanitizationReport(BaseModel):
 
 def sanitize_spec(value: Any) -> tuple[Any, SanitizationReport]:
     """Sanitize one parsed specification and count changed scalar values."""
+    catalog_identity.validate_credential_safe_paths(value)
     specialized = _sanitize_spec_fields(value)
     credential_safe = _relocate_sensitive_property_descriptions(specialized)
     sanitized = catalog_identity.sanitize_document(credential_safe)

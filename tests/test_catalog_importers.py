@@ -5,6 +5,7 @@ import os
 import shutil
 import socket
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -304,6 +305,33 @@ def test_swagger_precedes_postman_marker(tmp_path: Path) -> None:
     assert result.actions[0].confidence == "exact"
 
 
+def test_invalid_openapi_marker_selects_and_stores_exact_swagger_source_type(
+    tmp_path: Path,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    source_path = tmp_path / "invalid-openapi-valid-swagger.json"
+    source_path.write_text(
+        json.dumps(
+            {
+                "openapi": "invalid-marker",
+                "swagger": "2.0",
+                "info": {"version": "1"},
+                "paths": {
+                    "/items": {
+                        "get": {"responses": {"200": {"description": "OK"}}}
+                    }
+                },
+            }
+        )
+    )
+
+    result = import_spec(context, connector_id="custom", source_path=source_path)
+    revalidated = CatalogSource.model_validate(result.source.model_dump(mode="python"))
+
+    assert result.source.source_type == "swagger2"
+    assert revalidated.source_hash == result.source.source_hash
+
+
 @pytest.mark.parametrize("prefix", ["---\n", "%YAML 1.2\n---\n"])
 def test_yaml_directives_and_document_markers_are_parsed(
     tmp_path: Path,
@@ -500,6 +528,42 @@ def test_network_policy_rejects_host_when_any_dns_answer_is_unsafe(monkeypatch) 
     monkeypatch.setattr(socket, "getaddrinfo", mixed_answers)
 
     with pytest.raises(NetworkPolicyError, match="unsafe_resolved_address"):
+        NetworkPolicy().resolve_https_target("https://example.test/openapi.json")
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "0.0.0.0",
+        "::",
+        "127.0.0.1",
+        "::1",
+        "169.254.1.1",
+        "fe80::1",
+        "10.0.0.1",
+        "fc00::1",
+        "224.0.0.1",
+        "ff02::1",
+        "240.0.0.1",
+        "2001:db8::1",
+        "169.254.169.254",
+        "192.0.2.1",
+    ],
+)
+def test_network_policy_rejects_every_non_global_unicast_dns_answer(
+    monkeypatch,
+    address: str,
+) -> None:
+    family = socket.AF_INET6 if ":" in address else socket.AF_INET
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (family, socket.SOCK_STREAM, 6, "", (address, 443))
+        ],
+    )
+
+    with pytest.raises(NetworkPolicyError, match="^unsafe_resolved_address$"):
         NetworkPolicy().resolve_https_target("https://example.test/openapi.json")
 
 
@@ -712,6 +776,66 @@ def test_source_and_action_validation_errors_do_not_echo_values(tmp_path: Path) 
     assert secret not in str(action_error.value)
 
 
+@pytest.mark.parametrize("source_format", ["openapi3", "swagger2", "postman2.1", "markdown"])
+def test_import_rejects_credential_bearing_endpoint_paths_without_echo(
+    tmp_path: Path,
+    source_format: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    secret = "task-4-path-secret-must-not-echo"
+    unsafe_path = f"/v1/client_secret={secret}"
+    source_path = tmp_path / f"unsafe-{source_format}.txt"
+    if source_format == "openapi3":
+        document: dict[str, Any] = {
+            "openapi": "3.0.0",
+            "info": {"version": "1"},
+            "paths": {
+                unsafe_path: {
+                    "get": {"responses": {"200": {"description": "OK"}}}
+                }
+            },
+        }
+        source_path.write_text(json.dumps(document))
+    elif source_format == "swagger2":
+        document = {
+            "swagger": "2.0",
+            "info": {"version": "1"},
+            "paths": {
+                unsafe_path: {
+                    "get": {"responses": {"200": {"description": "OK"}}}
+                }
+            },
+        }
+        source_path.write_text(json.dumps(document))
+    elif source_format == "postman2.1":
+        source_path.write_text(
+            json.dumps(
+                {
+                    "info": {
+                        "name": "Unsafe",
+                        "schema": (
+                            "https://schema.getpostman.com/json/collection/"
+                            "v2.1.0/collection.json"
+                        ),
+                    },
+                    "item": [
+                        {
+                            "name": "Unsafe",
+                            "request": {"method": "GET", "url": unsafe_path},
+                        }
+                    ],
+                }
+            )
+        )
+    else:
+        source_path.write_text(f"GET {unsafe_path} - Unsafe endpoint")
+
+    with pytest.raises(ValueError, match="^catalog_credential_path_unsafe$") as raised:
+        import_spec(context, connector_id="custom", source_path=source_path)
+
+    assert secret not in str(raised.value)
+
+
 def test_remote_import_uses_mocked_dns_and_transport_without_auth_headers(
     tmp_path: Path,
     monkeypatch,
@@ -892,6 +1016,57 @@ def test_remote_deadline_bounds_blocking_request_and_headers(monkeypatch) -> Non
         assert entered.is_set()
     finally:
         release.set()
+
+
+def test_remote_deadline_never_runs_blocking_client_cleanup_on_caller(monkeypatch) -> None:
+    request_entered = threading.Event()
+    request_release = threading.Event()
+    cleanup_entered = threading.Event()
+    cleanup_threads: list[threading.Thread] = []
+
+    class BlockingCleanupClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        def build_request(self, method: str, url: str) -> httpx.Request:
+            return httpx.Request(method, url)
+
+        def send(self, _request: httpx.Request, *, stream: bool) -> httpx.Response:
+            assert stream is True
+            request_entered.set()
+            request_release.wait()
+            return _mock_response(200, json={"openapi": "3.0.0"})
+
+        def close(self) -> None:
+            cleanup_threads.append(threading.current_thread())
+            cleanup_entered.set()
+            time.sleep(0.3)
+
+    monkeypatch.setattr(
+        NetworkPolicy,
+        "resolve_https_target",
+        lambda _self, url: ResolvedTarget(
+            url=url,
+            hostname="specs.example.test",
+            port=443,
+            addresses=("93.184.216.34",),
+        ),
+    )
+    monkeypatch.setattr(service.httpx, "Client", BlockingCleanupClient)
+    monkeypatch.setattr(service, "REMOTE_IMPORT_DEADLINE_SECONDS", 0.05)
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(ValueError, match="^remote_import_deadline_exceeded$"):
+            service._read_remote_source("https://specs.example.test/openapi.json")
+        elapsed = time.monotonic() - started
+        assert request_entered.is_set()
+        assert cleanup_entered.wait(0.1)
+        assert elapsed < 0.2
+        assert cleanup_threads
+        assert all(thread is not threading.main_thread() for thread in cleanup_threads)
+    finally:
+        request_release.set()
 
 
 def test_remote_deadline_bounds_each_blocking_stream_read_and_closes_response(

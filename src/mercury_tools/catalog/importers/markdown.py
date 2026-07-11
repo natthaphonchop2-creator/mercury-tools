@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 
+from mercury_tools.catalog.identity import validate_credential_safe_path
 from mercury_tools.catalog.importers._common import (
     build_action,
     empty_input_schema,
@@ -25,6 +26,7 @@ def parse_markdown(text: str, source: CatalogSource, connector_id: str) -> list[
         if not match:
             continue
         method = match.group(1).upper()
+        validate_credential_safe_path(match.group(2).strip("`"))
         path = normalize_path(match.group(2).strip("`"))
         description = (match.group(3) or "").strip().strip("|").strip()
         schema = empty_input_schema()
@@ -48,4 +50,10 @@ def parse_markdown(text: str, source: CatalogSource, connector_id: str) -> list[
 
 
 def has_explicit_endpoints(text: str) -> bool:
-    return any(_ENDPOINT.fullmatch(line) for line in text.splitlines())
+    found = False
+    for line in text.splitlines():
+        match = _ENDPOINT.fullmatch(line)
+        if match:
+            validate_credential_safe_path(match.group(2).strip("`"))
+            found = True
+    return found

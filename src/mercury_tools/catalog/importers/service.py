@@ -34,6 +34,7 @@ MAX_SPEC_BYTES = 10 * 1024 * 1024
 REMOTE_IMPORT_DEADLINE_SECONDS = 20.0
 _READ_CHUNK_BYTES = 64 * 1024
 _YAML_MARKERS = {"info", "openapi", "swagger"}
+_SOURCE_TYPES = ("openapi3", "swagger2", "postman2.1")
 _monotonic = time.monotonic
 
 
@@ -77,7 +78,14 @@ def import_spec(
             raise ValueError("spec_document_invalid")
         safe_suggestion, _ = sanitize_spec(raw_suggestion)
         suggestion = safe_suggestion if isinstance(safe_suggestion, dict) else {}
-        source = _build_source(uri, connector_id, sanitized, report, suggestion)
+        source = _build_source(
+            uri,
+            connector_id,
+            sanitized,
+            report,
+            suggestion,
+            source_type=_SOURCE_TYPES[source_format],
+        )
         if source_format in {0, 1}:
             actions = parse_openapi(
                 sanitized,
@@ -93,7 +101,14 @@ def import_spec(
         sanitized, report = sanitize_spec({"version": "unknown", "content": raw})
         if not isinstance(sanitized, dict) or not isinstance(sanitized.get("content"), str):
             raise ValueError("spec_document_invalid")
-        source = _build_source(uri, connector_id, sanitized, report, {})
+        source = _build_source(
+            uri,
+            connector_id,
+            sanitized,
+            report,
+            {},
+            source_type="documentation",
+        )
         actions = parse_markdown(sanitized["content"], source, connector_id)
 
     LocalCatalogStore(context).write_import(source, actions)
@@ -106,12 +121,15 @@ def _build_source(
     document: dict[str, Any],
     report: SanitizationReport,
     driver_suggestion: dict[str, Any],
+    *,
+    source_type: str,
 ) -> CatalogSource:
     base = CatalogSource.from_document(
         uri=uri,
         connector_id=connector_id,
         document=document,
         report=report.model_dump(mode="json"),
+        source_type=source_type,
     )
     if not driver_suggestion:
         return base
@@ -353,13 +371,15 @@ def _read_remote_source(
         trust_env=False,
     )
     response: httpx.Response | None = None
+    close_response = _once(lambda: response.close() if response is not None else None)
+    close_client = _once(client.close)
     try:
         request = client.build_request("GET", target.url)
         response = _call_with_deadline(
             lambda: client.send(request, stream=True),
             deadline=deadline,
             monotonic=clock,
-            on_timeout=client.close,
+            on_timeout=close_client,
         )
         if 300 <= response.status_code < 400:
             raise ValueError("remote_redirect_forbidden")
@@ -375,7 +395,7 @@ def _read_remote_source(
                     lambda: next(iterator),
                     deadline=deadline,
                     monotonic=clock,
-                    on_timeout=response.close,
+                    on_timeout=close_response,
                 )
             except StopIteration:
                 break
@@ -390,11 +410,8 @@ def _read_remote_source(
     except (httpx.HTTPError, OSError):
         raise ValueError("remote_request_failed") from None
     finally:
-        if response is not None:
-            with suppress(Exception):
-                response.close()
-        with suppress(Exception):
-            client.close()
+        _cleanup_with_deadline(close_response, deadline=deadline, monotonic=clock)
+        _cleanup_with_deadline(close_client, deadline=deadline, monotonic=clock)
     try:
         text = b"".join(chunks).decode("utf-8", errors="strict")
     except UnicodeDecodeError:
@@ -446,9 +463,46 @@ def _call_with_deadline(
         _deadline_remaining(deadline, monotonic)
     except (queue.Empty, ValueError):
         if on_timeout is not None:
-            with suppress(Exception):
-                on_timeout()
+            _start_daemon_cleanup(on_timeout)
         raise ValueError("remote_import_deadline_exceeded") from None
     if succeeded:
         return value
     raise value
+
+
+def _once(callback: Callable[[], Any]) -> Callable[[], Any]:
+    lock = threading.Lock()
+    started = False
+
+    def run() -> Any:
+        nonlocal started
+        with lock:
+            if started:
+                return None
+            started = True
+        return callback()
+
+    return run
+
+
+def _start_daemon_cleanup(callback: Callable[[], Any]) -> None:
+    def run() -> None:
+        with suppress(Exception):
+            callback()
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _cleanup_with_deadline(
+    callback: Callable[[], Any],
+    *,
+    deadline: float,
+    monotonic: Callable[[], float],
+) -> None:
+    try:
+        _deadline_remaining(deadline, monotonic)
+    except ValueError:
+        _start_daemon_cleanup(callback)
+        return
+    with suppress(Exception):
+        _call_with_deadline(callback, deadline=deadline, monotonic=monotonic)

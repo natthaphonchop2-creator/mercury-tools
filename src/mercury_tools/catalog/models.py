@@ -12,6 +12,7 @@ from mercury_tools.catalog.identity import (
     sanitize_document,
     validate_action_identity,
     validate_credential_safe,
+    validate_credential_safe_paths,
 )
 
 
@@ -64,6 +65,7 @@ class CatalogSource(BaseModel):
     @classmethod
     def reject_credentials(cls, value: Any) -> Any:
         validate_credential_safe(value)
+        validate_credential_safe_paths(value)
         return value
 
     @model_validator(mode="after")
@@ -93,6 +95,9 @@ class CatalogSource(BaseModel):
         connector_id: str,
         document: dict[str, Any],
         report: dict[str, Any],
+        *,
+        source_type: Literal["openapi3", "swagger2", "postman2.1", "documentation"]
+        | None = None,
     ) -> "CatalogSource":
         sanitized_uri = sanitize_document(uri)
         sanitized_document = sanitize_document(document)
@@ -105,7 +110,7 @@ class CatalogSource(BaseModel):
         return cls(
             source_id=build_source_id(connector_id, sanitized_uri, source_hash),
             connector_id=connector_id,
-            source_type=_source_type(document),
+            source_type=source_type if source_type is not None else _source_type(document),
             source_uri=sanitized_uri,
             source_hash=source_hash,
             imported_version=_imported_version(document),
@@ -157,6 +162,7 @@ class CatalogAction(BaseModel):
     @classmethod
     def reject_credentials(cls, value: Any) -> Any:
         validate_credential_safe(value)
+        validate_credential_safe_paths(value)
         return value
 
     @model_validator(mode="after")

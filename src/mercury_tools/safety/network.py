@@ -13,6 +13,8 @@ _METADATA_HOSTS = {
     "metadata.goog",
 }
 _NUMERIC_COMPONENT = re.compile(r"^(?:0x[0-9a-f]+|0[0-7]+|[0-9]+)$", re.IGNORECASE)
+
+
 class NetworkPolicyError(ValueError):
     """A remote specification target failed the import network policy."""
 
@@ -83,7 +85,7 @@ class NetworkPolicy:
                 raise NetworkPolicyError("remote_dns_resolution_empty")
 
         for address in addresses:
-            if not ipaddress.ip_address(address).is_global:
+            if not _is_global_unicast(ipaddress.ip_address(address)):
                 raise NetworkPolicyError("unsafe_resolved_address")
         return ResolvedTarget(url=url, hostname=hostname, port=port, addresses=addresses)
 
@@ -98,3 +100,18 @@ def _parse_direct_ip(hostname: str) -> ipaddress.IPv4Address | ipaddress.IPv6Add
 def _is_numeric_alias(hostname: str) -> bool:
     parts = hostname.split(".")
     return bool(parts) and all(_NUMERIC_COMPONENT.fullmatch(part) for part in parts)
+
+
+def _is_global_unicast(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    mapped = address.ipv4_mapped if isinstance(address, ipaddress.IPv6Address) else None
+    candidates = (address, mapped) if mapped is not None else (address,)
+    return all(
+        candidate.is_global
+        and not candidate.is_multicast
+        and not candidate.is_unspecified
+        and not candidate.is_reserved
+        and not candidate.is_loopback
+        and not candidate.is_link_local
+        and not candidate.is_private
+        for candidate in candidates
+    )
