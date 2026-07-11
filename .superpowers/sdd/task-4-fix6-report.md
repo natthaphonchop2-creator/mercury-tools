@@ -47,7 +47,7 @@ The full suite warning is the existing Starlette deprecation warning in
 
 ## Commit
 
-Pending commit amendment with final SHA.
+`34e74fc8828b9dc466083e600ed3df6c518e0239 fix: classify encoded catalog path fields`
 
 ## Residual risk
 
