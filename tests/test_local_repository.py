@@ -92,6 +92,8 @@ def test_connector_configuration_pins_oauth_token_host(tmp_path: Path) -> None:
         auth_settings={
             "client_id_name": "CLIENT_ID",
             "client_secret_name": "CLIENT_SECRET",
+            "grant_type": "client_credentials",
+            "scope": "flowaccount-api",
             "token_url": "https://auth.example-books.com/oauth/token",
         },
     )
@@ -104,6 +106,113 @@ def test_connector_configuration_pins_oauth_token_host(tmp_path: Path) -> None:
         "api.example-books.com",
         "auth.example-books.com",
     )
+    assert config.connectors["custom-books"]["production"]["auth_settings"] == {
+        "client_id_name": "CLIENT_ID",
+        "client_secret_name": "CLIENT_SECRET",
+        "grant_type": "client_credentials",
+        "scope": "flowaccount-api",
+        "token_url": "https://auth.example-books.com/oauth/token",
+    }
+
+
+def test_connector_configuration_rejects_unsupported_oauth_grant_type(
+    tmp_path: Path,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+
+    with pytest.raises(ValueError, match="unsupported_auth_setting"):
+        configure_connector(
+            context,
+            connector_id="custom-books",
+            environment="production",
+            driver_id="oauth_client_credentials",
+            base_url="https://api.example-books.com/v2",
+            auth_settings={"grant_type": "authorization_code"},
+        )
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        "client_secret=shh",
+        "read CLIENT_SECRET=shh",
+        "read password",
+        "read credential",
+        "read authorization",
+        "read bearer",
+        "read api_key",
+        "read access_token",
+        "read refresh_token",
+    ],
+)
+def test_connector_configuration_rejects_sensitive_scope_markers(
+    tmp_path: Path,
+    scope: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+
+    with pytest.raises(ValueError, match="secret_auth_setting_not_allowed"):
+        configure_connector(
+            context,
+            connector_id="custom-books",
+            environment="production",
+            driver_id="oauth_client_credentials",
+            base_url="https://api.example-books.com/v2",
+            auth_settings={"scope": scope},
+        )
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        "",
+        "read  write",
+        "read\twrite",
+        "read\nwrite",
+        "x" * 257,
+    ],
+)
+def test_connector_configuration_rejects_invalid_oauth_scope(
+    tmp_path: Path,
+    scope: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+
+    with pytest.raises(ValueError, match="unsupported_auth_setting"):
+        configure_connector(
+            context,
+            connector_id="custom-books",
+            environment="production",
+            driver_id="oauth_client_credentials",
+            base_url="https://api.example-books.com/v2",
+            auth_settings={"scope": scope},
+        )
+
+
+@pytest.mark.parametrize(
+    ("setting", "value"),
+    [
+        ("key_name", "X API Key"),
+        ("client_id_name", "client_id=value"),
+        ("client_secret_name", "X" * 129),
+    ],
+)
+def test_connector_configuration_rejects_non_parameter_auth_names(
+    tmp_path: Path,
+    setting: str,
+    value: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+
+    with pytest.raises(ValueError, match="unsupported_auth_setting"):
+        configure_connector(
+            context,
+            connector_id="custom-books",
+            environment="production",
+            driver_id="api_key_header",
+            base_url="https://api.example-books.com/v2",
+            auth_settings={setting: value},
+        )
 
 
 @pytest.mark.parametrize(
@@ -160,6 +269,30 @@ def test_connector_configuration_rejects_token_url_with_persisted_parameters(
         )
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://api.example-books.com:invalid/v2",
+        "https://api.example-books.com:65536/v2",
+    ],
+)
+def test_connector_configuration_rejects_malformed_or_out_of_range_ports(
+    tmp_path: Path,
+    base_url: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+
+    with pytest.raises(ValueError, match="invalid_endpoint_url"):
+        configure_connector(
+            context,
+            connector_id="custom-books",
+            environment="production",
+            driver_id="api_key_header",
+            base_url=base_url,
+            auth_settings={"key_name": "X-API-Key"},
+        )
+
+
 def test_internet_urls_require_https_unless_private_network_is_enabled(
     tmp_path: Path,
 ) -> None:
@@ -185,6 +318,38 @@ def test_internet_urls_require_https_unless_private_network_is_enabled(
     )
 
     assert config.allow_private_network("local-books", "local") is True
+    assert load_repository_config(context).allow_private_network("local-books", "local") is True
+
+
+@pytest.mark.parametrize("allow_private_network", ["false", 0, 1, None])
+def test_load_repository_config_rejects_non_boolean_private_network_policy(
+    tmp_path: Path,
+    allow_private_network: object,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    context.config_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "trusted_hosts": {},
+                "connectors": {
+                    "custom-books": {
+                        "local": {
+                            "driver_id": "api_key_header",
+                            "base_url": "http://localhost:8080/v2",
+                            "auth_settings": {},
+                            "network_policy": {
+                                "allow_private_network": allow_private_network,
+                            },
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="invalid_network_policy"):
+        load_repository_config(context)
 
 
 @pytest.mark.parametrize(

@@ -35,7 +35,22 @@ _AUTH_PARAMETER_NAME_KEYS = {
     "key_name",
 }
 _AUTH_PARAMETER_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
+_OAUTH_SCOPE_PATTERN = re.compile(
+    r"^[\x21\x23-\x5b\x5d-\x7e]+(?: [\x21\x23-\x5b\x5d-\x7e]+)*$"
+)
 _HOST_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_SENSITIVE_SCOPE_MARKERS = (
+    "secret",
+    "password",
+    "credential",
+    "authorization",
+    "bearer",
+    "api_key",
+    "access_token",
+    "refresh_token",
+    "client_secret",
+)
+_MAX_OAUTH_SCOPE_LENGTH = 256
 _CREDENTIAL_VALUE_PREFIXES = (
     "bearer ",
     "basic ",
@@ -74,7 +89,8 @@ class RepositoryConfig:
         policy = selected.get("network_policy", {})
         if not isinstance(policy, Mapping):
             return False
-        return bool(policy.get("allow_private_network", False))
+        value = policy.get("allow_private_network", False)
+        return value if isinstance(value, bool) else False
 
 
 def root_paths(root_uris: Sequence[str]) -> tuple[Path, ...]:
@@ -289,6 +305,7 @@ def _copy_connectors(value: Mapping[str, Any]) -> dict[str, dict[str, dict[str, 
         for environment, config in environments.items():
             if not isinstance(config, Mapping):
                 raise ValueError("invalid_connectors")
+            _validate_loaded_network_policy(config)
             connectors[str(connector_id)][str(environment)] = dict(config)
     return connectors
 
@@ -306,6 +323,12 @@ def _sanitize_auth_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
 def _sanitize_auth_setting(key: str, value: Any) -> str:
     if not isinstance(value, str):
         raise ValueError("unsupported_auth_setting")
+    if key == "grant_type":
+        if value != "client_credentials":
+            raise ValueError("unsupported_auth_setting")
+        return value
+    if key == "scope":
+        return _validate_oauth_scope(value)
     if key in _AUTH_PARAMETER_NAME_KEYS:
         return _validate_auth_parameter_name(value)
     if _looks_like_credential_material(value):
@@ -321,17 +344,35 @@ def _validate_auth_parameter_name(value: str) -> str:
     return value
 
 
+def _validate_oauth_scope(value: str) -> str:
+    normalized = value.casefold()
+    if any(marker in normalized for marker in _SENSITIVE_SCOPE_MARKERS):
+        raise ValueError("secret_auth_setting_not_allowed")
+    if len(value) > _MAX_OAUTH_SCOPE_LENGTH or not _OAUTH_SCOPE_PATTERN.fullmatch(value):
+        raise ValueError("unsupported_auth_setting")
+    return value
+
+
 def _looks_like_credential_material(value: str) -> bool:
     normalized = value.strip().lower()
     return any(normalized.startswith(prefix) for prefix in _CREDENTIAL_VALUE_PREFIXES)
 
 
 def _validate_endpoint_url(url: str, environment: str, allow_private_network: bool) -> str:
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError as exc:
+        raise ValueError("invalid_endpoint_url") from exc
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("invalid_endpoint_url")
     if parsed.username or parsed.password:
         raise ValueError("url_credentials_not_allowed")
+    try:
+        parsed_port = parsed.port
+    except ValueError as exc:
+        raise ValueError("invalid_endpoint_url") from exc
+    if parsed_port is not None and not 0 <= parsed_port <= 65535:
+        raise ValueError("invalid_endpoint_url")
     if parsed.params or parsed.query or parsed.fragment:
         raise ValueError("invalid_endpoint_url")
 
@@ -380,6 +421,18 @@ def _trusted_host_tuple(value: Any) -> tuple[str, ...]:
             raise ValueError("invalid_trusted_hosts")
         hosts.append(host)
     return tuple(hosts)
+
+
+def _validate_loaded_network_policy(config: Mapping[str, Any]) -> None:
+    if "network_policy" not in config:
+        return
+    policy = config["network_policy"]
+    if not isinstance(policy, Mapping):
+        raise ValueError("invalid_network_policy")
+    if "allow_private_network" in policy and not isinstance(
+        policy["allow_private_network"], bool
+    ):
+        raise ValueError("invalid_network_policy")
 
 
 def _is_valid_trusted_host(host: str) -> bool:
