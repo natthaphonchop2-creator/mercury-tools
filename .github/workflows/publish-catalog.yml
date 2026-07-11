@@ -1,0 +1,26 @@
+name: Publish ERP Action Catalog
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "catalog/global/**"
+      - "src/mercury_tools/catalog/**"
+      - "src/mercury_tools/db/catalog.py"
+      - "scripts/publish_catalog.py"
+      - "supabase/migrations/20260711090000_erp_action_catalog.sql"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --no-dev
+      - run: uv run python scripts/publish_catalog.py --path catalog/global
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
