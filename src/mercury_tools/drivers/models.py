@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -64,17 +65,57 @@ class FrozenDict(dict[str, Any]):
 def immutable_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     """Copy a public mapping so callers cannot alter driver state."""
 
-    return deep_freeze(value)
+    frozen = deep_freeze(value)
+    if not isinstance(frozen, FrozenDict):
+        raise TypeError("public_data_invalid")
+    return frozen
 
 
 def deep_freeze(value: Any) -> Any:
     """Recursively freeze JSON-compatible public response data."""
 
+    return _deep_freeze(value, active=set())
+
+
+def _deep_freeze(value: Any, *, active: set[int]) -> Any:
+    if value is None or isinstance(value, str | bool | int):
+        return value
+    if isinstance(value, float):
+        if isfinite(value):
+            return value
+        raise TypeError("public_data_invalid")
     if isinstance(value, Mapping):
-        return FrozenDict({key: deep_freeze(item) for key, item in value.items()})
+        return FrozenDict(_freeze_mapping(value, active=active))
     if isinstance(value, list | tuple):
-        return tuple(deep_freeze(item) for item in value)
-    return value
+        return tuple(_freeze_sequence(value, active=active))
+    raise TypeError("public_data_invalid")
+
+
+def _freeze_mapping(value: Mapping[Any, Any], *, active: set[int]) -> dict[str, Any]:
+    identity = id(value)
+    if identity in active:
+        raise TypeError("public_data_invalid")
+    active.add(identity)
+    try:
+        frozen: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("public_data_invalid")
+            frozen[key] = _deep_freeze(item, active=active)
+        return frozen
+    finally:
+        active.remove(identity)
+
+
+def _freeze_sequence(value: list[Any] | tuple[Any, ...], *, active: set[int]) -> tuple[Any, ...]:
+    identity = id(value)
+    if identity in active:
+        raise TypeError("public_data_invalid")
+    active.add(identity)
+    try:
+        return tuple(_deep_freeze(item, active=active) for item in value)
+    finally:
+        active.remove(identity)
 
 
 @dataclass(frozen=True, repr=False)
@@ -114,7 +155,7 @@ class ConnectionProbe:
     details: Mapping[str, Any]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "details", deep_freeze(self.details))
+        object.__setattr__(self, "details", immutable_mapping(self.details))
 
 
 @dataclass(frozen=True)

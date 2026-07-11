@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import unquote, unquote_plus, urlsplit
 
 import httpx
 
@@ -35,7 +36,7 @@ class _GenericDriver:
 
     def __init__(self, *, connector_id: str, environments: Mapping[str, str]) -> None:
         self.connector_id = connector_id
-        self._environments = immutable_mapping(environments)
+        self._environments = immutable_mapping(_configured_environments(environments))
 
     @property
     def credential_schema(self) -> tuple[CredentialField, ...]:
@@ -118,7 +119,7 @@ class _GenericDriver:
                 headers=dict(auth.headers),
                 params=dict(auth.query),
             )
-        except httpx.HTTPError:
+        except (httpx.HTTPError, httpx.InvalidURL, TypeError, ValueError):
             return ConnectionProbe(
                 status="failed",
                 connector_id=self.connector_id,
@@ -214,7 +215,11 @@ class GenericApiKeyDriver(_GenericDriver):
         key_name: str,
         environments: Mapping[str, str],
     ) -> None:
-        if placement not in {"header", "query"} or not key_name:
+        if (
+            placement not in {"header", "query"}
+            or not isinstance(key_name, str)
+            or not key_name.strip()
+        ):
             raise DriverConfigurationError("api_key_configuration_invalid")
         super().__init__(connector_id=connector_id, environments=environments)
         self.placement = placement
@@ -270,7 +275,10 @@ class GenericOAuthClientCredentialsDriver(_GenericDriver):
         token_urls: Mapping[str, str],
     ) -> None:
         super().__init__(connector_id=connector_id, environments=environments)
-        self._token_urls = immutable_mapping(token_urls)
+        configured_token_urls = _configured_environments(token_urls)
+        if set(configured_token_urls) != set(self._environments):
+            raise DriverConfigurationError("oauth_environment_mismatch")
+        self._token_urls = immutable_mapping(configured_token_urls)
 
     def credential_fields(self, environment: str) -> tuple[CredentialField, ...]:
         self.resolve_base_url(environment)
@@ -300,7 +308,7 @@ class GenericOAuthClientCredentialsDriver(_GenericDriver):
                 },
             )
             payload = _response_json(response)
-        except httpx.HTTPError:
+        except (httpx.HTTPError, httpx.InvalidURL, TypeError, ValueError):
             raise ConnectorAuthError("oauth_token_failed") from None
         if not response.is_success or not isinstance(payload, Mapping):
             raise ConnectorAuthError("oauth_token_failed")
@@ -388,7 +396,7 @@ def _redact_paths(value: Any, paths: Sequence[str]) -> Any:
 
 def _copy_json(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return {str(key): _copy_json(item) for key, item in value.items()}
+        return {key: _copy_json(item) for key, item in value.items()}
     if isinstance(value, list | tuple):
         return [_copy_json(item) for item in value]
     return value
@@ -450,10 +458,29 @@ def _credential_values(credentials: Mapping[str, str], auth: AuthContext) -> tup
 
 
 def _redact_credential_values(value: str, credential_values: Sequence[str]) -> str:
-    redacted = value
-    for credential in credential_values:
-        redacted = redacted.replace(credential, _REDACTED)
-    return redacted
+    decoded_values = _reversibly_decoded_values(value)
+    if any(
+        credential
+        and any(credential in decoded_value for decoded_value in decoded_values)
+        for credential in credential_values
+    ):
+        return _REDACTED
+    return value
+
+
+def _reversibly_decoded_values(value: str) -> tuple[str, ...]:
+    values = {value}
+    pending = {value}
+    for _ in range(2):
+        decoded: set[str] = set()
+        for candidate in pending:
+            decoded.add(unquote(candidate))
+            decoded.add(unquote_plus(candidate))
+        pending = decoded - values
+        values.update(pending)
+        if not pending:
+            break
+    return tuple(values)
 
 
 @dataclass(frozen=True)
@@ -471,12 +498,11 @@ class GenericDriverFactory:
         key_name: str | None = None,
         token_urls: Mapping[str, str] | None = None,
     ) -> _GenericDriver:
-        configured_environments = _configured_environments(environments)
         if self.driver_id == "bearer":
             _require_factory_options(key_name=key_name, token_urls=token_urls)
             return GenericBearerDriver(
                 connector_id=connector_id,
-                environments=configured_environments,
+                environments=environments,
             )
         if self.driver_id in {"api_key_header", "api_key_query"}:
             if token_urls is not None:
@@ -487,25 +513,28 @@ class GenericDriverFactory:
             return GenericApiKeyDriver(
                 connector_id=connector_id,
                 placement=placement,
-                key_name=key_name or ("X-API-Key" if placement == "header" else "api_key"),
-                environments=configured_environments,
+                key_name=(
+                    key_name
+                    if key_name is not None
+                    else "X-API-Key"
+                    if placement == "header"
+                    else "api_key"
+                ),
+                environments=environments,
             )
         if self.driver_id == "basic":
             _require_factory_options(key_name=key_name, token_urls=token_urls)
             return GenericBasicDriver(
                 connector_id=connector_id,
-                environments=configured_environments,
+                environments=environments,
             )
         if self.driver_id == "oauth_client_credentials":
             if key_name is not None or token_urls is None:
                 raise DriverConfigurationError("generic_factory_configuration_invalid")
-            configured_token_urls = _configured_environments(token_urls)
-            if set(configured_token_urls) != set(configured_environments):
-                raise DriverConfigurationError("generic_factory_configuration_invalid")
             return GenericOAuthClientCredentialsDriver(
                 connector_id=connector_id,
-                environments=configured_environments,
-                token_urls=configured_token_urls,
+                environments=environments,
+                token_urls=token_urls,
             )
         raise DriverConfigurationError("generic_factory_not_supported")
 
@@ -526,15 +555,35 @@ def generic_driver_factories() -> tuple[GenericDriverFactory, ...]:
 def _configured_environments(environments: Mapping[str, str]) -> dict[str, str]:
     if not isinstance(environments, Mapping) or not environments:
         raise DriverConfigurationError("driver_environments_required")
-    if any(
-        not isinstance(environment, str)
-        or not environment
-        or not isinstance(base_url, str)
-        or not base_url.strip()
-        for environment, base_url in environments.items()
+    configured: dict[str, str] = {}
+    for environment, base_url in environments.items():
+        if not isinstance(environment, str) or not environment.strip():
+            raise DriverConfigurationError("driver_environment_invalid")
+        if not isinstance(base_url, str) or not base_url.strip():
+            raise DriverConfigurationError("driver_environment_invalid")
+        _validate_configured_url(base_url)
+        configured[environment] = base_url
+    return configured
+
+
+def _validate_configured_url(value: str) -> None:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+        parsed_url = httpx.URL(value)
+    except (httpx.InvalidURL, ValueError):
+        raise DriverConfigurationError("driver_url_invalid") from None
+    if (
+        value != value.strip()
+        or parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or "#" in value
+        or not parsed_url.host
+        or port is not None and not 0 <= port <= 65535
     ):
-        raise DriverConfigurationError("driver_environment_invalid")
-    return dict(environments)
+        raise DriverConfigurationError("driver_url_invalid")
 
 
 def _require_factory_options(

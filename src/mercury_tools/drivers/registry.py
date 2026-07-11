@@ -10,7 +10,7 @@ from mercury_tools.drivers.generic import (
     GenericDriverFactory,
     generic_driver_factories,
 )
-from mercury_tools.drivers.models import immutable_mapping
+from mercury_tools.drivers.models import CredentialField, immutable_mapping
 
 
 class DuplicateDriverError(ValueError):
@@ -65,24 +65,41 @@ class DriverRegistry:
         )
 
     def summaries(self) -> tuple[Mapping[str, Any], ...]:
-        summaries = [
-            (connector_id, driver.driver_id, driver.credential_schema)
-            for connector_id, driver in self._drivers.items()
-        ]
-        summaries.extend(
-            (factory.driver_id, factory.driver_id, factory.credential_schema)
-            for factory in self._factories.values()
-        )
-        return tuple(
-            immutable_mapping(
-                {
-                    "connector_id": connector_id,
-                    "driver_id": driver_id,
-                    "credential_fields": tuple(field.name for field in credential_schema),
-                }
+        summaries: list[tuple[tuple[str, str], dict[str, Any]]] = []
+        for connector_id, driver in self._drivers.items():
+            summaries.append(
+                (
+                    ("connector", connector_id),
+                    {
+                        "entry_type": "connector",
+                        "connector_id": connector_id,
+                        "driver_id": driver.driver_id,
+                        "credential_fields": _credential_field_names(driver),
+                    },
+                )
             )
-            for connector_id, driver_id, credential_schema in sorted(summaries)
+        for factory in self._factories.values():
+            summaries.append(
+                (
+                    ("factory", factory.driver_id),
+                    {
+                        "entry_type": "factory",
+                        "driver_id": factory.driver_id,
+                        "credential_fields": _credential_field_names(factory),
+                    },
+                )
+            )
+        return tuple(
+            immutable_mapping(summary)
+            for _, summary in sorted(summaries, key=lambda entry: entry[0])
         )
+
+
+def _credential_field_names(source: object) -> tuple[str, ...]:
+    schema = getattr(source, "credential_schema", ())
+    if not isinstance(schema, tuple):
+        return ()
+    return tuple(field.name for field in schema if isinstance(field, CredentialField))
 
 
 def build_generic_registry() -> DriverRegistry:

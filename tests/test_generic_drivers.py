@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from urllib.parse import quote, quote_plus
 
 import httpx
 import pytest
@@ -11,6 +12,7 @@ from mercury_tools.drivers.generic import (
     ConnectorAuthError,
     DriverConfigurationError,
     GenericApiKeyDriver,
+    GenericBasicDriver,
     GenericBearerDriver,
     GenericOAuthClientCredentialsDriver,
 )
@@ -53,15 +55,163 @@ def test_api_key_query_driver_rejects_unknown_environment() -> None:
         driver.credential_fields("sandbox")
 
 
-def test_oauth_credential_fields_require_a_token_url_for_the_environment() -> None:
+@pytest.mark.parametrize(
+    ("environments", "code"),
+    [
+        (None, "driver_environments_required"),
+        ({}, "driver_environments_required"),
+        ({"": "https://erp.example.test"}, "driver_environment_invalid"),
+        ({" \t ": "https://erp.example.test"}, "driver_environment_invalid"),
+        ({"production": ""}, "driver_environment_invalid"),
+        ({"production": "\t"}, "driver_environment_invalid"),
+        ({"production": "erp.example.test"}, "driver_url_invalid"),
+        ({"production": "ftp://erp.example.test"}, "driver_url_invalid"),
+        ({"production": "https:///missing-host"}, "driver_url_invalid"),
+        ({"production": "https://client:opaque-url-secret@erp.example.test"}, "driver_url_invalid"),
+        ({"production": "https://erp.example.test/path#fragment"}, "driver_url_invalid"),
+        ({"production": "https://erp.example.test:not-a-port"}, "driver_url_invalid"),
+        ({"production": "https://[::1"}, "driver_url_invalid"),
+    ],
+)
+def test_direct_driver_constructor_rejects_invalid_environment_maps_without_echoing_urls(
+    environments: object,
+    code: str,
+) -> None:
+    with pytest.raises(DriverConfigurationError, match=rf"^{code}$") as error:
+        GenericBearerDriver(connector_id="custom", environments=environments)  # type: ignore[arg-type]
+
+    assert "opaque-url-secret" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "environments",
+    [
+        {" \t ": "https://erp.example.test"},
+        {"production": "https://client:opaque-url-secret@erp.example.test"},
+        {"production": "https://erp.example.test:not-a-port"},
+    ],
+)
+def test_factory_rejects_invalid_environment_maps_at_construction(
+    environments: dict[str, str],
+) -> None:
+    registry = build_generic_registry()
+
+    with pytest.raises(DriverConfigurationError, match="^driver_") as error:
+        registry.create("bearer", connector_id="custom", environments=environments)
+
+    assert "opaque-url-secret" not in str(error.value)
+
+
+def test_direct_and_factory_drivers_allow_explicit_http_gateway_urls() -> None:
+    environment_url = "http://127.0.0.1:8080/gateway"
+    direct = GenericBearerDriver(connector_id="direct", environments={"local": environment_url})
+    factory = build_generic_registry().create(
+        "bearer",
+        connector_id="factory",
+        environments={"local": environment_url},
+    )
+
+    assert direct.resolve_base_url("local") == environment_url
+    assert factory.resolve_base_url("local") == environment_url
+
+
+@pytest.mark.parametrize(
+    ("token_urls", "code"),
+    [
+        (None, "driver_environments_required"),
+        ({}, "driver_environments_required"),
+        ({"sandbox": "https://auth.example.test/token"}, "oauth_environment_mismatch"),
+        (
+            {"production": "https://client:opaque-url-secret@auth.example.test/token"},
+            "driver_url_invalid",
+        ),
+        ({"production": "https://auth.example.test:not-a-port/token"}, "driver_url_invalid"),
+        ({"production": "https://auth.example.test/token#fragment"}, "driver_url_invalid"),
+    ],
+)
+def test_oauth_constructor_validates_token_urls_and_requires_exact_environment_sets(
+    token_urls: object,
+    code: str,
+) -> None:
+    with pytest.raises(DriverConfigurationError, match=rf"^{code}$") as error:
+        GenericOAuthClientCredentialsDriver(
+            connector_id="custom",
+            environments={"production": "https://erp.example.test"},
+            token_urls=token_urls,  # type: ignore[arg-type]
+        )
+
+    assert "opaque-url-secret" not in str(error.value)
+
+
+def test_api_key_factory_does_not_treat_an_explicit_blank_key_name_as_default() -> None:
+    registry = build_generic_registry()
+    environments = {"production": "https://erp.example.test"}
+
+    with pytest.raises(DriverConfigurationError, match="^api_key_configuration_invalid$"):
+        GenericApiKeyDriver(
+            connector_id="custom",
+            placement="header",
+            key_name=" \t ",
+            environments=environments,
+        )
+    with pytest.raises(DriverConfigurationError, match="^api_key_configuration_invalid$"):
+        registry.create(
+            "api_key_header",
+            connector_id="custom",
+            environments=environments,
+            key_name="",
+        )
+
+    defaulted = registry.create(
+        "api_key_header",
+        connector_id="defaulted",
+        environments=environments,
+        key_name=None,
+    )
+    assert defaulted.key_name == "X-API-Key"
+
+
+@pytest.mark.asyncio
+async def test_probe_url_construction_errors_are_returned_as_safe_probe_failures() -> None:
+    class UrlConstructionFailure:
+        async def get(self, *args: object, **kwargs: object) -> httpx.Response:
+            raise ValueError("opaque-url-secret")
+
+    driver = GenericBearerDriver(
+        connector_id="custom",
+        environments={"production": "https://erp.example.test"},
+    )
+    probe = await driver.validate_credentials(
+        environment="production",
+        credentials={"token": "credential-secret"},
+        client=UrlConstructionFailure(),  # type: ignore[arg-type]
+    )
+
+    assert probe.status == "failed"
+    assert probe.details == {"error": "probe_request_failed"}
+    assert "opaque-url-secret" not in json.dumps(probe.details)
+
+
+@pytest.mark.asyncio
+async def test_oauth_token_url_construction_errors_are_returned_as_safe_auth_failures() -> None:
+    class UrlConstructionFailure:
+        async def post(self, *args: object, **kwargs: object) -> httpx.Response:
+            raise ValueError("opaque-url-secret")
+
     driver = GenericOAuthClientCredentialsDriver(
         connector_id="custom",
         environments={"production": "https://erp.example.test"},
-        token_urls={},
+        token_urls={"production": "https://auth.example.test/token"},
     )
 
-    with pytest.raises(DriverConfigurationError, match="^unsupported_environment$"):
-        driver.credential_fields("production")
+    with pytest.raises(ConnectorAuthError, match="^oauth_token_failed$") as error:
+        await driver.prepare_auth(
+            environment="production",
+            credentials={"client_id": "client", "client_secret": "credential-secret"},
+            client=UrlConstructionFailure(),  # type: ignore[arg-type]
+        )
+
+    assert "opaque-url-secret" not in str(error.value)
 
 
 @pytest.mark.asyncio
@@ -139,15 +289,83 @@ async def test_probe_replaces_exact_credential_echoes_and_omits_provider_details
             client=client,
         )
 
-    assert probe.company_name == "Company [REDACTED]"
+    assert probe.company_name == "[REDACTED]"
     assert probe.details == {"http_status": 200}
     assert secret not in json.dumps({"company_name": probe.company_name, "details": probe.details})
+
+
+_ENCODED_PROBE_SECRET = "opaque+token space/%"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "company_name",
+    [
+        f"Acme {_ENCODED_PROBE_SECRET}",
+        f"Acme {quote(_ENCODED_PROBE_SECRET, safe='')}",
+        f"Acme {quote_plus(_ENCODED_PROBE_SECRET, safe='')}",
+        f"Acme {quote(quote(_ENCODED_PROBE_SECRET, safe=''), safe='')}",
+        f"Acme {quote(quote_plus(_ENCODED_PROBE_SECRET, safe=''), safe='')}",
+        "Acme "
+        + quote_plus(_ENCODED_PROBE_SECRET, safe="")
+        .replace("%2B", "%2b")
+        .replace("%2F", "%2f"),
+    ],
+)
+async def test_probe_fully_redacts_literal_and_reversibly_encoded_credential_echoes(
+    company_name: str,
+) -> None:
+    driver = GenericBearerDriver(
+        connector_id="custom",
+        environments={"production": "https://erp.example.test/v1"},
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"company_name": company_name})
+        )
+    ) as client:
+        probe = await driver.validate_credentials(
+            environment="production",
+            credentials={"token": _ENCODED_PROBE_SECRET},
+            client=client,
+        )
+
+    assert probe.company_name == "[REDACTED]"
+    assert _ENCODED_PROBE_SECRET not in json.dumps(probe.details)
+
+
+@pytest.mark.asyncio
+async def test_probe_fully_redacts_reversibly_encoded_auth_value_echoes() -> None:
+    driver = GenericBasicDriver(
+        connector_id="custom",
+        environments={"production": "https://erp.example.test/v1"},
+    )
+    credentials = {"username": "operator", "password": "opaque password"}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={"company_name": f"Acme {quote(request.headers['Authorization'], safe='')}"},
+            )
+        )
+    ) as client:
+        probe = await driver.validate_credentials(
+            environment="production",
+            credentials=credentials,
+            client=client,
+        )
+
+    assert probe.company_name == "[REDACTED]"
 
 
 def test_interpret_response_honors_body_error_rules_bounds_non_json_and_redacts_response(
     action_factory,
 ) -> None:
-    driver = GenericBearerDriver(connector_id="custom", environments={})
+    driver = GenericBearerDriver(
+        connector_id="custom",
+        environments={"production": "https://erp.example.test"},
+    )
     action = action_factory(
         connector_id="custom",
         error_rules={"body": {"path": "meta.status", "equals": "error"}},
@@ -182,7 +400,10 @@ def test_interpret_response_honors_body_error_rules_bounds_non_json_and_redacts_
 def test_interpret_response_distinguishes_json_null_from_json_decode_failure(
     action_factory,
 ) -> None:
-    driver = GenericBearerDriver(connector_id="custom", environments={})
+    driver = GenericBearerDriver(
+        connector_id="custom",
+        environments={"production": "https://erp.example.test"},
+    )
     action = action_factory(connector_id="custom")
 
     json_null = driver.interpret_response(
@@ -203,7 +424,10 @@ def test_interpret_response_distinguishes_json_null_from_json_decode_failure(
 
 
 def test_terminal_wildcard_redaction_replaces_every_child_value(action_factory) -> None:
-    driver = GenericBearerDriver(connector_id="custom", environments={})
+    driver = GenericBearerDriver(
+        connector_id="custom",
+        environments={"production": "https://erp.example.test"},
+    )
     action = action_factory(
         connector_id="custom",
         response_redaction=("credentials.*", "records.*"),
@@ -253,7 +477,10 @@ def test_prepare_files_requires_declared_file_inside_active_root_and_rejects_sym
         content_type="multipart/form-data",
         input_schema={"files": {"document": {}}},
     )
-    driver = GenericBearerDriver(connector_id="custom", environments={})
+    driver = GenericBearerDriver(
+        connector_id="custom",
+        environments={"production": "https://erp.example.test"},
+    )
 
     prepared = driver.prepare_files(
         action=action,
@@ -287,7 +514,10 @@ def test_prepare_files_requires_exact_multipart_type_and_existing_directory_root
     root.mkdir()
     document = root / "document.txt"
     document.write_text("document")
-    driver = GenericBearerDriver(connector_id="custom", environments={})
+    driver = GenericBearerDriver(
+        connector_id="custom",
+        environments={"production": "https://erp.example.test"},
+    )
     inputs = {"files": {"document": str(document)}}
 
     accepted = action_factory(
@@ -319,7 +549,10 @@ def test_prepare_files_converts_symlink_loop_failures_to_path_free_codes(
         content_type="multipart/form-data",
         input_schema={"files": {"document": {}}},
     )
-    driver = GenericBearerDriver(connector_id="custom", environments={})
+    driver = GenericBearerDriver(
+        connector_id="custom",
+        environments={"production": "https://erp.example.test"},
+    )
 
     with pytest.raises(DriverConfigurationError, match="^multipart_file_invalid$") as file_error:
         driver.prepare_files(

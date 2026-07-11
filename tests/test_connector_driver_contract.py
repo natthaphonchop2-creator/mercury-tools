@@ -11,12 +11,18 @@ import pytest
 from mercury_tools.drivers.base import (
     AuthContext,
     ConnectionProbe,
+    ConnectorDriver,
     ConnectorResult,
     PreparedFile,
 )
 from mercury_tools.drivers.generic import GenericBearerDriver
 from mercury_tools.drivers.models import CredentialField
-from mercury_tools.drivers.registry import DriverRegistry, DuplicateDriverError, UnknownDriverError
+from mercury_tools.drivers.registry import (
+    DriverRegistry,
+    DuplicateDriverError,
+    UnknownDriverError,
+    build_generic_registry,
+)
 
 
 def test_public_driver_models_are_frozen() -> None:
@@ -90,27 +96,84 @@ def test_probe_details_and_result_data_are_deeply_immutable_and_json_serializabl
 
     assert probe.details == {"meta": {"items": ({"status": "ok"},)}}
     assert result.data == {"meta": {"items": ({"status": "ok"},)}}
-    assert json.loads(json.dumps(probe.details)) == {"meta": {"items": [{"status": "ok"}]}}
-    assert json.loads(json.dumps(result.data)) == {"meta": {"items": [{"status": "ok"}]}}
+    assert json.loads(json.dumps(probe.details, allow_nan=False)) == {
+        "meta": {"items": [{"status": "ok"}]}
+    }
+    assert json.loads(json.dumps(result.data, allow_nan=False)) == {
+        "meta": {"items": [{"status": "ok"}]}
+    }
     with pytest.raises(TypeError, match="^immutable_mapping$"):
         probe.details["meta"]["items"][0]["status"] = "changed"  # type: ignore[index]
     with pytest.raises(TypeError, match="^immutable_mapping$"):
         result.data["meta"]["items"][0]["status"] = "changed"  # type: ignore[index]
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        {1: "non-string-key"},
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        b"opaque-bytes",
+        bytearray(b"opaque-bytearray"),
+        memoryview(b"opaque-memoryview"),
+        {"opaque-set"},
+        object(),
+    ],
+)
+def test_public_driver_response_models_reject_non_json_values_with_safe_stable_errors(
+    value: object,
+) -> None:
+    with pytest.raises(TypeError, match="^public_data_invalid$") as probe_error:
+        ConnectionProbe(
+            status="connected",
+            connector_id="custom",
+            environment="production",
+            company_name=None,
+            details={"value": value},
+        )
+    with pytest.raises(TypeError, match="^public_data_invalid$") as result_error:
+        ConnectorResult(
+            status="succeeded",
+            http_status=200,
+            data=value,
+            summary="json_response",
+            dispatched=True,
+        )
+
+    assert "opaque" not in str(probe_error.value)
+    assert "opaque" not in str(result_error.value)
+
+
+@pytest.mark.parametrize("value", [None, True, 1, 1.5, "ok", ["one", {"two": 2.0}]])
+def test_public_driver_response_models_accept_strict_json_data(value: object) -> None:
+    result = ConnectorResult(
+        status="succeeded",
+        http_status=200,
+        data=value,
+        summary="json_response",
+        dispatched=True,
+    )
+
+    json.dumps(result.data, allow_nan=False)
+
+
 def test_registry_rejects_duplicates_with_stable_error_and_lists_immutable_summaries() -> None:
     registry = DriverRegistry()
-    registry.register(GenericBearerDriver(connector_id="zeta", environments={}))
-    registry.register(GenericBearerDriver(connector_id="alpha", environments={}))
+    environments = {"production": "https://erp.example.test"}
+    registry.register(GenericBearerDriver(connector_id="zeta", environments=environments))
+    registry.register(GenericBearerDriver(connector_id="alpha", environments=environments))
 
     with pytest.raises(DuplicateDriverError, match="^duplicate_connector_driver$"):
-        registry.register(GenericBearerDriver(connector_id="alpha", environments={}))
+        registry.register(GenericBearerDriver(connector_id="alpha", environments=environments))
     with pytest.raises(UnknownDriverError, match="^connector_driver_not_found$"):
         registry.get("missing")
 
     summaries = registry.summaries()
 
     assert [item["connector_id"] for item in summaries] == ["alpha", "zeta"]
+    assert [item["entry_type"] for item in summaries] == ["connector", "connector"]
     assert summaries[0]["credential_fields"] == ("token",)
     assert "secret-token" not in json.dumps(summaries)
     with pytest.raises(TypeError):
@@ -135,11 +198,102 @@ def test_registry_summaries_use_explicit_credential_schema_without_a_fake_enviro
 
     assert registry.summaries() == (
         {
+            "entry_type": "connector",
             "connector_id": "custom",
             "driver_id": "schema_only",
             "credential_fields": ("token",),
         },
     )
+
+
+def test_connector_driver_protocol_does_not_require_credential_schema() -> None:
+    assert "credential_schema" not in ConnectorDriver.__annotations__
+
+
+def test_registry_summaries_accept_a_driver_with_only_the_planned_protocol() -> None:
+    class PlannedProtocolDriver:
+        driver_id = "planned"
+        connector_id = "custom"
+
+        def credential_fields(self, environment: str) -> tuple[CredentialField, ...]:
+            raise AssertionError(f"credential_fields must not receive {environment!r}")
+
+        def resolve_base_url(self, environment: str) -> str:
+            return "https://erp.example.test"
+
+        def safe_probe_action(self, environment: str) -> str:
+            return "GET /"
+
+        def prepare_files(self, **kwargs: object) -> tuple[PreparedFile, ...]:
+            return ()
+
+        async def prepare_auth(self, **kwargs: object) -> AuthContext:
+            return AuthContext(headers={}, query={}, expires_at=None)
+
+        async def validate_credentials(self, **kwargs: object) -> ConnectionProbe:
+            return ConnectionProbe(
+                status="connected",
+                connector_id=self.connector_id,
+                environment="production",
+                company_name=None,
+                details={},
+            )
+
+        def interpret_response(self, **kwargs: object) -> ConnectorResult:
+            return ConnectorResult(
+                status="succeeded",
+                http_status=200,
+                data=None,
+                summary="json_response",
+                dispatched=True,
+            )
+
+        def sanitize_response(self, action: object, value: object) -> object:
+            return value
+
+    registry = DriverRegistry()
+    registry.register(PlannedProtocolDriver())  # type: ignore[arg-type]
+
+    assert registry.summaries() == (
+        {
+            "entry_type": "connector",
+            "connector_id": "custom",
+            "driver_id": "planned",
+            "credential_fields": (),
+        },
+    )
+
+
+def test_registry_distinguishes_factory_recipes_from_connector_entries_with_same_name() -> None:
+    registry = build_generic_registry()
+    connector = GenericBearerDriver(
+        connector_id="bearer",
+        environments={"production": "https://erp.example.test"},
+    )
+
+    with pytest.raises(UnknownDriverError, match="^connector_driver_not_found$"):
+        registry.get("bearer")
+    registry.register(connector)
+
+    summaries = registry.summaries()
+    connector_summary = next(item for item in summaries if item["entry_type"] == "connector")
+    factory_summary = next(
+        item
+        for item in summaries
+        if item["entry_type"] == "factory" and item["driver_id"] == "bearer"
+    )
+
+    assert connector_summary == {
+        "entry_type": "connector",
+        "connector_id": "bearer",
+        "driver_id": "bearer",
+        "credential_fields": ("token",),
+    }
+    assert factory_summary["credential_fields"] == ("token",)
+    assert "connector_id" not in factory_summary
+    assert registry.get("bearer") is connector
+    assert registry.get_factory("bearer").driver_id == "bearer"
+    assert summaries == registry.summaries()
 
 
 @pytest.mark.asyncio
