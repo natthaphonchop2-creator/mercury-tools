@@ -18,7 +18,12 @@ def test_catalog_migration_has_normalized_immutable_service_role_only_contract()
         assert f"grant all on table public.{table} to service_role" in sql
 
     assert "unique (action_id, version_id)" in sql
-    assert "references public.erp_spec_sources(source_id) on delete restrict" in sql
+    assert "unique (source_id, connector_id)" in sql
+    assert (
+        "foreign key (source_id, connector_id)\n"
+        "    references public.erp_spec_sources(source_id, connector_id)\n"
+        "    on delete restrict"
+    ) in sql
     assert "references public.erp_action_versions(action_id, version_id)" in sql
     assert "erp_action_versions_are_immutable" in sql
     assert "before update or delete on public.erp_action_versions" in sql

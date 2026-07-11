@@ -1,12 +1,14 @@
 import importlib
 import json
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import yaml
 
-from mercury_tools.catalog.models import CatalogSource
+from mercury_tools.catalog.models import CatalogAction, CatalogSource
 
 
 def _catalog_module():
@@ -34,11 +36,16 @@ def _settings() -> SimpleNamespace:
 def test_publish_same_version_twice_is_idempotent_and_never_updates_versions(
     monkeypatch: pytest.MonkeyPatch,
     catalog_source,
-    catalog_action,
+    action_factory: Callable[..., CatalogAction],
 ) -> None:
     catalog = _catalog_module()
     calls: list[dict[str, Any]] = []
     inserted_versions: set[tuple[str, str]] = set()
+    catalog_action = action_factory(
+        connector_id=catalog_source.connector_id,
+        source_uri=catalog_source.source_uri,
+        source_hash=catalog_source.source_hash,
+    )
 
     def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
         calls.append({"method": method, "url": url, **kwargs})
@@ -98,6 +105,44 @@ def test_publish_rejects_unsafe_source_before_any_network_call(
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("connector_id", "peak"),
+        ("source_uri", "https://example.test/other-openapi.json"),
+        ("source_hash", "b" * 64),
+    ],
+)
+def test_publish_rejects_action_from_different_source_before_any_network_call(
+    monkeypatch: pytest.MonkeyPatch,
+    catalog_source,
+    action_factory: Callable[..., CatalogAction],
+    field: str,
+    value: str,
+) -> None:
+    catalog = _catalog_module()
+    calls: list[dict[str, Any]] = []
+    action_values = {
+        "connector_id": catalog_source.connector_id,
+        "source_uri": catalog_source.source_uri,
+        "source_hash": catalog_source.source_hash,
+    }
+    action_values[field] = value
+    mismatched_action = action_factory(**action_values)
+
+    monkeypatch.setattr(
+        catalog.httpx,
+        "request",
+        lambda *args, **kwargs: calls.append({"args": args, **kwargs}),
+    )
+
+    with pytest.raises(ValueError, match="^catalog_action_source_mismatch$") as raised:
+        catalog.SupabaseCatalogStore(_settings()).publish(catalog_source, [mismatched_action])
+
+    assert str(raised.value) == "catalog_action_source_mismatch"
+    assert calls == []
+
+
 def test_list_active_actions_serializes_filters_deterministically_and_round_trips(
     monkeypatch: pytest.MonkeyPatch,
     catalog_action,
@@ -134,7 +179,43 @@ def test_list_active_actions_serializes_filters_deterministically_and_round_trip
     assert calls[0]["params"]["capability"] == "eq.documents.invoice.create"
     assert calls[0]["params"]["connector_id"] == "eq.flowaccount"
     assert calls[0]["params"]["erp_action_versions.method"] == "eq.POST"
-    assert "definition" in calls[0]["params"]["select"]
+    assert calls[0]["params"]["select"] == (
+        "action_id,active_version_id,"
+        "erp_action_versions!erp_action_catalog_action_id_active_version_id_fkey!inner(definition)"
+    )
+
+
+def test_list_active_actions_without_method_filter_uses_valid_left_embed(
+    monkeypatch: pytest.MonkeyPatch,
+    catalog_action,
+) -> None:
+    catalog = _catalog_module()
+    calls: list[dict[str, Any]] = []
+
+    def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        return FakeResponse(
+            body=[
+                {
+                    "action_id": catalog_action.action_id,
+                    "active_version_id": catalog_action.version_id,
+                    "erp_action_versions": {"definition": catalog_action.model_dump(mode="json")},
+                }
+            ]
+        )
+
+    monkeypatch.setattr(catalog.httpx, "request", request)
+
+    actions = catalog.SupabaseCatalogStore(_settings()).list_active_actions(
+        {"connector_id": "flowaccount"}
+    )
+
+    assert actions == [catalog_action]
+    assert calls[0]["params"]["select"] == (
+        "action_id,active_version_id,"
+        "erp_action_versions!erp_action_catalog_action_id_active_version_id_fkey(definition)"
+    )
+    assert "erp_action_versions.method" not in calls[0]["params"]
 
 
 def test_list_active_actions_rejects_credential_bearing_filter_before_network(
@@ -208,3 +289,6 @@ def test_publisher_cli_and_workflow_use_secret_hygiene(
     assert "SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" in workflow
     assert "uv run python scripts/publish_catalog.py --path catalog/global" in workflow
     assert "test-service-role-key" not in workflow
+    triggers = yaml.load(workflow, Loader=yaml.BaseLoader)["on"]
+    assert "workflow_dispatch" in triggers
+    assert triggers["push"]["branches"] == ["main"]

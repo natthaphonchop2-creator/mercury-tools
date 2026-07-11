@@ -25,10 +25,7 @@ _FILTER_COLUMNS = {
     "method": "erp_action_versions.method",
 }
 _FILTER_VALUE = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
-_ACTIVE_SELECT = (
-    "action_id,active_version_id,"
-    "erp_action_versions!erp_action_catalog_action_id_active_version_id_fkey(definition)"
-)
+_ACTIVE_VERSION_RELATION = "erp_action_versions!erp_action_catalog_action_id_active_version_id_fkey"
 
 
 @dataclass(frozen=True)
@@ -53,6 +50,7 @@ class SupabaseCatalogStore:
     def publish(self, source: CatalogSource, actions: Sequence[CatalogAction]) -> PublishResult:
         validated_source = _validated_source(source)
         validated_actions = _validated_actions(actions)
+        _validate_action_sources(validated_source, validated_actions)
 
         self._request(
             "POST",
@@ -87,7 +85,9 @@ class SupabaseCatalogStore:
 
     def list_active_actions(self, filters: Mapping[str, str] | None = None) -> list[CatalogAction]:
         params = _filter_params(filters)
-        params["select"] = _ACTIVE_SELECT
+        params["select"] = _active_select(
+            method_filtered="erp_action_versions.method" in params
+        )
         rows = self._request("GET", "erp_action_catalog", params=params)
         if not isinstance(rows, list):
             raise RuntimeError("supabase_catalog_response_invalid")
@@ -138,6 +138,23 @@ def _validated_actions(actions: Sequence[CatalogAction]) -> list[CatalogAction]:
         action_ids.add(item.action_id)
         validated.append(item)
     return validated
+
+
+def _validate_action_sources(source: CatalogSource, actions: Sequence[CatalogAction]) -> None:
+    for action in actions:
+        if (
+            action.connector_id != source.connector_id
+            or action.source_uri != source.source_uri
+            or action.source_hash != source.source_hash
+        ):
+            raise ValueError("catalog_action_source_mismatch")
+
+
+def _active_select(*, method_filtered: bool) -> str:
+    relation = _ACTIVE_VERSION_RELATION
+    if method_filtered:
+        relation += "!inner"
+    return f"action_id,active_version_id,{relation}(definition)"
 
 
 def _source_payload(source: CatalogSource) -> dict[str, Any]:

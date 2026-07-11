@@ -13,6 +13,7 @@ create table if not exists public.erp_spec_sources (
   metadata jsonb not null default '{}'::jsonb check (jsonb_typeof(metadata) = 'object'),
   imported_at timestamptz not null,
   created_at timestamptz not null default now(),
+  unique (source_id, connector_id),
   unique (connector_id, source_uri, source_hash)
 );
 
@@ -24,9 +25,12 @@ create table if not exists public.erp_action_versions (
   method text not null check (method in ('GET', 'POST', 'PUT', 'PATCH', 'DELETE')),
   path_template text not null check (char_length(path_template) > 0),
   definition jsonb not null check (jsonb_typeof(definition) = 'object'),
-  source_id text not null references public.erp_spec_sources(source_id) on delete restrict,
+  source_id text not null,
   created_at timestamptz not null default now(),
-  unique (action_id, version_id)
+  unique (action_id, version_id),
+  foreign key (source_id, connector_id)
+    references public.erp_spec_sources(source_id, connector_id)
+    on delete restrict
 );
 
 create table if not exists public.erp_action_catalog (

@@ -3,6 +3,8 @@ name: Publish ERP Action Catalog
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     paths:
       - "catalog/global/**"
       - "src/mercury_tools/catalog/**"
