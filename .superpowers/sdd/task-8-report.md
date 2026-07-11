@@ -78,3 +78,12 @@ from `tests/test_connector_mcp_tools.py`.
 ## Commits
 
 - `8f55ea9 feat: port FlowAccount and PEAK connector drivers`
+## Review fix 3
+
+- Added failing tests for PEAK HTTP-200 responses with empty objects, missing provider codes, list payloads, and malformed JSON. All four previously returned `succeeded`.
+- PEAK action responses now fail closed unless traversal finds at least one relevant `resCode` node and every relevant node is successful.
+- PEAK probe failures with an actual HTTP response now expose a sanitized generic `http_status` for the compatibility wrapper.
+- RED: 5 focused assertions failed before the fix.
+- GREEN: 6 focused assertions passed after the fix.
+- Regression: 353 Task 8 tests passed; 903 non-integration tests passed with 1 pre-existing Starlette deprecation warning and 1 deselected test.
+- Static verification: `uv run ruff check .` and `git diff --check` passed.
