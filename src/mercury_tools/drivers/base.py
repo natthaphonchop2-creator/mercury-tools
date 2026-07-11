@@ -33,6 +33,7 @@ class ConnectorAuthError(DriverError):
 class ConnectorDriver(Protocol):
     driver_id: str
     connector_id: str
+    credential_schema: tuple[CredentialField, ...]
 
     def credential_fields(self, environment: str) -> tuple[CredentialField, ...]: ...
 

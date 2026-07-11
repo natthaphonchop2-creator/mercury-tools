@@ -7,10 +7,8 @@ from typing import Any
 
 from mercury_tools.drivers.base import ConnectorDriver
 from mercury_tools.drivers.generic import (
-    GenericApiKeyDriver,
-    GenericBasicDriver,
-    GenericBearerDriver,
-    GenericOAuthClientCredentialsDriver,
+    GenericDriverFactory,
+    generic_driver_factories,
 )
 from mercury_tools.drivers.models import immutable_mapping
 
@@ -26,6 +24,7 @@ class UnknownDriverError(LookupError):
 class DriverRegistry:
     def __init__(self) -> None:
         self._drivers: dict[str, ConnectorDriver] = {}
+        self._factories: dict[str, GenericDriverFactory] = {}
 
     def register(self, driver: ConnectorDriver) -> None:
         if driver.connector_id in self._drivers:
@@ -38,48 +37,58 @@ class DriverRegistry:
         except KeyError:
             raise UnknownDriverError("connector_driver_not_found") from None
 
+    def register_factory(self, factory: GenericDriverFactory) -> None:
+        if factory.driver_id in self._factories:
+            raise DuplicateDriverError("duplicate_connector_driver_factory")
+        self._factories[factory.driver_id] = factory
+
+    def get_factory(self, driver_id: str) -> GenericDriverFactory:
+        try:
+            return self._factories[driver_id]
+        except KeyError:
+            raise UnknownDriverError("connector_driver_factory_not_found") from None
+
+    def create(
+        self,
+        driver_id: str,
+        *,
+        connector_id: str,
+        environments: Mapping[str, str],
+        key_name: str | None = None,
+        token_urls: Mapping[str, str] | None = None,
+    ) -> ConnectorDriver:
+        return self.get_factory(driver_id).create(
+            connector_id=connector_id,
+            environments=environments,
+            key_name=key_name,
+            token_urls=token_urls,
+        )
+
     def summaries(self) -> tuple[Mapping[str, Any], ...]:
+        summaries = [
+            (connector_id, driver.driver_id, driver.credential_schema)
+            for connector_id, driver in self._drivers.items()
+        ]
+        summaries.extend(
+            (factory.driver_id, factory.driver_id, factory.credential_schema)
+            for factory in self._factories.values()
+        )
         return tuple(
             immutable_mapping(
                 {
                     "connector_id": connector_id,
-                    "driver_id": driver.driver_id,
-                    "credential_fields": tuple(
-                        field.name for field in driver.credential_fields("summary")
-                    ),
+                    "driver_id": driver_id,
+                    "credential_fields": tuple(field.name for field in credential_schema),
                 }
             )
-            for connector_id, driver in sorted(self._drivers.items())
+            for connector_id, driver_id, credential_schema in sorted(summaries)
         )
 
 
 def build_generic_registry() -> DriverRegistry:
     registry = DriverRegistry()
-    registry.register(GenericBearerDriver(connector_id="bearer", environments={}))
-    registry.register(
-        GenericApiKeyDriver(
-            connector_id="api_key_header",
-            placement="header",
-            key_name="X-API-Key",
-            environments={},
-        )
-    )
-    registry.register(
-        GenericApiKeyDriver(
-            connector_id="api_key_query",
-            placement="query",
-            key_name="api_key",
-            environments={},
-        )
-    )
-    registry.register(GenericBasicDriver(connector_id="basic", environments={}))
-    registry.register(
-        GenericOAuthClientCredentialsDriver(
-            connector_id="oauth_client_credentials",
-            environments={},
-            token_urls={},
-        )
-    )
+    for factory in generic_driver_factories():
+        registry.register_factory(factory)
     return registry
 
 

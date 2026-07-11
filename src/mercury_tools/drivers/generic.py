@@ -6,6 +6,7 @@ import base64
 import json
 import mimetypes
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -22,10 +23,10 @@ from mercury_tools.drivers.models import (
     PreparedFile,
     immutable_mapping,
 )
-from mercury_tools.safety.redaction import redact_json, redact_text
+from mercury_tools.safety.redaction import redact_json
 
-_TEXT_SUMMARY_LIMIT = 1024
 _REDACTED = "[REDACTED]"
+_JSON_DECODE_FAILED = object()
 
 
 class _GenericDriver:
@@ -36,8 +37,13 @@ class _GenericDriver:
         self.connector_id = connector_id
         self._environments = immutable_mapping(environments)
 
-    def credential_fields(self, environment: str) -> tuple[CredentialField, ...]:
+    @property
+    def credential_schema(self) -> tuple[CredentialField, ...]:
         return self._credential_fields
+
+    def credential_fields(self, environment: str) -> tuple[CredentialField, ...]:
+        self.resolve_base_url(environment)
+        return self.credential_schema
 
     def resolve_base_url(self, environment: str) -> str:
         base_url = self._environments.get(environment)
@@ -61,7 +67,7 @@ class _GenericDriver:
             raise DriverConfigurationError("multipart_files_invalid")
         if not files:
             return ()
-        if not action.content_type.casefold().startswith("multipart/form-data"):
+        if not _is_multipart_form_data(action.content_type):
             raise DriverConfigurationError("multipart_content_type_required")
 
         declared = action.input_schema.get("files", {})
@@ -76,7 +82,7 @@ class _GenericDriver:
                 raise DriverConfigurationError("multipart_file_invalid")
             try:
                 path = Path(raw_path).expanduser().resolve(strict=True)
-            except OSError:
+            except (OSError, RuntimeError):
                 raise DriverConfigurationError("multipart_file_invalid") from None
             if not path.is_file():
                 raise DriverConfigurationError("multipart_file_invalid")
@@ -105,6 +111,7 @@ class _GenericDriver:
             credentials=credentials,
             client=client,
         )
+        credential_values = _credential_values(credentials, auth)
         try:
             response = await client.get(
                 self.resolve_base_url(environment),
@@ -120,7 +127,7 @@ class _GenericDriver:
                 details={"error": "probe_request_failed"},
             )
 
-        company_name = _company_name(response) if response.is_success else None
+        company_name = _company_name(response, credential_values) if response.is_success else None
         return ConnectionProbe(
             status="connected" if response.is_success else "failed",
             connector_id=self.connector_id,
@@ -139,10 +146,10 @@ class _GenericDriver:
         value = _response_json(response)
         failed = not response.is_success or _matches_error_rules(
             action.error_rules,
-            value,
+            None if value is _JSON_DECODE_FAILED else value,
             response.status_code,
         )
-        if value is not None:
+        if value is not _JSON_DECODE_FAILED:
             return ConnectorResult(
                 status="failed" if failed else "succeeded",
                 http_status=response.status_code,
@@ -154,7 +161,7 @@ class _GenericDriver:
             status="failed" if failed else "succeeded",
             http_status=response.status_code,
             data=None,
-            summary=redact_text(response.text)[:_TEXT_SUMMARY_LIMIT],
+            summary="plaintext_response",
             dispatched=dispatched,
         )
 
@@ -162,11 +169,20 @@ class _GenericDriver:
         return redact_json(_redact_paths(value, action.response_redaction))
 
     def _required_credentials(self, credentials: Mapping[str, str]) -> dict[str, str]:
+        if not isinstance(credentials, Mapping):
+            raise ConnectorAuthError("credential_invalid")
+        declared = {field.name for field in self.credential_schema}
+        if any(not isinstance(name, str) or name not in declared for name in credentials):
+            raise ConnectorAuthError("credential_undeclared")
         values: dict[str, str] = {}
-        for field in self._credential_fields:
-            value = credentials.get(field.name)
-            if not isinstance(value, str) or not value:
-                raise ConnectorAuthError("credential_required")
+        for field in self.credential_schema:
+            if field.name not in credentials:
+                raise ConnectorAuthError("credential_missing")
+            value = credentials[field.name]
+            if not isinstance(value, str):
+                raise ConnectorAuthError("credential_invalid")
+            if not value.strip():
+                raise ConnectorAuthError("credential_blank")
             values[field.name] = value
         return values
 
@@ -256,6 +272,12 @@ class GenericOAuthClientCredentialsDriver(_GenericDriver):
         super().__init__(connector_id=connector_id, environments=environments)
         self._token_urls = immutable_mapping(token_urls)
 
+    def credential_fields(self, environment: str) -> tuple[CredentialField, ...]:
+        self.resolve_base_url(environment)
+        if not self._token_urls.get(environment):
+            raise DriverConfigurationError("unsupported_environment")
+        return self.credential_schema
+
     async def prepare_auth(
         self,
         *,
@@ -297,29 +319,32 @@ def _resolve_roots(roots: Sequence[Path]) -> tuple[Path, ...]:
     resolved: list[Path] = []
     for root in roots:
         try:
-            resolved.append(Path(root).expanduser().resolve(strict=True))
-        except OSError:
+            candidate = Path(root).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
             raise DriverConfigurationError("multipart_root_invalid") from None
+        if not candidate.is_dir():
+            raise DriverConfigurationError("multipart_root_invalid")
+        resolved.append(candidate)
     if not resolved:
         raise DriverConfigurationError("multipart_roots_required")
     return tuple(resolved)
 
 
-def _response_json(response: httpx.Response) -> Any | None:
+def _response_json(response: httpx.Response) -> Any:
     try:
         return response.json()
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return None
+        return _JSON_DECODE_FAILED
 
 
-def _company_name(response: httpx.Response) -> str | None:
+def _company_name(response: httpx.Response, credential_values: Sequence[str]) -> str | None:
     value = _response_json(response)
     if not isinstance(value, Mapping):
         return None
     for key in ("company_name", "companyName", "name"):
         candidate = value.get(key)
         if isinstance(candidate, str):
-            return redact_text(candidate)
+            return _redact_credential_values(candidate, credential_values)
     return None
 
 
@@ -377,7 +402,10 @@ def _redact_path(value: Any, components: list[str]) -> None:
     if isinstance(value, Mapping):
         if component == "*":
             for key in value:
-                _redact_path(value[key], remaining)
+                if remaining:
+                    _redact_path(value[key], remaining)
+                else:
+                    value[key] = _REDACTED
         elif component in value:
             if remaining:
                 _redact_path(value[component], remaining)
@@ -385,8 +413,11 @@ def _redact_path(value: Any, components: list[str]) -> None:
                 value[component] = _REDACTED
     elif isinstance(value, list):
         if component == "*":
-            for item in value:
-                _redact_path(item, remaining)
+            for index in range(len(value)):
+                if remaining:
+                    _redact_path(value[index], remaining)
+                else:
+                    value[index] = _REDACTED
         elif component.isdigit() and int(component) < len(value):
             if remaining:
                 _redact_path(value[int(component)], remaining)
@@ -402,10 +433,123 @@ def _expires_at(value: Any) -> datetime | None:
     return None
 
 
+def _is_multipart_form_data(content_type: str) -> bool:
+    return content_type.split(";", 1)[0].strip().casefold() == "multipart/form-data"
+
+
+def _credential_values(credentials: Mapping[str, str], auth: AuthContext) -> tuple[str, ...]:
+    values = [value for value in credentials.values() if isinstance(value, str) and value]
+    for value in (*auth.headers.values(), *auth.query.values()):
+        if isinstance(value, str) and value:
+            values.append(value)
+            if " " in value:
+                _, token = value.split(" ", 1)
+                if token:
+                    values.append(token)
+    return tuple(sorted(set(values), key=len, reverse=True))
+
+
+def _redact_credential_values(value: str, credential_values: Sequence[str]) -> str:
+    redacted = value
+    for credential in credential_values:
+        redacted = redacted.replace(credential, _REDACTED)
+    return redacted
+
+
+@dataclass(frozen=True)
+class GenericDriverFactory:
+    """A generic driver recipe that requires real connector configuration."""
+
+    driver_id: str
+    credential_schema: tuple[CredentialField, ...]
+
+    def create(
+        self,
+        *,
+        connector_id: str,
+        environments: Mapping[str, str],
+        key_name: str | None = None,
+        token_urls: Mapping[str, str] | None = None,
+    ) -> _GenericDriver:
+        configured_environments = _configured_environments(environments)
+        if self.driver_id == "bearer":
+            _require_factory_options(key_name=key_name, token_urls=token_urls)
+            return GenericBearerDriver(
+                connector_id=connector_id,
+                environments=configured_environments,
+            )
+        if self.driver_id in {"api_key_header", "api_key_query"}:
+            if token_urls is not None:
+                raise DriverConfigurationError("generic_factory_configuration_invalid")
+            placement: Literal["header", "query"] = (
+                "header" if self.driver_id == "api_key_header" else "query"
+            )
+            return GenericApiKeyDriver(
+                connector_id=connector_id,
+                placement=placement,
+                key_name=key_name or ("X-API-Key" if placement == "header" else "api_key"),
+                environments=configured_environments,
+            )
+        if self.driver_id == "basic":
+            _require_factory_options(key_name=key_name, token_urls=token_urls)
+            return GenericBasicDriver(
+                connector_id=connector_id,
+                environments=configured_environments,
+            )
+        if self.driver_id == "oauth_client_credentials":
+            if key_name is not None or token_urls is None:
+                raise DriverConfigurationError("generic_factory_configuration_invalid")
+            configured_token_urls = _configured_environments(token_urls)
+            if set(configured_token_urls) != set(configured_environments):
+                raise DriverConfigurationError("generic_factory_configuration_invalid")
+            return GenericOAuthClientCredentialsDriver(
+                connector_id=connector_id,
+                environments=configured_environments,
+                token_urls=configured_token_urls,
+            )
+        raise DriverConfigurationError("generic_factory_not_supported")
+
+
+def generic_driver_factories() -> tuple[GenericDriverFactory, ...]:
+    return (
+        GenericDriverFactory("bearer", GenericBearerDriver._credential_fields),
+        GenericDriverFactory("api_key_header", GenericApiKeyDriver._credential_fields),
+        GenericDriverFactory("api_key_query", GenericApiKeyDriver._credential_fields),
+        GenericDriverFactory("basic", GenericBasicDriver._credential_fields),
+        GenericDriverFactory(
+            "oauth_client_credentials",
+            GenericOAuthClientCredentialsDriver._credential_fields,
+        ),
+    )
+
+
+def _configured_environments(environments: Mapping[str, str]) -> dict[str, str]:
+    if not isinstance(environments, Mapping) or not environments:
+        raise DriverConfigurationError("driver_environments_required")
+    if any(
+        not isinstance(environment, str)
+        or not environment
+        or not isinstance(base_url, str)
+        or not base_url.strip()
+        for environment, base_url in environments.items()
+    ):
+        raise DriverConfigurationError("driver_environment_invalid")
+    return dict(environments)
+
+
+def _require_factory_options(
+    *, key_name: str | None, token_urls: Mapping[str, str] | None
+) -> None:
+    if key_name is not None or token_urls is not None:
+        raise DriverConfigurationError("generic_factory_configuration_invalid")
+
+
 __all__ = [
     "DriverConfigurationError",
     "GenericApiKeyDriver",
     "GenericBasicDriver",
     "GenericBearerDriver",
+    "GenericDriverFactory",
     "GenericOAuthClientCredentialsDriver",
+    "generic_driver_factories",
 ]

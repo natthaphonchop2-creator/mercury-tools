@@ -39,9 +39,18 @@ class CredentialStatus:
 class FrozenDict(dict[str, Any]):
     """JSON-serializable mapping that cannot be mutated after construction."""
 
-    def _immutable(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if getattr(self, "_initialized", False):
+            raise TypeError("immutable_mapping")
+        dict.__init__(self, *args, **kwargs)
+        object.__setattr__(self, "_initialized", True)
+
+    @staticmethod
+    def _immutable(*args: Any, **kwargs: Any) -> None:
         raise TypeError("immutable_mapping")
 
+    __setattr__ = _immutable
+    __delattr__ = _immutable
     __delitem__ = _immutable
     __ior__ = _immutable
     __setitem__ = _immutable
@@ -55,10 +64,20 @@ class FrozenDict(dict[str, Any]):
 def immutable_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     """Copy a public mapping so callers cannot alter driver state."""
 
-    return FrozenDict(value)
+    return deep_freeze(value)
 
 
-@dataclass(frozen=True)
+def deep_freeze(value: Any) -> Any:
+    """Recursively freeze JSON-compatible public response data."""
+
+    if isinstance(value, Mapping):
+        return FrozenDict({key: deep_freeze(item) for key, item in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(deep_freeze(item) for item in value)
+    return value
+
+
+@dataclass(frozen=True, repr=False)
 class AuthContext:
     headers: Mapping[str, str]
     query: Mapping[str, str]
@@ -67,6 +86,15 @@ class AuthContext:
     def __post_init__(self) -> None:
         object.__setattr__(self, "headers", immutable_mapping(self.headers))
         object.__setattr__(self, "query", immutable_mapping(self.query))
+
+    def __repr__(self) -> str:
+        return (
+            "AuthContext("
+            f"header_names={tuple(self.headers)}, "
+            f"query_names={tuple(self.query)}, "
+            f"expires_at={self.expires_at!r}"
+            ")"
+        )
 
 
 @dataclass(frozen=True)
@@ -86,7 +114,7 @@ class ConnectionProbe:
     details: Mapping[str, Any]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "details", immutable_mapping(self.details))
+        object.__setattr__(self, "details", deep_freeze(self.details))
 
 
 @dataclass(frozen=True)
@@ -96,3 +124,6 @@ class ConnectorResult:
     data: Any
     summary: str
     dispatched: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "data", deep_freeze(self.data))
