@@ -127,7 +127,7 @@ _SENSITIVE_PATH_PREFIX_VALUE = re.compile(
 _JWT_PATH_SEGMENT = re.compile(
     r"^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}$"
 )
-_PATH_VALUE_FIELDS = {"path", "pathtemplate", "sourceuri", "url"}
+_PATH_VALUE_FIELDS = {"endpoint", "path", "pathtemplate", "route", "sourceuri", "url"}
 
 
 class FrozenDict(dict[str, Any]):
@@ -278,7 +278,8 @@ def _inspect_credential_paths(
         for key, item in value.items():
             if not isinstance(key, str):
                 continue
-            normalized_key = _normalized_name(key)
+            decoded_field_key = _decode_field_name(key)
+            normalized_key = _normalized_name(decoded_field_key)
             decoded_key = _structural_path_key(key, in_path_context=in_path_context)
             if decoded_key is not None:
                 validate_credential_safe_path(decoded_key)
@@ -288,7 +289,7 @@ def _inspect_credential_paths(
                 _inspect_path_value(item)
             _inspect_credential_paths(
                 item,
-                parent_key=key,
+                parent_key=decoded_field_key,
                 in_path_context=in_path_context or normalized_key in _PATH_VALUE_FIELDS,
             )
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
@@ -332,6 +333,21 @@ def _decode_path_value(value: str) -> str:
             return decoded
         decoded = next_decoded
     raise ValueError(_CREDENTIAL_PATH_UNSAFE)
+
+
+def _decode_field_name(value: str) -> str:
+    """Decode field names for classification without rejecting unrelated metadata."""
+    decoded = value
+    for _ in range(len(value) + 1):
+        if not _has_valid_percent_encoding(decoded):
+            return decoded
+        next_decoded = _decode_percent_encoded_utf8(decoded)
+        if next_decoded is None:
+            return value
+        if next_decoded == decoded:
+            return decoded
+        decoded = next_decoded
+    return value
 
 
 def _structural_path_key(key: str, *, in_path_context: bool) -> str | None:

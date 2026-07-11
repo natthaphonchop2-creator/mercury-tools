@@ -584,6 +584,34 @@ def test_catalog_source_rejects_encoded_structural_endpoint_path_key_without_ech
     assert secret not in str(raised.value)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("%70ath", "/v1/ghp_task-4-encoded-field-secret"),
+        ("%2570ath", "/v1/client_secret=task-4-encoded-field-secret"),
+        ("path_%74emplate", "/v1/ghp_task-4-encoded-field-secret"),
+        ("%65ndpoint", "/v1/client_secret=task-4-encoded-field-secret"),
+        ("r%6fute", "/v1/ghp_task-4-encoded-field-secret"),
+        ("%75rl", {"raw": "/v1/client_secret=task-4-encoded-field-secret"}),
+    ],
+)
+def test_catalog_source_rejects_encoded_path_field_names_without_echo(
+    field: str,
+    value: object,
+) -> None:
+    secret = "task-4-encoded-field-secret"
+
+    with pytest.raises(ValidationError, match="catalog_credential_path_unsafe") as raised:
+        CatalogSource.from_document(
+            uri="https://example.test/openapi.json",
+            connector_id="flowaccount",
+            document={"openapi": "3.0.0", field: value},
+            report={"status": "imported"},
+        )
+
+    assert secret not in str(raised.value)
+
+
 def test_invalid_percent_decoded_utf8_path_error_has_no_exception_chain() -> None:
     with pytest.raises(ValueError, match="^catalog_credential_path_unsafe$") as raised:
         validate_credential_safe_path("/v1/%FF")

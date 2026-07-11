@@ -859,6 +859,29 @@ def test_import_rejects_encoded_structural_endpoint_path_key_without_echo(
     assert secret not in str(raised.value)
 
 
+def test_import_rejects_multi_layer_encoded_path_field_name_without_echo(
+    tmp_path: Path,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    secret = "task-4-import-encoded-field-secret"
+    source_path = tmp_path / "unsafe-encoded-path-field.json"
+    source_path.write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.0",
+                "info": {"version": "1"},
+                "paths": {"/items": {"get": {"responses": {"200": {"description": "OK"}}}}},
+                "%2570ath": f"/v1/client_secret={secret}",
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="^catalog_credential_path_unsafe$") as raised:
+        import_spec(context, connector_id="custom", source_path=source_path)
+
+    assert secret not in str(raised.value)
+
+
 def test_import_rejects_deeply_encoded_structural_endpoint_path_key_without_echo(
     tmp_path: Path,
 ) -> None:
