@@ -8,6 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+import mercury_tools.drivers.models as driver_models
 from mercury_tools.drivers.base import (
     AuthContext,
     ConnectionProbe,
@@ -52,6 +53,8 @@ def test_public_driver_models_are_frozen() -> None:
         with pytest.raises(FrozenInstanceError):
             model.status = "changed"  # type: ignore[misc,union-attr]
 
+    assert not hasattr(auth, "public_dict")
+
 
 @pytest.mark.parametrize(
     ("label", "headers", "query", "secret"),
@@ -78,7 +81,7 @@ def test_auth_context_repr_exposes_only_safe_metadata(
         assert name in rendered
 
 
-def test_probe_details_and_result_data_are_deeply_immutable_and_json_serializable() -> None:
+def test_probe_details_and_result_data_are_deeply_immutable_with_explicit_serialization() -> None:
     probe = ConnectionProbe(
         status="connected",
         connector_id="custom",
@@ -96,16 +99,79 @@ def test_probe_details_and_result_data_are_deeply_immutable_and_json_serializabl
 
     assert probe.details == {"meta": {"items": ({"status": "ok"},)}}
     assert result.data == {"meta": {"items": ({"status": "ok"},)}}
-    assert json.loads(json.dumps(probe.details, allow_nan=False)) == {
-        "meta": {"items": [{"status": "ok"}]}
+    assert isinstance(probe.details, Mapping)
+    assert isinstance(result.data, Mapping)
+    assert not isinstance(probe.details, dict)
+    assert not isinstance(result.data, dict)
+    assert driver_models.to_jsonable(probe.details) == {"meta": {"items": [{"status": "ok"}]}}
+    assert driver_models.to_jsonable(result.data) == {"meta": {"items": [{"status": "ok"}]}}
+    with pytest.raises(TypeError):
+        json.dumps(probe.details, allow_nan=False)
+    with pytest.raises(TypeError):
+        json.dumps(result.data, allow_nan=False)
+    assert probe.public_dict() == {
+        "status": "connected",
+        "connector_id": "custom",
+        "environment": "production",
+        "company_name": "Example Co.",
+        "details": {"meta": {"items": [{"status": "ok"}]}},
     }
-    assert json.loads(json.dumps(result.data, allow_nan=False)) == {
-        "meta": {"items": [{"status": "ok"}]}
+    assert result.public_dict() == {
+        "status": "succeeded",
+        "http_status": 200,
+        "data": {"meta": {"items": [{"status": "ok"}]}},
+        "summary": "json_response",
+        "dispatched": True,
     }
-    with pytest.raises(TypeError, match="^immutable_mapping$"):
+    assert json.loads(json.dumps(probe.public_dict(), allow_nan=False)) == probe.public_dict()
+    assert json.loads(json.dumps(result.public_dict(), allow_nan=False)) == result.public_dict()
+    with pytest.raises(TypeError):
         probe.details["meta"]["items"][0]["status"] = "changed"  # type: ignore[index]
-    with pytest.raises(TypeError, match="^immutable_mapping$"):
+    with pytest.raises(TypeError):
         result.data["meta"]["items"][0]["status"] = "changed"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        lambda value: dict.__setitem__(value, "injected", True),
+        lambda value: dict.update(value, {"injected": True}),
+        lambda value: dict.__init__(value, {"injected": True}),
+    ],
+)
+def test_public_mappings_cannot_be_mutated_through_dict_subclass_bypasses(
+    operation: object,
+) -> None:
+    probe = ConnectionProbe(
+        status="connected",
+        connector_id="custom",
+        environment="production",
+        company_name=None,
+        details={"nested": {"status": "original"}},
+    )
+    result = ConnectorResult(
+        status="succeeded",
+        http_status=200,
+        data={"nested": {"status": "original"}},
+        summary="json_response",
+        dispatched=True,
+    )
+    before_probe = probe.public_dict()
+    before_result = result.public_dict()
+
+    assert callable(operation)
+    for public_mapping in (probe.details, result.data):
+        with pytest.raises(TypeError):
+            operation(public_mapping)
+
+    with pytest.raises(TypeError):
+        probe.details["nested"]["status"] = "injected"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        result.data["nested"]["status"] = "injected"  # type: ignore[index]
+    assert probe.public_dict() == before_probe
+    assert result.public_dict() == before_result
+    assert json.dumps(probe.public_dict(), allow_nan=False)
+    assert json.dumps(result.public_dict(), allow_nan=False)
 
 
 @pytest.mark.parametrize(
@@ -156,7 +222,7 @@ def test_public_driver_response_models_accept_strict_json_data(value: object) ->
         dispatched=True,
     )
 
-    json.dumps(result.data, allow_nan=False)
+    assert json.dumps(result.public_dict(), allow_nan=False)
 
 
 def test_registry_rejects_duplicates_with_stable_error_and_lists_immutable_summaries() -> None:
@@ -175,7 +241,8 @@ def test_registry_rejects_duplicates_with_stable_error_and_lists_immutable_summa
     assert [item["connector_id"] for item in summaries] == ["alpha", "zeta"]
     assert [item["entry_type"] for item in summaries] == ["connector", "connector"]
     assert summaries[0]["credential_fields"] == ("token",)
-    assert "secret-token" not in json.dumps(summaries)
+    assert registry.public_summaries() == driver_models.to_jsonable(summaries)
+    assert "secret-token" not in json.dumps(registry.public_summaries(), allow_nan=False)
     with pytest.raises(TypeError):
         summaries[0]["connector_id"] = "changed"  # type: ignore[index]
     with pytest.raises(AttributeError):
@@ -323,6 +390,6 @@ async def test_probe_and_auth_exception_never_include_credential_values() -> Non
             )
 
     assert probe.status == "failed"
-    assert secret not in json.dumps(probe.details)
+    assert secret not in json.dumps(probe.public_dict())
     assert secret not in str(raised.value)
     assert isinstance(probe.details, Mapping)

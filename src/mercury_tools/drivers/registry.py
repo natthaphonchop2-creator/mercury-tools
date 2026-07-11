@@ -10,7 +10,7 @@ from mercury_tools.drivers.generic import (
     GenericDriverFactory,
     generic_driver_factories,
 )
-from mercury_tools.drivers.models import CredentialField, immutable_mapping
+from mercury_tools.drivers.models import CredentialField, immutable_mapping, to_jsonable
 
 
 class DuplicateDriverError(ValueError):
@@ -93,6 +93,14 @@ class DriverRegistry:
             immutable_mapping(summary)
             for _, summary in sorted(summaries, key=lambda entry: entry[0])
         )
+
+    def public_summaries(self) -> list[dict[str, Any]]:
+        """Return registry summaries as JSON-ready data at a public boundary."""
+
+        summaries = to_jsonable(self.summaries())
+        if not isinstance(summaries, list):
+            raise TypeError("public_data_invalid")
+        return summaries
 
 
 def _credential_field_names(source: object) -> tuple[str, ...]:

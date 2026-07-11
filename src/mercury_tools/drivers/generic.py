@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -28,6 +29,7 @@ from mercury_tools.safety.redaction import redact_json
 
 _REDACTED = "[REDACTED]"
 _JSON_DECODE_FAILED = object()
+_INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
 
 class _GenericDriver:
@@ -567,6 +569,12 @@ def _configured_environments(environments: Mapping[str, str]) -> dict[str, str]:
 
 
 def _validate_configured_url(value: str) -> None:
+    if (
+        any(ord(character) <= 0x20 or ord(character) == 0x7F for character in value)
+        or "\\" in value
+        or _INVALID_PERCENT_ESCAPE.search(value) is not None
+    ):
+        raise DriverConfigurationError("driver_url_invalid")
     try:
         parsed = urlsplit(value)
         port = parsed.port
@@ -581,6 +589,7 @@ def _validate_configured_url(value: str) -> None:
         or parsed.password is not None
         or "#" in value
         or not parsed_url.host
+        or parsed.netloc.endswith(":")
         or port is not None and not 0 <= port <= 65535
     ):
         raise DriverConfigurationError("driver_url_invalid")

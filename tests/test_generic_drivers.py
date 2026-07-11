@@ -18,6 +18,22 @@ from mercury_tools.drivers.generic import (
 )
 from mercury_tools.drivers.registry import UnknownDriverError, build_generic_registry
 
+_MALFORMED_URLS = (
+    "erp.example.test",
+    "ftp://erp.example.test",
+    "https:///missing-host",
+    "https://client:opaque-url-secret@erp.example.test",
+    "https://erp.example.test/path#fragment",
+    "https://erp.example.test:not-a-port",
+    "https://[::1",
+    "https://exa mple.test/path",
+    "https://erp.example.test/path\tsegment",
+    "https://erp.example.test/path\x00segment",
+    "https://good.example\\evil.example/path",
+    "https://erp.example.test/%ZZ",
+    "https://erp.example.test:",
+)
+
 
 @pytest.mark.asyncio
 async def test_bearer_driver_adds_authorization_only_to_operation_scoped_auth_context() -> None:
@@ -38,7 +54,7 @@ async def test_bearer_driver_adds_authorization_only_to_operation_scoped_auth_co
     assert auth.headers == {"Authorization": f"Bearer {token}"}
     assert auth.query == {}
     assert "token" not in driver.__dict__
-    assert token not in json.dumps(dict(driver.__dict__))
+    assert token not in repr(driver.__dict__)
 
 
 def test_api_key_query_driver_rejects_unknown_environment() -> None:
@@ -64,13 +80,7 @@ def test_api_key_query_driver_rejects_unknown_environment() -> None:
         ({" \t ": "https://erp.example.test"}, "driver_environment_invalid"),
         ({"production": ""}, "driver_environment_invalid"),
         ({"production": "\t"}, "driver_environment_invalid"),
-        ({"production": "erp.example.test"}, "driver_url_invalid"),
-        ({"production": "ftp://erp.example.test"}, "driver_url_invalid"),
-        ({"production": "https:///missing-host"}, "driver_url_invalid"),
-        ({"production": "https://client:opaque-url-secret@erp.example.test"}, "driver_url_invalid"),
-        ({"production": "https://erp.example.test/path#fragment"}, "driver_url_invalid"),
-        ({"production": "https://erp.example.test:not-a-port"}, "driver_url_invalid"),
-        ({"production": "https://[::1"}, "driver_url_invalid"),
+        *[({"production": value}, "driver_url_invalid") for value in _MALFORMED_URLS],
     ],
 )
 def test_direct_driver_constructor_rejects_invalid_environment_maps_without_echoing_urls(
@@ -84,26 +94,34 @@ def test_direct_driver_constructor_rejects_invalid_environment_maps_without_echo
 
 
 @pytest.mark.parametrize(
-    "environments",
+    ("environments", "code"),
     [
-        {" \t ": "https://erp.example.test"},
-        {"production": "https://client:opaque-url-secret@erp.example.test"},
-        {"production": "https://erp.example.test:not-a-port"},
+        ({" \t ": "https://erp.example.test"}, "driver_environment_invalid"),
+        *[({"production": value}, "driver_url_invalid") for value in _MALFORMED_URLS],
     ],
 )
 def test_factory_rejects_invalid_environment_maps_at_construction(
     environments: dict[str, str],
+    code: str,
 ) -> None:
     registry = build_generic_registry()
 
-    with pytest.raises(DriverConfigurationError, match="^driver_") as error:
+    with pytest.raises(DriverConfigurationError, match=rf"^{code}$") as error:
         registry.create("bearer", connector_id="custom", environments=environments)
 
     assert "opaque-url-secret" not in str(error.value)
 
 
-def test_direct_and_factory_drivers_allow_explicit_http_gateway_urls() -> None:
-    environment_url = "http://127.0.0.1:8080/gateway"
+@pytest.mark.parametrize(
+    "environment_url",
+    [
+        "http://127.0.0.1:8080/gateway",
+        "https://[2001:db8::1]:8443/gateway%2Fv1?name=valid%20escape",
+    ],
+)
+def test_direct_and_factory_drivers_allow_valid_gateway_and_ipv6_urls(
+    environment_url: str,
+) -> None:
     direct = GenericBearerDriver(connector_id="direct", environments={"local": environment_url})
     factory = build_generic_registry().create(
         "bearer",
@@ -127,6 +145,8 @@ def test_direct_and_factory_drivers_allow_explicit_http_gateway_urls() -> None:
         ),
         ({"production": "https://auth.example.test:not-a-port/token"}, "driver_url_invalid"),
         ({"production": "https://auth.example.test/token#fragment"}, "driver_url_invalid"),
+        ({"production": "https://auth.example.test/%ZZ"}, "driver_url_invalid"),
+        ({"production": "https://auth.example.test:"}, "driver_url_invalid"),
     ],
 )
 def test_oauth_constructor_validates_token_urls_and_requires_exact_environment_sets(
@@ -138,6 +158,19 @@ def test_oauth_constructor_validates_token_urls_and_requires_exact_environment_s
             connector_id="custom",
             environments={"production": "https://erp.example.test"},
             token_urls=token_urls,  # type: ignore[arg-type]
+        )
+
+    assert "opaque-url-secret" not in str(error.value)
+
+
+@pytest.mark.parametrize("token_url", _MALFORMED_URLS)
+def test_oauth_factory_rejects_malformed_token_urls(token_url: str) -> None:
+    with pytest.raises(DriverConfigurationError, match="^driver_url_invalid$") as error:
+        build_generic_registry().create(
+            "oauth_client_credentials",
+            connector_id="custom",
+            environments={"production": "https://erp.example.test"},
+            token_urls={"production": token_url},
         )
 
     assert "opaque-url-secret" not in str(error.value)
@@ -189,7 +222,7 @@ async def test_probe_url_construction_errors_are_returned_as_safe_probe_failures
 
     assert probe.status == "failed"
     assert probe.details == {"error": "probe_request_failed"}
-    assert "opaque-url-secret" not in json.dumps(probe.details)
+    assert "opaque-url-secret" not in json.dumps(probe.public_dict())
 
 
 @pytest.mark.asyncio
@@ -291,7 +324,7 @@ async def test_probe_replaces_exact_credential_echoes_and_omits_provider_details
 
     assert probe.company_name == "[REDACTED]"
     assert probe.details == {"http_status": 200}
-    assert secret not in json.dumps({"company_name": probe.company_name, "details": probe.details})
+    assert secret not in json.dumps(probe.public_dict())
 
 
 _ENCODED_PROBE_SECRET = "opaque+token space/%"
@@ -332,7 +365,7 @@ async def test_probe_fully_redacts_literal_and_reversibly_encoded_credential_ech
         )
 
     assert probe.company_name == "[REDACTED]"
-    assert _ENCODED_PROBE_SECRET not in json.dumps(probe.details)
+    assert _ENCODED_PROBE_SECRET not in json.dumps(probe.public_dict())
 
 
 @pytest.mark.asyncio

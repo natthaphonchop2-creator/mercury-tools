@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from math import isfinite
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 
@@ -37,36 +38,11 @@ class CredentialStatus:
         }
 
 
-class FrozenDict(dict[str, Any]):
-    """JSON-serializable mapping that cannot be mutated after construction."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        if getattr(self, "_initialized", False):
-            raise TypeError("immutable_mapping")
-        dict.__init__(self, *args, **kwargs)
-        object.__setattr__(self, "_initialized", True)
-
-    @staticmethod
-    def _immutable(*args: Any, **kwargs: Any) -> None:
-        raise TypeError("immutable_mapping")
-
-    __setattr__ = _immutable
-    __delattr__ = _immutable
-    __delitem__ = _immutable
-    __ior__ = _immutable
-    __setitem__ = _immutable
-    clear = _immutable
-    pop = _immutable
-    popitem = _immutable
-    setdefault = _immutable
-    update = _immutable
-
-
 def immutable_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     """Copy a public mapping so callers cannot alter driver state."""
 
     frozen = deep_freeze(value)
-    if not isinstance(frozen, FrozenDict):
+    if not isinstance(frozen, Mapping):
         raise TypeError("public_data_invalid")
     return frozen
 
@@ -85,7 +61,7 @@ def _deep_freeze(value: Any, *, active: set[int]) -> Any:
             return value
         raise TypeError("public_data_invalid")
     if isinstance(value, Mapping):
-        return FrozenDict(_freeze_mapping(value, active=active))
+        return MappingProxyType(_freeze_mapping(value, active=active))
     if isinstance(value, list | tuple):
         return tuple(_freeze_sequence(value, active=active))
     raise TypeError("public_data_invalid")
@@ -116,6 +92,22 @@ def _freeze_sequence(value: list[Any] | tuple[Any, ...], *, active: set[int]) ->
         return tuple(_deep_freeze(item, active=active) for item in value)
     finally:
         active.remove(identity)
+
+
+def to_jsonable(value: Any) -> Any:
+    """Return a plain JSON-compatible copy at an explicit serialization boundary."""
+
+    if value is None or isinstance(value, str | bool | int):
+        return value
+    if isinstance(value, float):
+        if isfinite(value):
+            return value
+        raise TypeError("public_data_invalid")
+    if isinstance(value, Mapping):
+        return {key: to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [to_jsonable(item) for item in value]
+    raise TypeError("public_data_invalid")
 
 
 @dataclass(frozen=True, repr=False)
@@ -157,6 +149,15 @@ class ConnectionProbe:
     def __post_init__(self) -> None:
         object.__setattr__(self, "details", immutable_mapping(self.details))
 
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "connector_id": self.connector_id,
+            "environment": self.environment,
+            "company_name": self.company_name,
+            "details": to_jsonable(self.details),
+        }
+
 
 @dataclass(frozen=True)
 class ConnectorResult:
@@ -168,3 +169,12 @@ class ConnectorResult:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "data", deep_freeze(self.data))
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "http_status": self.http_status,
+            "data": to_jsonable(self.data),
+            "summary": self.summary,
+            "dispatched": self.dispatched,
+        }

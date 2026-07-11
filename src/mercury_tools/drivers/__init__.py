@@ -10,7 +10,7 @@ from mercury_tools.drivers.base import (
     DriverError,
     PreparedFile,
 )
-from mercury_tools.drivers.models import CredentialField, CredentialStatus
+from mercury_tools.drivers.models import CredentialField, CredentialStatus, to_jsonable
 
 __all__ = [
     "AuthContext",
@@ -23,4 +23,5 @@ __all__ = [
     "DriverConfigurationError",
     "DriverError",
     "PreparedFile",
+    "to_jsonable",
 ]
