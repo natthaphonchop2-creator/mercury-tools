@@ -258,6 +258,241 @@ def test_source_ingestion_sanitizes_key_variants_and_known_token_prefixes() -> N
     }
 
 
+def test_source_ingestion_redacts_credential_containers_headers_and_uri_variants() -> None:
+    rejected_value = "task-3-credential-raw-value"
+    source = CatalogSource.from_document(
+        uri=(
+            f"//user:{rejected_value}@example.test/openapi.json?"
+            f"access_token={rejected_value}&scope=documents.read"
+        ),
+        connector_id="flowaccount",
+        document={
+            "openapi": "3.0.0",
+            "authentication": {
+                "type": "basic",
+                "scheme": "Bearer",
+                "scope": "documents.read",
+                "username": rejected_value,
+                "user": rejected_value,
+                "login": rejected_value,
+                "password": rejected_value,
+                "secret": rejected_value,
+                "token": rejected_value,
+                "value": rejected_value,
+                "field_name": rejected_value,
+                "credential_name": rejected_value,
+                "key_name": "X-API-Key",
+                "header_name": "Authorization",
+                "parameter_name": "access_token",
+                "client_id_name": "client_id",
+                "client_secret_name": "client_secret",
+            },
+            "headers": [
+                {"name": header_name, "value": rejected_value}
+                for header_name in (
+                    "Authorization",
+                    "Proxy-Authorization",
+                    "Cookie",
+                    "Set-Cookie",
+                    "API-Key",
+                    "X-API-Key",
+                    "X-Auth-Token",
+                    "X-Access-Token",
+                    "X-Client-Secret",
+                    "X-Amz-Security-Token",
+                )
+            ],
+            "relative_uri": f"/v1/items?token={rejected_value}&page=1",
+            "templated_uri": (
+                f"{{{{baseUrl}}}}/v1/items?X-Auth-Token={rejected_value}"
+                "&page=1"
+            ),
+            "ordinary_relative_uri": "/v1/items?page=1",
+        },
+        report={"status": "imported"},
+    )
+
+    dumped = source.model_dump(mode="json")
+    serialized = source.model_dump_json()
+    canonical = canonical_json(dumped)
+
+    assert rejected_value not in str(dumped)
+    assert rejected_value not in serialized
+    assert rejected_value not in canonical
+    assert source.source_uri.startswith("//[REDACTED]@example.test/")
+    assert dumped["sanitization"]["document"]["ordinary_relative_uri"] == (
+        "/v1/items?page=1"
+    )
+    assert dumped["sanitization"]["document"]["authentication"]["key_name"] == (
+        "X-API-Key"
+    )
+    assert dumped["sanitization"]["document"]["authentication"]["header_name"] == (
+        "Authorization"
+    )
+    authentication = dumped["sanitization"]["document"]["authentication"]
+    for key in (
+        "username",
+        "user",
+        "login",
+        "password",
+        "secret",
+        "token",
+        "value",
+        "field_name",
+        "credential_name",
+    ):
+        assert authentication[key] == "[REDACTED]"
+    assert {
+        key: authentication[key]
+        for key in (
+            "key_name",
+            "header_name",
+            "parameter_name",
+            "client_id_name",
+            "client_secret_name",
+        )
+    } == {
+        "key_name": "X-API-Key",
+        "header_name": "Authorization",
+        "parameter_name": "access_token",
+        "client_id_name": "client_id",
+        "client_secret_name": "client_secret",
+    }
+
+
+@pytest.mark.parametrize(
+    ("uri", "expected_uri"),
+    [
+        (
+            "https://user:task-3-credential-raw-value@example.test/v1?"
+            "access_token=task-3-credential-raw-value&page=1",
+            "https://[REDACTED]@example.test/v1?access_token=%5BREDACTED%5D&page=1",
+        ),
+        (
+            "//user:task-3-credential-raw-value@example.test/v1?"
+            "access_token=task-3-credential-raw-value&page=1",
+            "//[REDACTED]@example.test/v1?access_token=%5BREDACTED%5D&page=1",
+        ),
+        (
+            "/v1?access_token=task-3-credential-raw-value&page=1",
+            "/v1?access_token=%5BREDACTED%5D&page=1",
+        ),
+        (
+            "{{baseUrl}}/v1?access_token=task-3-credential-raw-value&page=1",
+            "{{baseUrl}}/v1?access_token=%5BREDACTED%5D&page=1",
+        ),
+        (
+            "user:task-3-credential-raw-value@example.test/v1?"
+            "access_token=task-3-credential-raw-value&page=1",
+            "[REDACTED]@example.test/v1?access_token=%5BREDACTED%5D&page=1",
+        ),
+    ],
+)
+def test_source_ingestion_sanitizes_sensitive_uri_forms(
+    uri: str,
+    expected_uri: str,
+) -> None:
+    source = CatalogSource.from_document(
+        uri=uri,
+        connector_id="flowaccount",
+        document={"openapi": "3.0.0", "server_uri": uri},
+        report={"status": "imported"},
+    )
+
+    dumped = source.model_dump(mode="json")
+    canonical = canonical_json(dumped)
+
+    assert source.source_uri == expected_uri
+    assert dumped["sanitization"]["document"]["server_uri"] == expected_uri
+    assert "task-3-credential-raw-value" not in canonical
+
+
+@pytest.mark.parametrize(
+    "examples",
+    [
+        ({"name": "Cookie", "value": "task-3-credential-raw-value"},),
+        ({"key": "Proxy-Authorization", "value": "task-3-credential-raw-value"},),
+        ({"header": "X-Auth-Token", "value": "task-3-credential-raw-value"},),
+        ({"name": "X-Access-Token", "value": "task-3-credential-raw-value"},),
+        ({"key": "X-Client-Secret", "value": "task-3-credential-raw-value"},),
+        ({"header": "X-Amz-Security-Token", "value": "task-3-credential-raw-value"},),
+        (
+            {
+                "authentication": {
+                    key: "task-3-credential-raw-value"
+                    for key in (
+                        "username",
+                        "user",
+                        "login",
+                        "password",
+                        "secret",
+                        "token",
+                        "value",
+                    )
+                }
+            },
+        ),
+    ],
+)
+def test_direct_catalog_actions_reject_new_credential_shapes_without_echoing_them(
+    action_factory,
+    examples: tuple[dict[str, object], ...],
+) -> None:
+    rejected_value = "task-3-credential-raw-value"
+
+    with pytest.raises(ValidationError, match="catalog_credentials_unsafe") as raised:
+        action_factory(examples=examples)
+
+    assert rejected_value not in str(raised.value)
+
+
+def test_direct_catalog_actions_allow_safe_parameter_metadata_and_relative_urls(
+    action_factory,
+) -> None:
+    action = action_factory(
+        source_uri="/v1/items?page=1",
+        examples=(
+            {
+                "authentication": {
+                    "key_name": "X-API-Key",
+                    "header_name": "Authorization",
+                    "parameter_name": "access_token",
+                    "client_id_name": "client_id",
+                    "client_secret_name": "client_secret",
+                }
+            },
+        ),
+    )
+
+    assert action.source_uri == "/v1/items?page=1"
+    assert action.examples[0]["authentication"]["key_name"] == "X-API-Key"
+
+
+@pytest.mark.parametrize(
+    "source_uri",
+    [
+        "https://user:task-3-credential-raw-value@example.test/v1?"
+        "access_token=task-3-credential-raw-value",
+        "//user:task-3-credential-raw-value@example.test/v1?"
+        "access_token=task-3-credential-raw-value",
+        "/v1?access_token=task-3-credential-raw-value",
+        "{{baseUrl}}/v1?access_token=task-3-credential-raw-value",
+        "user:task-3-credential-raw-value@example.test/v1?"
+        "access_token=task-3-credential-raw-value",
+    ],
+)
+def test_direct_catalog_actions_reject_sensitive_uri_forms_without_echoing_them(
+    action_factory,
+    source_uri: str,
+) -> None:
+    rejected_value = "task-3-credential-raw-value"
+
+    with pytest.raises(ValidationError, match="catalog_credentials_unsafe") as raised:
+        action_factory(source_uri=source_uri)
+
+    assert rejected_value not in str(raised.value)
+
+
 @pytest.mark.parametrize(
     "override",
     [

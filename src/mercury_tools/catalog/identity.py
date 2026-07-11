@@ -43,8 +43,6 @@ _SENSITIVE_KEY_SUFFIXES = (
 _METADATA_KEY_SUFFIXES = (
     "format",
     "granttype",
-    "name",
-    "names",
     "prefix",
     "scheme",
     "scope",
@@ -58,9 +56,35 @@ _METADATA_KEY_SUFFIXES = (
 _SENSITIVE_HEADER_NAMES = {
     "apikey",
     "authorization",
+    "cookie",
     "clientsecret",
+    "proxyauthorization",
+    "setcookie",
+    "xaccesstoken",
     "xapikey",
+    "xauthtoken",
     "xclientsecret",
+    "xamzsecuritytoken",
+}
+_SAFE_PARAMETER_METADATA_KEYS = {
+    "keyname",
+    "headername",
+    "parametername",
+    "clientidname",
+    "clientsecretname",
+}
+_CREDENTIAL_CONTAINER_NAMES = {
+    "auth",
+    "authentication",
+    "credential",
+    "credentials",
+    "oauth",
+    "oauth2",
+    "secret",
+    "secrets",
+    "security",
+    "securityscheme",
+    "securityschemes",
 }
 _HEADER_IDENTIFIER_FIELDS = {"header", "headername", "key", "name"}
 _HEADER_VALUE_FIELDS = {
@@ -226,17 +250,19 @@ def _credential_transform(value: Any, *, force_redaction: bool = False) -> tuple
         changed = False
         sensitive_header = _mapping_identifies_sensitive_header(value)
         schema_context = force_redaction and _looks_like_schema(value)
-        sensitive_context = force_redaction and not schema_context
+        sensitive_context = force_redaction
         for key, item in value.items():
             if not isinstance(key, str):
                 raise ValueError("unsupported_canonical_key")
             normalized_key = _normalized_name(key)
             redact_item = (
                 _is_sensitive_key(normalized_key)
+                or _is_credential_container_key(normalized_key)
+                or _is_sensitive_header_name(normalized_key)
                 or (sensitive_header and normalized_key in _HEADER_VALUE_FIELDS)
                 or (
                     sensitive_context
-                    and not normalized_key.endswith(_METADATA_KEY_SUFFIXES)
+                    and not _is_safe_metadata_key(normalized_key, item)
                 )
                 or (schema_context and normalized_key in _HEADER_VALUE_FIELDS)
             )
@@ -267,15 +293,17 @@ def _sanitize_string(value: str) -> tuple[str, bool]:
         return value, False
     if value.lstrip().casefold().startswith(_SENSITIVE_VALUE_PREFIXES):
         return _REDACTED, True
-    if "://" not in value:
+    if "?" not in value and "://" not in value and not value.startswith("//"):
         return value, False
+
     try:
         parsed = urlsplit(value)
     except ValueError:
-        return value, False
+        sanitized = _sanitize_userinfo(value)
+        return sanitized, sanitized != value
 
-    changed = False
     netloc = parsed.netloc
+    changed = False
     if "@" in netloc:
         userinfo, host = netloc.rsplit("@", 1)
         if userinfo != _REDACTED:
@@ -291,9 +319,41 @@ def _sanitize_string(value: str) -> tuple[str, bool]:
             query_items.append((key, item))
     query = urlencode(query_items, doseq=True)
     if not changed:
-        return value, False
+        sanitized = _sanitize_userinfo(value)
+        return sanitized, sanitized != value
     sanitized = urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
+    sanitized = _sanitize_userinfo(sanitized)
     return sanitized, True
+
+
+def _sanitize_userinfo(value: str) -> str:
+    authority_pattern = re.compile(
+        r"(?P<prefix>(?:[a-z][a-z0-9+.-]*:)?//|://)"
+        r"(?P<userinfo>[^/?#\s]*@)(?P<host>[^/?#\s]*)",
+        re.IGNORECASE,
+    )
+
+    def replace_authority(match: re.Match[str]) -> str:
+        if match.group("userinfo") == f"{_REDACTED}@":
+            return match.group(0)
+        return f"{match.group('prefix')}{_REDACTED}@{match.group('host')}"
+
+    sanitized = authority_pattern.sub(replace_authority, value, count=1)
+    if sanitized != value:
+        return sanitized
+
+    relative_pattern = re.compile(
+        r"^(?P<userinfo>[^/?#\s@]+@)(?P<host>[^/?#\s/]+)(?P<path>/[^?#\s]*)?"
+        r"(?P<suffix>[?#].*)?$"
+    )
+    return relative_pattern.sub(
+        lambda match: (
+            f"{_REDACTED}@{match.group('host')}{match.group('path') or ''}"
+            f"{match.group('suffix') or ''}"
+        ),
+        value,
+        count=1,
+    )
 
 
 def _mapping_identifies_sensitive_header(value: Mapping[Any, Any]) -> bool:
@@ -302,7 +362,7 @@ def _mapping_identifies_sensitive_header(value: Mapping[Any, Any]) -> bool:
             isinstance(key, str)
             and _normalized_name(key) in _HEADER_IDENTIFIER_FIELDS
             and isinstance(item, str)
-            and _normalized_name(item) in _SENSITIVE_HEADER_NAMES
+            and _is_sensitive_header_name(_normalized_name(item))
         ):
             return True
     return False
@@ -318,6 +378,34 @@ def _is_sensitive_key(normalized_key: str) -> bool:
     if normalized_key.endswith(_METADATA_KEY_SUFFIXES):
         return False
     return normalized_key.endswith(_SENSITIVE_KEY_SUFFIXES)
+
+
+def _is_safe_metadata_key(normalized_key: str, value: Any) -> bool:
+    if normalized_key in _SAFE_PARAMETER_METADATA_KEYS:
+        return isinstance(value, str)
+    return normalized_key.endswith(_METADATA_KEY_SUFFIXES)
+
+
+def _is_credential_container_key(normalized_key: str) -> bool:
+    return normalized_key in _CREDENTIAL_CONTAINER_NAMES or normalized_key.endswith(
+        ("authentication", "credentials", "secrets")
+    )
+
+
+def _is_sensitive_header_name(normalized_name: str) -> bool:
+    if normalized_name in _SENSITIVE_HEADER_NAMES:
+        return True
+    return (
+        normalized_name.startswith("x")
+        and (
+            normalized_name.endswith("apikey")
+            or normalized_name.endswith("authtoken")
+            or normalized_name.endswith("accesstoken")
+            or normalized_name.endswith("clientsecret")
+            or normalized_name.endswith("securitytoken")
+            or normalized_name.endswith("token")
+        )
+    )
 
 
 def _is_collection(value: Any) -> bool:
