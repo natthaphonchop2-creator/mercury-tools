@@ -106,6 +106,60 @@ def test_connector_configuration_pins_oauth_token_host(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://api.example-books.com/v2?client_secret=shh",
+        "https://api.example-books.com/v2;client_secret=shh",
+        "https://api.example-books.com/v2#client_secret=shh",
+    ],
+)
+def test_connector_configuration_rejects_base_url_with_persisted_parameters(
+    tmp_path: Path,
+    base_url: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+
+    with pytest.raises(ValueError, match="invalid_endpoint_url"):
+        configure_connector(
+            context,
+            connector_id="custom-books",
+            environment="production",
+            driver_id="api_key_header",
+            base_url=base_url,
+            auth_settings={"key_name": "X-API-Key"},
+        )
+
+
+@pytest.mark.parametrize(
+    "token_url",
+    [
+        "https://auth.example-books.com/oauth/token?client_secret=shh",
+        "https://auth.example-books.com/oauth/token;client_secret=shh",
+        "https://auth.example-books.com/oauth/token#client_secret=shh",
+    ],
+)
+def test_connector_configuration_rejects_token_url_with_persisted_parameters(
+    tmp_path: Path,
+    token_url: str,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+
+    with pytest.raises(ValueError, match="invalid_endpoint_url"):
+        configure_connector(
+            context,
+            connector_id="custom-books",
+            environment="production",
+            driver_id="oauth_client_credentials",
+            base_url="https://api.example-books.com/v2",
+            auth_settings={
+                "client_id_name": "CLIENT_ID",
+                "client_secret_name": "CLIENT_SECRET",
+                "token_url": token_url,
+            },
+        )
+
+
 def test_internet_urls_require_https_unless_private_network_is_enabled(
     tmp_path: Path,
 ) -> None:

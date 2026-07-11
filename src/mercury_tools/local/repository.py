@@ -332,6 +332,8 @@ def _validate_endpoint_url(url: str, environment: str, allow_private_network: bo
         raise ValueError("invalid_endpoint_url")
     if parsed.username or parsed.password:
         raise ValueError("url_credentials_not_allowed")
+    if parsed.params or parsed.query or parsed.fragment:
+        raise ValueError("invalid_endpoint_url")
 
     host = parsed.hostname.lower().rstrip(".")
     if _is_forbidden_metadata_host(host):
