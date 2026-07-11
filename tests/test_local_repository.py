@@ -1,3 +1,4 @@
+import json
 import os
 import stat
 from pathlib import Path
@@ -130,3 +131,71 @@ def test_internet_urls_require_https_unless_private_network_is_enabled(
     )
 
     assert config.allow_private_network("local-books", "local") is True
+
+
+@pytest.mark.parametrize(
+    "auth_settings",
+    [
+        {"credential": "shh"},
+        {"authorization_header": "Bearer shh"},
+    ],
+)
+def test_connector_configuration_rejects_unknown_auth_metadata(
+    tmp_path: Path,
+    auth_settings: dict[str, str],
+) -> None:
+    context = ensure_repository_state(tmp_path)
+
+    with pytest.raises(ValueError, match="unsupported_auth_setting"):
+        configure_connector(
+            context,
+            connector_id="custom-books",
+            environment="production",
+            driver_id="api_key_header",
+            base_url="https://api.example-books.com/v2",
+            auth_settings=auth_settings,
+        )
+
+
+def test_connector_configuration_rejects_url_collections(tmp_path: Path) -> None:
+    context = ensure_repository_state(tmp_path)
+
+    with pytest.raises(ValueError, match="unsupported_auth_setting"):
+        configure_connector(
+            context,
+            connector_id="custom-books",
+            environment="production",
+            driver_id="api_key_header",
+            base_url="https://api.example-books.com/v2",
+            auth_settings={
+                "key_name": "X-API-Key",
+                "token_urls": ["https://auth.example-books.com/oauth/token"],
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "hosts",
+    [
+        "api.example-books.com",
+        ["api.example-books.com", ""],
+        ["api.example-books.com:443"],
+    ],
+)
+def test_load_repository_config_rejects_malformed_trusted_hosts(
+    tmp_path: Path,
+    hosts: object,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    context.config_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "trusted_hosts": {"custom-books": {"production": hosts}},
+                "connectors": {},
+            },
+        ),
+    )
+
+    with pytest.raises(ValueError, match="invalid_trusted_hosts"):
+        load_repository_config(context)

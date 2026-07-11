@@ -2,6 +2,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -20,21 +21,32 @@ _FORBIDDEN_METADATA_HOSTS = {
     "metadata",
     "metadata.google.internal",
 }
-_SAFE_AUTH_METADATA_KEYS = {
-    "audience",
-    "credential_placement",
+_AUTH_METADATA_KEYS = {
+    "client_id_name",
+    "client_secret_name",
     "grant_type",
+    "key_name",
     "scope",
-    "scopes",
-    "token_audience",
+    "token_url",
 }
-_SECRET_KEY_PARTS = (
-    "access_key",
-    "api_key",
-    "password",
-    "refresh",
-    "secret",
-    "token",
+_AUTH_PARAMETER_NAME_KEYS = {
+    "client_id_name",
+    "client_secret_name",
+    "key_name",
+}
+_AUTH_PARAMETER_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
+_HOST_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_CREDENTIAL_VALUE_PREFIXES = (
+    "bearer ",
+    "basic ",
+    "digest ",
+    "ghp_",
+    "github_pat_",
+    "sk-",
+    "sk_",
+    "xoxb-",
+    "xoxp-",
+    "ya29.",
 )
 
 
@@ -152,17 +164,19 @@ def configure_connector(
     auth_settings: Mapping[str, Any],
 ) -> RepositoryConfig:
     settings = dict(auth_settings)
-    allow_private_network = bool(settings.pop("allow_private_network", False))
+    allow_private_network = settings.pop("allow_private_network", False)
+    if not isinstance(allow_private_network, bool):
+        raise ValueError("invalid_network_policy")
     if allow_private_network and environment not in _PRIVATE_NETWORK_ENVIRONMENTS:
         raise ValueError("private_network_only_for_local_or_gateway")
 
     hosts = [_validate_endpoint_url(base_url, environment, allow_private_network)]
     sanitized_auth_settings = _sanitize_auth_settings(settings)
-    for key, value in sanitized_auth_settings.items():
-        if _is_url_setting(key, value):
-            host = _validate_endpoint_url(str(value), environment, allow_private_network)
-            if host not in hosts:
-                hosts.append(host)
+    token_url = sanitized_auth_settings.get("token_url")
+    if token_url is not None:
+        host = _validate_endpoint_url(token_url, environment, allow_private_network)
+        if host not in hosts:
+            hosts.append(host)
 
     current = load_repository_config(context)
     trusted_hosts = _copy_trusted_hosts(current.trusted_hosts)
@@ -242,7 +256,7 @@ def _load_trusted_hosts(value: Any) -> dict[str, dict[str, tuple[str, ...]]]:
         if not isinstance(environments, Mapping):
             raise ValueError("invalid_trusted_hosts")
         trusted_hosts[str(connector_id)] = {
-            str(environment): tuple(str(host) for host in hosts)
+            str(environment): _trusted_host_tuple(hosts)
             for environment, hosts in environments.items()
         }
     return trusted_hosts
@@ -259,7 +273,7 @@ def _copy_trusted_hosts(
 ) -> dict[str, dict[str, tuple[str, ...]]]:
     return {
         str(connector_id): {
-            str(environment): tuple(str(host) for host in hosts)
+            str(environment): _trusted_host_tuple(hosts)
             for environment, hosts in environments.items()
         }
         for connector_id, environments in trusted_hosts.items()
@@ -282,48 +296,34 @@ def _copy_connectors(value: Mapping[str, Any]) -> dict[str, dict[str, dict[str, 
 def _sanitize_auth_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     sanitized: dict[str, Any] = {}
     for key, value in settings.items():
-        if _looks_like_secret_value(str(key)):
-            raise ValueError("secret_auth_setting_not_allowed")
-        if not _is_json_primitive(value):
+        normalized_key = str(key)
+        if normalized_key not in _AUTH_METADATA_KEYS:
             raise ValueError("unsupported_auth_setting")
-        sanitized[str(key)] = value
+        sanitized[normalized_key] = _sanitize_auth_setting(normalized_key, value)
     return sanitized
 
 
-def _looks_like_secret_value(key: str) -> bool:
-    normalized = key.lower()
-    if _is_safe_auth_metadata_key(normalized):
-        return False
-    return any(part in normalized for part in _SECRET_KEY_PARTS)
-
-
-def _is_safe_auth_metadata_key(normalized_key: str) -> bool:
-    return (
-        normalized_key in _SAFE_AUTH_METADATA_KEYS
-        or normalized_key.endswith("_name")
-        or normalized_key.endswith("_names")
-        or normalized_key.endswith("_param")
-        or normalized_key.endswith("_parameter")
-        or normalized_key.endswith("_url")
-        or normalized_key.endswith("_urls")
-    )
-
-
-def _is_json_primitive(value: Any) -> bool:
-    if value is None or isinstance(value, str | int | float | bool):
-        return True
-    if isinstance(value, list):
-        return all(_is_json_primitive(item) for item in value)
-    if isinstance(value, dict):
-        return all(isinstance(key, str) and _is_json_primitive(item) for key, item in value.items())
-    return False
-
-
-def _is_url_setting(key: str, value: Any) -> bool:
+def _sanitize_auth_setting(key: str, value: Any) -> str:
     if not isinstance(value, str):
-        return False
-    normalized = key.lower()
-    return normalized.endswith("_url") or normalized.endswith("_urls")
+        raise ValueError("unsupported_auth_setting")
+    if key in _AUTH_PARAMETER_NAME_KEYS:
+        return _validate_auth_parameter_name(value)
+    if _looks_like_credential_material(value):
+        raise ValueError("secret_auth_setting_not_allowed")
+    return value
+
+
+def _validate_auth_parameter_name(value: str) -> str:
+    if not _AUTH_PARAMETER_NAME_PATTERN.fullmatch(value):
+        raise ValueError("unsupported_auth_setting")
+    if _looks_like_credential_material(value):
+        raise ValueError("secret_auth_setting_not_allowed")
+    return value
+
+
+def _looks_like_credential_material(value: str) -> bool:
+    normalized = value.strip().lower()
+    return any(normalized.startswith(prefix) for prefix in _CREDENTIAL_VALUE_PREFIXES)
 
 
 def _validate_endpoint_url(url: str, environment: str, allow_private_network: bool) -> str:
@@ -336,6 +336,8 @@ def _validate_endpoint_url(url: str, environment: str, allow_private_network: bo
     host = parsed.hostname.lower().rstrip(".")
     if _is_forbidden_metadata_host(host):
         raise ValueError("forbidden_metadata_host")
+    if not _is_valid_trusted_host(host):
+        raise ValueError("invalid_endpoint_url")
     if parsed.scheme != "https" and (
         not allow_private_network
         or environment not in _PRIVATE_NETWORK_ENVIRONMENTS
@@ -363,3 +365,34 @@ def _is_private_network_host(host: str) -> bool:
     except ValueError:
         return False
     return address.is_private or address.is_loopback
+
+
+def _trusted_host_tuple(value: Any) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError("invalid_trusted_hosts")
+    if not value:
+        raise ValueError("invalid_trusted_hosts")
+    hosts: list[str] = []
+    for host in value:
+        if not isinstance(host, str) or not _is_valid_trusted_host(host):
+            raise ValueError("invalid_trusted_hosts")
+        hosts.append(host)
+    return tuple(hosts)
+
+
+def _is_valid_trusted_host(host: str) -> bool:
+    if not host or host.strip() != host or host.lower() != host or host.endswith("."):
+        return False
+    if "/" in host or "@" in host:
+        return False
+    if _is_forbidden_metadata_host(host):
+        return False
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return True
+    if host == "localhost":
+        return True
+    return all(_HOST_LABEL_PATTERN.fullmatch(label) for label in host.split("."))
