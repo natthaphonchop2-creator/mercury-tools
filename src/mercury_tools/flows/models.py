@@ -133,6 +133,7 @@ class FlowRunResult:
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     reason: str | None = None
     capability: str | None = None
+    tainted: bool = field(default=False, repr=False, compare=False)
 
     def as_dict(self) -> dict[str, Any]:
         payload = {

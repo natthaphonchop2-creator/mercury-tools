@@ -215,7 +215,141 @@ async def test_nested_workspace_flow_cannot_follow_symlink_outside_root(
         ctx=_context(repository.as_uri()),
     )
 
-    assert result == {"status": "flow_invalid"}
+    assert result == {"status": "flow_path_invalid"}
+
+
+@pytest.mark.asyncio
+async def test_workspace_flow_run_rejects_file_swap_before_cloud_callback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mercury_tools.mcp import local_server
+    from mercury_tools.mcp.local_runtime import LocalMercuryRuntime
+
+    async def offline_refresh(self) -> None:
+        return None
+
+    cloud_calls: list[str] = []
+
+    async def forbidden_search(self, query: str, **kwargs):
+        cloud_calls.append(query)
+        return ()
+
+    monkeypatch.setattr(LocalMercuryRuntime, "refresh_catalog", offline_refresh)
+    monkeypatch.setattr(LocalMercuryRuntime, "search_knowledge", forbidden_search)
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    main = repository / "main.yaml"
+    main.write_text('name: Main\n---\n- emitReport:\n    title: "Main"\n', encoding="utf-8")
+    outside = tmp_path / "outside.yaml"
+    outside.write_text(
+        'name: Outside\n---\n- searchKnowledge:\n    query: "outside-only"\n',
+        encoding="utf-8",
+    )
+    original_repository_path = local_server._repository_path
+
+    def swap_after_validation(*args, **kwargs):
+        path = original_repository_path(*args, **kwargs)
+        if kwargs.get("expected") == "file":
+            main.unlink()
+            main.symlink_to(outside)
+        return path
+
+    monkeypatch.setattr(local_server, "_repository_path", swap_after_validation)
+
+    result = await run_workspace_flow(path="main.yaml", ctx=_context(repository.as_uri()))
+
+    assert result == {"status": "flow_path_invalid"}
+    assert cloud_calls == []
+    assert "Outside" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_workspace_flow_list_rejects_file_swap_before_outside_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mercury_tools.mcp import local_server
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    main = repository / "main.yaml"
+    main.write_text('name: Main\n---\n- emitReport:\n    title: "Main"\n', encoding="utf-8")
+    outside = tmp_path / "outside.yaml"
+    outside.write_text('name: Outside\n---\n- unknownCommand\n', encoding="utf-8")
+    original_repository_path = local_server._repository_path
+
+    def swap_after_validation(*args, **kwargs):
+        path = original_repository_path(*args, **kwargs)
+        if kwargs.get("expected") == "directory":
+            main.unlink()
+            main.symlink_to(outside)
+        return path
+
+    monkeypatch.setattr(local_server, "_repository_path", swap_after_validation)
+
+    result = await list_workspace_flows(path=".", ctx=_context(repository.as_uri()))
+
+    assert result == {"status": "flow_path_invalid"}
+    assert "Outside" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_workspace_flow_save_rejects_directory_swap_before_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mercury_tools.mcp import local_server
+
+    repository = tmp_path / "repository"
+    flows = repository / "flows"
+    outside = tmp_path / "outside"
+    repository.mkdir()
+    flows.mkdir()
+    outside.mkdir()
+    original_repository_path = local_server._repository_path
+
+    def swap_after_validation(*args, **kwargs):
+        path = original_repository_path(*args, **kwargs)
+        if kwargs.get("expected") == "save":
+            flows.rmdir()
+            flows.symlink_to(outside, target_is_directory=True)
+        return path
+
+    monkeypatch.setattr(local_server, "_repository_path", swap_after_validation)
+
+    result = await save_workspace_flow(
+        path="flows/main.yaml",
+        content='name: Main\n---\n- emitReport:\n    title: "Main"\n',
+        ctx=_context(repository.as_uri()),
+    )
+
+    assert result == {"status": "flow_path_invalid"}
+    assert list(outside.iterdir()) == []
+
+
+def test_workspace_flow_save_fails_closed_without_no_follow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mercury_tools.local.repository import ensure_repository_state
+    from mercury_tools.mcp import local_server
+
+    root = tmp_path / "repository"
+    root.mkdir()
+    repository = ensure_repository_state(root)
+    destination = repository.root / "main.yaml"
+
+    monkeypatch.setattr(local_server.os, "name", "nt")
+
+    with pytest.raises(ValueError, match="flow_path_invalid"):
+        local_server._write_flow_file(
+            repository,
+            destination,
+            'name: Main\n---\n- emitReport:\n    title: "Main"\n',
+        )
+
+    assert destination.exists() is False
 
 
 @pytest.mark.asyncio

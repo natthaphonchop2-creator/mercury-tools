@@ -124,6 +124,171 @@ name: Allowed Read
     assert calls == ["connector"]
 
 
+def test_flow_runner_can_disable_hosted_capability_gate() -> None:
+    calls: list[str] = []
+    runner = MercuryFlowRunner(
+        capability_gate=None,
+        connector_status_getter=lambda: calls.append("connector") or {"status": "ok"},
+    )
+
+    payload = runner.run_text(
+        """
+name: Local Preview Policy
+---
+- connectorStatus:
+    capability: documents.invoice.create
+"""
+    ).as_dict()
+
+    assert payload["status"] == "ok"
+    assert payload["steps"][0]["status"] == "ok"
+    assert calls == ["connector"]
+
+
+@pytest.mark.parametrize(
+    ("cloud_command", "cloud_calls"),
+    [
+        (
+            """
+- searchKnowledge:
+    query: "invoice ${derived}"
+    filters:
+      connector: "${erp.result.reference}"
+""",
+            "search",
+        ),
+        (
+            """
+- retrieveContextPack:
+    query: "invoice ${derived}"
+    task: "${erp.result.reference}"
+""",
+            "context",
+        ),
+        (
+            """
+- getDocument:
+    documentId: "${erp.result.reference}"
+""",
+            "document",
+        ),
+        (
+            """
+- runSkill:
+    skillId: invoice-review-th
+    inputs:
+      source:
+        - "${erp.result.reference}"
+        - "invoice ${derived}"
+""",
+            "skill",
+        ),
+    ],
+)
+def test_flow_runner_blocks_erp_derived_values_before_cloud_dispatch(
+    cloud_command: str,
+    cloud_calls: str,
+) -> None:
+    calls: list[str] = []
+
+    class FakeService:
+        def search(self, *args, **kwargs):
+            calls.append("search")
+            return []
+
+        def context_pack(self, *args, **kwargs):
+            calls.append("context")
+
+            class Pack:
+                def as_dict(self):
+                    return {"context": []}
+
+            return Pack()
+
+    runner = MercuryFlowRunner(
+        rag_service_factory=lambda: FakeService(),
+        document_getter=lambda _document_id: calls.append("document") or None,
+        skill_runner=lambda *_args: calls.append("skill") or {"status": "ok"},
+        erp_read_callback=lambda *_args: {
+            "status": "ok",
+            "result": {"reference": "erp-private-invoice-2026"},
+        },
+    )
+
+    payload = runner.run_text(
+        """
+name: ERP Taint Boundary
+---
+- erpRead:
+    actionId: erp.invoice.list
+    saveAs: erp
+- assert:
+    exists: "${erp}"
+    saveAs: derived
+"""
+        + cloud_command
+    ).as_dict()
+
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "erp_to_cloud_taint"
+    assert payload["steps"][-1]["status"] == "blocked"
+    assert calls == []
+    assert cloud_calls not in calls
+    assert "erp-private-invoice-2026" not in str(payload)
+
+
+@pytest.mark.parametrize(
+    ("wrapper", "extra"),
+    [
+        ("runFlow", ""),
+        ("repeat", "    times: 1\n"),
+        ("retry", "    maxRetries: 0\n"),
+    ],
+)
+def test_flow_runner_preserves_erp_taint_through_nested_flow_wrappers(
+    wrapper: str,
+    extra: str,
+) -> None:
+    calls: list[str] = []
+
+    class FakeService:
+        def search(self, *args, **kwargs):
+            calls.append("search")
+            return []
+
+    runner = MercuryFlowRunner(
+        rag_service_factory=lambda: FakeService(),
+        erp_read_callback=lambda *_args: {
+            "status": "ok",
+            "result": {"reference": "erp-private-invoice-2026"},
+        },
+    )
+
+    payload = runner.run_text(
+        """
+name: Nested ERP Taint Boundary
+---
+- erpRead:
+    actionId: erp.invoice.list
+    saveAs: erp
+- """
+        + wrapper
+        + ":\n"
+        + extra
+        + """    env:
+      copied: "${erp}"
+    commands:
+      - searchKnowledge:
+          query: "${copied.result.reference}"
+"""
+    ).as_dict()
+
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "erp_to_cloud_taint"
+    assert calls == []
+    assert "erp-private-invoice-2026" not in str(payload)
+
+
 def test_flow_runner_supports_when_conditions() -> None:
     result = MercuryFlowRunner(dry_run=True).run_text(
         """
@@ -820,6 +985,151 @@ name: Symlink
         runner.run_path(traversal)
     with pytest.raises(FlowValidationError, match="outside repository root"):
         runner.run_path(symlink_parent)
+
+
+def test_repository_flow_loader_rejects_symlink_swap_before_top_level_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader_factory = getattr(flow_runner, "repository_flow_loader", None)
+    assert callable(loader_factory), "local repository flow loader is required"
+
+    root = tmp_path / "repository"
+    root.mkdir()
+    main = root / "main.yaml"
+    main.write_text(
+        'name: Main\n---\n- emitReport:\n    title: "Main"\n',
+        encoding="utf-8",
+    )
+    outside = tmp_path / "outside.yaml"
+    outside.write_text(
+        'name: Outside\n---\n- emitReport:\n    title: "Outside"\n',
+        encoding="utf-8",
+    )
+    loader = loader_factory(root)
+    original_open = flow_runner.os.open
+    swapped = False
+
+    def race_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if not swapped and path == "main.yaml" and dir_fd is not None:
+            main.unlink()
+            main.symlink_to(outside)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(flow_runner.os, "open", race_open)
+
+    with pytest.raises(FlowValidationError, match="flow_path_invalid"):
+        loader.load_path("main.yaml")
+
+    assert swapped is True
+
+
+def test_repository_flow_loader_rejects_symlinked_child_directory_before_callback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader_factory = getattr(flow_runner, "repository_flow_loader", None)
+    assert callable(loader_factory), "local repository flow loader is required"
+
+    root = tmp_path / "repository"
+    children = root / "children"
+    root.mkdir()
+    children.mkdir()
+    (root / "main.yaml").write_text(
+        'name: Main\n---\n- runFlow:\n    file: "children/child.yaml"\n',
+        encoding="utf-8",
+    )
+    (children / "child.yaml").write_text(
+        'name: Child\n---\n- emitReport:\n    title: "Child"\n',
+        encoding="utf-8",
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "child.yaml").write_text(
+        """name: Outside
+---
+- erpRead:
+    actionId: erp.invoice.list
+""",
+        encoding="utf-8",
+    )
+    loader = loader_factory(root)
+    parent = loader.load_path("main.yaml")
+    calls: list[str] = []
+    runner = MercuryFlowRunner(
+        flow_loader=loader,
+        erp_read_callback=lambda *_args: calls.append("erp") or {"status": "ok"},
+    )
+    original_open = flow_runner.os.open
+    swapped = False
+
+    def race_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if not swapped and path == "children" and dir_fd is not None:
+            (children / "child.yaml").unlink()
+            children.rmdir()
+            children.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(flow_runner.os, "open", race_open)
+
+    with pytest.raises(FlowValidationError, match="flow_path_invalid"):
+        runner.run_flow(parent)
+
+    assert swapped is True
+    assert calls == []
+
+
+def test_repository_flow_loader_rejects_symlink_swap_before_list_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    main = root / "main.yaml"
+    main.write_text(
+        'name: Main\n---\n- emitReport:\n    title: "Main"\n',
+        encoding="utf-8",
+    )
+    outside = tmp_path / "outside.yaml"
+    outside.write_text(
+        'name: Outside\n---\n- emitReport:\n    title: "Outside"\n',
+        encoding="utf-8",
+    )
+    loader = flow_runner.repository_flow_loader(root)
+    original_open = flow_runner.os.open
+    swapped = False
+
+    def race_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if not swapped and path == "main.yaml" and dir_fd is not None:
+            main.unlink()
+            main.symlink_to(outside)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(flow_runner.os, "open", race_open)
+
+    with pytest.raises(FlowValidationError, match="flow_path_invalid"):
+        loader.list_flows()
+
+    assert swapped is True
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["", ".", "../outside.yaml", "flows/../main.yaml", "flows//main.yaml"],
+)
+def test_repository_flow_loader_rejects_invalid_components(tmp_path: Path, path: str) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    loader = flow_runner.repository_flow_loader(root)
+
+    with pytest.raises(FlowValidationError, match="flow_path_invalid"):
+        loader.load_path(path)
 
 
 def test_flow_cli_validate_and_dry_run(tmp_path: Path, capsys) -> None:

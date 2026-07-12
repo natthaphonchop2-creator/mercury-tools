@@ -148,6 +148,121 @@ async def test_real_stdio_initialize_and_tools_list(tmp_path: Path) -> None:
     assert {tool.name for tool in listed.tools} == EXPECTED_TOOLS
 
 
+@pytest.mark.asyncio
+async def test_local_flow_preview_uses_executor_policy_not_hosted_capability_gate(
+    tmp_path: Path,
+) -> None:
+    preview_calls: list[tuple[str, dict[str, object], str]] = []
+
+    class FakeRuntime:
+        repository = SimpleNamespace(root=tmp_path)
+
+        async def refresh_catalog(self) -> None:
+            return None
+
+        def connector_summaries(self):
+            return []
+
+        async def get_document(self, _document_id: str):
+            return None
+
+        async def run_accounting_skill(self, *_args, **_kwargs):
+            return {"status": "ok"}
+
+        async def run_read(self, *_args):
+            return {"status": "ok"}
+
+        async def preview_write(
+            self,
+            action_id: str,
+            inputs: dict[str, object],
+            environment: str,
+        ) -> dict[str, str]:
+            preview_calls.append((action_id, inputs, environment))
+            return {"request_id": "req_local_preview", "payload_hash": "a" * 64}
+
+    result = await local_server._run_local_flow(
+        FakeRuntime(),
+        flow_yaml="""
+name: Local Preview
+---
+- erpWritePreview:
+    capability: documents.invoice.create
+    actionId: erp.invoice.create
+    inputs:
+      body:
+        reference: PREVIEW-001
+    saveAs: preview
+""",
+        flow_path=None,
+        env=None,
+        dry_run=False,
+    )
+
+    assert result["status"] == "confirmation_required"
+    assert preview_calls == [
+        ("erp.invoice.create", {"body": {"reference": "PREVIEW-001"}}, "production")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_local_flow_taint_blocks_cloud_adapter_without_erp_payload_leak(
+    tmp_path: Path,
+) -> None:
+    cloud_calls: list[str] = []
+
+    class FakeRuntime:
+        repository = SimpleNamespace(root=tmp_path)
+
+        async def refresh_catalog(self) -> None:
+            return None
+
+        def connector_summaries(self):
+            return []
+
+        async def get_document(self, _document_id: str):
+            cloud_calls.append("document")
+            return None
+
+        async def run_accounting_skill(self, *_args, **_kwargs):
+            cloud_calls.append("skill")
+            return {"status": "ok"}
+
+        async def run_read(self, *_args):
+            return {
+                "status": "ok",
+                "result": {"reference": "erp-private-invoice-2026"},
+            }
+
+        async def preview_write(self, *_args):
+            return {"request_id": "req_unused", "payload_hash": "a" * 64}
+
+        async def search_knowledge(self, query: str, **_kwargs):
+            cloud_calls.append(query)
+            return ()
+
+    result = await local_server._run_local_flow(
+        FakeRuntime(),
+        flow_yaml="""
+name: ERP Taint Local Flow
+---
+- erpRead:
+    actionId: erp.invoice.list
+    saveAs: erp
+- searchKnowledge:
+    query: "${erp.result.reference}"
+""",
+        flow_path=None,
+        env=None,
+        dry_run=False,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["reason"] == "erp_to_cloud_taint"
+    assert cloud_calls == []
+    assert "erp-private-invoice-2026" not in str(result)
+
+
 def _public_read_action(action_factory, **overrides):
     values = {
         "method": "GET",

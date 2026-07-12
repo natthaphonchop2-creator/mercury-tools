@@ -8,7 +8,6 @@ import os
 import re
 import secrets
 import stat
-import tempfile
 from collections.abc import Coroutine, Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -21,8 +20,8 @@ from mcp.types import ToolAnnotations
 
 from mercury_tools.catalog.models import HttpMethod, RiskTier
 from mercury_tools.execution.executor import ExecutionPolicyError
-from mercury_tools.flows.parser import FlowValidationError, parse_flow_path, parse_flow_text
-from mercury_tools.flows.runner import MercuryFlowRunner, repository_flow_path_resolver
+from mercury_tools.flows.parser import FlowValidationError, parse_flow_text
+from mercury_tools.flows.runner import MercuryFlowRunner, repository_flow_loader
 from mercury_tools.local.repository import (
     RepositoryContext,
     ensure_repository_state,
@@ -712,10 +711,17 @@ async def _run_local_flow(
         erp_write_preview_callback=lambda action_id, inputs, environment: wait(
             runtime.preview_write(action_id, inputs, environment)
         ),
-        flow_path_resolver=repository_flow_path_resolver(runtime.repository.root),
+        flow_loader=repository_flow_loader(runtime.repository.root),
+        capability_gate=None,
     )
     if flow_path is not None:
-        result = await asyncio.to_thread(runner.run_path, flow_path, env=env)
+        relative_path = flow_path.relative_to(runtime.repository.root).as_posix()
+        loader = runner.flow_loader
+        if loader is None:
+            raise FlowValidationError("flow_path_invalid")
+        result = await asyncio.to_thread(
+            lambda: runner.run_flow(loader.load_path(relative_path), env=env)
+        )
     else:
         if flow_yaml is None:
             raise FlowValidationError("Flow YAML is required.")
@@ -768,42 +774,35 @@ def _repository_path(
 ) -> Path:
     if not isinstance(raw_path, str) or not raw_path.strip():
         raise ValueError("path_outside_repository_root")
-    requested = Path(raw_path).expanduser()
-    if not requested.is_absolute() and ".." in requested.parts:
+    if raw_path != "." and any(not part for part in raw_path.split("/")):
         raise ValueError("path_outside_repository_root")
-    candidate = (
-        requested.resolve()
-        if requested.is_absolute()
-        else (repository.root / requested).resolve()
-    )
-    if not candidate.is_relative_to(repository.root):
+    requested = Path(raw_path)
+    if requested.is_absolute() or ".." in requested.parts:
         raise ValueError("path_outside_repository_root")
+    if expected == "directory" and raw_path == ".":
+        return repository.root
+    if not requested.parts or any(part in {".", ".."} for part in requested.parts):
+        raise ValueError("path_outside_repository_root")
+    candidate = repository.root.joinpath(*requested.parts)
+    checked = repository.root
+    for component in requested.parts:
+        checked = checked / component
+        if checked.is_symlink():
+            raise ValueError("path_outside_repository_root")
     if expected in {"file", "save"} and candidate.suffix.casefold() not in _FLOW_SUFFIXES:
         raise ValueError("flow_path_invalid")
-    if expected == "directory" and not candidate.is_dir():
-        raise ValueError("flow_directory_not_found")
-    if expected == "file" and not candidate.is_file():
-        raise ValueError("flow_file_not_found")
     return candidate
 
 
 def _flow_summaries(repository: RepositoryContext, directory: Path) -> list[dict[str, Any]]:
-    paths = sorted(
-        {
-            *directory.rglob("*.yaml"),
-            *directory.rglob("*.yml"),
-        },
-        key=lambda item: str(item),
-    )
+    relative_directory = directory.relative_to(repository.root)
+    loader = repository_flow_loader(repository.root)
+    raw_directory = relative_directory.as_posix() if relative_directory.parts else None
     flows: list[dict[str, Any]] = []
-    for path in paths:
-        resolved = path.resolve()
-        if not resolved.is_relative_to(repository.root):
-            raise ValueError("path_outside_repository_root")
-        flow = parse_flow_path(resolved)
+    for relative_path, flow in loader.list_flows(raw_directory):
         flows.append(
             {
-                "path": str(resolved.relative_to(repository.root)),
+                "path": relative_path.as_posix(),
                 "name": flow.name,
                 "tags": list(flow.tags),
                 "command_count": len(flow.commands),
@@ -818,9 +817,10 @@ def _write_flow_file(
     content: str,
 ) -> None:
     relative = destination.relative_to(repository.root)
-    if os.name != "posix":
-        _write_flow_file_fallback(repository, destination, content)
-        return
+    if os.name != "posix" or any(
+        not hasattr(os, name) for name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW")
+    ):
+        raise ValueError("flow_path_invalid")
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     root_fd = os.open(repository.root, directory_flags)
     parent_fd = root_fd
@@ -859,30 +859,5 @@ def _write_flow_file(
         for descriptor in reversed(opened):
             os.close(descriptor)
         os.close(root_fd)
-
-
-def _write_flow_file_fallback(
-    repository: RepositoryContext,
-    destination: Path,
-    content: str,
-) -> None:
-    if destination.exists() and (destination.is_symlink() or not destination.is_file()):
-        raise ValueError("flow_path_invalid")
-    if destination.parent.resolve() != destination.parent or not destination.parent.is_relative_to(
-        repository.root
-    ):
-        raise ValueError("path_outside_repository_root")
-    descriptor, temporary = tempfile.mkstemp(prefix=".flow-", dir=destination.parent)
-    temporary_path = Path(temporary)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, destination)
-    finally:
-        temporary_path.unlink(missing_ok=True)
-
-
 def serve_local() -> None:
     local_mcp.run(transport="stdio")
