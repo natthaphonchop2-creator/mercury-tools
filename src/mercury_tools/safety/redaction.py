@@ -64,6 +64,9 @@ _LOCAL_PATH_ROOT_RE = re.compile(
     r"(?i)^/(?:Users|Volumes|app|data|etc|home|mnt|opt|private|root|run|srv|"
     r"tmp|usr|var|workspace)(?:/|$)"
 )
+_URL_PATH_LOCAL_ROOT_RE = re.compile(
+    r"(?i)^/(?:Users|Volumes|home|mnt|private|root|tmp|usr|var|workspace)(?:/|$)"
+)
 _WINDOWS_DRIVE_RE = re.compile(r"(?i)^[A-Z]:[\\/]")
 _AMBIGUOUS_ENCODED_LOCAL_PREFIX_RE = re.compile(
     r"(?i)^(?:(?:%(?:25){0,8}2f){1,2}|(?:%(?:25){0,8}5c){2}|"
@@ -105,6 +108,7 @@ def redact_credential_text(value: str, credentials: Sequence[str]) -> str:
 
 def redact_text(value: str) -> str:
     text = _PATH_TOKEN_RE.sub(_redact_sensitive_representation, str(value))
+    text = _PATH_TOKEN_RE.sub(_redact_unsafe_http_uri, text)
     return _redact_plain_text(text)
 
 
@@ -159,13 +163,42 @@ def redact_json(value: Any) -> Any:
     return value
 
 
+def is_safe_public_http_url(value: Any) -> bool:
+    """Return whether an HTTP(S) URL has no sensitive decoded components."""
+
+    if not isinstance(value, str) or not _within_path_token_limit(value):
+        return False
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    return bool(
+        parsed.scheme.casefold() in {"http", "https"}
+        and parsed.netloc
+        and parsed.username is None
+        and parsed.password is None
+        and _url_components_are_public(
+            path=parsed.path,
+            query=parsed.query,
+            fragment=parsed.fragment,
+        )
+    )
+
+
 def _redact_path_token(match: re.Match[str]) -> str:
     token = match.group(0)
     if _is_safe_public_uri(token):
         return token
+    if _is_http_uri(token):
+        return _REDACTED
     if _is_local_path_representation(token):
         return _REDACTED_PATH
     return token
+
+
+def _redact_unsafe_http_uri(match: re.Match[str]) -> str:
+    token = match.group(0)
+    return _REDACTED if _is_http_uri(token) and not _is_safe_public_uri(token) else token
 
 
 def _is_local_path_representation(value: str) -> bool:
@@ -218,12 +251,93 @@ def _is_safe_public_uri(value: str) -> bool:
         return False
     scheme = parsed.scheme.casefold()
     if scheme in {"http", "https"}:
-        return bool(
-            parsed.netloc
-            and parsed.username is None
-            and parsed.password is None
-        )
+        return is_safe_public_http_url(candidate)
     return scheme == "mercury" and bool(parsed.netloc) and "\\" not in candidate
+
+
+def _is_http_uri(value: str) -> bool:
+    candidate = value.strip("\"'()[]{}<>,.;")
+    try:
+        return urlsplit(candidate).scheme.casefold() in {"http", "https"}
+    except ValueError:
+        return False
+
+
+def _url_components_are_public(*, path: str, query: str, fragment: str) -> bool:
+    if _decoded_url_path_is_sensitive(path) or _decoded_component_is_sensitive(
+        fragment
+    ):
+        return False
+    decoded_queries = _bounded_percent_decodings(query)
+    if decoded_queries is None:
+        return False
+    for decoded_query in decoded_queries:
+        if _plain_text_is_sensitive(decoded_query):
+            return False
+        for pair in re.split(r"[&;]", decoded_query):
+            key, separator, item = pair.partition("=")
+            if _decoded_query_key_is_sensitive(key) or (
+                separator and _decoded_component_is_sensitive(item)
+            ):
+                return False
+    return True
+
+
+def _decoded_query_key_is_sensitive(value: str) -> bool:
+    decoded_values = _bounded_percent_decodings(value)
+    return decoded_values is None or any(
+        _is_local_path(candidate)
+        or SENSITIVE_REPRESENTATION_KEY_RE.search(candidate)
+        for candidate in decoded_values
+    )
+
+
+def _decoded_component_is_sensitive(value: str) -> bool:
+    decoded_values = _bounded_percent_decodings(value)
+    return decoded_values is None or any(
+        _is_local_path(candidate)
+        or _plain_text_is_sensitive(candidate)
+        or any(
+            _plain_text_is_sensitive(segment)
+            for segment in re.split(r"[/\\]", candidate)
+            if segment
+        )
+        for candidate in decoded_values
+    )
+
+
+def _decoded_url_path_is_sensitive(value: str) -> bool:
+    decoded_values = _bounded_percent_decodings(value)
+    return decoded_values is None or any(
+        _URL_PATH_LOCAL_ROOT_RE.match(candidate)
+        or _plain_text_is_sensitive(candidate)
+        or any(
+            _plain_text_is_sensitive(segment)
+            for segment in candidate.split("/")
+            if segment
+        )
+        for candidate in decoded_values
+    )
+
+
+def _bounded_percent_decodings(value: str) -> tuple[str, ...] | None:
+    if not _within_path_token_limit(value):
+        return None
+    decoded_values = [value]
+    decoded = value
+    for _ in range(_MAX_PATH_DECODE_DEPTH):
+        if not _PERCENT_ESCAPE_RE.search(decoded):
+            return tuple(decoded_values)
+        next_value = unquote(decoded)
+        if not _within_path_token_limit(next_value):
+            return None
+        if next_value == decoded:
+            return tuple(decoded_values)
+        decoded_values.append(next_value)
+        decoded = next_value
+    if _PERCENT_ESCAPE_RE.search(decoded):
+        return None
+    return tuple(decoded_values)
 
 
 def _redact_sensitive_representation(match: re.Match[str]) -> str:

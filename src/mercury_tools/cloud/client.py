@@ -33,6 +33,8 @@ from mercury_tools.cloud.models import (
     sanitize_public_text,
     validate_document_identity,
     validate_public_api_path_template,
+    validate_public_catalog_identity,
+    validate_raw_catalog_action_payload,
     validate_skill_identity,
 )
 from mercury_tools.config import load_settings
@@ -121,6 +123,7 @@ class CloudBrainClient:
         if not isinstance(rows, list):
             raise ValueError("cloud_catalog_invalid")
         for item in rows:
+            validate_raw_catalog_action_payload(item)
             _validate_public_action_payload_path(item)
         etag = response.headers.get("etag")
         if not isinstance(etag, str) or not _ETAG_RE.fullmatch(etag):
@@ -154,6 +157,7 @@ class CloudBrainClient:
         payload = response.json()
         if not isinstance(payload, dict) or set(payload) != {"action"}:
             raise ValueError("cloud_catalog_invalid")
+        validate_raw_catalog_action_payload(payload["action"])
         _validate_public_action_payload_path(payload["action"])
         action = revalidate_catalog_action(CatalogAction.model_validate(payload["action"]))
         if action.action_id != action_id:
@@ -297,6 +301,10 @@ def _valid_document_identifier(value: str) -> bool:
 
 def _validate_public_catalog_action(action: CatalogAction) -> None:
     payload = action.model_dump(mode="json")
+    try:
+        validate_public_catalog_identity(action)
+    except ValueError:
+        raise ValueError("cloud_catalog_projection_invalid") from None
     if (
         payload["input_schema"] != _PUBLIC_INPUT_SCHEMA
         or payload["examples"] != []

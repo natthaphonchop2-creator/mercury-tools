@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from mercury_tools.catalog.cache import CatalogCache
-from mercury_tools.catalog.identity import build_version_id
+from mercury_tools.catalog.identity import build_action_id, build_version_id
 from mercury_tools.cloud.client import CloudBrainClient
 from mercury_tools.config import DEFAULT_CLOUD_BASE_URL, load_settings
 
@@ -265,6 +265,83 @@ async def test_client_raises_for_malformed_200_without_mutating_cache(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("risk_tier", "0"),
+        ("required_confirmations", "0"),
+    ],
+)
+async def test_client_rejects_coercive_catalog_scalars_without_mutating_cache(
+    repository_context, action_factory, field, value
+) -> None:
+    cached_action = _read_action(action_factory)
+    malicious = cached_action.model_dump(mode="json")
+    malicious[field] = value
+    cache = CatalogCache(repository_context)
+    cache.replace_global([cached_action], etag='"trusted"')
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=cache,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={"ETag": '"malicious"'},
+                json={"actions": [malicious]},
+            )
+        ),
+    )
+    try:
+        with pytest.raises(ValueError, match="^cloud_catalog_invalid$"):
+            await client.list_actions()
+    finally:
+        await client.aclose()
+
+    assert cache.list_global() == [cached_action]
+    assert cache.conditional_headers() == {"If-None-Match": '"trusted"'}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("connector_id", "flow/account"),
+        ("operation_id", "flow/account"),
+        ("variant_id", "../private"),
+        ("preflight_action_ids", ("/Users/operator/private",)),
+    ],
+)
+async def test_client_rejects_noncanonical_catalog_identity_with_valid_hashes(
+    repository_context, action_factory, field, value
+) -> None:
+    cached_action = _read_action(action_factory)
+    malicious = cached_action.model_copy(update={field: value})
+    malicious = malicious.model_copy(update={"action_id": build_action_id(malicious)})
+    malicious = malicious.model_copy(update={"version_id": build_version_id(malicious)})
+    cache = CatalogCache(repository_context)
+    cache.replace_global([cached_action], etag='"trusted"')
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=cache,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={"ETag": '"malicious"'},
+                json={"actions": [malicious.model_dump(mode="json")]},
+            )
+        ),
+    )
+    try:
+        with pytest.raises(ValueError, match="^cloud_catalog_projection_invalid$"):
+            await client.list_actions()
+    finally:
+        await client.aclose()
+
+    assert cache.list_global() == [cached_action]
+    assert cache.conditional_headers() == {"If-None-Match": '"trusted"'}
+
+
+@pytest.mark.asyncio
 async def test_client_raises_for_duplicate_catalog_without_mutating_cache(
     repository_context, action_factory
 ) -> None:
@@ -434,6 +511,42 @@ async def test_client_rejects_sensitive_skill_identifier_before_url_construction
                     {
                         **_public_search_result(),
                         "document_uri": "mercury://wiki/%2e%2e/private",
+                    }
+                ]
+            },
+        ),
+        (
+            "search_knowledge",
+            {
+                "results": [
+                    {
+                        **_public_search_result(),
+                        "citation": {"section": ["VAT", "WHT"]},
+                    }
+                ]
+            },
+        ),
+        (
+            "search_knowledge",
+            {
+                "results": [
+                    {
+                        **_public_search_result(),
+                        "citation": {"heading": "VAT", "chunk_index": "0"},
+                    }
+                ]
+            },
+        ),
+        (
+            "search_knowledge",
+            {
+                "results": [
+                    {
+                        **_public_search_result(),
+                        "source_url": (
+                            "https://example.test/docs?"
+                            "%252FUsers%252Foperator%252Fprivate.md=value"
+                        ),
                     }
                 ]
             },

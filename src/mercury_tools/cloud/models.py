@@ -12,13 +12,20 @@ from urllib.parse import unquote, urlsplit
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from mercury_tools.catalog.identity import sanitize_document
-from mercury_tools.safety.redaction import redact_absolute_paths, redact_json, redact_text
+from mercury_tools.safety.redaction import (
+    is_safe_public_http_url,
+    redact_absolute_paths,
+    redact_json,
+    redact_text,
+)
 
 PUBLIC_RESPONSE_VALIDATION_ERROR = "cloud_public_response_invalid"
 
 _SKILL_ID_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,198}[A-Za-z0-9])?$")
 _PUBLIC_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 _PUBLIC_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+_CATALOG_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+_ACTION_ID_RE = re.compile(r"^act_[0-9a-f]{24}$")
 _VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$")
 _WIKI_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,199}$")
 _CHUNK_FRAGMENT_RE = re.compile(r"^chunk-[0-9]+$")
@@ -46,6 +53,44 @@ _LOCAL_TEMPLATE_ROOTS = {
 _MAX_PUBLIC_TEXT_BYTES = 64 * 1024
 _MAX_PATH_TEMPLATE_BYTES = 2_048
 _MAX_PATH_TEMPLATE_DECODE_DEPTH = 2
+_CATALOG_STRING_FIELDS = {
+    "action_id",
+    "version_id",
+    "connector_id",
+    "method",
+    "path_template",
+    "operation_id",
+    "variant_id",
+    "content_type",
+    "capability",
+    "source_uri",
+    "source_hash",
+    "confidence",
+    "observed_state",
+    "description",
+}
+_CATALOG_STRING_LIST_FIELDS = {
+    "environments",
+    "aliases_th",
+    "aliases_en",
+    "side_effects",
+    "preflight_action_ids",
+    "response_redaction",
+}
+_CATALOG_MAPPING_FIELDS = {
+    "input_schema",
+    "idempotency",
+    "success_rules",
+    "error_rules",
+}
+_CATALOG_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
+_CATALOG_CONFIDENCE_VALUES = {"exact", "example_derived", "inferred"}
+_CATALOG_OBSERVED_STATE_VALUES = {
+    "untested",
+    "success",
+    "failed",
+    "outcome_unknown",
+}
 
 
 def sanitize_public_text(value: str, *, redact_paths: bool = True) -> str:
@@ -62,6 +107,71 @@ def is_canonical_skill_id(value: Any) -> bool:
 
 def is_canonical_public_id(value: Any) -> bool:
     return isinstance(value, str) and bool(_PUBLIC_ID_RE.fullmatch(value))
+
+
+def is_canonical_catalog_identity(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and _CATALOG_IDENTITY_RE.fullmatch(value)
+        and sanitize_public_text(value, redact_paths=False) == value
+    )
+
+
+def validate_public_catalog_identity(action: Any) -> None:
+    if (
+        not isinstance(action.action_id, str)
+        or not _ACTION_ID_RE.fullmatch(action.action_id)
+        or not is_canonical_catalog_identity(action.connector_id)
+        or not is_canonical_catalog_identity(action.operation_id)
+        or not is_canonical_catalog_identity(action.variant_id)
+        or any(
+            not isinstance(item, str) or not _ACTION_ID_RE.fullmatch(item)
+            for item in action.preflight_action_ids
+        )
+    ):
+        raise ValueError("cloud_catalog_identity_invalid")
+    validate_public_api_path_template(action.path_template)
+
+
+def validate_raw_catalog_action_payload(value: Any) -> None:
+    """Reject malformed public catalog JSON before coercive model normalization."""
+
+    if not isinstance(value, Mapping) or set(value) != set(_catalog_action_fields()):
+        raise ValueError("cloud_catalog_invalid")
+    if any(not isinstance(value[field], str) for field in _CATALOG_STRING_FIELDS):
+        raise ValueError("cloud_catalog_invalid")
+    if (
+        value["method"] not in _CATALOG_METHODS
+        or value["confidence"] not in _CATALOG_CONFIDENCE_VALUES
+        or value["observed_state"] not in _CATALOG_OBSERVED_STATE_VALUES
+    ):
+        raise ValueError("cloud_catalog_invalid")
+    if any(
+        not isinstance(value[field], list)
+        or any(not isinstance(item, str) for item in value[field])
+        for field in _CATALOG_STRING_LIST_FIELDS
+    ):
+        raise ValueError("cloud_catalog_invalid")
+    if any(not isinstance(value[field], dict) for field in _CATALOG_MAPPING_FIELDS):
+        raise ValueError("cloud_catalog_invalid")
+    if not isinstance(value["examples"], list) or any(
+        not isinstance(item, dict) for item in value["examples"]
+    ):
+        raise ValueError("cloud_catalog_invalid")
+    if (
+        not isinstance(value["risk_tier"], int)
+        or isinstance(value["risk_tier"], bool)
+        or value["risk_tier"] not in {0, 1, 2}
+        or not isinstance(value["required_confirmations"], int)
+        or isinstance(value["required_confirmations"], bool)
+    ):
+        raise ValueError("cloud_catalog_invalid")
+
+
+def _catalog_action_fields() -> tuple[str, ...]:
+    from mercury_tools.catalog.models import CatalogAction
+
+    return tuple(CatalogAction.model_fields)
 
 
 def is_canonical_public_wiki_uri(value: Any, *, allow_chunk: bool = False) -> bool:
@@ -215,7 +325,7 @@ class PublicCitation(StrictPublicModel):
     heading: str | None = Field(default=None, exclude_if=lambda value: value is None)
     chunk_index: int | None = Field(default=None, exclude_if=lambda value: value is None)
     page: int | None = Field(default=None, exclude_if=lambda value: value is None)
-    section: Any | None = Field(default=None, exclude_if=lambda value: value is None)
+    section: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def validate_citation(self) -> PublicCitation:
@@ -227,7 +337,6 @@ class PublicCitation(StrictPublicModel):
             raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
         if self.source_url is not None and not _is_public_http_url(self.source_url):
             raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
-        _validate_public_value(self.section)
         return self
 
 
@@ -349,15 +458,8 @@ def _validate_public_value(value: Any) -> None:
 
 
 def _is_public_http_url(value: str) -> bool:
-    try:
-        parsed = urlsplit(value)
-    except ValueError:
-        return False
     return bool(
-        parsed.scheme in {"http", "https"}
-        and parsed.netloc
-        and parsed.username is None
-        and parsed.password is None
+        is_safe_public_http_url(value)
         and sanitize_public_text(value) == value
     )
 

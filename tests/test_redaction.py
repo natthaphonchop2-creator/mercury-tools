@@ -188,6 +188,29 @@ def test_absolute_path_redaction_preserves_safe_public_paths(value: str) -> None
 
 
 @pytest.mark.parametrize(
+    "value",
+    [
+        "https://example.test/Users/operator/private.md",
+        "https://example.test/docs?path=/Users/operator/private.md",
+        "https://example.test/docs?path=%2FUsers%2Foperator%2Fprivate.md",
+        "https://example.test/docs?path=%252FUsers%252Foperator%252Fprivate.md",
+        "https://example.test/docs?%252FUsers%252Foperator%252Fprivate.md=value",
+        "https://example.test/%7B%22password%22%3A%22opaque-secret%22%7D",
+        "https://example.test/%257B%2522password%2522%253A%2522opaque-secret%2522%257D",
+        "https://example.test/docs#file%3A%2F%2F%2FUsers%2Foperator%2Fprivate.md",
+    ],
+)
+def test_url_component_redaction_rejects_bounded_sensitive_representations(
+    value: str,
+) -> None:
+    redacted = redact_text(value)
+
+    assert redacted != value
+    assert "operator" not in redacted
+    assert "opaque-secret" not in redacted
+
+
+@pytest.mark.parametrize(
     ("bound_name", "bound_value", "value"),
     [
         ("_MAX_PATH_DECODE_DEPTH", 1, "%252Fopt%252Fapp%252Fsecret"),

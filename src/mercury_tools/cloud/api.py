@@ -36,7 +36,8 @@ from mercury_tools.cloud.models import (
     is_canonical_public_wiki_uri,
     is_canonical_skill_id,
     sanitize_public_text,
-    validate_public_api_path_template,
+    validate_public_catalog_identity,
+    validate_raw_catalog_action_payload,
 )
 from mercury_tools.config import Settings, load_settings
 from mercury_tools.db.catalog import SupabaseCatalogStore
@@ -274,7 +275,11 @@ class CloudDependencies:
         rows = self._catalog_store().list_active_actions()
         actions: list[CatalogAction] = []
         for row in rows:
-            action = row if isinstance(row, CatalogAction) else CatalogAction.model_validate(row)
+            if isinstance(row, CatalogAction):
+                action = revalidate_catalog_action(row)
+            else:
+                validate_raw_catalog_action_payload(row)
+                action = CatalogAction.model_validate(row)
             actions.append(_public_catalog_action(action))
         return sorted(actions, key=lambda item: item.action_id)
 
@@ -428,6 +433,7 @@ def _validate_search_result_shape(result: SearchResult) -> None:
         or isinstance(result.score, bool)
         or not isinstance(result.score, (int, float))
         or not math.isfinite(result.score)
+        or not isinstance(result.metadata.get("review_status"), str)
     ):
         raise ValueError("cloud_search_result_invalid")
 
@@ -593,16 +599,10 @@ def _public_catalog_action(action: CatalogAction) -> CatalogAction:
 
 
 def _validate_public_action_identity(action: CatalogAction) -> None:
-    identity_values = (
-        action.connector_id,
-        action.operation_id,
-        action.variant_id,
-    )
-    if not _SELECTOR_RE.fullmatch(action.connector_id) or any(
-        sanitize_public_text(value) != value for value in identity_values
-    ):
-        raise ValueError("cloud_catalog_invalid")
-    validate_public_api_path_template(action.path_template)
+    try:
+        validate_public_catalog_identity(action)
+    except ValueError:
+        raise ValueError("cloud_catalog_invalid") from None
 
 
 def _filter_actions(

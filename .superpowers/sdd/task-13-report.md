@@ -534,3 +534,118 @@ $ git diff --check
 ### Residual Concern
 
 - `match_knowledge_chunks` still lacks a database RPC URI-prefix parameter. The accepted mitigation remains forced `review_status="reviewed"` plus strict canonical `mercury://wiki/...` validation after fetch and before public projection. Moving that restriction into query execution remains a future database/RPC change outside Task 13.
+
+## Fix Round 5: Bounded Acceptance Fix
+
+### Status
+
+DONE_WITH_CONCERNS
+
+This bounded acceptance fix starts from `f18de2a` with the concurrent Task 14
+flow commit and uncommitted local MCP work present in the shared worktree. No
+Task 14 flow, local runtime, local server, local MCP test, or MCP contract path
+was edited, staged, reverted, or included in this Task 13 commit.
+
+### Findings Addressed
+
+1. HTTP(S) URLs are no longer trusted solely from scheme and authority. Shared
+   redaction now inspects bounded single/double decoded path, query names,
+   query values, and fragment components for local filesystem paths and
+   credential syntax. Unsafe inbound URLs are redacted before the RAG call and
+   unsafe outbound `source_url` values fail the public schema. Safe URLs,
+   encoded web paths, Mercury URIs, and API path templates remain supported.
+2. `PublicCitation` now exposes only explicit scalar fields. `heading`,
+   `section`, titles, and URIs are strings or null; `chunk_index` and `page`
+   are strict integers or null. Nested mappings/lists and coercive scalar types
+   are rejected by both API projection and the exact client response model.
+3. Catalog JSON is validated with exact raw types before `CatalogAction`
+   normalization. Canonical action, connector, operation, variant, preflight,
+   and API path identities are enforced on server and client. The client also
+   applies every public projection and source rule before atomic cache
+   replacement, so malformed 200 responses preserve the previous snapshot.
+4. Search result `metadata.review_status` must be a string. Missing, boolean,
+   numeric, mapping, or list values return the constant 503 response; valid
+   non-reviewed strings remain filtered from the successful response.
+5. All previous Task 13 read-only route, reviewed Wiki membership, redaction,
+   ETag/cache fallback, async boundary, exact response, and constant-error
+   guarantees remain covered. The concurrent Task 14 tests are included in the
+   full non-integration verification.
+
+### Changed Files
+
+- `.superpowers/sdd/task-13-report.md`
+- `src/mercury_tools/cloud/api.py`
+- `src/mercury_tools/cloud/client.py`
+- `src/mercury_tools/cloud/models.py`
+- `src/mercury_tools/safety/redaction.py`
+- `tests/test_cloud_api.py`
+- `tests/test_cloud_client.py`
+- `tests/test_redaction.py`
+
+### RED Evidence
+
+The first URL component and citation schema cycle failed as expected:
+
+```text
+$ uv run pytest -q <url-citation-focused-tests>
+18 failed, 28 passed in 0.46s
+```
+
+The strict catalog admission and review metadata cycle then failed:
+
+```text
+$ uv run pytest -q <catalog-review-focused-tests>
+13 failed, 5 passed in 0.34s
+```
+
+Self-review added encoded local paths in query parameter names and reproduced
+the remaining bypass across shared redaction, API, and client boundaries:
+
+```text
+$ uv run pytest -q <query-name-focused-tests>
+4 failed, 44 passed in 0.38s
+```
+
+Total expected RED failures observed across the three TDD cycles: 35.
+
+### GREEN Evidence
+
+The final focused Cloud/API/client/models/redaction/hosted/RAG set passed:
+
+```text
+$ uv run pytest tests/test_cloud_api.py tests/test_cloud_client.py \
+    tests/test_redaction.py tests/test_http_app.py \
+    tests/test_mcp_rag_routing.py -q
+359 passed, 1 warning in 2.29s
+```
+
+The complete non-integration suite, including concurrent Task 14 tests, passed:
+
+```text
+$ uv run pytest -m 'not integration' -q
+1456 passed, 1 deselected, 1 warning in 8.81s
+```
+
+Static verification passed:
+
+```text
+$ uv run ruff check .
+All checks passed!
+```
+
+The warning is the pre-existing Starlette `TestClient` deprecation warning.
+
+### Commit
+
+- Parent: `7668c43a8d1b8c76c5c217d43e369c163d0e12f5`
+- Subject: `fix: close Task 13 bounded acceptance gaps`
+- Final hash: reported in the completion response because a commit cannot
+  contain its own hash.
+
+### Residual Concern
+
+- `match_knowledge_chunks` still lacks a database RPC URI-prefix parameter.
+  The accepted mitigation remains forced `review_status="reviewed"` plus strict
+  canonical `mercury://wiki/...` validation after fetch and before public
+  projection. Moving the URI restriction into query execution remains a future
+  database/RPC change outside Task 13.
