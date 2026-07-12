@@ -6,6 +6,9 @@ import re
 import stat
 from pathlib import Path
 
+import pytest
+
+from mercury_tools.local import audit
 from mercury_tools.local.audit import AuditLedger
 
 
@@ -38,6 +41,10 @@ def test_audit_ledger_redacts_credentials_personal_fields_and_request_inputs(
     assert row["event_id"] == event_id
     assert row["connector_id"] == "flowaccount"
     assert "request_inputs" not in row
+    assert "authorization" not in row
+    assert "email" not in row
+    assert "tax_id" not in row
+    assert "customer_name" not in row
 
 
 def test_audit_ledger_appends_jsonl_and_enforces_owner_only_mode(tmp_path: Path) -> None:
@@ -92,5 +99,75 @@ def test_audit_ledger_get_is_safe_for_tampered_rows(tmp_path: Path) -> None:
     row = ledger.get("evt_aaaaaaaaaaaaaaaaaaaaaaaa")
 
     assert row is not None
-    assert row["authorization"] == "[REDACTED]"
+    assert "authorization" not in row
     assert ledger.get("evt_not-an-event-id") is None
+
+
+def test_audit_ledger_strict_allowlists_drop_dynamic_keys(tmp_path: Path) -> None:
+    path = tmp_path / "audit.jsonl"
+    path.write_text(
+        '{"event_id":"evt_aaaaaaaaaaaaaaaaaaaaaaaa",'
+        '"connector_id":"flowaccount",'
+        '"person@example.com":"secret",'
+        '"cus_9f83ab12":"record",'
+        '"artifact_path":{"person@example.com":"nested"},'
+        '"response_summary":{"status_class":"2xx",'
+        '"invoice_number":"INV-001","0105559999999":"tax"}}\n'
+    )
+    ledger = AuditLedger(path)
+
+    row = ledger.get("evt_aaaaaaaaaaaaaaaaaaaaaaaa")
+
+    assert row == {
+        "event_id": "evt_aaaaaaaaaaaaaaaaaaaaaaaa",
+        "connector_id": "flowaccount",
+        "artifact_path": "[REDACTED]",
+        "response_summary": {"status_class": "2xx"},
+    }
+    assert "person@example.com" not in str(row)
+
+
+def test_audit_ledger_get_fails_without_partial_result_on_oversized_line(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "audit.jsonl"
+    path.write_bytes(
+        b'{"event_id":"evt_aaaaaaaaaaaaaaaaaaaaaaaa","event":"confirmed"}\n'
+        + b"x" * (audit.MAX_AUDIT_LINE_BYTES + 1)
+        + b"\n"
+    )
+    ledger = AuditLedger(path)
+
+    with pytest.raises(ValueError, match="^audit_scan_limit_exceeded$"):
+        ledger.get("evt_aaaaaaaaaaaaaaaaaaaaaaaa")
+
+
+@pytest.mark.parametrize(
+    ("constant", "limit", "content"),
+    [
+        (
+            "MAX_AUDIT_SCAN_BYTES",
+            32,
+            b'{"event_id":"evt_aaaaaaaaaaaaaaaaaaaaaaaa"}\n',
+        ),
+        (
+            "MAX_AUDIT_SCAN_LINES",
+            1,
+            b'{"event_id":"evt_aaaaaaaaaaaaaaaaaaaaaaaa"}\n{}\n',
+        ),
+    ],
+)
+def test_audit_ledger_get_enforces_total_scan_budgets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    constant: str,
+    limit: int,
+    content: bytes,
+) -> None:
+    path = tmp_path / "audit.jsonl"
+    path.write_bytes(content)
+    ledger = AuditLedger(path)
+    monkeypatch.setattr(audit, constant, limit)
+
+    with pytest.raises(ValueError, match="^audit_scan_limit_exceeded$"):
+        ledger.get("evt_aaaaaaaaaaaaaaaaaaaaaaaa")

@@ -226,11 +226,6 @@ def cmd_credentials_clear(args: argparse.Namespace) -> int:
 
     try:
         context = _command_context(args)
-        cleared = CredentialStore(context).clear(
-            connector_id=args.connector,
-            environment=args.environment,
-            clear_all=args.clear_all,
-        )
         from mercury_tools.execution.store import LocalRequestStore
 
         LocalRequestStore(context).invalidate_pending(
@@ -239,6 +234,11 @@ def cmd_credentials_clear(args: argparse.Namespace) -> int:
         )
         clear_connector_validations(
             context,
+            connector_id=args.connector,
+            environment=args.environment,
+            clear_all=args.clear_all,
+        )
+        cleared = CredentialStore(context).clear(
             connector_id=args.connector,
             environment=args.environment,
             clear_all=args.clear_all,

@@ -78,12 +78,53 @@ def test_status_never_prints_values(tmp_path: Path, capsys: pytest.CaptureFixtur
     assert "hidden-secret" not in output
 
 
-def test_clear_all_removes_file(tmp_path: Path) -> None:
+def test_clear_all_removes_file_and_invalidates_every_pending_preview(
+    tmp_path: Path,
+    catalog_action: CatalogAction,
+) -> None:
     seed_flow_credentials(tmp_path)
+    context = ensure_repository_state(tmp_path)
+    store = LocalRequestStore(context)
+    request_ids: list[str] = []
+    for environment, amount in (("production", 1000), ("sandbox", 2000)):
+        request_inputs = {"body": {"amount": amount}}
+        payload_hash = canonical_payload_hash(
+            {
+                "repository_id": context.repository_id,
+                "connector_id": catalog_action.connector_id,
+                "environment": environment,
+                "action_id": catalog_action.action_id,
+                "version_id": catalog_action.version_id,
+                "method": "POST",
+                "final_path": "/invoices",
+                "request_inputs": request_inputs,
+                "risk_tier": 1,
+                "required_confirmations": 1,
+            }
+        )
+        prepared = PreparedRequest.from_template(
+            repository=context,
+            action=catalog_action,
+            environment=environment,
+            request={
+                "method": "POST",
+                "final_path": "/invoices",
+                "request_inputs": request_inputs,
+            },
+            risk=RiskDecision(RiskTier.STANDARD_WRITE, 1, ()),
+            payload_hash=payload_hash,
+        )
+        created = store.create_preview(prepared)
+        store.confirm(created.request_id, created.payload_hash)
+        request_ids.append(created.request_id)
 
     assert main(["credentials", "clear", "--all", "--repo-root", str(tmp_path)]) == 0
 
     assert not (tmp_path / ".mercury/credentials.env").exists()
+    assert all(
+        store.get(request_id).failure_reason == "credentials_cleared"
+        for request_id in request_ids
+    )
 
 
 def test_clear_scoped_invalidates_pending_preview_and_resets_matching_validation(
@@ -92,6 +133,13 @@ def test_clear_scoped_invalidates_pending_preview_and_resets_matching_validation
 ) -> None:
     context = ensure_repository_state(tmp_path)
     action = catalog_action
+    request_template = {
+        "method": "POST",
+        "final_path": "/invoices",
+        "sanitized_summary": {"document_type": "invoice"},
+        "request_inputs": {"body": {"amount": 1000}},
+    }
+    risk = RiskDecision(RiskTier.STANDARD_WRITE, 1, ())
     payload_hash = canonical_payload_hash(
         {
             "repository_id": context.repository_id,
@@ -99,22 +147,24 @@ def test_clear_scoped_invalidates_pending_preview_and_resets_matching_validation
             "environment": "production",
             "action_id": action.action_id,
             "version_id": action.version_id,
+            "method": "POST",
+            "final_path": "/invoices",
+            "request_inputs": {"body": {"amount": 1000}},
+            "risk_tier": 1,
+            "required_confirmations": 1,
         }
     )
     prepared = PreparedRequest.from_template(
         repository=context,
         action=action,
         environment="production",
-        request={
-            "method": "POST",
-            "final_path": "/invoices",
-            "sanitized_summary": {"document_type": "invoice"},
-            "request_inputs": {"body": {"amount": 1000}},
-        },
-        risk=RiskDecision(RiskTier.STANDARD_WRITE, 1, ()),
+        request=request_template,
+        risk=risk,
         payload_hash=payload_hash,
     )
     request = LocalRequestStore(context).create_preview(prepared)
+    LocalRequestStore(context).confirm(request.request_id, request.payload_hash)
+    seed_flow_credentials(tmp_path)
     record_connector_validation(
         context,
         connector_id="flowaccount",
@@ -149,10 +199,154 @@ def test_clear_scoped_invalidates_pending_preview_and_resets_matching_validation
 
     stored = LocalRequestStore(context).get(request.request_id)
     assert stored.failure_reason == "credentials_cleared"
+    assert "hidden-secret" not in context.credentials_path.read_text()
     config = load_repository_config(context)
     assert "production" not in config.validations.get("flowaccount", {})
     assert "sandbox" in config.validations["flowaccount"]
     assert config.connectors == {}
+
+
+def _seed_clear_failure_state(
+    tmp_path: Path,
+    catalog_action: CatalogAction,
+) -> tuple[LocalRequestStore, str]:
+    context = ensure_repository_state(tmp_path)
+    seed_flow_credentials(tmp_path)
+    request_inputs = {"body": {"amount": 1000}}
+    risk = RiskDecision(RiskTier.STANDARD_WRITE, 1, ())
+    payload_hash = canonical_payload_hash(
+        {
+            "repository_id": context.repository_id,
+            "connector_id": catalog_action.connector_id,
+            "environment": "production",
+            "action_id": catalog_action.action_id,
+            "version_id": catalog_action.version_id,
+            "method": "POST",
+            "final_path": "/invoices",
+            "request_inputs": request_inputs,
+            "risk_tier": 1,
+            "required_confirmations": 1,
+        }
+    )
+    prepared = PreparedRequest.from_template(
+        repository=context,
+        action=catalog_action,
+        environment="production",
+        request={
+            "method": "POST",
+            "final_path": "/invoices",
+            "request_inputs": request_inputs,
+        },
+        risk=risk,
+        payload_hash=payload_hash,
+    )
+    store = LocalRequestStore(context)
+    created = store.create_preview(prepared)
+    store.confirm(created.request_id, created.payload_hash)
+    record_connector_validation(
+        context,
+        connector_id="flowaccount",
+        environment="production",
+        company_name=None,
+        probe_action="GET /company/info",
+        validated_at="2026-07-12T00:00:00+00:00",
+    )
+    return store, created.request_id
+
+
+def test_clear_failure_during_invalidation_keeps_credentials_and_ready_preview(
+    tmp_path: Path,
+    catalog_action: CatalogAction,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, request_id = _seed_clear_failure_state(tmp_path, catalog_action)
+
+    def fail_invalidation(*args: object, **kwargs: object) -> int:
+        raise OSError("injected")
+
+    monkeypatch.setattr(LocalRequestStore, "invalidate_pending", fail_invalidation)
+
+    assert (
+        main(
+            [
+                "credentials",
+                "clear",
+                "flowaccount",
+                "--env",
+                "production",
+                "--repo-root",
+                str(tmp_path),
+            ]
+        )
+        == 2
+    )
+    assert ensure_repository_state(tmp_path).credentials_path.exists()
+    assert store.get(request_id).state.value == "ready_to_execute"
+
+
+def test_clear_failure_during_validation_reset_keeps_credentials_after_invalidation(
+    tmp_path: Path,
+    catalog_action: CatalogAction,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, request_id = _seed_clear_failure_state(tmp_path, catalog_action)
+    from mercury_tools.local import credential_cli
+
+    def fail_validation_reset(*args: object, **kwargs: object) -> object:
+        raise OSError("injected")
+
+    monkeypatch.setattr(credential_cli, "clear_connector_validations", fail_validation_reset)
+
+    assert (
+        main(
+            [
+                "credentials",
+                "clear",
+                "flowaccount",
+                "--env",
+                "production",
+                "--repo-root",
+                str(tmp_path),
+            ]
+        )
+        == 2
+    )
+    assert ensure_repository_state(tmp_path).credentials_path.exists()
+    assert store.get(request_id).failure_reason == "credentials_cleared"
+
+
+def test_clear_failure_during_credential_delete_happens_after_safety_state_updates(
+    tmp_path: Path,
+    catalog_action: CatalogAction,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, request_id = _seed_clear_failure_state(tmp_path, catalog_action)
+
+    def fail_credential_delete(*args: object, **kwargs: object) -> int:
+        raise OSError("injected")
+
+    monkeypatch.setattr(CredentialStore, "clear", fail_credential_delete)
+
+    assert (
+        main(
+            [
+                "credentials",
+                "clear",
+                "flowaccount",
+                "--env",
+                "production",
+                "--repo-root",
+                str(tmp_path),
+            ]
+        )
+        == 2
+    )
+    context = ensure_repository_state(tmp_path)
+    assert context.credentials_path.exists()
+    assert store.get(request_id).failure_reason == "credentials_cleared"
+    assert "production" not in load_repository_config(context).validations.get(
+        "flowaccount", {}
+    )
 
 
 def test_custom_connector_requires_exact_host_confirmation(

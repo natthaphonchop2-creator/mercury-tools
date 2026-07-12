@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import secrets
 import sqlite3
 import stat
 from collections.abc import Iterator
@@ -30,6 +32,8 @@ _REPLAY_BLOCKING_STATES = (
 )
 _IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
 _REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_DATABASE_NAME = "requests.sqlite"
+_SIDECAR_NAMES = ("requests.sqlite-wal", "requests.sqlite-shm")
 
 
 class RequestStateError(ValueError):
@@ -56,7 +60,7 @@ class LocalRequestStore:
         if request.repository_id != self._context.repository_id:
             raise RequestStateError("repository_mismatch")
         if (
-            request.state is not RequestState.AWAITING_CONFIRMATION
+            request.state is not RequestState.PREVIEWED
             or request.confirmation_count != 0
             or request.failure_reason is not None
             or request.response_summary
@@ -64,6 +68,10 @@ class LocalRequestStore:
             raise RequestStateError("invalid_initial_request_state")
         with self._immediate_transaction() as connection:
             self._assert_replay_allowed(connection, request.payload_hash)
+            awaiting_confirmation = self._updated(
+                request,
+                state=RequestState.AWAITING_CONFIRMATION,
+            )
             try:
                 connection.execute(
                     """
@@ -73,18 +81,18 @@ class LocalRequestStore:
                     ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        request.request_id,
-                        request.payload_hash,
-                        request.connector_id,
-                        request.environment,
-                        request.state.value,
-                        request.expires_at.isoformat(),
-                        self._serialized_request(request),
+                        awaiting_confirmation.request_id,
+                        awaiting_confirmation.payload_hash,
+                        awaiting_confirmation.connector_id,
+                        awaiting_confirmation.environment,
+                        awaiting_confirmation.state.value,
+                        awaiting_confirmation.expires_at.isoformat(),
+                        self._serialized_request(awaiting_confirmation),
                     ),
                 )
             except sqlite3.IntegrityError as exc:
                 raise RequestStateError("request_already_exists") from exc
-        return request
+        return awaiting_confirmation
 
     def get(self, request_id: str) -> PreparedRequest:
         with self._immediate_transaction() as connection:
@@ -94,7 +102,10 @@ class LocalRequestStore:
     def confirm(self, request_id: str, payload_hash: str) -> PreparedRequest:
         with self._immediate_transaction() as connection:
             request = self._fetch(connection, request_id)
-            if payload_hash != request.payload_hash:
+            if not isinstance(payload_hash, str) or not secrets.compare_digest(
+                payload_hash,
+                request.payload_hash,
+            ):
                 raise RequestStateError("payload_hash_mismatch")
             request = self._expire_if_needed(connection, request)
             self._require_state(
@@ -250,7 +261,7 @@ class LocalRequestStore:
         try:
             self._assert_replay_allowed(connection, payload_hash)
         finally:
-            connection.close()
+            self._close_connection(connection)
 
     def _initialize(self) -> None:
         connection = self._connect()
@@ -280,7 +291,7 @@ class LocalRequestStore:
         except sqlite3.Error as exc:
             raise RequestStateError("request_store_unavailable") from exc
         finally:
-            connection.close()
+            self._close_connection(connection)
 
     @contextmanager
     def _immediate_transaction(self) -> Iterator[sqlite3.Connection]:
@@ -299,10 +310,49 @@ class LocalRequestStore:
             self._rollback(connection)
             raise
         finally:
-            connection.close()
+            self._close_connection(connection)
 
     def _connect(self) -> sqlite3.Connection:
         self._validate_storage_path()
+        if os.name != "posix":
+            return self._connect_path()
+
+        cache_fd = self._open_cache_directory()
+        database_fd = -1
+        sidecar_fds: dict[str, int] = {}
+        connection: sqlite3.Connection | None = None
+        try:
+            database_fd = self._open_store_file(cache_fd, _DATABASE_NAME, create=True)
+            retained = os.fstat(database_fd)
+            sidecar_fds = {
+                name: self._open_store_file(cache_fd, name, create=True)
+                for name in _SIDECAR_NAMES
+            }
+            retained_sidecars = {
+                name: os.fstat(file_fd) for name, file_fd in sidecar_fds.items()
+            }
+            connection = self._connect_path()
+            self._verify_entry_identity(cache_fd, _DATABASE_NAME, retained)
+            for name, sidecar_state in retained_sidecars.items():
+                self._verify_entry_identity(cache_fd, name, sidecar_state)
+            self._enforce_sidecar_modes(cache_fd)
+            return connection
+        except ValueError:
+            if connection is not None:
+                connection.close()
+            raise
+        except sqlite3.Error as exc:
+            if connection is not None:
+                connection.close()
+            raise RequestStateError("request_store_unavailable") from exc
+        finally:
+            if database_fd >= 0:
+                os.close(database_fd)
+            for sidecar_fd in sidecar_fds.values():
+                os.close(sidecar_fd)
+            os.close(cache_fd)
+
+    def _connect_path(self) -> sqlite3.Connection:
         try:
             connection = sqlite3.connect(
                 self._database,
@@ -313,6 +363,12 @@ class LocalRequestStore:
             raise RequestStateError("request_store_unavailable") from exc
         connection.row_factory = sqlite3.Row
         return connection
+
+    def _close_connection(self, connection: sqlite3.Connection) -> None:
+        try:
+            connection.close()
+        finally:
+            self._validate_storage_path()
 
     def _validate_storage_path(self) -> None:
         root = self._context.root
@@ -330,6 +386,19 @@ class LocalRequestStore:
                 raise ValueError("invalid_request_store_path") from exc
             if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
                 raise ValueError("invalid_request_store_path")
+        if os.name != "posix":
+            self._validate_database_path_fallback()
+            return
+        cache_fd = self._open_cache_directory()
+        try:
+            for name in (_DATABASE_NAME, *_SIDECAR_NAMES):
+                file_fd = self._open_store_file(cache_fd, name, create=False)
+                if file_fd is not None:
+                    os.close(file_fd)
+        finally:
+            os.close(cache_fd)
+
+    def _validate_database_path_fallback(self) -> None:
         try:
             mode = self._database.lstat().st_mode
         except FileNotFoundError:
@@ -337,6 +406,83 @@ class LocalRequestStore:
         except OSError as exc:
             raise ValueError("invalid_request_store_path") from exc
         if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            raise ValueError("invalid_request_store_path")
+
+    def _open_cache_directory(self) -> int:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        try:
+            directory_fd = os.open(self._context.cache_dir, flags)
+            state = os.fstat(directory_fd)
+            if not stat.S_ISDIR(state.st_mode) or state.st_uid != os.getuid():
+                raise ValueError("invalid_request_store_path")
+            os.fchmod(directory_fd, 0o700)
+            state = os.fstat(directory_fd)
+            if stat.S_IMODE(state.st_mode) != 0o700:
+                raise ValueError("invalid_request_store_path")
+            return directory_fd
+        except ValueError:
+            if "directory_fd" in locals():
+                os.close(directory_fd)
+            raise
+        except OSError as exc:
+            raise ValueError("invalid_request_store_path") from exc
+
+    def _open_store_file(
+        self,
+        cache_fd: int,
+        name: str,
+        *,
+        create: bool,
+    ) -> int | None:
+        flags = os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        if create:
+            flags |= os.O_CREAT
+        try:
+            file_fd = os.open(name, flags, 0o600, dir_fd=cache_fd)
+        except FileNotFoundError:
+            if not create:
+                return None
+            raise ValueError("invalid_request_store_path") from None
+        except OSError as exc:
+            raise ValueError("invalid_request_store_path") from exc
+        try:
+            state = os.fstat(file_fd)
+            if (
+                not stat.S_ISREG(state.st_mode)
+                or state.st_uid != os.getuid()
+                or state.st_nlink != 1
+            ):
+                raise ValueError("invalid_request_store_path")
+            os.fchmod(file_fd, 0o600)
+            state = os.fstat(file_fd)
+            if stat.S_IMODE(state.st_mode) != 0o600:
+                raise ValueError("invalid_request_store_path")
+            self._verify_entry_identity(cache_fd, name, state)
+            return file_fd
+        except Exception:
+            os.close(file_fd)
+            raise
+
+    def _enforce_sidecar_modes(self, cache_fd: int) -> None:
+        for name in _SIDECAR_NAMES:
+            file_fd = self._open_store_file(cache_fd, name, create=False)
+            if file_fd is not None:
+                os.close(file_fd)
+
+    @staticmethod
+    def _verify_entry_identity(
+        cache_fd: int,
+        name: str,
+        retained: os.stat_result,
+    ) -> None:
+        try:
+            current = os.stat(name, dir_fd=cache_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise ValueError("invalid_request_store_path") from exc
+        if (
+            stat.S_ISLNK(current.st_mode)
+            or (current.st_dev, current.st_ino) != (retained.st_dev, retained.st_ino)
+        ):
             raise ValueError("invalid_request_store_path")
 
     def _fetch(self, connection: sqlite3.Connection, request_id: str) -> PreparedRequest:

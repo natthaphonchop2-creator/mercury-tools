@@ -19,9 +19,9 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from mercury_tools.catalog.identity import deep_freeze
-from mercury_tools.catalog.models import CatalogAction, RiskTier
+from mercury_tools.catalog.models import CatalogAction, RiskTier, revalidate_catalog_action
 from mercury_tools.drivers.models import AuthContext
-from mercury_tools.execution.policy import RiskDecision
+from mercury_tools.execution.policy import RiskDecision, effective_risk
 from mercury_tools.local.repository import RepositoryContext
 from mercury_tools.safety.redaction import redact_json
 
@@ -30,6 +30,14 @@ _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _PAYLOAD_HASH = re.compile(r"^[0-9a-f]{64}$")
 _REQUEST_ID = re.compile(r"^req_[0-9a-z_]{8,128}$")
 _IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
+_PUBLIC_STRUCTURAL_KEY = re.compile(r"^[a-z][A-Za-z0-9_-]{0,127}$")
+_DYNAMIC_PROVIDER_KEY = re.compile(r"^[A-Za-z]{2,12}[_-]([A-Za-z0-9]{6,})$")
+_UUID_KEY = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+_OPAQUE_HEX_KEY = re.compile(r"^[0-9a-f]{16,}$", re.IGNORECASE)
+_OPAQUE_ALNUM_KEY = re.compile(r"^[A-Za-z0-9]{12,}$")
 _FORBIDDEN_HEADER_NAMES = frozenset(
     {"authorization", "cookie", "host", "proxy-authorization", "set-cookie"}
 )
@@ -77,6 +85,33 @@ def canonical_payload_hash(payload: Mapping[str, Any]) -> str:
     except (TypeError, ValueError) as exc:
         raise ValueError("payload_not_canonicalizable") from exc
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _binding_payload(
+    *,
+    repository_id: str,
+    connector_id: str,
+    environment: str,
+    action_id: str,
+    version_id: str,
+    method: str,
+    final_path: str,
+    request_inputs: Any,
+    risk_tier: RiskTier | int,
+    required_confirmations: int,
+) -> dict[str, Any]:
+    return {
+        "repository_id": repository_id,
+        "connector_id": connector_id,
+        "environment": environment,
+        "action_id": action_id,
+        "version_id": version_id,
+        "method": method,
+        "final_path": final_path,
+        "request_inputs": request_inputs,
+        "risk_tier": int(risk_tier),
+        "required_confirmations": required_confirmations,
+    }
 
 
 class PreparedRequest(BaseModel):
@@ -132,15 +167,20 @@ class PreparedRequest(BaseModel):
             raise ValueError("preview_created_at_naive")
         if self.expires_at.tzinfo is None or self.expires_at.utcoffset() is None:
             raise ValueError("preview_expiry_naive")
-        if self.expires_at < self.created_at:
-            raise ValueError("preview_expiry_invalid")
+        created_at = self.created_at.astimezone(UTC)
+        expires_at = self.expires_at.astimezone(UTC)
+        if expires_at - created_at != PREVIEW_TTL:
+            raise ValueError("preview_ttl_invalid")
         if self.failure_reason is not None and not _is_reason(self.failure_reason):
             raise ValueError("invalid_failure_reason")
         _validate_static_headers(self.request_inputs)
         _validate_state_fields(self)
+        expected_hash = canonical_payload_hash(self.binding_payload)
+        if not secrets.compare_digest(self.payload_hash, expected_hash):
+            raise ValueError("payload_hash_mismatch")
 
-        object.__setattr__(self, "created_at", self.created_at.astimezone(UTC))
-        object.__setattr__(self, "expires_at", self.expires_at.astimezone(UTC))
+        object.__setattr__(self, "created_at", created_at)
+        object.__setattr__(self, "expires_at", expires_at)
         object.__setattr__(
             self,
             "sanitized_summary",
@@ -154,6 +194,23 @@ class PreparedRequest(BaseModel):
         )
         return self
 
+    @property
+    def binding_payload(self) -> dict[str, Any]:
+        """Return the complete canonical request binding used by ``payload_hash``."""
+
+        return _binding_payload(
+            repository_id=self.repository_id,
+            connector_id=self.connector_id,
+            environment=self.environment,
+            action_id=self.action_id,
+            version_id=self.version_id,
+            method=self.method,
+            final_path=self.final_path,
+            request_inputs=self.request_inputs,
+            risk_tier=self.risk_tier,
+            required_confirmations=self.required_confirmations,
+        )
+
     @classmethod
     def from_template(
         cls,
@@ -166,21 +223,53 @@ class PreparedRequest(BaseModel):
     ) -> PreparedRequest:
         if not isinstance(repository, RepositoryContext):
             raise ValueError("invalid_repository_context")
-        if action.connector_id != getattr(action, "connector_id", None):
-            raise ValueError("invalid_action_binding")
+        try:
+            if not isinstance(action, CatalogAction):
+                raise TypeError
+            action = revalidate_catalog_action(action)
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("invalid_action_binding") from None
         if environment not in action.environments:
             raise ValueError("action_environment_not_supported")
         if action.method.value not in _MUTATING_METHODS:
             raise ValueError("read_action_cannot_be_previewed")
+        if not isinstance(risk, RiskDecision):
+            raise ValueError("invalid_risk_decision")
         if risk.required_confirmations != int(risk.tier):
             raise ValueError("invalid_risk_decision")
+        risk_floor = effective_risk(action)
+        if (
+            risk.tier < risk_floor.tier
+            or risk.required_confirmations < risk_floor.required_confirmations
+        ):
+            raise ValueError("risk_below_runtime_floor")
 
         method = _request_field(request, "method", action.method.value)
+        if method != action.method.value:
+            raise ValueError("request_method_mismatch")
         final_path = _request_field(request, "final_path", None)
         if final_path is None:
             final_path = _request_field(request, "path", None)
         summary = _request_field(request, "sanitized_summary", {})
         inputs = _request_field(request, "request_inputs", {})
+        binding_payload = _binding_payload(
+            repository_id=repository.repository_id,
+            connector_id=action.connector_id,
+            environment=environment,
+            action_id=action.action_id,
+            version_id=action.version_id,
+            method=method,
+            final_path=final_path,
+            request_inputs=inputs,
+            risk_tier=risk.tier,
+            required_confirmations=risk.required_confirmations,
+        )
+        expected_hash = canonical_payload_hash(binding_payload)
+        if not isinstance(payload_hash, str) or not secrets.compare_digest(
+            payload_hash,
+            expected_hash,
+        ):
+            raise ValueError("payload_hash_mismatch")
         now = datetime.now(UTC)
         return cls(
             request_id="req_" + secrets.token_hex(16),
@@ -196,7 +285,7 @@ class PreparedRequest(BaseModel):
             payload_hash=payload_hash,
             risk_tier=risk.tier,
             required_confirmations=risk.required_confirmations,
-            state=RequestState.AWAITING_CONFIRMATION,
+            state=RequestState.PREVIEWED,
             created_at=now,
             expires_at=now + PREVIEW_TTL,
         )
@@ -295,7 +384,7 @@ def _validate_static_headers(inputs: Mapping[str, Any]) -> None:
 
 
 def _validate_state_fields(request: PreparedRequest) -> None:
-    if request.state is RequestState.AWAITING_CONFIRMATION:
+    if request.state in {RequestState.PREVIEWED, RequestState.AWAITING_CONFIRMATION}:
         valid = request.confirmation_count == 0 and request.failure_reason is None
     elif request.state is RequestState.AWAITING_FINAL_CONFIRMATION:
         valid = (
@@ -334,6 +423,8 @@ def _redact_public_value(value: Any) -> Any:
         result: dict[str, Any] = {}
         for key, item in value.items():
             name = str(key)
+            if not _is_safe_public_key(name):
+                continue
             compact = re.sub(r"[^a-z0-9]", "", name.casefold())
             if any(part in compact for part in _SENSITIVE_PUBLIC_KEY_PARTS):
                 result[name] = "[REDACTED]"
@@ -366,12 +457,38 @@ def _thaw(value: Any) -> Any:
 def _public_summary(value: Mapping[str, Any]) -> dict[str, Any]:
     """Expose summary shape without copying business values out of local state."""
 
-    return {str(key): _summary_shape(item) for key, item in value.items()}
+    return {
+        str(key): _summary_shape(item)
+        for key, item in value.items()
+        if _is_safe_public_key(str(key))
+    }
 
 
 def _summary_shape(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return {str(key): _summary_shape(item) for key, item in value.items()}
+        return {
+            str(key): _summary_shape(item)
+            for key, item in value.items()
+            if _is_safe_public_key(str(key))
+        }
     if isinstance(value, (tuple, list)):
         return [_summary_shape(item) for item in value]
     return "[REDACTED]"
+
+
+def _is_safe_public_key(key: str) -> bool:
+    if _PUBLIC_STRUCTURAL_KEY.fullmatch(key) is None:
+        return False
+    if _UUID_KEY.fullmatch(key) is not None or _OPAQUE_HEX_KEY.fullmatch(key) is not None:
+        return False
+    if _OPAQUE_ALNUM_KEY.fullmatch(key) is not None and any(
+        character.isdigit() for character in key
+    ):
+        return False
+    provider_match = _DYNAMIC_PROVIDER_KEY.fullmatch(key)
+    if provider_match is not None:
+        suffix = provider_match.group(1)
+        if any(character.isdigit() for character in suffix) or len(suffix) >= 12:
+            return False
+    compact = re.sub(r"[^a-z0-9]", "", key.casefold())
+    return not compact.startswith(("bearer", "githubpat", "skproj", "xoxb", "xoxp"))

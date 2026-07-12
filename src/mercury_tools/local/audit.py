@@ -15,28 +15,17 @@ from typing import Any
 from mercury_tools.safety.redaction import redact_json
 
 _EVENT_ID = re.compile(r"^evt_[0-9a-f]{24}$")
-_MAX_EVENT_BYTES = 64 * 1024
-_SECRET_KEY_PARTS = frozenset(
-    {"apikey", "authorization", "cookie", "credential", "password", "secret", "token"}
+_EMAIL_VALUE = re.compile(r"(?i)(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Z]{2,}(?![\w.-])")
+_TAX_ID_VALUE = re.compile(r"(?<!\d)\d{13}(?!\d)")
+_TOKEN_VALUE = re.compile(
+    r"(?i)(?:\b(?:bearer|basic)\s+[A-Za-z0-9+/=._-]+|"
+    r"\b(?:github_pat_|ghp_|sk-|sk_|xox[bp]-|ya29\.)[A-Za-z0-9._-]+)"
 )
-_PERSONAL_KEY_PARTS = frozenset(
-    {
-        "address",
-        "citizen",
-        "contact",
-        "email",
-        "firstname",
-        "fullname",
-        "lastname",
-        "mobile",
-        "name",
-        "national",
-        "passport",
-        "personal",
-        "phone",
-        "taxid",
-    }
-)
+# Bounds apply to the complete scan, even when a matching row appears early.
+MAX_AUDIT_LINE_BYTES = 64 * 1024
+MAX_AUDIT_SCAN_BYTES = 8 * 1024 * 1024
+MAX_AUDIT_SCAN_LINES = 100_000
+_READ_CHUNK_BYTES = 64 * 1024
 _SAFE_EVENT_SCALARS = frozenset(
     {
         "action_id",
@@ -114,7 +103,7 @@ class AuditLedger:
             ).encode("utf-8")
         except (TypeError, ValueError) as exc:
             raise ValueError("invalid_audit_event") from exc
-        if len(encoded) > _MAX_EVENT_BYTES:
+        if len(encoded) > MAX_AUDIT_LINE_BYTES:
             raise ValueError("audit_event_too_large")
         self._append(encoded)
         return event_id
@@ -122,17 +111,24 @@ class AuditLedger:
     def get(self, event_id: str) -> dict[str, Any] | None:
         if not isinstance(event_id, str) or _EVENT_ID.fullmatch(event_id) is None:
             return None
-        for line in self._read_lines():
-            try:
-                decoded = json.loads(line)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-            if not isinstance(decoded, Mapping) or decoded.get("event_id") != event_id:
-                continue
-            sanitized = _sanitize_mapping(decoded)
-            if sanitized.get("event_id") == event_id:
-                return sanitized
-        return None
+        file_fd = self._open_for_read()
+        if file_fd is None:
+            return None
+        match: dict[str, Any] | None = None
+        try:
+            for line in _bounded_lines(file_fd):
+                try:
+                    decoded = json.loads(line.decode("utf-8"))
+                except (UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(decoded, Mapping) or decoded.get("event_id") != event_id:
+                    continue
+                sanitized = _sanitize_mapping(decoded)
+                if sanitized.get("event_id") == event_id:
+                    match = sanitized
+            return match
+        finally:
+            os.close(file_fd)
 
     def _append(self, encoded: bytes) -> None:
         self._validate_target()
@@ -155,7 +151,7 @@ class AuditLedger:
                 os.close(file_fd)
             os.close(directory_fd)
 
-    def _read_lines(self) -> list[str]:
+    def _open_for_read(self) -> int | None:
         self._validate_target()
         try:
             directory_fd = self._open_parent()
@@ -165,19 +161,16 @@ class AuditLedger:
             finally:
                 os.close(directory_fd)
         except FileNotFoundError:
-            return []
+            return None
         except OSError as exc:
             raise ValueError("audit_read_failed") from exc
         try:
-            chunks: list[bytes] = []
-            while True:
-                chunk = os.read(file_fd, 64 * 1024)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            return b"".join(chunks).decode("utf-8", errors="replace").splitlines()
-        finally:
+            if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                raise ValueError("audit_read_failed")
+            return file_fd
+        except Exception:
             os.close(file_fd)
+            raise
 
     def _open_parent(self) -> int:
         flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
@@ -213,42 +206,73 @@ class AuditLedger:
 
 
 def _sanitize_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        str(key): sanitized
-        for key, item in value.items()
-        if (sanitized := _sanitize_value(str(key), item)) is not _DROP
-    }
-
-
-_DROP = object()
-
-
-def _sanitize_value(key: str, value: Any) -> Any:
-    normalized = re.sub(r"[^a-z0-9]", "", key.casefold())
-    if normalized == "requestinputs":
-        return _DROP
-    if any(part in normalized for part in _SECRET_KEY_PARTS | _PERSONAL_KEY_PARTS):
-        return "[REDACTED]"
-    if normalized == "responsesummary":
-        return _sanitize_response_summary(value)
-    if key and key not in _SAFE_EVENT_SCALARS:
-        return "[REDACTED]"
-    value = redact_json(value)
-    if isinstance(value, Mapping):
-        return _sanitize_mapping(value)
-    if isinstance(value, tuple):
-        return [_sanitize_value("", item) for item in value]
-    if isinstance(value, list):
-        return [_sanitize_value("", item) for item in value]
-    return value
+    sanitized: dict[str, Any] = {}
+    for key, item in value.items():
+        name = str(key)
+        if name == "response_summary":
+            sanitized[name] = _sanitize_response_summary(item)
+        elif name in _SAFE_EVENT_SCALARS:
+            sanitized[name] = _sanitize_audit_scalar(item)
+    return sanitized
 
 
 def _sanitize_response_summary(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         return {"status": "[REDACTED]"}
     return {
-        str(key): _sanitize_value("", item)
-        if str(key) in _SAFE_RESPONSE_SUMMARY
-        else "[REDACTED]"
+        str(key): _sanitize_audit_scalar(item)
         for key, item in redact_json(value).items()
+        if str(key) in _SAFE_RESPONSE_SUMMARY
     }
+
+
+def _sanitize_audit_scalar(value: Any) -> Any:
+    redacted = redact_json(value)
+    if not (redacted is None or isinstance(redacted, (bool, int, float, str))):
+        return "[REDACTED]"
+    if isinstance(redacted, str) and (
+        _EMAIL_VALUE.search(redacted)
+        or _TAX_ID_VALUE.search(redacted)
+        or _TOKEN_VALUE.search(redacted)
+    ):
+        return "[REDACTED]"
+    return redacted
+
+
+def _bounded_lines(file_fd: int):
+    buffer = bytearray()
+    scanned_bytes = 0
+    scanned_lines = 0
+    while True:
+        try:
+            chunk = os.read(file_fd, _READ_CHUNK_BYTES)
+        except OSError as exc:
+            raise ValueError("audit_read_failed") from exc
+        if not chunk:
+            break
+        scanned_bytes += len(chunk)
+        if scanned_bytes > MAX_AUDIT_SCAN_BYTES:
+            raise ValueError("audit_scan_limit_exceeded")
+        buffer.extend(chunk)
+        while True:
+            newline = buffer.find(b"\n")
+            if newline < 0:
+                break
+            if newline > MAX_AUDIT_LINE_BYTES:
+                raise ValueError("audit_scan_limit_exceeded")
+            line = bytes(buffer[:newline])
+            del buffer[: newline + 1]
+            scanned_lines += 1
+            if scanned_lines > MAX_AUDIT_SCAN_LINES:
+                raise ValueError("audit_scan_limit_exceeded")
+            yield line
+        if len(buffer) > MAX_AUDIT_LINE_BYTES:
+            raise ValueError("audit_scan_limit_exceeded")
+    if buffer:
+        scanned_lines += 1
+        if (
+            len(buffer) > MAX_AUDIT_LINE_BYTES
+            or scanned_lines > MAX_AUDIT_SCAN_LINES
+        ):
+            raise ValueError("audit_scan_limit_exceeded")
+        yield bytes(buffer)
