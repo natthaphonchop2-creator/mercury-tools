@@ -20,9 +20,27 @@ KEY_VALUE_RE = re.compile(
     r"access[_-]?token|refresh[_-]?token|password|credential|secret|token))"
     r"\s*[:=]\s*([^\s,;]+)"
 )
+AUTH_HEADER_RE = re.compile(
+    r"(?i)\b(authorization|proxy[-_]?authorization)\s*[:=]\s*"
+    r"(?:(bearer|basic)\s+)?([^\s,;]+)"
+)
+COOKIE_HEADER_RE = re.compile(
+    r"(?i)\b(cookie|set[-_]?cookie)\s*[:=]\s*([^\s,;]+)"
+)
+GENERIC_BEARER_RE = re.compile(r"(?i)\bbearer\s+(?!tokens?\b)([^\s,;]+)")
 SENSITIVE_KEY_RE = re.compile(
     r"(?i)(?:secret|token|api[_-]?key|password|"
     r"service[_-]?role[_-]?key|private[_-]?key)"
+)
+SENSITIVE_HEADER_KEY_RE = re.compile(
+    r"(?i)^(?:authorization|proxy[-_]?authorization|cookie|set[-_]?cookie)$"
+)
+POSIX_ABSOLUTE_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9:/])/(?:Users|Volumes|app|data|etc|home|mnt|opt|private|"
+    r"root|run|srv|tmp|usr|var|workspace)(?:/[^\s,;\"'<>]+)+"
+)
+WINDOWS_ABSOLUTE_PATH_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])[A-Z]:[\\/][^\s,;\"'<>]+"
 )
 EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 THAI_TAX_ID_RE = re.compile(r"\b\d{13}\b")
@@ -57,11 +75,19 @@ def redact_credential_text(value: str, credentials: Sequence[str]) -> str:
 
 def redact_text(value: str) -> str:
     text = str(value)
+    text = AUTH_HEADER_RE.sub(_redact_auth_header, text)
+    text = COOKIE_HEADER_RE.sub(_redact_cookie_header, text)
+    text = GENERIC_BEARER_RE.sub(_redact_generic_bearer, text)
     text = KEY_VALUE_RE.sub(lambda m: f"{m.group(1)}=[REDACTED]", text)
     text = TOKEN_RE.sub("[REDACTED_TOKEN]", text)
     text = EMAIL_RE.sub("[REDACTED_EMAIL]", text)
     text = THAI_TAX_ID_RE.sub("[REDACTED_TAX_ID]", text)
     return text
+
+
+def redact_absolute_paths(value: str) -> str:
+    text = WINDOWS_ABSOLUTE_PATH_RE.sub("[REDACTED_PATH]", str(value))
+    return POSIX_ABSOLUTE_PATH_RE.sub("[REDACTED_PATH]", text)
 
 
 def redact_json(value: Any) -> Any:
@@ -75,13 +101,66 @@ def redact_json(value: Any) -> Any:
             key_text = str(key)
             if (
                 key_text not in SAFE_SECRET_SCHEMA_KEYS
-                and SENSITIVE_KEY_RE.search(key_text)
+                and (
+                    SENSITIVE_KEY_RE.search(key_text)
+                    or SENSITIVE_HEADER_KEY_RE.fullmatch(key_text)
+                )
             ):
-                redacted[key] = "[REDACTED]"
+                redacted[key] = (
+                    redact_text(item)
+                    if isinstance(item, str) and _is_documented_placeholder_value(item)
+                    else "[REDACTED]"
+                )
             else:
                 redacted[key] = redact_json(item)
         return redacted
     return value
+
+
+def _redact_auth_header(match: re.Match[str]) -> str:
+    secret = match.group(3)
+    if _is_documented_placeholder(secret):
+        return match.group(0)
+    return f"{match.group(1)}=[REDACTED]"
+
+
+def _redact_cookie_header(match: re.Match[str]) -> str:
+    value = match.group(2)
+    if _is_documented_placeholder_value(value):
+        return match.group(0)
+    return f"{match.group(1)}=[REDACTED]"
+
+
+def _redact_generic_bearer(match: re.Match[str]) -> str:
+    if _is_documented_placeholder(match.group(1)):
+        return match.group(0)
+    return "[REDACTED_TOKEN]"
+
+
+def _is_documented_placeholder_value(value: str) -> bool:
+    candidate = value.strip()
+    if _is_documented_placeholder(candidate):
+        return True
+    scheme, separator, credential = candidate.partition(" ")
+    if (
+        separator
+        and scheme.casefold() in {"bearer", "basic"}
+        and _is_documented_placeholder(credential)
+    ):
+        return True
+    _, separator, assigned = candidate.partition("=")
+    return bool(separator and _is_documented_placeholder(assigned))
+
+
+def _is_documented_placeholder(value: str) -> bool:
+    candidate = value.strip("\"'")
+    return bool(
+        re.fullmatch(
+            r"(?:<[^<>\s]+>|\{[^{}\s]+\}|\$\{?[A-Z][A-Z0-9_]*\}?|"
+            r"\[REDACTED(?:_TOKEN)?\])",
+            candidate,
+        )
+    )
 
 
 def _credential_representations(

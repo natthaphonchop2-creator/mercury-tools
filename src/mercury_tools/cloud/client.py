@@ -10,6 +10,7 @@ from typing import Any, Literal
 from urllib.parse import quote, urlparse
 
 import httpx
+from anyio import to_thread
 
 from mercury_tools.catalog.cache import CatalogCache
 from mercury_tools.catalog.models import (
@@ -85,19 +86,20 @@ class CloudBrainClient:
         method: str | None = None,
     ) -> CatalogFetchResult:
         _validate_catalog_filter(connector=connector, method=method)
+        conditional_headers = await to_thread.run_sync(self.cache.conditional_headers)
         try:
             response = await self.client.get(
                 "/api/cloud/v1/catalog/actions",
-                headers=self.cache.conditional_headers(),
+                headers=conditional_headers,
             )
         except httpx.TransportError:
             return CatalogFetchResult(
-                actions=self._cached_actions(connector=connector, method=method),
+                actions=await self._cached_actions(connector=connector, method=method),
                 source="cache",
             )
         if response.status_code == 304 or response.status_code >= 500:
             return CatalogFetchResult(
-                actions=self._cached_actions(connector=connector, method=method),
+                actions=await self._cached_actions(connector=connector, method=method),
                 source="cache",
             )
         response.raise_for_status()
@@ -116,7 +118,7 @@ class CloudBrainClient:
         )
         for action in actions:
             _validate_public_catalog_action(action)
-        self.cache.replace_global(list(actions), etag)
+        await to_thread.run_sync(self.cache.replace_global, list(actions), etag)
         return CatalogFetchResult(
             actions=_filter_actions(actions, connector=connector, method=method),
             source="cloud",
@@ -130,9 +132,9 @@ class CloudBrainClient:
                 f"/api/cloud/v1/catalog/actions/{quote(action_id, safe='')}"
             )
         except httpx.TransportError:
-            return self._cached_action(action_id)
+            return await self._cached_action(action_id)
         if response.status_code >= 500:
-            return self._cached_action(action_id)
+            return await self._cached_action(action_id)
         if response.status_code == 404:
             return None
         response.raise_for_status()
@@ -205,13 +207,13 @@ class CloudBrainClient:
         response.raise_for_status()
         return response.json()
 
-    def _cached_actions(
+    async def _cached_actions(
         self,
         *,
         connector: str | None,
         method: str | None,
     ) -> tuple[CatalogAction, ...]:
-        actions = tuple(self.cache.list_global())
+        actions = tuple(await to_thread.run_sync(self.cache.list_global))
         for action in actions:
             _validate_public_catalog_action(action)
         return _filter_actions(
@@ -220,9 +222,10 @@ class CloudBrainClient:
             method=method,
         )
 
-    def _cached_action(self, action_id: str) -> CatalogAction | None:
+    async def _cached_action(self, action_id: str) -> CatalogAction | None:
+        actions = await to_thread.run_sync(self.cache.list_global)
         action = next(
-            (item for item in self.cache.list_global() if item.action_id == action_id),
+            (item for item in actions if item.action_id == action_id),
             None,
         )
         if action is not None:
@@ -280,7 +283,13 @@ def _validate_public_catalog_action(action: CatalogAction) -> None:
         or not _is_public_catalog_source(action)
     ):
         raise ValueError("cloud_catalog_projection_invalid")
-    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if (
+        sanitize_public_text(action.path_template, redact_paths=False)
+        != action.path_template
+    ):
+        raise ValueError("cloud_catalog_projection_invalid")
+    public_text_payload = {**payload, "path_template": ""}
+    serialized = json.dumps(public_text_payload, ensure_ascii=False, sort_keys=True)
     if sanitize_public_text(serialized) != serialized:
         raise ValueError("cloud_catalog_projection_invalid")
 

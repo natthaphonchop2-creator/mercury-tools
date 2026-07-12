@@ -32,7 +32,11 @@ from mercury_tools.db.product import SKILL_CATALOG_SEED
 from mercury_tools.db.supabase import SupabaseRagStore
 from mercury_tools.mercury_runtime import skill_markdown
 from mercury_tools.rag.models import SearchFilters, SearchResult
-from mercury_tools.safety.redaction import redact_json, redact_text
+from mercury_tools.safety.redaction import (
+    redact_absolute_paths,
+    redact_json,
+    redact_text,
+)
 
 _FILTER_FIELDS = {
     "jurisdiction",
@@ -43,13 +47,9 @@ _FILTER_FIELDS = {
 }
 _SELECTOR_RE = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 _ACTION_ID_RE = re.compile(r"^act_[0-9a-f]{24}$")
+_PUBLIC_RESULT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _WIKI_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,199}$")
 _CHUNK_FRAGMENT_RE = re.compile(r"^chunk-[0-9]+$")
-_BEARER_RE = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
-_ABSOLUTE_PATH_RE = re.compile(
-    r"(?:(?:/Users|/home|/app|/var|/tmp|/private)/[^\s\"'<>]+|"
-    r"[A-Za-z]:\\[^\s\"'<>]+)"
-)
 _PRIVATE_KEY_RE = re.compile(
     r"(?i)(?:repository|source)?_?path|credential|secret|token|api[_-]?key|authorization"
 )
@@ -111,9 +111,7 @@ class CloudDependencies:
             return _service_unavailable()
         actions = _filter_actions(all_actions, connector=connector, method=method)
         payload = [action.model_dump(mode="json") for action in actions]
-        etag = _etag(
-            [action.model_dump(mode="json") for action in all_actions]
-        )
+        etag = _etag(payload)
         if request.headers.get("if-none-match") == etag:
             return Response(status_code=304, headers={"ETag": etag})
         return JSONResponse({"actions": payload}, headers={"ETag": etag})
@@ -178,7 +176,7 @@ class CloudDependencies:
             return _not_found()
         try:
             markdown = await run_in_threadpool(self.skill_loader, skill_id)
-        except OSError:
+        except (KeyError, TypeError, ValueError, OSError):
             return _service_unavailable()
         if markdown is None:
             return _not_found()
@@ -217,11 +215,18 @@ class CloudDependencies:
                 SearchFilters(**public_filters),
                 top_k,
             )
-        except (httpx.HTTPError, RuntimeError, ValueError):
+        except (
+            httpx.HTTPError,
+            KeyError,
+            TypeError,
+            ValueError,
+            OSError,
+            RuntimeError,
+        ):
             return _service_unavailable()
         try:
             public_results = _project_public_search_results(results, top_k=top_k)
-        except (TypeError, ValueError, OverflowError):
+        except (KeyError, TypeError, ValueError, OSError, OverflowError):
             return _service_unavailable()
         return JSONResponse({"results": public_results})
 
@@ -231,11 +236,18 @@ class CloudDependencies:
             return _bad_request()
         try:
             document = await run_in_threadpool(self._get_document, document_id)
-        except (httpx.HTTPError, RuntimeError, ValueError):
+        except (
+            httpx.HTTPError,
+            KeyError,
+            TypeError,
+            ValueError,
+            OSError,
+            RuntimeError,
+        ):
             return _service_unavailable()
         try:
             public_document = _project_public_document(document_id, document)
-        except (TypeError, ValueError, OverflowError):
+        except (KeyError, TypeError, ValueError, OSError, OverflowError):
             return _service_unavailable()
         if public_document is None:
             return _not_found()
@@ -336,17 +348,16 @@ def sanitize_search_filters(value: Any) -> dict[str, str]:
     return sanitized
 
 
-def sanitize_public_text(value: str) -> str:
+def sanitize_public_text(value: str, *, redact_paths: bool = True) -> str:
     text = str(sanitize_document(value))
-    text = _BEARER_RE.sub("[REDACTED_TOKEN]", text)
     text = redact_text(text)
-    return _ABSOLUTE_PATH_RE.sub("[REDACTED_PATH]", text)
+    return redact_absolute_paths(text) if redact_paths else text
 
 
 def _public_search_result(result: SearchResult) -> dict[str, Any]:
     return {
-        "chunk_id": str(result.chunk_id),
-        "document_id": str(result.document_id),
+        "chunk_id": result.chunk_id,
+        "document_id": result.document_id,
         "document_uri": sanitize_public_text(result.document_uri),
         "chunk_uri": sanitize_public_text(result.chunk_uri),
         "text": sanitize_public_text(result.text),
@@ -393,6 +404,11 @@ def _validate_search_result_shape(result: SearchResult) -> None:
     )
     if (
         any(not isinstance(item, str) for item in string_fields)
+        or any(
+            not _PUBLIC_RESULT_ID_RE.fullmatch(item)
+            or sanitize_public_text(item) != item
+            for item in (result.chunk_id, result.document_id)
+        )
         or not isinstance(result.citation, Mapping)
         or not isinstance(result.metadata, Mapping)
         or (result.source_url is not None and not isinstance(result.source_url, str))
@@ -563,14 +579,14 @@ def _public_catalog_action(action: CatalogAction) -> CatalogAction:
 def _validate_public_action_identity(action: CatalogAction) -> None:
     identity_values = (
         action.connector_id,
-        action.path_template,
         action.operation_id,
         action.variant_id,
     )
     if (
         not _SELECTOR_RE.fullmatch(action.connector_id)
         or any(sanitize_public_text(value) != value for value in identity_values)
-        or any(_ABSOLUTE_PATH_RE.search(value) for value in identity_values)
+        or sanitize_public_text(action.path_template, redact_paths=False)
+        != action.path_template
     ):
         raise ValueError("cloud_catalog_invalid")
 

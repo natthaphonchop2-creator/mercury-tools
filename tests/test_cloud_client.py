@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 
 import httpx
 import pytest
@@ -9,6 +10,28 @@ from mercury_tools.catalog.cache import CatalogCache
 from mercury_tools.catalog.identity import build_version_id
 from mercury_tools.cloud.client import CloudBrainClient
 from mercury_tools.config import DEFAULT_CLOUD_BASE_URL, load_settings
+
+
+class ThreadTrackingCache:
+    def __init__(self, delegate: CatalogCache) -> None:
+        self.delegate = delegate
+        self.calls: dict[str, list[int]] = {
+            "conditional_headers": [],
+            "replace_global": [],
+            "list_global": [],
+        }
+
+    def conditional_headers(self):
+        self.calls["conditional_headers"].append(threading.get_ident())
+        return self.delegate.conditional_headers()
+
+    def replace_global(self, actions, etag):
+        self.calls["replace_global"].append(threading.get_ident())
+        return self.delegate.replace_global(actions, etag)
+
+    def list_global(self):
+        self.calls["list_global"].append(threading.get_ident())
+        return self.delegate.list_global()
 
 
 def _read_action(action_factory, **overrides):
@@ -491,3 +514,118 @@ async def test_client_rejects_sensitive_filters_before_network(repository_contex
         await client.aclose()
 
     assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_client_offloads_catalog_etag_read_and_successful_replacement(
+    repository_context, action_factory
+) -> None:
+    old_action = _read_action(action_factory)
+    new_action = _read_action(
+        action_factory,
+        path_template="/contacts",
+        operation_id="listContacts",
+        capability="contacts.read",
+    )
+    delegate = CatalogCache(repository_context)
+    delegate.replace_global([old_action], etag='"old"')
+    cache = ThreadTrackingCache(delegate)
+    event_loop_thread = threading.get_ident()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["If-None-Match"] == '"old"'
+        return httpx.Response(
+            200,
+            headers={"ETag": '"new"'},
+            json={"actions": [new_action.model_dump(mode="json")]},
+        )
+
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=cache,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        result = await client.list_actions()
+    finally:
+        await client.aclose()
+
+    assert result.actions == (new_action,)
+    assert cache.calls["conditional_headers"]
+    assert cache.calls["replace_global"]
+    assert all(
+        thread_id != event_loop_thread
+        for method in ("conditional_headers", "replace_global")
+        for thread_id in cache.calls[method]
+    )
+    assert delegate.list_global() == [new_action]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["304", "5xx", "transport"])
+async def test_client_offloads_catalog_cache_reads_for_every_fallback(
+    repository_context, action_factory, failure_mode
+) -> None:
+    action = _read_action(action_factory)
+    delegate = CatalogCache(repository_context)
+    delegate.replace_global([action], etag='"trusted"')
+    cache = ThreadTrackingCache(delegate)
+    event_loop_thread = threading.get_ident()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if failure_mode == "transport":
+            raise httpx.ConnectError("offline", request=request)
+        return httpx.Response(304 if failure_mode == "304" else 503)
+
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=cache,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        result = await client.list_actions()
+    finally:
+        await client.aclose()
+
+    assert result.source == "cache"
+    assert result.actions == (action,)
+    assert cache.calls["conditional_headers"]
+    assert cache.calls["list_global"]
+    assert all(
+        thread_id != event_loop_thread
+        for method in ("conditional_headers", "list_global")
+        for thread_id in cache.calls[method]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["5xx", "transport"])
+async def test_client_offloads_detail_cache_lookup_for_get_action_fallback(
+    repository_context, action_factory, failure_mode
+) -> None:
+    action = _read_action(action_factory)
+    delegate = CatalogCache(repository_context)
+    delegate.replace_global([action], etag='"trusted"')
+    cache = ThreadTrackingCache(delegate)
+    event_loop_thread = threading.get_ident()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if failure_mode == "transport":
+            raise httpx.ConnectError("offline", request=request)
+        return httpx.Response(503)
+
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=cache,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        result = await client.get_action(action.action_id)
+    finally:
+        await client.aclose()
+
+    assert result == action
+    assert cache.calls["list_global"]
+    assert all(
+        thread_id != event_loop_thread for thread_id in cache.calls["list_global"]
+    )

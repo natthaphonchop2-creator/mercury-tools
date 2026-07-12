@@ -215,9 +215,7 @@ $ uv run pytest -m 'not integration' -q
 ```
 
 ```text
-$ uv run ruff check src/mercury_tools/cloud/api.py \
-    src/mercury_tools/cloud/client.py src/mercury_tools/safety/redaction.py \
-    tests/test_cloud_api.py tests/test_cloud_client.py
+$ uv run ruff check .
 All checks passed!
 ```
 
@@ -236,3 +234,113 @@ $ git diff --check
 
 - `match_knowledge_chunks` still has no source-URI-prefix parameter. This fix retains the forced `review_status="reviewed"` store filter and now applies strict canonical `mercury://wiki/...` membership validation after fetch. No legacy or malformed row can be projected, but a future database/RPC change would be needed to move the URI boundary into query execution.
 - The pre-existing Starlette `TestClient` deprecation warning remains. Integration tests were intentionally excluded by the required full non-integration command.
+
+## Fix Round 2: Async Cache and Projection Boundaries
+
+### Status
+
+DONE_WITH_CONCERNS
+
+This second fix round addresses every mandatory re-review finding while preserving the existing seven-route read-only surface and prior Task 13 hardening.
+
+### Findings Addressed
+
+1. Moved every synchronous `CatalogCache` access used by `CloudBrainClient` behind `anyio.to_thread.run_sync`, including conditional ETag reads, successful global replacement, 304/5xx/transport fallback reads, and action-detail fallback reads. The client still fetches and caches one unfiltered global snapshot and applies connector/method filters locally.
+2. Added explicit ordinary-exception boundaries for skill loaders and search/document dependency and projection failures. `KeyError`, `TypeError`, `ValueError`, and `OSError` now produce the constant `503 {"error":"service_unavailable"}` response where applicable without catching cancellation or other `BaseException` subclasses.
+3. Extended shared text and JSON redaction for `Authorization`, `Proxy-Authorization`, `Cookie`, and `Set-Cookie` values while preserving documented placeholders. Inbound queries and every public catalog, skill, search, and document projection are covered by regression tests.
+4. Added strict canonical validation for returned search `chunk_id` and `document_id` values. Identifiers containing headers, paths, whitespace, or sanitizer-sensitive material fail closed with the constant 503 response instead of being string-cast into output.
+5. Centralized local absolute-path redaction for common POSIX roots including `/opt`, `/workspace`, and `/mnt`, plus Windows drive paths. Safe HTTP URLs, canonical Mercury URIs, endpoint path templates, and ordinary slash-separated prose remain unchanged.
+6. Changed catalog response ETags to hash the actual filtered response representation. Different filter results now have different ETags, and `If-None-Match` returns 304 only for the matching representation. The local client continues to request only the unfiltered representation for its global cache.
+7. Preserved prior guarantees, including strict public Wiki URI post-fetch enforcement, forced `review_status="reviewed"`, lazy dependencies, exact route/method behavior, catalog projection admission, and fail-closed cache semantics.
+
+### Changed Files
+
+- `src/mercury_tools/cloud/api.py`
+- `src/mercury_tools/cloud/client.py`
+- `src/mercury_tools/safety/redaction.py`
+- `tests/test_cloud_api.py`
+- `tests/test_cloud_client.py`
+- `.superpowers/sdd/task-13-report.md`
+
+### RED Evidence
+
+The required regression tests were added before implementation:
+
+```text
+$ uv run python -m py_compile tests/test_cloud_api.py tests/test_cloud_client.py && uv run pytest tests/test_cloud_api.py tests/test_cloud_client.py -q
+27 failed, 101 passed in 3.63s
+```
+
+The failures covered event-loop cache access, ordinary dependency exceptions escaping as 500, authorization/cookie leakage, malformed search identifiers, uncovered absolute paths, and ETags shared across filtered representations.
+
+A placeholder-preservation test added during self-review failed before the JSON redaction adjustment:
+
+```text
+$ uv run pytest tests/test_cloud_api.py::test_shared_json_redaction_preserves_documented_header_placeholders -q
+1 failed in 0.18s
+```
+
+The first full non-integration run then exposed one overbroad generic Bearer match in existing product YAML:
+
+```text
+$ uv run pytest -m 'not integration' -q
+1 failed, 1229 passed, 1 deselected, 1 warning in 9.68s
+```
+
+The matcher was narrowed to preserve the ordinary documentation phrase `bearer tokens` while retaining generic credential redaction.
+
+### GREEN Evidence
+
+```text
+$ uv run pytest tests/test_cloud_api.py tests/test_cloud_client.py -q
+128 passed in 0.95s
+```
+
+```text
+$ uv run pytest tests/test_cloud_api.py::test_shared_json_redaction_preserves_documented_header_placeholders -q
+1 passed in 0.13s
+```
+
+```text
+$ uv run pytest tests/test_cloud_api.py tests/test_cloud_client.py \
+    tests/test_http_app.py tests/test_mcp_rag_routing.py tests/test_redaction.py -q
+168 passed, 1 warning in 1.24s
+```
+
+The focused set was rerun with the full-suite regression included after narrowing the Bearer matcher:
+
+```text
+$ uv run pytest \
+    tests/test_product_fallback.py::test_product_store_audit_fallback_records_workspace_flow \
+    tests/test_cloud_api.py tests/test_cloud_client.py tests/test_http_app.py \
+    tests/test_mcp_rag_routing.py tests/test_redaction.py -q
+169 passed, 1 warning in 1.07s
+```
+
+```text
+$ uv run pytest -m 'not integration' -q
+1230 passed, 1 deselected, 1 warning in 7.60s
+```
+
+```text
+$ uv run ruff check src/mercury_tools/cloud/api.py \
+    src/mercury_tools/cloud/client.py src/mercury_tools/safety/redaction.py \
+    tests/test_cloud_api.py tests/test_cloud_client.py
+All checks passed!
+```
+
+```text
+$ git diff --check
+<no output>
+```
+
+### Commit
+
+- Parent: `a672d8fb1699d50ddd0a4ea63598325984019167`
+- Subject: `fix: close Cloud Brain review gaps`
+- Final hash: reported in the completion response because a commit cannot contain its own hash.
+
+### Residual Concerns
+
+- `match_knowledge_chunks` still has no source-URI-prefix parameter. The API therefore retains the accepted boundary of forcing `review_status="reviewed"` and applying strict canonical `mercury://wiki/...` membership validation after fetch. Moving this restriction into query execution requires a future RPC/database change outside Task 13.
+- The pre-existing Starlette `TestClient` deprecation warning remains. The required full suite excluded the single integration test.
