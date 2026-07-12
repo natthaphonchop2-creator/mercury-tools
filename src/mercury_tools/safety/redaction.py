@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import re
 from base64 import b64decode, b64encode, urlsafe_b64decode, urlsafe_b64encode
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from typing import Any
-from urllib.parse import quote, quote_plus, unquote, unquote_plus
+from urllib.parse import quote, quote_plus, unquote, unquote_plus, urlsplit
 
 TOKEN_RE = re.compile(
     r"(?i)\b(?:bearer\s+)?(?:sk-[a-z0-9_-]{12,}|gho_[a-z0-9_]{12,}|"
@@ -25,7 +25,7 @@ AUTH_HEADER_RE = re.compile(
     r"(?:(bearer|basic)\s+)?([^\s,;]+)"
 )
 COOKIE_HEADER_RE = re.compile(
-    r"(?i)\b(cookie|set[-_]?cookie)\s*[:=]\s*([^\s,;]+)"
+    r"(?im)\b(cookie|set[-_]?cookie)\s*[:=]\s*([^\r\n]*)"
 )
 GENERIC_BEARER_RE = re.compile(r"(?i)\bbearer\s+(?!tokens?\b)([^\s,;]+)")
 SENSITIVE_KEY_RE = re.compile(
@@ -50,6 +50,15 @@ _MAX_REVERSIBLE_TRANSFORM_DEPTH = 8
 _MAX_REPRESENTATIONS = 512
 _MAX_REPRESENTATION_BYTES = 4096
 _MAX_CREDENTIAL_INPUTS = 16
+_REDACTED_PATH = "[REDACTED_PATH]"
+_MAX_PATH_DECODE_DEPTH = 3
+_MAX_ENCODED_PATH_TOKEN_BYTES = 4096
+_PATH_TOKEN_RE = re.compile(r"\S+")
+_PERCENT_ESCAPE_RE = re.compile(r"(?i)%[0-9a-f]{2}")
+_AMBIGUOUS_ENCODED_ABSOLUTE_PATH_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:%(?:25){0,8}2f|"
+    r"[A-Z]%(?:25){0,8}3a%(?:25){0,8}5c)"
+)
 
 
 def redact_credential_text(value: str, credentials: Sequence[str]) -> str:
@@ -86,8 +95,7 @@ def redact_text(value: str) -> str:
 
 
 def redact_absolute_paths(value: str) -> str:
-    text = WINDOWS_ABSOLUTE_PATH_RE.sub("[REDACTED_PATH]", str(value))
-    return POSIX_ABSOLUTE_PATH_RE.sub("[REDACTED_PATH]", text)
+    return _PATH_TOKEN_RE.sub(_redact_path_token, str(value))
 
 
 def redact_json(value: Any) -> Any:
@@ -95,8 +103,8 @@ def redact_json(value: Any) -> Any:
         return redact_text(value)
     if isinstance(value, list):
         return [redact_json(item) for item in value]
-    if isinstance(value, dict):
-        redacted: dict[str, Any] = {}
+    if isinstance(value, Mapping):
+        redacted: dict[Any, Any] = {}
         for key, item in value.items():
             key_text = str(key)
             if (
@@ -115,6 +123,55 @@ def redact_json(value: Any) -> Any:
                 redacted[key] = redact_json(item)
         return redacted
     return value
+
+
+def _redact_path_token(match: re.Match[str]) -> str:
+    token = match.group(0)
+    if _is_safe_http_url(token):
+        return token
+    if _PERCENT_ESCAPE_RE.search(token) and _is_encoded_absolute_path(token):
+        return _REDACTED_PATH
+    token = WINDOWS_ABSOLUTE_PATH_RE.sub(_REDACTED_PATH, token)
+    return POSIX_ABSOLUTE_PATH_RE.sub(_REDACTED_PATH, token)
+
+
+def _is_encoded_absolute_path(value: str) -> bool:
+    if not _within_path_token_limit(value):
+        return bool(_AMBIGUOUS_ENCODED_ABSOLUTE_PATH_RE.search(value))
+    decoded = value
+    for _ in range(_MAX_PATH_DECODE_DEPTH):
+        candidate = unquote(decoded)
+        if not _within_path_token_limit(candidate):
+            return True
+        if _contains_absolute_path(candidate):
+            return True
+        if candidate == decoded:
+            return False
+        decoded = candidate
+    return bool(_AMBIGUOUS_ENCODED_ABSOLUTE_PATH_RE.search(decoded))
+
+
+def _contains_absolute_path(value: str) -> bool:
+    return bool(
+        WINDOWS_ABSOLUTE_PATH_RE.search(value)
+        or POSIX_ABSOLUTE_PATH_RE.search(value)
+    )
+
+
+def _within_path_token_limit(value: str) -> bool:
+    try:
+        return len(value.encode("utf-8")) <= _MAX_ENCODED_PATH_TOKEN_BYTES
+    except UnicodeError:
+        return False
+
+
+def _is_safe_http_url(value: str) -> bool:
+    candidate = value.strip("\"'()[]{}<>,.;")
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return False
+    return parsed.scheme.casefold() in {"http", "https"} and bool(parsed.netloc)
 
 
 def _redact_auth_header(match: re.Match[str]) -> str:

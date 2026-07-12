@@ -5,6 +5,7 @@ import pytest
 
 from mercury_tools.safety import redaction
 from mercury_tools.safety.redaction import (
+    redact_absolute_paths,
     redact_credential_text,
     redact_json,
     redact_text,
@@ -45,6 +46,108 @@ def test_redaction_keeps_connector_schema_field_names() -> None:
     assert payload["token_url"] == "https://openapi.flowaccount.com/v1/token"
     assert payload["access_token"] == "[REDACTED]"
     assert payload["client_secret"] == "[REDACTED]"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Cookie: a=secret; b=secret2",
+        "Set-Cookie: session=secret; HttpOnly; Path=/",
+        "cookie=a=secret; SameSite=Lax; Secure",
+    ],
+)
+def test_text_redaction_removes_complete_semicolon_cookie_header(value: str) -> None:
+    redacted = redact_text(value)
+
+    assert redacted.casefold() in {"cookie=[redacted]", "set-cookie=[redacted]"}
+    assert "secret" not in redacted
+    assert ";" not in redacted
+
+
+def test_text_redaction_only_preserves_whole_cookie_placeholder_values() -> None:
+    assert redact_text("Cookie: session=<cookie>") == "Cookie: session=<cookie>"
+
+    mixed = redact_text("Cookie: session=<cookie>; private=secret")
+
+    assert mixed == "Cookie=[REDACTED]"
+    assert "secret" not in mixed
+
+
+def test_json_redaction_removes_multi_pair_cookies_and_preserves_safe_placeholder() -> None:
+    payload = redact_json(
+        {
+            "cookie": "a=secret; b=secret2",
+            "set-cookie": "session=secret; HttpOnly; Path=/",
+            "nested": [
+                {"cookie": "session=<cookie>"},
+                {"cookie": "session=<cookie>; private=secret"},
+            ],
+        }
+    )
+
+    assert payload == {
+        "cookie": "[REDACTED]",
+        "set-cookie": "[REDACTED]",
+        "nested": [
+            {"cookie": "session=<cookie>"},
+            {"cookie": "[REDACTED]"},
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "%2FUsers%2Falice%2Frepo%2Fsecret.env",
+        "%252Fopt%252Fapp%252Fsecret",
+        "C%3A%5CUsers%5CAlice%5Csecret",
+        "%2fhome%2fAlice%2fMiXeD-secret",
+    ],
+)
+def test_absolute_path_redaction_removes_bounded_percent_encoded_paths(
+    value: str,
+) -> None:
+    redacted = redact_absolute_paths(value)
+
+    assert redacted == "[REDACTED_PATH]"
+    assert "secret" not in redacted.casefold()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://example.test/docs%2Fvat",
+        "https://example.test/C%3A%5Cdocs%5Cpublic",
+        "mercury://wiki/vat-input-tax",
+        "/api/items/{item_id}",
+        "docs%2Fvat",
+        "docs%2525252Fvat",
+    ],
+)
+def test_absolute_path_redaction_preserves_safe_public_paths(value: str) -> None:
+    assert redact_absolute_paths(value) == value
+
+
+@pytest.mark.parametrize(
+    ("bound_name", "bound_value", "value"),
+    [
+        ("_MAX_PATH_DECODE_DEPTH", 1, "%252Fopt%252Fapp%252Fsecret"),
+        (
+            "_MAX_ENCODED_PATH_TOKEN_BYTES",
+            8,
+            "%2FUsers%2Falice%2Frepo%2Fsecret.env",
+        ),
+    ],
+)
+def test_absolute_path_redaction_fails_closed_at_decode_bounds(
+    monkeypatch: pytest.MonkeyPatch,
+    bound_name: str,
+    bound_value: int,
+    value: str,
+) -> None:
+    monkeypatch.setattr(redaction, bound_name, bound_value)
+
+    assert redact_absolute_paths(value) == "[REDACTED_PATH]"
 
 
 @pytest.mark.parametrize(

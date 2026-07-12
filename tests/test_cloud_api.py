@@ -15,6 +15,16 @@ from mercury_tools.db.product import SKILL_CATALOG_SEED
 from mercury_tools.rag.models import SearchResult
 from mercury_tools.safety.redaction import redact_json
 
+ORDINARY_DEPENDENCY_ERROR_TYPES = (
+    httpx.HTTPError,
+    KeyError,
+    TypeError,
+    ValueError,
+    OSError,
+    RuntimeError,
+    OverflowError,
+)
+
 
 class CatalogStoreSpy:
     def __init__(self, actions) -> None:
@@ -280,6 +290,95 @@ async def test_cloud_search_redacts_personal_data_and_private_fields(
     assert "private-value" not in serialized
     assert "/Users/" not in serialized
     assert "SUPABASE_SERVICE_ROLE_KEY" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_cloud_recursively_key_redacts_nested_citation_mapping(
+    client, cloud_dependencies
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    rag_store.search_knowledge = lambda **_kwargs: [
+        SearchResult(
+            chunk_id="chunk-nested-mapping",
+            document_id="document-nested-mapping",
+            document_uri="mercury://wiki/vat-nested-mapping",
+            chunk_uri="mercury://wiki/vat-nested-mapping#chunk-0",
+            text="VAT",
+            score=0.9,
+            source_title="VAT",
+            source_uri="mercury://wiki/vat-nested-mapping",
+            source_url=None,
+            source_path=None,
+            citation={
+                "heading": "VAT",
+                "section": {
+                    "cookie": "a=secret; b=secret2",
+                    "set-cookie": "session=secret; HttpOnly; Path=/",
+                    "authorization": "Bearer nested-auth",
+                    "password": "nested-password",
+                    "token": "nested-token",
+                    "secret": "nested-secret",
+                },
+            },
+            metadata={"review_status": "reviewed"},
+        )
+    ]
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": "VAT", "top_k": 4},
+    )
+
+    assert response.status_code == 200
+    section = response.json()["results"][0]["citation"]["section"]
+    assert section == {
+        "cookie": "[REDACTED]",
+        "set-cookie": "[REDACTED]",
+        "authorization": "[REDACTED]",
+        "password": "[REDACTED]",
+        "token": "[REDACTED]",
+        "secret": "[REDACTED]",
+    }
+    json.dumps(response.json(), allow_nan=False)
+
+
+@pytest.mark.asyncio
+async def test_cloud_recursively_key_redacts_nested_citation_list(
+    client, cloud_dependencies
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    rag_store.search_knowledge = lambda **_kwargs: [
+        SearchResult(
+            chunk_id="chunk-nested-list",
+            document_id="document-nested-list",
+            document_uri="mercury://wiki/vat-nested-list",
+            chunk_uri="mercury://wiki/vat-nested-list#chunk-0",
+            text="VAT",
+            score=0.9,
+            source_title="VAT",
+            source_uri="mercury://wiki/vat-nested-list",
+            source_url=None,
+            source_path=None,
+            citation={
+                "section": [
+                    {"cookie": "a=secret; b=secret2"},
+                    {"details": [{"password": "nested-password"}]},
+                ]
+            },
+            metadata={"review_status": "reviewed"},
+        )
+    ]
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": "VAT", "top_k": 4},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["results"][0]["citation"]["section"] == [
+        {"cookie": "[REDACTED]"},
+        {"details": [{"password": "[REDACTED]"}]},
+    ]
 
 
 @pytest.mark.asyncio
@@ -936,22 +1035,14 @@ async def test_cloud_filtered_etag_only_returns_304_for_same_representation(clie
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "error",
-    [
-        KeyError("malformed loader"),
-        TypeError("malformed loader"),
-        ValueError("malformed loader"),
-        OSError("loader unavailable"),
-    ],
-)
+@pytest.mark.parametrize("error_type", ORDINARY_DEPENDENCY_ERROR_TYPES)
 async def test_cloud_skill_loader_errors_return_constant_503(
-    client, cloud_dependencies, error
+    client, cloud_dependencies, error_type
 ) -> None:
     dependencies, _, _, _, _ = cloud_dependencies
 
     def fail_loader(_skill_id):
-        raise error
+        raise error_type("malformed loader")
 
     dependencies.skill_loader = fail_loader
     response = await client.get("/api/cloud/v1/skills/vat-summary-th")
@@ -963,22 +1054,14 @@ async def test_cloud_skill_loader_errors_return_constant_503(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["search", "document"])
-@pytest.mark.parametrize(
-    "error",
-    [
-        KeyError("malformed store"),
-        TypeError("malformed store"),
-        ValueError("malformed store"),
-        OSError("store unavailable"),
-    ],
-)
+@pytest.mark.parametrize("error_type", ORDINARY_DEPENDENCY_ERROR_TYPES)
 async def test_cloud_store_errors_return_constant_503(
-    client, cloud_dependencies, route, error
+    client, cloud_dependencies, route, error_type
 ) -> None:
     _, _, rag_store, _, _ = cloud_dependencies
 
     def fail_store(*_args, **_kwargs):
-        raise error
+        raise error_type("malformed store")
 
     if route == "search":
         rag_store.search_knowledge = fail_store
@@ -997,12 +1080,81 @@ async def test_cloud_store_errors_return_constant_503(
     assert "malformed store" not in response.text
 
 
-class KeyErrorMapping(dict):
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/cloud/v1/catalog/actions",
+        "/api/cloud/v1/catalog/actions/act_000000000000000000000000",
+        "/api/cloud/v1/connectors",
+    ],
+)
+async def test_cloud_catalog_none_rows_return_constant_503(
+    client, cloud_dependencies, path
+) -> None:
+    _, _, _, catalog_store, _ = cloud_dependencies
+    catalog_store.list_active_actions = lambda: None
+
+    response = await client.get(path)
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "service_unavailable"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/cloud/v1/catalog/actions",
+        "/api/cloud/v1/catalog/actions/act_000000000000000000000000",
+        "/api/cloud/v1/connectors",
+    ],
+)
+@pytest.mark.parametrize("error_type", ORDINARY_DEPENDENCY_ERROR_TYPES)
+async def test_cloud_catalog_ordinary_dependency_errors_return_constant_503(
+    client, cloud_dependencies, path, error_type
+) -> None:
+    _, _, _, catalog_store, _ = cloud_dependencies
+
+    def fail_store():
+        raise error_type("malformed catalog")
+
+    catalog_store.list_active_actions = fail_store
+    response = await client.get(path)
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "service_unavailable"}
+    assert "malformed catalog" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_cloud_dependency_boundary_does_not_catch_base_exception(
+    client, cloud_dependencies
+) -> None:
+    _, _, _, catalog_store, _ = cloud_dependencies
+
+    class DependencyAbort(BaseException):
+        pass
+
+    def abort_store():
+        raise DependencyAbort
+
+    catalog_store.list_active_actions = abort_store
+
+    with pytest.raises(DependencyAbort):
+        await client.get("/api/cloud/v1/catalog/actions")
+
+
+class ErrorMapping(dict):
+    def __init__(self, *args, error_type=KeyError, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.error_type = error_type
+
     def __contains__(self, _key):
-        raise KeyError("malformed projection")
+        raise self.error_type("malformed projection")
 
     def get(self, _key, _default=None):
-        raise KeyError("malformed projection")
+        raise self.error_type("malformed projection")
 
 
 @pytest.mark.asyncio
@@ -1022,7 +1174,7 @@ async def test_cloud_search_projection_key_error_returns_constant_503(
             source_uri="mercury://wiki/vat",
             source_url=None,
             source_path=None,
-            citation=KeyErrorMapping({"heading": "VAT"}),
+            citation=ErrorMapping({"heading": "VAT"}),
             metadata={"review_status": "reviewed"},
         )
     ]
@@ -1047,7 +1199,7 @@ async def test_cloud_document_projection_key_error_returns_constant_503(
         "title": "VAT",
         "body": "VAT",
         "sha256": "a" * 64,
-        "knowledge_sources": KeyErrorMapping(
+        "knowledge_sources": ErrorMapping(
             {
                 "title": "Wiki",
                 "source_uri": "mercury://wiki/vat",
@@ -1063,6 +1215,54 @@ async def test_cloud_document_projection_key_error_returns_constant_503(
 
     assert response.status_code == 503
     assert response.json() == {"error": "service_unavailable"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["search", "document"])
+@pytest.mark.parametrize("error_type", ORDINARY_DEPENDENCY_ERROR_TYPES)
+async def test_cloud_projection_ordinary_dependency_errors_return_constant_503(
+    client, cloud_dependencies, route, error_type
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    malformed = ErrorMapping({"review_status": "reviewed"}, error_type=error_type)
+
+    if route == "search":
+        rag_store.search_knowledge = lambda **_kwargs: [
+            SearchResult(
+                chunk_id="chunk-1",
+                document_id="document-1",
+                document_uri="mercury://wiki/vat",
+                chunk_uri="mercury://wiki/vat#chunk-0",
+                text="VAT",
+                score=0.9,
+                source_title="VAT",
+                source_uri="mercury://wiki/vat",
+                source_url=None,
+                source_path=None,
+                citation={"heading": "VAT"},
+                metadata=malformed,
+            )
+        ]
+        response = await client.post(
+            "/api/cloud/v1/knowledge/search",
+            json={"query": "VAT", "top_k": 4},
+        )
+    else:
+        rag_store.get_document = lambda document_id: {
+            "id": document_id,
+            "document_uri": "mercury://wiki/vat",
+            "title": "VAT",
+            "body": "VAT",
+            "sha256": "a" * 64,
+            "knowledge_sources": malformed,
+        }
+        response = await client.get(
+            "/api/cloud/v1/documents/11111111-1111-4111-8111-111111111111"
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "service_unavailable"}
+    assert "malformed projection" not in response.text
 
 
 def test_public_sanitizer_preserves_documented_auth_cookie_placeholders() -> None:
@@ -1101,6 +1301,28 @@ async def test_cloud_redacts_auth_and_cookie_values_before_rag(
     assert response.status_code == 200
     for secret in ("opaque-auth", "proxy-auth", "opaque-cookie", "opaque-set-cookie"):
         assert secret not in rag_store.last_query
+
+
+@pytest.mark.asyncio
+async def test_cloud_redacts_complete_multi_pair_cookie_headers_before_rag(
+    client, cloud_dependencies
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    query = (
+        "Cookie: a=inbound-secret; b=inbound-secret2\n"
+        "Set-Cookie: session=inbound-session; HttpOnly; Path=/"
+    )
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": query, "top_k": 4},
+    )
+
+    assert response.status_code == 200
+    for secret in ("inbound-secret", "inbound-secret2", "inbound-session"):
+        assert secret not in rag_store.last_query
+    assert "HttpOnly" not in rag_store.last_query
+    assert "Path=/" not in rag_store.last_query
 
 
 @pytest.mark.asyncio
@@ -1169,6 +1391,47 @@ async def test_cloud_redacts_auth_and_cookie_values_from_every_projection(
 
 
 @pytest.mark.asyncio
+async def test_cloud_redacts_complete_multi_pair_cookies_from_public_projection(
+    client, cloud_dependencies
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    rag_store.search_knowledge = lambda **_kwargs: [
+        SearchResult(
+            chunk_id="chunk-cookie",
+            document_id="document-cookie",
+            document_uri="mercury://wiki/vat-cookie",
+            chunk_uri="mercury://wiki/vat-cookie#chunk-0",
+            text="Cookie: a=outbound-secret; b=outbound-secret2",
+            score=0.9,
+            source_title="VAT",
+            source_uri="mercury://wiki/vat-cookie",
+            source_url=None,
+            source_path=None,
+            citation={
+                "section": {
+                    "set-cookie": (
+                        "session=outbound-session; HttpOnly; Path=/"
+                    )
+                }
+            },
+            metadata={"review_status": "reviewed"},
+        )
+    ]
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": "VAT", "top_k": 4},
+    )
+
+    serialized = json.dumps(response.json())
+    assert response.status_code == 200
+    for secret in ("outbound-secret", "outbound-secret2", "outbound-session"):
+        assert secret not in serialized
+    assert "HttpOnly" not in serialized
+    assert "Path=/" not in serialized
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -1234,6 +1497,91 @@ def test_public_sanitizer_redacts_cross_platform_absolute_paths(value) -> None:
 )
 def test_public_sanitizer_preserves_safe_uri_and_slash_text(value) -> None:
     assert cloud_api.sanitize_public_text(value) == value
+
+
+@pytest.mark.asyncio
+async def test_cloud_redacts_percent_encoded_local_paths_before_rag(
+    client, cloud_dependencies
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    encoded_paths = (
+        "%2FUsers%2Falice%2Frepo%2Fsecret.env",
+        "%252Fopt%252Fapp%252Fsecret",
+        "C%3A%5CUsers%5CAlice%5Csecret",
+        "%2fhome%2fAlice%2fMiXeD-secret",
+    )
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": " ".join(encoded_paths), "top_k": 4},
+    )
+
+    assert response.status_code == 200
+    assert "[REDACTED_PATH]" in rag_store.last_query
+    for path in encoded_paths:
+        assert path not in rag_store.last_query
+    assert "secret" not in rag_store.last_query.casefold()
+
+
+@pytest.mark.asyncio
+async def test_cloud_redacts_percent_encoded_local_paths_from_public_projection(
+    client, cloud_dependencies
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    encoded_paths = (
+        "%2FUsers%2Falice%2Frepo%2Fsecret.env",
+        "%252Fopt%252Fapp%252Fsecret",
+        "C%3A%5CUsers%5CAlice%5Csecret",
+    )
+    rag_store.search_knowledge = lambda **_kwargs: [
+        SearchResult(
+            chunk_id="chunk-path",
+            document_id="document-path",
+            document_uri="mercury://wiki/vat-path",
+            chunk_uri="mercury://wiki/vat-path#chunk-0",
+            text=f"Read {encoded_paths[0]}",
+            score=0.9,
+            source_title=f"Read {encoded_paths[1]}",
+            source_uri="mercury://wiki/vat-path",
+            source_url="https://example.test/docs%2Fvat",
+            source_path=None,
+            citation={"section": [{"note": encoded_paths[2]}]},
+            metadata={"review_status": "reviewed"},
+        )
+    ]
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": "VAT", "top_k": 4},
+    )
+
+    serialized = json.dumps(response.json())
+    assert response.status_code == 200
+    for path in encoded_paths:
+        assert path not in serialized
+    assert "secret" not in serialized.casefold()
+    assert response.json()["results"][0]["source_url"] == (
+        "https://example.test/docs%2Fvat"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cloud_preserves_safe_urls_mercury_uris_and_encoded_url_paths_before_rag(
+    client, cloud_dependencies
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    safe_query = (
+        "https://example.test/docs%2Fvat "
+        "mercury://wiki/vat-input-tax docs%2Fvat"
+    )
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": safe_query, "top_k": 4},
+    )
+
+    assert response.status_code == 200
+    assert rag_store.last_query == safe_query
 
 
 @pytest.mark.asyncio

@@ -50,9 +50,7 @@ _ACTION_ID_RE = re.compile(r"^act_[0-9a-f]{24}$")
 _PUBLIC_RESULT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _WIKI_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,199}$")
 _CHUNK_FRAGMENT_RE = re.compile(r"^chunk-[0-9]+$")
-_PRIVATE_KEY_RE = re.compile(
-    r"(?i)(?:repository|source)?_?path|credential|secret|token|api[_-]?key|authorization"
-)
+_PRIVATE_KEY_RE = re.compile(r"(?i)(?:repository|source)?_?path|credential")
 _PUBLIC_SKILL_FIELDS = (
     "skill_id",
     "title",
@@ -66,6 +64,15 @@ _PUBLIC_SKILL_FIELDS = (
 _CANONICAL_SKILLS = tuple(deepcopy(SKILL_CATALOG_SEED))
 _CANONICAL_SKILL_IDS = frozenset(
     str(item["skill_id"]) for item in _CANONICAL_SKILLS
+)
+_ORDINARY_DEPENDENCY_ERRORS = (
+    httpx.HTTPError,
+    KeyError,
+    TypeError,
+    ValueError,
+    OSError,
+    RuntimeError,
+    OverflowError,
 )
 
 
@@ -107,11 +114,11 @@ class CloudDependencies:
             return _bad_request()
         try:
             all_actions = await run_in_threadpool(self._catalog_actions)
-        except (httpx.HTTPError, RuntimeError, ValueError):
+            actions = _filter_actions(all_actions, connector=connector, method=method)
+            payload = [action.model_dump(mode="json") for action in actions]
+            etag = _etag(payload)
+        except _ORDINARY_DEPENDENCY_ERRORS:
             return _service_unavailable()
-        actions = _filter_actions(all_actions, connector=connector, method=method)
-        payload = [action.model_dump(mode="json") for action in actions]
-        etag = _etag(payload)
         if request.headers.get("if-none-match") == etag:
             return Response(status_code=304, headers={"ETag": etag})
         return JSONResponse({"actions": payload}, headers={"ETag": etag})
@@ -129,54 +136,68 @@ class CloudDependencies:
                 ),
                 None,
             )
-        except (httpx.HTTPError, RuntimeError, ValueError):
+        except _ORDINARY_DEPENDENCY_ERRORS:
             return _service_unavailable()
         if action is None:
             return _not_found()
-        return JSONResponse({"action": action.model_dump(mode="json")})
+        try:
+            payload = action.model_dump(mode="json")
+        except _ORDINARY_DEPENDENCY_ERRORS:
+            return _service_unavailable()
+        return JSONResponse({"action": payload})
 
     async def list_connectors(self, request: Request) -> Response:
         try:
             actions = await run_in_threadpool(self._catalog_actions)
-        except (httpx.HTTPError, RuntimeError, ValueError):
+            grouped: dict[str, dict[str, set[str]]] = {}
+            for action in actions:
+                connector = grouped.setdefault(
+                    action.connector_id,
+                    {"capabilities": set(), "environments": set()},
+                )
+                connector["capabilities"].add(action.capability)
+                connector["environments"].update(action.environments)
+            payload = [
+                {
+                    "connector_id": connector_id,
+                    "capabilities": sorted(values["capabilities"]),
+                    "environments": sorted(values["environments"]),
+                }
+                for connector_id, values in sorted(grouped.items())
+            ]
+        except _ORDINARY_DEPENDENCY_ERRORS:
             return _service_unavailable()
-        grouped: dict[str, dict[str, set[str]]] = {}
-        for action in actions:
-            connector = grouped.setdefault(
-                action.connector_id,
-                {"capabilities": set(), "environments": set()},
-            )
-            connector["capabilities"].add(action.capability)
-            connector["environments"].update(action.environments)
         return JSONResponse(
-            {
-                "connectors": [
-                    {
-                        "connector_id": connector_id,
-                        "capabilities": sorted(values["capabilities"]),
-                        "environments": sorted(values["environments"]),
-                    }
-                    for connector_id, values in sorted(grouped.items())
-                ]
-            }
+            {"connectors": payload}
         )
 
     async def list_skills(self, request: Request) -> Response:
-        return JSONResponse({"skills": self._public_skills()})
+        try:
+            skills = self._public_skills()
+        except _ORDINARY_DEPENDENCY_ERRORS:
+            return _service_unavailable()
+        return JSONResponse({"skills": skills})
 
     async def get_skill(self, request: Request) -> Response:
         skill_id = request.path_params["skill_id"]
         if not _valid_selector(skill_id, required=True):
             return _bad_request()
-        skill = next(
-            (item for item in self._public_skills() if item["skill_id"] == skill_id),
-            None,
-        )
+        try:
+            skill = next(
+                (
+                    item
+                    for item in self._public_skills()
+                    if item["skill_id"] == skill_id
+                ),
+                None,
+            )
+        except _ORDINARY_DEPENDENCY_ERRORS:
+            return _service_unavailable()
         if skill is None:
             return _not_found()
         try:
             markdown = await run_in_threadpool(self.skill_loader, skill_id)
-        except (KeyError, TypeError, ValueError, OSError):
+        except _ORDINARY_DEPENDENCY_ERRORS:
             return _service_unavailable()
         if markdown is None:
             return _not_found()
@@ -215,18 +236,11 @@ class CloudDependencies:
                 SearchFilters(**public_filters),
                 top_k,
             )
-        except (
-            httpx.HTTPError,
-            KeyError,
-            TypeError,
-            ValueError,
-            OSError,
-            RuntimeError,
-        ):
+        except _ORDINARY_DEPENDENCY_ERRORS:
             return _service_unavailable()
         try:
             public_results = _project_public_search_results(results, top_k=top_k)
-        except (KeyError, TypeError, ValueError, OSError, OverflowError):
+        except _ORDINARY_DEPENDENCY_ERRORS:
             return _service_unavailable()
         return JSONResponse({"results": public_results})
 
@@ -236,18 +250,11 @@ class CloudDependencies:
             return _bad_request()
         try:
             document = await run_in_threadpool(self._get_document, document_id)
-        except (
-            httpx.HTTPError,
-            KeyError,
-            TypeError,
-            ValueError,
-            OSError,
-            RuntimeError,
-        ):
+        except _ORDINARY_DEPENDENCY_ERRORS:
             return _service_unavailable()
         try:
             public_document = _project_public_document(document_id, document)
-        except (KeyError, TypeError, ValueError, OSError, OverflowError):
+        except _ORDINARY_DEPENDENCY_ERRORS:
             return _service_unavailable()
         if public_document is None:
             return _not_found()
@@ -487,9 +494,10 @@ def _clean_public_value(value: Any) -> Any:
     if isinstance(value, str):
         return sanitize_public_text(value)
     if isinstance(value, Mapping):
+        redacted = redact_json({str(key): item for key, item in value.items()})
         return {
             str(key): _clean_public_value(item)
-            for key, item in value.items()
+            for key, item in redacted.items()
             if not _PRIVATE_KEY_RE.search(str(key))
         }
     if isinstance(value, (list, tuple, set, frozenset)):

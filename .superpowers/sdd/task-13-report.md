@@ -344,3 +344,91 @@ $ git diff --check
 
 - `match_knowledge_chunks` still has no source-URI-prefix parameter. The API therefore retains the accepted boundary of forcing `review_status="reviewed"` and applying strict canonical `mercury://wiki/...` membership validation after fetch. Moving this restriction into query execution requires a future RPC/database change outside Task 13.
 - The pre-existing Starlette `TestClient` deprecation warning remains. The required full suite excluded the single integration test.
+
+## Fix Round 3: Final Hardening
+
+### Status
+
+DONE_WITH_CONCERNS
+
+This final hardening round closes all four mandatory findings from HEAD `55bc60fb98dee9cda90fb812aea0af64f588ae3a` without changing Task 14 files or the existing seven-route read-only Cloud surface.
+
+### Findings Addressed
+
+1. Public citation projection now sends every nested mapping through the shared recursive JSON key-redaction policy before recursively sanitizing text and paths. Permitted citation fields, nested mappings, nested lists, and JSON-safe output are preserved, while `cookie`, `set-cookie`, `authorization`, `password`, `token`, and `secret` values become constant placeholders.
+2. Added one `_ORDINARY_DEPENDENCY_ERRORS` tuple containing `httpx.HTTPError`, `KeyError`, `TypeError`, `ValueError`, `OSError`, `RuntimeError`, and `OverflowError`. Catalog list/detail, connector projection, skill catalog/loading, search, document, and post-fetch projection boundaries use this tuple consistently and return the exact `503 {"error":"service_unavailable"}` body. A dedicated regression proves `BaseException` is not caught; cancellation, `KeyboardInterrupt`, and `SystemExit` remain outside the tuple.
+3. Cookie text redaction now consumes the complete line-delimited `Cookie` or `Set-Cookie` value, including semicolon-delimited pairs and attributes. Only a whole safe documented placeholder value is preserved; placeholder-plus-secret input is fully redacted. Shared JSON, inbound RAG query, and outbound public projection regressions cover the policy.
+4. Local absolute-path redaction now checks single and repeated percent encodings case-insensitively, with a maximum decode depth of 3 and a 4,096-byte token bound. It fails closed for ambiguous encoded absolute roots and Windows drive paths while preserving valid HTTP URLs, Mercury URIs, endpoint templates, relative encoded URL paths, and deeply encoded relative URL paths.
+5. All previous Task 13 adversarial API/client/hosted/RAG/redaction tests remain green. No Task 14 file was modified.
+
+### Changed Files
+
+- `src/mercury_tools/cloud/api.py`
+- `src/mercury_tools/safety/redaction.py`
+- `tests/test_cloud_api.py`
+- `tests/test_redaction.py`
+- `.superpowers/sdd/task-13-report.md`
+
+### RED Evidence
+
+All mandatory endpoint and shared-redaction regressions were added before production changes:
+
+```text
+$ uv run pytest tests/test_cloud_api.py tests/test_redaction.py -q
+38 failed, 136 passed in 2.20s
+```
+
+The failures covered nested citation mappings/lists, malformed catalog `None`, ordinary dependency and projection exceptions, skill-loader `RuntimeError`, semicolon cookie tails, and percent-encoded local paths crossing inbound and outbound boundaries.
+
+A second RED cycle tightened safe relative URL-path preservation at the decode bound:
+
+```text
+$ uv run pytest tests/test_redaction.py::test_absolute_path_redaction_preserves_safe_public_paths -q
+1 failed, 5 passed in 0.03s
+```
+
+### GREEN Evidence
+
+The mandatory API and redaction set passed after the implementation:
+
+```text
+$ uv run pytest tests/test_cloud_api.py tests/test_redaction.py -q
+174 passed in 0.38s
+```
+
+The final focused Cloud/API/client/redaction/hosted/RAG set, including bounded decoding and `BaseException` regressions, passed:
+
+```text
+$ uv run pytest tests/test_cloud_api.py tests/test_cloud_client.py \
+    tests/test_redaction.py tests/test_http_app.py tests/test_mcp_rag_routing.py -q
+240 passed, 1 warning in 1.64s
+```
+
+The warning is the pre-existing Starlette `TestClient` deprecation warning.
+
+The complete non-integration suite passed:
+
+```text
+$ uv run pytest -m 'not integration' -q
+1302 passed, 1 deselected, 1 warning in 6.08s
+```
+
+Static and whitespace verification passed:
+
+```text
+$ uv run ruff check .
+All checks passed!
+
+$ git diff --check
+<no output>
+```
+
+### Commit
+
+- Parent: `55bc60fb98dee9cda90fb812aea0af64f588ae3a`
+- Subject: `fix: finalize Task 13 Cloud hardening`
+- Final hash: reported in the completion response because a commit cannot contain its own hash.
+
+### Residual Concern
+
+- `match_knowledge_chunks` still has no database RPC URI-prefix parameter. The accepted mitigation remains forced `review_status="reviewed"` plus strict canonical `mercury://wiki/...` URI checks after fetch and before public projection. Moving the URI restriction into query execution requires a future database/RPC change outside Task 13.
