@@ -40,6 +40,7 @@ _DESTRUCTIVE_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
 _STATUS_CODE = re.compile(r"^[a-z][a-z0-9_]{1,127}$")
 _FLOW_SUFFIXES = {".yaml", ".yml"}
 _MAX_FLOW_CHARS = 500_000
+_SCHEMA_VALUE_KEYS = frozenset({"const", "default", "enum", "example", "examples"})
 
 
 async def active_root_paths(ctx: Context) -> tuple[Path, ...]:
@@ -96,6 +97,38 @@ def _action_summary(action: Any) -> dict[str, Any]:
         "confidence": action.confidence.value,
         "observed_state": action.observed_state.value,
     }
+
+
+def _public_action_schema(action: Any) -> dict[str, Any]:
+    """Project validated catalog metadata without treating schema field names as values."""
+    payload = action.model_dump(mode="json")
+    if not isinstance(payload, Mapping):
+        raise ValueError("catalog_action_schema_invalid")
+    projected = dict(payload)
+    projected["input_schema"] = _public_executable_schema(projected.get("input_schema"))
+    projected["examples"] = []
+    return projected
+
+
+def _public_executable_schema(value: Any, *, field_map: bool = False) -> Any:
+    if isinstance(value, Mapping):
+        projected: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError("catalog_action_schema_invalid")
+            normalized = key.casefold()
+            if field_map:
+                projected[key] = _public_executable_schema(item)
+            elif normalized in _SCHEMA_VALUE_KEYS:
+                projected[key] = [] if normalized in {"enum", "examples"} else "[REDACTED]"
+            elif normalized in {"files", "headers", "path", "properties", "query"}:
+                projected[key] = _public_executable_schema(item, field_map=True)
+            else:
+                projected[key] = _public_executable_schema(item)
+        return projected
+    if isinstance(value, list | tuple):
+        return [_public_executable_schema(item) for item in value]
+    return value
 
 
 @local_mcp.tool(annotations=_READ_ONLY)
@@ -390,7 +423,7 @@ async def get_erp_action_schema(
                 if version
                 else runtime.catalog.require(action_id)
             )
-        return {"status": "ok", "action": redact_json(action.model_dump(mode="json"))}
+        return {"status": "ok", "action": _public_action_schema(action)}
     except (httpx.HTTPError, LookupError, OSError, RuntimeError, ValueError) as error:
         return _error_payload(error)
 

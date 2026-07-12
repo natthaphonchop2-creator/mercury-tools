@@ -1083,6 +1083,185 @@ def test_repository_flow_loader_rejects_symlinked_child_directory_before_callbac
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    "base_factory",
+    [
+        lambda root, outside: root / "trusted" / "..",
+        lambda root, outside: root / "trusted" / ".." / "trusted",
+        lambda root, outside: root / ".." / outside.name,
+        lambda root, outside: outside,
+        lambda root, outside: root / "alias",
+    ],
+)
+def test_repository_flow_loader_rejects_untrusted_base_dir_before_openat(
+    tmp_path: Path,
+    base_factory,
+) -> None:
+    root = tmp_path / "repository"
+    trusted = root / "trusted"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    trusted.mkdir()
+    outside.mkdir()
+    (trusted / "child.yaml").write_text(
+        'name: Child\n---\n- emitReport:\n    title: "Child"\n',
+        encoding="utf-8",
+    )
+    (root / "child.yaml").write_text(
+        'name: Root Child\n---\n- emitReport:\n    title: "Root Child"\n',
+        encoding="utf-8",
+    )
+    (outside / "child.yaml").write_text(
+        'name: Outside\n---\n- emitReport:\n    title: "Outside"\n',
+        encoding="utf-8",
+    )
+    (root / "alias").symlink_to(trusted, target_is_directory=True)
+    loader = flow_runner.repository_flow_loader(root)
+
+    with pytest.raises(FlowValidationError, match="flow_path_invalid"):
+        loader(base_factory(root, outside), "child.yaml")
+
+
+@pytest.mark.parametrize(
+    ("wrapper", "wrapper_options"),
+    [
+        ("runFlow", ""),
+        ("repeat", "    times: 1\n"),
+        ("retry", "    maxRetries: 0\n"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("label", "outside_parent"),
+    [
+        ("../pivot", ".."),
+        ("../pivot/", "../pivot"),
+        ("nested/../../pivot", ".."),
+    ],
+)
+def test_inline_flow_labels_cannot_escape_loader_or_dispatch_outside_callbacks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wrapper: str,
+    wrapper_options: str,
+    label: str,
+    outside_parent: str,
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    (root / "nested").mkdir()
+    (root / "outside.yaml").write_text(
+        'name: Safe Child\n---\n- emitReport:\n    title: "Safe child"\n',
+        encoding="utf-8",
+    )
+    main = root / "main.yaml"
+    main.write_text(
+        f"""name: Main
+---
+- {wrapper}:
+{wrapper_options}    label: {label}
+    commands:
+      - runFlow:
+          file: outside.yaml
+""",
+        encoding="utf-8",
+    )
+    outside = root / outside_parent / "outside.yaml"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside_marker = "Outside YAML must never be parsed"
+    outside.write_text(
+        f"""name: {outside_marker}
+---
+- erpRead:
+    actionId: erp.outside.dispatch
+- searchKnowledge:
+    query: outside-cloud-dispatch
+""",
+        encoding="utf-8",
+    )
+    loader = flow_runner.repository_flow_loader(root)
+    parent = loader.load_path("main.yaml")
+    parsed_text: list[str] = []
+    original_parse = flow_runner.parse_flow_text
+
+    def parse_spy(text: str, *, path: Path | None = None):
+        parsed_text.append(text)
+        return original_parse(text, path=path)
+
+    monkeypatch.setattr(flow_runner, "parse_flow_text", parse_spy)
+    erp_calls: list[str] = []
+    cloud_calls: list[str] = []
+
+    class FakeService:
+        def search(self, query, **_kwargs):
+            cloud_calls.append(query)
+            return []
+
+    runner = MercuryFlowRunner(
+        flow_loader=loader,
+        rag_service_factory=lambda: FakeService(),
+        erp_read_callback=lambda action_id, *_args: erp_calls.append(action_id) or {"status": "ok"},
+        capability_gate=None,
+    )
+
+    result = runner.run_flow(parent)
+
+    assert result.status == "ok"
+    assert erp_calls == []
+    assert cloud_calls == []
+    assert all(outside_marker not in text for text in parsed_text)
+
+
+def test_inline_flow_label_preserves_parent_taint_without_outside_dispatch(tmp_path: Path) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    (root / "main.yaml").write_text(
+        """name: Main
+---
+- erpRead:
+    actionId: erp.parent.read
+    saveAs: parent_erp
+- runFlow:
+    label: ../pivot
+    env:
+      child_erp: "${parent_erp}"
+    commands:
+      - runFlow:
+          file: child.yaml
+""",
+        encoding="utf-8",
+    )
+    (root / "child.yaml").write_text(
+        """name: Child
+---
+- searchKnowledge:
+    query: "${child_erp.reference}"
+""",
+        encoding="utf-8",
+    )
+    loader = flow_runner.repository_flow_loader(root)
+    erp_calls: list[str] = []
+    cloud_calls: list[str] = []
+
+    class FakeService:
+        def search(self, query, **_kwargs):
+            cloud_calls.append(query)
+            return []
+
+    result = MercuryFlowRunner(
+        flow_loader=loader,
+        rag_service_factory=lambda: FakeService(),
+        erp_read_callback=lambda action_id, *_args: erp_calls.append(action_id)
+        or {"reference": "parent-private-reference"},
+        capability_gate=None,
+    ).run_flow(loader.load_path("main.yaml"))
+
+    assert result.status == "blocked"
+    assert result.reason == "erp_to_cloud_taint"
+    assert erp_calls == ["erp.parent.read"]
+    assert cloud_calls == []
+    assert "parent-private-reference" not in str(result.as_dict())
+
+
 def test_repository_flow_loader_rejects_symlink_swap_before_list_parse(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

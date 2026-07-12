@@ -263,6 +263,77 @@ name: ERP Taint Local Flow
     assert "erp-private-invoice-2026" not in str(result)
 
 
+@pytest.mark.asyncio
+async def test_get_erp_action_schema_keeps_credential_field_shapes_without_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action_factory,
+) -> None:
+    raw_credential = "client-secret-value-must-not-leak"
+    action = action_factory().model_copy(
+        update={
+            "input_schema": {
+                "path": {},
+                "query": {
+                    "access_token": {
+                        "type": "string",
+                        "example": raw_credential,
+                    }
+                },
+                "headers": {},
+                "body": {
+                    "type": "object",
+                    "required": ["client_secret", "password", "access_token"],
+                    "properties": {
+                        "client_secret": {"type": "string", "default": raw_credential},
+                        "password": {"type": "string", "example": raw_credential},
+                        "access_token": {"type": "string", "examples": [raw_credential]},
+                        "reference": {"type": "string", "default": "REF-EXAMPLE"},
+                    },
+                },
+                "files": {},
+            },
+            "examples": ({"body": {"client_secret": raw_credential}},),
+        }
+    )
+
+    class FakeRuntime:
+        catalog = SimpleNamespace(require=lambda _action_id: action)
+
+        async def refresh_catalog(self) -> None:
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        local_server.LocalMercuryRuntime,
+        "for_repository",
+        classmethod(lambda cls, context: FakeRuntime()),
+    )
+
+    result = await local_server.get_erp_action_schema(
+        action_id=action.action_id,
+        ctx=_direct_context(tmp_path),
+    )
+
+    schema = result["action"]["input_schema"]
+    properties = schema["body"]["properties"]
+    assert result["status"] == "ok"
+    assert schema["body"]["required"] == ["client_secret", "password", "access_token"]
+    assert properties["client_secret"]["type"] == "string"
+    assert properties["password"]["type"] == "string"
+    assert properties["access_token"]["type"] == "string"
+    assert schema["query"]["access_token"]["type"] == "string"
+    assert properties["client_secret"]["default"] == "[REDACTED]"
+    assert properties["password"]["example"] == "[REDACTED]"
+    assert properties["access_token"]["examples"] == []
+    assert properties["reference"]["default"] == "[REDACTED]"
+    assert result["action"]["examples"] == []
+    assert raw_credential not in str(result)
+    assert "REF-EXAMPLE" not in str(result)
+
+
 def _public_read_action(action_factory, **overrides):
     values = {
         "method": "GET",

@@ -44,6 +44,7 @@ _CLOUD_BOUND_COMMANDS = frozenset(
 )
 _TAINTED_VALUE_SUMMARY = {"status": "erp_derived_value_withheld"}
 _MAX_FLOW_BYTES = 500_000
+_INLINE_FLOW_FILENAME = ".mercury-inline-flow.yaml"
 
 
 @dataclass(frozen=True)
@@ -97,7 +98,10 @@ class RepositoryFlowLoader:
     """Read repository-contained flows through descriptor-pinned paths only."""
 
     def __init__(self, repository_root: Path, *, max_bytes: int = _MAX_FLOW_BYTES) -> None:
-        self.root = Path(repository_root).expanduser()
+        try:
+            self.root = Path(repository_root).expanduser().resolve(strict=True)
+        except OSError as exc:
+            raise FlowValidationError("flow_path_invalid") from exc
         self.max_bytes = max_bytes
         self._require_secure_openat()
 
@@ -106,11 +110,8 @@ class RepositoryFlowLoader:
         return self._load_components(components)
 
     def __call__(self, base_dir: Path, raw_path: str) -> MercuryFlow:
-        try:
-            relative_base = Path(base_dir).relative_to(self.root)
-        except ValueError as exc:
-            raise FlowValidationError("flow_path_invalid") from exc
-        return self._load_components((*relative_base.parts, *self._components(raw_path)))
+        relative_base = self._trusted_base_components(base_dir)
+        return self._load_components((*relative_base, *self._components(raw_path)))
 
     def list_flows(self, raw_directory: str | None = None) -> list[tuple[Path, MercuryFlow]]:
         components = () if raw_directory is None else self._components(raw_directory)
@@ -142,6 +143,21 @@ class RepositoryFlowLoader:
         ):
             raise FlowValidationError("flow_path_invalid")
         return tuple(str(part) for part in requested.parts)
+
+    def _trusted_base_components(self, base_dir: Path) -> tuple[str, ...]:
+        if not isinstance(base_dir, Path) or not base_dir.is_absolute():
+            raise FlowValidationError("flow_path_invalid")
+        try:
+            relative_base = base_dir.relative_to(self.root)
+        except ValueError as exc:
+            raise FlowValidationError("flow_path_invalid") from exc
+        components = tuple(str(part) for part in relative_base.parts)
+        if any(part in {"", ".", ".."} for part in components):
+            raise FlowValidationError("flow_path_invalid")
+
+        descriptor = self._open_directory(components)
+        os.close(descriptor)
+        return components
 
     def _load_components(self, components: tuple[str, ...]) -> MercuryFlow:
         payload = self._read_file(components)
@@ -1086,14 +1102,13 @@ class MercuryFlowRunner:
                     f"{command_name} commands must include at least one command."
                 )
             label = str(args.get("label") or "Inline Flow").strip() or "Inline Flow"
-            suffix = command_name if command_name in {"repeat", "retry"} else "inline"
             child_flow = MercuryFlow(
                 name=label,
                 description=f"Inline Mercury {command_name} flow",
                 tags=[],
                 env=child_env,
                 commands=commands,
-                path=base_dir / f"{label}.{suffix}.yaml",
+                path=base_dir / _INLINE_FLOW_FILENAME,
             )
             child_taint = _child_taint_state(child_env, taint, tainted_child_env_keys)
             return self.run_flow(
