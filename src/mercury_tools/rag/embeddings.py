@@ -21,17 +21,17 @@ class EmbeddingProvider(Protocol):
 
 class OpenAIEmbeddingProvider:
     def __init__(self, settings: Settings):
-        if not settings.openai_configured:
-            raise RuntimeError("OPENAI_API_KEY is required for OpenAI embeddings.")
         try:
-            from openai import OpenAI
+            import openai
         except ModuleNotFoundError as error:
             if error.name == "openai":
                 raise RuntimeError(
                     "Install mercury-tools[openai] to use OpenAI embeddings."
                 ) from error
             raise
-        self.client: Any = OpenAI(api_key=settings.openai_api_key)
+        if not settings.openai_configured:
+            raise RuntimeError("OPENAI_API_KEY is required for OpenAI embeddings.")
+        self.client: Any = openai.OpenAI(api_key=settings.openai_api_key)
         self.model = settings.embedding_model
         self.dimensions = settings.embedding_dim
 

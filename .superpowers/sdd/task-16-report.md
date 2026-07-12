@@ -30,13 +30,13 @@ Passed:
 - `uvx --from . mercury --help`
 - `uv run python /Users/natthaphon/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py plugins/mercury-finance`
 - `uv run python scripts/validate_release_plugin.py`
-- `uv run pytest tests/test_plugin_package.py -q` - 26 passed
-- `uv run pytest tests/test_plugin_clean_install.py -q` - 2 passed in 98.67s
+- `uv run --extra dev pytest tests/test_plugin_package.py -q` - 38 passed
+- `uv run --extra dev pytest tests/test_plugin_clean_install.py -q` - 2 passed in 98.67s
 - `uv run ruff check scripts/validate_release_plugin.py src/mercury_tools/rag/embeddings.py src/mercury_tools/__init__.py tests/test_plugin_clean_install.py tests/test_plugin_package.py`
 
 Shared-worktree blockers recorded, not changed by Task 16:
 
-- `uv run pytest -m "not integration" -q` stops during collection because
+- `uv run --extra dev pytest -m "not integration" -q` stops during collection because
   `tests/test_cloud_secret_removal.py` imports the not-yet-created
   `scripts.purge_cloud_erp_secrets`, and `tests/test_journal_write_store.py`
   imports the removed `vault_key` symbol.
@@ -47,3 +47,24 @@ Shared-worktree blockers recorded, not changed by Task 16:
 ## Commit
 
 `feat: package one pinned Mercury Finance MCP`
+
+## Review Follow-Up
+
+- Empty MCP server objects now fail command, immutable args, cwd, and timeout checks.
+- Release manifests use bounded high-confidence credential literal detection while
+  preserving documentation placeholders.
+- The standalone validator now enforces the one-plugin marketplace contract.
+- OpenAI is imported before API-key validation, with only a missing top-level
+  `openai` module translated to the optional-extra message.
+- Validator and tests use the seven remaining exact direct dependency pins after
+  Task 17 removed direct `cryptography`.
+- Every recorded pytest command uses `uv run --extra dev pytest`.
+
+Follow-up files:
+
+- `scripts/validate_release_plugin.py`
+- `src/mercury_tools/rag/embeddings.py`
+- `tests/test_plugin_package.py`
+- `.superpowers/sdd/task-16-report.md`
+
+Follow-up commit message: `fix: harden Mercury Finance release validation`

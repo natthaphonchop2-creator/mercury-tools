@@ -416,7 +416,7 @@ def test_embeddings_import_without_openai_and_fail_with_actionable_extra_message
     settings = Settings(
         supabase_url="",
         supabase_service_role_key="",
-        openai_api_key="test-key",
+        openai_api_key="",
     )
     with pytest.raises(
         RuntimeError,
@@ -427,9 +427,29 @@ def test_embeddings_import_without_openai_and_fail_with_actionable_extra_message
     assert isinstance(default_provider, embeddings.HashEmbeddingProvider)
 
 
+def test_openai_embedding_provider_preserves_nested_dependency_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mercury_tools.config import Settings
+    from mercury_tools.rag import embeddings
+
+    original_import = builtins.__import__
+
+    def without_nested_dependency(name: str, *args: object, **kwargs: object):
+        if name == "openai":
+            raise ModuleNotFoundError("No module named 'jiter'", name="jiter")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_nested_dependency)
+    with pytest.raises(ModuleNotFoundError) as error:
+        embeddings.OpenAIEmbeddingProvider(Settings("", "", "test-key"))
+    assert error.value.name == "jiter"
+
+
 def _release_layout(tmp_path: Path, *, pinned_launcher: bool = False) -> Path:
     release_root = tmp_path / "release"
     for relative_path in (
+        ".agents/plugins/marketplace.json",
         "plugins/mercury-finance/.mcp.json",
         "plugins/mercury-finance/.codex-plugin/plugin.json",
         "pyproject.toml",
@@ -472,11 +492,23 @@ def _run_release_validator(root: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _rewrite_mcp(root: Path, mutate) -> None:
-    path = root / "plugins/mercury-finance/.mcp.json"
+def _rewrite_release_json(root: Path, relative_path: str, mutate) -> None:
+    path = root / relative_path
     data = json.loads(path.read_text(encoding="utf-8"))
     mutate(data)
     path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _rewrite_mcp(root: Path, mutate) -> None:
+    _rewrite_release_json(root, "plugins/mercury-finance/.mcp.json", mutate)
+
+
+def _rewrite_plugin(root: Path, mutate) -> None:
+    _rewrite_release_json(root, "plugins/mercury-finance/.codex-plugin/plugin.json", mutate)
+
+
+def _rewrite_marketplace(root: Path, mutate) -> None:
+    _rewrite_release_json(root, ".agents/plugins/marketplace.json", mutate)
 
 
 def test_release_validator_accepts_the_offline_release_contract(tmp_path: Path) -> None:
@@ -484,6 +516,78 @@ def test_release_validator_accepts_the_offline_release_contract(tmp_path: Path) 
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "release plugin validation passed" in result.stdout
+
+
+def test_release_validator_rejects_empty_server_with_every_required_contract(
+    tmp_path: Path,
+) -> None:
+    release_root = _release_layout(tmp_path, pinned_launcher=True)
+    _rewrite_mcp(
+        release_root,
+        lambda data: data["mcpServers"].__setitem__("mercury-finance", {}),
+    )
+
+    result = _run_release_validator(release_root)
+
+    assert result.returncode == 1
+    for expected_error in (
+        "command must be uvx",
+        "immutable v0.2.0 Git tag",
+        "cwd must be .",
+        "tool_timeout_sec must be 900",
+    ):
+        assert expected_error in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        (
+            "notes",
+            "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature",
+        ),
+        ("notes", "eyJhbGciOiJIUzI1NiJ9.payload.signature"),
+        ("api_key", "sk-live-51f89c816a374ad6b62be6a1"),
+        ("client_secret", "v1.N9x4pQ7sT2wL8mK6rH3c"),
+    ],
+    ids=["bearer", "jwt", "api-key", "secret"],
+)
+def test_release_validator_rejects_high_confidence_credential_values(
+    tmp_path: Path,
+    key: str,
+    value: str,
+) -> None:
+    release_root = _release_layout(tmp_path, pinned_launcher=True)
+    _rewrite_plugin(
+        release_root,
+        lambda data: data.update({"review_fixture": {key: value}}),
+    )
+
+    result = _run_release_validator(release_root)
+
+    assert result.returncode == 1
+    assert "credential literal values" in result.stdout
+
+
+def test_release_validator_allows_documentation_credential_placeholders(tmp_path: Path) -> None:
+    release_root = _release_layout(tmp_path, pinned_launcher=True)
+    _rewrite_plugin(
+        release_root,
+        lambda data: data.update(
+            {
+                "review_fixture": {
+                    "authorization": "Bearer <token>",
+                    "api_key": "${FLOWACCOUNT_API_KEY}",
+                    "client_secret": "YOUR_CLIENT_SECRET",
+                    "password": "[REDACTED]",
+                }
+            }
+        ),
+    )
+
+    result = _run_release_validator(release_root)
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(
@@ -544,6 +648,44 @@ def test_release_validator_rejects_mutated_unsafe_launchers(
     assert expected_error in result.stdout
 
 
+@pytest.mark.parametrize(
+    ("mutate", "expected_error"),
+    [
+        (
+            lambda data: data["plugins"].append(dict(data["plugins"][0])),
+            "exactly one mercury-finance plugin",
+        ),
+        (
+            lambda data: data["plugins"][0]["source"].update({"path": "./plugins/other"}),
+            "source must be local ./plugins/mercury-finance",
+        ),
+        (
+            lambda data: data["plugins"][0]["policy"].update(
+                {"installation": "INSTALLED_BY_DEFAULT"}
+            ),
+            "installation policy must be AVAILABLE",
+        ),
+        (
+            lambda data: data["plugins"][0]["policy"].update({"authentication": "ON_USE"}),
+            "authentication policy must be ON_INSTALL",
+        ),
+    ],
+    ids=["multiple", "source-path", "installation", "authentication"],
+)
+def test_release_validator_rejects_invalid_marketplace_contract(
+    tmp_path: Path,
+    mutate,
+    expected_error: str,
+) -> None:
+    release_root = _release_layout(tmp_path, pinned_launcher=True)
+    _rewrite_marketplace(release_root, mutate)
+
+    result = _run_release_validator(release_root)
+
+    assert result.returncode == 1
+    assert expected_error in result.stdout
+
+
 def test_judge_quickstart_matches_current_public_plugin() -> None:
     text = (ROOT / "docs/JUDGE_QUICKSTART.md").read_text(encoding="utf-8")
 
@@ -558,6 +700,14 @@ def test_judge_quickstart_matches_current_public_plugin() -> None:
     assert "token provided by the Mercury demo owner" not in text
     assert "SUPABASE_SERVICE_ROLE_KEY" not in text
     assert "client_secret =" not in text
+
+
+def test_task_16_report_uses_dev_extra_for_pytest_commands() -> None:
+    report = (ROOT / ".superpowers/sdd/task-16-report.md").read_text(encoding="utf-8")
+    pytest_commands = [line for line in report.splitlines() if "pytest" in line]
+
+    assert pytest_commands
+    assert all("uv run --extra dev pytest" in line for line in pytest_commands)
 
 
 def test_plugin_package_has_no_embedded_secret_env_names_or_values() -> None:
