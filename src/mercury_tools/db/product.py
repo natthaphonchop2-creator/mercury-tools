@@ -144,6 +144,15 @@ PUBLIC_CONNECTOR_METADATA_KEYS = frozenset(
         "source",
     }
 )
+LEGACY_VAULT_KEYS = frozenset(
+    {
+        "server_vault",
+        "ciphertext",
+        "credential_vault",
+        "encrypted_credentials",
+        "vault_record",
+    }
+)
 
 
 def slugify(value: str, *, fallback: str = "workspace") -> str:
@@ -288,8 +297,20 @@ def public_connector_profiles(profiles: Any) -> list[dict[str, Any]]:
     ]
 
 
+def _strip_legacy_vault_values(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _strip_legacy_vault_values(item)
+            for key, item in value.items()
+            if str(key).strip().casefold().replace("-", "_") not in LEGACY_VAULT_KEYS
+        }
+    if isinstance(value, list):
+        return [_strip_legacy_vault_values(item) for item in value]
+    return value
+
+
 def public_product_event(row: dict[str, Any]) -> dict[str, Any]:
-    return redact_json(dict(row))
+    return redact_json(_strip_legacy_vault_values(dict(row)))
 
 
 def connector_profile_status_from_metadata(metadata: dict[str, Any] | None) -> str:
