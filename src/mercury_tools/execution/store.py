@@ -17,6 +17,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from mercury_tools.execution.models import PreparedRequest, RequestState
+from mercury_tools.local.operation_lock import repository_locked, repository_operation_lock
 from mercury_tools.local.repository import RepositoryContext
 
 _PENDING_STATES = (
@@ -48,13 +49,20 @@ class LocalRequestStore:
             raise ValueError("invalid_repository_context")
         self._context = context
         self._database = context.cache_dir / "requests.sqlite"
-        self._validate_storage_path()
-        self._initialize()
+        try:
+            with repository_operation_lock(context):
+                self._validate_storage_path()
+                self._initialize()
+        except ValueError as exc:
+            if str(exc) == "invalid_operation_lock_path":
+                raise ValueError("invalid_request_store_path") from exc
+            raise
 
     @property
     def database_path(self) -> Path:
         return self._database
 
+    @repository_locked
     def create_preview(self, prepared: PreparedRequest) -> PreparedRequest:
         request = self._validated_request(prepared)
         if request.repository_id != self._context.repository_id:
@@ -94,11 +102,13 @@ class LocalRequestStore:
                 raise RequestStateError("request_already_exists") from exc
         return awaiting_confirmation
 
+    @repository_locked
     def get(self, request_id: str) -> PreparedRequest:
         with self._immediate_transaction() as connection:
             request = self._fetch(connection, request_id)
             return self._expire_if_needed(connection, request)
 
+    @repository_locked
     def confirm(self, request_id: str, payload_hash: str) -> PreparedRequest:
         with self._immediate_transaction() as connection:
             request = self._fetch(connection, request_id)
@@ -127,6 +137,7 @@ class LocalRequestStore:
             self._store(connection, updated)
             return updated
 
+    @repository_locked
     def invalidate(self, request_id: str, reason: str) -> PreparedRequest:
         if _REASON.fullmatch(reason) is None:
             raise RequestStateError("invalid_invalidation_reason")
@@ -141,12 +152,14 @@ class LocalRequestStore:
             self._store(connection, updated)
             return updated
 
+    @repository_locked
     def require_ready(self, request_id: str) -> PreparedRequest:
         with self._immediate_transaction() as connection:
             request = self._expire_if_needed(connection, self._fetch(connection, request_id))
             self._require_state(request, RequestState.READY_TO_EXECUTE)
             return request
 
+    @repository_locked
     def fail_before_dispatch(
         self,
         request_id: str,
@@ -167,6 +180,7 @@ class LocalRequestStore:
             self._store(connection, updated)
             return updated
 
+    @repository_locked
     def start_execution(self, request_id: str) -> PreparedRequest:
         with self._immediate_transaction() as connection:
             request = self._expire_if_needed(connection, self._fetch(connection, request_id))
@@ -183,6 +197,7 @@ class LocalRequestStore:
                 raise self._replay_error(connection, request.payload_hash) from exc
             return updated
 
+    @repository_locked
     def complete(
         self,
         request_id: str,
@@ -216,6 +231,7 @@ class LocalRequestStore:
             self._store(connection, updated)
             return updated
 
+    @repository_locked
     def invalidate_pending(
         self,
         connector_id: str | None = None,
@@ -254,6 +270,7 @@ class LocalRequestStore:
                 )
             return len(rows)
 
+    @repository_locked
     def assert_replay_allowed(self, payload_hash: str) -> None:
         if not _payload_hash(payload_hash):
             raise RequestStateError("invalid_payload_hash")

@@ -10,15 +10,18 @@ import re
 import secrets
 import stat
 import unicodedata
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from functools import wraps
 from io import StringIO
 from pathlib import Path
+from typing import Any, TypeVar, cast
 
 from dotenv import dotenv_values
 
 from mercury_tools.drivers.models import CredentialField, CredentialStatus
+from mercury_tools.local.operation_lock import repository_operation_lock
 from mercury_tools.local.repository import RepositoryContext
 
 _DOTENV_ASSIGNMENT = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
@@ -27,6 +30,19 @@ _SIMPLE_COMPONENT = re.compile(r"^[a-z][a-z0-9]*$")
 _SIMPLE_FIELD = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 _PROFILE_METADATA_PREFIX = "_MERCURY_PROFILE_INDEX_"
 _HASH_LENGTH = 12
+
+_Return = TypeVar("_Return")
+
+
+def _credential_locked(method: Callable[..., _Return]) -> Callable[..., _Return]:
+    @wraps(method)
+    def wrapped(owner: Any, *args: Any, **kwargs: Any) -> _Return:
+        with _validated_parent_fd(owner._root, owner._parent):
+            pass
+        with repository_operation_lock(owner._context):
+            return method(owner, *args, **kwargs)
+
+    return cast(Callable[..., _Return], wrapped)
 
 
 @dataclass
@@ -72,6 +88,7 @@ class CredentialStore:
             document = self._read(parent_fd)
         return _status_from_document(connector_id, environment, field_names, document)
 
+    @_credential_locked
     def save(
         self,
         connector_id: str,
@@ -137,6 +154,7 @@ class CredentialStore:
             if document.values.get(environment_name, "") != ""
         }
 
+    @_credential_locked
     def clear(
         self,
         connector_id: str | None = None,

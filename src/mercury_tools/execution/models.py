@@ -10,10 +10,12 @@ import hashlib
 import json
 import re
 import secrets
+import unicodedata
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Literal
+from urllib.parse import quote, unquote
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -30,16 +32,61 @@ _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _PAYLOAD_HASH = re.compile(r"^[0-9a-f]{64}$")
 _REQUEST_ID = re.compile(r"^req_[0-9a-z_]{8,128}$")
 _IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
-_PUBLIC_STRUCTURAL_KEY = re.compile(r"^[a-z][A-Za-z0-9_-]{0,127}$")
-_DYNAMIC_PROVIDER_KEY = re.compile(r"^[A-Za-z]{2,12}[_-]([A-Za-z0-9]{6,})$")
-_UUID_KEY = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
-    re.IGNORECASE,
-)
-_OPAQUE_HEX_KEY = re.compile(r"^[0-9a-f]{16,}$", re.IGNORECASE)
-_OPAQUE_ALNUM_KEY = re.compile(r"^[A-Za-z0-9]{12,}$")
+_PATH_PLACEHOLDER = re.compile(r"^\{([A-Za-z][A-Za-z0-9_]*)\}$")
 _FORBIDDEN_HEADER_NAMES = frozenset(
     {"authorization", "cookie", "host", "proxy-authorization", "set-cookie"}
+)
+# Public previews expose only these documented structural names. Values are
+# always replaced by shape markers before leaving the local state boundary.
+_PREVIEW_SUMMARY_KEYS = frozenset(
+    {
+        "amount",
+        "body",
+        "content_type",
+        "count",
+        "currency",
+        "customer",
+        "document",
+        "document_type",
+        "fields",
+        "files",
+        "has_body",
+        "headers",
+        "idempotency",
+        "items",
+        "line_items",
+        "name",
+        "operation",
+        "path",
+        "query",
+        "record",
+        "records",
+        "request",
+        "resource",
+        "resources",
+        "total",
+    }
+)
+_RESPONSE_SUMMARY_KEYS = frozenset(
+    {
+        "count",
+        "customer",
+        "data",
+        "document_number",
+        "error",
+        "error_code",
+        "http_status",
+        "invoice_number",
+        "items",
+        "latency_ms",
+        "outcome",
+        "provider_code",
+        "provider_status",
+        "result",
+        "status",
+        "status_class",
+        "success",
+    }
 )
 _SENSITIVE_PUBLIC_KEY_PARTS = frozenset(
     {
@@ -131,6 +178,7 @@ class PreparedRequest(BaseModel):
     action_id: str
     version_id: str
     method: Literal["POST", "PUT", "PATCH", "DELETE"]
+    path_template: str
     final_path: str
     sanitized_summary: dict[str, Any]
     request_inputs: dict[str, Any]
@@ -155,6 +203,15 @@ class PreparedRequest(BaseModel):
             raise ValueError("invalid_request_binding")
         if self.method not in _MUTATING_METHODS or not _valid_final_path(self.final_path):
             raise ValueError("invalid_request_binding")
+        try:
+            rendered_path = render_action_path(
+                self.path_template,
+                self.request_inputs.get("path", {}),
+            )
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("invalid_action_path") from None
+        if not secrets.compare_digest(self.final_path, rendered_path):
+            raise ValueError("request_path_mismatch")
         if _PAYLOAD_HASH.fullmatch(self.payload_hash) is None:
             raise ValueError("invalid_payload_hash")
         if self.required_confirmations not in (1, 2):
@@ -184,13 +241,23 @@ class PreparedRequest(BaseModel):
         object.__setattr__(
             self,
             "sanitized_summary",
-            deep_freeze(_sanitize_public_data(self.sanitized_summary)),
+            deep_freeze(
+                _sanitize_public_data(
+                    self.sanitized_summary,
+                    _PREVIEW_SUMMARY_KEYS,
+                )
+            ),
         )
         object.__setattr__(self, "request_inputs", deep_freeze(self.request_inputs))
         object.__setattr__(
             self,
             "response_summary",
-            deep_freeze(_sanitize_public_data(self.response_summary)),
+            deep_freeze(
+                _sanitize_public_data(
+                    self.response_summary,
+                    _RESPONSE_SUMMARY_KEYS,
+                )
+            ),
         )
         return self
 
@@ -252,6 +319,18 @@ class PreparedRequest(BaseModel):
             final_path = _request_field(request, "path", None)
         summary = _request_field(request, "sanitized_summary", {})
         inputs = _request_field(request, "request_inputs", {})
+        try:
+            rendered_path = render_action_path(
+                action.path_template,
+                inputs.get("path", {}) if isinstance(inputs, Mapping) else None,
+            )
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("invalid_action_path") from None
+        if not isinstance(final_path, str) or not secrets.compare_digest(
+            final_path,
+            rendered_path,
+        ):
+            raise ValueError("request_path_mismatch")
         binding_payload = _binding_payload(
             repository_id=repository.repository_id,
             connector_id=action.connector_id,
@@ -279,6 +358,7 @@ class PreparedRequest(BaseModel):
             action_id=action.action_id,
             version_id=action.version_id,
             method=method,
+            path_template=action.path_template,
             final_path=final_path,
             sanitized_summary=summary,
             request_inputs=inputs,
@@ -322,14 +402,21 @@ class PreparedRequest(BaseModel):
             "action_id": self.action_id,
             "version_id": self.version_id,
             "method": self.method,
-            "sanitized_summary": _public_summary(self.sanitized_summary),
+            "target": self.path_template,
+            "sanitized_summary": _public_summary(
+                self.sanitized_summary,
+                _PREVIEW_SUMMARY_KEYS,
+            ),
             "payload_hash": self.payload_hash,
             "risk_tier": int(self.risk_tier),
             "required_confirmations": self.required_confirmations,
             "confirmation_count": self.confirmation_count,
             "state": self.state.value,
             "failure_reason": self.failure_reason,
-            "response_summary": _public_summary(self.response_summary),
+            "response_summary": _public_summary(
+                self.response_summary,
+                _RESPONSE_SUMMARY_KEYS,
+            ),
             "created_at": self.created_at.isoformat(),
             "expires_at": self.expires_at.isoformat(),
         }
@@ -364,6 +451,69 @@ def _valid_final_path(value: str) -> bool:
         and "\\" not in value
         and "://" not in value
     )
+
+
+def render_action_path(path_template: str, path_parameters: Any) -> str:
+    """Render one catalog path template from an exact set of segment values."""
+
+    if not isinstance(path_template, str) or not _valid_final_path(path_template):
+        raise ValueError("invalid_action_path")
+    if not isinstance(path_parameters, Mapping):
+        raise ValueError("invalid_action_path")
+    if any(not isinstance(key, str) for key in path_parameters):
+        raise ValueError("invalid_action_path")
+
+    placeholders: dict[str, int] = {}
+    rendered_segments: list[str] = []
+    for segment in path_template.split("/"):
+        match = _PATH_PLACEHOLDER.fullmatch(segment)
+        if match is not None:
+            name = match.group(1)
+            if name in placeholders:
+                raise ValueError("invalid_action_path")
+            placeholders[name] = len(rendered_segments)
+            rendered_segments.append("")
+            continue
+        if "{" in segment or "}" in segment:
+            raise ValueError("invalid_action_path")
+        _validate_path_segment(segment, allow_empty=not segment)
+        rendered_segments.append(segment)
+
+    if set(path_parameters) != set(placeholders):
+        raise ValueError("invalid_action_path")
+    for name, index in placeholders.items():
+        raw_value = path_parameters[name]
+        if isinstance(raw_value, bool) or not isinstance(raw_value, (str, int)):
+            raise ValueError("invalid_action_path")
+        raw_segment = str(raw_value)
+        _validate_path_segment(raw_segment)
+        rendered_segments[index] = quote(raw_segment, safe="-._~", encoding="utf-8")
+
+    rendered = "/".join(rendered_segments)
+    if not _valid_final_path(rendered):
+        raise ValueError("invalid_action_path")
+    return rendered
+
+
+def _validate_path_segment(value: str, *, allow_empty: bool = False) -> None:
+    if not isinstance(value, str) or (not value and not allow_empty):
+        raise ValueError("invalid_action_path")
+    decoded = value
+    for _ in range(len(value) + 2):
+        if (
+            decoded in {".", ".."}
+            or "/" in decoded
+            or "\\" in decoded
+            or "?" in decoded
+            or "#" in decoded
+            or any(unicodedata.category(character) == "Cc" for character in decoded)
+        ):
+            raise ValueError("invalid_action_path")
+        next_value = unquote(decoded, encoding="utf-8", errors="strict")
+        if next_value == decoded:
+            return
+        decoded = next_value
+    raise ValueError("invalid_action_path")
 
 
 def _is_reason(value: str) -> bool:
@@ -409,31 +559,31 @@ def _validate_state_fields(request: PreparedRequest) -> None:
         raise ValueError("invalid_request_state")
 
 
-def _sanitize_public_data(value: Any) -> dict[str, Any]:
+def _sanitize_public_data(value: Any, allowlist: frozenset[str]) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError("invalid_public_summary")
-    sanitized = _redact_public_value(redact_json(dict(value)))
+    sanitized = _redact_public_value(value, allowlist)
     if not isinstance(sanitized, dict):
         raise ValueError("invalid_public_summary")
     return sanitized
 
 
-def _redact_public_value(value: Any) -> Any:
+def _redact_public_value(value: Any, allowlist: frozenset[str]) -> Any:
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
         for key, item in value.items():
             name = str(key)
-            if not _is_safe_public_key(name):
+            if name not in allowlist:
                 continue
             compact = re.sub(r"[^a-z0-9]", "", name.casefold())
             if any(part in compact for part in _SENSITIVE_PUBLIC_KEY_PARTS):
                 result[name] = "[REDACTED]"
             else:
-                result[name] = _redact_public_value(item)
+                result[name] = _redact_public_value(item, allowlist)
         return result
     if isinstance(value, (tuple, list)):
-        return [_redact_public_value(item) for item in value]
-    return value
+        return [_redact_public_value(item, allowlist) for item in value]
+    return redact_json(value)
 
 
 def _string_mapping(value: Any, error: str) -> dict[str, str]:
@@ -454,41 +604,27 @@ def _thaw(value: Any) -> Any:
     return value
 
 
-def _public_summary(value: Mapping[str, Any]) -> dict[str, Any]:
+def _public_summary(
+    value: Mapping[str, Any],
+    allowlist: frozenset[str],
+) -> dict[str, Any]:
     """Expose summary shape without copying business values out of local state."""
 
     return {
-        str(key): _summary_shape(item)
+        str(key): _summary_shape(item, allowlist)
         for key, item in value.items()
-        if _is_safe_public_key(str(key))
+        if str(key) in allowlist
     }
 
 
-def _summary_shape(value: Any) -> Any:
+def _summary_shape(value: Any, allowlist: frozenset[str] | None = None) -> Any:
+    selected = allowlist or _PREVIEW_SUMMARY_KEYS
     if isinstance(value, Mapping):
         return {
-            str(key): _summary_shape(item)
+            str(key): _summary_shape(item, selected)
             for key, item in value.items()
-            if _is_safe_public_key(str(key))
+            if str(key) in selected
         }
     if isinstance(value, (tuple, list)):
-        return [_summary_shape(item) for item in value]
+        return [_summary_shape(item, selected) for item in value]
     return "[REDACTED]"
-
-
-def _is_safe_public_key(key: str) -> bool:
-    if _PUBLIC_STRUCTURAL_KEY.fullmatch(key) is None:
-        return False
-    if _UUID_KEY.fullmatch(key) is not None or _OPAQUE_HEX_KEY.fullmatch(key) is not None:
-        return False
-    if _OPAQUE_ALNUM_KEY.fullmatch(key) is not None and any(
-        character.isdigit() for character in key
-    ):
-        return False
-    provider_match = _DYNAMIC_PROVIDER_KEY.fullmatch(key)
-    if provider_match is not None:
-        suffix = provider_match.group(1)
-        if any(character.isdigit() for character in suffix) or len(suffix) >= 12:
-            return False
-    compact = re.sub(r"[^a-z0-9]", "", key.casefold())
-    return not compact.startswith(("bearer", "githubpat", "skproj", "xoxb", "xoxp"))

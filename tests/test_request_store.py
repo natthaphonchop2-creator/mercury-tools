@@ -223,6 +223,140 @@ def test_from_template_requires_request_method_to_match_action(
         )
 
 
+def test_from_template_requires_static_action_path_to_match_exactly(
+    repository_context: RepositoryContext,
+    catalog_action: CatalogAction,
+) -> None:
+    template = RequestTemplate(final_path="/payments/approve")
+    payload_hash = canonical_payload_hash(
+        binding_payload(
+            repository_context,
+            catalog_action,
+            template,
+            RiskDecision(RiskTier.STANDARD_WRITE, 1, ()),
+        )
+    )
+
+    with pytest.raises(ValueError, match="^request_path_mismatch$"):
+        make_prepared_request(
+            repository_context,
+            catalog_action,
+            template=template,
+            payload_hash=payload_hash,
+        )
+
+
+def test_from_template_renders_dynamic_action_path_deterministically(
+    repository_context: RepositoryContext,
+    action_factory: Any,
+) -> None:
+    action = action_factory(
+        path_template="/invoices/{invoice_id}",
+        input_schema={
+            "path": {"invoice_id": {"type": "string"}},
+            "query": {},
+            "headers": {},
+            "body": {"type": "object"},
+            "files": {},
+        },
+    )
+    template = RequestTemplate(
+        final_path="/invoices/INV%20%E0%B9%91%20~",
+        request_inputs={
+            "path": {"invoice_id": "INV ๑ ~"},
+            "body": {"amount": 1000},
+        },
+    )
+
+    prepared = make_prepared_request(
+        repository_context,
+        action,
+        template=template,
+    )
+
+    assert prepared.final_path == "/invoices/INV%20%E0%B9%91%20~"
+    assert prepared.public_dict()["target"] == "/invoices/{invoice_id}"
+
+
+def test_from_template_rejects_dynamic_final_path_mismatch(
+    repository_context: RepositoryContext,
+    action_factory: Any,
+) -> None:
+    action = action_factory(path_template="/invoices/{invoice_id}")
+    template = RequestTemplate(
+        final_path="/payments/approve",
+        request_inputs={"path": {"invoice_id": "INV-1"}, "body": {}},
+    )
+    payload_hash = canonical_payload_hash(
+        binding_payload(
+            repository_context,
+            action,
+            template,
+            RiskDecision(RiskTier.STANDARD_WRITE, 1, ()),
+        )
+    )
+
+    with pytest.raises(ValueError, match="^request_path_mismatch$"):
+        make_prepared_request(
+            repository_context,
+            action,
+            template=template,
+            payload_hash=payload_hash,
+        )
+
+
+@pytest.mark.parametrize(
+    ("path_template", "path_parameters", "final_path"),
+    [
+        ("/invoices/{invoice_id}", {}, "/invoices/INV-1"),
+        ("/invoices/{invoice_id}", {"invoice_id": "INV-1", "extra": "x"}, "/invoices/INV-1"),
+        ("/invoices/{bad-name}", {"bad-name": "INV-1"}, "/invoices/INV-1"),
+        ("/invoices/{invoice_id}/tail", {"invoice_id": ".."}, "/invoices/../tail"),
+        ("/invoices/{invoice_id}", {"invoice_id": "%2fpayments"}, "/invoices/%252fpayments"),
+        ("/invoices/{invoice_id}", {"invoice_id": "a\\b"}, "/invoices/a%5Cb"),
+        ("/invoices/{invoice_id}", {"invoice_id": "x?admin=true"}, "/invoices/x%3Fadmin%3Dtrue"),
+        ("/invoices/{invoice_id}", {"invoice_id": "x\x00y"}, "/invoices/x%00y"),
+    ],
+)
+def test_from_template_rejects_invalid_dynamic_action_paths(
+    repository_context: RepositoryContext,
+    action_factory: Any,
+    path_template: str,
+    path_parameters: dict[str, Any],
+    final_path: str,
+) -> None:
+    action = action_factory(
+        path_template=path_template,
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": {"type": "object"},
+            "files": {},
+        },
+    )
+    template = RequestTemplate(
+        final_path=final_path,
+        request_inputs={"path": path_parameters, "body": {}},
+    )
+    payload_hash = canonical_payload_hash(
+        binding_payload(
+            repository_context,
+            action,
+            template,
+            RiskDecision(RiskTier.STANDARD_WRITE, 1, ()),
+        )
+    )
+
+    with pytest.raises(ValueError, match="^invalid_action_path$"):
+        make_prepared_request(
+            repository_context,
+            action,
+            template=template,
+            payload_hash=payload_hash,
+        )
+
+
 def test_from_template_enforces_effective_runtime_risk_floor(
     repository_context: RepositoryContext,
     action_factory: Any,
@@ -245,24 +379,25 @@ def test_from_template_enforces_effective_runtime_risk_floor(
 
 
 @pytest.mark.parametrize(
-    ("field", "replacement"),
+    ("field", "replacement", "error_code"),
     [
-        ("repository_id", "repo_changed"),
-        ("connector_id", "peak"),
-        ("environment", "sandbox"),
-        ("action_id", "act_changed"),
-        ("version_id", "ver_changed"),
-        ("method", "PATCH"),
-        ("final_path", "/changed"),
-        ("request_inputs", {"body": {"amount": 9999}}),
-        ("risk_tier", RiskTier.HIGH_RISK),
-        ("required_confirmations", 2),
+        ("repository_id", "repo_changed", "payload_hash_mismatch"),
+        ("connector_id", "peak", "payload_hash_mismatch"),
+        ("environment", "sandbox", "payload_hash_mismatch"),
+        ("action_id", "act_changed", "payload_hash_mismatch"),
+        ("version_id", "ver_changed", "payload_hash_mismatch"),
+        ("method", "PATCH", "payload_hash_mismatch"),
+        ("final_path", "/changed", "request_path_mismatch"),
+        ("request_inputs", {"body": {"amount": 9999}}, "payload_hash_mismatch"),
+        ("risk_tier", RiskTier.HIGH_RISK, "payload_hash_mismatch"),
+        ("required_confirmations", 2, "payload_hash_mismatch"),
     ],
 )
 def test_model_validation_rejects_changed_binding_field(
     prepared_request: PreparedRequest,
     field: str,
     replacement: Any,
+    error_code: str,
 ) -> None:
     payload = prepared_request.model_dump(mode="json")
     payload[field] = replacement
@@ -271,7 +406,7 @@ def test_model_validation_rejects_changed_binding_field(
     if field == "required_confirmations":
         payload["risk_tier"] = 2
 
-    with pytest.raises(ValidationError, match="payload_hash_mismatch"):
+    with pytest.raises(ValidationError, match=error_code):
         PreparedRequest.model_validate(payload)
 
 
@@ -354,6 +489,51 @@ def test_public_summary_drops_sensitive_values_encoded_as_dynamic_keys(
     assert "Ada Lovelace" not in str(public)
     assert "AdaLovelace" not in str(public)
     assert "abcDef123456789" not in str(public)
+
+
+def test_public_summary_uses_fixed_preview_and_response_keys_at_every_depth(
+    prepared_request: PreparedRequest,
+) -> None:
+    request = prepared_request.model_copy(
+        update={
+            "sanitized_summary": {
+                "body": {
+                    "document_type": "invoice",
+                    "adaLovelace": "present",
+                    "cus_abcdef": "present",
+                },
+                "adaLovelace": {"document_type": "invoice"},
+            },
+            "response_summary": {
+                "status_class": "2xx",
+                "result": {
+                    "status": "created",
+                    "adaLovelace": "present",
+                    "cus_abcdef": "present",
+                },
+                "items": [
+                    {
+                        "status": "created",
+                        "body": {"document_type": "must-not-cross-allowlists"},
+                    }
+                ],
+                "body": {"document_type": "must-not-cross-allowlists"},
+            },
+        }
+    )
+
+    public = request.public_dict()
+
+    assert public["sanitized_summary"] == {
+        "body": {"document_type": "[REDACTED]"}
+    }
+    assert public["response_summary"] == {
+        "status_class": "[REDACTED]",
+        "result": {"status": "[REDACTED]"},
+        "items": [{"status": "[REDACTED]"}],
+    }
+    assert "adaLovelace" not in str(public)
+    assert "cus_abcdef" not in str(public)
 
 
 def test_tier_two_needs_two_confirmations(

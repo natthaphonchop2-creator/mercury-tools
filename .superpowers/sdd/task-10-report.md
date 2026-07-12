@@ -90,3 +90,50 @@ and an append-only local audit ledger without adding network execution.
   and retained-descriptor identity checks around WAL connections.
 - Audit lookup streams with 64 KiB line, 8 MiB byte, and 100,000-line scan caps
   and does not return an early match from a ledger that later exceeds a bound.
+
+## Final Hardening Wave
+
+### RED Evidence
+
+1. `uv run pytest tests/test_request_store.py -q` -> `11 failed, 48 passed`.
+   Static and dynamic action paths were trusted, unsafe path parameters were not
+   rejected, no safe target was exposed, and heuristic public-summary keys
+   remained visible.
+2. `uv run pytest tests/test_operation_lock.py tests/test_credential_cli.py -q`
+   failed during collection because the repository operation-lock module did not
+   exist. The added forked-process interleaving tests exercise clear versus
+   preview readiness and credential save versus clear.
+3. `uv run pytest tests/test_local_audit.py -q` -> `15 failed, 5 passed`.
+   Known-field cycles recursed, field values were weakly typed, duplicate IDs
+   used last-row-wins behavior, no event index existed, and ledgers beyond 8 MiB
+   were unavailable.
+4. The response-list allowlist regression test failed once before nested lists
+   retained the response-summary allowlist instead of falling back to preview
+   keys.
+
+### GREEN Evidence
+
+- Focused request/audit/credential/lock/repository/redaction suite:
+  `uv run pytest tests/test_request_store.py tests/test_local_audit.py tests/test_audit.py tests/test_local_credentials.py tests/test_credential_cli.py tests/test_connector_setup.py tests/test_operation_lock.py tests/test_local_repository.py tests/test_redaction.py -q`
+  -> `344 passed`.
+- Full non-integration: `uv run pytest -q -m 'not integration'`
+  -> `1035 passed, 1 deselected, 1 warning`.
+- Ruff: `uv run ruff check .` -> `All checks passed!`.
+- Diff check: `git diff --check` -> passed with no output.
+
+### Final Hardening Delivered
+
+- Structured segment renderer binds the verified final path to the catalog
+  template and exact path-parameter set, rejects encoded traversal and path
+  ambiguity, and exposes only the action template as the public target.
+- Fixed preview and response structural allowlists replace runtime key
+  heuristics at every depth.
+- One owner-only, no-follow repository operation lock serializes request-store
+  mutations and credential setup/clear operations with process/thread
+  reentrancy and a portable fallback.
+- Audit fields now have bounded field-specific validation before scalar
+  redaction; unknown values are never traversed and artifact paths retain only
+  opaque Mercury references.
+- The append-only JSONL ledger now has an owner-only SQLite event index with
+  row hashes, byte offsets, ledger fingerprints, streaming stale-index rebuild,
+  duplicate detection, and exact bounded lookup beyond the former 8 MiB cap.

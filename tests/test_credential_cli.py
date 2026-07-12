@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import multiprocessing
+import queue
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -19,6 +24,84 @@ from mercury_tools.local.repository import (
     load_repository_config,
     record_connector_validation,
 )
+
+_MP_CLEAR_ENTERED: Any = None
+_MP_CLEAR_RELEASE: Any = None
+_MP_ORIGINAL_CLEAR: Any = None
+_MP_SAVE_ENTERED: Any = None
+_MP_SAVE_RELEASE: Any = None
+_MP_ORIGINAL_WRITE: Any = None
+
+
+def _paused_credential_clear(self: CredentialStore, *args: Any, **kwargs: Any) -> int:
+    _MP_CLEAR_ENTERED.set()
+    if not _MP_CLEAR_RELEASE.wait(10):
+        raise RuntimeError("test_clear_release_timeout")
+    return _MP_ORIGINAL_CLEAR(self, *args, **kwargs)
+
+
+def _paused_credential_write(self: CredentialStore, *args: Any, **kwargs: Any) -> None:
+    _MP_SAVE_ENTERED.set()
+    if not _MP_SAVE_RELEASE.wait(10):
+        raise RuntimeError("test_save_release_timeout")
+    _MP_ORIGINAL_WRITE(self, *args, **kwargs)
+
+
+def _run_clear_cli(root: Path, results: Any) -> None:
+    with contextlib.redirect_stdout(io.StringIO()):
+        code = main(
+            [
+                "credentials",
+                "clear",
+                "flowaccount",
+                "--env",
+                "production",
+                "--repo-root",
+                str(root),
+            ]
+        )
+    results.put(code)
+
+
+def _create_and_confirm_preview(
+    context: Any,
+    prepared: PreparedRequest,
+    started: Any,
+    results: Any,
+) -> None:
+    started.set()
+    try:
+        store = LocalRequestStore(context)
+        created = store.create_preview(prepared)
+        confirmed = store.confirm(created.request_id, created.payload_hash)
+        credentials = CredentialStore(context).load(
+            "flowaccount",
+            "production",
+            (
+                CredentialField("client_id", secret=False, label="Client ID"),
+                CredentialField("client_secret", secret=True, label="Client Secret"),
+            ),
+        )
+        results.put((confirmed.state.value, bool(credentials)))
+    except Exception as exc:  # pragma: no cover - assertion reports child outcome
+        results.put(("error", type(exc).__name__, str(exc)))
+
+
+def _save_flow_credentials_process(root: Path, results: Any) -> None:
+    try:
+        seed_flow_credentials(root)
+        results.put("saved")
+    except Exception as exc:  # pragma: no cover - assertion reports child outcome
+        results.put(("error", type(exc).__name__, str(exc)))
+
+
+def _clear_flow_credentials_process(context: Any, started: Any, results: Any) -> None:
+    started.set()
+    try:
+        cleared = CredentialStore(context).clear("flowaccount", "production")
+        results.put(("cleared", cleared))
+    except Exception as exc:  # pragma: no cover - assertion reports child outcome
+        results.put(("error", type(exc).__name__, str(exc)))
 
 
 def seed_flow_credentials(
@@ -347,6 +430,151 @@ def test_clear_failure_during_credential_delete_happens_after_safety_state_updat
     assert "production" not in load_repository_config(context).validations.get(
         "flowaccount", {}
     )
+
+
+@pytest.mark.skipif(
+    "fork" not in multiprocessing.get_all_start_methods(),
+    reason="requires inherited process instrumentation",
+)
+def test_clear_holds_repository_lock_until_credentials_are_deleted(
+    tmp_path: Path,
+    catalog_action: CatalogAction,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_clear_failure_state(tmp_path, catalog_action)
+    context = ensure_repository_state(tmp_path)
+    request_inputs = {"body": {"amount": 2000}}
+    payload_hash = canonical_payload_hash(
+        {
+            "repository_id": context.repository_id,
+            "connector_id": catalog_action.connector_id,
+            "environment": "production",
+            "action_id": catalog_action.action_id,
+            "version_id": catalog_action.version_id,
+            "method": "POST",
+            "final_path": "/invoices",
+            "request_inputs": request_inputs,
+            "risk_tier": 1,
+            "required_confirmations": 1,
+        }
+    )
+    prepared = PreparedRequest.from_template(
+        repository=context,
+        action=catalog_action,
+        environment="production",
+        request={
+            "method": "POST",
+            "final_path": "/invoices",
+            "request_inputs": request_inputs,
+        },
+        risk=RiskDecision(RiskTier.STANDARD_WRITE, 1, ()),
+        payload_hash=payload_hash,
+    )
+    process_context = multiprocessing.get_context("fork")
+    clear_entered = process_context.Event()
+    clear_release = process_context.Event()
+    preview_started = process_context.Event()
+    clear_results = process_context.Queue()
+    preview_results = process_context.Queue()
+
+    global _MP_CLEAR_ENTERED, _MP_CLEAR_RELEASE, _MP_ORIGINAL_CLEAR
+    _MP_CLEAR_ENTERED = clear_entered
+    _MP_CLEAR_RELEASE = clear_release
+    _MP_ORIGINAL_CLEAR = CredentialStore.clear
+    monkeypatch.setattr(CredentialStore, "clear", _paused_credential_clear)
+
+    clear_process = process_context.Process(
+        target=_run_clear_cli,
+        args=(tmp_path, clear_results),
+    )
+    preview_process = process_context.Process(
+        target=_create_and_confirm_preview,
+        args=(context, prepared, preview_started, preview_results),
+    )
+    clear_process.start()
+    try:
+        assert clear_entered.wait(10)
+        preview_process.start()
+        assert preview_started.wait(10)
+        with pytest.raises(queue.Empty):
+            preview_results.get(timeout=0.5)
+        clear_release.set()
+        clear_process.join(10)
+        preview_process.join(10)
+    finally:
+        clear_release.set()
+        for process in (clear_process, preview_process):
+            if process.pid is not None and process.is_alive():
+                process.terminate()
+            if process.pid is not None:
+                process.join(5)
+
+    assert clear_process.exitcode == 0
+    assert preview_process.exitcode == 0
+    assert clear_results.get(timeout=1) == 0
+    assert preview_results.get(timeout=1) == ("ready_to_execute", False)
+
+
+@pytest.mark.skipif(
+    "fork" not in multiprocessing.get_all_start_methods(),
+    reason="requires inherited process instrumentation",
+)
+def test_credential_save_and_clear_are_cross_process_serialized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    process_context = multiprocessing.get_context("fork")
+    save_entered = process_context.Event()
+    save_release = process_context.Event()
+    clear_started = process_context.Event()
+    save_results = process_context.Queue()
+    clear_results = process_context.Queue()
+
+    global _MP_SAVE_ENTERED, _MP_SAVE_RELEASE, _MP_ORIGINAL_WRITE
+    _MP_SAVE_ENTERED = save_entered
+    _MP_SAVE_RELEASE = save_release
+    _MP_ORIGINAL_WRITE = CredentialStore._write
+    monkeypatch.setattr(CredentialStore, "_write", _paused_credential_write)
+
+    save_process = process_context.Process(
+        target=_save_flow_credentials_process,
+        args=(tmp_path, save_results),
+    )
+    clear_process = process_context.Process(
+        target=_clear_flow_credentials_process,
+        args=(context, clear_started, clear_results),
+    )
+    save_process.start()
+    try:
+        assert save_entered.wait(10)
+        clear_process.start()
+        assert clear_started.wait(10)
+        with pytest.raises(queue.Empty):
+            clear_results.get(timeout=0.5)
+        save_release.set()
+        save_process.join(10)
+        clear_process.join(10)
+    finally:
+        save_release.set()
+        for process in (save_process, clear_process):
+            if process.pid is not None and process.is_alive():
+                process.terminate()
+            if process.pid is not None:
+                process.join(5)
+
+    assert save_process.exitcode == 0
+    assert clear_process.exitcode == 0
+    assert save_results.get(timeout=1) == "saved"
+    assert clear_results.get(timeout=1) == ("cleared", 2)
+    assert CredentialStore(context).load(
+        "flowaccount",
+        "production",
+        (
+            CredentialField("client_id", secret=False, label="Client ID"),
+            CredentialField("client_secret", secret=True, label="Client Secret"),
+        ),
+    ) == {}
 
 
 def test_custom_connector_requires_exact_host_confirmation(

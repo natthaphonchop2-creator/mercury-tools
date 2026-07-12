@@ -22,6 +22,7 @@ from mercury_tools.drivers.base import DriverConfigurationError
 from mercury_tools.drivers.models import ConnectionProbe, CredentialStatus
 from mercury_tools.drivers.registry import DriverRegistry, UnknownDriverError
 from mercury_tools.local.credentials import CredentialStore
+from mercury_tools.local.operation_lock import repository_operation_lock
 from mercury_tools.local.repository import (
     RepositoryConfig,
     RepositoryContext,
@@ -102,12 +103,13 @@ def cmd_credentials_setup(args: argparse.Namespace) -> int:
             values[field.name] = (
                 getpass.getpass(prompt) if field.secret else input(prompt)
             )
-        status = CredentialStore(context).save(
-            args.connector,
-            args.environment,
-            values,
-            fields,
-        )
+        with repository_operation_lock(context):
+            status = CredentialStore(context).save(
+                args.connector,
+                args.environment,
+                values,
+                fields,
+            )
     except (EOFError, KeyboardInterrupt, OSError):
         return _error("interactive_input_required")
     except (DriverConfigurationError, UnknownDriverError, ValueError):
@@ -228,21 +230,22 @@ def cmd_credentials_clear(args: argparse.Namespace) -> int:
         context = _command_context(args)
         from mercury_tools.execution.store import LocalRequestStore
 
-        LocalRequestStore(context).invalidate_pending(
-            connector_id=args.connector,
-            environment=args.environment,
-        )
-        clear_connector_validations(
-            context,
-            connector_id=args.connector,
-            environment=args.environment,
-            clear_all=args.clear_all,
-        )
-        cleared = CredentialStore(context).clear(
-            connector_id=args.connector,
-            environment=args.environment,
-            clear_all=args.clear_all,
-        )
+        with repository_operation_lock(context):
+            LocalRequestStore(context).invalidate_pending(
+                connector_id=args.connector,
+                environment=args.environment,
+            )
+            clear_connector_validations(
+                context,
+                connector_id=args.connector,
+                environment=args.environment,
+                clear_all=args.clear_all,
+            )
+            cleared = CredentialStore(context).clear(
+                connector_id=args.connector,
+                environment=args.environment,
+                clear_all=args.clear_all,
+            )
     except (OSError, ValueError):
         return _error("credential_clear_failed")
 
