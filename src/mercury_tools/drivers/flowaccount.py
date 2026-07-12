@@ -17,6 +17,7 @@ from mercury_tools.drivers.models import (
     ConnectorResult,
     CredentialField,
 )
+from mercury_tools.safety.redaction import redact_credential_text
 
 
 class _FlowAccountAuthFailure(ConnectorAuthError):
@@ -255,23 +256,8 @@ def _company_name(payload: Mapping[str, Any], sensitive_values: tuple[str, ...])
     for key in ("companyName", "company_name", "name"):
         value = payload.get(key)
         if isinstance(value, str) and value:
-            return _redact_sensitive_text(value, sensitive_values)
+            return redact_credential_text(value, sensitive_values)
     return None
-
-
-def _redact_sensitive_text(value: str, sensitive_values: tuple[str, ...]) -> str:
-    candidates = _reversibly_decoded_values(value)
-    if any(
-        secret
-        and any(
-            normalized_secret in candidate
-            for normalized_secret in _reversibly_decoded_values(secret)
-            for candidate in candidates
-        )
-        for secret in sensitive_values
-    ):
-        return "[REDACTED]"
-    return value
 
 
 def _credential_token_collision(token: str, credential_values: Any) -> bool:

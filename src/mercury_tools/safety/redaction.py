@@ -7,7 +7,7 @@ from base64 import b64decode, b64encode, urlsafe_b64decode, urlsafe_b64encode
 from collections.abc import Sequence
 from contextlib import suppress
 from typing import Any
-from urllib.parse import unquote, unquote_plus
+from urllib.parse import quote, quote_plus, unquote, unquote_plus
 
 TOKEN_RE = re.compile(
     r"(?i)\b(?:bearer\s+)?(?:sk-[a-z0-9_-]{12,}|gho_[a-z0-9_]{12,}|eyj[a-z0-9_-]{20,}|mc_[a-z0-9_-]{20,}\.[a-z0-9_-]{20,})\b"
@@ -18,16 +18,31 @@ KEY_VALUE_RE = re.compile(
 EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 THAI_TAX_ID_RE = re.compile(r"\b\d{13}\b")
 SAFE_SECRET_SCHEMA_KEYS = {"required_secret_fields", "token_url"}
-_MAX_REVERSIBLE_DECODING_DEPTH = 8
+_REDACTED = "[REDACTED]"
+_MAX_REVERSIBLE_TRANSFORM_DEPTH = 8
+_MAX_REPRESENTATIONS = 512
+_MAX_REPRESENTATION_BYTES = 4096
+_MAX_CREDENTIAL_INPUTS = 16
 
 
 def redact_credential_text(value: str, credentials: Sequence[str]) -> str:
     """Fail closed when text contains a reversible representation of a credential."""
 
     text = str(value)
-    sensitive_values = _credential_values(credentials)
-    if _contains_reversible_credential(text, sensitive_values):
-        return "[REDACTED]"
+    if not _within_representation_limit(text):
+        return _REDACTED
+    representations = _credential_representations(text, credentials)
+    candidate_values = _reversibly_decoded_values((text,))
+    if (
+        representations is None
+        or candidate_values is None
+        or any(
+            representation in candidate
+            for candidate in candidate_values
+            for representation in representations
+        )
+    ):
+        return _REDACTED
     return redact_text(text)
 
 
@@ -60,71 +75,161 @@ def redact_json(value: Any) -> Any:
     return value
 
 
-def _credential_values(credentials: Sequence[str]) -> tuple[str, ...]:
-    values = tuple(
-        dict.fromkeys(
-            value for value in credentials if isinstance(value, str) and value
+def _credential_representations(
+    text: str,
+    credentials: Sequence[str],
+) -> tuple[str, ...] | None:
+    values = _credential_values(credentials)
+    if values is None:
+        return None
+    decoded_values = _reversibly_decoded_values(values)
+    if decoded_values is None:
+        return None
+    return _reversibly_encoded_values(decoded_values, text_length=len(text))
+
+
+def _credential_values(credentials: Sequence[str]) -> tuple[str, ...] | None:
+    values: list[str] = []
+    for index, value in enumerate(credentials):
+        if index >= _MAX_CREDENTIAL_INPUTS:
+            return None
+        if not isinstance(value, str) or not value:
+            continue
+        if not _within_representation_limit(value):
+            return None
+        if value not in values:
+            values.append(value)
+
+    sensitive_values = list(values)
+    for first in values:
+        for second in values:
+            pair = f"{first}:{second}"
+            if not _within_representation_limit(pair):
+                return None
+            if pair not in sensitive_values:
+                if len(sensitive_values) >= _MAX_REPRESENTATIONS:
+                    return None
+                sensitive_values.append(pair)
+    return tuple(sensitive_values)
+
+
+def _reversibly_decoded_values(values: Sequence[str]) -> tuple[str, ...] | None:
+    known = set(values)
+    frontier = set(values)
+    for _ in range(_MAX_REVERSIBLE_TRANSFORM_DEPTH):
+        next_frontier = _add_representations(
+            known,
+            frontier,
+            _reversible_decodings,
+            text_length=None,
         )
+        if next_frontier is None:
+            return None
+        if not next_frontier:
+            return tuple(known)
+        frontier = next_frontier
+    if _has_new_representations(known, frontier, _reversible_decodings, None):
+        return None
+    return tuple(known)
+
+
+def _reversibly_encoded_values(
+    values: Sequence[str],
+    *,
+    text_length: int,
+) -> tuple[str, ...] | None:
+    known = {value for value in values if len(value) <= text_length}
+    frontier = set(known)
+    for _ in range(_MAX_REVERSIBLE_TRANSFORM_DEPTH):
+        next_frontier = _add_representations(
+            known,
+            frontier,
+            _reversible_encodings,
+            text_length=text_length,
+        )
+        if next_frontier is None:
+            return None
+        if not next_frontier:
+            return tuple(known)
+        frontier = next_frontier
+    return (
+        None
+        if _has_new_representations(known, frontier, _reversible_encodings, text_length)
+        else tuple(known)
     )
-    pairs = tuple(
-        f"{first}:{second}"
-        for first in values
-        for second in values
-    )
-    return tuple(dict.fromkeys((*values, *pairs)))
 
 
-def _contains_reversible_credential(text: str, credentials: Sequence[str]) -> bool:
-    if not credentials:
-        return False
+def _add_representations(
+    known: set[str],
+    frontier: set[str],
+    transform: Any,
+    *,
+    text_length: int | None,
+) -> set[str] | None:
+    next_frontier: set[str] = set()
+    for value in frontier:
+        representations = transform(value)
+        if representations is None:
+            return None
+        for representation in representations:
+            if representation in known:
+                continue
+            if not _within_representation_limit(representation):
+                return None
+            if text_length is not None and len(representation) > text_length:
+                continue
+            if len(known) >= _MAX_REPRESENTATIONS:
+                return None
+            known.add(representation)
+            next_frontier.add(representation)
+    return next_frontier
 
-    sensitive_values = set(credentials)
-    for credential in tuple(sensitive_values):
-        sensitive_values.update(_recursive_url_decodings(credential))
-        sensitive_values.update(_recursive_base64_decodings(credential))
 
-    needles = set(sensitive_values)
-    for credential in sensitive_values:
-        needles.update(_base64_encodings(credential))
-
-    for candidate in _recursive_url_decodings(text):
-        if any(needle in candidate for needle in needles):
+def _has_new_representations(
+    known: set[str],
+    frontier: set[str],
+    transform: Any,
+    text_length: int | None,
+) -> bool:
+    for value in frontier:
+        representations = transform(value)
+        if representations is None:
             return True
+        for representation in representations:
+            if not _within_representation_limit(representation):
+                return True
+            if (text_length is None or len(representation) <= text_length) and (
+                representation not in known
+            ):
+                return True
     return False
 
 
-def _recursive_url_decodings(value: str) -> tuple[str, ...]:
-    decoded = {value}
-    frontier = {value}
-    for _ in range(_MAX_REVERSIBLE_DECODING_DEPTH):
-        next_frontier = {
-            result
-            for item in frontier
-            for result in (unquote(item), unquote_plus(item))
-            if result not in decoded
-        }
-        if not next_frontier:
-            break
-        decoded.update(next_frontier)
-        frontier = next_frontier
-    return tuple(decoded)
+def _reversible_decodings(value: str) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            (unquote(value), unquote_plus(value), *_base64_decodings(value))
+        )
+    )
 
 
-def _recursive_base64_decodings(value: str) -> tuple[str, ...]:
-    decoded: set[str] = set()
-    frontier = {value}
-    for _ in range(_MAX_REVERSIBLE_DECODING_DEPTH):
-        next_frontier = {
-            result
-            for item in frontier
-            for result in _base64_decodings(item)
-            if result not in decoded
-        }
-        if not next_frontier:
-            break
-        decoded.update(next_frontier)
-        frontier = next_frontier
-    return tuple(decoded)
+def _reversible_encodings(value: str) -> tuple[str, ...] | None:
+    try:
+        representations = (
+            quote(value, safe=""),
+            quote_plus(value, safe=""),
+            *_base64_encodings(value),
+        )
+    except UnicodeError:
+        return None
+    return tuple(dict.fromkeys(representations))
+
+
+def _within_representation_limit(value: str) -> bool:
+    try:
+        return len(value.encode("utf-8")) <= _MAX_REPRESENTATION_BYTES
+    except UnicodeError:
+        return False
 
 
 def _base64_encodings(value: str) -> tuple[str, ...]:

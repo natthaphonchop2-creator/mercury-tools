@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from base64 import b64encode
 from datetime import UTC, datetime
 from urllib.parse import parse_qs, quote, quote_plus
 
@@ -175,6 +176,33 @@ async def test_flowaccount_company_name_redacts_reversibly_encoded_secret_and_to
     rendered = json.dumps(probe.public_dict()) + repr(probe)
     assert client_secret not in rendered
     assert access_token not in rendered
+
+
+@pytest.mark.asyncio
+async def test_flowaccount_probe_redacts_base64_encoded_derived_access_token() -> None:
+    access_token = "issued-access-token"
+    encoded_access_token = b64encode(access_token.encode()).decode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/token"):
+            return httpx.Response(200, json={"access_token": access_token})
+        assert request.headers["Authorization"] == f"Bearer {access_token}"
+        return httpx.Response(
+            200,
+            json={"companyName": f"Example Books {encoded_access_token}"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        probe = await FlowAccountDriver().validate_credentials(
+            environment="production",
+            credentials={"client_id": "client-id", "client_secret": "client-secret"},
+            client=client,
+        )
+
+    rendered = json.dumps(probe.public_dict()) + repr(probe)
+    assert probe.company_name == "[REDACTED]"
+    assert access_token not in rendered
+    assert encoded_access_token not in rendered
 
 
 @pytest.mark.asyncio

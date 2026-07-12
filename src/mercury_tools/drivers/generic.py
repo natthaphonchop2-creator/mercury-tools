@@ -26,7 +26,7 @@ from mercury_tools.drivers.models import (
     PreparedFile,
     immutable_mapping,
 )
-from mercury_tools.safety.redaction import redact_json
+from mercury_tools.safety.redaction import redact_credential_text, redact_json
 
 _REDACTED = "[REDACTED]"
 _JSON_DECODE_FAILED = object()
@@ -372,7 +372,7 @@ def _company_name(response: httpx.Response, credential_values: Sequence[str]) ->
     for key in ("company_name", "companyName", "name"):
         candidate = value.get(key)
         if isinstance(candidate, str):
-            return _redact_credential_values(candidate, credential_values)
+            return redact_credential_text(candidate, credential_values)
     return None
 
 
@@ -479,17 +479,6 @@ def _credential_values(credentials: Mapping[str, str], auth: AuthContext) -> tup
                 if token:
                     values.append(token)
     return tuple(sorted(set(values), key=len, reverse=True))
-
-
-def _redact_credential_values(value: str, credential_values: Sequence[str]) -> str:
-    decoded_values = _reversibly_decoded_values(value)
-    if any(
-        credential
-        and any(credential in decoded_value for decoded_value in decoded_values)
-        for credential in credential_values
-    ):
-        return _REDACTED
-    return value
 
 
 def _reversibly_decoded_values(value: str) -> tuple[str, ...]:

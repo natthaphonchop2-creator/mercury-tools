@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from base64 import b64encode
 from pathlib import Path
 from urllib.parse import quote, quote_plus
 
@@ -566,6 +567,66 @@ async def test_probe_fully_redacts_reversibly_encoded_auth_value_echoes() -> Non
         )
 
     assert probe.company_name == "[REDACTED]"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("driver", "credentials", "auth_value"),
+    [
+        (
+            GenericBearerDriver(
+                connector_id="custom",
+                environments={"production": "https://erp.example.test/v1"},
+            ),
+            {"token": "bearer-probe-token"},
+            "Bearer bearer-probe-token",
+        ),
+        (
+            GenericApiKeyDriver(
+                connector_id="custom",
+                placement="query",
+                key_name="api_key",
+                environments={"production": "https://erp.example.test/v1"},
+            ),
+            {"api_key": "query-probe-token"},
+            "query-probe-token",
+        ),
+        (
+            GenericBasicDriver(
+                connector_id="custom",
+                environments={"production": "https://erp.example.test/v1"},
+            ),
+            {"username": "basic-user", "password": "basic-probe-token"},
+            "Basic " + b64encode(b"basic-user:basic-probe-token").decode(),
+        ),
+    ],
+    ids=("bearer-header", "api-key-query", "basic-header"),
+)
+async def test_probe_redacts_base64_encoded_generic_auth_representations(
+    driver: GenericBearerDriver | GenericApiKeyDriver | GenericBasicDriver,
+    credentials: dict[str, str],
+    auth_value: str,
+) -> None:
+    encoded_auth_value = b64encode(auth_value.encode()).decode()
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={"company_name": f"Acme {encoded_auth_value}"},
+            )
+        )
+    ) as client:
+        probe = await driver.validate_credentials(
+            environment="production",
+            credentials=credentials,
+            client=client,
+        )
+
+    rendered = json.dumps(probe.public_dict()) + repr(probe)
+    assert probe.company_name == "[REDACTED]"
+    assert auth_value not in rendered
+    assert encoded_auth_value not in rendered
 
 
 def test_interpret_response_honors_body_error_rules_bounds_non_json_and_redacts_response(
