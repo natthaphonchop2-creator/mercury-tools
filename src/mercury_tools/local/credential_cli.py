@@ -25,6 +25,7 @@ from mercury_tools.local.credentials import CredentialStore
 from mercury_tools.local.repository import (
     RepositoryConfig,
     RepositoryContext,
+    clear_connector_validations,
     configure_connector,
     ensure_repository_state,
     load_repository_config,
@@ -230,7 +231,19 @@ def cmd_credentials_clear(args: argparse.Namespace) -> int:
             environment=args.environment,
             clear_all=args.clear_all,
         )
-    except ValueError:
+        from mercury_tools.execution.store import LocalRequestStore
+
+        LocalRequestStore(context).invalidate_pending(
+            connector_id=args.connector,
+            environment=args.environment,
+        )
+        clear_connector_validations(
+            context,
+            connector_id=args.connector,
+            environment=args.environment,
+            clear_all=args.clear_all,
+        )
+    except (OSError, ValueError):
         return _error("credential_clear_failed")
 
     _print_json({"status": "cleared", "cleared_fields": cleared})

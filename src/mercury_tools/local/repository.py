@@ -687,6 +687,65 @@ def record_connector_validation(
     return updated
 
 
+def clear_connector_validations(
+    context: RepositoryContext,
+    *,
+    connector_id: str | None = None,
+    environment: str | None = None,
+    clear_all: bool = False,
+) -> RepositoryConfig:
+    """Remove non-secret validation records without changing connector configuration."""
+
+    if clear_all:
+        if connector_id is not None or environment is not None:
+            raise ValueError("validation_clear_scope_ambiguous")
+    elif connector_id is None and environment is None:
+        raise ValueError("validation_clear_scope_required")
+    if connector_id is not None:
+        _validate_connector_identifier(connector_id)
+    if environment is not None:
+        _validate_connector_identifier(environment)
+
+    current = load_repository_config(context)
+    if clear_all:
+        validations = {}
+    else:
+        validations = {
+            configured_connector_id: {
+                configured_environment: dict(record)
+                for configured_environment, record in environments.items()
+                if not (
+                    (connector_id is None or configured_connector_id == connector_id)
+                    and (
+                        environment is None
+                        or configured_environment == environment
+                    )
+                )
+            }
+            for configured_connector_id, environments in current.validations.items()
+        }
+        validations = {
+            configured_connector_id: environments
+            for configured_connector_id, environments in validations.items()
+            if environments
+        }
+    updated = RepositoryConfig(
+        schema_version=current.schema_version,
+        trusted_hosts=_copy_trusted_hosts(current.trusted_hosts),
+        connectors={
+            configured_connector_id: {
+                configured_environment: dict(config)
+                for configured_environment, config in environments.items()
+            }
+            for configured_connector_id, environments in current.connectors.items()
+        },
+        validations=validations,
+    )
+    if updated != current:
+        _write_config_atomic(context.config_path, updated)
+    return updated
+
+
 def _ensure_gitignore(root: Path) -> None:
     _ensure_gitignore_rules(root / ".gitignore", _ROOT_GITIGNORE_LINES)
     _ensure_gitignore_rules(root / ".mercury" / ".gitignore", _MERCURY_GITIGNORE_LINES)

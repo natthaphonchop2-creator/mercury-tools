@@ -3,6 +3,7 @@
 from mercury_tools.local.repository import (
     RepositoryConfig,
     RepositoryContext,
+    clear_connector_validations,
     configure_connector,
     ensure_repository_state,
     load_repository_config,
@@ -15,6 +16,7 @@ from mercury_tools.local.repository import (
 __all__ = [
     "RepositoryConfig",
     "RepositoryContext",
+    "clear_connector_validations",
     "configure_connector",
     "ensure_repository_state",
     "load_repository_config",

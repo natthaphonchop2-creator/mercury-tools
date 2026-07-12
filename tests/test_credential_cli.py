@@ -6,13 +6,18 @@ from pathlib import Path
 
 import pytest
 
+from mercury_tools.catalog.models import CatalogAction, RiskTier
 from mercury_tools.cli import main
 from mercury_tools.drivers.models import ConnectionProbe, CredentialField
+from mercury_tools.execution.models import PreparedRequest, canonical_payload_hash
+from mercury_tools.execution.policy import RiskDecision
+from mercury_tools.execution.store import LocalRequestStore
 from mercury_tools.local.credentials import CredentialStore
 from mercury_tools.local.repository import (
     configure_connector,
     ensure_repository_state,
     load_repository_config,
+    record_connector_validation,
 )
 
 
@@ -79,6 +84,75 @@ def test_clear_all_removes_file(tmp_path: Path) -> None:
     assert main(["credentials", "clear", "--all", "--repo-root", str(tmp_path)]) == 0
 
     assert not (tmp_path / ".mercury/credentials.env").exists()
+
+
+def test_clear_scoped_invalidates_pending_preview_and_resets_matching_validation(
+    tmp_path: Path,
+    catalog_action: CatalogAction,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    action = catalog_action
+    payload_hash = canonical_payload_hash(
+        {
+            "repository_id": context.repository_id,
+            "connector_id": "flowaccount",
+            "environment": "production",
+            "action_id": action.action_id,
+            "version_id": action.version_id,
+        }
+    )
+    prepared = PreparedRequest.from_template(
+        repository=context,
+        action=action,
+        environment="production",
+        request={
+            "method": "POST",
+            "final_path": "/invoices",
+            "sanitized_summary": {"document_type": "invoice"},
+            "request_inputs": {"body": {"amount": 1000}},
+        },
+        risk=RiskDecision(RiskTier.STANDARD_WRITE, 1, ()),
+        payload_hash=payload_hash,
+    )
+    request = LocalRequestStore(context).create_preview(prepared)
+    record_connector_validation(
+        context,
+        connector_id="flowaccount",
+        environment="production",
+        company_name=None,
+        probe_action="GET /company/info",
+        validated_at="2026-07-12T00:00:00+00:00",
+    )
+    record_connector_validation(
+        context,
+        connector_id="flowaccount",
+        environment="sandbox",
+        company_name=None,
+        probe_action="GET /company/info",
+        validated_at="2026-07-12T00:00:00+00:00",
+    )
+
+    assert (
+        main(
+            [
+                "credentials",
+                "clear",
+                "flowaccount",
+                "--env",
+                "production",
+                "--repo-root",
+                str(tmp_path),
+            ]
+        )
+        == 0
+    )
+
+    stored = LocalRequestStore(context).get(request.request_id)
+    assert stored.failure_reason == "credentials_cleared"
+    config = load_repository_config(context)
+    assert "production" not in config.validations.get("flowaccount", {})
+    assert "sandbox" in config.validations["flowaccount"]
+    assert config.connectors == {}
 
 
 def test_custom_connector_requires_exact_host_confirmation(
