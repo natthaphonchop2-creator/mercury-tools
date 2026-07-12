@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import re
 import uuid
@@ -227,14 +226,11 @@ def validate_public_catalog_action(action: Any) -> None:
         or not _is_public_catalog_source_uri(action.source_uri)
     ):
         raise ValueError("cloud_catalog_projection_invalid")
-    public_text_payload = {**payload, "path_template": ""}
-    serialized = json.dumps(public_text_payload, ensure_ascii=False, sort_keys=True)
-    if sanitize_public_text(serialized) != serialized:
-        raise ValueError("cloud_catalog_projection_invalid")
 
 
 def _validate_public_catalog_contract_payload(payload: Mapping[str, Any]) -> None:
     try:
+        _validate_public_catalog_text_fields(payload)
         validate_public_api_path_template(payload["path_template"])
         _validate_public_input_schema(payload["input_schema"])
         if payload["examples"] != []:
@@ -249,6 +245,14 @@ def _validate_public_catalog_contract_payload(payload: Mapping[str, Any]) -> Non
         _validate_response_redaction(payload["response_redaction"])
     except (KeyError, OverflowError, RecursionError, TypeError, ValueError):
         raise ValueError("cloud_catalog_projection_invalid") from None
+
+
+def _validate_public_catalog_text_fields(payload: Mapping[str, Any]) -> None:
+    for field in _CATALOG_STRING_FIELDS - {"path_template"}:
+        _validate_safe_text(payload[field], max_bytes=_MAX_PUBLIC_TEXT_BYTES)
+    for field in _CATALOG_STRING_LIST_FIELDS:
+        for item in payload[field]:
+            _validate_safe_text(item, max_bytes=_MAX_PUBLIC_TEXT_BYTES)
 
 
 def _validate_public_input_schema(value: Any) -> None:

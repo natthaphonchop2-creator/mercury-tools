@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 import pytest
 import pytest_asyncio
 from starlette.applications import Starlette
 
+from mercury_tools.catalog import identity as catalog_identity
 from mercury_tools.catalog.identity import build_action_id, build_version_id
 from mercury_tools.catalog.models import CatalogAction, revalidate_catalog_action
 from mercury_tools.cloud import api as cloud_api
@@ -1719,6 +1721,101 @@ async def test_cloud_encoded_credentials_and_header_descriptors_never_cross_boun
 
 
 @pytest.mark.asyncio
+async def test_cloud_redacts_json_shaped_public_text_routes(
+    client, cloud_dependencies
+) -> None:
+    _, _, rag_store, _, skill_loader = cloud_dependencies
+    json_text = (
+        ' \n [[{"name":"Authorization","value":"Bearer rag-json-secret"}],'
+        '[{"header":"Cookie","value":"sid=route-json-secret"}]] \t'
+    )
+    skill_loader.markdown = json_text
+    rag_store.search_knowledge = lambda **_kwargs: [
+        SearchResult(
+            chunk_id="chunk-json",
+            document_id="document-json",
+            document_uri="mercury://wiki/vat-json",
+            chunk_uri="mercury://wiki/vat-json#chunk-0",
+            text=json_text,
+            score=0.9,
+            source_title="VAT",
+            source_uri="mercury://wiki/vat-json",
+            source_url=None,
+            source_path=None,
+            citation={"heading": "VAT"},
+            metadata={"review_status": "reviewed"},
+        )
+    ]
+    rag_store.get_document = lambda document_id: {
+        "id": document_id,
+        "document_uri": "mercury://wiki/vat-json",
+        "title": "VAT",
+        "body": json_text,
+        "sha256": "a" * 64,
+        "knowledge_sources": {
+            "title": "Wiki",
+            "source_uri": "mercury://wiki/vat-json",
+            "source_url": None,
+            "review_status": "reviewed",
+        },
+    }
+
+    responses = [
+        await client.post(
+            "/api/cloud/v1/knowledge/search",
+            json={"query": "VAT", "top_k": 4},
+        ),
+        await client.get("/api/cloud/v1/skills/vat-summary-th"),
+        await client.get(
+            "/api/cloud/v1/documents/11111111-1111-4111-8111-111111111111"
+        ),
+    ]
+
+    serialized = json.dumps([response.json() for response in responses])
+    assert all(response.status_code == 200 for response in responses)
+    assert "[REDACTED]" in serialized
+    assert "rag-json-secret" not in serialized
+    assert "route-json-secret" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_cloud_triple_encoded_authorization_never_reaches_rag_or_public_output(
+    client, cloud_dependencies
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    represented = "Authorization: Bearer triple-route-secret"
+    for _ in range(3):
+        represented = quote(represented, safe="")
+    rag_store.search_knowledge = lambda **_kwargs: [
+        SearchResult(
+            chunk_id="chunk-percent",
+            document_id="document-percent",
+            document_uri="mercury://wiki/vat-percent",
+            chunk_uri="mercury://wiki/vat-percent#chunk-0",
+            text=represented,
+            score=0.9,
+            source_title="VAT",
+            source_uri="mercury://wiki/vat-percent",
+            source_url=None,
+            source_path=None,
+            citation={"heading": "VAT"},
+            metadata={"review_status": "reviewed"},
+        )
+    ]
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": represented, "top_k": 4},
+    )
+
+    assert response.status_code == 200
+    assert represented not in rag_store.last_query
+    assert "triple-route-secret" not in rag_store.last_query
+    assert represented not in response.text
+    assert "triple-route-secret" not in response.text
+
+
+@pytest.mark.asyncio
 async def test_cloud_redacts_percent_encoded_local_paths_before_rag(
     client, cloud_dependencies
 ) -> None:
@@ -1944,6 +2041,57 @@ async def test_cloud_catalog_preserves_executable_contract_and_canonical_version
 
     assert response.status_code == 200
     assert response.json()["actions"] == [action.model_dump(mode="json")]
+
+
+@pytest.mark.asyncio
+async def test_cloud_catalog_rejects_duplicate_canonical_action_rows_before_etag(
+    client, cloud_dependencies
+) -> None:
+    _, read_action, _, catalog_store, _ = cloud_dependencies
+    next_version = read_action.model_copy(update={"description": "Updated description"})
+    next_version = next_version.model_copy(
+        update={"version_id": build_version_id(next_version)}
+    )
+    catalog_store.actions = [read_action, next_version]
+
+    response = await client.get("/api/cloud/v1/catalog/actions")
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "service_unavailable"}
+    assert "etag" not in response.headers
+
+
+@pytest.mark.asyncio
+async def test_cloud_catalog_rejects_duplicate_canonical_version_rows_before_etag(
+    client, cloud_dependencies, action_factory, monkeypatch
+) -> None:
+    _, read_action, _, catalog_store, _ = cloud_dependencies
+    other_action = action_factory(
+        method="GET",
+        path_template="/company/summary",
+        operation_id="getCompanySummary",
+        capability="company.summary.read",
+        risk_tier=0,
+        required_confirmations=0,
+        side_effects=(),
+        source_uri="mercury://catalog/global/flowaccount/source",
+    )
+    duplicate_version_id = "av_" + "b" * 64
+    catalog_store.actions = [
+        read_action.model_copy(update={"version_id": duplicate_version_id}),
+        other_action.model_copy(update={"version_id": duplicate_version_id}),
+    ]
+    monkeypatch.setattr(
+        catalog_identity,
+        "build_version_id",
+        lambda _action: duplicate_version_id,
+    )
+
+    response = await client.get("/api/cloud/v1/catalog/actions")
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "service_unavailable"}
+    assert "etag" not in response.headers
 
 
 @pytest.mark.parametrize(

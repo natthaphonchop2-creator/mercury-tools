@@ -272,13 +272,23 @@ class CloudDependencies:
     def _catalog_actions(self) -> list[CatalogAction]:
         rows = self._catalog_store().list_active_actions()
         actions: list[CatalogAction] = []
+        action_ids: set[str] = set()
+        version_ids: set[str] = set()
         for row in rows:
             if isinstance(row, CatalogAction):
                 action = revalidate_catalog_action(row)
             else:
                 validate_raw_catalog_action_payload(row)
                 action = CatalogAction.model_validate(row)
-            actions.append(_public_catalog_action(action))
+            public_action = _public_catalog_action(action)
+            if (
+                public_action.action_id in action_ids
+                or public_action.version_id in version_ids
+            ):
+                raise ValueError("cloud_catalog_duplicate")
+            action_ids.add(public_action.action_id)
+            version_ids.add(public_action.version_id)
+            actions.append(public_action)
         return sorted(actions, key=lambda item: item.action_id)
 
     def _search_knowledge(

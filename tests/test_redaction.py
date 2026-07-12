@@ -1,3 +1,4 @@
+import json
 from base64 import b64encode, urlsafe_b64encode
 from urllib.parse import quote, quote_plus
 
@@ -145,6 +146,121 @@ def test_json_redaction_recognizes_nested_header_descriptor_shapes() -> None:
             {"name": "Accept", "value": "application/json"},
         ]
     }
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            '{"header":"Authorization","value":"Bearer compact-secret"}',
+            '{"header":"Authorization","value":"[REDACTED]"}',
+        ),
+        (
+            ' \n [ { "name": "Cookie", "value": "sid=whitespace-secret" } ] \t',
+            '[{"name":"Cookie","value":"[REDACTED]"}]',
+        ),
+        (
+            (
+                '[["safe",[{"header":"Set-Cookie",'
+                '"value":"sid=nested-secret; HttpOnly"}]]]'
+            ),
+            '[["safe",[{"header":"Set-Cookie","value":"[REDACTED]"}]]]',
+        ),
+    ],
+)
+def test_text_redaction_projects_whole_json_objects_and_arrays(
+    value: str,
+    expected: str,
+) -> None:
+    assert redact_text(value) == expected
+
+
+def test_text_redaction_projects_escaped_whole_json_string() -> None:
+    represented = json.dumps(
+        json.dumps(
+            {"name": "Authorization", "value": "Bearer escaped-secret"},
+            separators=(",", ":"),
+        )
+    )
+
+    redacted = redact_text(represented)
+
+    assert "escaped-secret" not in redacted
+    assert json.loads(json.loads(redacted)) == {
+        "name": "Authorization",
+        "value": "[REDACTED]",
+    }
+
+
+def test_text_redaction_preserves_safe_whole_json_formatting() -> None:
+    value = ' \n { "name": "Accept", "value": "application/json" } \t'
+
+    assert redact_text(value) == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        '{"name":"Authorization","value":"unterminated"',
+        "[" * 33 + "]" * 33,
+    ],
+)
+def test_text_redaction_fails_closed_for_unsafe_json_projection(value: str) -> None:
+    assert redact_text(value) == "[REDACTED]"
+
+
+def _percent_encode(value: str, depth: int) -> str:
+    for _ in range(depth):
+        value = quote(value, safe="")
+    return value
+
+
+@pytest.mark.parametrize(
+    "depth",
+    [1, 2, 3, redaction._MAX_PATH_DECODE_DEPTH],
+)
+def test_text_redaction_removes_arbitrarily_nested_percent_encoded_authorization(
+    depth: int,
+) -> None:
+    represented = _percent_encode("Authorization: Bearer depth-secret", depth)
+
+    assert redact_text(represented) == "[REDACTED]"
+
+
+def test_text_redaction_fails_closed_above_percent_decode_bound() -> None:
+    represented = _percent_encode(
+        "Authorization: Bearer over-bound-secret",
+        redaction._MAX_PATH_DECODE_DEPTH + 1,
+    )
+
+    assert redact_text(represented) == "[REDACTED]"
+
+
+@pytest.mark.parametrize(
+    "depth",
+    [1, 2, 3, redaction._MAX_PATH_DECODE_DEPTH],
+)
+def test_text_redaction_preserves_bounded_nested_percent_encoded_safe_urls(
+    depth: int,
+) -> None:
+    represented = _percent_encode("https://example.test/docs/vat?topic=input", depth)
+
+    assert redact_text(represented) == represented
+
+
+def test_text_redaction_fails_closed_for_ambiguous_encoded_safe_url() -> None:
+    represented = _percent_encode(
+        "https://example.test/docs/vat?topic=input",
+        redaction._MAX_PATH_DECODE_DEPTH + 1,
+    )
+
+    assert redact_text(represented) == "[REDACTED]"
+
+
+def test_text_redaction_fails_closed_when_percent_token_exceeds_byte_bound() -> None:
+    represented = "%41" * (redaction._MAX_REPRESENTATION_BYTES + 1)
+
+    assert redact_text(represented) == "[REDACTED]"
 
 
 @pytest.mark.parametrize(

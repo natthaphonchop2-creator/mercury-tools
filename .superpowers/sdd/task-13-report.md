@@ -767,3 +767,134 @@ The warning remains the pre-existing Starlette `TestClient` deprecation warning.
   `{"properties": ...}` without an explicit object type and API paths with a
   trailing slash. Any broader schema evolution requires an explicit validator
   and request-builder compatibility update.
+
+## Fix Round 7: Final JSON, Encoding, and Catalog Review
+
+### Status
+
+DONE_WITH_CONCERNS
+
+This final review started from Cloud head `fa91562`. The concurrent Task 14
+worker committed its owned flow/local MCP changes as `9277e09` before the full
+suite. This patch changes only shared redaction, Cloud API/models, Cloud and
+redaction tests, and this Task 13 report. Cloud client envelope/cache behavior
+is unchanged.
+
+### Findings Addressed
+
+1. Whole bounded JSON object/array strings are now parsed before plain-text
+   regex projection. Recursive `redact_json` handling covers compact,
+   whitespace, escaped JSON-string, and nested-array forms, including
+   `header`/`name` descriptors for Authorization, Cookie, and Set-Cookie.
+   Unsafe parse/projection, depth, node, wrapper, input-byte, or output-byte
+   states fail closed to `[REDACTED]`. Safe JSON retains its original text and
+   formatting so repeated sanitization is deterministic.
+2. Percent decoding now uses one bounded iterative path with a maximum depth of
+   8 and a 4 KiB token budget. Depths 1, 2, 3, and 8 are inspected; values that
+   still change at depth 9 fail closed. Triple-encoded Authorization values are
+   removed from both inbound RAG queries and outbound public RAG text. Safe
+   nested URL text is preserved through the bound, while ambiguous over-bound
+   URL text is rejected.
+3. Catalog loading now rejects duplicate canonical `action_id` or `version_id`
+   rows before sorting, filtering, payload construction, or ETag calculation.
+   Both cases return the constant 503 envelope without an ETag.
+4. Generic JSON redaction is no longer applied to the complete executable
+   catalog payload during admission because schema property declarations such
+   as `access_token` and `client_secret` are names, not credential values.
+   Public scalar/list text is validated directly and executable schema/rule
+   content remains under the existing strict structural validators. All 190
+   FlowAccount and 64 PEAK builtins retain their canonical version and
+   executable request contract.
+
+### Changed Files
+
+- `.superpowers/sdd/task-13-report.md`
+- `src/mercury_tools/cloud/api.py`
+- `src/mercury_tools/cloud/models.py`
+- `src/mercury_tools/safety/redaction.py`
+- `tests/test_cloud_api.py`
+- `tests/test_redaction.py`
+
+### RED Evidence
+
+The direct JSON regression cycle failed as expected:
+
+```text
+$ .venv/bin/pytest -q tests/test_redaction.py -k 'whole_json or unsafe_json_projection'
+6 failed, 1 passed, 64 deselected
+```
+
+The iterative percent-decoding cycle failed at depth 3 and above-bound cases:
+
+```text
+$ .venv/bin/pytest -q tests/test_redaction.py -k '<percent-depth-tests>'
+4 failed, 7 passed, 60 deselected
+```
+
+The route-level and duplicate-catalog cycle failed as expected:
+
+```text
+$ .venv/bin/pytest -q tests/test_cloud_api.py -k '<json-percent-duplicate-tests>'
+4 failed, 207 deselected
+```
+
+Total expected RED failures observed: 14.
+
+### GREEN Evidence
+
+Direct shared-redaction verification:
+
+```text
+$ .venv/bin/pytest -q tests/test_redaction.py
+71 passed
+```
+
+Focused Cloud API/client/redaction/hosted/RAG verification:
+
+```text
+$ .venv/bin/pytest -q tests/test_cloud_api.py tests/test_cloud_client.py \
+    tests/test_redaction.py tests/test_http_app.py tests/test_mcp_rag_routing.py
+392 passed, 1 warning
+```
+
+Explicit executable compatibility checks:
+
+```text
+$ .venv/bin/pytest -q \
+    tests/test_cloud_api.py::test_public_catalog_validator_accepts_every_builtin_action
+2 passed  # FlowAccount 190 + PEAK 64
+
+$ .venv/bin/pytest -q \
+    tests/test_cloud_client.py::test_client_preserves_global_executable_contract_for_request_validation
+1 passed
+```
+
+Complete non-integration verification after Task 14 stabilized:
+
+```text
+$ .venv/bin/pytest -q -m 'not integration'
+1511 passed, 1 deselected, 1 warning
+
+$ .venv/bin/ruff check .
+All checks passed!
+
+$ git diff --check
+# no output
+```
+
+The warning remains the pre-existing Starlette `TestClient` deprecation warning.
+
+### Commit
+
+- Cloud base: `fa9156296e52801209d0f5b1bcbd00e42f1c88ad`
+- Current parent after concurrent Task 14: `9277e09f54025fd3ba021bb66e90308dc09d4e03`
+- Subject: `fix: close final Cloud redaction gaps`
+- Final hash: reported in the completion response because a commit cannot
+  contain its own hash.
+
+### Residual Concern
+
+- The public boundary intentionally fails closed beyond 8 percent decodes, 4
+  escaped JSON-string wrappers, 32 JSON levels, 8,192 JSON nodes, or 64 KiB of
+  JSON text. Legitimate content beyond those limits is redacted rather than
+  projected. No known in-scope credential or duplicate-catalog bypass remains.

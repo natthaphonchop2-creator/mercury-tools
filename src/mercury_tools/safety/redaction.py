@@ -56,10 +56,15 @@ _MAX_REPRESENTATIONS = 512
 _MAX_REPRESENTATION_BYTES = 4096
 _MAX_CREDENTIAL_INPUTS = 16
 _REDACTED_PATH = "[REDACTED_PATH]"
-_MAX_PATH_DECODE_DEPTH = 3
+_MAX_PATH_DECODE_DEPTH = 8
 _MAX_ENCODED_PATH_TOKEN_BYTES = 4096
+_MAX_JSON_TEXT_BYTES = 64 * 1024
+_MAX_JSON_TEXT_DEPTH = 32
+_MAX_JSON_TEXT_NODES = 8_192
+_MAX_JSON_STRING_LAYERS = 4
 _PATH_TOKEN_RE = re.compile(r"\S+")
 _PERCENT_ESCAPE_RE = re.compile(r"(?i)%[0-9a-f]{2}")
+_REDACTION_MARKER_RE = re.compile(r"\[REDACTED(?:_[A-Z]+)?\]")
 _LOCAL_PATH_ROOT_RE = re.compile(
     r"(?i)^/(?:Users|Volumes|app|data|etc|home|mnt|opt|private|root|run|srv|"
     r"tmp|usr|var|workspace)(?:/|$)"
@@ -68,10 +73,6 @@ _URL_PATH_LOCAL_ROOT_RE = re.compile(
     r"(?i)^/(?:Users|Volumes|home|mnt|private|root|tmp|usr|var|workspace)(?:/|$)"
 )
 _WINDOWS_DRIVE_RE = re.compile(r"(?i)^[A-Z]:[\\/]")
-_AMBIGUOUS_ENCODED_LOCAL_PREFIX_RE = re.compile(
-    r"(?i)^(?:(?:%(?:25){0,8}2f){1,2}|(?:%(?:25){0,8}5c){2}|"
-    r"file%(?:25){0,8}3a|[A-Z]%(?:25){0,8}3a)"
-)
 _TOKEN_WRAPPERS = "\"'()[]{}<>,.;"
 _HEADER_DESCRIPTOR_FIELDS = {
     "current",
@@ -107,9 +108,84 @@ def redact_credential_text(value: str, credentials: Sequence[str]) -> str:
 
 
 def redact_text(value: str) -> str:
-    text = _PATH_TOKEN_RE.sub(_redact_sensitive_representation, str(value))
+    text = str(value)
+    json_projection = _redact_whole_json_text(text)
+    if json_projection is not None:
+        return json_projection
+    text = _PATH_TOKEN_RE.sub(_redact_sensitive_representation, text)
     text = _PATH_TOKEN_RE.sub(_redact_unsafe_http_uri, text)
     return _redact_plain_text(text)
+
+
+def _redact_whole_json_text(value: str) -> str | None:
+    candidate = value.strip()
+    if not candidate or candidate[0] not in '{["':
+        return None
+    if all(_REDACTION_MARKER_RE.fullmatch(item) for item in candidate.split()):
+        return value
+    if not _within_json_text_limit(value):
+        return _REDACTED
+
+    encoded = candidate
+    string_layers = 0
+    try:
+        while True:
+            parsed = json.loads(encoded)
+            if isinstance(parsed, dict | list):
+                break
+            if not isinstance(parsed, str) or not parsed.strip().startswith(("{", "[")):
+                return None
+            string_layers += 1
+            if string_layers > _MAX_JSON_STRING_LAYERS or not _within_json_text_limit(parsed):
+                return _REDACTED
+            encoded = parsed.strip()
+    except (json.JSONDecodeError, RecursionError, UnicodeError):
+        return _REDACTED
+
+    if not _json_value_within_projection_bounds(parsed):
+        return _REDACTED
+    try:
+        redacted = redact_json(parsed)
+        if redacted == parsed:
+            return value
+        projected = json.dumps(
+            redacted,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        for _ in range(string_layers):
+            projected = json.dumps(
+                projected,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+    except (RecursionError, TypeError, ValueError, UnicodeError):
+        return _REDACTED
+    return projected if _within_json_text_limit(projected) else _REDACTED
+
+
+def _json_value_within_projection_bounds(value: Any) -> bool:
+    remaining = _MAX_JSON_TEXT_NODES
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        remaining -= 1
+        if remaining < 0 or depth > _MAX_JSON_TEXT_DEPTH:
+            return False
+        if isinstance(item, dict):
+            stack.extend((nested, depth + 1) for nested in item.values())
+        elif isinstance(item, list):
+            stack.extend((nested, depth + 1) for nested in item)
+    return True
+
+
+def _within_json_text_limit(value: str) -> bool:
+    try:
+        return len(value.encode("utf-8")) <= _MAX_JSON_TEXT_BYTES
+    except UnicodeError:
+        return False
 
 
 def _redact_plain_text(value: str) -> str:
@@ -205,24 +281,10 @@ def _is_local_path_representation(value: str) -> bool:
     candidate = value.strip(_TOKEN_WRAPPERS)
     if _is_safe_public_uri(candidate):
         return False
-    if not _within_path_token_limit(value):
+    decoded_values = _bounded_percent_decodings(candidate)
+    if decoded_values is None:
         return bool(_PERCENT_ESCAPE_RE.search(candidate) or _is_local_path(candidate))
-    decoded = candidate
-    for _ in range(_MAX_PATH_DECODE_DEPTH):
-        if _is_local_path(decoded):
-            return True
-        if not _PERCENT_ESCAPE_RE.search(decoded):
-            return False
-        next_value = unquote(decoded)
-        if not _within_path_token_limit(next_value):
-            return True
-        if next_value == decoded:
-            return False
-        decoded = next_value
-    return bool(
-        _is_local_path(decoded)
-        or _AMBIGUOUS_ENCODED_LOCAL_PREFIX_RE.search(decoded)
-    )
+    return any(_is_local_path(decoded) for decoded in decoded_values)
 
 
 def _is_local_path(value: str) -> bool:
@@ -346,18 +408,14 @@ def _redact_sensitive_representation(match: re.Match[str]) -> str:
         return token
     if not _within_representation_limit(token):
         return _REDACTED
-    decoded = token
-    for _ in range(2):
-        candidate = unquote(decoded)
-        if not _within_representation_limit(candidate):
-            return _REDACTED
-        if candidate == decoded:
-            break
-        if _is_local_path_representation(candidate):
+    decoded_values = _bounded_percent_decodings(token)
+    if decoded_values is None:
+        return _REDACTED
+    for candidate in decoded_values[1:]:
+        if _is_local_path(candidate):
             return _REDACTED_PATH
         if _plain_text_is_sensitive(candidate):
             return _REDACTED
-        decoded = candidate
     return token
 
 
@@ -395,10 +453,11 @@ def _sensitive_header_descriptor(value: Mapping[Any, Any]) -> bool:
             continue
         if not isinstance(item, str):
             continue
-        decoded = item
-        for _ in range(2):
-            decoded = unquote(decoded)
-        if SENSITIVE_HEADER_KEY_RE.fullmatch(decoded.strip()):
+        decoded_values = _bounded_percent_decodings(item)
+        if decoded_values is None or any(
+            SENSITIVE_HEADER_KEY_RE.fullmatch(decoded.strip())
+            for decoded in decoded_values
+        ):
             return True
     return False
 
