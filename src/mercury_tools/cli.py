@@ -146,8 +146,10 @@ def cmd_mcp_serve_local(_args: argparse.Namespace) -> int:
     """Defer the Task 14 local runtime import until this command is executed."""
 
     try:
-        from mercury_tools.local_server import serve_local
-    except ModuleNotFoundError:
+        from mercury_tools.mcp.local_server import serve_local
+    except ModuleNotFoundError as exc:
+        if exc.name != "mercury_tools.mcp.local_server":
+            raise
         _print_json({"status": "error", "error": "local_runtime_unavailable"})
         return 1
     serve_local()

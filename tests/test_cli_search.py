@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import builtins
 import json
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 
 def test_cli_search_applies_connector_inference(monkeypatch, capsys) -> None:
@@ -71,3 +74,53 @@ def test_cli_parser_exposes_local_credential_contract_without_importing_cloud_mc
         assert command in help_text
     assert callable(parsed.func)
     assert project["project"]["scripts"]["mercury"] == "mercury_tools.cli:main"
+
+
+def test_mcp_serve_local_handles_only_a_missing_local_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from mercury_tools import cli
+
+    requested: list[str] = []
+    original_import = builtins.__import__
+
+    def missing_local_runtime(name: str, *args: object, **kwargs: object) -> object:
+        requested.append(name)
+        if name == "mercury_tools.mcp.local_server":
+            raise ModuleNotFoundError(
+                "No module named 'mercury_tools.mcp.local_server'",
+                name="mercury_tools.mcp.local_server",
+            )
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_local_runtime)
+
+    assert cli.cmd_mcp_serve_local(argparse.Namespace()) == 1
+
+    assert "mercury_tools.mcp.local_server" in requested
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "local_runtime_unavailable",
+        "status": "error",
+    }
+
+
+def test_mcp_serve_local_reraises_missing_nested_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mercury_tools import cli
+
+    original_import = builtins.__import__
+
+    def missing_nested_dependency(name: str, *args: object, **kwargs: object) -> object:
+        if name == "mercury_tools.mcp.local_server":
+            raise ModuleNotFoundError(
+                "No module named 'future_nested_dependency'",
+                name="future_nested_dependency",
+            )
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_nested_dependency)
+
+    with pytest.raises(ModuleNotFoundError, match="future_nested_dependency"):
+        cli.cmd_mcp_serve_local(argparse.Namespace())

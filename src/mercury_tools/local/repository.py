@@ -578,20 +578,14 @@ def configure_connector(
     base_url: str,
     auth_settings: Mapping[str, Any],
 ) -> RepositoryConfig:
-    if not isinstance(auth_settings, Mapping):
-        raise ValueError("unsupported_auth_setting")
-    settings = dict(auth_settings)
-    allow_private_network = settings.pop("allow_private_network", False)
-    record, hosts = _normalize_connector_record(
-        connector_id,
-        environment,
-        {
-            "driver_id": driver_id,
-            "base_url": base_url,
-            "auth_settings": settings,
-            "network_policy": {"allow_private_network": allow_private_network},
-        },
+    record, trust_candidates = prepare_connector_configuration(
+        connector_id=connector_id,
+        environment=environment,
+        driver_id=driver_id,
+        base_url=base_url,
+        auth_settings=auth_settings,
     )
+    hosts = tuple(host for _, host in trust_candidates)
 
     current = load_repository_config(context)
     trusted_hosts = _copy_trusted_hosts(current.trusted_hosts)
@@ -614,6 +608,42 @@ def configure_connector(
     )
     _write_config_atomic(context.config_path, updated)
     return updated
+
+
+def prepare_connector_configuration(
+    *,
+    connector_id: str,
+    environment: str,
+    driver_id: str,
+    base_url: str,
+    auth_settings: Mapping[str, Any],
+) -> tuple[dict[str, Any], tuple[tuple[str, str], ...]]:
+    """Validate a connector record and return its canonical trust candidates."""
+
+    if not isinstance(auth_settings, Mapping):
+        raise ValueError("unsupported_auth_setting")
+    settings = dict(auth_settings)
+    allow_private_network = settings.pop("allow_private_network", False)
+    record, hosts = _normalize_connector_record(
+        connector_id,
+        environment,
+        {
+            "driver_id": driver_id,
+            "base_url": base_url,
+            "auth_settings": settings,
+            "network_policy": {"allow_private_network": allow_private_network},
+        },
+    )
+    endpoints = [record["base_url"]]
+    token_url = record["auth_settings"].get("token_url")
+    if token_url is not None:
+        endpoints.append(token_url)
+    candidates: dict[str, tuple[str, str]] = {}
+    for endpoint in endpoints:
+        parsed = urlparse(endpoint)
+        host = parsed.hostname.lower().rstrip(".")
+        candidates.setdefault(host, (parsed.scheme, host))
+    return record, tuple(candidates[host] for host in hosts)
 
 
 def record_connector_validation(

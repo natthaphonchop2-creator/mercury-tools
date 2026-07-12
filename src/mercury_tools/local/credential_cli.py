@@ -10,11 +10,9 @@ import os
 import shutil
 import stat
 import sys
-from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 import httpx
 
@@ -30,9 +28,11 @@ from mercury_tools.local.repository import (
     configure_connector,
     ensure_repository_state,
     load_repository_config,
+    prepare_connector_configuration,
     record_connector_validation,
 )
 from mercury_tools.remote import DEFAULT_RENDER_URL
+from mercury_tools.safety.redaction import redact_credential_text
 
 _BUILTIN_ENVIRONMENTS = {
     "flowaccount": ("production", "sandbox"),
@@ -142,12 +142,10 @@ async def _validate_credentials(
         )
 
 
-def _sanitize_company_name(value: str | None, credentials: Sequence[str]) -> str | None:
+def _sanitize_company_name(value: str | None, credentials: tuple[str, ...]) -> str | None:
     if not isinstance(value, str):
         return None
-    sanitized = value
-    for credential in sorted((item for item in credentials if item), key=len, reverse=True):
-        sanitized = sanitized.replace(credential, "[REDACTED]")
+    sanitized = redact_credential_text(value, credentials)
     normalized = " ".join(sanitized.split())
     return normalized[:256] or None
 
@@ -285,20 +283,6 @@ def _configure_auth_settings(args: argparse.Namespace) -> tuple[dict[str, str], 
     return auth_settings, create_options
 
 
-def _trusted_endpoints(urls: Sequence[str]) -> tuple[tuple[str, str], ...]:
-    endpoints: list[tuple[str, str]] = []
-    seen_hosts: set[str] = set()
-    for value in urls:
-        parsed = urlsplit(value)
-        if parsed.scheme != "https" or parsed.hostname is None:
-            raise ValueError("https_required")
-        host = parsed.hostname.lower().rstrip(".")
-        if host not in seen_hosts:
-            endpoints.append((parsed.scheme, host))
-            seen_hosts.add(host)
-    return tuple(endpoints)
-
-
 def _existing_connector_matches(
     config: RepositoryConfig,
     args: argparse.Namespace,
@@ -332,20 +316,23 @@ def cmd_connector_configure(args: argparse.Namespace) -> int:
         context = _command_context(args)
         config = load_repository_config(context)
         registry = DriverRegistry.for_repository(config)
-        registry.get_factory(args.driver)
         auth_settings, create_options = _configure_auth_settings(args)
+        record, endpoints = prepare_connector_configuration(
+            connector_id=args.connector,
+            environment=args.environment,
+            driver_id=args.driver,
+            base_url=args.base_url,
+            auth_settings=auth_settings,
+        )
+        registry.get_factory(args.driver)
         registry.create(
             args.driver,
             connector_id=args.connector,
-            environments={args.environment: args.base_url},
+            environments={args.environment: record["base_url"]},
             **create_options,
         )
         if not _existing_connector_matches(config, args, auth_settings):
             return _error("connector_configuration_mismatch")
-        urls = [args.base_url]
-        if args.token_url is not None:
-            urls.append(args.token_url)
-        endpoints = _trusted_endpoints(urls)
     except (DriverConfigurationError, UnknownDriverError, ValueError):
         return _error("connector_configuration_invalid")
 
@@ -407,6 +394,25 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     settings = load_settings()
     _print_json(
         {
+            "supabase": settings.supabase_configured,
+            "openai": settings.openai_configured,
+            "embedding_provider": settings.embedding_provider,
+            "embedding_configured": settings.embedding_configured,
+            "embedding_model": settings.embedding_model,
+            "embedding_dim": settings.embedding_dim,
+            "mercury_agent_path": (
+                str(settings.mercury_agent_path) if settings.mercury_agent_path else None
+            ),
+            "mercury_home": str(settings.mercury_home) if settings.mercury_home else None,
+            "mcp": {
+                "transport": settings.mcp_transport,
+                "host": settings.mcp_host,
+                "port": settings.mcp_port,
+                "path": settings.mcp_path,
+                "endpoint": settings.mcp_endpoint,
+                "http_auth_required": settings.http_require_auth,
+                "http_auth_configured": settings.http_auth_configured,
+            },
             "python_version": sys.version.split()[0],
             "uvx_available": shutil.which("uvx") is not None,
             "repository": str(context.root),
