@@ -98,10 +98,69 @@ def test_json_redaction_removes_multi_pair_cookies_and_preserves_safe_placeholde
 @pytest.mark.parametrize(
     "value",
     [
+        "Authorization%3A%20Bearer%20opaque-secret",
+        "Authorization%253A%2520Bearer%2520opaque-secret",
+        "Cookie%3A%20session%3Dopaque-secret%3B%20other%3Dreal-secret",
+        "%7B%22client_secret%22%3A%22opaque-secret%22%7D",
+        "%257B%2522authorization%2522%253A%2522opaque-secret%2522%257D",
+    ],
+)
+def test_text_redaction_removes_bounded_percent_encoded_sensitive_representations(
+    value: str,
+) -> None:
+    redacted = redact_text(value)
+
+    assert redacted == "[REDACTED]"
+    assert "opaque-secret" not in redacted
+    assert "real-secret" not in redacted
+
+
+def test_json_redaction_recognizes_nested_header_descriptor_shapes() -> None:
+    payload = redact_json(
+        {
+            "headers": [
+                {"name": "Authorization", "value": "Bearer opaque-auth"},
+                {
+                    "name": "Cookie",
+                    "value": "safe=<cookie>; private=opaque-cookie",
+                },
+                {
+                    "name": "Set-Cookie",
+                    "values": ["sid=opaque-session; HttpOnly; Path=/"],
+                },
+                {"name": "Authorization", "value": "Bearer <token>"},
+                {"name": "Cookie", "value": "session=<cookie>"},
+                {"name": "Accept", "value": "application/json"},
+            ]
+        }
+    )
+
+    assert payload == {
+        "headers": [
+            {"name": "Authorization", "value": "[REDACTED]"},
+            {"name": "Cookie", "value": "[REDACTED]"},
+            {"name": "Set-Cookie", "values": "[REDACTED]"},
+            {"name": "Authorization", "value": "Bearer <token>"},
+            {"name": "Cookie", "value": "session=<cookie>"},
+            {"name": "Accept", "value": "application/json"},
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
         "%2FUsers%2Falice%2Frepo%2Fsecret.env",
         "%252Fopt%252Fapp%252Fsecret",
         "C%3A%5CUsers%5CAlice%5Csecret",
         "%2fhome%2fAlice%2fMiXeD-secret",
+        "//Users/alice/repo/secret.env",
+        "%2F%2FUsers%2Falice%2Frepo%2Fsecret.env",
+        "%252F%252Fopt%252Fapp%252Fsecret",
+        "file:///Users/alice/repo/secret.env",
+        "file%253A%252F%252F%252Fopt%252Fapp%252Fsecret",
+        r"\\server\share\secret.env",
+        "%5C%5Cserver%5Cshare%5Csecret.env",
     ],
 )
 def test_absolute_path_redaction_removes_bounded_percent_encoded_paths(

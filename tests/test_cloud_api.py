@@ -487,6 +487,19 @@ async def test_cloud_skill_rejects_unknown_and_traversal_ids_before_loader(
 
 
 @pytest.mark.asyncio
+async def test_cloud_skill_rejects_sensitive_identifier_grammar_before_loader(
+    client, cloud_dependencies
+) -> None:
+    _, _, _, _, skill_loader = cloud_dependencies
+
+    response = await client.get("/api/cloud/v1/skills/token:opaque-secret")
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "bad_request"}
+    assert skill_loader.calls == []
+
+
+@pytest.mark.asyncio
 async def test_cloud_skill_injected_metadata_cannot_expand_seed_allowlist(
     client, cloud_dependencies
 ) -> None:
@@ -1053,6 +1066,59 @@ async def test_cloud_skill_loader_errors_return_constant_503(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", [123, {"markdown": "VAT"}, ["VAT"]])
+async def test_cloud_skill_loader_malformed_type_returns_constant_503(
+    client, cloud_dependencies, malformed
+) -> None:
+    dependencies, _, _, _, _ = cloud_dependencies
+    dependencies.skill_loader = lambda _skill_id: malformed
+
+    response = await client.get("/api/cloud/v1/skills/vat-summary-th")
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "service_unavailable"}
+    assert str(malformed) not in response.text
+
+
+@pytest.mark.asyncio
+async def test_cloud_skill_projection_value_error_returns_constant_503(
+    client, cloud_dependencies, monkeypatch
+) -> None:
+    original = cloud_api.sanitize_public_text
+
+    def fail_markdown_projection(value, *, redact_paths=True):
+        if value.startswith("# VAT"):
+            raise ValueError("malformed skill projection")
+        return original(value, redact_paths=redact_paths)
+
+    monkeypatch.setattr(cloud_api, "sanitize_public_text", fail_markdown_projection)
+
+    response = await client.get("/api/cloud/v1/skills/vat-summary-th")
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "service_unavailable"}
+    assert "malformed skill projection" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_cloud_skill_boundary_does_not_catch_base_exception(
+    client, cloud_dependencies
+) -> None:
+    dependencies, _, _, _, _ = cloud_dependencies
+
+    class SkillAbort(BaseException):
+        pass
+
+    def abort_loader(_skill_id):
+        raise SkillAbort
+
+    dependencies.skill_loader = abort_loader
+
+    with pytest.raises(SkillAbort):
+        await client.get("/api/cloud/v1/skills/vat-summary-th")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["search", "document"])
 @pytest.mark.parametrize("error_type", ORDINARY_DEPENDENCY_ERROR_TYPES)
 async def test_cloud_store_errors_return_constant_503(
@@ -1500,6 +1566,129 @@ def test_public_sanitizer_preserves_safe_uri_and_slash_text(value) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value",
+    [
+        "//Users/alice/repo/private.env",
+        "%2F%2FUsers%2Falice%2Frepo%2Fprivate.env",
+        "%252F%252Fopt%252Fapp%252Fprivate.env",
+        "file:///Users/alice/repo/private.env",
+        "file%253A%252F%252F%252Fopt%252Fapp%252Fprivate.env",
+        r"\\server\share\private.env",
+        "%5C%5Cserver%5Cshare%5Cprivate.env",
+    ],
+)
+async def test_cloud_local_path_representations_never_cross_rag_or_public_projection(
+    client, cloud_dependencies, value
+) -> None:
+    dependencies, read_action, rag_store, catalog_store, skill_loader = cloud_dependencies
+    tampered = read_action.model_copy(update={"description": f"Read {value}"})
+    catalog_store.actions = [
+        tampered.model_copy(update={"version_id": build_version_id(tampered)})
+    ]
+    skill_loader.markdown = f"# VAT\nRead {value}"
+    rag_store.search_knowledge = lambda **_kwargs: [
+        SearchResult(
+            chunk_id="chunk-path",
+            document_id="document-path",
+            document_uri="mercury://wiki/vat-path",
+            chunk_uri="mercury://wiki/vat-path#chunk-0",
+            text=f"Read {value}",
+            score=0.9,
+            source_title="VAT",
+            source_uri="mercury://wiki/vat-path",
+            source_url=None,
+            source_path=None,
+            citation={"section": {"note": value}},
+            metadata={"review_status": "reviewed"},
+        )
+    ]
+    rag_store.get_document = lambda document_id: {
+        "id": document_id,
+        "document_uri": "mercury://wiki/vat-path",
+        "title": "VAT",
+        "body": f"Read {value}",
+        "sha256": "a" * 64,
+        "knowledge_sources": {
+            "title": "Wiki",
+            "source_uri": "mercury://wiki/vat-path",
+            "source_url": None,
+            "review_status": "reviewed",
+        },
+    }
+
+    inbound = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": value, "top_k": 4},
+    )
+    assert value not in rag_store.last_query
+
+    responses = [
+        await client.get("/api/cloud/v1/catalog/actions"),
+        await client.get("/api/cloud/v1/skills/vat-summary-th"),
+        inbound,
+        await client.get(
+            "/api/cloud/v1/documents/11111111-1111-4111-8111-111111111111"
+        ),
+    ]
+    serialized = json.dumps([response.json() for response in responses])
+    assert all(response.status_code == 200 for response in responses)
+    assert value not in serialized
+    assert "private.env" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_cloud_encoded_credentials_and_header_descriptors_never_cross_boundary(
+    client, cloud_dependencies
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    represented = (
+        "Authorization%253A%2520Bearer%2520opaque-auth "
+        "%257B%2522client_secret%2522%253A%2522opaque-json%2522%257D"
+    )
+    rag_store.search_knowledge = lambda **_kwargs: [
+        SearchResult(
+            chunk_id="chunk-header",
+            document_id="document-header",
+            document_uri="mercury://wiki/vat-header",
+            chunk_uri="mercury://wiki/vat-header#chunk-0",
+            text=represented,
+            score=0.9,
+            source_title="VAT",
+            source_uri="mercury://wiki/vat-header",
+            source_url=None,
+            source_path=None,
+            citation={
+                "section": [
+                    {"name": "Authorization", "value": "Bearer outbound-auth"},
+                    {
+                        "name": "Cookie",
+                        "value": "safe=<cookie>; private=outbound-cookie",
+                    },
+                ]
+            },
+            metadata={"review_status": "reviewed"},
+        )
+    ]
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": represented, "top_k": 4},
+    )
+
+    assert response.status_code == 200
+    serialized = json.dumps(response.json())
+    for secret in (
+        "opaque-auth",
+        "opaque-json",
+        "outbound-auth",
+        "outbound-cookie",
+    ):
+        assert secret not in rag_store.last_query
+        assert secret not in serialized
+
+
+@pytest.mark.asyncio
 async def test_cloud_redacts_percent_encoded_local_paths_before_rag(
     client, cloud_dependencies
 ) -> None:
@@ -1604,3 +1793,40 @@ async def test_cloud_catalog_preserves_endpoint_path_templates(
 
     assert response.status_code == 200
     assert response.json()["actions"][0]["path_template"] == action.path_template
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path_template",
+    [
+        "//Users/alice/private",
+        "/opt/mercury/private",
+        "/%2FUsers%2Falice%2Fprivate",
+        "file:///Users/alice/private",
+        r"C:\Users\alice\private",
+        r"\\server\share\private",
+        "/v1/../private",
+        "/v1/items?view=private",
+        "/v1/items#private",
+        r"/v1\items",
+        "/v1/token%253Dopaque-secret",
+    ],
+)
+async def test_cloud_catalog_rejects_non_api_path_templates(
+    client, cloud_dependencies, action_factory, path_template
+) -> None:
+    _, _, _, catalog_store, _ = cloud_dependencies
+    action = action_factory(
+        method="GET",
+        operation_id="getPrivateItem",
+        capability="private.items.read",
+        risk_tier=0,
+        required_confirmations=0,
+        side_effects=(),
+    )
+    catalog_store.actions = [action.model_copy(update={"path_template": path_template})]
+
+    response = await client.get("/api/cloud/v1/catalog/actions")
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "service_unavailable"}

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-import uuid
 from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import quote, urlparse
@@ -19,10 +18,22 @@ from mercury_tools.catalog.models import (
     revalidate_catalog_action,
 )
 from mercury_tools.cloud.api import (
-    is_canonical_public_wiki_uri,
-    sanitize_public_text,
     sanitize_search_filters,
     sanitize_search_query,
+)
+from mercury_tools.cloud.models import (
+    PUBLIC_RESPONSE_VALIDATION_ERROR,
+    PublicConnectorsEnvelope,
+    PublicDocument,
+    PublicSearchEnvelope,
+    PublicSkillDetail,
+    PublicSkillsEnvelope,
+    is_canonical_document_identifier,
+    is_canonical_skill_id,
+    sanitize_public_text,
+    validate_document_identity,
+    validate_public_api_path_template,
+    validate_skill_identity,
 )
 from mercury_tools.config import load_settings
 
@@ -109,6 +120,8 @@ class CloudBrainClient:
         rows = payload["actions"]
         if not isinstance(rows, list):
             raise ValueError("cloud_catalog_invalid")
+        for item in rows:
+            _validate_public_action_payload_path(item)
         etag = response.headers.get("etag")
         if not isinstance(etag, str) or not _ETAG_RE.fullmatch(etag):
             raise ValueError("cloud_catalog_etag_invalid")
@@ -141,6 +154,7 @@ class CloudBrainClient:
         payload = response.json()
         if not isinstance(payload, dict) or set(payload) != {"action"}:
             raise ValueError("cloud_catalog_invalid")
+        _validate_public_action_payload_path(payload["action"])
         action = revalidate_catalog_action(CatalogAction.model_validate(payload["action"]))
         if action.action_id != action_id:
             raise ValueError("cloud_catalog_invalid")
@@ -150,20 +164,27 @@ class CloudBrainClient:
     async def list_connectors(self) -> tuple[dict[str, Any], ...]:
         response = await self.client.get("/api/cloud/v1/connectors")
         response.raise_for_status()
-        return tuple(response.json()["connectors"])
+        envelope = _validate_public_response(response, PublicConnectorsEnvelope)
+        return tuple(item.model_dump(mode="json") for item in envelope.connectors)
 
     async def list_skills(self) -> tuple[dict[str, Any], ...]:
         response = await self.client.get("/api/cloud/v1/skills")
         response.raise_for_status()
-        return tuple(response.json()["skills"])
+        envelope = _validate_public_response(response, PublicSkillsEnvelope)
+        return tuple(item.model_dump(mode="json") for item in envelope.skills)
 
     async def get_skill(self, skill_id: str) -> dict[str, Any] | None:
-        _require_selector(skill_id)
+        _require_skill_identifier(skill_id)
         response = await self.client.get(f"/api/cloud/v1/skills/{quote(skill_id, safe='')}")
         if response.status_code == 404:
             return None
         response.raise_for_status()
-        return response.json()
+        skill = _validate_public_response(response, PublicSkillDetail)
+        try:
+            validate_skill_identity(skill_id, skill)
+        except ValueError:
+            raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR) from None
+        return skill.model_dump(mode="json")
 
     async def search_knowledge(
         self,
@@ -194,7 +215,8 @@ class CloudBrainClient:
             },
         )
         response.raise_for_status()
-        return tuple(response.json()["results"])
+        envelope = _validate_public_response(response, PublicSearchEnvelope)
+        return tuple(item.model_dump(mode="json") for item in envelope.results)
 
     async def get_document(self, document_id: str) -> dict[str, Any] | None:
         if not _valid_document_identifier(document_id):
@@ -205,7 +227,12 @@ class CloudBrainClient:
         if response.status_code == 404:
             return None
         response.raise_for_status()
-        return response.json()
+        document = _validate_public_response(response, PublicDocument)
+        try:
+            validate_document_identity(document_id, document)
+        except ValueError:
+            raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR) from None
+        return document.model_dump(mode="json")
 
     async def _cached_actions(
         self,
@@ -259,14 +286,13 @@ def _require_selector(value: str) -> None:
         raise ValueError("cloud_identifier_invalid")
 
 
+def _require_skill_identifier(value: str) -> None:
+    if not is_canonical_skill_id(value):
+        raise ValueError("cloud_identifier_invalid")
+
+
 def _valid_document_identifier(value: str) -> bool:
-    if not isinstance(value, str):
-        return False
-    try:
-        return str(uuid.UUID(value)) == value
-    except ValueError:
-        pass
-    return is_canonical_public_wiki_uri(value)
+    return is_canonical_document_identifier(value)
 
 
 def _validate_public_catalog_action(action: CatalogAction) -> None:
@@ -284,14 +310,26 @@ def _validate_public_catalog_action(action: CatalogAction) -> None:
     ):
         raise ValueError("cloud_catalog_projection_invalid")
     if (
-        sanitize_public_text(action.path_template, redact_paths=False)
-        != action.path_template
+        sanitize_public_text(action.path_template, redact_paths=False) != action.path_template
     ):
         raise ValueError("cloud_catalog_projection_invalid")
+    try:
+        validate_public_api_path_template(action.path_template)
+    except ValueError:
+        raise ValueError("cloud_catalog_projection_invalid") from None
     public_text_payload = {**payload, "path_template": ""}
     serialized = json.dumps(public_text_payload, ensure_ascii=False, sort_keys=True)
     if sanitize_public_text(serialized) != serialized:
         raise ValueError("cloud_catalog_projection_invalid")
+
+
+def _validate_public_action_payload_path(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise ValueError("cloud_catalog_invalid")
+    try:
+        validate_public_api_path_template(value.get("path_template"))
+    except ValueError:
+        raise ValueError("cloud_catalog_projection_invalid") from None
 
 
 def _is_public_catalog_source(action: CatalogAction) -> bool:
@@ -307,3 +345,10 @@ def _is_public_catalog_source(action: CatalogAction) -> bool:
         and not parsed.fragment
         and sanitize_public_text(source_uri) == source_uri
     )
+
+
+def _validate_public_response(response: httpx.Response, model_type: Any) -> Any:
+    try:
+        return model_type.model_validate(response.json())
+    except (KeyError, OverflowError, RecursionError, TypeError, ValueError):
+        raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR) from None

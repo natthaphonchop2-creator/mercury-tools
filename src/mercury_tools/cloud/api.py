@@ -6,13 +6,12 @@ import hashlib
 import json
 import math
 import re
-import uuid
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
-from urllib.parse import urlparse, urlsplit
+from urllib.parse import urlparse
 
 import httpx
 from starlette.concurrency import run_in_threadpool
@@ -20,11 +19,24 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from mercury_tools.catalog.identity import build_version_id, sanitize_document
+from mercury_tools.catalog.identity import build_version_id
 from mercury_tools.catalog.models import (
     CatalogAction,
     HttpMethod,
     revalidate_catalog_action,
+)
+from mercury_tools.cloud.models import (
+    PublicConnectorsEnvelope,
+    PublicDocument,
+    PublicSearchEnvelope,
+    PublicSkill,
+    PublicSkillDetail,
+    PublicSkillsEnvelope,
+    is_canonical_document_identifier,
+    is_canonical_public_wiki_uri,
+    is_canonical_skill_id,
+    sanitize_public_text,
+    validate_public_api_path_template,
 )
 from mercury_tools.config import Settings, load_settings
 from mercury_tools.db.catalog import SupabaseCatalogStore
@@ -32,11 +44,7 @@ from mercury_tools.db.product import SKILL_CATALOG_SEED
 from mercury_tools.db.supabase import SupabaseRagStore
 from mercury_tools.mercury_runtime import skill_markdown
 from mercury_tools.rag.models import SearchFilters, SearchResult
-from mercury_tools.safety.redaction import (
-    redact_absolute_paths,
-    redact_json,
-    redact_text,
-)
+from mercury_tools.safety.redaction import redact_json
 
 _FILTER_FIELDS = {
     "jurisdiction",
@@ -48,8 +56,6 @@ _FILTER_FIELDS = {
 _SELECTOR_RE = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 _ACTION_ID_RE = re.compile(r"^act_[0-9a-f]{24}$")
 _PUBLIC_RESULT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
-_WIKI_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,199}$")
-_CHUNK_FRAGMENT_RE = re.compile(r"^chunk-[0-9]+$")
 _PRIVATE_KEY_RE = re.compile(r"(?i)(?:repository|source)?_?path|credential")
 _PUBLIC_SKILL_FIELDS = (
     "skill_id",
@@ -165,22 +171,24 @@ class CloudDependencies:
                 }
                 for connector_id, values in sorted(grouped.items())
             ]
+            envelope = PublicConnectorsEnvelope.model_validate(
+                {"connectors": payload}
+            )
         except _ORDINARY_DEPENDENCY_ERRORS:
             return _service_unavailable()
-        return JSONResponse(
-            {"connectors": payload}
-        )
+        return JSONResponse(envelope.model_dump(mode="json"))
 
     async def list_skills(self, request: Request) -> Response:
         try:
             skills = self._public_skills()
+            envelope = PublicSkillsEnvelope.model_validate({"skills": skills})
         except _ORDINARY_DEPENDENCY_ERRORS:
             return _service_unavailable()
-        return JSONResponse({"skills": skills})
+        return JSONResponse(envelope.model_dump(mode="json"))
 
     async def get_skill(self, request: Request) -> Response:
         skill_id = request.path_params["skill_id"]
-        if not _valid_selector(skill_id, required=True):
+        if not is_canonical_skill_id(skill_id):
             return _bad_request()
         try:
             skill = next(
@@ -191,17 +199,19 @@ class CloudDependencies:
                 ),
                 None,
             )
-        except _ORDINARY_DEPENDENCY_ERRORS:
-            return _service_unavailable()
-        if skill is None:
-            return _not_found()
-        try:
+            if skill is None:
+                return _not_found()
             markdown = await run_in_threadpool(self.skill_loader, skill_id)
+            if markdown is None:
+                return _not_found()
+            if not isinstance(markdown, str):
+                raise ValueError("cloud_skill_markdown_invalid")
+            payload = PublicSkillDetail.model_validate(
+                {**skill, "markdown": sanitize_public_text(markdown)}
+            )
         except _ORDINARY_DEPENDENCY_ERRORS:
             return _service_unavailable()
-        if markdown is None:
-            return _not_found()
-        return JSONResponse({**skill, "markdown": sanitize_public_text(markdown)})
+        return JSONResponse(payload.model_dump(mode="json"))
 
     async def search_knowledge(self, request: Request) -> Response:
         try:
@@ -296,7 +306,7 @@ class CloudDependencies:
                 if field in skill
             }
             if isinstance(public.get("skill_id"), str):
-                result.append(public)
+                result.append(PublicSkill.model_validate(public).model_dump(mode="json"))
         return sorted(result, key=lambda item: item["skill_id"])
 
 
@@ -355,12 +365,6 @@ def sanitize_search_filters(value: Any) -> dict[str, str]:
     return sanitized
 
 
-def sanitize_public_text(value: str, *, redact_paths: bool = True) -> str:
-    text = str(sanitize_document(value))
-    text = redact_text(text)
-    return redact_absolute_paths(text) if redact_paths else text
-
-
 def _public_search_result(result: SearchResult) -> dict[str, Any]:
     return {
         "chunk_id": result.chunk_id,
@@ -396,7 +400,9 @@ def _project_public_search_results(
             public.append(projected)
             if len(public) == top_k:
                 break
-    return public
+    return PublicSearchEnvelope.model_validate(
+        {"results": public}
+    ).model_dump(mode="json")["results"]
 
 
 def _validate_search_result_shape(result: SearchResult) -> None:
@@ -487,7 +493,9 @@ def _project_public_document(
         and not isinstance(source.get("source_url"), str)
     ):
         raise ValueError("cloud_document_invalid")
-    return _public_document(document)
+    return PublicDocument.model_validate(_public_document(document)).model_dump(
+        mode="json"
+    )
 
 
 def _clean_public_value(value: Any) -> Any:
@@ -590,13 +598,11 @@ def _validate_public_action_identity(action: CatalogAction) -> None:
         action.operation_id,
         action.variant_id,
     )
-    if (
-        not _SELECTOR_RE.fullmatch(action.connector_id)
-        or any(sanitize_public_text(value) != value for value in identity_values)
-        or sanitize_public_text(action.path_template, redact_paths=False)
-        != action.path_template
+    if not _SELECTOR_RE.fullmatch(action.connector_id) or any(
+        sanitize_public_text(value) != value for value in identity_values
     ):
         raise ValueError("cloud_catalog_invalid")
+    validate_public_api_path_template(action.path_template)
 
 
 def _filter_actions(
@@ -629,50 +635,12 @@ def _is_public_search_result(result: Any) -> bool:
     return result.metadata.get("review_status") == "reviewed"
 
 
-def is_canonical_public_wiki_uri(
-    value: Any,
-    *,
-    allow_chunk: bool = False,
-) -> bool:
-    if not isinstance(value, str) or not value or len(value) > 520:
-        return False
-    if "%" in value or "\\" in value:
-        return False
-    try:
-        parsed = urlsplit(value)
-    except ValueError:
-        return False
-    if (
-        parsed.scheme != "mercury"
-        or parsed.netloc != "wiki"
-        or parsed.query
-        or not parsed.path.startswith("/")
-    ):
-        return False
-    if parsed.fragment:
-        if not allow_chunk or not _CHUNK_FRAGMENT_RE.fullmatch(parsed.fragment):
-            return False
-    elif allow_chunk:
-        return False
-    segments = parsed.path.removeprefix("/").split("/")
-    if not segments or any(not _WIKI_SEGMENT_RE.fullmatch(item) for item in segments):
-        return False
-    canonical = f"mercury://wiki/{'/'.join(segments)}"
-    if parsed.fragment:
-        canonical = f"{canonical}#{parsed.fragment}"
-    return canonical == value
-
-
 def _looks_like_wiki_uri(value: Any) -> bool:
     return isinstance(value, str) and value.casefold().startswith("mercury://wiki")
 
 
 def _valid_document_identifier(value: str) -> bool:
-    try:
-        return str(uuid.UUID(value)) == value
-    except ValueError:
-        pass
-    return is_canonical_public_wiki_uri(value)
+    return is_canonical_document_identifier(value)
 
 
 def _document_source(document: Mapping[str, Any]) -> Mapping[str, Any] | None:

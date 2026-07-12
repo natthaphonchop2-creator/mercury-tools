@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from base64 import b64decode, b64encode, urlsafe_b64decode, urlsafe_b64encode
 from collections.abc import Mapping, Sequence
@@ -32,6 +33,10 @@ SENSITIVE_KEY_RE = re.compile(
     r"(?i)(?:secret|token|api[_-]?key|password|"
     r"service[_-]?role[_-]?key|private[_-]?key)"
 )
+SENSITIVE_REPRESENTATION_KEY_RE = re.compile(
+    r"(?i)(?:credential|secret|token|api[_-]?key|password|"
+    r"service[_-]?role[_-]?key|private[_-]?key)"
+)
 SENSITIVE_HEADER_KEY_RE = re.compile(
     r"(?i)^(?:authorization|proxy[-_]?authorization|cookie|set[-_]?cookie)$"
 )
@@ -55,10 +60,26 @@ _MAX_PATH_DECODE_DEPTH = 3
 _MAX_ENCODED_PATH_TOKEN_BYTES = 4096
 _PATH_TOKEN_RE = re.compile(r"\S+")
 _PERCENT_ESCAPE_RE = re.compile(r"(?i)%[0-9a-f]{2}")
-_AMBIGUOUS_ENCODED_ABSOLUTE_PATH_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9])(?:%(?:25){0,8}2f|"
-    r"[A-Z]%(?:25){0,8}3a%(?:25){0,8}5c)"
+_LOCAL_PATH_ROOT_RE = re.compile(
+    r"(?i)^/(?:Users|Volumes|app|data|etc|home|mnt|opt|private|root|run|srv|"
+    r"tmp|usr|var|workspace)(?:/|$)"
 )
+_WINDOWS_DRIVE_RE = re.compile(r"(?i)^[A-Z]:[\\/]")
+_AMBIGUOUS_ENCODED_LOCAL_PREFIX_RE = re.compile(
+    r"(?i)^(?:(?:%(?:25){0,8}2f){1,2}|(?:%(?:25){0,8}5c){2}|"
+    r"file%(?:25){0,8}3a|[A-Z]%(?:25){0,8}3a)"
+)
+_TOKEN_WRAPPERS = "\"'()[]{}<>,.;"
+_HEADER_DESCRIPTOR_FIELDS = {
+    "current",
+    "currentvalue",
+    "default",
+    "example",
+    "examples",
+    "secret",
+    "value",
+    "values",
+}
 
 
 def redact_credential_text(value: str, credentials: Sequence[str]) -> str:
@@ -83,7 +104,12 @@ def redact_credential_text(value: str, credentials: Sequence[str]) -> str:
 
 
 def redact_text(value: str) -> str:
-    text = str(value)
+    text = _PATH_TOKEN_RE.sub(_redact_sensitive_representation, str(value))
+    return _redact_plain_text(text)
+
+
+def _redact_plain_text(value: str) -> str:
+    text = value
     text = AUTH_HEADER_RE.sub(_redact_auth_header, text)
     text = COOKIE_HEADER_RE.sub(_redact_cookie_header, text)
     text = GENERIC_BEARER_RE.sub(_redact_generic_bearer, text)
@@ -104,10 +130,18 @@ def redact_json(value: Any) -> Any:
     if isinstance(value, list):
         return [redact_json(item) for item in value]
     if isinstance(value, Mapping):
+        sensitive_descriptor = _sensitive_header_descriptor(value)
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
             key_text = str(key)
-            if (
+            normalized_key = _normalized_key(key_text)
+            if sensitive_descriptor and normalized_key in _HEADER_DESCRIPTOR_FIELDS:
+                redacted[key] = (
+                    redact_text(item)
+                    if isinstance(item, str) and _is_documented_placeholder_value(item)
+                    else _REDACTED
+                )
+            elif (
                 key_text not in SAFE_SECRET_SCHEMA_KEYS
                 and (
                     SENSITIVE_KEY_RE.search(key_text)
@@ -127,34 +161,45 @@ def redact_json(value: Any) -> Any:
 
 def _redact_path_token(match: re.Match[str]) -> str:
     token = match.group(0)
-    if _is_safe_http_url(token):
+    if _is_safe_public_uri(token):
         return token
-    if _PERCENT_ESCAPE_RE.search(token) and _is_encoded_absolute_path(token):
+    if _is_local_path_representation(token):
         return _REDACTED_PATH
-    token = WINDOWS_ABSOLUTE_PATH_RE.sub(_REDACTED_PATH, token)
-    return POSIX_ABSOLUTE_PATH_RE.sub(_REDACTED_PATH, token)
+    return token
 
 
-def _is_encoded_absolute_path(value: str) -> bool:
+def _is_local_path_representation(value: str) -> bool:
+    candidate = value.strip(_TOKEN_WRAPPERS)
+    if _is_safe_public_uri(candidate):
+        return False
     if not _within_path_token_limit(value):
-        return bool(_AMBIGUOUS_ENCODED_ABSOLUTE_PATH_RE.search(value))
-    decoded = value
+        return bool(_PERCENT_ESCAPE_RE.search(candidate) or _is_local_path(candidate))
+    decoded = candidate
     for _ in range(_MAX_PATH_DECODE_DEPTH):
-        candidate = unquote(decoded)
-        if not _within_path_token_limit(candidate):
+        if _is_local_path(decoded):
             return True
-        if _contains_absolute_path(candidate):
-            return True
-        if candidate == decoded:
+        if not _PERCENT_ESCAPE_RE.search(decoded):
             return False
-        decoded = candidate
-    return bool(_AMBIGUOUS_ENCODED_ABSOLUTE_PATH_RE.search(decoded))
-
-
-def _contains_absolute_path(value: str) -> bool:
+        next_value = unquote(decoded)
+        if not _within_path_token_limit(next_value):
+            return True
+        if next_value == decoded:
+            return False
+        decoded = next_value
     return bool(
-        WINDOWS_ABSOLUTE_PATH_RE.search(value)
-        or POSIX_ABSOLUTE_PATH_RE.search(value)
+        _is_local_path(decoded)
+        or _AMBIGUOUS_ENCODED_LOCAL_PREFIX_RE.search(decoded)
+    )
+
+
+def _is_local_path(value: str) -> bool:
+    candidate = value.strip(_TOKEN_WRAPPERS)
+    folded = candidate.casefold()
+    return bool(
+        folded.startswith("file:/")
+        or candidate.startswith(("//", "\\\\"))
+        or _WINDOWS_DRIVE_RE.match(candidate)
+        or _LOCAL_PATH_ROOT_RE.match(candidate)
     )
 
 
@@ -165,13 +210,87 @@ def _within_path_token_limit(value: str) -> bool:
         return False
 
 
-def _is_safe_http_url(value: str) -> bool:
+def _is_safe_public_uri(value: str) -> bool:
     candidate = value.strip("\"'()[]{}<>,.;")
     try:
         parsed = urlsplit(candidate)
     except ValueError:
         return False
-    return parsed.scheme.casefold() in {"http", "https"} and bool(parsed.netloc)
+    scheme = parsed.scheme.casefold()
+    if scheme in {"http", "https"}:
+        return bool(
+            parsed.netloc
+            and parsed.username is None
+            and parsed.password is None
+        )
+    return scheme == "mercury" and bool(parsed.netloc) and "\\" not in candidate
+
+
+def _redact_sensitive_representation(match: re.Match[str]) -> str:
+    token = match.group(0)
+    if not _PERCENT_ESCAPE_RE.search(token):
+        return token
+    if not _within_representation_limit(token):
+        return _REDACTED
+    decoded = token
+    for _ in range(2):
+        candidate = unquote(decoded)
+        if not _within_representation_limit(candidate):
+            return _REDACTED
+        if candidate == decoded:
+            break
+        if _is_local_path_representation(candidate):
+            return _REDACTED_PATH
+        if _plain_text_is_sensitive(candidate):
+            return _REDACTED
+        decoded = candidate
+    return token
+
+
+def _plain_text_is_sensitive(value: str) -> bool:
+    if _redact_plain_text(value) != value:
+        return True
+    with suppress(json.JSONDecodeError, RecursionError):
+        return _structured_value_is_sensitive(json.loads(value))
+    return False
+
+
+def _structured_value_is_sensitive(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        if _sensitive_header_descriptor(value):
+            return True
+        return any(
+            (
+                str(key) not in SAFE_SECRET_SCHEMA_KEYS
+                and (
+                    SENSITIVE_REPRESENTATION_KEY_RE.search(str(key))
+                    or SENSITIVE_HEADER_KEY_RE.fullmatch(str(key))
+                )
+            )
+            or _structured_value_is_sensitive(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_structured_value_is_sensitive(item) for item in value)
+    return isinstance(value, str) and _redact_plain_text(value) != value
+
+
+def _sensitive_header_descriptor(value: Mapping[Any, Any]) -> bool:
+    for key, item in value.items():
+        if _normalized_key(str(key)) not in {"header", "headername", "key", "name"}:
+            continue
+        if not isinstance(item, str):
+            continue
+        decoded = item
+        for _ in range(2):
+            decoded = unquote(decoded)
+        if SENSITIVE_HEADER_KEY_RE.fullmatch(decoded.strip()):
+            return True
+    return False
+
+
+def _normalized_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.casefold())
 
 
 def _redact_auth_header(match: re.Match[str]) -> str:

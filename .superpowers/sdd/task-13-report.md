@@ -432,3 +432,105 @@ $ git diff --check
 ### Residual Concern
 
 - `match_knowledge_chunks` still has no database RPC URI-prefix parameter. The accepted mitigation remains forced `review_status="reviewed"` plus strict canonical `mercury://wiki/...` URI checks after fetch and before public projection. Moving the URI restriction into query execution requires a future database/RPC change outside Task 13.
+
+## Fix Round 4: Structural Final Fix
+
+### Status
+
+DONE_WITH_CONCERNS
+
+This structural fix started from reviewed Task 13 head `0fcf621a02d6cf41bcffb555e928f51a117b6d08`. The concurrent Task 14 worker committed `c3ef61a0485749a4d5fcb9d21b6bc80abe7b3cbd` while this work was in progress. No Task 14 flow source, template, model, test, or report path was edited, staged, reverted, or included in the Task 13 fix commit.
+
+### Structural Changes
+
+1. Added `src/mercury_tools/cloud/models.py` as the shared fail-closed public boundary. Strict Pydantic models forbid extra fields and validate exact connector, skill, skill-detail, search, citation, and document response shapes. They also enforce canonical identifiers and Wiki URIs, finite scores, JSON-safe values, sanitized idempotent public text, safe public URLs, and requested skill/document identity.
+2. `CloudBrainClient` now validates every 200 response from `list_connectors`, `list_skills`, `get_skill`, `search_knowledge`, and `get_document` through those models. Any malformed response raises only `ValueError("cloud_public_response_invalid")`; raw payloads are never returned. Catalog path templates are admitted before model construction and before cache replacement.
+3. Skill IDs now use a dedicated grammar without colon or assignment syntax on both API and client boundaries. Action IDs and document identifiers retain their canonical path-specific validators. Sensitive skill IDs are rejected before URL construction or loader access.
+4. Skill loading, type checking, sanitization, strict projection, and serialization preparation now remain inside one ordinary dependency-error boundary. Runtime, malformed type, and projection errors return the constant 503 response while `BaseException` remains uncaught.
+5. Path handling now classifies raw and bounded percent-decoded representations instead of adding endpoint-specific substitutions. It covers repeated leading slashes, file URIs, Windows drives, UNC paths, and single/double encoded variants with explicit depth and byte limits. Safe HTTP(S), Mercury URIs, API templates, and ordinary encoded web paths remain intact.
+6. API path templates now share one server/client admission rule. It requires a single-leading-slash relative API path and rejects local roots, repeated slashes, file/drive/UNC forms, credentials, query/fragment data, traversal, backslashes, encoded local paths, unsafe representations, and unresolved decoding beyond the supported bound.
+7. Shared text redaction now classifies bounded percent-encoded credential representations, including quoted JSON, Authorization, Cookie, and double-encoded forms. Sensitive encoded segments fail closed as one constant placeholder.
+8. Shared structured redaction now recognizes recursive header descriptor mappings such as `{name, value}` and `{name, values}`. Authorization and complete Cookie/Set-Cookie values are removed, mixed placeholder-plus-secret values fail closed, and only complete documented placeholder values are preserved.
+9. Repeated-slash, file URI, encoded secret, structured header, and local path matrices prove unsafe values do not reach the RAG query spy and do not leave catalog, skill, search, or document projections.
+10. All previous Task 13 guarantees remain covered: exactly seven read-only routes, canonical reviewed Wiki membership, forced reviewed filters, immutable canonical skills, async cache/store calls off-loop, ETag fallback policy, no outbound credentials/repository/ERP payloads, and lazy Supabase dependencies.
+
+### Changed Files
+
+- `.superpowers/sdd/task-13-report.md`
+- `src/mercury_tools/cloud/api.py`
+- `src/mercury_tools/cloud/client.py`
+- `src/mercury_tools/cloud/models.py` (new shared strict public schema)
+- `src/mercury_tools/safety/redaction.py`
+- `tests/test_cloud_api.py`
+- `tests/test_cloud_client.py`
+- `tests/test_redaction.py`
+
+### RED Evidence
+
+The required endpoint, client, and redaction regressions were added before production changes:
+
+```text
+$ uv run python -m py_compile tests/test_cloud_api.py tests/test_cloud_client.py tests/test_redaction.py
+$ uv run pytest tests/test_cloud_api.py tests/test_cloud_client.py tests/test_redaction.py -q
+69 failed, 218 passed in 1.37s
+```
+
+The failures reproduced the permissive 200 client responses, sensitive skill identifier grammar, skill projection boundary escape, malformed loader coercion, unsafe path templates, repeated/file/UNC path leakage, percent-encoded credential leakage, and unrecognized structured header descriptors.
+
+A self-review RED cycle then covered documented placeholders in descriptor-shaped headers and credential-like keys nested inside citation sections:
+
+```text
+$ uv run pytest \
+    tests/test_redaction.py::test_json_redaction_recognizes_nested_header_descriptor_shapes \
+    tests/test_cloud_client.py::test_client_rejects_every_malformed_public_200_with_constant_error -q
+2 failed, 24 passed in 0.31s
+```
+
+The first full-suite pass also exposed an overbroad global `credential` key policy:
+
+```text
+$ uv run pytest -m 'not integration' -q
+2 failed, 1381 passed, 1 deselected, 1 warning in 6.37s
+```
+
+The representation-only credential classifier was separated from legacy JSON container redaction, preserving safe internal `credentials` containers and `credentials_configured` metadata.
+
+### GREEN Evidence
+
+The final focused Cloud/API/client/redaction/hosted/RAG set passed:
+
+```text
+$ uv run pytest tests/test_cloud_api.py tests/test_cloud_client.py \
+    tests/test_redaction.py tests/test_http_app.py tests/test_mcp_rag_routing.py -q
+316 passed, 1 warning in 1.64s
+```
+
+The complete non-integration suite passed:
+
+```text
+$ uv run pytest -m 'not integration' -q
+1384 passed, 1 deselected, 1 warning in 5.90s
+```
+
+The warning is the pre-existing Starlette `TestClient` deprecation warning.
+
+Static and whitespace verification:
+
+```text
+$ uv run ruff check .
+All checks passed!
+
+$ git diff --check
+<no output>
+```
+
+### Commit
+
+- Reviewed Task 13 base: `0fcf621a02d6cf41bcffb555e928f51a117b6d08`
+- Concurrent Task 14 parent: `c3ef61a0485749a4d5fcb9d21b6bc80abe7b3cbd`
+- Subject: `fix: enforce strict Cloud public boundary`
+- Final hash: reported in the completion response because a commit cannot contain its own hash.
+
+### Residual Concern
+
+- `match_knowledge_chunks` still lacks a database RPC URI-prefix parameter. The accepted mitigation remains forced `review_status="reviewed"` plus strict canonical `mercury://wiki/...` validation after fetch and before public projection. Moving that restriction into query execution remains a future database/RPC change outside Task 13.
