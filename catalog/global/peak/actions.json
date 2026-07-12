@@ -1,0 +1,5572 @@
+[
+  {
+    "action_id": "act_0114957a3922dc0f46a99907",
+    "aliases_en": [
+      "Peak Invoice Payment All In One",
+      "peakInvoicePaymentAllInOne"
+    ],
+    "aliases_th": [
+      "บันทึกการชำระใบแจ้งหนี้"
+    ],
+    "capability": "documents.invoice.payment.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Peak Invoice Payment All In One",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakPaidPayments": {
+            "properties": {
+              "paidPayments": {
+                "properties": {
+                  "paymentDate": {
+                    "type": "string"
+                  },
+                  "payments": {
+                    "items": {
+                      "properties": {
+                        "amount": {
+                          "type": "string"
+                        },
+                        "note": {
+                          "type": "string"
+                        },
+                        "paymentMethod": {
+                          "properties": {
+                            "carringBalanceValue": {
+                              "type": "string"
+                            },
+                            "code": {
+                              "type": "string"
+                            },
+                            "memo": {
+                              "type": "string"
+                            },
+                            "name": {
+                              "type": "string"
+                            },
+                            "type": {
+                              "type": "integer"
+                            }
+                          },
+                          "type": "object"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "withholdingTaxAmount": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "transactionId": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "peakInvoicePaymentAllInOne",
+    "path_template": "/invoices/paidpaymentallinone",
+    "preflight_action_ids": [],
+    "required_confirmations": 2,
+    "response_redaction": [],
+    "risk_tier": 2,
+    "side_effects": [
+      "writes_remote_data",
+      "payment"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_e90f0f57aa76ffc8d44b6eadd1fd6df5df9a3b2216e5b4873c56f607c84e185b"
+  },
+  {
+    "action_id": "act_0b47bbf8bcc51ceada745adc",
+    "aliases_en": [
+      "Peak Expense Payment",
+      "peakExpensePayment"
+    ],
+    "aliases_th": [
+      "บันทึกการชำระค่าใช้จ่าย"
+    ],
+    "capability": "documents.expense.payment.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Peak Expense Payment",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakPaidPayments": {
+            "properties": {
+              "paymentDate": {
+                "type": "string"
+              },
+              "payments": {
+                "items": {
+                  "properties": {
+                    "amount": {
+                      "type": "string"
+                    },
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "transactionId": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "peakExpensePayment",
+    "path_template": "/expenses/paidpayment",
+    "preflight_action_ids": [],
+    "required_confirmations": 2,
+    "response_redaction": [],
+    "risk_tier": 2,
+    "side_effects": [
+      "writes_remote_data",
+      "payment"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_64c34c16981733e9610a7b75a4ee436bc9353dc5855847fb6c0bca560598e4fb"
+  },
+  {
+    "action_id": "act_0dcc727c86ca16631816ed12",
+    "aliases_en": [
+      "Post Peak Product /w Account",
+      "postPeakProductWAccount"
+    ],
+    "aliases_th": [
+      "สร้างสินค้า"
+    ],
+    "capability": "products.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Product /w Account",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakProducts": {
+            "properties": {
+              "products": {
+                "items": {
+                  "properties": {
+                    "carryingBalanceAmount": {
+                      "type": "integer"
+                    },
+                    "carryingBalanceValue": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "purchaseValue": {
+                      "type": "string"
+                    },
+                    "purchaseVattype": {
+                      "type": "integer"
+                    },
+                    "sellAccount": {
+                      "type": "string"
+                    },
+                    "sellValue": {
+                      "type": "string"
+                    },
+                    "sellVatType": {
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakProductWAccount",
+    "path_template": "/products",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "postpeakproductwaccount_c27cbf30e071",
+    "version_id": "av_efd1473944186910b40174f8ed5c3e14760842cd976d257c7a546b80cc68bdc4"
+  },
+  {
+    "action_id": "act_260661133c4f8b1fbbeeadac",
+    "aliases_en": [
+      "Void Peak Receipt",
+      "voidPeakReceipt"
+    ],
+    "aliases_th": [
+      "ยกเลิกใบเสร็จรับเงิน"
+    ],
+    "capability": "documents.receipt.void",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Void Peak Receipt",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakReceipts": {
+            "properties": {
+              "receiptId": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "voidPeakReceipt",
+    "path_template": "/receipts/void",
+    "preflight_action_ids": [],
+    "required_confirmations": 2,
+    "response_redaction": [],
+    "risk_tier": 2,
+    "side_effects": [
+      "writes_remote_data",
+      "void"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_45e3354092406838198cebc27088d4a17bab3f5b67fdb8e3916a1bc0573a65ec"
+  },
+  {
+    "action_id": "act_308b782f3c276b9a0dd818d3",
+    "aliases_en": [
+      "Void Peak Invoice Payment",
+      "voidPeakInvoicePayment"
+    ],
+    "aliases_th": [
+      "ยกเลิกการชำระใบแจ้งหนี้"
+    ],
+    "capability": "documents.invoice.payment.void",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Void Peak Invoice Payment",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakPaidPayments": {
+            "properties": {
+              "paymentGroupId": {
+                "type": "integer"
+              },
+              "transactionId": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "voidPeakInvoicePayment",
+    "path_template": "/invoices/voidpayment",
+    "preflight_action_ids": [],
+    "required_confirmations": 2,
+    "response_redaction": [],
+    "risk_tier": 2,
+    "side_effects": [
+      "writes_remote_data",
+      "payment",
+      "void"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_ad8a337c9a7ec0772f3086aba4417a0a5f6fd35d7dbaef6bc2082f27e83acb4b"
+  },
+  {
+    "action_id": "act_3863cfee28a4ce0ab4f65ab9",
+    "aliases_en": [
+      "Post Peak Credit Note",
+      "postPeakCreditNote"
+    ],
+    "aliases_th": [
+      "สร้างใบลดหนี้"
+    ],
+    "capability": "documents.credit_note.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Credit Note",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakCreditNotes": {
+            "properties": {
+              "creditNotes": {
+                "items": {
+                  "properties": {
+                    "goodsReturn": {
+                      "type": "string"
+                    },
+                    "reasonDescription": {
+                      "type": "string"
+                    },
+                    "reasonTypeId": {
+                      "type": "string"
+                    },
+                    "transactionId": {
+                      "type": "string"
+                    },
+                    "transactionTypeId": {
+                      "type": "string"
+                    },
+                    "transactions": {
+                      "properties": {
+                        "issuedDate": {
+                          "type": "string"
+                        },
+                        "products": {
+                          "items": {
+                            "properties": {
+                              "discount": {
+                                "type": "string"
+                              },
+                              "id": {
+                                "type": "string"
+                              },
+                              "price": {
+                                "type": "integer"
+                              },
+                              "quantity": {
+                                "type": "integer"
+                              },
+                              "vatType": {
+                                "type": "integer"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakCreditNote",
+    "path_template": "/creditnotes",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "postpeakcreditnote_c0cd72f99fec",
+    "version_id": "av_9f3558d396f85dbf67b2b6f33149b83d2de9fd87338ac77296da6677de4d6fea"
+  },
+  {
+    "action_id": "act_3c4cc6c07a8ffa418232c909",
+    "aliases_en": [
+      "Get Peak DailyJournal",
+      "getPeakDailyjournal"
+    ],
+    "aliases_th": [
+      "ดูสมุดรายวัน"
+    ],
+    "capability": "daily_journal.get",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak DailyJournal",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakDailyjournal",
+    "path_template": "/dailyjournals/",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_925aec344cbec2e51c697fc8ed9e8c3694dafe084aa1490367a0b0ea3781aa9a"
+  },
+  {
+    "action_id": "act_3f63028cae55eb90783e7be5",
+    "aliases_en": [
+      "Post Peak Receipt All In One",
+      "postPeakReceiptAllInOne"
+    ],
+    "aliases_th": [
+      "สร้างใบเสร็จรับเงิน"
+    ],
+    "capability": "documents.receipt.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Receipt All In One",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakReceipts": {
+            "properties": {
+              "receipts": {
+                "items": {
+                  "properties": {
+                    "contactId": {
+                      "type": "string"
+                    },
+                    "dueDate": {
+                      "type": "string"
+                    },
+                    "issuedDate": {
+                      "type": "string"
+                    },
+                    "istaxInvoice": {
+                      "type": "integer"
+                    },
+                    "paidPayments": {
+                      "properties": {
+                        "paymentDate": {
+                          "type": "string"
+                        },
+                        "payments": {
+                          "items": {
+                            "properties": {
+                              "amount": {
+                                "type": "integer"
+                              },
+                              "paymentMethodId": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "products": {
+                      "items": {
+                        "properties": {
+                          "price": {
+                            "type": "string"
+                          },
+                          "productId": {
+                            "type": "string"
+                          },
+                          "quantity": {
+                            "type": "integer"
+                          },
+                          "vatType": {
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "tags": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakReceiptAllInOne",
+    "path_template": "/receipts/allinone",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_69d2b44a34525755f6412007a7b77fd734a87b062a20a3075b8e401c9b726cac"
+  },
+  {
+    "action_id": "act_402bb61694a153488b29ab33",
+    "aliases_en": [
+      "Post Peak Receipt",
+      "postPeakReceipt"
+    ],
+    "aliases_th": [
+      "สร้างใบเสร็จรับเงิน"
+    ],
+    "capability": "documents.receipt.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Receipt",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakReceipts": {
+            "properties": {
+              "receipts": {
+                "items": {
+                  "properties": {
+                    "contactCode": {
+                      "type": "string"
+                    },
+                    "dueDate": {
+                      "type": "string"
+                    },
+                    "issuedDate": {
+                      "type": "string"
+                    },
+                    "istaxInvoice": {
+                      "type": "integer"
+                    },
+                    "paidPayments": {
+                      "properties": {
+                        "paymentDate": {
+                          "type": "string"
+                        },
+                        "payments": {
+                          "items": {
+                            "properties": {
+                              "amount": {
+                                "type": "number"
+                              },
+                              "paymentMethodId": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "products": {
+                      "items": {
+                        "properties": {
+                          "accountCode": {
+                            "type": "null"
+                          },
+                          "accountSubCode": {
+                            "type": "null"
+                          },
+                          "accountSubId": {
+                            "type": "null"
+                          },
+                          "description": {
+                            "type": "null"
+                          },
+                          "discount": {
+                            "type": "null"
+                          },
+                          "id": {
+                            "type": "null"
+                          },
+                          "price": {
+                            "type": "number"
+                          },
+                          "productCode": {
+                            "type": "string"
+                          },
+                          "productId": {
+                            "type": "null"
+                          },
+                          "productTemplate": {
+                            "type": "null"
+                          },
+                          "quantity": {
+                            "type": "number"
+                          },
+                          "vatType": {
+                            "type": "null"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "tags": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "taxStatus": {
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakReceipt",
+    "path_template": "/receipts",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "postpeakreceipt_e37fc7e96402",
+    "version_id": "av_426f74c9a69838ccf860b9a4e7b012427bb054b9e53290467e855b17d5e8c7c2"
+  },
+  {
+    "action_id": "act_41394a4923b15a4c53cf644d",
+    "aliases_en": [
+      "Post Peak Quotation All In One",
+      "postPeakQuotationAllInOne"
+    ],
+    "aliases_th": [
+      "สร้างใบเสนอราคา"
+    ],
+    "capability": "documents.quotation.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Quotation All In One",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakQuotations": {
+            "properties": {
+              "quotations": {
+                "items": {
+                  "properties": {
+                    "contact": {
+                      "properties": {
+                        "address": {
+                          "type": "string"
+                        },
+                        "branchCode": {
+                          "type": "string"
+                        },
+                        "callCenterNumber": {
+                          "type": "string"
+                        },
+                        "code": {
+                          "type": "string"
+                        },
+                        "contactEmail": {
+                          "type": "string"
+                        },
+                        "contactFirstName": {
+                          "type": "string"
+                        },
+                        "contactLastName": {
+                          "type": "string"
+                        },
+                        "contactNickName": {
+                          "type": "string"
+                        },
+                        "contactPhoneNumber": {
+                          "type": "string"
+                        },
+                        "contactPosition": {
+                          "type": "string"
+                        },
+                        "country": {
+                          "type": "string"
+                        },
+                        "district": {
+                          "type": "string"
+                        },
+                        "email": {
+                          "type": "string"
+                        },
+                        "faxNumber": {
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "postCode": {
+                          "type": "string"
+                        },
+                        "province": {
+                          "type": "string"
+                        },
+                        "subDistrict": {
+                          "type": "string"
+                        },
+                        "taxNumber": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "integer"
+                        },
+                        "website": {
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "dueDate": {
+                      "type": "string"
+                    },
+                    "issuedDate": {
+                      "type": "string"
+                    },
+                    "products": {
+                      "items": {
+                        "properties": {
+                          "price": {
+                            "type": "string"
+                          },
+                          "productTemplate": {
+                            "properties": {
+                              "carryingBalanceAmount": {
+                                "type": "integer"
+                              },
+                              "carryingBalanceValue": {
+                                "type": "string"
+                              },
+                              "code": {
+                                "type": "string"
+                              },
+                              "description": {
+                                "type": "string"
+                              },
+                              "name": {
+                                "type": "string"
+                              },
+                              "purchaseValue": {
+                                "type": "string"
+                              },
+                              "purchaseVattype": {
+                                "type": "integer"
+                              },
+                              "sellValue": {
+                                "type": "string"
+                              },
+                              "sellVatType": {
+                                "type": "integer"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "quantity": {
+                            "type": "integer"
+                          },
+                          "vatType": {
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "tags": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakQuotationAllInOne",
+    "path_template": "/quotations/allinone",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_9d45a828d94cc245966e5b84f06237f4593441cba965d8638ce463ccb7d4a4cf"
+  },
+  {
+    "action_id": "act_46c9288523202918dd477367",
+    "aliases_en": [
+      "Post Peak Invoice /w Fee",
+      "postPeakInvoiceWFee"
+    ],
+    "aliases_th": [
+      "สร้างใบแจ้งหนี้"
+    ],
+    "capability": "documents.invoice.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Invoice /w Fee",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakInvoices": {
+            "properties": {
+              "invoices": {
+                "items": {
+                  "properties": {
+                    "contactId": {
+                      "type": "string"
+                    },
+                    "dueDate": {
+                      "type": "string"
+                    },
+                    "issuedDate": {
+                      "type": "string"
+                    },
+                    "istaxInvoice": {
+                      "type": "integer"
+                    },
+                    "paidPayments": {
+                      "properties": {
+                        "paymentDate": {
+                          "type": "string"
+                        },
+                        "payments": {
+                          "items": {
+                            "properties": {
+                              "amount": {
+                                "type": "integer"
+                              },
+                              "paymentMethodId": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "products": {
+                      "items": {
+                        "properties": {
+                          "price": {
+                            "type": "string"
+                          },
+                          "productCode": {
+                            "type": "string"
+                          },
+                          "quantity": {
+                            "type": "integer"
+                          },
+                          "vatType": {
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "tags": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakInvoiceWFee",
+    "path_template": "/invoices",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "postpeakinvoicewfee_0a4675d489a9",
+    "version_id": "av_232d5f124f25a1919bcfc532cd11b13a4297bf2f269aa7bd939e3a9cb9158ff5"
+  },
+  {
+    "action_id": "act_46db1343db1c07b58d37cf3e",
+    "aliases_en": [
+      "Post Peak Credit Note Full Credit",
+      "postPeakCreditNoteFullCredit"
+    ],
+    "aliases_th": [
+      "สร้างใบลดหนี้"
+    ],
+    "capability": "documents.credit_note.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Credit Note Full Credit",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakCreditNotes": {
+            "properties": {
+              "creditNotes": {
+                "items": {
+                  "properties": {
+                    "creditNoteType": {
+                      "type": "string"
+                    },
+                    "goodsReturn": {
+                      "type": "string"
+                    },
+                    "isFullCredit": {
+                      "type": "string"
+                    },
+                    "reasonDescription": {
+                      "type": "string"
+                    },
+                    "reasonTypeId": {
+                      "type": "string"
+                    },
+                    "transactionId": {
+                      "type": "string"
+                    },
+                    "transactionTypeId": {
+                      "type": "string"
+                    },
+                    "transactions": {
+                      "properties": {
+                        "issuedDate": {
+                          "type": "string"
+                        },
+                        "tags": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakCreditNoteFullCredit",
+    "path_template": "/creditnotes",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "postpeakcreditnotefullcredit_64ea03466dbc",
+    "version_id": "av_49b3f621d6d203832725a9e41048a8fe1f238c4e0104380a44b9b3140235b4e3"
+  },
+  {
+    "action_id": "act_4ec1db144d0b79dbdc133236",
+    "aliases_en": [
+      "Get Peak PaymentMethod",
+      "getPeakPaymentmethod"
+    ],
+    "aliases_th": [
+      "ดูช่องทางรับชำระ"
+    ],
+    "capability": "payment_methods.get",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak PaymentMethod",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakPaymentmethod",
+    "path_template": "/paymentmethods",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_43d6d67e148ce3f1a22093b403f8e7623f40a1cfb0b49b66d533725d47b81487"
+  },
+  {
+    "action_id": "act_5ab58230233fb4cff85d36ff",
+    "aliases_en": [
+      "Post Peak Product",
+      "postPeakProduct"
+    ],
+    "aliases_th": [
+      "สร้างสินค้า"
+    ],
+    "capability": "products.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Product",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakProducts": {
+            "properties": {
+              "products": {
+                "items": {
+                  "properties": {
+                    "carryingBalanceAmount": {
+                      "type": "integer"
+                    },
+                    "carryingBalanceValue": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "purchaseValue": {
+                      "type": "string"
+                    },
+                    "purchaseVattype": {
+                      "type": "integer"
+                    },
+                    "sellValue": {
+                      "type": "string"
+                    },
+                    "sellVatType": {
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakProduct",
+    "path_template": "/products",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "postpeakproduct_2385ae2cf341",
+    "version_id": "av_b0a1656158d5d61217e14425079bce567b4f83461666e5ebe0d2c139e15b9a2d"
+  },
+  {
+    "action_id": "act_5ccd2472984a6e8007989784",
+    "aliases_en": [
+      "Edit Peak Expense",
+      "editPeakExpense"
+    ],
+    "aliases_th": [
+      "แก้ไขค่าใช้จ่าย"
+    ],
+    "capability": "documents.expense.update",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Edit Peak Expense",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakExpenses": {
+            "properties": {
+              "expenses": {
+                "items": {
+                  "properties": {
+                    "contactId": {
+                      "type": "string"
+                    },
+                    "dueDate": {
+                      "type": "string"
+                    },
+                    "issuedDate": {
+                      "type": "string"
+                    },
+                    "istaxInvoice": {
+                      "type": "integer"
+                    },
+                    "paidPayments": {
+                      "properties": {
+                        "paymentDate": {
+                          "type": "string"
+                        },
+                        "payments": {
+                          "items": {
+                            "properties": {
+                              "amount": {
+                                "type": "integer"
+                              },
+                              "paymentMethodId": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "products": {
+                      "items": {
+                        "properties": {
+                          "price": {
+                            "type": "string"
+                          },
+                          "productId": {
+                            "type": "string"
+                          },
+                          "quantity": {
+                            "type": "integer"
+                          },
+                          "vatType": {
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "tags": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "editPeakExpense",
+    "path_template": "/expenses",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "editpeakexpense_896a9375696c",
+    "version_id": "av_fcaf0996c0741992aa8834cb312eff44d07f978339950e6a236aafbfae53397d"
+  },
+  {
+    "action_id": "act_5d022ddce93542bed3ba3c55",
+    "aliases_en": [
+      "Peak Invoice Payment",
+      "peakInvoicePayment"
+    ],
+    "aliases_th": [
+      "บันทึกการชำระใบแจ้งหนี้"
+    ],
+    "capability": "documents.invoice.payment.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Peak Invoice Payment",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakPaidPayments": {
+            "properties": {
+              "paymentDate": {
+                "type": "string"
+              },
+              "payments": {
+                "items": {
+                  "properties": {
+                    "amount": {
+                      "type": "string"
+                    },
+                    "note": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "transactionId": {
+                "type": "string"
+              },
+              "withholdingTaxAmount": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "peakInvoicePayment",
+    "path_template": "/invoices/paidpayment",
+    "preflight_action_ids": [],
+    "required_confirmations": 2,
+    "response_redaction": [],
+    "risk_tier": 2,
+    "side_effects": [
+      "writes_remote_data",
+      "payment"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_5cf9adec93819b0a4e6a70ee73354837efd6a81ca9a57df602aafe321526f4f7"
+  },
+  {
+    "action_id": "act_6aa9e1aeb5c70e874a3a2b19",
+    "aliases_en": [
+      "Edit Peak Contact",
+      "editPeakContact"
+    ],
+    "aliases_th": [
+      "แก้ไขผู้ติดต่อ"
+    ],
+    "capability": "contacts.update",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Edit Peak Contact",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakContacts": {
+            "properties": {
+              "contacts": {
+                "properties": {
+                  "address": {
+                    "type": "string"
+                  },
+                  "branchCode": {
+                    "type": "string"
+                  },
+                  "callCenterNumber": {
+                    "type": "string"
+                  },
+                  "code": {
+                    "type": "string"
+                  },
+                  "contactEmail": {
+                    "type": "string"
+                  },
+                  "contactFirstName": {
+                    "type": "string"
+                  },
+                  "contactLastName": {
+                    "type": "string"
+                  },
+                  "contactNickName": {
+                    "type": "string"
+                  },
+                  "contactPhoneNumber": {
+                    "type": "string"
+                  },
+                  "contactPosition": {
+                    "type": "string"
+                  },
+                  "country": {
+                    "type": "string"
+                  },
+                  "district": {
+                    "type": "string"
+                  },
+                  "email": {
+                    "type": "string"
+                  },
+                  "faxNumber": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "postCode": {
+                    "type": "string"
+                  },
+                  "province": {
+                    "type": "string"
+                  },
+                  "subDistrict": {
+                    "type": "string"
+                  },
+                  "taxNumber": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "integer"
+                  },
+                  "website": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "id": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "editPeakContact",
+    "path_template": "/contacts/edit",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_c88df2a2ff7072c5841588542601cbe7a922f4092573f8c359651ce0d31685c7"
+  },
+  {
+    "action_id": "act_6e49e877eb897677e2eb5b15",
+    "aliases_en": [
+      "Get Peak Purchase Order List",
+      "getPeakPurchaseOrderList"
+    ],
+    "aliases_th": [
+      "ดูรายการใบสั่งซื้อ"
+    ],
+    "capability": "documents.purchase_order.list",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak Purchase Order List",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {
+        "limit": {
+          "description": "",
+          "type": "string"
+        },
+        "page": {
+          "description": "",
+          "type": "string"
+        },
+        "status": {
+          "description": "",
+          "type": "string"
+        }
+      }
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakPurchaseOrderList",
+    "path_template": "/purchaseorders/list",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_2cc96c450746945131c19eb3524333ad1673675ed382356fc406f7a3de57a7cd"
+  },
+  {
+    "action_id": "act_6eca4e9dd9b68da50839acc2",
+    "aliases_en": [
+      "Post Peak DailyJournal",
+      "postPeakDailyjournal"
+    ],
+    "aliases_th": [
+      "สร้างสมุดรายวัน"
+    ],
+    "capability": "daily_journal.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak DailyJournal",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakDailyJournals": {
+            "properties": {
+              "dailyJournals": {
+                "items": {
+                  "properties": {
+                    "description": {
+                      "type": "string"
+                    },
+                    "issuedDate": {
+                      "type": "string"
+                    },
+                    "journalEntries": {
+                      "items": {
+                        "properties": {
+                          "accountCode": {
+                            "type": "string"
+                          },
+                          "accountSubId": {
+                            "type": "string"
+                          },
+                          "credit": {
+                            "type": "string"
+                          },
+                          "debit": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "journalTypeId": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakDailyjournal",
+    "path_template": "/dailyjournals",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_a5f787fa68a7f806aee01305379cc1c749c86b101037acd1c134128ed32c8e70"
+  },
+  {
+    "action_id": "act_7284bd508c7d69b2062caf86",
+    "aliases_en": [
+      "Get Peak Receipt",
+      "getPeakReceipt"
+    ],
+    "aliases_th": [
+      "ดูใบเสร็จรับเงิน"
+    ],
+    "capability": "documents.receipt.get",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak Receipt",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {
+        "code": {
+          "description": "",
+          "type": "string"
+        }
+      }
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakReceipt",
+    "path_template": "/receipts",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_3cf9bfc8de12027f273a440aad0d41f1bc7c643703c4030f5f0e4118386cf6ff"
+  },
+  {
+    "action_id": "act_7771eabbe70dd3c4cb2db76f",
+    "aliases_en": [
+      "Get Peak Product",
+      "getPeakProduct"
+    ],
+    "aliases_th": [
+      "ดูสินค้า"
+    ],
+    "capability": "products.get",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak Product",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {
+        "code": {
+          "description": "",
+          "type": "string"
+        }
+      }
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakProduct",
+    "path_template": "/products",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_5ec713eea2450448adf233566e1f379804f8c833a9ce5fff3f8dcacdd31f01bd"
+  },
+  {
+    "action_id": "act_86726c451fa0efd2550e9991",
+    "aliases_en": [
+      "Get Peak Quotation",
+      "getPeakQuotation"
+    ],
+    "aliases_th": [
+      "ดูใบเสนอราคา"
+    ],
+    "capability": "documents.quotation.get",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak Quotation",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakQuotation",
+    "path_template": "/quotations",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_1fefc350b2828a4f708dc1110f2063c3d3900081ab81c7931298659281d403b7"
+  },
+  {
+    "action_id": "act_88d77abde2055b5bc7d1dd13",
+    "aliases_en": [
+      "Get Peak Billing Note",
+      "getPeakBillingNote"
+    ],
+    "aliases_th": [
+      "ดูใบวางบิล"
+    ],
+    "capability": "documents.billing_note.get",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak Billing Note",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakBillingNote",
+    "path_template": "/billingnotes",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_4d240b35b1b0da28d29a553a08052d731cc10d39611e5216732b2f687e9671e5"
+  },
+  {
+    "action_id": "act_8db2ad5402e03ff26f75d826",
+    "aliases_en": [
+      "Post Peak Expense All In One",
+      "postPeakExpenseAllInOne"
+    ],
+    "aliases_th": [
+      "สร้างค่าใช้จ่าย"
+    ],
+    "capability": "documents.expense.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Expense All In One",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakExpenses": {
+            "properties": {
+              "expenses": {
+                "items": {
+                  "properties": {
+                    "contact": {
+                      "properties": {
+                        "address": {
+                          "type": "string"
+                        },
+                        "branchCode": {
+                          "type": "string"
+                        },
+                        "callCenterNumber": {
+                          "type": "string"
+                        },
+                        "code": {
+                          "type": "string"
+                        },
+                        "contactEmail": {
+                          "type": "string"
+                        },
+                        "contactFirstName": {
+                          "type": "string"
+                        },
+                        "contactLastName": {
+                          "type": "string"
+                        },
+                        "contactNickName": {
+                          "type": "string"
+                        },
+                        "contactPhoneNumber": {
+                          "type": "string"
+                        },
+                        "contactPosition": {
+                          "type": "string"
+                        },
+                        "country": {
+                          "type": "string"
+                        },
+                        "district": {
+                          "type": "string"
+                        },
+                        "email": {
+                          "type": "string"
+                        },
+                        "faxNumber": {
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "postCode": {
+                          "type": "string"
+                        },
+                        "province": {
+                          "type": "string"
+                        },
+                        "subDistrict": {
+                          "type": "string"
+                        },
+                        "taxNumber": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "integer"
+                        },
+                        "website": {
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "dueDate": {
+                      "type": "string"
+                    },
+                    "issuedDate": {
+                      "type": "string"
+                    },
+                    "istaxInvoice": {
+                      "type": "integer"
+                    },
+                    "paidPayments": {
+                      "properties": {
+                        "paymentDate": {
+                          "type": "string"
+                        },
+                        "payments": {
+                          "items": {
+                            "properties": {
+                              "amount": {
+                                "type": "integer"
+                              },
+                              "paymentMethod": {
+                                "properties": {
+                                  "carringBalanceValue": {
+                                    "type": "string"
+                                  },
+                                  "memo": {
+                                    "type": "string"
+                                  },
+                                  "name": {
+                                    "type": "string"
+                                  },
+                                  "type": {
+                                    "type": "integer"
+                                  }
+                                },
+                                "type": "object"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "products": {
+                      "items": {
+                        "properties": {
+                          "price": {
+                            "type": "string"
+                          },
+                          "productTemplate": {
+                            "properties": {
+                              "carryingBalanceAmount": {
+                                "type": "integer"
+                              },
+                              "carryingBalanceValue": {
+                                "type": "string"
+                              },
+                              "code": {
+                                "type": "string"
+                              },
+                              "description": {
+                                "type": "string"
+                              },
+                              "name": {
+                                "type": "string"
+                              },
+                              "purchaseValue": {
+                                "type": "string"
+                              },
+                              "purchaseVattype": {
+                                "type": "integer"
+                              },
+                              "sellValue": {
+                                "type": "string"
+                              },
+                              "sellVatType": {
+                                "type": "integer"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "quantity": {
+                            "type": "integer"
+                          },
+                          "vatType": {
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "tags": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakExpenseAllInOne",
+    "path_template": "/expenses/allinone",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_49f42dce3250346e7ece1d58a428603efdbdec0fe21c20e3624d1238767fa4a6"
+  },
+  {
+    "action_id": "act_8fcd208ff82ccc6429492e75",
+    "aliases_en": [
+      "Post Peak Tag",
+      "postPeakTag"
+    ],
+    "aliases_th": [
+      "สร้างแท็ก"
+    ],
+    "capability": "tags.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Tag",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakTags": {
+            "properties": {
+              "tags": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "transactionId": {
+                "type": "string"
+              },
+              "transactionTypeId": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakTag",
+    "path_template": "/tags",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_7fb0e6e4b7032730f882bc7057b290345988d706ced797b4e80c99d69ee9de4f"
+  },
+  {
+    "action_id": "act_926b428b4b14729473e0e0c0",
+    "aliases_en": [
+      "Get Peak Expense List",
+      "getPeakExpenseList"
+    ],
+    "aliases_th": [
+      "ดูรายการค่าใช้จ่าย"
+    ],
+    "capability": "documents.expense.list",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak Expense List",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {
+        "limit": {
+          "description": "",
+          "type": "string"
+        },
+        "page": {
+          "description": "",
+          "type": "string"
+        },
+        "status": {
+          "description": "",
+          "type": "string"
+        }
+      }
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakExpenseList",
+    "path_template": "/expenses/list",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_e9b8c7ceadd7c41a4629cdde534e2c2860de757134d8da65d3ae37ea9e51aaae"
+  },
+  {
+    "action_id": "act_92c9d694f30bc103781a62ee",
+    "aliases_en": [
+      "Post Peak Invoice",
+      "postPeakInvoice"
+    ],
+    "aliases_th": [
+      "สร้างใบแจ้งหนี้"
+    ],
+    "capability": "documents.invoice.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Invoice",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakInvoices": {
+            "properties": {
+              "invoices": {
+                "items": {
+                  "properties": {
+                    "contactId": {
+                      "type": "string"
+                    },
+                    "dueDate": {
+                      "type": "string"
+                    },
+                    "isTaxInvoice": {
+                      "type": "integer"
+                    },
+                    "issuedDate": {
+                      "type": "string"
+                    },
+                    "paidPayments": {
+                      "properties": {
+                        "paymentDate": {
+                          "type": "string"
+                        },
+                        "payments": {
+                          "items": {
+                            "properties": {
+                              "amount": {
+                                "type": "integer"
+                              },
+                              "paymentMethodId": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "products": {
+                      "items": {
+                        "properties": {
+                          "price": {
+                            "type": "string"
+                          },
+                          "productCode": {
+                            "type": "string"
+                          },
+                          "quantity": {
+                            "type": "integer"
+                          },
+                          "vatType": {
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "tags": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakInvoice",
+    "path_template": "/invoices",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "postpeakinvoice_c8d86926e0a7",
+    "version_id": "av_785284030716a1fd303018d44e0dd30a529b03e16c2050739da51887310133ac"
+  },
+  {
+    "action_id": "act_93a09cc8c33bbcb6f9ac3679",
+    "aliases_en": [
+      "Post Peak Purchase Order",
+      "postPeakPurchaseOrder"
+    ],
+    "aliases_th": [
+      "สร้างใบสั่งซื้อ"
+    ],
+    "capability": "documents.purchase_order.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Purchase Order",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakPurchaseOrders": {
+            "properties": {
+              "purchaseOrders": {
+                "items": {
+                  "properties": {
+                    "contactId": {
+                      "type": "string"
+                    },
+                    "dueDate": {
+                      "type": "string"
+                    },
+                    "issuedDate": {
+                      "type": "string"
+                    },
+                    "products": {
+                      "items": {
+                        "properties": {
+                          "price": {
+                            "type": "string"
+                          },
+                          "productId": {
+                            "type": "string"
+                          },
+                          "quantity": {
+                            "type": "integer"
+                          },
+                          "vatType": {
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "tags": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakPurchaseOrder",
+    "path_template": "/purchaseorders",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_18410c8b6ef21f3e22a1566fd9d5bdd5fd81e43b295e4c57f03cfb1a5b341faa"
+  },
+  {
+    "action_id": "act_93fa566f5267d83e04faba9e",
+    "aliases_en": [
+      "Edit Peak Invoice",
+      "editPeakInvoice"
+    ],
+    "aliases_th": [
+      "แก้ไขใบแจ้งหนี้"
+    ],
+    "capability": "documents.invoice.update",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Edit Peak Invoice",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakInvoices": {
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "invoices": {
+                "properties": {
+                  "code": {
+                    "type": "string"
+                  },
+                  "contactId": {
+                    "type": "string"
+                  },
+                  "discountTotal": {
+                    "type": "string"
+                  },
+                  "dueDate": {
+                    "type": "string"
+                  },
+                  "isTaxInvoice": {
+                    "type": "integer"
+                  },
+                  "issuedDate": {
+                    "type": "string"
+                  },
+                  "paidPayments": {
+                    "type": "null"
+                  },
+                  "products": {
+                    "items": {
+                      "properties": {
+                        "accountCode": {
+                          "type": "string"
+                        },
+                        "accountSubId": {
+                          "type": "null"
+                        },
+                        "description": {
+                          "type": "string"
+                        },
+                        "discount": {
+                          "type": "string"
+                        },
+                        "price": {
+                          "type": "number"
+                        },
+                        "productId": {
+                          "type": "string"
+                        },
+                        "quantity": {
+                          "type": "number"
+                        },
+                        "vatType": {
+                          "type": "integer"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "remark": {
+                    "type": "null"
+                  },
+                  "tags": {
+                    "type": "null"
+                  },
+                  "taxStatus": {
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "editPeakInvoice",
+    "path_template": "/invoices/edit",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_b68db796eca6cc05263da138c22b97543bb5b86beda3fd865216c61ce3fa7365"
+  },
+  {
+    "action_id": "act_97010c84618ec71bd7944a7b",
+    "aliases_en": [
+      "Post Peak Expense",
+      "postPeakExpense"
+    ],
+    "aliases_th": [
+      "สร้างค่าใช้จ่าย"
+    ],
+    "capability": "documents.expense.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Expense",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakExpenses": {
+            "properties": {
+              "expenses": {
+                "items": {
+                  "properties": {
+                    "contactId": {
+                      "type": "string"
+                    },
+                    "dueDate": {
+                      "type": "string"
+                    },
+                    "issuedDate": {
+                      "type": "string"
+                    },
+                    "istaxInvoice": {
+                      "type": "integer"
+                    },
+                    "paidPayments": {
+                      "properties": {
+                        "paymentDate": {
+                          "type": "string"
+                        },
+                        "payments": {
+                          "items": {
+                            "properties": {
+                              "amount": {
+                                "type": "integer"
+                              },
+                              "paymentMethodId": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "products": {
+                      "items": {
+                        "properties": {
+                          "price": {
+                            "type": "string"
+                          },
+                          "productId": {
+                            "type": "string"
+                          },
+                          "quantity": {
+                            "type": "integer"
+                          },
+                          "vatType": {
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "tags": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakExpense",
+    "path_template": "/expenses",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "postpeakexpense_896a9375696c",
+    "version_id": "av_54ef41085a72594e463e78e2adb232e82f8ddff144ec4bad5a9e3d6f27e11b6e"
+  },
+  {
+    "action_id": "act_97c2fd64b9ffb9e25179c49d",
+    "aliases_en": [
+      "ByInvoice Peak Receipt",
+      "byinvoicePeakReceipt"
+    ],
+    "aliases_th": [
+      "สร้างใบเสร็จรับเงิน"
+    ],
+    "capability": "documents.receipt.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "ByInvoice Peak Receipt ",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakReceipts": {
+            "properties": {
+              "invoiceId": {
+                "type": "string"
+              },
+              "paymentGroupId": {
+                "type": "integer"
+              },
+              "receipts": {
+                "properties": {
+                  "issuedDate": {
+                    "type": "string"
+                  },
+                  "remark": {
+                    "type": "null"
+                  },
+                  "tags": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "byinvoicePeakReceipt",
+    "path_template": "/receipts/createbyinvoice",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_1e6a7690dd1dbc4355511da3072d7f1007061ad0584422edb84273b927a81364"
+  },
+  {
+    "action_id": "act_987d7da49b5c2152305f4fcd",
+    "aliases_en": [
+      "Void Peak Quotation",
+      "voidPeakQuotation"
+    ],
+    "aliases_th": [
+      "ยกเลิกใบเสนอราคา"
+    ],
+    "capability": "documents.quotation.void",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Void Peak Quotation",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakQuotations": {
+            "properties": {
+              "id": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "voidPeakQuotation",
+    "path_template": "/quotations/void",
+    "preflight_action_ids": [],
+    "required_confirmations": 2,
+    "response_redaction": [],
+    "risk_tier": 2,
+    "side_effects": [
+      "writes_remote_data",
+      "void"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_dc27cf11dd36fce7de32fbce2e8e98e319b8b8c2a30cdf3d11daf32dfd2dd932"
+  },
+  {
+    "action_id": "act_9e8c8d5a1fe33e4a9c28cef1",
+    "aliases_en": [
+      "Get Peak Expense",
+      "getPeakExpense"
+    ],
+    "aliases_th": [
+      "ดูค่าใช้จ่าย"
+    ],
+    "capability": "documents.expense.get",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak Expense",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {
+        "code": {
+          "description": "",
+          "type": "string"
+        }
+      }
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakExpense",
+    "path_template": "/expenses",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_ff825691bca5afc1ff26d32c7d3187eb800b765ca141a1551f4df1da93b3f4b1"
+  },
+  {
+    "action_id": "act_a739859a3ff8941fa0a6c25c",
+    "aliases_en": [
+      "Edit Peak Service",
+      "editPeakService"
+    ],
+    "aliases_th": [
+      "แก้ไขบริการ"
+    ],
+    "capability": "services.update",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Edit Peak Service",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakServices": {
+            "properties": {
+              "services": {
+                "items": {
+                  "properties": {
+                    "description": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "purchaseValue": {
+                      "type": "string"
+                    },
+                    "purchaseVattype": {
+                      "type": "integer"
+                    },
+                    "sellValue": {
+                      "type": "string"
+                    },
+                    "sellVatType": {
+                      "type": "integer"
+                    },
+                    "website": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "editPeakService",
+    "path_template": "/services",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "editpeakservice_cf3cf7d7c8fc",
+    "version_id": "av_a6f49e25549cd6a23dbcd92fb4fa015e72da454f620831dcf2c721783c0e7f2a"
+  },
+  {
+    "action_id": "act_a7f3097c2a8e59319c0dd716",
+    "aliases_en": [
+      "Post Peak Billing Note",
+      "postPeakBillingNote"
+    ],
+    "aliases_th": [
+      "สร้างใบวางบิล"
+    ],
+    "capability": "documents.billing_note.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Billing Note",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakBillingNotes": {
+            "properties": {
+              "billingNotes": {
+                "items": {
+                  "properties": {
+                    "contactId": {
+                      "type": "string"
+                    },
+                    "dueDate": {
+                      "type": "string"
+                    },
+                    "issuedDate": {
+                      "type": "string"
+                    },
+                    "paidPayments": {
+                      "properties": {
+                        "paymentDate": {
+                          "type": "string"
+                        },
+                        "payments": {
+                          "items": {
+                            "properties": {
+                              "amount": {
+                                "type": "integer"
+                              },
+                              "paymentMethodId": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "tags": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "transactions": {
+                      "items": {
+                        "properties": {
+                          "amount": {
+                            "type": "integer"
+                          },
+                          "id": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakBillingNote",
+    "path_template": "/billingnotes",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_fc52ce410834f3b8ef8765f50d728e950daaae3532db5634c4b69eeb36d3723a"
+  },
+  {
+    "action_id": "act_a854ec32e2b7ac849f11deeb",
+    "aliases_en": [
+      "Get Peak Contact",
+      "getPeakContact"
+    ],
+    "aliases_th": [
+      "ดูผู้ติดต่อ"
+    ],
+    "capability": "contacts.get",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak Contact",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {
+        "code": {
+          "description": "",
+          "type": "string"
+        }
+      }
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakContact",
+    "path_template": "/contacts",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_2981d281c7e87500e3f69ba6983ff29f46d465edeecfb81132c819613174904b"
+  },
+  {
+    "action_id": "act_a86f5ab29488d2109529cfdb",
+    "aliases_en": [
+      "Post Peak Billing Note Expense",
+      "postPeakBillingNoteExpense"
+    ],
+    "aliases_th": [
+      "สร้างใบวางบิลรายจ่าย"
+    ],
+    "capability": "documents.billing_note_expense.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Billing Note Expense",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakBillingNotesExpenses": {
+            "properties": {
+              "billingNotesExpenses": {
+                "items": {
+                  "properties": {
+                    "contactId": {
+                      "type": "string"
+                    },
+                    "dueDate": {
+                      "type": "string"
+                    },
+                    "issuedDate": {
+                      "type": "string"
+                    },
+                    "paidPayments": {
+                      "properties": {
+                        "paymentDate": {
+                          "type": "string"
+                        },
+                        "payments": {
+                          "items": {
+                            "properties": {
+                              "amount": {
+                                "type": "integer"
+                              },
+                              "paymentMethodId": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "tags": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "transactions": {
+                      "items": {
+                        "properties": {
+                          "amount": {
+                            "type": "integer"
+                          },
+                          "id": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakBillingNoteExpense",
+    "path_template": "/billingnotesexpenses",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_40ca39dda84fff81fe0807cef514918d2cc3cb72120f379b75d97667ec8fca0c"
+  },
+  {
+    "action_id": "act_ab53b5325bebc62984f4516b",
+    "aliases_en": [
+      "Post Peak Credit Note Expense",
+      "postPeakCreditNoteExpense"
+    ],
+    "aliases_th": [
+      "สร้างใบลดหนี้รายจ่าย"
+    ],
+    "capability": "documents.credit_note_expense.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Credit Note Expense",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakCreditNotesExpenses": {
+            "properties": {
+              "creditNotesExpenses": {
+                "items": {
+                  "properties": {
+                    "goodsReturn": {
+                      "type": "string"
+                    },
+                    "reasonDescription": {
+                      "type": "string"
+                    },
+                    "reasonTypeId": {
+                      "type": "string"
+                    },
+                    "transactionId": {
+                      "type": "string"
+                    },
+                    "transactionTypeId": {
+                      "type": "string"
+                    },
+                    "transactions": {
+                      "properties": {
+                        "issuedDate": {
+                          "type": "string"
+                        },
+                        "products": {
+                          "items": {
+                            "properties": {
+                              "discount": {
+                                "type": "string"
+                              },
+                              "id": {
+                                "type": "string"
+                              },
+                              "price": {
+                                "type": "integer"
+                              },
+                              "quantity": {
+                                "type": "integer"
+                              },
+                              "vatType": {
+                                "type": "integer"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakCreditNoteExpense",
+    "path_template": "/creditnotesExpenses",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_de5a2a991b1a14274f1dc023bf6b409f315901717e2de449e7d16f64a70a78a9"
+  },
+  {
+    "action_id": "act_ae4c4adac955fc15bf85865f",
+    "aliases_en": [
+      "Post Invitation",
+      "postInvitation"
+    ],
+    "aliases_th": [
+      "เชิญคำเชิญผู้ใช้"
+    ],
+    "capability": "invitation.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Invitation",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakInvitation": {
+            "properties": {
+              "email": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postInvitation",
+    "path_template": "/invitation",
+    "preflight_action_ids": [],
+    "required_confirmations": 2,
+    "response_redaction": [],
+    "risk_tier": 2,
+    "side_effects": [
+      "writes_remote_data",
+      "invite"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_f4298735030d1cf9418c18932ebd9ca392eed0512f8e9dc7d831d981c19e74ab"
+  },
+  {
+    "action_id": "act_b76683cad7af033640036e7c",
+    "aliases_en": [
+      "Get Peak Credit Note",
+      "getPeakCreditNote"
+    ],
+    "aliases_th": [
+      "ดูใบลดหนี้"
+    ],
+    "capability": "documents.credit_note.get",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak Credit Note",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {
+        "code": {
+          "description": "",
+          "type": "string"
+        }
+      }
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakCreditNote",
+    "path_template": "/creditnotes",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_0cd6a8b4a0fd0ea9586cc3e04da267f13d9b4dfd075744ae6da514f6a997ffc3"
+  },
+  {
+    "action_id": "act_baa0f8fc773de48ffe631499",
+    "aliases_en": [
+      "ByPurchaseOrder Peak Expense",
+      "bypurchaseorderPeakExpense"
+    ],
+    "aliases_th": [
+      "สร้างค่าใช้จ่าย"
+    ],
+    "capability": "documents.expense.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "ByPurchaseOrder Peak Expense",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakExpenses": {
+            "properties": {
+              "expenses": {
+                "properties": {
+                  "dueDate": {
+                    "type": "string"
+                  },
+                  "issuedDate": {
+                    "type": "string"
+                  },
+                  "istaxInvoice": {
+                    "type": "integer"
+                  },
+                  "paidPayments": {
+                    "properties": {
+                      "paymentDate": {
+                        "type": "string"
+                      },
+                      "payments": {
+                        "items": {
+                          "properties": {
+                            "amount": {
+                              "type": "integer"
+                            },
+                            "paymentMethodId": {
+                              "type": "string"
+                            }
+                          },
+                          "type": "object"
+                        },
+                        "type": "array"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "tags": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "type": "object"
+              },
+              "purchaseOrderId": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "bypurchaseorderPeakExpense",
+    "path_template": "/expenses/createbypurchaseorder",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_addb9843ea052124c5c3b76e471992be7e76745443e006a204e85ccfce023766"
+  },
+  {
+    "action_id": "act_bd70b00e0df3d157d22fb1a1",
+    "aliases_en": [
+      "Get Peak Invoice",
+      "getPeakInvoice"
+    ],
+    "aliases_th": [
+      "ดูใบแจ้งหนี้"
+    ],
+    "capability": "documents.invoice.get",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak Invoice",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {
+        "code": {
+          "description": "",
+          "type": "string"
+        }
+      }
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakInvoice",
+    "path_template": "/invoices",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_63fe4bcf9dc737a03677aa013bc729b5d0b891e7f5bc2459f37335dba0f5066a"
+  },
+  {
+    "action_id": "act_c022b664b9954b24789e0d5d",
+    "aliases_en": [
+      "Get Peak Purchase Order",
+      "getPeakPurchaseOrder"
+    ],
+    "aliases_th": [
+      "ดูใบสั่งซื้อ"
+    ],
+    "capability": "documents.purchase_order.get",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak Purchase Order",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakPurchaseOrder",
+    "path_template": "/purchaseorders",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_5fcbb88fa7dda38d868b23d6a03a1a2d90e1610d1307b986120e1382a62b7910"
+  },
+  {
+    "action_id": "act_c0fb09d59ce450c3819a9521",
+    "aliases_en": [
+      "Post Peak Receipt /w Fee",
+      "postPeakReceiptWFee"
+    ],
+    "aliases_th": [
+      "สร้างใบเสร็จรับเงิน"
+    ],
+    "capability": "documents.receipt.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Receipt /w Fee",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakReceipts": {
+            "properties": {
+              "receipts": {
+                "items": {
+                  "properties": {
+                    "contactCode": {
+                      "type": "string"
+                    },
+                    "dueDate": {
+                      "type": "string"
+                    },
+                    "issuedDate": {
+                      "type": "string"
+                    },
+                    "istaxInvoice": {
+                      "type": "integer"
+                    },
+                    "paidPayments": {
+                      "properties": {
+                        "paymentDate": {
+                          "type": "string"
+                        },
+                        "payments": {
+                          "items": {
+                            "properties": {
+                              "amount": {
+                                "type": "number"
+                              },
+                              "paymentMethodId": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "products": {
+                      "items": {
+                        "properties": {
+                          "price": {
+                            "type": "number"
+                          },
+                          "productCode": {
+                            "type": "string"
+                          },
+                          "quantity": {
+                            "type": "number"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "tags": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "taxStatus": {
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakReceiptWFee",
+    "path_template": "/receipts",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "postpeakreceiptwfee_4e6cdb287cb4",
+    "version_id": "av_24d7e1e075d9a9bc73df29abe509aeae6192ffbe6bbcdcb347236f66021ec188"
+  },
+  {
+    "action_id": "act_c2feb6d508c7ad482c11a468",
+    "aliases_en": [
+      "Edit Peak Receipt",
+      "editPeakReceipt"
+    ],
+    "aliases_th": [
+      "แก้ไขใบเสร็จรับเงิน"
+    ],
+    "capability": "documents.receipt.update",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Edit Peak Receipt",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakReceipts": {
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "receipts": {
+                "properties": {
+                  "code": {
+                    "type": "string"
+                  },
+                  "contactId": {
+                    "type": "string"
+                  },
+                  "discountTotal": {
+                    "type": "string"
+                  },
+                  "dueDate": {
+                    "type": "string"
+                  },
+                  "isTaxInvoice": {
+                    "type": "integer"
+                  },
+                  "issuedDate": {
+                    "type": "string"
+                  },
+                  "paidPayments": {
+                    "properties": {
+                      "paymentDate": {
+                        "type": "string"
+                      },
+                      "payments": {
+                        "items": {
+                          "properties": {
+                            "amount": {
+                              "type": "number"
+                            },
+                            "paymentMethodId": {
+                              "type": "string"
+                            }
+                          },
+                          "type": "object"
+                        },
+                        "type": "array"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "products": {
+                    "items": {
+                      "properties": {
+                        "accountCode": {
+                          "type": "string"
+                        },
+                        "accountSubId": {
+                          "type": "null"
+                        },
+                        "description": {
+                          "type": "string"
+                        },
+                        "discount": {
+                          "type": "string"
+                        },
+                        "price": {
+                          "type": "number"
+                        },
+                        "productId": {
+                          "type": "null"
+                        },
+                        "quantity": {
+                          "type": "number"
+                        },
+                        "vatType": {
+                          "type": "integer"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "remark": {
+                    "type": "null"
+                  },
+                  "tags": {
+                    "type": "null"
+                  },
+                  "taxStatus": {
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "editPeakReceipt",
+    "path_template": "/receipts/edit",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_dc13337ef05ecd11cf9f96d268e39d2c9052f6cf7754941cd8199cfa6676cfbd"
+  },
+  {
+    "action_id": "act_c4af9d26172dd61c9a9e4432",
+    "aliases_en": [
+      "Post Peak Receipt With Cheque",
+      "postPeakReceiptWithCheque"
+    ],
+    "aliases_th": [
+      "สร้างใบเสร็จรับเงิน"
+    ],
+    "capability": "documents.receipt.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Receipt With Cheque",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakReceipts": {
+            "properties": {
+              "receipts": {
+                "items": {
+                  "properties": {
+                    "contactId": {
+                      "type": "string"
+                    },
+                    "dueDate": {
+                      "type": "string"
+                    },
+                    "issuedDate": {
+                      "type": "string"
+                    },
+                    "istaxInvoice": {
+                      "type": "integer"
+                    },
+                    "paidPayments": {
+                      "properties": {
+                        "paymentDate": {
+                          "type": "string"
+                        },
+                        "payments": {
+                          "items": {
+                            "properties": {
+                              "cheque": {
+                                "properties": {
+                                  "accountNo": {
+                                    "type": "string"
+                                  },
+                                  "amount": {
+                                    "type": "string"
+                                  },
+                                  "bankId": {
+                                    "type": "string"
+                                  },
+                                  "branchNo": {
+                                    "type": "string"
+                                  },
+                                  "chequeDate": {
+                                    "type": "string"
+                                  },
+                                  "chequeNo": {
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object"
+                              },
+                              "isCheque": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "products": {
+                      "items": {
+                        "properties": {
+                          "price": {
+                            "type": "string"
+                          },
+                          "productId": {
+                            "type": "string"
+                          },
+                          "quantity": {
+                            "type": "integer"
+                          },
+                          "vatType": {
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "tags": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakReceiptWithCheque",
+    "path_template": "/receipts",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "postpeakreceiptwithcheque_cdbc204bae14",
+    "version_id": "av_30d136bf4ce01df411bec6e1eefb1231c1b192f0f23aedf069b9c7c1da93f246"
+  },
+  {
+    "action_id": "act_c5b0baafb0d76261e443457c",
+    "aliases_en": [
+      "Remove Peak Tag",
+      "removePeakTag"
+    ],
+    "aliases_th": [
+      "ลบแท็ก"
+    ],
+    "capability": "tags.delete",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Remove Peak Tag",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakTags": {
+            "properties": {
+              "tags": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "transactionId": {
+                "type": "string"
+              },
+              "transactionTypeId": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "removePeakTag",
+    "path_template": "/tags/remove",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_309d6faf7293a0efa9c1674c78348ef1a2c67ba9ada0d433e9e0b400a07e63dd"
+  },
+  {
+    "action_id": "act_cbe47f843982380a2f6e3bf5",
+    "aliases_en": [
+      "Post Peak Service",
+      "postPeakService"
+    ],
+    "aliases_th": [
+      "สร้างบริการ"
+    ],
+    "capability": "services.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Service",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakServices": {
+            "properties": {
+              "services": {
+                "items": {
+                  "properties": {
+                    "description": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "purchaseValue": {
+                      "type": "string"
+                    },
+                    "purchaseVattype": {
+                      "type": "integer"
+                    },
+                    "sellValue": {
+                      "type": "string"
+                    },
+                    "sellVatType": {
+                      "type": "integer"
+                    },
+                    "website": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakService",
+    "path_template": "/services",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "postpeakservice_cf3cf7d7c8fc",
+    "version_id": "av_6d89b22e8f3bb88b85ee5703a1052b00d3ffc43b8418be6e5f50861ace662548"
+  },
+  {
+    "action_id": "act_ccc3343c893ddeb9a4d4a207",
+    "aliases_en": [
+      "Get Peak Invoice List",
+      "getPeakInvoiceList"
+    ],
+    "aliases_th": [
+      "ดูรายการใบแจ้งหนี้"
+    ],
+    "capability": "documents.invoice.list",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak Invoice List",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {
+        "limit": {
+          "description": "",
+          "type": "string"
+        },
+        "page": {
+          "description": "",
+          "type": "string"
+        },
+        "searchText": {
+          "description": "",
+          "type": "string"
+        },
+        "status": {
+          "description": "",
+          "type": "string"
+        }
+      }
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakInvoiceList",
+    "path_template": "/invoices/list",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_3123b9451db9b6d22a5462ccd54f86cdd3bdf3c180d0c1e226a7c3bdfb95e53a"
+  },
+  {
+    "action_id": "act_cfea2f8629ca1587e64c87cd",
+    "aliases_en": [
+      "Edit Peak Product",
+      "editPeakProduct"
+    ],
+    "aliases_th": [
+      "แก้ไขสินค้า"
+    ],
+    "capability": "products.update",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Edit Peak Product",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakProducts": {
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "products": {
+                "properties": {
+                  "carryingBalanceAmount": {
+                    "type": "integer"
+                  },
+                  "carryingBalanceValue": {
+                    "type": "string"
+                  },
+                  "code": {
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "purchaseValue": {
+                    "type": "string"
+                  },
+                  "purchaseVattype": {
+                    "type": "integer"
+                  },
+                  "sellValue": {
+                    "type": "string"
+                  },
+                  "sellVatType": {
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "editPeakProduct",
+    "path_template": "/products/edit",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_2dd329eeb5c11c23035ac83cd454616179a8ed1105fcb52e0cc49603b455fc23"
+  },
+  {
+    "action_id": "act_d1034a254d9cc65822cc83c9",
+    "aliases_en": [
+      "Post Peak Contact",
+      "postPeakContact"
+    ],
+    "aliases_th": [
+      "สร้างผู้ติดต่อ"
+    ],
+    "capability": "contacts.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Contact",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakContacts": {
+            "properties": {
+              "contacts": {
+                "items": {
+                  "properties": {
+                    "address": {
+                      "type": "string"
+                    },
+                    "branchCode": {
+                      "type": "string"
+                    },
+                    "callCenterNumber": {
+                      "type": "string"
+                    },
+                    "contactEmail": {
+                      "type": "string"
+                    },
+                    "contactFirstName": {
+                      "type": "string"
+                    },
+                    "contactLastName": {
+                      "type": "string"
+                    },
+                    "contactNickName": {
+                      "type": "string"
+                    },
+                    "contactPhoneNumber": {
+                      "type": "string"
+                    },
+                    "contactPosition": {
+                      "type": "string"
+                    },
+                    "country": {
+                      "type": "string"
+                    },
+                    "district": {
+                      "type": "string"
+                    },
+                    "email": {
+                      "type": "string"
+                    },
+                    "faxNumber": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "postCode": {
+                      "type": "string"
+                    },
+                    "province": {
+                      "type": "string"
+                    },
+                    "subDistrict": {
+                      "type": "string"
+                    },
+                    "taxNumber": {
+                      "type": "string"
+                    },
+                    "type": {
+                      "type": "integer"
+                    },
+                    "website": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakContact",
+    "path_template": "/contacts",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "postpeakcontact_4baceb122f3e",
+    "version_id": "av_5ff413f0c4e9f98fd08880dddedde7476614f25bdbddf0863277b05131f8c30a"
+  },
+  {
+    "action_id": "act_d14adea3e772e3f406ba790e",
+    "aliases_en": [
+      "Post Peak Contact /w Bank",
+      "postPeakContactWBank"
+    ],
+    "aliases_th": [
+      "สร้างผู้ติดต่อ"
+    ],
+    "capability": "contacts.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Contact /w Bank",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakContacts": {
+            "properties": {
+              "contacts": {
+                "items": {
+                  "properties": {
+                    "address": {
+                      "type": "string"
+                    },
+                    "bankAccount": {
+                      "properties": {
+                        "bankAccountName": {
+                          "type": "string"
+                        },
+                        "bankAccountNo": {
+                          "type": "string"
+                        },
+                        "bankBranch": {
+                          "type": "string"
+                        },
+                        "bankId": {
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "callCenterNumber": {
+                      "type": "string"
+                    },
+                    "contactEmail": {
+                      "type": "string"
+                    },
+                    "contactFirstName": {
+                      "type": "string"
+                    },
+                    "contactLastName": {
+                      "type": "string"
+                    },
+                    "contactNickName": {
+                      "type": "string"
+                    },
+                    "contactPhoneNumber": {
+                      "type": "string"
+                    },
+                    "contactPosition": {
+                      "type": "string"
+                    },
+                    "country": {
+                      "type": "string"
+                    },
+                    "district": {
+                      "type": "string"
+                    },
+                    "email": {
+                      "type": "string"
+                    },
+                    "faxNumber": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "postCode": {
+                      "type": "string"
+                    },
+                    "province": {
+                      "type": "string"
+                    },
+                    "subDistrict": {
+                      "type": "string"
+                    },
+                    "type": {
+                      "type": "integer"
+                    },
+                    "website": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakContactWBank",
+    "path_template": "/contacts",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "postpeakcontactwbank_4da505f8772c",
+    "version_id": "av_f2bd081dc2067351eeb62cf1b2dd060ffafeb33267a03015fb59d1301a9d8453"
+  },
+  {
+    "action_id": "act_d1aa008c401d40255ca0738e",
+    "aliases_en": [
+      "Get Peak Billing Note Expense",
+      "getPeakBillingNoteExpense"
+    ],
+    "aliases_th": [
+      "ดูใบวางบิลรายจ่าย"
+    ],
+    "capability": "documents.billing_note_expense.get",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak Billing Note Expense",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakBillingNoteExpense",
+    "path_template": "/billingnotesexpenses",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_8da87567c98b9516f3b1544d6a9ed4ce3221a8351b9405831bb4bee48e44cf6e"
+  },
+  {
+    "action_id": "act_d1d6ef93ff84247b17baa719",
+    "aliases_en": [
+      "Get Peak Service",
+      "getPeakService"
+    ],
+    "aliases_th": [
+      "ดูบริการ"
+    ],
+    "capability": "services.get",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak Service",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakService",
+    "path_template": "/services",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_3b4842aada8bf8dbea88e14ee706fd3f72263bfb8cd73dbfe25bbb69afcf87f6"
+  },
+  {
+    "action_id": "act_d34838c6775859ea15830d5d",
+    "aliases_en": [
+      "Post Peak PaymentMethod",
+      "postPeakPaymentmethod"
+    ],
+    "aliases_th": [
+      "สร้างช่องทางรับชำระ"
+    ],
+    "capability": "payment_methods.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak PaymentMethod",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakPaymentMethods": {
+            "properties": {
+              "paymentMethods": {
+                "items": {
+                  "properties": {
+                    "carringBalanceValue": {
+                      "type": "string"
+                    },
+                    "memo": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "type": {
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakPaymentmethod",
+    "path_template": "/paymentmethods",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_219c776f6a04c9f2171cdee9374d2f86f4f06f88e076eb50e40266285cd74099"
+  },
+  {
+    "action_id": "act_dbb5a5862c26dec57ef1a220",
+    "aliases_en": [
+      "Get Peak Receipt List",
+      "getPeakReceiptList"
+    ],
+    "aliases_th": [
+      "ดูรายการใบเสร็จรับเงิน"
+    ],
+    "capability": "documents.receipt.list",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak Receipt List",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {
+        "limit": {
+          "description": "",
+          "type": "string"
+        },
+        "page": {
+          "description": "",
+          "type": "string"
+        },
+        "status": {
+          "description": "",
+          "type": "string"
+        }
+      }
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakReceiptList",
+    "path_template": "/receipts/list",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_749ee62799630ab9a93acb2f8f3c032d9d7b9e1519099527835dff14c3b6f613"
+  },
+  {
+    "action_id": "act_e370123e4fd83afb6490cdf9",
+    "aliases_en": [
+      "Get Peak AccountCode",
+      "getPeakAccountcode"
+    ],
+    "aliases_th": [
+      "ดูผังบัญชี"
+    ],
+    "capability": "journal.account_code.get",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak AccountCode",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakAccountcode",
+    "path_template": "/dailyjournals/accountcode",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_195369104f5c56d7e688d27ef193d20e8dd301d579084bf06698e44e6564ab09"
+  },
+  {
+    "action_id": "act_e4744c138983b7fd8fd9b402",
+    "aliases_en": [
+      "Post Peak Quotation",
+      "postPeakQuotation"
+    ],
+    "aliases_th": [
+      "สร้างใบเสนอราคา"
+    ],
+    "capability": "documents.quotation.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Quotation",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakQuotations": {
+            "properties": {
+              "quotations": {
+                "items": {
+                  "properties": {
+                    "contactId": {
+                      "type": "string"
+                    },
+                    "dueDate": {
+                      "type": "string"
+                    },
+                    "issuedDate": {
+                      "type": "string"
+                    },
+                    "products": {
+                      "items": {
+                        "properties": {
+                          "price": {
+                            "type": "string"
+                          },
+                          "productId": {
+                            "type": "string"
+                          },
+                          "quantity": {
+                            "type": "integer"
+                          },
+                          "vatType": {
+                            "type": "number"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "tags": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakQuotation",
+    "path_template": "/quotations",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_3a19d251a67a38310d1588f78af5b892050441d94a9af3064eb06297547cbb0b"
+  },
+  {
+    "action_id": "act_e5ebcd779f494d89d8e53d2e",
+    "aliases_en": [
+      "Get Peak Credit Note Expense",
+      "getPeakCreditNoteExpense"
+    ],
+    "aliases_th": [
+      "ดูใบลดหนี้รายจ่าย"
+    ],
+    "capability": "documents.credit_note_expense.get",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak Credit Note Expense",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakCreditNoteExpense",
+    "path_template": "/creditnotesExpenses",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_fe4a0379ed6537a2399bf5764958ae516153a6666258f193d881f9c009b79616"
+  },
+  {
+    "action_id": "act_e705bc1495702ad0914e3494",
+    "aliases_en": [
+      "Edit Peak Quotation",
+      "editPeakQuotation"
+    ],
+    "aliases_th": [
+      "แก้ไขใบเสนอราคา"
+    ],
+    "capability": "documents.quotation.update",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Edit Peak Quotation",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakQuotations": {
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "quotations": {
+                "properties": {
+                  "code": {
+                    "type": "string"
+                  },
+                  "contactId": {
+                    "type": "string"
+                  },
+                  "discountTotal": {
+                    "type": "string"
+                  },
+                  "dueDate": {
+                    "type": "string"
+                  },
+                  "issuedDate": {
+                    "type": "string"
+                  },
+                  "products": {
+                    "items": {
+                      "properties": {
+                        "accountCode": {
+                          "type": "string"
+                        },
+                        "accountSubId": {
+                          "type": "null"
+                        },
+                        "description": {
+                          "type": "string"
+                        },
+                        "discount": {
+                          "type": "string"
+                        },
+                        "price": {
+                          "type": "number"
+                        },
+                        "productId": {
+                          "type": "null"
+                        },
+                        "quantity": {
+                          "type": "number"
+                        },
+                        "vatType": {
+                          "type": "integer"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "remark": {
+                    "type": "null"
+                  },
+                  "status": {
+                    "type": "string"
+                  },
+                  "tags": {
+                    "type": "null"
+                  },
+                  "taxStatus": {
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "editPeakQuotation",
+    "path_template": "/quotations/edit",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_628c8f5f4831fb719fd601a9732dfab1c17fa089b452327089951da636295b0b"
+  },
+  {
+    "action_id": "act_eaadd03ba498084a17d266fa",
+    "aliases_en": [
+      "Post Peak Service /w Account",
+      "postPeakServiceWAccount"
+    ],
+    "aliases_th": [
+      "สร้างบริการ"
+    ],
+    "capability": "services.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Post Peak Service /w Account",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakServices": {
+            "properties": {
+              "services": {
+                "items": {
+                  "properties": {
+                    "description": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "purchaseAccount": {
+                      "type": "string"
+                    },
+                    "purchaseValue": {
+                      "type": "string"
+                    },
+                    "purchaseVattype": {
+                      "type": "integer"
+                    },
+                    "sellAccount": {
+                      "type": "string"
+                    },
+                    "sellValue": {
+                      "type": "string"
+                    },
+                    "sellVatType": {
+                      "type": "integer"
+                    },
+                    "website": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "postPeakServiceWAccount",
+    "path_template": "/services",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "postpeakservicewaccount_fed91b946794",
+    "version_id": "av_188115eac24b83b988635daa3609c2ac36c04a40b608bfcb0a40e89d535bd461"
+  },
+  {
+    "action_id": "act_ed12fe4f9e2c080243869ffa",
+    "aliases_en": [
+      "Get Peak Quotation List",
+      "getPeakQuotationList"
+    ],
+    "aliases_th": [
+      "ดูรายการใบเสนอราคา"
+    ],
+    "capability": "documents.quotation.list",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Get Peak Quotation List",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {},
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {
+        "limit": {
+          "description": "",
+          "type": "string"
+        },
+        "page": {
+          "description": "",
+          "type": "string"
+        },
+        "status": {
+          "description": "",
+          "type": "string"
+        }
+      }
+    },
+    "method": "GET",
+    "observed_state": "untested",
+    "operation_id": "getPeakQuotationList",
+    "path_template": "/quotations/list",
+    "preflight_action_ids": [],
+    "required_confirmations": 0,
+    "response_redaction": [],
+    "risk_tier": 0,
+    "side_effects": [],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_549b0147da22d0d31f53bf5a7b0f64d77131a59dfb05337bbaaa2013e511e333"
+  },
+  {
+    "action_id": "act_ef839e82267a176b9fc738b8",
+    "aliases_en": [
+      "Approve Peak Invoice",
+      "approvePeakInvoice"
+    ],
+    "aliases_th": [
+      "อนุมัติใบแจ้งหนี้"
+    ],
+    "capability": "documents.invoice.approve",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Approve Peak Invoice",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakInvoices": {
+            "properties": {
+              "id": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "approvePeakInvoice",
+    "path_template": "/invoices/approve",
+    "preflight_action_ids": [],
+    "required_confirmations": 2,
+    "response_redaction": [],
+    "risk_tier": 2,
+    "side_effects": [
+      "writes_remote_data",
+      "approve"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_fe59716b6fa42ae39c362e37a229ae04a2207badd0e36523100a539d57420145"
+  },
+  {
+    "action_id": "act_f087bdd426544f61eb91387a",
+    "aliases_en": [
+      "Create Client Token",
+      "createClientToken"
+    ],
+    "aliases_th": [
+      "สร้างโทเคนเชื่อมต่อ"
+    ],
+    "capability": "auth.client_token.create",
+    "confidence": "example_derived",
+    "connector_id": "peak",
+    "content_type": "application/json",
+    "description": "Create Client Token",
+    "environments": [
+      "production",
+      "uat",
+      "sandbox"
+    ],
+    "error_rules": {},
+    "examples": [],
+    "idempotency": {},
+    "input_schema": {
+      "body": {
+        "properties": {
+          "PeakClientToken": {
+            "properties": {
+              "connectId": {
+                "type": "string"
+              },
+              "password": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "files": {},
+      "headers": {},
+      "path": {},
+      "query": {}
+    },
+    "method": "POST",
+    "observed_state": "untested",
+    "operation_id": "createClientToken",
+    "path_template": "/clienttoken",
+    "preflight_action_ids": [],
+    "required_confirmations": 1,
+    "response_redaction": [],
+    "risk_tier": 1,
+    "side_effects": [
+      "writes_remote_data"
+    ],
+    "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+    "source_uri": "mercury://catalog/global/peak/source",
+    "success_rules": {},
+    "variant_id": "default",
+    "version_id": "av_d0475609954bed84beb0fa68aecb891b02d4a2cd4aa2205db64f415b8145d57b"
+  }
+]

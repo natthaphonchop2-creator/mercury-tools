@@ -24,9 +24,11 @@ metadata:
 > ConnectKey, ApplicationCode, UserToken, ClientToken, API keys, tax IDs, emails,
 > bearer tokens, customer data, or accounting transaction payloads.
 
-> Public contest policy: Mercury may explain every endpoint below, but executes
-> only setup authentication probes and read capabilities. All accounting
-> mutations remain blocked before connector dispatch.
+> Mercury Cloud serves this catalog and related knowledge read-only. The Mercury
+> local MCP may execute a cataloged GET or POST from the user's machine after
+> local credential setup, schema validation, risk classification, and the
+> required preview/confirmation steps. It never exposes an arbitrary-URL HTTP
+> proxy.
 
 # PEAK API Data Dictionary
 
@@ -55,8 +57,8 @@ When a user asks Mercury to work with PEAK:
 2. Identify the action: get/list, create, edit/update, approve, paidpayment,
    void/voidpayment, create from source document, attach, tag, or invite.
 3. Match the endpoint row below and require the matching capability in the flow.
-4. In public contest mode, classify POST mutations as blocked and return
-   `public_preview_read_only`. Their field hints remain documentation only.
+4. For a POST mutation, create an immutable preview, show the sanitized request
+   shape and risk, collect the required confirmation, then dispatch locally.
 
 ## Intent Keywords
 
@@ -89,12 +91,12 @@ When a user asks Mercury to work with PEAK:
 | --- | --- |
 | `setup_auth` | Authentication/setup probe. Does not create accounting documents. |
 | `safe_read` | GET endpoint for lookup/list/preflight. |
-| `master_write` | POST creates or updates master data; blocked in public contest mode. |
-| `document_write` | POST creates or updates accounting documents; blocked in public contest mode. |
-| `payment_write` | POST records payment or paidpayment; blocked in public contest mode. |
-| `status_write` | POST changes status, approval, void, or voidpayment; blocked in public contest mode. |
-| `journal_write` | POST creates journal entries; blocked in public contest mode. |
-| `utility_write` | POST creates tags, invitations, or supporting records; blocked in public contest mode. |
+| `master_write` | POST creates or updates master data; local preview and confirmation are required. |
+| `document_write` | POST creates or updates accounting documents; local preview and confirmation are required. |
+| `payment_write` | POST records payment or paidpayment; Tier 2 confirmation is required. |
+| `status_write` | POST changes status, approval, void, or voidpayment; Tier 2 confirmation is required. |
+| `journal_write` | POST creates journal entries; local preview and confirmation are required. |
+| `utility_write` | POST creates tags, invitations, or supporting records; risk-based confirmation is required. |
 
 ## Common Field Hints
 
@@ -194,3 +196,652 @@ PEAK may return HTTP 200 while the response body has a failed `resCode`. Mercury
 must inspect body-level `resCode`, `resDesc`, and the expected response node for
 each endpoint. Treat missing `resCode=200` as a failed operation and report only
 sanitized status and error context.
+
+<!-- MERCURY GENERATED ACTION CATALOG START -->
+
+## Generated Mercury Action Catalog
+
+This section is generated from the sanitized built-in catalog. Each block binds
+endpoint knowledge to one immutable Mercury action identity.
+
+### 1. Peak Invoice Payment All In One
+
+action_id: act_0114957a3922dc0f46a99907
+method: POST
+path: /invoices/paidpaymentallinone
+capability: documents.invoice.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_0114957a3922dc0f46a99907
+
+### 2. Peak Expense Payment
+
+action_id: act_0b47bbf8bcc51ceada745adc
+method: POST
+path: /expenses/paidpayment
+capability: documents.expense.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_0b47bbf8bcc51ceada745adc
+
+### 3. Post Peak Product /w Account
+
+action_id: act_0dcc727c86ca16631816ed12
+method: POST
+path: /products
+capability: products.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_0dcc727c86ca16631816ed12
+
+### 4. Void Peak Receipt
+
+action_id: act_260661133c4f8b1fbbeeadac
+method: POST
+path: /receipts/void
+capability: documents.receipt.void
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_260661133c4f8b1fbbeeadac
+
+### 5. Void Peak Invoice Payment
+
+action_id: act_308b782f3c276b9a0dd818d3
+method: POST
+path: /invoices/voidpayment
+capability: documents.invoice.payment.void
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_308b782f3c276b9a0dd818d3
+
+### 6. Post Peak Credit Note
+
+action_id: act_3863cfee28a4ce0ab4f65ab9
+method: POST
+path: /creditnotes
+capability: documents.credit_note.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_3863cfee28a4ce0ab4f65ab9
+
+### 7. Get Peak DailyJournal
+
+action_id: act_3c4cc6c07a8ffa418232c909
+method: GET
+path: /dailyjournals/
+capability: daily_journal.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_3c4cc6c07a8ffa418232c909
+
+### 8. Post Peak Receipt All In One
+
+action_id: act_3f63028cae55eb90783e7be5
+method: POST
+path: /receipts/allinone
+capability: documents.receipt.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_3f63028cae55eb90783e7be5
+
+### 9. Post Peak Receipt
+
+action_id: act_402bb61694a153488b29ab33
+method: POST
+path: /receipts
+capability: documents.receipt.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_402bb61694a153488b29ab33
+
+### 10. Post Peak Quotation All In One
+
+action_id: act_41394a4923b15a4c53cf644d
+method: POST
+path: /quotations/allinone
+capability: documents.quotation.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_41394a4923b15a4c53cf644d
+
+### 11. Post Peak Invoice /w Fee
+
+action_id: act_46c9288523202918dd477367
+method: POST
+path: /invoices
+capability: documents.invoice.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_46c9288523202918dd477367
+
+### 12. Post Peak Credit Note Full Credit
+
+action_id: act_46db1343db1c07b58d37cf3e
+method: POST
+path: /creditnotes
+capability: documents.credit_note.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_46db1343db1c07b58d37cf3e
+
+### 13. Get Peak PaymentMethod
+
+action_id: act_4ec1db144d0b79dbdc133236
+method: GET
+path: /paymentmethods
+capability: payment_methods.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_4ec1db144d0b79dbdc133236
+
+### 14. Post Peak Product
+
+action_id: act_5ab58230233fb4cff85d36ff
+method: POST
+path: /products
+capability: products.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_5ab58230233fb4cff85d36ff
+
+### 15. Edit Peak Expense
+
+action_id: act_5ccd2472984a6e8007989784
+method: POST
+path: /expenses
+capability: documents.expense.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_5ccd2472984a6e8007989784
+
+### 16. Peak Invoice Payment
+
+action_id: act_5d022ddce93542bed3ba3c55
+method: POST
+path: /invoices/paidpayment
+capability: documents.invoice.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_5d022ddce93542bed3ba3c55
+
+### 17. Edit Peak Contact
+
+action_id: act_6aa9e1aeb5c70e874a3a2b19
+method: POST
+path: /contacts/edit
+capability: contacts.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_6aa9e1aeb5c70e874a3a2b19
+
+### 18. Get Peak Purchase Order List
+
+action_id: act_6e49e877eb897677e2eb5b15
+method: GET
+path: /purchaseorders/list
+capability: documents.purchase_order.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_6e49e877eb897677e2eb5b15
+
+### 19. Post Peak DailyJournal
+
+action_id: act_6eca4e9dd9b68da50839acc2
+method: POST
+path: /dailyjournals
+capability: daily_journal.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_6eca4e9dd9b68da50839acc2
+
+### 20. Get Peak Receipt
+
+action_id: act_7284bd508c7d69b2062caf86
+method: GET
+path: /receipts
+capability: documents.receipt.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_7284bd508c7d69b2062caf86
+
+### 21. Get Peak Product
+
+action_id: act_7771eabbe70dd3c4cb2db76f
+method: GET
+path: /products
+capability: products.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_7771eabbe70dd3c4cb2db76f
+
+### 22. Get Peak Quotation
+
+action_id: act_86726c451fa0efd2550e9991
+method: GET
+path: /quotations
+capability: documents.quotation.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_86726c451fa0efd2550e9991
+
+### 23. Get Peak Billing Note
+
+action_id: act_88d77abde2055b5bc7d1dd13
+method: GET
+path: /billingnotes
+capability: documents.billing_note.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_88d77abde2055b5bc7d1dd13
+
+### 24. Post Peak Expense All In One
+
+action_id: act_8db2ad5402e03ff26f75d826
+method: POST
+path: /expenses/allinone
+capability: documents.expense.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_8db2ad5402e03ff26f75d826
+
+### 25. Post Peak Tag
+
+action_id: act_8fcd208ff82ccc6429492e75
+method: POST
+path: /tags
+capability: tags.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_8fcd208ff82ccc6429492e75
+
+### 26. Get Peak Expense List
+
+action_id: act_926b428b4b14729473e0e0c0
+method: GET
+path: /expenses/list
+capability: documents.expense.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_926b428b4b14729473e0e0c0
+
+### 27. Post Peak Invoice
+
+action_id: act_92c9d694f30bc103781a62ee
+method: POST
+path: /invoices
+capability: documents.invoice.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_92c9d694f30bc103781a62ee
+
+### 28. Post Peak Purchase Order
+
+action_id: act_93a09cc8c33bbcb6f9ac3679
+method: POST
+path: /purchaseorders
+capability: documents.purchase_order.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_93a09cc8c33bbcb6f9ac3679
+
+### 29. Edit Peak Invoice
+
+action_id: act_93fa566f5267d83e04faba9e
+method: POST
+path: /invoices/edit
+capability: documents.invoice.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_93fa566f5267d83e04faba9e
+
+### 30. Post Peak Expense
+
+action_id: act_97010c84618ec71bd7944a7b
+method: POST
+path: /expenses
+capability: documents.expense.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_97010c84618ec71bd7944a7b
+
+### 31. ByInvoice Peak Receipt
+
+action_id: act_97c2fd64b9ffb9e25179c49d
+method: POST
+path: /receipts/createbyinvoice
+capability: documents.receipt.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_97c2fd64b9ffb9e25179c49d
+
+### 32. Void Peak Quotation
+
+action_id: act_987d7da49b5c2152305f4fcd
+method: POST
+path: /quotations/void
+capability: documents.quotation.void
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_987d7da49b5c2152305f4fcd
+
+### 33. Get Peak Expense
+
+action_id: act_9e8c8d5a1fe33e4a9c28cef1
+method: GET
+path: /expenses
+capability: documents.expense.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_9e8c8d5a1fe33e4a9c28cef1
+
+### 34. Edit Peak Service
+
+action_id: act_a739859a3ff8941fa0a6c25c
+method: POST
+path: /services
+capability: services.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_a739859a3ff8941fa0a6c25c
+
+### 35. Post Peak Billing Note
+
+action_id: act_a7f3097c2a8e59319c0dd716
+method: POST
+path: /billingnotes
+capability: documents.billing_note.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_a7f3097c2a8e59319c0dd716
+
+### 36. Get Peak Contact
+
+action_id: act_a854ec32e2b7ac849f11deeb
+method: GET
+path: /contacts
+capability: contacts.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_a854ec32e2b7ac849f11deeb
+
+### 37. Post Peak Billing Note Expense
+
+action_id: act_a86f5ab29488d2109529cfdb
+method: POST
+path: /billingnotesexpenses
+capability: documents.billing_note_expense.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_a86f5ab29488d2109529cfdb
+
+### 38. Post Peak Credit Note Expense
+
+action_id: act_ab53b5325bebc62984f4516b
+method: POST
+path: /creditnotesExpenses
+capability: documents.credit_note_expense.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_ab53b5325bebc62984f4516b
+
+### 39. Post Invitation
+
+action_id: act_ae4c4adac955fc15bf85865f
+method: POST
+path: /invitation
+capability: invitation.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_ae4c4adac955fc15bf85865f
+
+### 40. Get Peak Credit Note
+
+action_id: act_b76683cad7af033640036e7c
+method: GET
+path: /creditnotes
+capability: documents.credit_note.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_b76683cad7af033640036e7c
+
+### 41. ByPurchaseOrder Peak Expense
+
+action_id: act_baa0f8fc773de48ffe631499
+method: POST
+path: /expenses/createbypurchaseorder
+capability: documents.expense.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_baa0f8fc773de48ffe631499
+
+### 42. Get Peak Invoice
+
+action_id: act_bd70b00e0df3d157d22fb1a1
+method: GET
+path: /invoices
+capability: documents.invoice.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_bd70b00e0df3d157d22fb1a1
+
+### 43. Get Peak Purchase Order
+
+action_id: act_c022b664b9954b24789e0d5d
+method: GET
+path: /purchaseorders
+capability: documents.purchase_order.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_c022b664b9954b24789e0d5d
+
+### 44. Post Peak Receipt /w Fee
+
+action_id: act_c0fb09d59ce450c3819a9521
+method: POST
+path: /receipts
+capability: documents.receipt.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_c0fb09d59ce450c3819a9521
+
+### 45. Edit Peak Receipt
+
+action_id: act_c2feb6d508c7ad482c11a468
+method: POST
+path: /receipts/edit
+capability: documents.receipt.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_c2feb6d508c7ad482c11a468
+
+### 46. Post Peak Receipt With Cheque
+
+action_id: act_c4af9d26172dd61c9a9e4432
+method: POST
+path: /receipts
+capability: documents.receipt.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_c4af9d26172dd61c9a9e4432
+
+### 47. Remove Peak Tag
+
+action_id: act_c5b0baafb0d76261e443457c
+method: POST
+path: /tags/remove
+capability: tags.delete
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_c5b0baafb0d76261e443457c
+
+### 48. Post Peak Service
+
+action_id: act_cbe47f843982380a2f6e3bf5
+method: POST
+path: /services
+capability: services.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_cbe47f843982380a2f6e3bf5
+
+### 49. Get Peak Invoice List
+
+action_id: act_ccc3343c893ddeb9a4d4a207
+method: GET
+path: /invoices/list
+capability: documents.invoice.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_ccc3343c893ddeb9a4d4a207
+
+### 50. Edit Peak Product
+
+action_id: act_cfea2f8629ca1587e64c87cd
+method: POST
+path: /products/edit
+capability: products.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_cfea2f8629ca1587e64c87cd
+
+### 51. Post Peak Contact
+
+action_id: act_d1034a254d9cc65822cc83c9
+method: POST
+path: /contacts
+capability: contacts.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_d1034a254d9cc65822cc83c9
+
+### 52. Post Peak Contact /w Bank
+
+action_id: act_d14adea3e772e3f406ba790e
+method: POST
+path: /contacts
+capability: contacts.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_d14adea3e772e3f406ba790e
+
+### 53. Get Peak Billing Note Expense
+
+action_id: act_d1aa008c401d40255ca0738e
+method: GET
+path: /billingnotesexpenses
+capability: documents.billing_note_expense.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_d1aa008c401d40255ca0738e
+
+### 54. Get Peak Service
+
+action_id: act_d1d6ef93ff84247b17baa719
+method: GET
+path: /services
+capability: services.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_d1d6ef93ff84247b17baa719
+
+### 55. Post Peak PaymentMethod
+
+action_id: act_d34838c6775859ea15830d5d
+method: POST
+path: /paymentmethods
+capability: payment_methods.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_d34838c6775859ea15830d5d
+
+### 56. Get Peak Receipt List
+
+action_id: act_dbb5a5862c26dec57ef1a220
+method: GET
+path: /receipts/list
+capability: documents.receipt.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_dbb5a5862c26dec57ef1a220
+
+### 57. Get Peak AccountCode
+
+action_id: act_e370123e4fd83afb6490cdf9
+method: GET
+path: /dailyjournals/accountcode
+capability: journal.account_code.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_e370123e4fd83afb6490cdf9
+
+### 58. Post Peak Quotation
+
+action_id: act_e4744c138983b7fd8fd9b402
+method: POST
+path: /quotations
+capability: documents.quotation.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_e4744c138983b7fd8fd9b402
+
+### 59. Get Peak Credit Note Expense
+
+action_id: act_e5ebcd779f494d89d8e53d2e
+method: GET
+path: /creditnotesExpenses
+capability: documents.credit_note_expense.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_e5ebcd779f494d89d8e53d2e
+
+### 60. Edit Peak Quotation
+
+action_id: act_e705bc1495702ad0914e3494
+method: POST
+path: /quotations/edit
+capability: documents.quotation.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_e705bc1495702ad0914e3494
+
+### 61. Post Peak Service /w Account
+
+action_id: act_eaadd03ba498084a17d266fa
+method: POST
+path: /services
+capability: services.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_eaadd03ba498084a17d266fa
+
+### 62. Get Peak Quotation List
+
+action_id: act_ed12fe4f9e2c080243869ffa
+method: GET
+path: /quotations/list
+capability: documents.quotation.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_ed12fe4f9e2c080243869ffa
+
+### 63. Approve Peak Invoice
+
+action_id: act_ef839e82267a176b9fc738b8
+method: POST
+path: /invoices/approve
+capability: documents.invoice.approve
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_ef839e82267a176b9fc738b8
+
+### 64. Create Client Token
+
+action_id: act_f087bdd426544f61eb91387a
+method: POST
+path: /clienttoken
+capability: auth.client_token.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/peak/source#act_f087bdd426544f61eb91387a
+
+<!-- MERCURY GENERATED ACTION CATALOG END -->

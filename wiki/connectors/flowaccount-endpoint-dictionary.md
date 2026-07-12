@@ -23,7 +23,12 @@ metadata:
 
 ## Mercury Operating Note
 
-FlowAccount is an endpoint-capable accounting connector. Mercury public v1 may discover all documented endpoints but executes only read-only validation and explicitly allowed read capabilities. Production-changing calls remain blocked. Setup validation uses a low-impact company/profile check.
+FlowAccount is an endpoint-capable accounting connector. Mercury Cloud serves this
+catalog and related knowledge read-only. The Mercury local MCP may execute a
+cataloged GET, POST, PUT, PATCH, or DELETE from the user's machine after local
+credential setup, schema validation, risk classification, and the required
+preview/confirmation steps. It never exposes an arbitrary-URL HTTP proxy. Setup
+validation uses a low-impact company/profile check.
 
 # FlowAccount Endpoint Data Dictionary
 
@@ -7816,7 +7821,7 @@ Body fields:
 | creditType | integer | 1 | ประเภทเครดิต/การชำระเงิน |
 | creditDays | integer | 0 | จำนวนวันเครดิต |
 | dueDate | string | 2021-06-15 | วันครบกำหนดชำระ |
-| salesName | string | sale@apitel.co | ชื่อพนักงานขาย |
+| salesName | string | [REDACTED] | ชื่อพนักงานขาย |
 | projectName | string |  | ชื่อโครงการ |
 | reference | string | invoice: INV2021060007 | เลขที่อ้างอิง |
 | isVatInclusive | boolean | True | ระบุว่าราคาสินค้ารวม VAT แล้วหรือไม่ |
@@ -8436,7 +8441,7 @@ Body fields:
 | --- | --- | --- | --- |
 | contactName | string | Withholidng | ชื่อผู้ติดต่อหรือนิติบุคคล |
 | contactAddress | string | [redacted] | ที่อยู่ผู้ติดต่อ |
-| contactNumber | string | 028181969 | เบอร์โทรผู้ติดต่อ |
+| contactNumber | string | [REDACTED] | เบอร์โทรผู้ติดต่อ |
 | contactGroup | integer | 3 | กลุ่มผู้ติดต่อ เช่น ลูกค้า/ผู้ขาย |
 | contactPerson | string | New New | ชื่อบุคคลติดต่อ |
 | contactTaxId | string | [redacted] | เลขประจำตัวผู้เสียภาษีของผู้ติดต่อ |
@@ -8543,7 +8548,7 @@ Body fields:
 | companyWebsite | string | [redacted] | เว็บไซต์บริษัท |
 | contactName | string | Withholidng | ชื่อผู้ติดต่อหรือนิติบุคคล |
 | contactAddress | string | [redacted] | ที่อยู่ผู้ติดต่อ |
-| contactNumber | string | 028181969 | เบอร์โทรผู้ติดต่อ |
+| contactNumber | string | [REDACTED] | เบอร์โทรผู้ติดต่อ |
 | contactGroup | integer | 3 | กลุ่มผู้ติดต่อ เช่น ลูกค้า/ผู้ขาย |
 | contactPerson | string | New New | ชื่อบุคคลติดต่อ |
 | contactTaxId | string | [redacted] | เลขประจำตัวผู้เสียภาษีของผู้ติดต่อ |
@@ -9870,3 +9875,1912 @@ Body fields:
 | Source document | Postman collection only |
 
 Body mode: `none`; parse status: `none`
+
+<!-- MERCURY GENERATED ACTION CATALOG START -->
+
+## Generated Mercury Action Catalog
+
+This section is generated from the sanitized built-in catalog. Each block binds
+endpoint knowledge to one immutable Mercury action identity.
+
+### 1. สร้างหรือส่งลิงก์แชร์เอกสาร (ใบเสร็จรับเงิน)
+
+action_id: act_015b49bd41e4f80716d78ee4
+method: POST
+path: /receipts/sharedocument
+capability: documents.receipt.share.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_015b49bd41e4f80716d78ee4
+
+### 2. ลบข้อมูลหรือเอกสาร (ข้อมูล master ของสินค้า)
+
+action_id: act_01b9797215c4f456f766a527
+method: DELETE
+path: /product-masters/{Product_Id}
+capability: product_masters.delete
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_01b9797215c4f456f766a527
+
+### 3. ดึงรายการข้อมูล (ข้อมูลบริษัท ช่องทางการเงิน และการตั้งค่า)
+
+action_id: act_04c896400ea719532d300b17
+method: GET
+path: /bank-channel/credit-card
+capability: bank_channels.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_04c896400ea719532d300b17
+
+### 4. ดึงข้อมูลตามรหัส (เอกสารซื้อ/รับสินค้า)
+
+action_id: act_05a6524a4c3ab0dcbeb90d40
+method: GET
+path: /purchases/{recordId}
+capability: documents.purchase.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_05a6524a4c3ab0dcbeb90d40
+
+### 5. แก้ไขข้อมูลหรือเอกสารเดิม (ใบกำกับภาษี)
+
+action_id: act_06e6b6f917c7007dcf6ff00f
+method: PUT
+path: /tax-invoices/{recordId}
+capability: documents.invoice.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_06e6b6f917c7007dcf6ff00f
+
+### 6. ดึงรายการข้อมูล (ใบวางบิล)
+
+action_id: act_0b5ee93b2b65ccc79bc97f29
+method: GET
+path: /billing-notes
+capability: documents.billing_note.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_0b5ee93b2b65ccc79bc97f29
+
+### 7. แก้ไขข้อมูลหรือเอกสารเดิม (ใบเสร็จรับเงิน)
+
+action_id: act_0f01452a8f83a1b00219dbf8
+method: PUT
+path: /receipts/{recordId}
+capability: documents.receipt.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_0f01452a8f83a1b00219dbf8
+
+### 8. บันทึกหรือเปลี่ยนสถานะการชำระเงิน (ใบกำกับภาษี/ใบเสร็จรับเงินสด)
+
+action_id: act_0f7d40067b256994236b1690
+method: POST
+path: /upgrade/cash-invoices/inline/with-payment
+capability: documents.cash_invoice.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_0f7d40067b256994236b1690
+
+### 9. สร้างหรือส่งลิงก์แชร์เอกสาร (ใบกำกับภาษี)
+
+action_id: act_0ffccd94c319126b3c1636ad
+method: POST
+path: /tax-invoices/sharedocument
+capability: documents.invoice.share.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_0ffccd94c319126b3c1636ad
+
+### 10. ดึงข้อมูลตามรหัส (ใบกำกับภาษี/ใบเสร็จรับเงิน)
+
+action_id: act_107001c7e4eef81d38c499a1
+method: GET
+path: /tax-invoices/{recordId}
+capability: documents.invoice.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_107001c7e4eef81d38c499a1
+
+### 11. สร้างหรือส่งลิงก์แชร์เอกสาร (ค่าใช้จ่าย)
+
+action_id: act_11f9469e693acc4d35526baf
+method: POST
+path: /expenses/sharedocument
+capability: documents.expense.share.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_11f9469e693acc4d35526baf
+
+### 12. ส่งเอกสารทางอีเมล (ใบกำกับภาษี/ใบเสร็จรับเงินสด)
+
+action_id: act_13c621b3be44c61edc8cb66e
+method: POST
+path: /cash-invoices/email-document
+capability: documents.cash_invoice.email.send
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_13c621b3be44c61edc8cb66e
+
+### 13. อัปโหลดไฟล์แนบให้เอกสาร (หนังสือรับรองหัก ณ ที่จ่าย)
+
+action_id: act_148aea8f383e8baac99e79b5
+method: POST
+path: /withholding-taxes/{recordId}/attachment
+capability: documents.withholding_tax.attachment.upload
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_148aea8f383e8baac99e79b5
+
+### 14. สร้างข้อมูลหรือเอกสารใหม่ (ใบสั่งซื้อ)
+
+action_id: act_153341d91049ad9657ea03be
+method: POST
+path: /purchases-orders/inline
+capability: documents.purchase_order.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_153341d91049ad9657ea03be
+
+### 15. ส่งเอกสารทางอีเมล (ค่าใช้จ่าย)
+
+action_id: act_1734ca25c8aa5eba5449844b
+method: POST
+path: /expenses/email-document
+capability: documents.expense.email.send
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_1734ca25c8aa5eba5449844b
+
+### 16. บันทึกหรือเปลี่ยนสถานะการชำระเงิน (ใบกำกับภาษี/ใบเสร็จรับเงิน)
+
+action_id: act_1898616881be7e910ceacd46
+method: POST
+path: /tax-invoices/{recordId}/payment
+capability: documents.invoice.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_1898616881be7e910ceacd46
+
+### 17. บันทึกหรือเปลี่ยนสถานะการชำระเงิน (ค่าใช้จ่าย)
+
+action_id: act_18e6662dc27063b55c7e7320
+method: POST
+path: /expenses/{recordId}/payment
+capability: documents.expense.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_18e6662dc27063b55c7e7320
+
+### 18. สร้างรายการสมุดรายวันแบบร่าง (รายการสมุดรายวัน)
+
+action_id: act_1ab364842f3d0a038bcf7721
+method: POST
+path: /journal-entries/draft
+capability: journal_entry.draft.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_1ab364842f3d0a038bcf7721
+
+### 19. สร้างหรือส่งลิงก์แชร์เอกสาร (หนังสือรับรองหัก ณ ที่จ่าย)
+
+action_id: act_1b0823ff36149ce5c7af14a9
+method: POST
+path: /withholding-taxes/sharedocument
+capability: documents.withholding_tax.share.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_1b0823ff36149ce5c7af14a9
+
+### 20. แก้ไขข้อมูลหรือเอกสารเดิม (เอกสารซื้อ/รับสินค้า)
+
+action_id: act_1fe22131cea7c84d9b1ee274
+method: PUT
+path: /purchases/{recordId}
+capability: documents.purchase.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_1fe22131cea7c84d9b1ee274
+
+### 21. สร้างข้อมูลหรือเอกสารใหม่ (ใบกำกับภาษี/ใบเสร็จรับเงินสด)
+
+action_id: act_21999f45d49a67a83e142c79
+method: POST
+path: /cash-invoices/inline
+capability: documents.cash_invoice.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_21999f45d49a67a83e142c79
+
+### 22. สร้างหรือส่งลิงก์แชร์เอกสาร (ใบสั่งซื้อ)
+
+action_id: act_21aad46b733c111783ff2f85
+method: POST
+path: /purchases-orders/sharedocument
+capability: documents.purchase_order.share.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_21aad46b733c111783ff2f85
+
+### 23. ส่งเอกสารทางอีเมล (ใบเสร็จรับเงิน)
+
+action_id: act_22b6fb1673cf111b48b43c3a
+method: POST
+path: /receipts/email-document
+capability: documents.receipt.email.send
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_22b6fb1673cf111b48b43c3a
+
+### 24. ส่งเอกสารทางอีเมล (ใบวางบิล)
+
+action_id: act_23f7e8939106da14bee6f401
+method: POST
+path: /billing-notes/email-document
+capability: documents.billing_note.email.send
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_23f7e8939106da14bee6f401
+
+### 25. สร้างข้อมูลหรือเอกสารใหม่ (ค่าใช้จ่าย)
+
+action_id: act_2453abc64b4c8ad0bb8ccbad
+method: POST
+path: /expenses/inline/with-payment
+capability: documents.expense.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_2453abc64b4c8ad0bb8ccbad
+
+### 26. อัปโหลดไฟล์แนบให้เอกสาร (ค่าใช้จ่าย)
+
+action_id: act_266b085b6f6b4140ce813c41
+method: POST
+path: /expenses/{recordId}/attachment
+capability: documents.expense.attachment.upload
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_266b085b6f6b4140ce813c41
+
+### 27. เปลี่ยนสถานะเอกสาร (ใบกำกับภาษี/ใบเสร็จรับเงิน)
+
+action_id: act_278319416de515baf42a99cb
+method: POST
+path: /tax-invoices/{recordId}/status/awaiting
+capability: documents.invoice.status.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_278319416de515baf42a99cb
+
+### 28. ดึงรายการข้อมูล (ผู้ติดต่อ ลูกค้า หรือผู้ขาย)
+
+action_id: act_28a40ff500382918e7dc1ccb
+method: GET
+path: /contacts
+capability: contacts.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_28a40ff500382918e7dc1ccb
+
+### 29. แปลงหรือยกระดับเอกสารจากขั้นตอนก่อนหน้า (ใบสั่งซื้อ)
+
+action_id: act_29d6903d6c23575f00934cf4
+method: POST
+path: /upgrade/purchases-orders
+capability: documents.purchase_order.upgrade
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_29d6903d6c23575f00934cf4
+
+### 30. ดึงข้อมูลตามรหัส (หนังสือรับรองหัก ณ ที่จ่าย)
+
+action_id: act_2bdcfa22a54f608995a59721
+method: POST
+path: /withholding-taxes/{recordId}/status/void
+capability: documents.withholding_tax.void
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_2bdcfa22a54f608995a59721
+
+### 31. ขอ access token สำหรับเรียก FlowAccount API (การยืนยันตัวตนและขอ access token)
+
+action_id: act_2fe33e97a18cbd6ee7cc0ac6
+method: POST
+path: /token
+capability: auth.token.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_2fe33e97a18cbd6ee7cc0ac6
+
+### 32. สร้างข้อมูลหรือเอกสารใหม่ (ใบกำกับภาษี)
+
+action_id: act_30c6bbf6133527126dce571b
+method: POST
+path: /tax-invoices/inline
+capability: documents.invoice.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_30c6bbf6133527126dce571b
+
+### 33. แก้ไขข้อมูลหรือเอกสารเดิม (ข้อมูล master ของสินค้า)
+
+action_id: act_339bea9f9e8d713818dedabf
+method: PUT
+path: /product-masters/{Product_Id}
+capability: product_masters.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_339bea9f9e8d713818dedabf
+
+### 34. อัปโหลดไฟล์แนบให้เอกสาร (ใบเสนอราคา)
+
+action_id: act_35e9ff24728bbce9fb4f696f
+method: POST
+path: /quotations/{recordId}/attachment
+capability: documents.quotation.attachment.upload
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_35e9ff24728bbce9fb4f696f
+
+### 35. ดึงข้อมูลตามรหัส (ใบกำกับภาษี/ใบเสร็จรับเงินสด)
+
+action_id: act_360aa086ea183d2c817bad9c
+method: GET
+path: /cash-invoices/{recordId}
+capability: documents.cash_invoice.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_360aa086ea183d2c817bad9c
+
+### 36. สร้างหรือส่งลิงก์แชร์เอกสาร (ใบวางบิล)
+
+action_id: act_37367e9d686ae814b9b807df
+method: POST
+path: /billing-notes/sharedocument
+capability: documents.billing_note.share.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_37367e9d686ae814b9b807df
+
+### 37. อัปโหลดไฟล์แนบให้เอกสาร (ใบกำกับภาษี/ใบเสร็จรับเงินสด)
+
+action_id: act_3742fc2fd1183e671f62f9bc
+method: POST
+path: /cash-invoices/{recordId}/attachment
+capability: documents.cash_invoice.attachment.upload
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_3742fc2fd1183e671f62f9bc
+
+### 38. แปลงหรือยกระดับเอกสารจากขั้นตอนก่อนหน้า (ใบกำกับภาษี)
+
+action_id: act_37a98ae379e691ce16f9886f
+method: POST
+path: /upgrade/tax-invoices/inline
+capability: documents.invoice.upgrade
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_37a98ae379e691ce16f9886f
+
+### 39. แก้ไขข้อมูลหรือเอกสารเดิม (ข้อมูลบริษัท ช่องทางการเงิน และการตั้งค่า)
+
+action_id: act_3962b47d771bc65b1d2411b7
+method: PUT
+path: /company/info
+capability: company.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_3962b47d771bc65b1d2411b7
+
+### 40. บันทึกหรือเปลี่ยนสถานะการชำระเงิน (ใบกำกับภาษี/ใบเสร็จรับเงิน)
+
+action_id: act_3bec2fe4f9b51ef5e820f382
+method: POST
+path: /upgrade/tax-invoices/with-payment
+capability: documents.invoice.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_3bec2fe4f9b51ef5e820f382
+
+### 41. แก้ไขข้อมูลหรือเอกสารเดิม (ใบกำกับภาษี/ใบเสร็จรับเงินสด)
+
+action_id: act_3ee3b88d9c6321d5c2f8effd
+method: PUT
+path: /cash-invoices/{recordId}
+capability: documents.cash_invoice.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_3ee3b88d9c6321d5c2f8effd
+
+### 42. สร้างข้อมูลหรือเอกสารใหม่ (เอกสารซื้อ/รับสินค้า)
+
+action_id: act_447152b5811c38ecbebdf288
+method: POST
+path: /purchases/inline/with-payment
+capability: documents.purchase.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_447152b5811c38ecbebdf288
+
+### 43. ลบข้อมูลหรือเอกสาร (ใบเสนอราคา)
+
+action_id: act_48ca679eaaa6ca7849a7dfd2
+method: DELETE
+path: /quotations/{recordId}
+capability: documents.quotation.delete
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_48ca679eaaa6ca7849a7dfd2
+
+### 44. แปลงหรือยกระดับเอกสารจากขั้นตอนก่อนหน้า (ใบวางบิล)
+
+action_id: act_49e392a500c231d4b608c630
+method: POST
+path: /upgrade/billing-notes
+capability: documents.billing_note.upgrade
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_49e392a500c231d4b608c630
+
+### 45. สร้างข้อมูลหรือเอกสารใหม่ (ข้อมูล master ของสินค้า)
+
+action_id: act_4af84354f00d8f9139b03c60
+method: POST
+path: /product-masters
+capability: product_masters.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_4af84354f00d8f9139b03c60
+
+### 46. ดึงรายการข้อมูล (ใบเสร็จรับเงิน)
+
+action_id: act_4b2ef85f09fdecb1d68a1767
+method: GET
+path: /receipts
+capability: documents.receipt.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_4b2ef85f09fdecb1d68a1767
+
+### 47. บันทึกหรือเปลี่ยนสถานะการชำระเงิน (เอกสารซื้อ/รับสินค้า)
+
+action_id: act_4c94e28af476d3eed503fea6
+method: POST
+path: /purchases/{recordId}/payment
+capability: documents.purchase.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_4c94e28af476d3eed503fea6
+
+### 48. สร้างหรือส่งลิงก์แชร์เอกสาร (เอกสารซื้อ/รับสินค้า)
+
+action_id: act_4cd0c9c5fc28da8197ddf465
+method: POST
+path: /purchases/sharedocument
+capability: documents.purchase.share.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_4cd0c9c5fc28da8197ddf465
+
+### 49. เปลี่ยนสถานะเอกสาร (ใบเสนอราคา)
+
+action_id: act_4cf9e5802d57699dc0bf5140
+method: POST
+path: /quotations/{recordId}/status/awaiting
+capability: documents.quotation.status.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_4cf9e5802d57699dc0bf5140
+
+### 50. แปลงหรือยกระดับเอกสารจากขั้นตอนก่อนหน้า (ใบวางบิล)
+
+action_id: act_4da8a3fa8bb11003b2ca8a86
+method: POST
+path: /upgrade/billing-notes/inline
+capability: documents.billing_note.upgrade
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_4da8a3fa8bb11003b2ca8a86
+
+### 51. ดึงข้อมูลตามรหัส (ผู้ติดต่อ ลูกค้า หรือผู้ขาย)
+
+action_id: act_4dd2db7e2bf8c3854764784c
+method: GET
+path: /contacts/{recordId}
+capability: contacts.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_4dd2db7e2bf8c3854764784c
+
+### 52. ดึงรายการข้อมูล (ข้อมูล master ของสินค้า)
+
+action_id: act_4e0873e60b60925fa10dd30f
+method: GET
+path: /product-masters
+capability: product_masters.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_4e0873e60b60925fa10dd30f
+
+### 53. ส่งเอกสารทางอีเมล (ใบกำกับภาษี/ใบเสร็จรับเงิน)
+
+action_id: act_54de3cc569058db7879257c7
+method: POST
+path: /tax-invoices/email-document
+capability: documents.invoice.email.send
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_54de3cc569058db7879257c7
+
+### 54. ดึงรายการข้อมูล (ค่าใช้จ่าย)
+
+action_id: act_56a89d42aecdf5c62f39f90c
+method: GET
+path: /expenses/categories/business
+capability: documents.expense.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_56a89d42aecdf5c62f39f90c
+
+### 55. สร้างข้อมูลหรือเอกสารใหม่ (สินค้าและบริการ)
+
+action_id: act_58cf6b5240d8d291d8411191
+method: POST
+path: /products
+capability: products.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_58cf6b5240d8d291d8411191
+
+### 56. อัปโหลดไฟล์แนบให้เอกสาร (เอกสารซื้อ/รับสินค้า)
+
+action_id: act_5aab20fc3929e5baf0fe4e8b
+method: POST
+path: /purchases/{recordId}/attachment
+capability: documents.purchase.attachment.upload
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_5aab20fc3929e5baf0fe4e8b
+
+### 57. สร้างข้อมูลหรือเอกสารใหม่ (ใบเสนอราคา)
+
+action_id: act_5cb79cabb534698645c98529
+method: POST
+path: /quotations
+capability: documents.quotation.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_5cb79cabb534698645c98529
+
+### 58. สร้างรายการสมุดรายวันแบบร่าง (รายการสมุดรายวัน)
+
+action_id: act_5d14ee0467a696707d4bc137
+method: POST
+path: /journal-entries/draft
+capability: journal_entry.draft.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_5d14ee0467a696707d4bc137
+
+### 59. สร้างข้อมูลหรือเอกสารใหม่ (ใบกำกับภาษี/ใบเสร็จรับเงินสด)
+
+action_id: act_5fb570b595f6dacd4217597b
+method: POST
+path: /cash-invoices
+capability: documents.cash_invoice.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_5fb570b595f6dacd4217597b
+
+### 60. สร้างข้อมูลหรือเอกสารใหม่ (ใบกำกับภาษี)
+
+action_id: act_5feb2003ba48fb1081a5f45b
+method: POST
+path: /tax-invoices/with-payment
+capability: documents.invoice.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_5feb2003ba48fb1081a5f45b
+
+### 61. ดึงรายการข้อมูล (ผังบัญชี)
+
+action_id: act_64f6b1e4bd64aeb6f3de599c
+method: GET
+path: /chart-of-accounts/accounts
+capability: journal.account_code.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_64f6b1e4bd64aeb6f3de599c
+
+### 62. แปลงหรือยกระดับเอกสารจากขั้นตอนก่อนหน้า (เอกสารซื้อ/รับสินค้า)
+
+action_id: act_659e652a48409a44ac7f2448
+method: POST
+path: /upgrade/purchases
+capability: documents.purchase.upgrade
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_659e652a48409a44ac7f2448
+
+### 63. เปลี่ยนสถานะเอกสาร (ใบกำกับภาษี)
+
+action_id: act_66861bf3c29f5f01bc725380
+method: POST
+path: /tax-invoices/{recordId}/status/awaiting
+capability: documents.invoice.status.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_66861bf3c29f5f01bc725380
+
+### 64. บันทึกหรือเปลี่ยนสถานะการชำระเงิน (ใบเสร็จรับเงิน)
+
+action_id: act_679a05d4fd31b8ca138615ea
+method: POST
+path: /upgrade/receipts/inline/with-payment
+capability: documents.receipt.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_679a05d4fd31b8ca138615ea
+
+### 65. ลบข้อมูลหรือเอกสาร (ใบกำกับภาษี/ใบเสร็จรับเงิน)
+
+action_id: act_67c7e5bb3f5690b9bea36e5b
+method: DELETE
+path: /tax-invoices/{recordId}
+capability: documents.invoice.delete
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_67c7e5bb3f5690b9bea36e5b
+
+### 66. สร้างข้อมูลหรือเอกสารใหม่ (ใบเสนอราคา)
+
+action_id: act_696fe4b7416bcf60a0b8d2f5
+method: POST
+path: /quotations/inline
+capability: documents.quotation.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_696fe4b7416bcf60a0b8d2f5
+
+### 67. เปลี่ยนสถานะเอกสาร (ใบกำกับภาษี/ใบเสร็จรับเงินสด)
+
+action_id: act_6d0e0949b70d620079ed0e0a
+method: POST
+path: /cash-invoices/{recordId}/status/awaiting
+capability: documents.cash_invoice.status.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_6d0e0949b70d620079ed0e0a
+
+### 68. สร้างข้อมูลหรือเอกสารใหม่ (ค่าใช้จ่าย)
+
+action_id: act_6fcaff07eec45b1481d04096
+method: POST
+path: /expenses/inline
+capability: documents.expense.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_6fcaff07eec45b1481d04096
+
+### 69. ดึงรายการข้อมูล (ค่าใช้จ่าย)
+
+action_id: act_72a24aa717ed06b4726f45a3
+method: GET
+path: /expenses/categories/accounting
+capability: documents.expense.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_72a24aa717ed06b4726f45a3
+
+### 70. สร้างหรือส่งลิงก์แชร์เอกสาร (ใบกำกับภาษี/ใบเสร็จรับเงินสด)
+
+action_id: act_739443fc00796284a9dd76c9
+method: POST
+path: /cash-invoices/sharedocument
+capability: documents.cash_invoice.share.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_739443fc00796284a9dd76c9
+
+### 71. สร้างหรืออนุมัติรายการสมุดรายวัน (รายการสมุดรายวัน)
+
+action_id: act_755943502cd91b6a000cf556
+method: POST
+path: /journal-entries/approve
+capability: journal_entry.approve
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_755943502cd91b6a000cf556
+
+### 72. แปลงหรือยกระดับเอกสารจากขั้นตอนก่อนหน้า (ใบกำกับภาษี)
+
+action_id: act_75f499d190e6fcb2701cc7f0
+method: POST
+path: /upgrade/tax-invoices
+capability: documents.invoice.upgrade
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_75f499d190e6fcb2701cc7f0
+
+### 73. บันทึกหรือเปลี่ยนสถานะการชำระเงิน (เอกสารซื้อ/รับสินค้า)
+
+action_id: act_76ac380262b8f2ff8e4fbcdf
+method: POST
+path: /upgrade/purchases/inline/with-payment
+capability: documents.purchase.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_76ac380262b8f2ff8e4fbcdf
+
+### 74. เปลี่ยนสถานะเอกสาร (ใบสั่งซื้อ)
+
+action_id: act_77262bf618b76e990b1a8094
+method: POST
+path: /purchases-orders/{recordId}/status/awaiting
+capability: documents.purchase_order.status.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_77262bf618b76e990b1a8094
+
+### 75. ลบข้อมูลหรือเอกสาร (ใบกำกับภาษี)
+
+action_id: act_772db41b0770b20007178a73
+method: DELETE
+path: /tax-invoices/{recordId}
+capability: documents.invoice.delete
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_772db41b0770b20007178a73
+
+### 76. ดึงข้อมูลตามรหัส (สินค้าและบริการ)
+
+action_id: act_789ac9768a77fb793ef62fbb
+method: PUT
+path: /products/{recordId}
+capability: products.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_789ac9768a77fb793ef62fbb
+
+### 77. แก้ไขข้อมูลหรือเอกสารเดิม (ใบกำกับภาษี/ใบเสร็จรับเงิน)
+
+action_id: act_79f7d470dcf1e83a8590a52d
+method: PUT
+path: /tax-invoices/{recordId}
+capability: documents.invoice.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_79f7d470dcf1e83a8590a52d
+
+### 78. สร้างหรืออนุมัติรายการสมุดรายวัน (รายการสมุดรายวัน)
+
+action_id: act_79f899dad888e42e9d918b79
+method: POST
+path: /journal-entries/approve
+capability: journal_entry.approve
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_79f899dad888e42e9d918b79
+
+### 79. ดึงข้อมูลตามรหัส (ใบสั่งซื้อ)
+
+action_id: act_7b2f02106ec029760ec08b67
+method: GET
+path: /purchases-orders/{recordId}
+capability: documents.purchase_order.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_7b2f02106ec029760ec08b67
+
+### 80. บันทึกหรือเปลี่ยนสถานะการชำระเงิน (ใบกำกับภาษี/ใบเสร็จรับเงินสด)
+
+action_id: act_7c5e6edb4356c598e22ac81c
+method: POST
+path: /upgrade/cash-invoices/with-payment
+capability: documents.cash_invoice.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_7c5e6edb4356c598e22ac81c
+
+### 81. ดึงรายการข้อมูล (เอกสารซื้อ/รับสินค้า)
+
+action_id: act_7d0d020871eb89100358565f
+method: GET
+path: /purchases
+capability: documents.purchase.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_7d0d020871eb89100358565f
+
+### 82. แก้ไขข้อมูลหรือเอกสารเดิม (ใบวางบิล)
+
+action_id: act_7f362a06d4157d27289be634
+method: PUT
+path: /billing-notes/{recordId}
+capability: documents.billing_note.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_7f362a06d4157d27289be634
+
+### 83. ส่งเอกสารทางอีเมล (ใบสั่งซื้อ)
+
+action_id: act_7f80eb9c93db001bb2802a95
+method: POST
+path: /purchases-orders/email-document
+capability: documents.purchase_order.email.send
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_7f80eb9c93db001bb2802a95
+
+### 84. สร้างข้อมูลหรือเอกสารใหม่ (หนังสือรับรองหัก ณ ที่จ่าย)
+
+action_id: act_800c0161a6e01b41dc3a3158
+method: POST
+path: /withholding-taxes
+capability: documents.withholding_tax.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_800c0161a6e01b41dc3a3158
+
+### 85. แปลงหรือยกระดับเอกสารจากขั้นตอนก่อนหน้า (ใบเสร็จรับเงิน)
+
+action_id: act_803c7059fd06d8e58f951e74
+method: POST
+path: /receipts/inline
+capability: documents.receipt.upgrade
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_803c7059fd06d8e58f951e74
+
+### 86. สร้างรายการสมุดรายวันแบบร่าง (รายการสมุดรายวัน)
+
+action_id: act_809067749a3dd20c2716ec86
+method: POST
+path: /journal-entries/draft
+capability: journal_entry.draft.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_809067749a3dd20c2716ec86
+
+### 87. อัปโหลดไฟล์แนบให้เอกสาร (ใบกำกับภาษี)
+
+action_id: act_85e8148d7dc18e44da37cbd5
+method: POST
+path: /tax-invoices/{recordId}/attachment
+capability: documents.invoice.attachment.upload
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_85e8148d7dc18e44da37cbd5
+
+### 88. ดึงรายการข้อมูล (ข้อมูลบริษัท ช่องทางการเงิน และการตั้งค่า)
+
+action_id: act_862e4ae305ce4f54acecec16
+method: GET
+path: /settings/documents-remark
+capability: settings.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_862e4ae305ce4f54acecec16
+
+### 89. สร้างข้อมูลหรือเอกสารใหม่ (ผู้ติดต่อ ลูกค้า หรือผู้ขาย)
+
+action_id: act_87af9c03744a59e2a5f0c0fa
+method: POST
+path: /contacts
+capability: contacts.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_87af9c03744a59e2a5f0c0fa
+
+### 90. ลบข้อมูลหรือเอกสาร (สินค้าและบริการ)
+
+action_id: act_8889da8ff6ce7f83f9114a00
+method: DELETE
+path: /products/{recordId}
+capability: products.delete
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_8889da8ff6ce7f83f9114a00
+
+### 91. สร้างข้อมูลหรือเอกสารใหม่ (ค่าใช้จ่าย)
+
+action_id: act_88fc96d59a472720363ee1c0
+method: POST
+path: /expenses/inline
+capability: documents.expense.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_88fc96d59a472720363ee1c0
+
+### 92. ลบข้อมูลหรือเอกสาร (ใบเสร็จรับเงิน)
+
+action_id: act_898b7e883e9a9796f89931e1
+method: DELETE
+path: /receipts/{recordId}
+capability: documents.receipt.delete
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_898b7e883e9a9796f89931e1
+
+### 93. ดึงรายการข้อมูล (หนังสือรับรองหัก ณ ที่จ่าย)
+
+action_id: act_8b352bc607cbab6ca7820bc1
+method: GET
+path: /withholding-taxes
+capability: documents.withholding_tax.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_8b352bc607cbab6ca7820bc1
+
+### 94. เปลี่ยนสถานะเอกสาร (ใบวางบิล)
+
+action_id: act_8dcdab472f92ba01819c52c3
+method: POST
+path: /billing-notes/{recordId}/status/awaiting
+capability: documents.billing_note.status.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_8dcdab472f92ba01819c52c3
+
+### 95. แก้ไขข้อมูลหรือเอกสารเดิม (ใบเสนอราคา)
+
+action_id: act_90819deb8f40a0a0420e0cd1
+method: PUT
+path: /quotations/{recordId}
+capability: documents.quotation.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_90819deb8f40a0a0420e0cd1
+
+### 96. สร้างข้อมูลหรือเอกสารใหม่ (ค่าใช้จ่าย)
+
+action_id: act_909eea6771bda9710b82e7ae
+method: POST
+path: /expenses
+capability: documents.expense.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_909eea6771bda9710b82e7ae
+
+### 97. สร้างข้อมูลหรือเอกสารใหม่ (ค่าใช้จ่าย)
+
+action_id: act_91928855a9fc68619e7bb1ba
+method: POST
+path: /expenses/with-payment
+capability: documents.expense.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_91928855a9fc68619e7bb1ba
+
+### 98. ดึงข้อมูลตามรหัส (ผู้ติดต่อ ลูกค้า หรือผู้ขาย)
+
+action_id: act_93258d0540643d4a271ca150
+method: PUT
+path: /contacts/{recordId}
+capability: contacts.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_93258d0540643d4a271ca150
+
+### 99. บันทึกหรือเปลี่ยนสถานะการชำระเงิน (ใบเสร็จรับเงิน)
+
+action_id: act_9400a6360e77c027c8da945b
+method: POST
+path: /receipts/{recordId}/payment
+capability: documents.receipt.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_9400a6360e77c027c8da945b
+
+### 100. สร้างข้อมูลหรือเอกสารใหม่ (ค่าใช้จ่าย)
+
+action_id: act_94756a0f05ca50ebf5d7e577
+method: POST
+path: /expenses
+capability: documents.expense.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_94756a0f05ca50ebf5d7e577
+
+### 101. ดึงรายการข้อมูล (ค่าใช้จ่าย)
+
+action_id: act_96ed1617b6e4931cc4b585b2
+method: GET
+path: /expenses
+capability: documents.expense.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_96ed1617b6e4931cc4b585b2
+
+### 102. ดึงข้อมูลตามรหัส (ใบวางบิล)
+
+action_id: act_97f9b66f25a476c32c038670
+method: GET
+path: /billing-notes/{recordId}
+capability: documents.billing_note.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_97f9b66f25a476c32c038670
+
+### 103. แปลงหรือยกระดับเอกสารจากขั้นตอนก่อนหน้า (เอกสารซื้อ/รับสินค้า)
+
+action_id: act_980c4e062dcd5cf653f7f859
+method: POST
+path: /upgrade/purchases/inline
+capability: documents.purchase.upgrade
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_980c4e062dcd5cf653f7f859
+
+### 104. แก้ไขข้อมูลหรือเอกสารเดิม (เอกสารซื้อ/รับสินค้า)
+
+action_id: act_9815a1384394dbbf7ae7c4e5
+method: PUT
+path: /purchases/{recordId}
+capability: documents.purchase.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_9815a1384394dbbf7ae7c4e5
+
+### 105. ดึงรายการข้อมูล (ใบกำกับภาษี/ใบเสร็จรับเงิน)
+
+action_id: act_9a77991a6742a48906bbeca5
+method: GET
+path: /tax-invoices
+capability: documents.invoice.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_9a77991a6742a48906bbeca5
+
+### 106. แก้ไขข้อมูลหรือเอกสารเดิม (ใบเสร็จรับเงิน)
+
+action_id: act_9e6e9389e7688e247659eb91
+method: PUT
+path: /receipts/{recordId}
+capability: documents.receipt.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_9e6e9389e7688e247659eb91
+
+### 107. สร้างข้อมูลหรือเอกสารใหม่ (ใบกำกับภาษี)
+
+action_id: act_9f8278763c15f961c1eb9431
+method: POST
+path: /tax-invoices/inline/with-payment
+capability: documents.invoice.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_9f8278763c15f961c1eb9431
+
+### 108. ดึงรายการข้อมูล (ใบกำกับภาษี)
+
+action_id: act_a1103ce9f5dc42038e8174f8
+method: GET
+path: /tax-invoices
+capability: documents.invoice.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_a1103ce9f5dc42038e8174f8
+
+### 109. ลบข้อมูลหรือเอกสาร (หนังสือรับรองหัก ณ ที่จ่าย)
+
+action_id: act_a15ba785fd21dafff07b99f2
+method: DELETE
+path: /withholding-taxes/{recordId}
+capability: documents.withholding_tax.delete
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_a15ba785fd21dafff07b99f2
+
+### 110. ดึงรายการข้อมูล (ใบกำกับภาษี/ใบเสร็จรับเงินสด)
+
+action_id: act_a20e76f20f4edc99d3c1988e
+method: GET
+path: /cash-invoices
+capability: documents.cash_invoice.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_a20e76f20f4edc99d3c1988e
+
+### 111. สร้างหรือส่งลิงก์แชร์เอกสาร (ใบเสนอราคา)
+
+action_id: act_a20eb8188f2588b921cb5a05
+method: POST
+path: /quotations/sharedocument
+capability: documents.quotation.share.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_a20eb8188f2588b921cb5a05
+
+### 112. สร้างข้อมูลหรือเอกสารใหม่ (เอกสารซื้อ/รับสินค้า)
+
+action_id: act_a5deefd0147902d972503fac
+method: POST
+path: /purchases/with-payment
+capability: documents.purchase.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_a5deefd0147902d972503fac
+
+### 113. สร้างข้อมูลหรือเอกสารใหม่ (ค่าใช้จ่าย)
+
+action_id: act_a6cc8fd33bad6141ea45b08c
+method: POST
+path: /expenses/inline
+capability: documents.expense.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_a6cc8fd33bad6141ea45b08c
+
+### 114. สร้างข้อมูลหรือเอกสารใหม่ (ค่าใช้จ่าย)
+
+action_id: act_a7a2a38441109e8cbf25f119
+method: POST
+path: /expenses
+capability: documents.expense.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_a7a2a38441109e8cbf25f119
+
+### 115. ส่งเอกสารทางอีเมล (ใบกำกับภาษี)
+
+action_id: act_a81d3c5245eae5ecf91cdd91
+method: POST
+path: /tax-invoices/email-document
+capability: documents.invoice.email.send
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_a81d3c5245eae5ecf91cdd91
+
+### 116. สร้างข้อมูลหรือเอกสารใหม่ (ใบวางบิล)
+
+action_id: act_a88353626405447f55289aab
+method: POST
+path: /billing-notes
+capability: documents.billing_note.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_a88353626405447f55289aab
+
+### 117. แปลงหรือยกระดับเอกสารจากขั้นตอนก่อนหน้า (ใบเสร็จรับเงิน)
+
+action_id: act_a8985c23c077ccac7592e62d
+method: POST
+path: /upgrade/receipts
+capability: documents.receipt.upgrade
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_a8985c23c077ccac7592e62d
+
+### 118. สร้างข้อมูลหรือเอกสารใหม่ (ค่าใช้จ่าย)
+
+action_id: act_acc6d5395d997360e88bb3e9
+method: POST
+path: /expenses/inline
+capability: documents.expense.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_acc6d5395d997360e88bb3e9
+
+### 119. บันทึกหรือเปลี่ยนสถานะการชำระเงิน (ใบกำกับภาษี)
+
+action_id: act_aeb20bbfc6ba8720bd0002af
+method: POST
+path: /upgrade/tax-invoices/with-payment
+capability: documents.invoice.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_aeb20bbfc6ba8720bd0002af
+
+### 120. ดึงข้อมูลตามรหัส (ข้อมูล master ของสินค้า)
+
+action_id: act_b059a4a38f0d165931402880
+method: GET
+path: /product-masters/{Product_Id}
+capability: product_masters.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_b059a4a38f0d165931402880
+
+### 121. แปลงหรือยกระดับเอกสารจากขั้นตอนก่อนหน้า (ใบสั่งซื้อ)
+
+action_id: act_b0f795243061719592712f4c
+method: POST
+path: /upgrade/purchases-orders/inline
+capability: documents.purchase_order.upgrade
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_b0f795243061719592712f4c
+
+### 122. สร้างข้อมูลหรือเอกสารใหม่ (สินค้าและบริการ)
+
+action_id: act_b1b39cad5da545edf01f8cd1
+method: POST
+path: /products
+capability: products.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_b1b39cad5da545edf01f8cd1
+
+### 123. อัปโหลดไฟล์แนบให้เอกสาร (ใบเสร็จรับเงิน)
+
+action_id: act_b49aafeec268d9ec3fa04bb4
+method: POST
+path: /receipts/{recordId}/attachment
+capability: documents.receipt.attachment.upload
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_b49aafeec268d9ec3fa04bb4
+
+### 124. อัปโหลดไฟล์แนบให้เอกสาร (ใบสั่งซื้อ)
+
+action_id: act_b7546172c247dfe58f337952
+method: POST
+path: /purchases-orders/{recordId}/attachment
+capability: documents.purchase_order.attachment.upload
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_b7546172c247dfe58f337952
+
+### 125. ดึงรายการข้อมูล (ข้อมูลบริษัท ช่องทางการเงิน และการตั้งค่า)
+
+action_id: act_b7d0ac30426331071666ef23
+method: GET
+path: /bank-channel/cheque
+capability: bank_channels.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_b7d0ac30426331071666ef23
+
+### 126. ดึงรายการข้อมูล (สินค้าและบริการ)
+
+action_id: act_b9831f909a47a4364dba8d90
+method: GET
+path: /products
+capability: products.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_b9831f909a47a4364dba8d90
+
+### 127. ดึงข้อมูลตามรหัส (ค่าใช้จ่าย)
+
+action_id: act_baee388f163a21f7489d440e
+method: PUT
+path: /expenses/{recordId}
+capability: documents.expense.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_baee388f163a21f7489d440e
+
+### 128. สร้างหรือส่งลิงก์แชร์เอกสาร (ใบกำกับภาษี/ใบเสร็จรับเงิน)
+
+action_id: act_bbc7bb91d5e01505a88a674d
+method: POST
+path: /tax-invoices/sharedocument
+capability: documents.invoice.share.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_bbc7bb91d5e01505a88a674d
+
+### 129. สร้างข้อมูลหรือเอกสารใหม่ (เอกสารซื้อ/รับสินค้า)
+
+action_id: act_bc526a74e05377c18e6a4080
+method: POST
+path: /purchases
+capability: documents.purchase.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_bc526a74e05377c18e6a4080
+
+### 130. ลบข้อมูลหรือเอกสาร (ผู้ติดต่อ ลูกค้า หรือผู้ขาย)
+
+action_id: act_bcf4c522b585a300d68130bd
+method: DELETE
+path: /contacts/{recordId}
+capability: contacts.delete
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_bcf4c522b585a300d68130bd
+
+### 131. สร้างข้อมูลหรือเอกสารใหม่ (ใบกำกับภาษี/ใบเสร็จรับเงิน)
+
+action_id: act_bd48b3ea2d48324cfb28a836
+method: POST
+path: /tax-invoices/inline/with-payment
+capability: documents.invoice.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_bd48b3ea2d48324cfb28a836
+
+### 132. บันทึกหรือเปลี่ยนสถานะการชำระเงิน (เอกสารซื้อ/รับสินค้า)
+
+action_id: act_be4cf948c0c47c19a940ba97
+method: POST
+path: /upgrade/purchases/with-payment
+capability: documents.purchase.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_be4cf948c0c47c19a940ba97
+
+### 133. ดึงข้อมูลตามรหัส (ใบเสร็จรับเงิน)
+
+action_id: act_be7440a613493602d93dde22
+method: GET
+path: /receipts/{recordId}
+capability: documents.receipt.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_be7440a613493602d93dde22
+
+### 134. ลบข้อมูลหรือเอกสาร (ใบกำกับภาษี/ใบเสร็จรับเงินสด)
+
+action_id: act_bf1b36b47b8c434529e4ba8e
+method: DELETE
+path: /cash-invoices/{recordId}
+capability: documents.cash_invoice.delete
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_bf1b36b47b8c434529e4ba8e
+
+### 135. แก้ไขข้อมูลหรือเอกสารเดิม (ใบกำกับภาษี/ใบเสร็จรับเงิน)
+
+action_id: act_bf779c5430820d4a952cde59
+method: PUT
+path: /tax-invoices/{recordId}
+capability: documents.invoice.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_bf779c5430820d4a952cde59
+
+### 136. ดึงข้อมูลตามรหัส (หนังสือรับรองหัก ณ ที่จ่าย)
+
+action_id: act_c02a57cc5b5944d6d34f8d46
+method: GET
+path: /withholding-taxes/{recordId}
+capability: documents.withholding_tax.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_c02a57cc5b5944d6d34f8d46
+
+### 137. ดึงข้อมูลตามรหัส (ใบเสนอราคา)
+
+action_id: act_c05f415fa8dd16d4a58761b5
+method: GET
+path: /quotations/{recordId}
+capability: documents.quotation.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_c05f415fa8dd16d4a58761b5
+
+### 138. สร้างข้อมูลหรือเอกสารใหม่ (ใบกำกับภาษี/ใบเสร็จรับเงิน)
+
+action_id: act_c4691c7e52b89d9a8331d12b
+method: POST
+path: /tax-invoices/with-payment
+capability: documents.invoice.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_c4691c7e52b89d9a8331d12b
+
+### 139. ดึงข้อมูลตามรหัส (สินค้าและบริการ)
+
+action_id: act_c708318695455c9437da9f30
+method: GET
+path: /products/{recordId}
+capability: products.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_c708318695455c9437da9f30
+
+### 140. ลบข้อมูลหรือเอกสาร (เอกสารซื้อ/รับสินค้า)
+
+action_id: act_c9dd5867a0807bbe7568b35c
+method: DELETE
+path: /purchases/{recordId}
+capability: documents.purchase.delete
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_c9dd5867a0807bbe7568b35c
+
+### 141. แก้ไขข้อมูลหรือเอกสารเดิม (ใบวางบิล)
+
+action_id: act_ca38ff27dc47596a6c20ff4b
+method: PUT
+path: /billing-notes/{recordId}
+capability: documents.billing_note.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_ca38ff27dc47596a6c20ff4b
+
+### 142. ดึงข้อมูลตามรหัส (ค่าใช้จ่าย)
+
+action_id: act_cac85416c88be9921b98da14
+method: GET
+path: /expenses/{recordId}
+capability: documents.expense.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_cac85416c88be9921b98da14
+
+### 143. ดึงรายการข้อมูล (ใบสั่งซื้อ)
+
+action_id: act_cb9260b7b04a3b3483e15839
+method: GET
+path: /purchases-orders
+capability: documents.purchase_order.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_cb9260b7b04a3b3483e15839
+
+### 144. ลบข้อมูลหรือเอกสาร (ค่าใช้จ่าย)
+
+action_id: act_cdf34b91bbe3b2a9995aa5f4
+method: DELETE
+path: /expenses/{recordId}
+capability: documents.expense.delete
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_cdf34b91bbe3b2a9995aa5f4
+
+### 145. บันทึกหรือเปลี่ยนสถานะการชำระเงิน (ใบกำกับภาษี/ใบเสร็จรับเงินสด)
+
+action_id: act_ce32407fa3e5af0f781f4b33
+method: POST
+path: /cash-invoices/{recordId}/payment
+capability: documents.cash_invoice.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_ce32407fa3e5af0f781f4b33
+
+### 146. สร้างหรืออนุมัติรายการสมุดรายวัน (รายการสมุดรายวัน)
+
+action_id: act_cf28f8d72dcf30724deae3f7
+method: POST
+path: /journal-entries/approve
+capability: journal_entry.approve
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_cf28f8d72dcf30724deae3f7
+
+### 147. ดึงรายการข้อมูล (ข้อมูลบริษัท ช่องทางการเงิน และการตั้งค่า)
+
+action_id: act_cfda9281facf4a5e94129392
+method: GET
+path: /company/info
+capability: company.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_cfda9281facf4a5e94129392
+
+### 148. แปลงหรือยกระดับเอกสารจากขั้นตอนก่อนหน้า (ใบกำกับภาษี/ใบเสร็จรับเงิน)
+
+action_id: act_d031d6b1371f6ed30503bd58
+method: POST
+path: /upgrade/tax-invoices
+capability: documents.invoice.upgrade
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_d031d6b1371f6ed30503bd58
+
+### 149. สร้างข้อมูลหรือเอกสารใหม่ (สินค้าและบริการ)
+
+action_id: act_d0505f5ffa949ab72ead7209
+method: POST
+path: /products
+capability: products.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_d0505f5ffa949ab72ead7209
+
+### 150. สร้างรายการสมุดรายวันแบบร่าง (รายการสมุดรายวัน)
+
+action_id: act_d1342389a0140d14a16ddb16
+method: POST
+path: /journal-entries/draft
+capability: journal_entry.draft.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_d1342389a0140d14a16ddb16
+
+### 151. สร้างข้อมูลหรือเอกสารใหม่ (ใบกำกับภาษี/ใบเสร็จรับเงิน)
+
+action_id: act_d266a8878b4d4575c01f400b
+method: POST
+path: /tax-invoices/inline
+capability: documents.invoice.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_d266a8878b4d4575c01f400b
+
+### 152. แก้ไขข้อมูลหรือเอกสารเดิม (ใบเสนอราคา)
+
+action_id: act_d312aec02e05a77a1723f41a
+method: PUT
+path: /quotations/{recordId}
+capability: documents.quotation.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_d312aec02e05a77a1723f41a
+
+### 153. ดึงรายการข้อมูล (ข้อมูลบริษัท ช่องทางการเงิน และการตั้งค่า)
+
+action_id: act_d49a0da15df4b6927f8be883
+method: GET
+path: /bank-channel/petty-cash
+capability: bank_channels.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_d49a0da15df4b6927f8be883
+
+### 154. ส่งเอกสารทางอีเมล (หนังสือรับรองหัก ณ ที่จ่าย)
+
+action_id: act_d5216009b761b705ce679cfc
+method: POST
+path: /withholding-taxes/email-document
+capability: documents.withholding_tax.email.send
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_d5216009b761b705ce679cfc
+
+### 155. สร้างข้อมูลหรือเอกสารใหม่ (สินค้าและบริการ)
+
+action_id: act_d524205f39ce1d9ae2e50375
+method: POST
+path: /products
+capability: products.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_d524205f39ce1d9ae2e50375
+
+### 156. บันทึกหรือเปลี่ยนสถานะการชำระเงิน (ใบกำกับภาษี/ใบเสร็จรับเงิน)
+
+action_id: act_d56ec4d55d7e7dc18b8fb1e0
+method: POST
+path: /upgrade/tax-invoices/inline/with-payment
+capability: documents.invoice.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_d56ec4d55d7e7dc18b8fb1e0
+
+### 157. สร้างข้อมูลหรือเอกสารใหม่ (เอกสารซื้อ/รับสินค้า)
+
+action_id: act_d67d1320191616086ba42249
+method: POST
+path: /purchases/inline
+capability: documents.purchase.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_d67d1320191616086ba42249
+
+### 158. แก้ไขข้อมูลหรือเอกสารเดิม (ใบสั่งซื้อ)
+
+action_id: act_d7e966b8f28c4c9232d571da
+method: PUT
+path: /purchases-orders/{recordId}
+capability: documents.purchase_order.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_d7e966b8f28c4c9232d571da
+
+### 159. ดึงรายการข้อมูล (ข้อมูลบริษัท ช่องทางการเงิน และการตั้งค่า)
+
+action_id: act_d83a97638940c28788602ba4
+method: GET
+path: /bank-accounts
+capability: bank_accounts.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_d83a97638940c28788602ba4
+
+### 160. ดึงรายการข้อมูล (ข้อมูลบริษัท ช่องทางการเงิน และการตั้งค่า)
+
+action_id: act_d939a9a9e72dc7c504d37625
+method: GET
+path: /bank-channel/other-channels
+capability: bank_channels.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_d939a9a9e72dc7c504d37625
+
+### 161. แก้ไขข้อมูลหรือเอกสารเดิม (ใบกำกับภาษี)
+
+action_id: act_d9664c6e7d8815466012d007
+method: PUT
+path: /tax-invoices/{recordId}
+capability: documents.invoice.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_d9664c6e7d8815466012d007
+
+### 162. สร้างหรืออนุมัติรายการสมุดรายวัน (รายการสมุดรายวัน)
+
+action_id: act_d9ab5afbee86cb46bbe87e38
+method: POST
+path: /journal-entries/approve
+capability: journal_entry.approve
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_d9ab5afbee86cb46bbe87e38
+
+### 163. สร้างข้อมูลหรือเอกสารใหม่ (ใบกำกับภาษี/ใบเสร็จรับเงินสด)
+
+action_id: act_da3925d52ff19d094ceef9b1
+method: POST
+path: /cash-invoices/inline/with-payment
+capability: documents.cash_invoice.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_da3925d52ff19d094ceef9b1
+
+### 164. อัปโหลดไฟล์แนบให้เอกสาร (ใบกำกับภาษี/ใบเสร็จรับเงิน)
+
+action_id: act_dc376e1d2668772965d102a1
+method: POST
+path: /tax-invoices/{recordId}/attachment
+capability: documents.invoice.attachment.upload
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_dc376e1d2668772965d102a1
+
+### 165. บันทึกหรือเปลี่ยนสถานะการชำระเงิน (ใบเสร็จรับเงิน)
+
+action_id: act_e005e75730d990ca135b57ab
+method: POST
+path: /upgrade/receipts/with-payment
+capability: documents.receipt.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_e005e75730d990ca135b57ab
+
+### 166. สร้างข้อมูลหรือเอกสารใหม่ (ข้อมูลบริษัท ช่องทางการเงิน และการตั้งค่า)
+
+action_id: act_e127ee2c326ef15ef8274b08
+method: POST
+path: /bank-channel/bank-accounts
+capability: bank_channels.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_e127ee2c326ef15ef8274b08
+
+### 167. สร้างข้อมูลหรือเอกสารใหม่ (ใบกำกับภาษี/ใบเสร็จรับเงิน)
+
+action_id: act_e382770c25c8c540b931db1f
+method: POST
+path: /tax-invoices
+capability: documents.invoice.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_e382770c25c8c540b931db1f
+
+### 168. บันทึกหรือเปลี่ยนสถานะการชำระเงิน (ใบกำกับภาษี)
+
+action_id: act_e45d77e5944f4c124e771e7b
+method: POST
+path: /upgrade/tax-invoices/inline/with-payment
+capability: documents.invoice.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_e45d77e5944f4c124e771e7b
+
+### 169. ลบข้อมูลหรือเอกสาร (ใบสั่งซื้อ)
+
+action_id: act_e61a1fc8a6edef5256388d9c
+method: DELETE
+path: /purchases-orders/{recordId}
+capability: documents.purchase_order.delete
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_e61a1fc8a6edef5256388d9c
+
+### 170. สร้างข้อมูลหรือเอกสารใหม่ (ใบวางบิล)
+
+action_id: act_e7495bfc924eb687d0ef08fb
+method: POST
+path: /billing-notes/inline
+capability: documents.billing_note.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_e7495bfc924eb687d0ef08fb
+
+### 171. อัปโหลดไฟล์แนบให้เอกสาร (ใบวางบิล)
+
+action_id: act_e8271aa8aaac485daa54e3e5
+method: POST
+path: /billing-notes/{recordId}/attachment
+capability: documents.billing_note.attachment.upload
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_e8271aa8aaac485daa54e3e5
+
+### 172. สร้างรายการสมุดรายวันแบบร่าง (รายการสมุดรายวัน)
+
+action_id: act_e977e2f65c9ab896d1dcfbc2
+method: POST
+path: /journal-entries/draft
+capability: journal_entry.draft.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_e977e2f65c9ab896d1dcfbc2
+
+### 173. สร้างหรืออนุมัติรายการสมุดรายวัน (รายการสมุดรายวัน)
+
+action_id: act_ea49778952980c7b524ca85c
+method: POST
+path: /journal-entries/approve
+capability: journal_entry.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_ea49778952980c7b524ca85c
+
+### 174. สร้างข้อมูลหรือเอกสารใหม่ (ใบกำกับภาษี/ใบเสร็จรับเงินสด)
+
+action_id: act_ec0bd9f4e788aa9aecd6829a
+method: POST
+path: /cash-invoices/with-payment
+capability: documents.cash_invoice.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_ec0bd9f4e788aa9aecd6829a
+
+### 175. แปลงหรือยกระดับเอกสารจากขั้นตอนก่อนหน้า (ใบกำกับภาษี/ใบเสร็จรับเงินสด)
+
+action_id: act_ecce89b5aaeb4de731ccc842
+method: POST
+path: /upgrade/cash-invoices
+capability: documents.cash_invoice.upgrade
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_ecce89b5aaeb4de731ccc842
+
+### 176. บันทึกหรือเปลี่ยนสถานะการชำระเงิน (ใบกำกับภาษี)
+
+action_id: act_ef2d305cc249fb18aab01c1d
+method: POST
+path: /tax-invoices/{recordId}/payment
+capability: documents.invoice.payment.create
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_ef2d305cc249fb18aab01c1d
+
+### 177. เปลี่ยนสถานะเอกสาร (เอกสารซื้อ/รับสินค้า)
+
+action_id: act_ef57c99d1a55d57a1e5687a9
+method: POST
+path: /purchases/{recordId}/status/awaiting
+capability: documents.purchase.status.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_ef57c99d1a55d57a1e5687a9
+
+### 178. เปลี่ยนสถานะเอกสาร (ใบเสร็จรับเงิน)
+
+action_id: act_efbe3f19d5f4746ad30ea0a7
+method: POST
+path: /tax-invoices/{recordId}/status/awaiting
+capability: documents.invoice.status.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_efbe3f19d5f4746ad30ea0a7
+
+### 179. สร้างข้อมูลหรือเอกสารใหม่ (ใบสั่งซื้อ)
+
+action_id: act_f0be27a73d7e7b3bc7493643
+method: POST
+path: /purchases-orders
+capability: documents.purchase_order.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_f0be27a73d7e7b3bc7493643
+
+### 180. ดึงรายการข้อมูล (ใบเสนอราคา)
+
+action_id: act_f17b0f2f97104e569f1ffe30
+method: GET
+path: /quotations
+capability: documents.quotation.list
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_f17b0f2f97104e569f1ffe30
+
+### 181. สร้างข้อมูลหรือเอกสารใหม่ (ใบกำกับภาษี)
+
+action_id: act_f4276c49d652d470c92eec32
+method: POST
+path: /tax-invoices
+capability: documents.invoice.create
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_f4276c49d652d470c92eec32
+
+### 182. แก้ไขข้อมูลหรือเอกสารเดิม (ใบกำกับภาษี/ใบเสร็จรับเงินสด)
+
+action_id: act_f4731107fd349992739c124f
+method: PUT
+path: /cash-invoices/{recordId}
+capability: documents.cash_invoice.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_f4731107fd349992739c124f
+
+### 183. ส่งเอกสารทางอีเมล (เอกสารซื้อ/รับสินค้า)
+
+action_id: act_f4f0ede6b78f5a3b96a478de
+method: POST
+path: /purchases/email-document
+capability: documents.purchase.email.send
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_f4f0ede6b78f5a3b96a478de
+
+### 184. แปลงหรือยกระดับเอกสารจากขั้นตอนก่อนหน้า (ใบกำกับภาษี/ใบเสร็จรับเงินสด)
+
+action_id: act_f6ec40d26e780e31a19bea45
+method: POST
+path: /upgrade/cash-invoices/inline
+capability: documents.cash_invoice.upgrade
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_f6ec40d26e780e31a19bea45
+
+### 185. ดึงข้อมูลตามรหัส (ใบกำกับภาษี)
+
+action_id: act_f72d017ae88861d974cf48f2
+method: GET
+path: /tax-invoices/{recordId}
+capability: documents.invoice.get
+risk_tier: 0
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_f72d017ae88861d974cf48f2
+
+### 186. ลบข้อมูลหรือเอกสาร (ใบวางบิล)
+
+action_id: act_f92f5b67759ee55824733a47
+method: DELETE
+path: /billing-notes/{recordId}
+capability: documents.billing_note.delete
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_f92f5b67759ee55824733a47
+
+### 187. แปลงหรือยกระดับเอกสารจากขั้นตอนก่อนหน้า (ใบกำกับภาษี/ใบเสร็จรับเงิน)
+
+action_id: act_f9951bf6ba48dbb169e59c3b
+method: POST
+path: /upgrade/tax-invoices/inline
+capability: documents.invoice.upgrade
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_f9951bf6ba48dbb169e59c3b
+
+### 188. แก้ไขข้อมูลหรือเอกสารเดิม (ใบสั่งซื้อ)
+
+action_id: act_fd033b1d6533ec1bdc4e9390
+method: PUT
+path: /purchases-orders/{recordId}
+capability: documents.purchase_order.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_fd033b1d6533ec1bdc4e9390
+
+### 189. เปลี่ยนสถานะเอกสาร (ค่าใช้จ่าย)
+
+action_id: act_fda1a595fb442f399e60cec2
+method: POST
+path: /expenses/{recordId}/status/void
+capability: documents.expense.void
+risk_tier: 2
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_fda1a595fb442f399e60cec2
+
+### 190. ดึงข้อมูลตามรหัส (หนังสือรับรองหัก ณ ที่จ่าย)
+
+action_id: act_ffec66b3803d3a8aa0eca84f
+method: PUT
+path: /withholding-taxes/{recordId}
+capability: documents.withholding_tax.update
+risk_tier: 1
+confidence: example_derived
+source_citation: mercury://catalog/global/flowaccount/source#act_ffec66b3803d3a8aa0eca84f
+
+<!-- MERCURY GENERATED ACTION CATALOG END -->

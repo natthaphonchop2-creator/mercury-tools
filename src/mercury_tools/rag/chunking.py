@@ -13,6 +13,7 @@ from mercury_tools.rag.models import KnowledgeChunk, KnowledgeDocument
 
 FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
+ACTION_ID_RE = re.compile(r"^action_id: (act_[0-9a-f]{24})$", re.MULTILINE)
 
 
 def sha256_text(text: str) -> str:
@@ -117,6 +118,8 @@ def chunk_document(document: KnowledgeDocument, *, max_chars: int = 1800) -> lis
         for text in _window_text(section, max_chars=max_chars):
             index = len(chunks)
             chunk_uri = f"{document.document_uri}#chunk-{index}"
+            action_ids = ACTION_ID_RE.findall(text)
+            action_metadata = {"action_id": action_ids[0]} if len(action_ids) == 1 else {}
             citation = {
                 "source_title": document.source_title,
                 "source_uri": document.source_uri,
@@ -143,6 +146,7 @@ def chunk_document(document: KnowledgeDocument, *, max_chars: int = 1800) -> lis
                         "doc_type": document.doc_type,
                         "review_status": document.review_status,
                         "effective_date": document.effective_date,
+                        **action_metadata,
                     },
                 )
             )
