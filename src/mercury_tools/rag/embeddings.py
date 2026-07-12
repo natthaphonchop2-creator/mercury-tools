@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from typing import Protocol
-
-from openai import OpenAI
+from typing import Any, Protocol
 
 from mercury_tools.config import Settings
 
@@ -25,7 +23,15 @@ class OpenAIEmbeddingProvider:
     def __init__(self, settings: Settings):
         if not settings.openai_configured:
             raise RuntimeError("OPENAI_API_KEY is required for OpenAI embeddings.")
-        self.client = OpenAI(api_key=settings.openai_api_key)
+        try:
+            from openai import OpenAI
+        except ModuleNotFoundError as error:
+            if error.name == "openai":
+                raise RuntimeError(
+                    "Install mercury-tools[openai] to use OpenAI embeddings."
+                ) from error
+            raise
+        self.client: Any = OpenAI(api_key=settings.openai_api_key)
         self.model = settings.embedding_model
         self.dimensions = settings.embedding_dim
 

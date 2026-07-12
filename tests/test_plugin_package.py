@@ -1,6 +1,14 @@
+import builtins
+import importlib
 import json
 import re
+import shutil
+import subprocess
+import sys
+import tomllib
 from pathlib import Path
+
+import pytest
 
 from mercury_tools.db.product import SKILL_CATALOG_SEED
 
@@ -327,29 +335,213 @@ def test_skill_package_has_no_secret_fields_or_credential_chat_flow() -> None:
         assert unsafe_phrase not in combined
 
 
-def test_plugin_capabilities_match_current_public_manifest() -> None:
+def test_plugin_registers_one_pinned_local_stdio_server() -> None:
+    data = json.loads((PLUGIN_ROOT / ".mcp.json").read_text(encoding="utf-8"))
+
+    assert list(data["mcpServers"]) == ["mercury-finance"]
+    server = data["mcpServers"]["mercury-finance"]
+    assert server["command"] == "uvx"
+    assert server["args"] == [
+        "--from",
+        "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.0",
+        "mercury",
+        "mcp",
+        "serve-local",
+    ]
+    assert server["cwd"] == "."
+    assert server["tool_timeout_sec"] == 900
+    assert "type" not in server
+    assert "url" not in server
+    assert "env" not in server
+    assert "bearer_token_env_var" not in server
+
+
+def test_plugin_declares_read_and_write_without_embedded_secrets() -> None:
     manifest = json.loads(
         (PLUGIN_ROOT / ".codex-plugin/plugin.json").read_text(encoding="utf-8")
     )
+    serialized = json.dumps(manifest)
 
-    assert manifest["interface"]["capabilities"] == ["Interactive", "Read"]
-
-
-def test_plugin_declares_current_remote_mcp_without_secret_values() -> None:
-    plugin = json.loads(
-        (PLUGIN_ROOT / ".codex-plugin/plugin.json").read_text(encoding="utf-8")
-    )
-    mcp = json.loads((PLUGIN_ROOT / ".mcp.json").read_text(encoding="utf-8"))
-    serialized = json.dumps({"plugin": plugin, "mcp": mcp})
-
-    assert plugin["name"] == "mercury-finance"
-    assert plugin["skills"] == "./skills/"
-    assert plugin["mcpServers"] == "./.mcp.json"
-    assert plugin["interface"]["displayName"] == "Mercury Finance"
-    assert "https://mercury-tools-mcp.onrender.com/mcp" in serialized
-    assert "bearer_token_env_var" not in serialized
-    assert "SUPABASE_SERVICE_ROLE_KEY" not in serialized
+    assert manifest["version"] == "0.2.0+codex.20260711"
+    assert manifest["interface"]["capabilities"] == ["Interactive", "Read", "Write"]
+    assert manifest["interface"]["defaultPrompt"] == [
+        "Set up local FlowAccount access for this repository and verify it.",
+        "Search the local ERP action catalog and run a safe read action.",
+        "Preview an approval-gated PEAK write for this repository without executing it.",
+    ]
+    assert "MERCURY_PRIVATE_MCP_TOKEN" not in serialized
     assert "client_secret" not in serialized
+
+
+def test_release_runtime_dependencies_are_exactly_pinned() -> None:
+    data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    dependencies = data["project"]["dependencies"]
+
+    assert data["project"]["version"] == "0.2.0"
+    assert all("==" in dependency for dependency in dependencies)
+    assert dependencies == [
+        "cryptography==49.0.0",
+        "httpx==0.28.1",
+        "mcp==1.26.0",
+        "pydantic==2.13.4",
+        "python-dotenv==1.2.2",
+        "pyyaml==6.0.3",
+        "starlette==1.3.1",
+        "uvicorn==0.50.0",
+    ]
+    assert data["project"]["optional-dependencies"]["openai"] == ["openai==2.44.0"]
+    assert "openai" not in "\n".join(dependencies)
+    assert (ROOT / "src/mercury_tools/__init__.py").read_text(encoding="utf-8").strip().endswith(
+        '__version__ = "0.2.0"'
+    )
+
+
+def test_embeddings_import_without_openai_and_fail_with_actionable_extra_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "mercury_tools.rag.embeddings"
+    sys.modules.pop(module_name, None)
+    original_import = builtins.__import__
+
+    def without_openai(name: str, *args: object, **kwargs: object):
+        if name == "openai" or name.startswith("openai."):
+            raise ModuleNotFoundError("No module named 'openai'", name="openai")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_openai)
+    embeddings = importlib.import_module(module_name)
+
+    from mercury_tools.config import Settings
+
+    settings = Settings(
+        supabase_url="",
+        supabase_service_role_key="",
+        openai_api_key="test-key",
+    )
+    with pytest.raises(
+        RuntimeError,
+        match=re.escape("Install mercury-tools[openai] to use OpenAI embeddings."),
+    ):
+        embeddings.OpenAIEmbeddingProvider(settings)
+    default_provider = embeddings.create_embedding_provider(Settings("", "", ""))
+    assert isinstance(default_provider, embeddings.HashEmbeddingProvider)
+
+
+def _release_layout(tmp_path: Path, *, pinned_launcher: bool = False) -> Path:
+    release_root = tmp_path / "release"
+    for relative_path in (
+        "plugins/mercury-finance/.mcp.json",
+        "plugins/mercury-finance/.codex-plugin/plugin.json",
+        "pyproject.toml",
+    ):
+        source = ROOT / relative_path
+        destination = release_root / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    if pinned_launcher:
+        (release_root / "plugins/mercury-finance/.mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "mercury-finance": {
+                            "command": "uvx",
+                            "args": [
+                                "--from",
+                                "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.0",
+                                "mercury",
+                                "mcp",
+                                "serve-local",
+                            ],
+                            "cwd": ".",
+                            "tool_timeout_sec": 900,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+    return release_root
+
+
+def _run_release_validator(root: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(ROOT / "scripts/validate_release_plugin.py"), "--root", str(root)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _rewrite_mcp(root: Path, mutate) -> None:
+    path = root / "plugins/mercury-finance/.mcp.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    mutate(data)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_release_validator_accepts_the_offline_release_contract(tmp_path: Path) -> None:
+    result = _run_release_validator(_release_layout(tmp_path))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "release plugin validation passed" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_error"),
+    [
+        (
+            lambda data: data["mcpServers"]["mercury-finance"].update(
+                {"url": "https://example.invalid/mcp"}
+            ),
+            "must not declare an HTTP URL",
+        ),
+        (
+            lambda data: data["mcpServers"]["mercury-finance"].update(
+                {
+                    "args": [
+                        "--from",
+                        "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@main",
+                        "mercury",
+                        "mcp",
+                        "serve-local",
+                    ]
+                }
+            ),
+            "immutable v0.2.0 Git tag",
+        ),
+        (
+            lambda data: data["mcpServers"].update(
+                {"mercury-tools": {"command": "uvx", "args": ["mercury"]}}
+            ),
+            "exactly one server",
+        ),
+        (
+            lambda data: data["mcpServers"]["mercury-finance"].update(
+                {"env": {"FLOWACCOUNT_CLIENT_SECRET": "should-not-ship"}}
+            ),
+            "must not declare environment or credential values",
+        ),
+        (
+            lambda data: data["mcpServers"]["mercury-finance"].update(
+                {"private_token_env_var": "MERCURY_PRIVATE_TOKEN"}
+            ),
+            "private token names",
+        ),
+    ],
+    ids=["http-url", "moving-ref", "second-server", "credential-env", "private-token-name"],
+)
+def test_release_validator_rejects_mutated_unsafe_launchers(
+    tmp_path: Path,
+    mutate,
+    expected_error: str,
+) -> None:
+    release_root = _release_layout(tmp_path, pinned_launcher=True)
+    _rewrite_mcp(release_root, mutate)
+
+    result = _run_release_validator(release_root)
+
+    assert result.returncode == 1
+    assert expected_error in result.stdout
 
 
 def test_judge_quickstart_matches_current_public_plugin() -> None:
@@ -357,11 +549,10 @@ def test_judge_quickstart_matches_current_public_plugin() -> None:
 
     assert "Mercury Finance" in text
     assert "codex plugin marketplace add" in text
-    assert "https://mercury-tools-mcp.onrender.com/mcp" in text
-    assert "hosted MCP server config" in text
-    assert "create_public_workspace" in text
-    assert "workspace_id" in text
-    assert "private tenant isolation" in text
+    assert "v0.2.0" in text
+    assert "repository-local" in text
+    assert "Task 18" in text
+    assert "remote-tag smoke" in text
     assert "client_token" not in text
     assert "Mercury Connect" not in text
     assert "token provided by the Mercury demo owner" not in text

@@ -1,101 +1,50 @@
 # Mercury Finance Judge Quickstart
 
-Mercury Finance is a Codex plugin backed by a public Remote MCP. It adds ERP
-connector discovery, cited accounting knowledge, guided setup skills, and
-read-only Mercury Flows directly inside the judge's AI host. It is not a web
-application.
+Mercury Finance installs one repository-local `stdio` MCP server. It uses the
+Mercury `v0.2.0` runtime for FlowAccount and PEAK endpoint search, safe reads,
+and approval-gated writes. The plugin does not register a hosted HTTP MCP and
+does not contain tokens, environment values, or ERP credentials.
 
-## Install
+## Install After The Task 18 Release
 
-Add the GitHub marketplace once:
+Use an isolated Codex home for evaluation. Install only the marketplace and
+plugin paths below.
 
 ```bash
-codex plugin marketplace add natthaphonchop2-creator/mercury-tools \
-  --ref main \
+export MERCURY_TEST_CODEX_HOME="$(mktemp -d)"
+CODEX_HOME="$MERCURY_TEST_CODEX_HOME" codex plugin marketplace add \
+  natthaphonchop2-creator/mercury-tools \
+  --ref v0.2.0 \
   --sparse .agents/plugins \
   --sparse plugins/mercury-finance
+CODEX_HOME="$MERCURY_TEST_CODEX_HOME" codex plugin add mercury-finance@mercury-tools
 ```
 
-Open the Codex plugin list, install **Mercury Finance**, then start a fresh
-task. The plugin already contains the hosted MCP server config:
+The installed plugin launches exactly this local command through `uvx`:
 
 ```text
-https://mercury-tools-mcp.onrender.com/mcp
+uvx --from git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.0 mercury mcp serve-local
 ```
 
-No repository clone, bearer token, local Python runtime, or browser setup page
-is required.
+## Evaluate In A Repository
 
-## First Use
+Open the repository that will own the ERP connection. Mercury stores local
+connection material and its audit ledger in that repository; do not paste
+secrets into chat or plugin configuration.
 
-Ask Mercury to begin setup. The host calls `connector_status`; when setup has
-not started it calls `create_public_workspace` and receives an opaque
-`workspace_id` beginning with `mw_`. The setup skill then:
+Use these prompts in Codex:
 
-1. selects an ERP and environment;
-2. requests only the connector fields that are missing;
-3. submits the values once and validates a low-impact read endpoint;
-4. enables only public read capabilities;
-5. retrieves ERP-specific RAG context with citations.
+1. `Set up local FlowAccount access for this repository and verify it.`
+2. `Search the local ERP action catalog and run a safe read action.`
+3. `Preview an approval-gated PEAK write for this repository without executing it.`
 
-Keep the returned `workspace_id` in the current task. It routes state but is not
-an authentication credential.
+Writes require the runtime's returned confirmation contract. A preview does not
+execute an ERP mutation.
 
-## Demo Prompts
+## Task16 Validation Boundary
 
-```text
-เริ่ม Mercury workspace แล้วแสดงโปรแกรมบัญชีที่เชื่อมได้
-เชื่อม FlowAccount sandbox และตรวจ company info แบบ read-only
-ค้นหา FlowAccount invoice endpoint แล้วทำ company health check แบบ dry run
-```
-
-The same flow supports PEAK UAT using the fields returned by its connector
-manifest.
-
-## What To Inspect
-
-- `list_connectors` exposes ERP names, environments, required field names, and presets.
-- `connector_capabilities` separates `read_capabilities` from `blocked_capabilities`.
-- `search_knowledge` returns `inferred_connector`, applied filters, metadata, and citations.
-- `retrieve_workspace_context_pack` stays inside the selected ERP documentation.
-- `run_mercury_flow` blocks production-changing capabilities before connector dispatch.
-
-## Verified Contest Build
-
-Verification snapshot: **2026-07-10**
-
-- Runtime commit: `31c3ca2651886545bf5d94fc07e69fb8e16cdfee`
-- Render deploy: `dep-d988majtqb8s73f80me0` (`live`)
-- Hosted MCP: `https://mercury-tools-mcp.onrender.com/mcp`
-- MCP contract: 22 tools; public stateful schemas use opaque `workspace_id` routing
-- Public HTTP surface: legacy dashboard, upload, invite, and compatibility APIs disabled
-- Local quality gate: 242 tests passed, 1 skipped; Ruff and both plugin validations passed
-- GitHub CI: passed on pull request #2
-- Marketplace install: `mercury-finance` installed and enabled from the GitHub branch in an isolated Codex home
-- Production smoke: 22 tools, 9 bundled skills, 4 connectors, public workspace creation, accounting skill execution, flow planning, and setup metadata all passed
-- RAG evidence: production retrieval routes Thai accounting standards, Thai tax,
-  FlowAccount endpoints, and PEAK endpoints into separate filtered domains with citations
-- Abstention evidence: an unsupported `QZX-9999` accounting-standard query returned
-  `no_relevant_knowledge` instead of unrelated context
-- Supabase: hybrid-search endpoint terms are active; product and RAG tables use RLS with anonymous and authenticated DML denied
-- Private boundary smoke: unauthenticated `/private-mcp` returned `401`; authenticated
-  discovery returned exactly the three journal tools and the public MCP returned none of them
-- FlowAccount production smoke: the 4,236.00 baht marketplace journal preview
-  resolved three chart-of-account lines and balanced debit/credit; no draft was
-  created and the audit row has no FlowAccount record ID
-
-The verified runtime is deployed manually from pull request #2. Before the
-judge handoff, merge that pull request so the `--ref main` install command and
-Render auto-deploy both follow the same release commit.
-
-## Contest Boundary
-
-This build intentionally has no login or private tenant isolation. Use contest,
-UAT, sandbox, or disposable demo credentials only. Credential values are
-encrypted server-side and never returned, but `workspace_id` is routing state,
-not authorization. Production mutations remain blocked on the public MCP.
-
-The separately packaged **Mercury Finance Private** plugin uses an authenticated
-`/private-mcp` route for company-owned FlowAccount journal writes. Its bearer
-token is not distributed to judges and its write tools are not listed by the
-public contest MCP.
+Task 16 validates the `v0.2.0` launcher statically and runs a local wheel-only
+`uvx` CLI and stdio smoke test. The immutable `v0.2.0` tag is available only
+after the Task 18 release, when remote-tag smoke can run. Do not bypass this
+boundary by editing an installed Codex plugin cache; update the repository
+source and reinstall the plugin instead.

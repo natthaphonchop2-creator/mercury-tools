@@ -1,8 +1,16 @@
 {
   "mcpServers": {
-    "mercury-tools": {
-      "type": "http",
-      "url": "https://mercury-tools-mcp.onrender.com/mcp"
+    "mercury-finance": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.0",
+        "mercury",
+        "mcp",
+        "serve-local"
+      ],
+      "cwd": ".",
+      "tool_timeout_sec": 900
     }
   }
 }

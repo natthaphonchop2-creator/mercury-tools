@@ -1,7 +1,7 @@
 {
   "name": "mercury-finance",
-  "version": "0.1.0+codex.20260710010341",
-  "description": "Accounting AI for ERP connectors, VAT, reports, audit context, and Mercury Flows.",
+  "version": "0.2.0+codex.20260711",
+  "description": "Local ERP accounting tools for repository-scoped FlowAccount and PEAK work.",
   "author": {
     "name": "Mercury Agent",
     "url": "https://github.com/natthaphonchop2-creator/mercury-tools"
@@ -20,19 +20,20 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Mercury Finance",
-    "shortDescription": "Accounting AI tools for ERP connectors and finance workflows.",
-    "longDescription": "Mercury Finance connects Codex to a public hosted MCP for ERP/API connector knowledge, Thai finance workflows, VAT context packs, invoice review, management reporting, and read-only Mercury Flows.",
+    "shortDescription": "Repository-local ERP tools for FlowAccount and PEAK workflows.",
+    "longDescription": "Mercury Finance runs one local stdio MCP for repository-scoped FlowAccount and PEAK setup, endpoint search, safe read actions, and approval-gated ERP writes. Credentials and execution audit data stay in the selected repository.",
     "developerName": "Mercury Agent",
     "category": "Finance",
     "capabilities": [
       "Interactive",
-      "Read"
+      "Read",
+      "Write"
     ],
     "websiteURL": "https://github.com/natthaphonchop2-creator/mercury-tools",
     "defaultPrompt": [
-      "Prepare a Thai VAT context pack",
-      "Connect FlowAccount endpoint docs",
-      "Run a company health check flow"
+      "Set up local FlowAccount access for this repository and verify it.",
+      "Search the local ERP action catalog and run a safe read action.",
+      "Preview an approval-gated PEAK write for this repository without executing it."
     ],
     "brandColor": "#42C6BB"
   }
