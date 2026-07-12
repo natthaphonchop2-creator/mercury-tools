@@ -31,6 +31,8 @@ _MP_ORIGINAL_CLEAR: Any = None
 _MP_SAVE_ENTERED: Any = None
 _MP_SAVE_RELEASE: Any = None
 _MP_ORIGINAL_WRITE: Any = None
+_MP_PROBE_ENTERED: Any = None
+_MP_PROBE_RELEASE: Any = None
 
 
 def _paused_credential_clear(self: CredentialStore, *args: Any, **kwargs: Any) -> int:
@@ -66,13 +68,14 @@ def _run_clear_cli(root: Path, results: Any) -> None:
 def _create_and_confirm_preview(
     context: Any,
     prepared: PreparedRequest,
+    action: CatalogAction,
     started: Any,
     results: Any,
 ) -> None:
     started.set()
     try:
         store = LocalRequestStore(context)
-        created = store.create_preview(prepared)
+        created = store.create_preview(prepared, action=action)
         confirmed = store.confirm(created.request_id, created.payload_hash)
         credentials = CredentialStore(context).load(
             "flowaccount",
@@ -102,6 +105,40 @@ def _clear_flow_credentials_process(context: Any, started: Any, results: Any) ->
         results.put(("cleared", cleared))
     except Exception as exc:  # pragma: no cover - assertion reports child outcome
         results.put(("error", type(exc).__name__, str(exc)))
+
+
+async def _paused_connected_probe(
+    driver: Any,
+    *,
+    environment: str,
+    credentials: dict[str, str],
+) -> ConnectionProbe:
+    _MP_PROBE_ENTERED.set()
+    if not _MP_PROBE_RELEASE.wait(10):
+        raise RuntimeError("test_probe_release_timeout")
+    return ConnectionProbe(
+        status="connected",
+        connector_id="flowaccount",
+        environment=environment,
+        company_name="Example Books",
+        details={"http_status": 200},
+    )
+
+
+def _run_credentials_test_cli(root: Path, results: Any) -> None:
+    with contextlib.redirect_stdout(io.StringIO()):
+        code = main(
+            [
+                "credentials",
+                "test",
+                "flowaccount",
+                "--env",
+                "production",
+                "--repo-root",
+                str(root),
+            ]
+        )
+    results.put(code)
 
 
 def seed_flow_credentials(
@@ -197,7 +234,7 @@ def test_clear_all_removes_file_and_invalidates_every_pending_preview(
             risk=RiskDecision(RiskTier.STANDARD_WRITE, 1, ()),
             payload_hash=payload_hash,
         )
-        created = store.create_preview(prepared)
+        created = store.create_preview(prepared, action=catalog_action)
         store.confirm(created.request_id, created.payload_hash)
         request_ids.append(created.request_id)
 
@@ -245,7 +282,7 @@ def test_clear_scoped_invalidates_pending_preview_and_resets_matching_validation
         risk=risk,
         payload_hash=payload_hash,
     )
-    request = LocalRequestStore(context).create_preview(prepared)
+    request = LocalRequestStore(context).create_preview(prepared, action=action)
     LocalRequestStore(context).confirm(request.request_id, request.payload_hash)
     seed_flow_credentials(tmp_path)
     record_connector_validation(
@@ -324,7 +361,7 @@ def _seed_clear_failure_state(
         payload_hash=payload_hash,
     )
     store = LocalRequestStore(context)
-    created = store.create_preview(prepared)
+    created = store.create_preview(prepared, action=catalog_action)
     store.confirm(created.request_id, created.payload_hash)
     record_connector_validation(
         context,
@@ -489,7 +526,7 @@ def test_clear_holds_repository_lock_until_credentials_are_deleted(
     )
     preview_process = process_context.Process(
         target=_create_and_confirm_preview,
-        args=(context, prepared, preview_started, preview_results),
+        args=(context, prepared, catalog_action, preview_started, preview_results),
     )
     clear_process.start()
     try:
@@ -757,6 +794,72 @@ def test_credentials_test_saves_only_sanitized_validation_metadata(
     assert "visible-client" not in output
     assert "hidden-secret" not in context.config_path.read_text()
     assert "visible-client" not in context.config_path.read_text()
+    assert "fingerprint" not in context.config_path.read_text()
+
+
+@pytest.mark.skipif(
+    "fork" not in multiprocessing.get_all_start_methods(),
+    reason="requires inherited process instrumentation",
+)
+def test_credentials_test_does_not_restore_validation_after_concurrent_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seed_flow_credentials(tmp_path)
+    context = ensure_repository_state(tmp_path)
+    process_context = multiprocessing.get_context("fork")
+    probe_entered = process_context.Event()
+    probe_release = process_context.Event()
+    results = process_context.Queue()
+    from mercury_tools.local import credential_cli
+
+    global _MP_PROBE_ENTERED, _MP_PROBE_RELEASE
+    _MP_PROBE_ENTERED = probe_entered
+    _MP_PROBE_RELEASE = probe_release
+    monkeypatch.setattr(credential_cli, "_validate_credentials", _paused_connected_probe)
+
+    process = process_context.Process(
+        target=_run_credentials_test_cli,
+        args=(tmp_path, results),
+    )
+    process.start()
+    try:
+        assert probe_entered.wait(10)
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert (
+                main(
+                    [
+                        "credentials",
+                        "clear",
+                        "flowaccount",
+                        "--env",
+                        "production",
+                        "--repo-root",
+                        str(tmp_path),
+                    ]
+                )
+                == 0
+            )
+        probe_release.set()
+        process.join(10)
+    finally:
+        probe_release.set()
+        if process.is_alive():
+            process.terminate()
+        process.join(5)
+
+    assert process.exitcode == 0
+    assert results.get(timeout=1) == 2
+    config = load_repository_config(context)
+    assert "production" not in config.validations.get("flowaccount", {})
+    assert CredentialStore(context).load(
+        "flowaccount",
+        "production",
+        (
+            CredentialField("client_id", secret=False, label="Client ID"),
+            CredentialField("client_secret", secret=True, label="Client Secret"),
+        ),
+    ) == {}
     assert "fingerprint" not in context.config_path.read_text()
 
 

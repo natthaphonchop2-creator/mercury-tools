@@ -538,15 +538,19 @@ def test_public_summary_uses_fixed_preview_and_response_keys_at_every_depth(
 
 def test_tier_two_needs_two_confirmations(
     request_store: LocalRequestStore,
-    prepared_request: PreparedRequest,
+    repository_context: RepositoryContext,
+    action_factory: Any,
 ) -> None:
-    request = request_store.create_preview(
-        rebind_request(
-            prepared_request,
-            risk_tier=RiskTier.HIGH_RISK,
-            required_confirmations=2,
-        )
+    action = action_factory(
+        risk_tier=RiskTier.HIGH_RISK,
+        required_confirmations=2,
     )
+    prepared = make_prepared_request(
+        repository_context,
+        action,
+        risk=RiskDecision(RiskTier.HIGH_RISK, 2, ()),
+    )
+    request = request_store.create_preview(prepared, action=action)
 
     first = request_store.confirm(request.request_id, request.payload_hash)
     second = request_store.confirm(request.request_id, request.payload_hash)
@@ -560,13 +564,55 @@ def test_tier_two_needs_two_confirmations(
 def test_create_preview_transitions_previewed_to_awaiting_in_transaction(
     request_store: LocalRequestStore,
     prepared_request: PreparedRequest,
+    catalog_action: CatalogAction,
 ) -> None:
     assert prepared_request.state is RequestState.PREVIEWED
 
-    created = request_store.create_preview(prepared_request)
+    created = request_store.create_preview(prepared_request, action=catalog_action)
 
     assert created.state is RequestState.AWAITING_CONFIRMATION
     assert request_store.get(created.request_id).state is RequestState.AWAITING_CONFIRMATION
+
+
+def test_create_preview_requires_catalog_action_provenance(
+    request_store: LocalRequestStore,
+    prepared_request: PreparedRequest,
+) -> None:
+    with pytest.raises(TypeError):
+        request_store.create_preview(prepared_request)
+
+
+def test_create_preview_rejects_self_consistent_forged_catalog_binding(
+    request_store: LocalRequestStore,
+    prepared_request: PreparedRequest,
+    catalog_action: CatalogAction,
+) -> None:
+    forged = rebind_request(
+        prepared_request,
+        action_id="act_nonexistent",
+        version_id="av_nonexistent",
+        method="DELETE",
+        path_template="/admin/delete-all",
+        final_path="/admin/delete-all",
+    )
+
+    with pytest.raises(RequestStateError, match="^catalog_binding_mismatch$"):
+        request_store.create_preview(forged, action=catalog_action)
+
+
+def test_create_preview_recomputes_exact_effective_catalog_risk(
+    request_store: LocalRequestStore,
+    prepared_request: PreparedRequest,
+    catalog_action: CatalogAction,
+) -> None:
+    forged = rebind_request(
+        prepared_request,
+        risk_tier=RiskTier.HIGH_RISK,
+        required_confirmations=2,
+    )
+
+    with pytest.raises(RequestStateError, match="^catalog_risk_mismatch$"):
+        request_store.create_preview(forged, action=catalog_action)
 
 
 def test_prepared_state_graph_rejects_invalid_previewed_fields(
@@ -582,8 +628,9 @@ def test_prepared_state_graph_rejects_invalid_previewed_fields(
 def test_wrong_hash_fails_without_increasing_confirmation_count(
     request_store: LocalRequestStore,
     prepared_request: PreparedRequest,
+    catalog_action: CatalogAction,
 ) -> None:
-    request = request_store.create_preview(prepared_request)
+    request = request_store.create_preview(prepared_request, action=catalog_action)
 
     with pytest.raises(RequestStateError, match="^payload_hash_mismatch$"):
         request_store.confirm(request.request_id, "0" * 64)
@@ -594,12 +641,13 @@ def test_wrong_hash_fails_without_increasing_confirmation_count(
 def test_expired_request_is_invalidated_before_confirmation(
     request_store: LocalRequestStore,
     prepared_request: PreparedRequest,
+    catalog_action: CatalogAction,
 ) -> None:
     created_at = datetime.now(UTC) - PREVIEW_TTL - timedelta(seconds=1)
     expired = prepared_request.model_copy(
         update={"created_at": created_at, "expires_at": created_at + PREVIEW_TTL}
     )
-    request = request_store.create_preview(expired)
+    request = request_store.create_preview(expired, action=catalog_action)
 
     with pytest.raises(RequestStateError, match="^preview_expired$"):
         request_store.confirm(request.request_id, request.payload_hash)
@@ -612,8 +660,9 @@ def test_expired_request_is_invalidated_before_confirmation(
 def test_outcome_unknown_blocks_same_hash(
     request_store: LocalRequestStore,
     prepared_request: PreparedRequest,
+    catalog_action: CatalogAction,
 ) -> None:
-    request = request_store.create_preview(prepared_request)
+    request = request_store.create_preview(prepared_request, action=catalog_action)
     request_store.confirm(request.request_id, request.payload_hash)
     request_store.start_execution(request.request_id)
     request_store.complete(
@@ -629,10 +678,12 @@ def test_outcome_unknown_blocks_same_hash(
 def test_start_execution_rechecks_same_hash_within_write_transaction(
     request_store: LocalRequestStore,
     prepared_request: PreparedRequest,
+    catalog_action: CatalogAction,
 ) -> None:
-    first = request_store.create_preview(prepared_request)
+    first = request_store.create_preview(prepared_request, action=catalog_action)
     second = request_store.create_preview(
-        prepared_request.model_copy(update={"request_id": "req_second_preview"})
+        prepared_request.model_copy(update={"request_id": "req_second_preview"}),
+        action=catalog_action,
     )
     request_store.confirm(first.request_id, first.payload_hash)
     request_store.confirm(second.request_id, second.payload_hash)
@@ -645,8 +696,9 @@ def test_start_execution_rechecks_same_hash_within_write_transaction(
 def test_credential_clear_invalidates_matching_pending_previews(
     request_store: LocalRequestStore,
     prepared_request: PreparedRequest,
+    catalog_action: CatalogAction,
 ) -> None:
-    request = request_store.create_preview(prepared_request)
+    request = request_store.create_preview(prepared_request, action=catalog_action)
 
     assert request_store.invalidate_pending("flowaccount", "production") == 1
     with pytest.raises(RequestStateError, match="^credentials_cleared$"):
@@ -656,8 +708,9 @@ def test_credential_clear_invalidates_matching_pending_previews(
 def test_store_rejects_tampered_json_without_echoing_request_inputs(
     request_store: LocalRequestStore,
     prepared_request: PreparedRequest,
+    catalog_action: CatalogAction,
 ) -> None:
-    request = request_store.create_preview(prepared_request)
+    request = request_store.create_preview(prepared_request, action=catalog_action)
     database = request_store.database_path
     connection = sqlite3.connect(database)
     try:
@@ -692,11 +745,12 @@ def test_store_rejects_tampered_json_without_echoing_request_inputs(
 def test_store_rejects_coordinated_json_and_column_binding_tampering(
     request_store: LocalRequestStore,
     prepared_request: PreparedRequest,
+    catalog_action: CatalogAction,
     field: str,
     replacement: Any,
     column: str | None,
 ) -> None:
-    request = request_store.create_preview(prepared_request)
+    request = request_store.create_preview(prepared_request, action=catalog_action)
     payload = request.model_dump(mode="json")
     payload[field] = replacement
     if field == "risk_tier":
@@ -725,8 +779,9 @@ def test_store_rejects_coordinated_json_and_column_binding_tampering(
 def test_store_rejects_coordinated_expiry_column_tampering(
     request_store: LocalRequestStore,
     prepared_request: PreparedRequest,
+    catalog_action: CatalogAction,
 ) -> None:
-    request = request_store.create_preview(prepared_request)
+    request = request_store.create_preview(prepared_request, action=catalog_action)
     payload = request.model_dump(mode="json")
     changed_expiry = request.expires_at + timedelta(seconds=1)
     payload["expires_at"] = changed_expiry.isoformat()

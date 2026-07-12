@@ -16,7 +16,9 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from mercury_tools.execution.models import PreparedRequest, RequestState
+from mercury_tools.catalog.models import CatalogAction, revalidate_catalog_action
+from mercury_tools.execution.models import PreparedRequest, RequestState, render_action_path
+from mercury_tools.execution.policy import effective_risk
 from mercury_tools.local.operation_lock import repository_locked, repository_operation_lock
 from mercury_tools.local.repository import RepositoryContext
 
@@ -63,8 +65,14 @@ class LocalRequestStore:
         return self._database
 
     @repository_locked
-    def create_preview(self, prepared: PreparedRequest) -> PreparedRequest:
+    def create_preview(
+        self,
+        prepared: PreparedRequest,
+        *,
+        action: CatalogAction,
+    ) -> PreparedRequest:
         request = self._validated_request(prepared)
+        self._verify_catalog_binding(request, action)
         if request.repository_id != self._context.repository_id:
             raise RequestStateError("repository_mismatch")
         if (
@@ -101,6 +109,43 @@ class LocalRequestStore:
             except sqlite3.IntegrityError as exc:
                 raise RequestStateError("request_already_exists") from exc
         return awaiting_confirmation
+
+    @staticmethod
+    def _verify_catalog_binding(
+        request: PreparedRequest,
+        action: CatalogAction,
+    ) -> None:
+        try:
+            if not isinstance(action, CatalogAction):
+                raise TypeError
+            validated = revalidate_catalog_action(action)
+            rendered_path = render_action_path(
+                validated.path_template,
+                request.request_inputs.get("path", {}),
+            )
+        except (AttributeError, TypeError, ValueError, ValidationError):
+            raise RequestStateError("invalid_catalog_action") from None
+
+        expected_bindings = (
+            (request.action_id, validated.action_id),
+            (request.version_id, validated.version_id),
+            (request.connector_id, validated.connector_id),
+            (request.method, validated.method.value),
+            (request.path_template, validated.path_template),
+            (request.final_path, rendered_path),
+        )
+        if request.environment not in validated.environments or any(
+            not secrets.compare_digest(actual, expected)
+            for actual, expected in expected_bindings
+        ):
+            raise RequestStateError("catalog_binding_mismatch")
+
+        risk = effective_risk(validated)
+        if (
+            request.risk_tier != risk.tier
+            or request.required_confirmations != risk.required_confirmations
+        ):
+            raise RequestStateError("catalog_risk_mismatch")
 
     @repository_locked
     def get(self, request_id: str) -> PreparedRequest:

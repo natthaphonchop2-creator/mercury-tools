@@ -13,6 +13,7 @@ import unicodedata
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from functools import wraps
 from io import StringIO
 from pathlib import Path
@@ -30,6 +31,7 @@ _SIMPLE_COMPONENT = re.compile(r"^[a-z][a-z0-9]*$")
 _SIMPLE_FIELD = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 _PROFILE_METADATA_PREFIX = "_MERCURY_PROFILE_INDEX_"
 _HASH_LENGTH = 12
+_GENERATION_KEY = secrets.token_bytes(32)
 
 _Return = TypeVar("_Return")
 
@@ -49,6 +51,15 @@ def _credential_locked(method: Callable[..., _Return]) -> Callable[..., _Return]
 class _CredentialDocument:
     values: dict[str, str]
     profiles: dict[tuple[str, str], dict[str, str]]
+
+
+@dataclass(frozen=True)
+class CredentialSnapshot:
+    """One internally consistent credential view for optimistic probe binding."""
+
+    credentials: dict[str, str] = dataclass_field(repr=False)
+    status: CredentialStatus
+    generation: bytes = dataclass_field(repr=False)
 
 
 class _DuplicateIndexKeyError(ValueError):
@@ -153,6 +164,49 @@ class CredentialStore:
             for field_name, environment_name in field_names.items()
             if document.values.get(environment_name, "") != ""
         }
+
+    @_credential_locked
+    def snapshot(
+        self,
+        connector_id: str,
+        environment: str,
+        fields: Sequence[CredentialField],
+    ) -> CredentialSnapshot:
+        field_names = _field_environment_names(connector_id, environment, fields)
+        with _validated_parent_fd(self._root, self._parent) as parent_fd:
+            document = self._read(parent_fd)
+        credentials = {
+            field_name: document.values[environment_name]
+            for field_name, environment_name in field_names.items()
+            if document.values.get(environment_name, "") != ""
+        }
+        generation_payload = json.dumps(
+            {
+                "connector_id": connector_id,
+                "environment": environment,
+                "fields": sorted(credentials.items()),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        generation = hashlib.blake2b(
+            generation_payload,
+            digest_size=32,
+            key=_GENERATION_KEY,
+            person=b"mercury-cred-v1",
+        ).digest()
+        return CredentialSnapshot(
+            credentials=credentials,
+            status=_status_from_document(
+                connector_id,
+                environment,
+                field_names,
+                document,
+            ),
+            generation=generation,
+        )
 
     @_credential_locked
     def clear(

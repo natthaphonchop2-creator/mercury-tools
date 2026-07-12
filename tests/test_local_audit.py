@@ -1,15 +1,38 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
+import queue
 import re
+import sqlite3
 import stat
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from mercury_tools.local import audit
 from mercury_tools.local.audit import AuditLedger
+
+_MP_AUDIT_WRITE_ENTERED: Any = None
+_MP_AUDIT_WRITE_RELEASE: Any = None
+_MP_AUDIT_REAL_WRITE: Any = None
+
+
+def _paused_audit_write(file_fd: int, data: bytes) -> int:
+    if multiprocessing.current_process().name == "audit-paused-writer":
+        _MP_AUDIT_WRITE_ENTERED.set()
+        if not _MP_AUDIT_WRITE_RELEASE.wait(10):
+            raise RuntimeError("test_audit_write_release_timeout")
+    return _MP_AUDIT_REAL_WRITE(file_fd, data)
+
+
+def _record_audit_process(path: Path, event: str, results: Any) -> None:
+    try:
+        results.put(("ok", AuditLedger(path).record({"event": event})))
+    except Exception as exc:  # pragma: no cover - assertion reports child outcome
+        results.put(("error", type(exc).__name__, str(exc)))
 
 
 def test_audit_ledger_redacts_credentials_personal_fields_and_request_inputs(
@@ -84,6 +107,34 @@ def test_audit_ledger_keeps_response_classification_without_provider_record_valu
     assert row["response_summary"]["http_status"] == 201
     assert "INV-0001" not in str(row)
     assert "Ada Lovelace" not in str(row)
+
+
+def test_audit_ledger_redacts_unknown_semantic_values_in_allowlisted_fields(
+    tmp_path: Path,
+) -> None:
+    ledger = AuditLedger(tmp_path / "audit.jsonl")
+    disguised = ("ada_lovelace", "AdaLovelace", "INV-001", "cus_abcdef")
+
+    event_id = ledger.record(
+        {
+            "event": disguised[0],
+            "state": disguised[0],
+            "failure_reason": disguised[3],
+            "response_summary": {
+                "status": disguised[1],
+                "error_code": disguised[2],
+                "provider_status": disguised[3],
+                "provider_code": disguised[3],
+            },
+        }
+    )
+
+    row = ledger.get(event_id)
+    rendered = json.dumps(row, ensure_ascii=False)
+    assert all(value not in rendered for value in disguised)
+    assert row is not None
+    assert row["event"] == "[REDACTED]"
+    assert set(row["response_summary"].values()) == {"[REDACTED]"}
 
 
 def test_audit_ledger_never_returns_partial_match_from_corrupted_rows(
@@ -234,6 +285,159 @@ def test_audit_ledger_stale_index_rebuilds_from_append_only_jsonl(tmp_path: Path
         "event": "confirmed",
         "event_id": appended_id,
     }
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ctime regression")
+def test_repeated_get_keeps_ledger_fingerprint_and_does_not_rebuild(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "audit.jsonl"
+    ledger = AuditLedger(path)
+    event_id = ledger.record({"event": "confirmed"})
+    fingerprint = audit._ledger_fingerprint(path.stat())
+    rebuilds = 0
+    original = AuditLedger._rebuild_index
+
+    def counted_rebuild(self: AuditLedger, *args: Any, **kwargs: Any) -> None:
+        nonlocal rebuilds
+        rebuilds += 1
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(AuditLedger, "_rebuild_index", counted_rebuild)
+
+    assert ledger.get(event_id) is not None
+    assert ledger.get(event_id) is not None
+    assert audit._ledger_fingerprint(path.stat()) == fingerprint
+    assert rebuilds == 0
+
+
+def test_audit_ledger_recovers_malformed_sqlite_index_from_jsonl(tmp_path: Path) -> None:
+    path = tmp_path / "audit.jsonl"
+    ledger = AuditLedger(path)
+    event_id = ledger.record({"event": "confirmed"})
+    ledger.index_path.write_bytes(b"not-a-sqlite-database")
+
+    row = ledger.get(event_id)
+
+    assert row is not None
+    assert row["event"] == "confirmed"
+    assert row["event_id"] == event_id
+
+
+def test_audit_index_miss_for_present_event_forces_one_rebuild(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "audit.jsonl"
+    ledger = AuditLedger(path)
+    event_id = ledger.record({"event": "confirmed"})
+    connection = sqlite3.connect(ledger.index_path)
+    try:
+        connection.execute("DELETE FROM events WHERE event_id = ?", (event_id,))
+        connection.commit()
+    finally:
+        connection.close()
+    if os.name == "posix":
+        monkeypatch.setattr(audit.os, "fchmod", lambda file_fd, mode: None)
+
+    row = ledger.get(event_id)
+
+    assert row is not None
+    assert row["event_id"] == event_id
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("byte_offset", 1),
+        ("byte_length", 1),
+        ("row_hash", "0" * 64),
+    ],
+)
+def test_audit_ledger_recovers_malicious_index_coordinates_and_hashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    column: str,
+    value: object,
+) -> None:
+    ledger = AuditLedger(tmp_path / "audit.jsonl")
+    event_id = ledger.record({"event": "confirmed"})
+    connection = sqlite3.connect(ledger.index_path)
+    try:
+        connection.execute(
+            f"UPDATE events SET {column} = ? WHERE event_id = ?",  # noqa: S608
+            (value, event_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    if os.name == "posix":
+        monkeypatch.setattr(audit.os, "fchmod", lambda file_fd, mode: None)
+
+    row = ledger.get(event_id)
+
+    assert row is not None
+    assert row["event_id"] == event_id
+
+
+@pytest.mark.skipif(
+    "fork" not in multiprocessing.get_all_start_methods(),
+    reason="requires inherited process instrumentation",
+)
+def test_audit_ledger_non_fcntl_fallback_serializes_cross_process_writers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "audit.jsonl"
+    process_context = multiprocessing.get_context("fork")
+    write_entered = process_context.Event()
+    write_release = process_context.Event()
+    paused_results = process_context.Queue()
+    contender_results = process_context.Queue()
+
+    global _MP_AUDIT_WRITE_ENTERED, _MP_AUDIT_WRITE_RELEASE, _MP_AUDIT_REAL_WRITE
+    _MP_AUDIT_WRITE_ENTERED = write_entered
+    _MP_AUDIT_WRITE_RELEASE = write_release
+    _MP_AUDIT_REAL_WRITE = os.write
+    monkeypatch.setattr(audit, "_fcntl", None)
+    monkeypatch.setattr(audit.os, "write", _paused_audit_write)
+
+    paused = process_context.Process(
+        name="audit-paused-writer",
+        target=_record_audit_process,
+        args=(path, "preview_created", paused_results),
+    )
+    contender = process_context.Process(
+        name="audit-contender-writer",
+        target=_record_audit_process,
+        args=(path, "confirmed", contender_results),
+    )
+    paused.start()
+    try:
+        assert write_entered.wait(10)
+        contender.start()
+        with pytest.raises(queue.Empty):
+            contender_results.get(timeout=0.5)
+        write_release.set()
+        paused.join(10)
+        contender.join(10)
+    finally:
+        write_release.set()
+        for process in (paused, contender):
+            if process.pid is not None and process.is_alive():
+                process.terminate()
+            if process.pid is not None:
+                process.join(5)
+
+    assert paused.exitcode == 0
+    assert contender.exitcode == 0
+    paused_result = paused_results.get(timeout=1)
+    contender_result = contender_results.get(timeout=1)
+    assert paused_result[0] == contender_result[0] == "ok"
+    ledger = AuditLedger(path)
+    assert ledger.get(paused_result[1])["event"] == "preview_created"  # type: ignore[index]
+    assert ledger.get(contender_result[1])["event"] == "confirmed"  # type: ignore[index]
 
 
 def test_audit_ledger_stale_index_detects_appended_duplicate(tmp_path: Path) -> None:

@@ -10,8 +10,10 @@ import re
 import secrets
 import sqlite3
 import stat
+import time
 from collections.abc import Iterator, Mapping
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -51,6 +53,11 @@ MAX_AUDIT_KEY_BYTES = 64
 MAX_AUDIT_SCALAR_BYTES = 2 * 1024
 _READ_CHUNK_BYTES = 64 * 1024
 _INDEX_SUFFIX = ".index.sqlite"
+_INDEX_SCHEMA_VERSION = 2
+_LOCK_GUARD_SUFFIX = ".lock.guard"
+_LOCK_TIMEOUT_SECONDS = 5.0
+_LOCK_POLL_SECONDS = 0.025
+_ROW_HASH = re.compile(r"^[0-9a-f]{64}$")
 
 _SAFE_EVENT_FIELDS = frozenset(
     {
@@ -90,6 +97,89 @@ _SAFE_RESPONSE_FIELDS = frozenset(
     }
 )
 _METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
+_EVENT_VALUES = frozenset(
+    {
+        "completed",
+        "confirmation_recorded",
+        "confirmed",
+        "dispatch_started",
+        "execution_completed",
+        "execution_started",
+        "invalidated",
+        "pre_dispatch_failed",
+        "preview_created",
+    }
+)
+_STATE_VALUES = frozenset(
+    {
+        "awaiting_confirmation",
+        "awaiting_final_confirmation",
+        "executing",
+        "failed",
+        "outcome_unknown",
+        "previewed",
+        "ready_to_execute",
+        "succeeded",
+    }
+)
+_FAILURE_VALUES = frozenset(
+    {
+        "credentials_cleared",
+        "execution_failed",
+        "outcome_unknown",
+        "pre_dispatch_failed",
+        "preview_expired",
+    }
+)
+_RESPONSE_SEMANTIC_VALUES = {
+    "error_code": frozenset(
+        {
+            "authentication_failed",
+            "authorization_failed",
+            "network_error",
+            "provider_error",
+            "rate_limited",
+            "request_failed",
+            "timeout",
+            "unknown",
+            "validation_failed",
+        }
+    ),
+    "outcome": frozenset(
+        {"failed", "outcome_unknown", "succeeded", "timeout", "unknown"}
+    ),
+    "provider_code": frozenset({"error", "failed", "success", "unknown"}),
+    "provider_status": frozenset(
+        {"error", "failed", "ok", "pending", "success", "timeout", "unknown"}
+    ),
+    "status": frozenset(
+        {"error", "failed", "ok", "pending", "success", "timeout", "unknown"}
+    ),
+    "status_class": frozenset(
+        {
+            "2xx",
+            "3xx",
+            "4xx",
+            "5xx",
+            "network_error",
+            "provider_error",
+            "success",
+            "timeout",
+            "unknown",
+        }
+    ),
+}
+
+
+class _IndexResetRequired(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class _FallbackGuard:
+    path: Path
+    device: int
+    inode: int
 
 
 class AuditLedger:
@@ -131,10 +221,10 @@ class AuditLedger:
 
         ledger_fd = self._open_ledger(create=True, write=True)
         connection: sqlite3.Connection | None = None
+        fallback_guard: _FallbackGuard | None = None
         try:
-            _lock_file(ledger_fd)
-            connection = self._open_index()
-            self._ensure_index(connection, ledger_fd)
+            fallback_guard = _lock_file(ledger_fd, self._parent, self._name)
+            connection = self._open_ready_index(ledger_fd)
             event_id = self._new_event_id(connection)
             row["event_id"] = event_id
             row["recorded_at"] = datetime.now(UTC).isoformat()
@@ -161,8 +251,10 @@ class AuditLedger:
         finally:
             if connection is not None:
                 connection.close()
-            _unlock_file(ledger_fd)
-            os.close(ledger_fd)
+            try:
+                _unlock_file(ledger_fd, fallback_guard)
+            finally:
+                os.close(ledger_fd)
 
     def get(self, event_id: str) -> dict[str, Any] | None:
         if not isinstance(event_id, str) or _EVENT_ID.fullmatch(event_id) is None:
@@ -171,34 +263,66 @@ class AuditLedger:
         if ledger_fd is None:
             return None
         connection: sqlite3.Connection | None = None
+        fallback_guard: _FallbackGuard | None = None
         try:
-            _lock_file(ledger_fd)
-            connection = self._open_index()
-            self._ensure_index(connection, ledger_fd)
-            indexed = connection.execute(
-                "SELECT byte_offset, byte_length, row_hash FROM events WHERE event_id = ?",
-                (event_id,),
-            ).fetchone()
+            fallback_guard = _lock_file(ledger_fd, self._parent, self._name)
+            connection = self._open_ready_index(ledger_fd)
+            indexed = self._indexed_event(connection, event_id)
             if indexed is None:
-                return None
-            encoded = _read_exact_row(
-                ledger_fd,
-                offset=indexed[0],
-                length=indexed[1],
-            )
-            if not secrets.compare_digest(_row_hash(encoded), indexed[2]):
-                raise ValueError("audit_index_corrupt")
-            decoded = _decode_ledger_row(encoded)
-            if decoded.get("event_id") != event_id:
-                raise ValueError("audit_index_corrupt")
-            return _sanitize_mapping_for_read(decoded)
+                self._rebuild_index(connection, ledger_fd, os.fstat(ledger_fd))
+                indexed = self._indexed_event(connection, event_id)
+                if indexed is None:
+                    return None
+            try:
+                return self._read_indexed_event(ledger_fd, event_id, indexed)
+            except ValueError as exc:
+                if str(exc) != "audit_index_corrupt":
+                    raise
+                self._rebuild_index(connection, ledger_fd, os.fstat(ledger_fd))
+                recovered = self._indexed_event(connection, event_id)
+                if recovered is None:
+                    return None
+                return self._read_indexed_event(ledger_fd, event_id, recovered)
         except sqlite3.Error as exc:
             raise ValueError("audit_index_corrupt") from exc
         finally:
             if connection is not None:
                 connection.close()
-            _unlock_file(ledger_fd)
-            os.close(ledger_fd)
+            try:
+                _unlock_file(ledger_fd, fallback_guard)
+            finally:
+                os.close(ledger_fd)
+
+    @staticmethod
+    def _indexed_event(
+        connection: sqlite3.Connection,
+        event_id: str,
+    ) -> sqlite3.Row | tuple[Any, ...] | None:
+        return connection.execute(
+            "SELECT byte_offset, byte_length, row_hash FROM events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+
+    @staticmethod
+    def _read_indexed_event(
+        ledger_fd: int,
+        event_id: str,
+        indexed: sqlite3.Row | tuple[Any, ...],
+    ) -> dict[str, Any]:
+        row_hash = indexed[2]
+        if not isinstance(row_hash, str) or _ROW_HASH.fullmatch(row_hash) is None:
+            raise ValueError("audit_index_corrupt")
+        encoded = _read_exact_row(
+            ledger_fd,
+            offset=indexed[0],
+            length=indexed[1],
+        )
+        if not secrets.compare_digest(_row_hash(encoded), row_hash):
+            raise ValueError("audit_index_corrupt")
+        decoded = _decode_ledger_row(encoded)
+        if decoded.get("event_id") != event_id:
+            raise ValueError("audit_index_corrupt")
+        return _sanitize_mapping_for_read(decoded)
 
     def _open_ledger(self, *, create: bool, write: bool) -> int | None:
         self._validate_target(self._path)
@@ -230,6 +354,38 @@ class AuditLedger:
             os.close(directory_fd)
 
     def _open_index(self) -> sqlite3.Connection:
+        for attempt in range(2):
+            try:
+                return self._open_index_once()
+            except _IndexResetRequired as exc:
+                if attempt == 1:
+                    raise ValueError("audit_index_corrupt") from exc
+                self._discard_index()
+        raise ValueError("audit_index_corrupt")
+
+    def _open_ready_index(self, ledger_fd: int) -> sqlite3.Connection:
+        failure: BaseException | None = None
+        for attempt in range(2):
+            connection: sqlite3.Connection | None = None
+            attempt_failure: BaseException | None = None
+            try:
+                connection = self._open_index()
+                self._ensure_index(connection, ledger_fd)
+                return connection
+            except sqlite3.Error as exc:
+                attempt_failure = failure = exc
+            except ValueError as exc:
+                if str(exc) != "audit_index_corrupt":
+                    raise
+                attempt_failure = failure = exc
+            finally:
+                if attempt_failure is not None and connection is not None:
+                    connection.close()
+            if attempt == 0:
+                self._discard_index()
+        raise ValueError("audit_index_corrupt") from failure
+
+    def _open_index_once(self) -> sqlite3.Connection:
         self._validate_target(self._index_path)
         directory_fd = self._open_parent()
         index_fd = -1
@@ -251,33 +407,14 @@ class AuditLedger:
             self._verify_identity(directory_fd, self._index_name, retained)
             connection.execute("PRAGMA journal_mode=OFF")
             connection.execute("PRAGMA synchronous=FULL")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS events (
-                    event_id TEXT PRIMARY KEY,
-                    byte_offset INTEGER NOT NULL,
-                    byte_length INTEGER NOT NULL,
-                    row_hash TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS ledger_metadata (
-                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                    device INTEGER NOT NULL,
-                    inode INTEGER NOT NULL,
-                    byte_size INTEGER NOT NULL,
-                    modified_ns INTEGER NOT NULL,
-                    changed_ns INTEGER NOT NULL
-                )
-                """
-            )
+            self._initialize_index_schema(connection)
             result = connection
             connection = None
             return result
         except sqlite3.Error as exc:
-            raise ValueError("audit_index_corrupt") from exc
+            raise _IndexResetRequired from exc
+        except _IndexResetRequired:
+            raise
         except ValueError:
             raise
         except OSError as exc:
@@ -289,16 +426,119 @@ class AuditLedger:
                 os.close(index_fd)
             os.close(directory_fd)
 
+    @staticmethod
+    def _initialize_index_schema(connection: sqlite3.Connection) -> None:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if tables:
+            if version != _INDEX_SCHEMA_VERSION or tables != {
+                "events",
+                "ledger_metadata",
+            }:
+                raise _IndexResetRequired
+            columns = {
+                "events": ("event_id", "byte_offset", "byte_length", "row_hash"),
+                "ledger_metadata": (
+                    "singleton",
+                    "device",
+                    "inode",
+                    "byte_size",
+                    "modified_ns",
+                    "changed_ns",
+                    "event_count",
+                    "indexed_bytes",
+                ),
+            }
+            for table, expected in columns.items():
+                actual = tuple(
+                    row[1] for row in connection.execute(f"PRAGMA table_info({table})")
+                )
+                if actual != expected:
+                    raise _IndexResetRequired
+            return
+
+        connection.execute(
+            """
+            CREATE TABLE events (
+                event_id TEXT PRIMARY KEY,
+                byte_offset INTEGER NOT NULL,
+                byte_length INTEGER NOT NULL,
+                row_hash TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE ledger_metadata (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                device INTEGER NOT NULL,
+                inode INTEGER NOT NULL,
+                byte_size INTEGER NOT NULL,
+                modified_ns INTEGER NOT NULL,
+                changed_ns INTEGER NOT NULL,
+                event_count INTEGER NOT NULL,
+                indexed_bytes INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(f"PRAGMA user_version={_INDEX_SCHEMA_VERSION}")
+
+    def _discard_index(self) -> None:
+        directory_fd = self._open_parent()
+        index_fd = -1
+        try:
+            flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                index_fd = os.open(self._index_name, flags, dir_fd=directory_fd)
+            except FileNotFoundError:
+                return
+            retained = self._validate_open_file(
+                directory_fd,
+                self._index_name,
+                index_fd,
+            )
+            self._verify_identity(directory_fd, self._index_name, retained)
+            os.unlink(self._index_name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        except OSError as exc:
+            raise ValueError("invalid_audit_index_path") from exc
+        finally:
+            if index_fd >= 0:
+                os.close(index_fd)
+            os.close(directory_fd)
+
     def _ensure_index(self, connection: sqlite3.Connection, ledger_fd: int) -> None:
         ledger_state = os.fstat(ledger_fd)
         metadata = connection.execute(
             """
-            SELECT device, inode, byte_size, modified_ns, changed_ns
+            SELECT device, inode, byte_size, modified_ns, changed_ns,
+                   event_count, indexed_bytes
             FROM ledger_metadata WHERE singleton = 1
             """
         ).fetchone()
-        expected = _ledger_fingerprint(ledger_state)
-        if metadata is not None and tuple(metadata) == expected:
+        index_shape = connection.execute(
+            """
+            SELECT COUNT(*), COALESCE(SUM(byte_length), 0),
+                   COALESCE(MAX(byte_offset + byte_length), 0),
+                   COALESCE(MIN(byte_offset), 0)
+            FROM events
+            """
+        ).fetchone()
+        count, total_length, final_offset, first_offset = index_shape
+        expected = (*_ledger_fingerprint(ledger_state), count, ledger_state.st_size)
+        complete = (
+            total_length == ledger_state.st_size
+            and final_offset == ledger_state.st_size
+            and first_offset == 0
+        )
+        if metadata is not None and tuple(metadata) == expected and complete:
             return
         self._rebuild_index(connection, ledger_fd, ledger_state)
 
@@ -311,6 +551,7 @@ class AuditLedger:
         try:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute("DELETE FROM events")
+            event_count = 0
             for offset, encoded in _iter_ledger_rows(ledger_fd):
                 decoded = _decode_ledger_row(encoded)
                 sanitized = _sanitize_mapping_for_read(decoded)
@@ -327,10 +568,11 @@ class AuditLedger:
                     )
                 except sqlite3.IntegrityError as exc:
                     raise ValueError("audit_ledger_corrupt") from exc
+                event_count += 1
             final_state = os.fstat(ledger_fd)
             if _ledger_fingerprint(final_state) != _ledger_fingerprint(initial_state):
                 raise ValueError("audit_ledger_unavailable")
-            self._replace_metadata(connection, final_state)
+            self._replace_metadata(connection, final_state, event_count)
             connection.execute("COMMIT")
         except ValueError:
             _rollback(connection)
@@ -343,15 +585,17 @@ class AuditLedger:
     def _replace_metadata(
         connection: sqlite3.Connection,
         ledger_state: os.stat_result,
+        event_count: int,
     ) -> None:
         connection.execute("DELETE FROM ledger_metadata")
         connection.execute(
             """
             INSERT INTO ledger_metadata (
-                singleton, device, inode, byte_size, modified_ns, changed_ns
-            ) VALUES (1, ?, ?, ?, ?, ?)
+                singleton, device, inode, byte_size, modified_ns, changed_ns,
+                event_count, indexed_bytes
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
             """,
-            _ledger_fingerprint(ledger_state),
+            (*_ledger_fingerprint(ledger_state), event_count, ledger_state.st_size),
         )
 
     def _index_insert(
@@ -373,7 +617,8 @@ class AuditLedger:
                 """,
                 (event_id, offset, length, row_hash),
             )
-            self._replace_metadata(connection, ledger_state)
+            event_count = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+            self._replace_metadata(connection, ledger_state, event_count)
             connection.execute("COMMIT")
         except sqlite3.Error as exc:
             _rollback(connection)
@@ -427,8 +672,10 @@ class AuditLedger:
         if os.name == "posix":
             if retained.st_uid != os.getuid() or retained.st_nlink != 1:
                 raise ValueError("invalid_audit_path")
-            os.fchmod(file_fd, 0o600)
-            if stat.S_IMODE(os.fstat(file_fd).st_mode) != 0o600:
+            if stat.S_IMODE(retained.st_mode) != 0o600:
+                os.fchmod(file_fd, 0o600)
+                retained = os.fstat(file_fd)
+            if stat.S_IMODE(retained.st_mode) != 0o600:
                 raise ValueError("invalid_audit_path")
         AuditLedger._verify_identity(directory_fd, name, retained)
         return retained
@@ -506,8 +753,12 @@ def _sanitize_event_field(name: str, value: Any) -> Any:
     if name == "method":
         if not isinstance(scalar, str) or scalar not in _METHODS:
             raise ValueError("invalid_audit_event")
-    elif name in {"event", "state", "failure_reason"}:
-        _require_pattern(scalar, _CODE)
+    elif name == "event":
+        scalar = _semantic_value(scalar, _EVENT_VALUES, _CODE)
+    elif name == "state":
+        scalar = _semantic_value(scalar, _STATE_VALUES, _CODE)
+    elif name == "failure_reason":
+        scalar = _semantic_value(scalar, _FAILURE_VALUES, _CODE)
     elif name in {"connector_id", "environment"}:
         _require_pattern(scalar, _IDENTIFIER)
     elif name == "repository_id":
@@ -549,10 +800,29 @@ def _sanitize_response_field(name: str, value: Any) -> Any:
             and not isinstance(scalar, bool)
             and 0 <= scalar <= 2_147_483_647
         ):
-            _require_pattern(scalar, _STATUS)
+            scalar = _semantic_value(
+                scalar,
+                _RESPONSE_SEMANTIC_VALUES["provider_code"],
+                _STATUS,
+            )
     else:
-        _require_pattern(scalar, _STATUS)
+        scalar = _semantic_value(
+            scalar,
+            _RESPONSE_SEMANTIC_VALUES[name],
+            _STATUS,
+        )
     return _redact_scalar(scalar)
+
+
+def _semantic_value(
+    value: Any,
+    allowed: frozenset[str],
+    pattern: re.Pattern[str],
+) -> str:
+    if value == "[REDACTED]":
+        return value
+    _require_pattern(value, pattern)
+    return value if value in allowed else "[REDACTED]"
 
 
 def _bounded_key(value: Any) -> str:
@@ -700,7 +970,18 @@ def _read_exact_row(file_fd: int, *, offset: Any, length: Any) -> bytes:
         or not 0 < length <= MAX_AUDIT_LINE_BYTES
     ):
         raise ValueError("audit_index_corrupt")
+    ledger_size = os.fstat(file_fd).st_size
+    if offset + length > ledger_size:
+        raise ValueError("audit_index_corrupt")
     try:
+        if offset > 0:
+            if hasattr(os, "pread"):
+                preceding = os.pread(file_fd, 1, offset - 1)
+            else:  # pragma: no cover - portable fallback
+                os.lseek(file_fd, offset - 1, os.SEEK_SET)
+                preceding = os.read(file_fd, 1)
+            if preceding != b"\n":
+                raise ValueError("audit_index_corrupt")
         if hasattr(os, "pread"):
             encoded = os.pread(file_fd, length, offset)
         else:  # pragma: no cover - portable fallback
@@ -727,18 +1008,71 @@ def _row_hash(encoded: bytes) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _lock_file(file_fd: int) -> None:
+def _lock_file(
+    file_fd: int,
+    parent: Path,
+    ledger_name: str,
+) -> _FallbackGuard | None:
     if _fcntl is not None:
         try:
             _fcntl.flock(file_fd, _fcntl.LOCK_EX)
+            return None
+        except OSError as exc:
+            raise ValueError("audit_ledger_unavailable") from exc
+
+    guard_path = parent / f"{ledger_name}{_LOCK_GUARD_SUFFIX}"
+    deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+    while True:  # pragma: no branch - fallback used only without fcntl
+        try:
+            os.mkdir(guard_path, 0o700)
+            state = guard_path.lstat()
+            if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
+                raise ValueError("audit_ledger_unavailable")
+            if os.name == "posix":
+                if state.st_uid != os.getuid():
+                    raise ValueError("audit_ledger_unavailable")
+                if stat.S_IMODE(state.st_mode) != 0o700:
+                    os.chmod(guard_path, 0o700)
+                    state = guard_path.lstat()
+                if stat.S_IMODE(state.st_mode) != 0o700:
+                    raise ValueError("audit_ledger_unavailable")
+            return _FallbackGuard(guard_path, state.st_dev, state.st_ino)
+        except FileExistsError:
+            try:
+                state = guard_path.lstat()
+            except OSError as exc:
+                raise ValueError("audit_ledger_unavailable") from exc
+            if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
+                raise ValueError("audit_ledger_unavailable") from None
+            if time.monotonic() >= deadline:
+                raise ValueError("audit_ledger_unavailable") from None
+            time.sleep(_LOCK_POLL_SECONDS)
+        except ValueError:
+            with suppress(OSError):
+                guard_path.rmdir()
+            raise
         except OSError as exc:
             raise ValueError("audit_ledger_unavailable") from exc
 
 
-def _unlock_file(file_fd: int) -> None:
+def _unlock_file(file_fd: int, fallback_guard: _FallbackGuard | None) -> None:
     if _fcntl is not None:
         with suppress(OSError):
             _fcntl.flock(file_fd, _fcntl.LOCK_UN)
+        return
+    if fallback_guard is not None:
+        try:
+            state = fallback_guard.path.lstat()
+            if (
+                stat.S_ISLNK(state.st_mode)
+                or not stat.S_ISDIR(state.st_mode)
+                or (state.st_dev, state.st_ino)
+                != (fallback_guard.device, fallback_guard.inode)
+            ):
+                raise ValueError("audit_ledger_unavailable")
+            fallback_guard.path.rmdir()
+        except OSError as exc:
+            raise ValueError("audit_ledger_unavailable") from exc
 
 
 def _rollback(connection: sqlite3.Connection) -> None:

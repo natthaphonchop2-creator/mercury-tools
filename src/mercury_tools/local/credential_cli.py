@@ -7,6 +7,7 @@ import asyncio
 import getpass
 import json
 import os
+import secrets
 import shutil
 import stat
 import sys
@@ -166,8 +167,10 @@ def cmd_credentials_test(args: argparse.Namespace) -> int:
         _, driver = _driver_for(context, args.connector)
         fields = driver.credential_fields(args.environment)
         store = CredentialStore(context)
-        credentials = store.load(args.connector, args.environment, fields)
-        status = store.status(args.connector, args.environment, fields)
+        with repository_operation_lock(context):
+            snapshot = store.snapshot(args.connector, args.environment, fields)
+        credentials = snapshot.credentials
+        status = snapshot.status
         if not status.configured:
             _print_json(
                 {
@@ -204,14 +207,21 @@ def cmd_credentials_test(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        record_connector_validation(
-            context,
-            connector_id=args.connector,
-            environment=args.environment,
-            company_name=company_name,
-            probe_action=probe_action,
-            validated_at=datetime.now(UTC).isoformat(),
-        )
+        with repository_operation_lock(context):
+            current = store.snapshot(args.connector, args.environment, fields)
+            if not current.status.configured or not secrets.compare_digest(
+                snapshot.generation,
+                current.generation,
+            ):
+                return _error("credential_validation_stale")
+            record_connector_validation(
+                context,
+                connector_id=args.connector,
+                environment=args.environment,
+                company_name=company_name,
+                probe_action=probe_action,
+                validated_at=datetime.now(UTC).isoformat(),
+            )
     except ValueError:
         return _error("credential_validation_persistence_failed")
 
