@@ -1146,3 +1146,150 @@ $ git diff --name-only -- .agents plugins src/mercury_tools/db/product.py \
   to fail closed under the earlier acceptance fix.
 - The full suite retains the pre-existing Starlette/httpx deprecation warning
   from `tests/test_connector_mcp_tools.py`.
+
+## Acceptance Fix D: Canonical Multipart Request Boundaries
+
+### Status
+
+IMPLEMENTED
+
+This final acceptance fix started from `11ed193`. Task 16 concurrently owns the
+plugin manifests, packaging metadata and lockfile, embeddings, release docs,
+and plugin package tests. None of those files was edited or staged by this fix.
+
+### Findings Addressed
+
+1. Model-supplied `Content-Type` headers are rejected case-insensitively even
+   when an action schema declares that header. `httpx` therefore remains the
+   sole owner of multipart boundary generation and cannot emit a body whose
+   boundary disagrees with a user-controlled header.
+2. OpenAPI import and executable request validation now use the same canonical
+   schema-name predicate as Cloud admission. Property and required names must
+   be non-empty, trimmed, bounded, sanitizer-stable names without path,
+   assignment, URI, control-character, or encoding ambiguity.
+3. A body-schema `required` list is valid only on an explicit object schema. It
+   must be a canonical, unique subset of declared properties. A scalar schema
+   carrying `required`, including `required: []`, fails closed.
+4. Optional multipart `body=None` is normalized to the same absent body as an
+   omitted body. It emits no dummy form part and no content type when no files
+   exist; with files, only the declared file parts reach the wire. A whole-body
+   `x-mercury-required` marker still rejects `None` as `required_body_missing`.
+5. Existing JSON and form-urlencoded paths are unchanged. Multipart media-type
+   parameters remain recognition-only and are never copied into the rendered
+   request header.
+6. Cloud already enforced the required-shape behavior. Its canonical name
+   predicate was moved to the shared executable schema contract without
+   changing public admission behavior, and client cache-poisoning regressions
+   cover scalar required lists and noncanonical property names.
+
+### Changed Files
+
+- `.superpowers/sdd/task-13-report.md`
+- `src/mercury_tools/catalog/schema_contract.py`
+- `src/mercury_tools/catalog/importers/openapi.py`
+- `src/mercury_tools/cloud/models.py`
+- `src/mercury_tools/drivers/generic.py`
+- `src/mercury_tools/execution/request_builder.py`
+- `tests/test_catalog_importers.py`
+- `tests/test_cloud_client.py`
+- `tests/test_erp_executor.py`
+- `tests/test_generic_drivers.py`
+
+The generic API-key driver now rejects `Content-Type` as a header credential
+name. Request rendering also removes a driver-authored transport content type
+before `httpx` selects the canonical encoding and boundary.
+
+### RED Evidence
+
+The focused acceptance tests were added before production changes:
+
+```text
+$ uv run pytest -q \
+    tests/test_erp_executor.py::test_request_builder_rejects_user_content_type_overrides \
+    tests/test_erp_executor.py::test_request_builder_rejects_noncanonical_body_required_contracts \
+    tests/test_erp_executor.py::test_request_builder_treats_optional_multipart_none_body_as_absent \
+    tests/test_erp_executor.py::test_request_builder_rejects_none_for_required_multipart_body \
+    tests/test_catalog_importers.py::test_openapi_rejects_noncanonical_body_required_contracts \
+    tests/test_cloud_client.py::test_client_rejects_nonpublic_catalog_projection_without_poisoning_cache
+10 failed, 13 passed in 0.40s
+```
+
+The failures were the three `Content-Type` casings, three runtime schema
+contracts, optional and required multipart `None`, and two importer contracts.
+The Cloud cases passed before implementation, confirming that Cloud already
+held the intended canonical boundary.
+
+### GREEN Evidence
+
+```text
+$ uv run pytest -q tests/test_catalog_importers.py tests/test_erp_executor.py \
+    tests/test_generic_drivers.py tests/test_cloud_api.py tests/test_cloud_client.py
+570 passed in 2.56s
+```
+
+```text
+$ uv run pytest -q \
+    tests/test_erp_executor.py::test_request_builder_rejects_user_content_type_overrides \
+    tests/test_erp_executor.py::test_request_builder_replaces_auth_content_type_for_multipart_rendering \
+    tests/test_erp_executor.py::test_request_builder_encodes_body_only_multipart_with_client_boundary \
+    tests/test_erp_executor.py::test_request_builder_encodes_files_only_and_body_plus_files_as_multipart \
+    tests/test_erp_executor.py::test_request_builder_leaves_empty_optional_multipart_unencoded \
+    tests/test_erp_executor.py::test_request_builder_treats_optional_multipart_none_body_as_absent \
+    tests/test_erp_executor.py::test_request_builder_omits_none_body_from_multipart_file_wire \
+    tests/test_erp_executor.py::test_request_builder_rejects_none_for_required_multipart_body \
+    tests/test_erp_executor.py::test_request_builder_preserves_json_and_urlencoded_body_encodings \
+    tests/test_erp_executor.py::test_complete_body_only_multipart_dispatches_form_data
+13 passed in 0.13s
+```
+
+```text
+$ uv run pytest -q \
+    tests/test_builtin_action_catalog.py::test_every_builtin_action_is_cloud_valid_and_request_buildable
+1 passed in 0.82s
+```
+
+The builtin sweep validates Cloud admission and calls `build_request` for all
+190 FlowAccount and 64 PEAK actions, preserving all 254 builtins.
+
+During concurrent Task 16 work, the full non-integration run excluded only its
+two active package-test files:
+
+```text
+$ uv run pytest -q -m 'not integration' \
+    --ignore=tests/test_plugin_package.py \
+    --ignore=tests/test_plugin_clean_install.py
+1552 passed, 1 deselected, 1 warning in 8.61s
+```
+
+The count changed because the concurrent Cloud-secret removal worker deleted
+legacy private-journal tests and updated the remaining connector contracts. No
+file from that change is part of this commit.
+
+```text
+$ uv run ruff check \
+    src/mercury_tools/catalog/importers/openapi.py \
+    src/mercury_tools/catalog/schema_contract.py \
+    src/mercury_tools/cloud/models.py \
+    src/mercury_tools/drivers/generic.py \
+    src/mercury_tools/execution/request_builder.py \
+    tests/test_catalog_importers.py tests/test_cloud_client.py \
+    tests/test_erp_executor.py tests/test_generic_drivers.py
+All checks passed!
+
+$ git diff --check && git diff --cached --check
+# no output
+```
+
+### Residual
+
+- The full suite retains the pre-existing Starlette/httpx deprecation warning
+  from `tests/test_connector_mcp_tools.py`.
+- Task 16 package tests remained excluded from the final non-integration run.
+  A direct package run completed 27 tests before the clean-wheel case timed out
+  after 120 seconds while `uvx --no-cache` downloaded dependencies; later
+  retries overlapped Task 16's own clean-install worker and were not used as
+  acceptance evidence.
+- Full-repository Ruff currently reports four errors only in the concurrent,
+  unstaged `scripts/purge_cloud_erp_secrets.py` and
+  `tests/test_cloud_secret_removal.py`. Owned-scope Ruff and both staged and
+  unstaged diff checks pass.
