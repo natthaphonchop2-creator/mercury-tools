@@ -17,6 +17,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
+from mercury_tools.cloud.api import CloudDependencies, cloud_routes
 from mercury_tools.config import load_settings
 from mercury_tools.connectors.catalog import (
     connector_by_id,
@@ -2745,7 +2746,11 @@ async def healthz(request: Request) -> Response:
     )
 
 
-def create_http_app(*, require_auth: bool | None = None):
+def create_http_app(
+    *,
+    require_auth: bool | None = None,
+    cloud_dependencies: CloudDependencies | None = None,
+):
     settings = load_settings()
     mcp.settings.streamable_http_path = settings.mcp_path
     if settings.public_base_url:
@@ -2791,7 +2796,10 @@ def create_http_app(*, require_auth: bool | None = None):
                 async with private_app.router.lifespan_context(private_app):
                     yield
 
-    routes = [*public_app.routes]
+    routes = [
+        *public_app.routes,
+        *cloud_routes(cloud_dependencies or CloudDependencies(settings=settings)),
+    ]
     if private_app is not None:
         routes.extend(private_app.routes)
     app = Starlette(routes=routes, lifespan=lifespan)

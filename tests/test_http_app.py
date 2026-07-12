@@ -18,6 +18,7 @@ def _clear_live_env(monkeypatch) -> None:
         "MERCURY_CONNECT_SIGNING_SECRET",
         "MERCURY_PRIVATE_MCP_PATH",
         "MERCURY_PRIVATE_MCP_TOKEN",
+        "MERCURY_CLOUD_BASE_URL",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API", "true")
@@ -70,6 +71,24 @@ def test_public_contest_app_does_not_mount_legacy_http_api(monkeypatch) -> None:
     assert status["legacy_http_api"] == "disabled"
     assert "dashboard" not in status
     assert "skill_upload" not in status
+
+
+def test_public_app_mounts_cloud_reads_without_cloud_write_or_legacy_routes(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MERCURY_TOOLS_MCP_PATH", "/mcp")
+    monkeypatch.delenv("MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API", raising=False)
+
+    client = TestClient(create_http_app(require_auth=False), raise_server_exceptions=False)
+
+    assert client.get("/api/cloud/v1/catalog/actions").status_code == 503
+    assert client.post("/api/cloud/v1/catalog/actions", json={}).status_code == 405
+    assert client.post("/api/cloud/v1/connectors", json={}).status_code == 405
+    assert client.post("/api/cloud/v1/skills", json={}).status_code == 405
+    assert client.post("/api/cloud/v1/documents/document-1", json={}).status_code == 405
+    assert client.post("/api/connect", json={}).status_code == 404
+    assert client.post("/api/flows/run", json={}).status_code == 404
+    assert client.get("/mcp").status_code != 404
 
 
 def test_remote_http_app_allows_public_base_url_host(monkeypatch) -> None:

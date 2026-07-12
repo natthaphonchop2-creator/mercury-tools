@@ -16,6 +16,7 @@ DEFAULT_MCP_HOST = "0.0.0.0"
 DEFAULT_MCP_PORT = 8000
 DEFAULT_MCP_PATH = "/mcp"
 DEFAULT_PRIVATE_MCP_PATH = "/private-mcp"
+DEFAULT_CLOUD_BASE_URL = "https://mercury-tools-mcp.onrender.com"
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,7 @@ class Settings:
     enable_legacy_http_api: bool = False
     connect_invite_code: str = ""
     connect_signing_secret: str = ""
+    cloud_base_url: str = DEFAULT_CLOUD_BASE_URL
 
     @property
     def supabase_configured(self) -> bool:
@@ -152,6 +154,10 @@ def load_settings(*, dotenv_path: str | Path | None = None) -> Settings:
         connect_signing_secret=(
             os.environ.get("MERCURY_CREDENTIAL_VAULT_SECRET", "").strip()
             or os.environ.get("MERCURY_CONNECT_SIGNING_SECRET", "").strip()
+        ),
+        cloud_base_url=(
+            os.environ.get("MERCURY_CLOUD_BASE_URL", DEFAULT_CLOUD_BASE_URL).strip().rstrip("/")
+            or DEFAULT_CLOUD_BASE_URL
         ),
     )
 
