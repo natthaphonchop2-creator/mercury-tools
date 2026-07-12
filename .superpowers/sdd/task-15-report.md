@@ -85,3 +85,61 @@ The full suite emits the existing Starlette/httpx deprecation warning from
 `tests/test_connector_mcp_tools.py`. Task 16 still owns the public local-stdio
 MCP packaging, manifest/version/capability changes, and release validator. Task
 17 still owns removal of private server/runtime source.
+
+## Task 15 Follow-up: Skill Risk-Contract Repair
+
+### Scope
+
+This follow-up changes only public Mercury Skill Markdown, the package/runtime
+Skill contracts, and this report. The concurrent importer/request-builder and
+Cloud work was already committed as `5c705d5` and was not modified.
+
+### RED Evidence
+
+The textual, ordering, and pressure-contract assertions were added before the
+Skill Markdown changed.
+
+```text
+$ uv run pytest tests/test_plugin_package.py tests/test_runtime_skills.py -q
+6 failed, 26 passed in 0.16s
+```
+
+The failures proved that setup Skills could run a credential test after an
+unconfigured second status; read Skills did not explicitly constrain action
+searches to risk tier zero or inspect schemas; and the journal Skill did not
+apply returned risk and confirmation requirements to every mutation, did not
+invalidate bound previews safely, and did not give approval its own request.
+
+### Delivered Contract
+
+- Every journal mutation now branches on returned `risk_tier` and
+  `required_confirmations`: Tier 1 requires one distinct user confirmation;
+  tier two or two-or-more required confirmations use one fresh bound preview,
+  two distinct user confirmations, two confirmation calls, then one execution.
+- Approval restarts as a separate action with a new search, schema, preview,
+  request identifier, and risk-contract evaluation.
+- Expired or mismatched previews, altered inputs, binding/version/state errors,
+  and hash errors discard the old request. The old request identifier and hash
+  are never reused; search, schema, preview, and confirmations restart. An
+  unknown outcome remains status lookup only and is never replayed.
+- Company, VAT, invoice, and management Skills search with `risk_tier=0`,
+  inspect the selected schema, then read.
+- Setup Skills return to local setup when the second credential status is
+  missing or unconfigured. They run the local test only when configured and
+  proceed only after `connected`.
+
+### GREEN Evidence
+
+```text
+$ uv run pytest tests/test_plugin_package.py tests/test_runtime_skills.py tests/test_journal_models.py -q
+38 passed in 0.13s
+
+$ uv run pytest -m "not integration" -q
+1577 passed, 1 deselected, 1 warning in 8.47s
+```
+
+### Residual
+
+The non-integration suite retains the pre-existing Starlette/httpx deprecation
+warning from `tests/test_connector_mcp_tools.py`. No concurrent importer,
+request-builder, execution, Cloud, or unrelated test files were changed.

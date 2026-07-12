@@ -58,6 +58,29 @@ def test_bundled_journal_skill_uses_generic_local_write_tools() -> None:
     assert "create_flowaccount_journal_draft" not in markdown
 
 
+def test_bundled_journal_skill_keeps_tiered_write_pressure_contract() -> None:
+    markdown = skill_markdown("flowaccount-journal-posting-th")
+
+    assert markdown is not None
+    required_order = (
+        "returned `risk_tier` and `required_confirmations`",
+        "Tier 1",
+        "one distinct explicit user confirmation",
+        "risk_tier >= 2 or `required_confirmations >= 2`",
+        "first `confirm_erp_write`",
+        "second `confirm_erp_write`",
+        "Never reuse its `request_id` or `payload_hash`",
+        "get_erp_request_status",
+        "never replay or retry",
+    )
+    markdown = " ".join(markdown.split())
+    cursor = 0
+    for term in required_order:
+        position = markdown.find(term, cursor)
+        assert position >= 0, f"missing {term!r} after offset {cursor}"
+        cursor = position + len(term)
+
+
 def test_skill_markdown_honors_an_explicit_runtime_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

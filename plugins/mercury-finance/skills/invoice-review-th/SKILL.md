@@ -9,9 +9,10 @@ description: Use when the user asks to review invoices, tax invoices, receipts, 
    and route to local connector setup unless status is connected.
 2. Call `retrieve_context_pack` for invoice, VAT, counterparty, and review policy
    context. Preserve its citations for accounting and compliance claims.
-3. Call `search_erp_actions` for the required safe invoice or receipt read. Stop on
-   ambiguity.
-4. Call `get_erp_action_schema` for the exact selected action and prepare only its inputs.
+3. Call `search_erp_actions` with `risk_tier=0` for the required safe invoice or receipt
+   read. Stop on ambiguity.
+4. Call `get_erp_action_schema` for the exact selected action. Inspect the returned schema
+   and prepare only its inputs.
 5. Call `run_erp_read`; repeat the search, schema, and read steps only when related
    documents require separate actions.
 

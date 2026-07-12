@@ -9,9 +9,10 @@ description: Use when the user asks for Thai VAT output tax, input tax, filing c
    and route to local connector setup unless status is connected.
 2. Call `retrieve_context_pack` for the company, tax period, VAT policy, and filing
    context. Preserve its citations for tax and accounting claims.
-3. Call `search_erp_actions` for each required safe VAT or document read. Stop on
-   ambiguity.
-4. Call `get_erp_action_schema` for the exact selected action and prepare only its inputs.
+3. Call `search_erp_actions` with `risk_tier=0` for each required safe VAT or document
+   read. Stop on ambiguity.
+4. Call `get_erp_action_schema` for the exact selected action. Inspect the returned schema
+   and prepare only its inputs.
 5. Call `run_erp_read`; repeat the search, schema, and read steps only when another VAT
    source requires a separate action.
 

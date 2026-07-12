@@ -97,6 +97,7 @@ def skill_text(skill_name: str) -> str:
 
 
 def assert_terms_in_order(text: str, terms: tuple[str, ...]) -> None:
+    text = " ".join(text.split())
     cursor = 0
     for term in terms:
         position = text.find(term, cursor)
@@ -154,6 +155,7 @@ def test_setup_skills_use_the_exact_local_credential_gate() -> None:
         "mercury credentials setup",
         "After the user confirms setup is complete",
         "credential_status",
+        "If it is still missing or not configured, stop and return to local setup",
         "mercury credentials test",
         "Continue only when the test reports `connected`",
     )
@@ -183,29 +185,89 @@ def test_read_skills_use_only_the_generic_read_sequence() -> None:
         assert not any(tool in text for tool in disallowed_tools)
 
 
-def test_journal_skill_uses_bound_generic_write_sequence_once() -> None:
-    text = skill_text("flowaccount-journal-posting-th")
+def test_read_skills_explicitly_filter_safe_actions_and_inspect_schema() -> None:
     required_order = (
+        "search_erp_actions",
+        "`risk_tier=0`",
+        "get_erp_action_schema",
+        "Inspect the returned schema",
+        "run_erp_read",
+    )
+
+    for skill_name in READ_SKILLS:
+        assert_terms_in_order(skill_text(skill_name), required_order)
+
+
+def test_journal_skill_branches_every_mutation_on_returned_risk_contract() -> None:
+    text = skill_text("flowaccount-journal-posting-th")
+    common_order = (
         "required accounting context",
         "total debit equals total credit",
         "search_erp_actions",
         "get_erp_action_schema",
         "preview_erp_write",
-        "Stop and wait for explicit confirmation",
+        "returned `risk_tier` and `required_confirmations`",
+    )
+    tier_one_order = (
+        "Tier 1",
+        "one distinct explicit user confirmation",
         "request_id",
         "payload_hash",
         "confirm_erp_write",
         "execute_erp_write",
     )
+    tier_two_order = (
+        "risk_tier >= 2 or `required_confirmations >= 2`",
+        "same fresh bound preview",
+        "first distinct explicit user confirmation",
+        "first `confirm_erp_write`",
+        "second distinct explicit user confirmation",
+        "second `confirm_erp_write`",
+        "execute_erp_write",
+    )
 
-    assert_terms_in_order(text, required_order)
+    assert_terms_in_order(text, common_order)
+    assert_terms_in_order(text, tier_one_order)
+    assert_terms_in_order(text, tier_two_order)
+    assert "for every journal mutation, not only approval" in text.lower()
     assert "Call `execute_erp_write` exactly once" in text
-    assert "A Tier 2 approval is a separate action" in text
-    assert "fresh `preview_erp_write`" in text
-    assert "two separate explicit confirmations" in text
-    assert text.count("confirm_erp_write") == 2
     assert "get_erp_request_status" in text
     assert "never replay or retry" in text
+
+
+def test_journal_skill_discards_invalidated_previews_before_restarting() -> None:
+    text = skill_text("flowaccount-journal-posting-th")
+    invalidation_causes = (
+        "stale or expired preview",
+        "payload hash mismatch",
+        "action-version or binding mismatch",
+        "state mismatch",
+        "changed inputs",
+    )
+    recovery_order = (
+        "Stop; discard the old request",
+        "Never reuse its `request_id` or `payload_hash`",
+        "redo `search_erp_actions`",
+        "get_erp_action_schema",
+        "fresh `preview_erp_write`",
+        "collect confirmations again",
+    )
+
+    assert all(cause in text for cause in invalidation_causes)
+    assert_terms_in_order(text, recovery_order)
+
+
+def test_journal_skill_restarts_approval_with_a_new_bound_request() -> None:
+    text = skill_text("flowaccount-journal-posting-th")
+    approval_order = (
+        "Approval is a separate action",
+        "new `search_erp_actions`",
+        "get_erp_action_schema",
+        "fresh `preview_erp_write`",
+        "new `request_id`",
+    )
+
+    assert_terms_in_order(text, approval_order)
 
 
 def test_flow_runner_cannot_confirm_execute_or_retry_writes() -> None:
