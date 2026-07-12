@@ -901,6 +901,20 @@ async def test_client_uses_configured_cloud_base_url_when_not_explicit(
                 "files": {},
             },
         ),
+        (
+            "input_schema",
+            {
+                "path": {},
+                "query": {},
+                "headers": {},
+                "body": {
+                    "type": "object",
+                    "properties": {"reference": {"type": "string"}},
+                    "required": ["missing"],
+                },
+                "files": {},
+            },
+        ),
         ("examples", ({"body": {"amount": 100}},)),
         ("idempotency", {"header": "Idempotency-Key"}),
         ("success_rules", {"status": [200]}),

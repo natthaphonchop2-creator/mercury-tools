@@ -70,6 +70,7 @@ class RequestTemplate:
     environment: str | None
     _request_inputs: Mapping[str, Any] = field(repr=False)
     _body_present: bool = field(default=False, repr=False)
+    _content_type: str = field(default="application/json", repr=False)
     _files: tuple[_BoundFile, ...] = field(default=(), repr=False)
 
     def __post_init__(self) -> None:
@@ -133,22 +134,43 @@ class RequestTemplate:
 
         url = self.base_url.rstrip("/") + self.final_path
         body = _json_copy(self._request_inputs["body"])
-        if self._files:
-            files: dict[str, tuple[str, bytes, str]] = {}
+        media_type = self._content_type.split(";", 1)[0].strip().casefold()
+        if media_type == "multipart/form-data":
+            parts: list[tuple[str, Any]] = []
+            if self._body_present:
+                if not isinstance(body, Mapping):
+                    raise RequestBuildError("invalid_body_value")
+                parts.extend(
+                    (name, (None, _multipart_field_value(value)))
+                    for name, value in body.items()
+                )
             for item in self._files:
                 content = _read_bound_file(item)
-                files[item.field_name] = (item.filename, content, item.content_type)
-            data = body if isinstance(body, Mapping) else {}
+                parts.append(
+                    (
+                        item.field_name,
+                        (item.filename, content, item.content_type),
+                    )
+                )
+            if not parts:
+                return httpx.Request(self.method, url, params=query, headers=headers)
             return httpx.Request(
                 self.method,
                 url,
                 params=query,
                 headers=headers,
-                data=dict(data),
-                files=files,
+                files=parts,
             )
         if not self._body_present:
             return httpx.Request(self.method, url, params=query, headers=headers)
+        if media_type == "application/x-www-form-urlencoded" and isinstance(body, Mapping):
+            return httpx.Request(
+                self.method,
+                url,
+                params=query,
+                headers=headers,
+                data=dict(body),
+            )
         return httpx.Request(
             self.method,
             url,
@@ -277,6 +299,7 @@ def build_request(
         environment=environment,
         _request_inputs=normalized_inputs,
         _body_present=body_present,
+        _content_type=action.content_type,
         _files=bound_files,
     )
 
@@ -417,7 +440,7 @@ def _validate_body_required_contract(schema: Mapping[str, Any], *, top_level: bo
             raise RequestBuildError("invalid_action_input_schema")
     if "required" in schema:
         required = schema["required"]
-        properties = schema.get("properties")
+        properties = schema.get("properties", {})
         if (
             not isinstance(required, (list, tuple))
             or any(not isinstance(name, str) for name in required)
@@ -454,6 +477,20 @@ def _validate_type(value: Any, schema: Mapping[str, Any], section: str) -> None:
     enum = schema.get("enum")
     if isinstance(enum, (list, tuple)) and value not in enum:
         raise RequestBuildError(f"invalid_{section}_value")
+
+
+def _multipart_field_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        raise RequestBuildError("invalid_body_value") from None
 
 
 def _reject_auth_overrides(query: Mapping[str, Any], headers: Mapping[str, Any]) -> None:

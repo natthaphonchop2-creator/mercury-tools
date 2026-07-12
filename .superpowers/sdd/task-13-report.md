@@ -998,3 +998,151 @@ not part of this fix's staged diff.
   closed instead of silently losing required semantics.
 - The full suite retains the pre-existing Starlette `TestClient` deprecation
   warning. No in-scope test or lint failure remains.
+
+## Acceptance Fix C: Multipart Required Semantics
+
+### Status
+
+IMPLEMENTED
+
+This acceptance fix started while Task 15 changes were uncommitted on
+`d3a2d95b89d3737a46f77254075b7f72d9272d1d`. Task 15 stabilized independently
+as `59a0b13d8e078988c0314e01fdfb9ba89fd958a7`, which is the parent for this fix.
+No plugin, marketplace, product, runtime-Skill, or Task 15 report file was
+modified or staged by this work.
+
+### Findings Addressed
+
+1. Request rendering now follows the catalog action media type rather than the
+   presence of bound files. A multipart action with only body fields is encoded
+   as multipart form fields even when `files` is absent or empty. Files-only and
+   body-plus-files requests use the same multipart path.
+2. `httpx` owns multipart boundary generation. Catalog media-type parameters
+   are used only to recognize multipart and are never copied as a hard-coded
+   boundary header. Empty optional multipart input remains an empty request with
+   no fabricated boundary or dummy form field.
+3. `application/json` retains JSON encoding and
+   `application/x-www-form-urlencoded` uses form encoding.
+4. OpenAPI import now validates every object-schema `required` contract before
+   multipart properties can be split into body and file declarations. Required
+   names must be a unique list of non-empty canonical strings and an exact
+   subset of declared properties. Regular OpenAPI and Swagger body schemas are
+   checked recursively under object properties and array items.
+5. Valid required body fields, required multipart file markers, and the
+   root-only `x-mercury-required` whole-body marker remain unchanged. A valid
+   empty `required: []` list is preserved as the empty subset even when the
+   schema omits `properties`.
+6. Cloud public catalog admission already enforced canonical schema names,
+   unique required lists, recursive subset membership, and root-only whole-body
+   markers. New raw-validator and client cache-poisoning regressions prove the
+   invariant, so no Cloud production change was required.
+7. Missing required multipart bodies and fields fail during preview request
+   construction before credential loading, network validation, preview record
+   creation, or provider dispatch. A complete body-only multipart write reaches
+   the provider as form data.
+
+### Changed Files
+
+- `.superpowers/sdd/task-13-report.md`
+- `src/mercury_tools/catalog/importers/openapi.py`
+- `src/mercury_tools/execution/request_builder.py`
+- `tests/test_catalog_importers.py`
+- `tests/test_cloud_api.py`
+- `tests/test_cloud_client.py`
+- `tests/test_erp_executor.py`
+
+The generic driver required no change because it only validates and prepares
+file paths; request media encoding is owned by `RequestTemplate`.
+
+### RED Evidence
+
+Importer malformed-required reproduction before implementation:
+
+```text
+$ uv run pytest -q tests/test_catalog_importers.py \
+    -k 'malformed_object_required_contracts'
+7 failed, 3 passed, 94 deselected
+```
+
+Request builder and executor multipart reproduction before implementation:
+
+```text
+$ uv run pytest -q tests/test_erp_executor.py \
+    -k 'body_only_multipart or files_only_and_body_plus_files or \
+        empty_optional_multipart or preserves_json_and_urlencoded or \
+        required_multipart_fails or complete_body_only_multipart'
+3 failed, 4 passed, 39 deselected
+```
+
+The failures were exactly body-only multipart and complete multipart dispatch
+using `application/json`, plus urlencoded bodies using JSON. The Cloud
+validator/client regressions passed before implementation (`10 passed`),
+confirming that layer already failed closed.
+
+Self-review then caught an over-strict empty-subset interpretation before the
+adjustment. The importer and request-builder tests each failed once on valid
+`required: []` without `properties`, then each passed after missing properties
+were treated as an empty mapping. Explicit non-mapping properties still fail
+closed.
+
+### Multipart Wire Evidence
+
+An imported body-only OpenAPI action was passed through `build_request` and
+`RequestTemplate.to_httpx_request`. The generated boundary was normalized only
+for this report:
+
+```text
+content-type: multipart/form-data; boundary=<BOUNDARY>
+--<BOUNDARY>
+Content-Disposition: form-data; name="caption"
+
+Invoice
+--<BOUNDARY>--
+```
+
+The wire body contains no JSON media marker or JSON object wrapper.
+
+### GREEN Evidence
+
+```text
+$ uv run pytest -q tests/test_catalog_importers.py tests/test_erp_executor.py \
+    tests/test_generic_drivers.py tests/test_cloud_api.py tests/test_cloud_client.py
+552 passed in 2.40s
+
+$ uv run pytest -q \
+    tests/test_builtin_action_catalog.py::test_every_builtin_action_is_cloud_valid_and_request_buildable
+1 passed in 0.67s
+```
+
+The builtin acceptance test validated Cloud admission and `build_request` for
+all 190 FlowAccount and 64 PEAK actions, for 254 actions total.
+
+```text
+$ uv run pytest -q -m 'not integration'
+1571 passed, 1 deselected, 1 warning in 8.23s
+```
+
+The final commands below are rerun after every production and report edit before
+the single owned-scope commit:
+
+```text
+$ uv run ruff check .
+All checks passed!
+
+$ git diff --check
+# no output
+
+$ git diff --name-only -- .agents plugins src/mercury_tools/db/product.py \
+    tests/test_plugin_package.py tests/test_private_mcp.py \
+    tests/test_runtime_skills.py .superpowers/sdd/task-15-report.md
+# no output
+```
+
+### Residual
+
+- Empty optional multipart input intentionally emits no body and no
+  `Content-Type`; inventing an empty part would change provider semantics.
+- OpenAPI component references remain unsupported by this importer and continue
+  to fail closed under the earlier acceptance fix.
+- The full suite retains the pre-existing Starlette/httpx deprecation warning
+  from `tests/test_connector_mcp_tools.py`.

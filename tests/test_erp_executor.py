@@ -623,6 +623,186 @@ def test_request_builder_keeps_optional_body_independent_from_required_propertie
         )
 
 
+def test_request_builder_accepts_valid_empty_object_required_list(
+    repository_context: RepositoryContext,
+    action_factory: Callable[..., CatalogAction],
+) -> None:
+    action = action_factory(
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": {"type": "object", "required": []},
+            "files": {},
+        }
+    )
+
+    request = build_request(
+        action,
+        "https://erp.example.com",
+        {},
+        (repository_context.root,),
+    ).to_httpx_request(AuthContext(headers={}, query={}, expires_at=None))
+
+    assert request.content == b""
+
+
+def test_request_builder_encodes_body_only_multipart_with_client_boundary(
+    repository_context: RepositoryContext,
+    action_factory: Callable[..., CatalogAction],
+) -> None:
+    action = action_factory(
+        content_type="multipart/form-data",
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": {
+                "type": "object",
+                "properties": {"caption": {"type": "string"}},
+                "required": ["caption"],
+                "additionalProperties": False,
+            },
+            "files": {},
+        },
+    )
+
+    template = build_request(
+        action,
+        "https://erp.example.com",
+        {"body": {"caption": "Invoice"}, "files": {}},
+        (repository_context.root,),
+    )
+    request = template.to_httpx_request(AuthContext(headers={}, query={}, expires_at=None))
+    content_type = request.headers["content-type"]
+    boundary = content_type.partition("boundary=")[2]
+    body = request.read()
+
+    assert content_type.startswith("multipart/form-data; boundary=")
+    assert boundary
+    assert f"--{boundary}".encode() in body
+    assert b'Content-Disposition: form-data; name="caption"' in body
+    assert b"Invoice" in body
+    assert b'application/json' not in body
+
+
+def test_request_builder_encodes_files_only_and_body_plus_files_as_multipart(
+    repository_context: RepositoryContext,
+    action_factory: Callable[..., CatalogAction],
+) -> None:
+    document = repository_context.root / "invoice.txt"
+    document.write_bytes(b"invoice-document")
+    action = action_factory(
+        content_type="Multipart/Form-Data; boundary=ignored-upstream-boundary",
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": {
+                "type": "object",
+                "properties": {"caption": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            "files": {"document": {"type": "string", "format": "binary"}},
+        },
+    )
+
+    for inputs, expected_parts in (
+        ({"files": {"document": str(document)}}, (b"invoice-document",)),
+        (
+            {
+                "body": {"caption": "Invoice"},
+                "files": {"document": str(document)},
+            },
+            (b"Invoice", b"invoice-document"),
+        ),
+    ):
+        request = build_request(
+            action,
+            "https://erp.example.com",
+            inputs,
+            (repository_context.root,),
+        ).to_httpx_request(AuthContext(headers={}, query={}, expires_at=None))
+        content_type = request.headers["content-type"]
+        body = request.read()
+
+        assert content_type.startswith("multipart/form-data; boundary=")
+        assert "ignored-upstream-boundary" not in content_type
+        assert b'Content-Disposition: form-data; name="document"; filename="invoice.txt"' in body
+        for expected in expected_parts:
+            assert expected in body
+
+
+def test_request_builder_leaves_empty_optional_multipart_unencoded(
+    repository_context: RepositoryContext,
+    action_factory: Callable[..., CatalogAction],
+) -> None:
+    action = action_factory(
+        content_type="multipart/form-data",
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": {"type": "object", "properties": {}},
+            "files": {},
+        },
+    )
+
+    request = build_request(
+        action,
+        "https://erp.example.com",
+        {},
+        (repository_context.root,),
+    ).to_httpx_request(AuthContext(headers={}, query={}, expires_at=None))
+
+    assert request.content == b""
+    assert "content-type" not in request.headers
+
+
+@pytest.mark.parametrize(
+    ("content_type", "expected_header", "expected_body"),
+    [
+        ("application/json", "application/json", b'{"status":"draft"}'),
+        (
+            "application/x-www-form-urlencoded",
+            "application/x-www-form-urlencoded",
+            b"status=draft",
+        ),
+    ],
+)
+def test_request_builder_preserves_json_and_urlencoded_body_encodings(
+    repository_context: RepositoryContext,
+    action_factory: Callable[..., CatalogAction],
+    content_type: str,
+    expected_header: str,
+    expected_body: bytes,
+) -> None:
+    action = action_factory(
+        content_type=content_type,
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": {
+                "type": "object",
+                "properties": {"status": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            "files": {},
+        },
+    )
+
+    request = build_request(
+        action,
+        "https://erp.example.com",
+        {"body": {"status": "draft"}},
+        (repository_context.root,),
+    ).to_httpx_request(AuthContext(headers={}, query={}, expires_at=None))
+
+    assert request.headers["content-type"].startswith(expected_header)
+    assert request.content == expected_body
+
+
 @pytest.mark.asyncio
 async def test_imported_write_preview_rejects_required_inputs_before_creation(
     executor_parts: dict[str, Any],
@@ -699,6 +879,99 @@ async def test_imported_write_preview_rejects_required_inputs_before_creation(
     )
     assert preview.state.value == "awaiting_confirmation"
     assert network.validate_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_required_multipart_fails_before_credentials_network_or_preview(
+    executor_parts: dict[str, Any],
+    action_factory: Callable[..., CatalogAction],
+) -> None:
+    class NetworkSpy:
+        def __init__(self) -> None:
+            self.validate_calls = 0
+
+        def validate_base_url(self, *_: Any, **__: Any) -> None:
+            self.validate_calls += 1
+
+    action = action_factory(
+        content_type="multipart/form-data",
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": {
+                "type": "object",
+                "properties": {"caption": {"type": "string"}},
+                "required": ["caption"],
+                "x-mercury-required": True,
+            },
+            "files": {},
+        },
+    )
+    executor_parts["catalog"] = MutableCatalog((action,))
+    executor = make_executor(executor_parts, lambda request: response(request))
+    network = NetworkSpy()
+    executor.network = network  # type: ignore[assignment]
+
+    for inputs, error in (
+        ({}, "required_body_missing"),
+        ({"body": {}}, "required_body_field_missing"),
+    ):
+        with pytest.raises(RequestBuildError, match=f"^{error}$"):
+            await executor.preview_write(
+                repository=executor_parts["context"],
+                action=action,
+                environment="production",
+                inputs=inputs,
+            )
+
+    assert executor_parts["credentials"].load_calls == 0
+    assert network.validate_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_complete_body_only_multipart_dispatches_form_data(
+    executor_parts: dict[str, Any],
+    action_factory: Callable[..., CatalogAction],
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return response(request, payload={"status": "created"})
+
+    action = action_factory(
+        content_type="multipart/form-data",
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": {
+                "type": "object",
+                "properties": {"caption": {"type": "string"}},
+                "required": ["caption"],
+                "x-mercury-required": True,
+            },
+            "files": {},
+        },
+    )
+    executor_parts["catalog"] = MutableCatalog((action,))
+    executor = make_executor(executor_parts, handler)
+    preview = await executor.preview_write(
+        repository=executor_parts["context"],
+        action=action,
+        environment="production",
+        inputs={"body": {"caption": "Invoice"}, "files": {}},
+    )
+    ready = executor.confirm_write(preview.request_id, preview.payload_hash)
+
+    result = await executor.execute_write(ready.request_id)
+
+    assert result.status == "succeeded"
+    assert len(requests) == 1
+    assert requests[0].headers["content-type"].startswith("multipart/form-data; boundary=")
+    assert b'Content-Disposition: form-data; name="caption"' in requests[0].read()
+    assert b"Invoice" in requests[0].read()
 
 
 @pytest.mark.asyncio

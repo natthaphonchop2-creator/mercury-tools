@@ -2199,6 +2199,17 @@ async def test_cloud_catalog_rejects_unsafe_or_unsupported_executable_contract(
             },
             "files": {},
         },
+        {
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": {
+                "type": "object",
+                "properties": {"mode": {"type": "string"}},
+                "required": ["missing"],
+            },
+            "files": {},
+        },
     ],
 )
 def test_cloud_raw_catalog_rejects_coercive_or_unknown_required_markers(

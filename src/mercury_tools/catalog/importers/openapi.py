@@ -186,6 +186,10 @@ def _input_schema(
                 content_type = selected
             if body_required and not result["body"]:
                 raise ValueError("spec_required_request_body_schema_missing")
+    _validate_object_required_contract(
+        result["body"],
+        error="spec_body_required_invalid",
+    )
     return result, content_type
 
 
@@ -206,16 +210,14 @@ def _strict_required(value: Mapping[str, Any], *, error: str) -> bool:
 
 
 def _multipart_schema(schema: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    _validate_object_required_contract(
+        schema,
+        error="spec_multipart_required_invalid",
+    )
     properties = schema.get("properties")
     if not isinstance(properties, Mapping):
         return schema, {}
     raw_required = schema.get("required", [])
-    if (
-        not isinstance(raw_required, list)
-        or any(not isinstance(name, str) for name in raw_required)
-        or len(raw_required) != len(set(raw_required))
-    ):
-        raise ValueError("spec_multipart_required_invalid")
     required = set(raw_required)
     body_properties: dict[str, Any] = {}
     files: dict[str, Any] = {}
@@ -237,6 +239,31 @@ def _multipart_schema(schema: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
     else:
         body.pop("required", None)
     return body, files
+
+
+def _validate_object_required_contract(schema: Any, *, error: str) -> None:
+    if not isinstance(schema, Mapping):
+        return
+    properties = schema.get("properties", {})
+    if not isinstance(properties, Mapping):
+        raise ValueError(error)
+    if "required" in schema:
+        required = schema["required"]
+        if (
+            not isinstance(required, list)
+            or any(
+                not isinstance(name, str)
+                or not name
+                or name != name.strip()
+                for name in required
+            )
+            or len(required) != len(set(required))
+            or any(name not in properties for name in required)
+        ):
+            raise ValueError(error)
+    for declaration in properties.values():
+        _validate_object_required_contract(declaration, error=error)
+    _validate_object_required_contract(schema.get("items"), error=error)
 
 
 def _response_codes(responses: Any) -> tuple[tuple[int, ...], tuple[int, ...]]:

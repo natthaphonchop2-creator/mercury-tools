@@ -501,6 +501,92 @@ def test_openapi_multipart_preserves_required_file_and_body_semantics(
     }
 
 
+@pytest.mark.parametrize("content_type", ["application/json", "multipart/form-data"])
+@pytest.mark.parametrize(
+    "required",
+    [
+        ["missing"],
+        ["caption", "caption"],
+        [" caption "],
+        [1],
+        "caption",
+    ],
+)
+def test_openapi_fails_closed_for_malformed_object_required_contracts(
+    tmp_path: Path,
+    content_type: str,
+    required: object,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    source_path = tmp_path / "malformed-object-required-openapi.json"
+    source_path.write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.0",
+                "info": {"version": "1"},
+                "paths": {
+                    "/documents": {
+                        "post": {
+                            "requestBody": {
+                                "content": {
+                                    content_type: {
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "caption": {"type": "string"},
+                                                "document": {
+                                                    "type": "string",
+                                                    "format": "binary",
+                                                },
+                                            },
+                                            "required": required,
+                                        }
+                                    }
+                                }
+                            },
+                            "responses": {"201": {"description": "Created"}},
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="required_invalid"):
+        import_spec(context, connector_id="custom", source_path=source_path)
+
+
+def test_openapi_preserves_valid_empty_object_required_list(tmp_path: Path) -> None:
+    context = ensure_repository_state(tmp_path)
+    source_path = tmp_path / "empty-required-openapi.json"
+    source_path.write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.0",
+                "info": {"version": "1"},
+                "paths": {
+                    "/documents": {
+                        "post": {
+                            "requestBody": {
+                                "content": {
+                                    "application/json": {
+                                        "schema": {"type": "object", "required": []}
+                                    }
+                                }
+                            },
+                            "responses": {"201": {"description": "Created"}},
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    action = import_spec(context, connector_id="custom", source_path=source_path).actions[0]
+
+    assert action.input_schema["body"]["required"] == ()
+
+
 def test_swagger_precedes_postman_marker(tmp_path: Path) -> None:
     context = ensure_repository_state(tmp_path)
     source_path = tmp_path / "swagger-over-postman.json"
