@@ -92,16 +92,17 @@ def _is_placeholder(value: str) -> bool:
 
 
 def _string_contains_credential_literal(key: str, value: str) -> bool:
-    bounded = value[:MAX_SCAN_STRING_CHARS]
-    bearer = BEARER_LITERAL_RE.search(bounded)
+    if len(value) > MAX_SCAN_STRING_CHARS:
+        return True
+    bearer = BEARER_LITERAL_RE.search(value)
     if bearer is not None and not _is_placeholder(bearer.group("value")):
         return True
-    if JWT_LITERAL_RE.search(bounded) is not None:
+    if JWT_LITERAL_RE.search(value) is not None:
         return True
-    if TOKEN_PREFIX_RE.search(bounded) is not None:
+    if TOKEN_PREFIX_RE.search(value) is not None:
         return True
 
-    candidate = bounded.strip()
+    candidate = value.strip()
     return bool(
         CREDENTIAL_KEY_RE.search(key)
         and CREDENTIAL_LITERAL_RE.fullmatch(candidate)
@@ -121,7 +122,7 @@ def _contains_credential_literal(payload: Any) -> bool:
             pending.extend((key, child) for child in value)
         elif isinstance(value, str) and _string_contains_credential_literal(key, value):
             return True
-    return False
+    return bool(pending)
 
 
 def validate_release(root: Path) -> list[str]:

@@ -590,6 +590,30 @@ def test_release_validator_allows_documentation_credential_placeholders(tmp_path
 
 
 @pytest.mark.parametrize(
+    "review_fixture",
+    [
+        {"notes": "x" * 4_096 + " sk-live-51f89c816a374ad6b62be6a1"},
+        {"nodes": ["padding"] * 10_001 + ["sk-live-51f89c816a374ad6b62be6a1"]},
+    ],
+    ids=["overlong-string", "node-budget"],
+)
+def test_release_validator_fails_closed_when_credential_scan_budget_is_exceeded(
+    tmp_path: Path,
+    review_fixture: dict[str, object],
+) -> None:
+    release_root = _release_layout(tmp_path, pinned_launcher=True)
+    _rewrite_plugin(
+        release_root,
+        lambda data: data.update({"review_fixture": review_fixture}),
+    )
+
+    result = _run_release_validator(release_root)
+
+    assert result.returncode == 1
+    assert "credential literal values" in result.stdout
+
+
+@pytest.mark.parametrize(
     ("mutate", "expected_error"),
     [
         (
