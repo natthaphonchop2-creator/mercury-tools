@@ -252,6 +252,16 @@ def test_api_key_factory_does_not_treat_an_explicit_blank_key_name_as_default() 
     assert defaulted.key_name == "X-API-Key"
 
 
+def test_api_key_header_driver_rejects_transport_managed_content_type() -> None:
+    with pytest.raises(DriverConfigurationError, match="^api_key_configuration_invalid$"):
+        GenericApiKeyDriver(
+            connector_id="custom",
+            placement="header",
+            key_name="Content-Type",
+            environments={"production": "https://erp.example.test"},
+        )
+
+
 @pytest.mark.asyncio
 async def test_probe_url_construction_errors_are_returned_as_safe_probe_failures() -> None:
     class UrlConstructionFailure:

@@ -223,6 +223,7 @@ class GenericApiKeyDriver(_GenericDriver):
             placement not in {"header", "query"}
             or not isinstance(key_name, str)
             or not key_name.strip()
+            or (placement == "header" and key_name.casefold() == "content-type")
         ):
             raise DriverConfigurationError("api_key_configuration_invalid")
         super().__init__(connector_id=connector_id, environments=environments)

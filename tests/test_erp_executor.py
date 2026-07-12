@@ -304,6 +304,72 @@ def test_request_builder_rejects_undeclared_and_auth_overrides(
         )
 
 
+@pytest.mark.parametrize("header_name", ["Content-Type", "content-type", "CONTENT-TYPE"])
+def test_request_builder_rejects_user_content_type_overrides(
+    action_factory: Callable[..., CatalogAction],
+    repository_context: RepositoryContext,
+    header_name: str,
+) -> None:
+    action = action_factory(
+        content_type="multipart/form-data",
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {header_name: {"type": "string"}},
+            "body": {"type": "object", "properties": {}},
+            "files": {},
+        },
+    )
+
+    with pytest.raises(RequestBuildError, match="^content_type_override_forbidden$"):
+        build_request(
+            action,
+            "https://erp.example.com",
+            {"headers": {header_name: "multipart/form-data; boundary=user-boundary"}},
+            (repository_context.root,),
+        )
+
+
+def test_request_builder_replaces_auth_content_type_for_multipart_rendering(
+    action_factory: Callable[..., CatalogAction],
+    repository_context: RepositoryContext,
+) -> None:
+    action = action_factory(
+        content_type="multipart/form-data",
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": {
+                "type": "object",
+                "properties": {"note": {"type": "string"}},
+            },
+            "files": {},
+        },
+    )
+    template = build_request(
+        action,
+        "https://erp.example.com",
+        {"body": {"note": "transport-owned"}},
+        (repository_context.root,),
+    )
+
+    request = template.to_httpx_request(
+        AuthContext(
+            headers={"Content-Type": "multipart/form-data; boundary=user-boundary"},
+            query={},
+            expires_at=None,
+        )
+    )
+
+    content_type = request.headers["content-type"]
+    boundary = content_type.partition("boundary=")[2]
+    body = request.read()
+    assert content_type.startswith("multipart/form-data; boundary=")
+    assert boundary and boundary != "user-boundary"
+    assert f"--{boundary}".encode() in body
+
+
 def test_request_builder_binds_relative_file_hash_without_absolute_path(
     action_factory: Callable[..., CatalogAction],
     repository_context: RepositoryContext,
@@ -647,6 +713,41 @@ def test_request_builder_accepts_valid_empty_object_required_list(
     assert request.content == b""
 
 
+@pytest.mark.parametrize(
+    "body_schema",
+    [
+        {"type": "string", "required": []},
+        {
+            "type": "object",
+            "properties": {" bad ": {"type": "string"}},
+            "required": [" bad "],
+        },
+        {
+            "type": "object",
+            "properties": {"bad/name": {"type": "string"}},
+            "required": ["bad/name"],
+        },
+    ],
+)
+def test_request_builder_rejects_noncanonical_body_required_contracts(
+    repository_context: RepositoryContext,
+    action_factory: Callable[..., CatalogAction],
+    body_schema: dict[str, Any],
+) -> None:
+    action = action_factory(
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": body_schema,
+            "files": {},
+        }
+    )
+
+    with pytest.raises(RequestBuildError, match="^invalid_action_input_schema$"):
+        build_request(action, "https://erp.example.com", {}, (repository_context.root,))
+
+
 def test_request_builder_encodes_body_only_multipart_with_client_boundary(
     repository_context: RepositoryContext,
     action_factory: Callable[..., CatalogAction],
@@ -757,6 +858,93 @@ def test_request_builder_leaves_empty_optional_multipart_unencoded(
 
     assert request.content == b""
     assert "content-type" not in request.headers
+
+
+def test_request_builder_treats_optional_multipart_none_body_as_absent(
+    repository_context: RepositoryContext,
+    action_factory: Callable[..., CatalogAction],
+) -> None:
+    action = action_factory(
+        content_type="multipart/form-data",
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": {"type": "object", "properties": {}},
+            "files": {},
+        },
+    )
+
+    template = build_request(
+        action,
+        "https://erp.example.com",
+        {"body": None},
+        (repository_context.root,),
+    )
+    request = template.to_httpx_request(AuthContext(headers={}, query={}, expires_at=None))
+
+    assert template.request_inputs["body"] == {}
+    assert request.content == b""
+    assert "content-type" not in request.headers
+
+
+def test_request_builder_omits_none_body_from_multipart_file_wire(
+    repository_context: RepositoryContext,
+    action_factory: Callable[..., CatalogAction],
+) -> None:
+    document = repository_context.root / "invoice.txt"
+    document.write_bytes(b"invoice-document")
+    action = action_factory(
+        content_type="multipart/form-data",
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": {"type": "object", "properties": {}},
+            "files": {"document": {"type": "string", "format": "binary"}},
+        },
+    )
+
+    request = build_request(
+        action,
+        "https://erp.example.com",
+        {"body": None, "files": {"document": str(document)}},
+        (repository_context.root,),
+    ).to_httpx_request(AuthContext(headers={}, query={}, expires_at=None))
+    wire = request.read()
+
+    assert request.headers["content-type"].startswith("multipart/form-data; boundary=")
+    assert b'name="document"; filename="invoice.txt"' in wire
+    assert b"invoice-document" in wire
+    assert b'name="body"' not in wire
+
+
+def test_request_builder_rejects_none_for_required_multipart_body(
+    repository_context: RepositoryContext,
+    action_factory: Callable[..., CatalogAction],
+) -> None:
+    action = action_factory(
+        content_type="multipart/form-data",
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": {
+                "type": "object",
+                "properties": {},
+                "x-mercury-required": True,
+            },
+            "files": {},
+        },
+    )
+
+    with pytest.raises(RequestBuildError, match="^required_body_missing$"):
+        build_request(
+            action,
+            "https://erp.example.com",
+            {"body": None},
+            (repository_context.root,),
+        )
 
 
 @pytest.mark.parametrize(

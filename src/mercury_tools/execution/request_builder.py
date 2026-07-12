@@ -21,6 +21,7 @@ import httpx
 
 from mercury_tools.catalog.identity import deep_freeze
 from mercury_tools.catalog.models import CatalogAction, revalidate_catalog_action
+from mercury_tools.catalog.schema_contract import validate_required_schema_contract
 from mercury_tools.drivers.models import AuthContext
 from mercury_tools.execution.models import canonical_payload_hash, render_action_path
 from mercury_tools.execution.policy import effective_risk
@@ -131,10 +132,11 @@ class RequestTemplate:
             raise RequestBuildError("authentication_override_forbidden")
         headers.update(auth.headers)
         query.update(auth.query)
+        _drop_transport_content_type(headers)
 
         url = self.base_url.rstrip("/") + self.final_path
         body = _json_copy(self._request_inputs["body"])
-        media_type = self._content_type.split(";", 1)[0].strip().casefold()
+        media_type = _media_type(self._content_type)
         if media_type == "multipart/form-data":
             parts: list[tuple[str, Any]] = []
             if self._body_present:
@@ -219,8 +221,9 @@ def build_request(
     query = _section_mapping(supplied.get("query", {}), "query")
     headers = _section_mapping(supplied.get("headers", {}), "headers")
     files = _section_mapping(supplied.get("files", {}), "files")
-    body_present = "body" in supplied
-    body = _json_copy(supplied.get("body", {}))
+    multipart = _media_type(action.content_type) == "multipart/form-data"
+    body_present = "body" in supplied and not (multipart and supplied["body"] is None)
+    body = _json_copy(supplied["body"] if body_present else {})
 
     _reject_auth_overrides(query, headers)
     _validate_declared_mapping(path, schema["path"], "path")
@@ -409,7 +412,10 @@ def _validate_declared_mapping(values: Mapping[str, Any], schema: Any, section: 
 def _validate_body(value: Any, schema: Any, *, present: bool) -> None:
     if not isinstance(schema, Mapping):
         raise RequestBuildError("invalid_action_input_schema")
-    _validate_body_required_contract(schema, top_level=True)
+    try:
+        validate_required_schema_contract(schema)
+    except (TypeError, ValueError):
+        raise RequestBuildError("invalid_action_input_schema") from None
     if schema.get("x-mercury-required", False) and not present:
         raise RequestBuildError("required_body_missing")
     if not present:
@@ -431,32 +437,6 @@ def _validate_body(value: Any, schema: Any, *, present: bool) -> None:
                 declaration = properties.get(name)
                 if isinstance(declaration, Mapping):
                     _validate_type(item, declaration, "body")
-
-
-def _validate_body_required_contract(schema: Mapping[str, Any], *, top_level: bool) -> None:
-    if "x-mercury-required" in schema:
-        marker = schema["x-mercury-required"]
-        if not top_level or not isinstance(marker, bool):
-            raise RequestBuildError("invalid_action_input_schema")
-    if "required" in schema:
-        required = schema["required"]
-        properties = schema.get("properties", {})
-        if (
-            not isinstance(required, (list, tuple))
-            or any(not isinstance(name, str) for name in required)
-            or len(required) != len(set(required))
-            or not isinstance(properties, Mapping)
-            or any(name not in properties for name in required)
-        ):
-            raise RequestBuildError("invalid_action_input_schema")
-    properties = schema.get("properties", {})
-    if isinstance(properties, Mapping):
-        for declaration in properties.values():
-            if isinstance(declaration, Mapping):
-                _validate_body_required_contract(declaration, top_level=False)
-    items = schema.get("items")
-    if isinstance(items, Mapping):
-        _validate_body_required_contract(items, top_level=False)
 
 
 def _validate_type(value: Any, schema: Mapping[str, Any], section: str) -> None:
@@ -495,6 +475,8 @@ def _multipart_field_value(value: Any) -> str:
 
 def _reject_auth_overrides(query: Mapping[str, Any], headers: Mapping[str, Any]) -> None:
     for name, value in headers.items():
+        if name.casefold() == "content-type":
+            raise RequestBuildError("content_type_override_forbidden")
         if (
             name.casefold() in _FORBIDDEN_HEADERS
             or _looks_like_auth_key(name)
@@ -507,6 +489,12 @@ def _reject_auth_overrides(query: Mapping[str, Any], headers: Mapping[str, Any])
             raise RequestBuildError("authentication_override_forbidden")
     if any(_looks_like_auth_key(name) for name in query):
         raise RequestBuildError("authentication_override_forbidden")
+
+
+def _drop_transport_content_type(headers: dict[str, str]) -> None:
+    for name in tuple(headers):
+        if name.casefold() == "content-type":
+            headers.pop(name)
 
 
 def _idempotency_header(action: CatalogAction) -> str | None:
@@ -524,6 +512,10 @@ def _idempotency_header(action: CatalogAction) -> str | None:
     ):
         raise RequestBuildError("invalid_idempotency_binding")
     return header
+
+
+def _media_type(value: str) -> str:
+    return value.split(";", 1)[0].strip().casefold()
 
 
 def _apply_idempotency(

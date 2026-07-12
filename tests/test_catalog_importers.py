@@ -587,6 +587,51 @@ def test_openapi_preserves_valid_empty_object_required_list(tmp_path: Path) -> N
     assert action.input_schema["body"]["required"] == ()
 
 
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "string", "required": []},
+        {
+            "type": "object",
+            "properties": {" bad ": {"type": "string"}},
+            "required": [" bad "],
+        },
+        {
+            "type": "object",
+            "properties": {"bad/name": {"type": "string"}},
+            "required": ["bad/name"],
+        },
+    ],
+)
+def test_openapi_rejects_noncanonical_body_required_contracts(
+    tmp_path: Path,
+    schema: dict[str, object],
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    source_path = tmp_path / "noncanonical-required-openapi.json"
+    source_path.write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.0",
+                "info": {"version": "1"},
+                "paths": {
+                    "/documents": {
+                        "post": {
+                            "requestBody": {
+                                "content": {"application/json": {"schema": schema}}
+                            },
+                            "responses": {"201": {"description": "Created"}},
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="spec_body_required_invalid"):
+        import_spec(context, connector_id="custom", source_path=source_path)
+
+
 def test_swagger_precedes_postman_marker(tmp_path: Path) -> None:
     context = ensure_repository_state(tmp_path)
     source_path = tmp_path / "swagger-over-postman.json"

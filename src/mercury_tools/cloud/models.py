@@ -12,6 +12,10 @@ from urllib.parse import unquote, urlsplit
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from mercury_tools.catalog.identity import sanitize_document, validate_action_identity
+from mercury_tools.catalog.schema_contract import (
+    is_canonical_schema_name,
+    validate_required_schema_contract,
+)
 from mercury_tools.safety.redaction import (
     is_safe_public_http_url,
     redact_absolute_paths,
@@ -131,7 +135,6 @@ _AUTH_IDENTIFIER_RE = re.compile(
 )
 _MAX_SCHEMA_DEPTH = 20
 _MAX_SCHEMA_NODES = 8_192
-_MAX_SCHEMA_NAME_BYTES = 512
 _MAX_RULE_STRING_BYTES = 2_048
 
 
@@ -276,6 +279,7 @@ def _validate_public_input_schema(value: Any) -> None:
     if not isinstance(body, dict):
         raise ValueError
     if body:
+        validate_required_schema_contract(body, allow_frozen_required=False)
         _validate_body_schema(body, depth=0, budget=budget)
         if body.get("type") != "object":
             raise ValueError
@@ -379,17 +383,7 @@ def _consume_schema_budget(depth: int, budget: list[int]) -> None:
 
 
 def _validate_schema_name(value: Any) -> None:
-    if (
-        not isinstance(value, str)
-        or not value
-        or value != value.strip()
-        or not _within_limit(value, _MAX_SCHEMA_NAME_BYTES)
-        or value in {".", ".."}
-        or any(character in value for character in ("/", "\\", "=", "%"))
-        or "://" in value
-        or any(ord(character) < 32 or ord(character) == 127 for character in value)
-        or sanitize_public_text(value, redact_paths=False) != value
-    ):
+    if not is_canonical_schema_name(value):
         raise ValueError
 
 

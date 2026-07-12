@@ -5,6 +5,7 @@ from typing import Any
 
 from mercury_tools.catalog.importers._common import build_action, empty_input_schema, sort_actions
 from mercury_tools.catalog.models import CatalogAction, CatalogSource
+from mercury_tools.catalog.schema_contract import validate_required_schema_contract
 
 _METHODS = ("get", "post", "put", "patch", "delete")
 
@@ -244,26 +245,10 @@ def _multipart_schema(schema: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
 def _validate_object_required_contract(schema: Any, *, error: str) -> None:
     if not isinstance(schema, Mapping):
         return
-    properties = schema.get("properties", {})
-    if not isinstance(properties, Mapping):
-        raise ValueError(error)
-    if "required" in schema:
-        required = schema["required"]
-        if (
-            not isinstance(required, list)
-            or any(
-                not isinstance(name, str)
-                or not name
-                or name != name.strip()
-                for name in required
-            )
-            or len(required) != len(set(required))
-            or any(name not in properties for name in required)
-        ):
-            raise ValueError(error)
-    for declaration in properties.values():
-        _validate_object_required_contract(declaration, error=error)
-    _validate_object_required_contract(schema.get("items"), error=error)
+    try:
+        validate_required_schema_contract(schema, allow_frozen_required=False)
+    except (TypeError, ValueError):
+        raise ValueError(error) from None
 
 
 def _response_codes(responses: Any) -> tuple[tuple[int, ...], tuple[int, ...]]:
