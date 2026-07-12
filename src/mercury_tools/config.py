@@ -15,7 +15,6 @@ DEFAULT_MCP_TRANSPORT = "streamable-http"
 DEFAULT_MCP_HOST = "0.0.0.0"
 DEFAULT_MCP_PORT = 8000
 DEFAULT_MCP_PATH = "/mcp"
-DEFAULT_PRIVATE_MCP_PATH = "/private-mcp"
 DEFAULT_CLOUD_BASE_URL = "https://mercury-tools-mcp.onrender.com"
 
 
@@ -33,8 +32,6 @@ class Settings:
     mcp_host: str = DEFAULT_MCP_HOST
     mcp_port: int = DEFAULT_MCP_PORT
     mcp_path: str = DEFAULT_MCP_PATH
-    private_mcp_path: str = DEFAULT_PRIVATE_MCP_PATH
-    private_mcp_bearer_token: str = ""
     public_base_url: str = ""
     http_bearer_token: str = ""
     http_require_auth: bool = False
@@ -60,10 +57,6 @@ class Settings:
     @property
     def http_auth_configured(self) -> bool:
         return bool(self.http_bearer_token or self.connect_signing_secret)
-
-    @property
-    def private_mcp_configured(self) -> bool:
-        return bool(self.private_mcp_bearer_token)
 
     @property
     def mcp_endpoint(self) -> str:
@@ -116,10 +109,6 @@ def load_settings(*, dotenv_path: str | Path | None = None) -> Settings:
         os.environ.get("MERCURY_TOOLS_MCP_PATH", DEFAULT_MCP_PATH),
         default=DEFAULT_MCP_PATH,
     )
-    private_mcp_path = _normalize_path(
-        os.environ.get("MERCURY_PRIVATE_MCP_PATH", DEFAULT_PRIVATE_MCP_PATH),
-        default=DEFAULT_PRIVATE_MCP_PATH,
-    )
     return Settings(
         supabase_url=os.environ.get("SUPABASE_URL", "").strip().rstrip("/"),
         supabase_service_role_key=os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip(),
@@ -139,10 +128,6 @@ def load_settings(*, dotenv_path: str | Path | None = None) -> Settings:
         mcp_host=os.environ.get("MERCURY_TOOLS_HOST", DEFAULT_MCP_HOST).strip() or DEFAULT_MCP_HOST,
         mcp_port=_env_int(("MERCURY_TOOLS_PORT", "PORT"), default=DEFAULT_MCP_PORT),
         mcp_path=mcp_path,
-        private_mcp_path=private_mcp_path,
-        private_mcp_bearer_token=os.environ.get(
-            "MERCURY_PRIVATE_MCP_TOKEN", ""
-        ).strip(),
         public_base_url=os.environ.get("MERCURY_TOOLS_PUBLIC_BASE_URL", "").strip().rstrip("/"),
         http_bearer_token=os.environ.get("MERCURY_TOOLS_HTTP_BEARER_TOKEN", "").strip(),
         http_require_auth=_env_bool("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", default=False),
@@ -151,10 +136,7 @@ def load_settings(*, dotenv_path: str | Path | None = None) -> Settings:
             default=False,
         ),
         connect_invite_code=os.environ.get("MERCURY_CONNECT_INVITE_CODE", "").strip(),
-        connect_signing_secret=(
-            os.environ.get("MERCURY_CREDENTIAL_VAULT_SECRET", "").strip()
-            or os.environ.get("MERCURY_CONNECT_SIGNING_SECRET", "").strip()
-        ),
+        connect_signing_secret=os.environ.get("MERCURY_CONNECT_SIGNING_SECRET", "").strip(),
         cloud_base_url=(
             os.environ.get("MERCURY_CLOUD_BASE_URL", DEFAULT_CLOUD_BASE_URL).strip().rstrip("/")
             or DEFAULT_CLOUD_BASE_URL

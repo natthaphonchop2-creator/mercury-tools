@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import hmac
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -23,10 +22,6 @@ from mercury_tools.connectors.catalog import (
     connector_by_id,
     list_connector_public_summaries,
     public_capability_gate,
-)
-from mercury_tools.connectors.setup import (
-    required_missing_fields,
-    validate_connector_connection_healthcheck,
 )
 from mercury_tools.db.product import (
     SupabaseProductStore,
@@ -89,37 +84,6 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if not is_authorized_bearer(load_settings(), request.headers.get("authorization")):
             return JSONResponse(
                 {"error": "unauthorized", "message": "Valid bearer token is required."},
-                status_code=401,
-            )
-        return await call_next(request)
-
-
-class PrivateBearerAuthMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, *, protected_path: str):
-        super().__init__(app)
-        self.protected_path = protected_path.rstrip("/") or "/"
-
-    async def dispatch(self, request: Request, call_next):
-        path = request.url.path
-        protected = path == self.protected_path or path.startswith(
-            f"{self.protected_path}/"
-        )
-        if request.method == "OPTIONS" or not protected:
-            return await call_next(request)
-
-        authorization = request.headers.get("authorization") or ""
-        supplied = (
-            authorization.removeprefix("Bearer ").strip()
-            if authorization.startswith("Bearer ")
-            else ""
-        )
-        expected = load_settings().private_mcp_bearer_token
-        if not supplied or not expected or not hmac.compare_digest(supplied, expected):
-            return JSONResponse(
-                {
-                    "error": "unauthorized",
-                    "message": "Valid private bearer token is required.",
-                },
                 status_code=401,
             )
         return await call_next(request)
@@ -465,23 +429,6 @@ def _profile_enabled_capabilities(profile: dict[str, Any]) -> list[Any]:
     return []
 
 
-def _profile_has_public_encrypted_credentials(profile: dict[str, Any]) -> bool:
-    metadata = profile.get("metadata") if isinstance(profile.get("metadata"), dict) else {}
-    if _clean_selector(metadata.get("credential_storage")) != "encrypted_server_vault":
-        return False
-    if metadata.get("credentials_configured") is not True:
-        return False
-    credential_fields = [
-        str(field).strip()
-        for field in metadata.get("credential_fields") or []
-        if str(field).strip()
-    ]
-    credential_fingerprints = metadata.get("credential_fingerprints")
-    if not credential_fields or not isinstance(credential_fingerprints, dict):
-        return False
-    return all(str(credential_fingerprints.get(field) or "").strip() for field in credential_fields)
-
-
 def _manifest_has_connection_healthcheck_adapter(manifest: Any) -> bool:
     validation = getattr(manifest, "validation", None)
     method = str(getattr(validation, "method", "") or "").strip().lower()
@@ -773,11 +720,11 @@ def _workspace_connector_ready(
             continue
         if selected_environment and profile_environment != selected_environment:
             continue
+        if _clean_selector(profile.get("status")) not in {"connected", "connected_read_only"}:
+            continue
         metadata = profile.get("metadata") or {}
         setup_state = _clean_selector(metadata.get("setup_state")) if isinstance(metadata, dict) else None
         if setup_state != "ready":
-            continue
-        if not _profile_has_public_encrypted_credentials(profile):
             continue
         enabled_capabilities = {str(item).strip() for item in _profile_enabled_capabilities(profile)}
         if not enabled_capabilities:
@@ -871,24 +818,6 @@ def _connector_setup_block_payload() -> dict[str, Any]:
         "next_tool": "start_connector_setup",
         "next_skill": "connector-credential-setup-th",
     }
-
-
-def _public_connector_credentials_summary(
-    result: dict[str, Any],
-    *,
-    connector_id: str,
-    environment: str,
-) -> dict[str, Any]:
-    summary: dict[str, Any] = {
-        "status": "credentials_received",
-        "connector_id": str(result.get("connector_id") or connector_id),
-        "environment": str(result.get("environment") or environment),
-        "credential_fields": sorted(str(field) for field in result.get("credential_fields") or []),
-    }
-    setup_state = result.get("setup_state") or result.get("status")
-    if setup_state:
-        summary["setup_state"] = str(setup_state)
-    return summary
 
 
 def _json_error(error: str, message: str, *, status_code: int) -> JSONResponse:
@@ -1198,171 +1127,6 @@ def start_connector_setup(
         payload = {"status": "error", "message": str(exc)}
         _audit(
             "start_connector_setup",
-            {
-                **_public_workspace_audit_ref_optional(workspace_id),
-                "connector_id": connector_id,
-            },
-            payload,
-        )
-        return payload
-
-
-@mcp.tool()
-def submit_connector_credentials(
-    workspace_id: str,
-    connector_id: str,
-    environment: str,
-    credentials: dict[str, Any],
-) -> dict[str, Any]:
-    """Store connector credentials server-side after checking required fields."""
-    try:
-        settings = load_settings()
-        token_payload = _public_workspace_payload_from_value(workspace_id)
-        manifest = connector_by_id(connector_id)
-        if not manifest:
-            raise ValueError(f"Unknown connector: {connector_id}")
-        missing = required_missing_fields(manifest, credentials)
-        if missing:
-            payload = {
-                "status": "awaiting_credentials",
-                "missing_fields": missing,
-                "message": "Required connector credentials are missing.",
-            }
-            _audit(
-                "submit_connector_credentials",
-                {
-                    **_public_workspace_audit_ref(workspace_id),
-                    "connector_id": connector_id,
-                },
-                payload,
-            )
-            return payload
-
-        result = _product_store(settings).set_connector_credentials(
-            token_payload=token_payload,
-            connector_id=connector_id,
-            environment=environment,
-            credentials={str(key): str(value) for key, value in credentials.items()},
-        )
-        payload = _public_connector_credentials_summary(
-            result,
-            connector_id=connector_id,
-            environment=environment,
-        )
-        _audit(
-            "submit_connector_credentials",
-            {**_public_workspace_audit_ref(workspace_id), "connector_id": connector_id},
-            {
-                "status": "credentials_received",
-                "credential_fields": payload["credential_fields"],
-            },
-        )
-        return payload
-    except (PermissionError, RuntimeError, ValueError) as exc:
-        payload = {"status": "error", "message": str(exc)}
-        _audit(
-            "submit_connector_credentials",
-            {
-                **_public_workspace_audit_ref_optional(workspace_id),
-                "connector_id": connector_id,
-            },
-            payload,
-        )
-        return payload
-
-
-@mcp.tool()
-def validate_connector_connection(
-    workspace_id: str,
-    connector_id: str,
-    environment: str,
-    credentials: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Validate stored connector credentials through safe read-only setup calls."""
-    try:
-        settings = load_settings()
-        token_payload = _public_workspace_payload_from_value(workspace_id)
-        manifest = connector_by_id(connector_id)
-        if not manifest:
-            raise ValueError(f"Unknown connector: {connector_id}")
-        if environment not in manifest.environments:
-            raise ValueError(f"Unsupported environment for {manifest.connector_id}: {environment}")
-        store = _product_store(settings)
-        resolved_credentials = credentials or store.get_connector_credentials(
-            workspace_id=workspace_id,
-            connector_id=manifest.connector_id,
-            environment=environment,
-        )
-        result = validate_connector_connection_healthcheck(
-            manifest,
-            credentials=resolved_credentials,
-            environment=environment,
-        )
-        result.setdefault("connector_id", manifest.connector_id)
-        result.setdefault("environment", environment)
-        provider_capabilities = result.get("enabled_capabilities")
-        if not isinstance(provider_capabilities, list):
-            provider_capabilities = list(manifest.capabilities)
-        allowed_capabilities = [
-            capability
-            for capability in provider_capabilities
-            if capability in manifest.read_capabilities
-        ]
-        result["enabled_capabilities"] = allowed_capabilities
-        result["blocked_capabilities"] = manifest.blocked_capabilities
-        if result["status"] in {"connected", "connected_read_only"}:
-            store.set_connector_credentials(
-                token_payload=token_payload,
-                connector_id=manifest.connector_id,
-                environment=environment,
-                credentials={
-                    str(key): str(value) for key, value in resolved_credentials.items()
-                },
-            )
-            store.set_connector_profile(
-                token_payload=token_payload,
-                connector_id=manifest.connector_id,
-                environment=environment,
-                company_name=result.get("company_name"),
-                metadata={
-                    "setup_state": "ready",
-                    "enabled_capabilities": allowed_capabilities,
-                    "validation": result.get("validation") or {},
-                },
-            )
-            result["status"] = "ready"
-        payload = result
-        payload = redact_json(payload)
-        validation = result.get("validation")
-        if isinstance(validation, dict):
-            public_validation = {
-                "token_status": validation.get("token_status")
-                or validation.get("clienttoken_status"),
-                "company_info_status": validation.get("company_info_status")
-                or validation.get("user_status"),
-                "user_res_code": validation.get("user_res_code"),
-            }
-            payload["validation"] = {
-                key: value for key, value in public_validation.items() if value is not None
-            }
-        _audit(
-            "validate_connector_connection",
-            {
-                **_public_workspace_audit_ref(workspace_id),
-                "connector_id": connector_id,
-                "environment": environment,
-                "credential_fields": sorted(str(key) for key in resolved_credentials),
-            },
-            {
-                "status": payload["status"],
-                "connector_id": payload.get("connector_id"),
-            },
-        )
-        return payload
-    except (PermissionError, RuntimeError, ValueError) as exc:
-        payload = {"status": "error", "message": str(exc)}
-        _audit(
-            "validate_connector_connection",
             {
                 **_public_workspace_audit_ref_optional(workspace_id),
                 "connector_id": connector_id,
@@ -2268,7 +2032,6 @@ async def status(_: Request) -> Response:
                 "connect": "/api/connect",
                 "dashboard": "/api/dashboard",
                 "connector_setup": "/api/connectors/setup",
-                "connector_credentials": "/api/connectors/credentials",
                 "team_invite": "/api/team/invite",
                 "skill_enable": "/api/skills/enable",
                 "skill_upload": "/api/skills/upload",
@@ -2563,35 +2326,6 @@ async def setup_connector(request: Request) -> Response:
         return _json_error("service_unavailable", str(exc), status_code=503)
 
 
-async def setup_connector_credentials(request: Request) -> Response:
-    settings = load_settings()
-    try:
-        token_payload = _client_token_payload(request)
-        if not settings.supabase_configured:
-            return _json_error(
-                "service_unavailable",
-                "Supabase is required to save connector credentials.",
-                status_code=503,
-            )
-        data = await request.json()
-        credentials = data.get("credentials") or {}
-        if not isinstance(credentials, dict):
-            raise ValueError("credentials must be an object.")
-        result = _product_store(settings).set_connector_credentials(
-            token_payload=token_payload,
-            connector_id=str(data.get("connector_id") or "").strip().lower(),
-            environment=str(data.get("environment") or "").strip().lower(),
-            credentials={str(key): str(value) for key, value in credentials.items()},
-        )
-        return JSONResponse(redact_json({"status": "ok", "credentials": result}))
-    except PermissionError as exc:
-        return _json_error("unauthorized", str(exc), status_code=401)
-    except ValueError as exc:
-        return _json_error("bad_request", str(exc), status_code=400)
-    except RuntimeError as exc:
-        return _json_error("service_unavailable", str(exc), status_code=503)
-
-
 async def enable_skill(request: Request) -> Response:
     settings = load_settings()
     try:
@@ -2731,12 +2465,6 @@ async def healthz(request: Request) -> Response:
             "embedding_provider": settings.embedding_provider,
             "embedding_configured": settings.embedding_configured,
             "mcp_path": settings.mcp_path,
-            "private_mcp": (
-                "enabled" if settings.private_mcp_configured else "disabled"
-            ),
-            "private_mcp_path": (
-                settings.private_mcp_path if settings.private_mcp_configured else None
-            ),
             "http_auth_required": http_auth_required,
             "http_auth_configured": settings.http_auth_configured,
             "legacy_http_api": (
@@ -2762,46 +2490,16 @@ def create_http_app(
         if allowed_origin and allowed_origin not in mcp.settings.transport_security.allowed_origins:
             mcp.settings.transport_security.allowed_origins.append(allowed_origin)
     public_app = mcp.streamable_http_app()
-    private_app = None
-    if settings.private_mcp_configured:
-        from mercury_tools.mcp.private_server import private_mcp
-
-        private_mcp.settings.streamable_http_path = settings.private_mcp_path
-        if settings.public_base_url:
-            public_url = urlparse(settings.public_base_url)
-            allowed_host = public_url.netloc
-            allowed_origin = f"{public_url.scheme}://{public_url.netloc}"
-            if (
-                allowed_host
-                and allowed_host
-                not in private_mcp.settings.transport_security.allowed_hosts
-            ):
-                private_mcp.settings.transport_security.allowed_hosts.append(allowed_host)
-            if (
-                allowed_origin
-                and allowed_origin
-                not in private_mcp.settings.transport_security.allowed_origins
-            ):
-                private_mcp.settings.transport_security.allowed_origins.append(
-                    allowed_origin
-                )
-        private_app = private_mcp.streamable_http_app()
 
     @asynccontextmanager
     async def lifespan(_app):
         async with public_app.router.lifespan_context(public_app):
-            if private_app is None:
-                yield
-            else:
-                async with private_app.router.lifespan_context(private_app):
-                    yield
+            yield
 
     routes = [
         *public_app.routes,
         *cloud_routes(cloud_dependencies or CloudDependencies(settings=settings)),
     ]
-    if private_app is not None:
-        routes.extend(private_app.routes)
     app = Starlette(routes=routes, lifespan=lifespan)
     app.add_route("/", root, methods=["GET"])
     app.add_route("/api/status", status, methods=["GET"])
@@ -2822,11 +2520,6 @@ def create_http_app(
         app.add_route("/api/connect", connect, methods=["POST"])
         app.add_route("/api/dashboard", dashboard, methods=["GET"])
         app.add_route("/api/connectors/setup", setup_connector, methods=["POST"])
-        app.add_route(
-            "/api/connectors/credentials",
-            setup_connector_credentials,
-            methods=["POST"],
-        )
         app.add_route("/api/team/invite", invite_member, methods=["POST"])
         app.add_route("/api/skills/enable", enable_skill, methods=["POST"])
         app.add_route("/api/skills/upload", upload_skill, methods=["POST"])
@@ -2837,11 +2530,6 @@ def create_http_app(
 
     should_require_auth = settings.http_require_auth if require_auth is None else require_auth
     app.state.mercury_http_require_auth = should_require_auth
-    if private_app is not None:
-        app.add_middleware(
-            PrivateBearerAuthMiddleware,
-            protected_path=settings.private_mcp_path,
-        )
     if should_require_auth:
         if not settings.http_auth_configured:
             raise RuntimeError(

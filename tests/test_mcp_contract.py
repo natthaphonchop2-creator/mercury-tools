@@ -244,7 +244,7 @@ def test_mcp_workspace_flow_tools_use_public_workspace_id(monkeypatch) -> None:
                     {
                         "connector_id": "flowaccount",
                         "environment": "production",
-                        "status": "ready",
+                        "status": "connected",
                         "metadata": {
                             "setup_state": "ready",
                             "enabled_capabilities": ["company.info.read"],
@@ -338,8 +338,6 @@ async def test_public_mcp_tool_schemas_use_workspace_id() -> None:
     for name in {
         "retrieve_workspace_context_pack",
         "start_connector_setup",
-        "submit_connector_credentials",
-        "validate_connector_connection",
         "list_workspace_flows",
         "run_workspace_flow",
         "save_workspace_flow",

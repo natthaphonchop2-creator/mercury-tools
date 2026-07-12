@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import re
@@ -10,7 +9,6 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
-from cryptography.fernet import Fernet, InvalidToken
 
 from mercury_tools.config import Settings, require_supabase
 from mercury_tools.connectors.catalog import connector_by_id, list_connector_summaries
@@ -135,22 +133,17 @@ SKILL_CATALOG_SEED: list[dict[str, Any]] = [
 
 PRODUCT_STATE_TOOL = "mercury_product_state"
 PRODUCT_FALLBACK_LIMIT = 500
-SERVER_ONLY_CONNECTOR_PROFILE_KEYS = {
-    "ciphertext",
-    "credential_vault",
-    "encrypted_credentials",
-    "server_vault",
-    "vault_record",
-}
-PRESERVED_CONNECTOR_CREDENTIAL_METADATA_KEYS = {
-    "credential_storage",
-    "credential_fields",
-    "credential_fingerprints",
-    "credentials_configured",
-    "credentials_configured_at",
-    "configured_at",
-    "server_vault",
-}
+PUBLIC_CONNECTOR_METADATA_KEYS = frozenset(
+    {
+        "setup_state",
+        "required_secret_fields",
+        "preset",
+        "capabilities",
+        "enabled_capabilities",
+        "validation",
+        "source",
+    }
+)
 
 
 def slugify(value: str, *, fallback: str = "workspace") -> str:
@@ -267,99 +260,19 @@ def email_domain(email: str) -> str:
     return parts[1] if len(parts) == 2 else ""
 
 
-def vault_key(settings: Settings, workspace_key_value: str) -> bytes:
-    material = f"{settings.connect_signing_secret}:vault:{workspace_key_value}".encode()
-    return base64.urlsafe_b64encode(hashlib.sha256(material).digest())
-
-
-def encrypt_connector_credentials(
-    settings: Settings,
-    *,
-    workspace_key_value: str,
-    connector_id: str,
-    environment: str,
-    credentials: dict[str, str],
-) -> dict[str, Any]:
-    if not settings.connect_signing_secret:
-        raise RuntimeError("MERCURY_CREDENTIAL_VAULT_SECRET is required for credential vault.")
-    cleaned = {
-        key: str(value).strip()
-        for key, value in credentials.items()
-        if str(value).strip()
-    }
-    plaintext = json.dumps(
-        {
-            "connector_id": connector_id,
-            "environment": environment,
-            "credentials": cleaned,
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-    ).encode("utf-8")
-    token = Fernet(vault_key(settings, workspace_key_value)).encrypt(plaintext).decode("ascii")
+def _public_connector_metadata(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
     return {
-        "version": 1,
-        "algorithm": "fernet-sha256-derived",
-        "connector_id": connector_id,
-        "environment": environment,
-        "fields": sorted(cleaned),
-        "fingerprints": {
-            field: hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
-            for field, value in cleaned.items()
-        },
-        "ciphertext": token,
-        "configured_at": now_utc(),
-    }
-
-
-def decrypt_connector_credentials(
-    settings: Settings,
-    *,
-    workspace_key_value: str,
-    vault_record: dict[str, Any],
-) -> dict[str, str]:
-    ciphertext = str(vault_record.get("ciphertext") or "")
-    if not ciphertext:
-        raise ValueError("Connector credential vault is empty.")
-    try:
-        plaintext = Fernet(vault_key(settings, workspace_key_value)).decrypt(
-            ciphertext.encode("ascii")
-        )
-    except (InvalidToken, ValueError) as exc:
-        raise ValueError("Connector credential vault cannot be decrypted.") from exc
-    decoded = json.loads(plaintext)
-    if decoded.get("connector_id") != vault_record.get("connector_id"):
-        raise ValueError("Connector credential vault does not match connector.")
-    if decoded.get("environment") != vault_record.get("environment"):
-        raise ValueError("Connector credential vault does not match environment.")
-    credentials = decoded.get("credentials")
-    if not isinstance(credentials, dict):
-        raise ValueError("Connector credential vault payload is invalid.")
-    return {str(key): str(value) for key, value in credentials.items()}
-
-
-def _strip_server_only_connector_data(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            key: _strip_server_only_connector_data(item)
-            for key, item in value.items()
-            if str(key) not in SERVER_ONLY_CONNECTOR_PROFILE_KEYS
-        }
-    if isinstance(value, list):
-        return [_strip_server_only_connector_data(item) for item in value]
-    return value
-
-
-def _preserved_connector_credential_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: metadata[key]
-        for key in PRESERVED_CONNECTOR_CREDENTIAL_METADATA_KEYS
-        if key in metadata
+        str(key): item
+        for key, item in value.items()
+        if str(key) in PUBLIC_CONNECTOR_METADATA_KEYS
     }
 
 
 def public_connector_profile(profile: dict[str, Any]) -> dict[str, Any]:
-    public = _strip_server_only_connector_data(dict(profile))
+    public = dict(profile)
+    public["metadata"] = _public_connector_metadata(public.get("metadata"))
     if str(public.get("status") or "").strip().lower() == "connected_read_only":
         public["status"] = "connected"
     return redact_json(public)
@@ -376,13 +289,10 @@ def public_connector_profiles(profiles: Any) -> list[dict[str, Any]]:
 
 
 def public_product_event(row: dict[str, Any]) -> dict[str, Any]:
-    return redact_json(_strip_server_only_connector_data(dict(row)))
+    return redact_json(dict(row))
 
 
 def connector_profile_status_from_metadata(metadata: dict[str, Any] | None) -> str:
-    setup_state = str((metadata or {}).get("setup_state") or "").strip().lower()
-    if setup_state in {"ready", "connected", "connected_read_only"}:
-        return "connected"
     return "requires_credentials"
 
 
@@ -422,7 +332,6 @@ class SupabaseProductStore:
             "Authorization": f"Bearer {settings.supabase_service_role_key}",
             "Content-Type": "application/json",
         }
-        self._fallback_private_connector_profiles: dict[str, dict[str, Any]] = {}
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = f"{self.base_url}/{path.lstrip('/')}"
@@ -569,10 +478,7 @@ class SupabaseProductStore:
                             if field in saved_workspace
                         },
                     }
-            elif event_type in {
-                "connector.profile_configured",
-                "connector.credentials_configured",
-            }:
+            elif event_type == "connector.profile_configured":
                 profile = summary.get("profile") or {}
                 profile_key = f"{profile.get('connector_id')}:{profile.get('environment')}"
                 connector_profiles[profile_key] = public_connector_profile(profile)
@@ -607,9 +513,7 @@ class SupabaseProductStore:
                     "id": row.get("id"),
                     "created_at": row.get("created_at"),
                     "event_type": event_type,
-                    "summary": _strip_server_only_connector_data(
-                        summary.get("event_summary") or {}
-                    ),
+                    "summary": summary.get("event_summary") or {},
                     "status": row.get("status"),
                     "metadata": {"storage": "audit_fallback"},
                 }
@@ -843,10 +747,7 @@ class SupabaseProductStore:
         existing_profile: dict[str, Any] | None = None
         for row in self._fallback_state_events(context["workspace"]["workspace_key"]):
             summary = row.get("output_summary") or {}
-            if summary.get("event_type") not in {
-                "connector.profile_configured",
-                "connector.credentials_configured",
-            }:
+            if summary.get("event_type") != "connector.profile_configured":
                 continue
             profile = summary.get("profile") or {}
             if (
@@ -854,18 +755,14 @@ class SupabaseProductStore:
                 and profile.get("environment") == environment
             ):
                 existing_profile = profile
-        private_profile = self._fallback_private_connector_profiles.get(profile_id)
-        existing_metadata = (
-            private_profile or existing_profile or {}
-        ).get("metadata") or {}
+        existing_metadata = _public_connector_metadata(
+            (existing_profile or {}).get("metadata")
+        )
         merged_metadata = {
             **existing_metadata,
             "required_secret_fields": connector.required_secret_fields,
             "preset": connector.preset_for_environment(environment),
-            "credential_storage": "host_or_user_vault",
-            "storage": "audit_fallback",
-            **(metadata or {}),
-            **_preserved_connector_credential_metadata(existing_metadata),
+            **_public_connector_metadata(metadata),
         }
         profile = {
             "id": profile_id,
@@ -883,7 +780,6 @@ class SupabaseProductStore:
             "created_at": now_utc(),
             "updated_at": now_utc(),
         }
-        self._fallback_private_connector_profiles[profile_id] = profile
         public_profile = public_connector_profile(profile)
         self._fallback_record_state_event(
             workspace_key=context["workspace"]["workspace_key"],
@@ -902,7 +798,7 @@ class SupabaseProductStore:
                 },
             },
         )
-        return _strip_server_only_connector_data(dict(profile))
+        return public_connector_profile(profile)
 
     def start_connector_setup(
         self,
@@ -934,232 +830,6 @@ class SupabaseProductStore:
                 "capabilities": manifest.capabilities,
             },
         )
-
-    def set_connector_credentials(
-        self,
-        *,
-        token_payload: dict[str, Any],
-        connector_id: str,
-        environment: str,
-        credentials: dict[str, str],
-    ) -> dict[str, Any]:
-        connector = connector_by_id(connector_id)
-        if not connector:
-            raise ValueError(f"Unknown connector: {connector_id}")
-        canonical_connector_id = connector.connector_id
-        if environment not in connector.environments:
-            raise ValueError(
-                f"Unsupported environment for {canonical_connector_id}: {environment}"
-            )
-        required_fields = list(connector.required_secret_fields)
-        missing = [
-            field
-            for field in required_fields
-            if not str(credentials.get(field) or "").strip()
-        ]
-        if missing:
-            raise ValueError(f"Missing credential fields: {', '.join(missing)}")
-
-        try:
-            return self._set_connector_credentials_product_tables(
-                token_payload=token_payload,
-                connector_id=canonical_connector_id,
-                environment=environment,
-                credentials=credentials,
-            )
-        except RuntimeError as exc:
-            if is_product_schema_error(exc):
-                return self._fallback_set_connector_credentials(
-                    token_payload=token_payload,
-                    connector_id=canonical_connector_id,
-                    environment=environment,
-                    credentials=credentials,
-                )
-            raise
-
-    def _set_connector_credentials_product_tables(
-        self,
-        *,
-        token_payload: dict[str, Any],
-        connector_id: str,
-        environment: str,
-        credentials: dict[str, str],
-    ) -> dict[str, Any]:
-        context = self.workspace_for_token(token_payload)
-        if not context:
-            raise ValueError("Workspace is not registered for this client token.")
-        connector = connector_by_id(connector_id)
-        if not connector:
-            raise ValueError(f"Unknown connector: {connector_id}")
-        canonical_connector_id = connector.connector_id
-
-        rows = self._request(
-            "GET",
-            "mercury_connector_profiles",
-            params={
-                "workspace_id": f"eq.{context['workspace']['id']}",
-                "connector_id": f"eq.{canonical_connector_id}",
-                "environment": f"eq.{environment}",
-                "select": "id,metadata,display_name,company_name",
-                "limit": "1",
-            },
-        )
-        if rows:
-            profile = rows[0]
-        else:
-            profile = self._set_connector_profile_product_tables(
-                token_payload=token_payload,
-                connector_id=canonical_connector_id,
-                environment=environment,
-                company_name=str(context["workspace"].get("name") or ""),
-            )
-
-        vault_record = encrypt_connector_credentials(
-            self.settings,
-            workspace_key_value=context["workspace"]["workspace_key"],
-            connector_id=canonical_connector_id,
-            environment=environment,
-            credentials=credentials,
-        )
-        profile_metadata = {
-            **(profile.get("metadata") or {}),
-            "credential_storage": "encrypted_server_vault",
-            "credential_fields": vault_record["fields"],
-            "credential_fingerprints": vault_record["fingerprints"],
-            "credentials_configured": True,
-            "credentials_configured_at": vault_record["configured_at"],
-        }
-        server_metadata = {
-            **profile_metadata,
-            "server_vault": vault_record,
-        }
-        rows = self._request(
-            "PATCH",
-            "mercury_connector_profiles",
-            params={"id": f"eq.{profile['id']}"},
-            headers={**self.headers, "Prefer": "return=representation"},
-            json={
-                "status": "credentials_configured",
-                "metadata": server_metadata,
-                "updated_at": now_utc(),
-            },
-        )
-        event_profile = public_connector_profile(
-            {
-                **(rows[0] if rows else profile),
-                "status": "credentials_configured",
-                "metadata": server_metadata,
-            }
-        )
-        self._fallback_record_state_event(
-            workspace_key=context["workspace"]["workspace_key"],
-            client_jti=str(token_payload.get("jti") or ""),
-            event_type="connector.credentials_configured",
-            input_payload={
-                "connector_id": canonical_connector_id,
-                "environment": environment,
-                "credential_fields": vault_record["fields"],
-            },
-            summary={
-                "profile": event_profile,
-                "event_summary": {
-                    "connector_id": canonical_connector_id,
-                    "environment": environment,
-                    "credential_fields": vault_record["fields"],
-                    "status": "credentials_configured",
-                },
-            },
-        )
-        return {
-            "status": "credentials_configured",
-            "connector_id": canonical_connector_id,
-            "environment": environment,
-            "credential_fields": vault_record["fields"],
-            "credential_fingerprints": vault_record["fingerprints"],
-            "configured_at": vault_record["configured_at"],
-        }
-
-    def _fallback_set_connector_credentials(
-        self,
-        *,
-        token_payload: dict[str, Any],
-        connector_id: str,
-        environment: str,
-        credentials: dict[str, str],
-    ) -> dict[str, Any]:
-        context = self._fallback_workspace_for_token(token_payload)
-        connector = connector_by_id(connector_id)
-        if not connector:
-            raise ValueError(f"Unknown connector: {connector_id}")
-        canonical_connector_id = connector.connector_id
-        vault_record = encrypt_connector_credentials(
-            self.settings,
-            workspace_key_value=context["workspace"]["workspace_key"],
-            connector_id=canonical_connector_id,
-            environment=environment,
-            credentials=credentials,
-        )
-        profile = {
-            "id": stable_id(
-                "connector",
-                context["workspace"]["workspace_key"],
-                canonical_connector_id,
-                environment,
-            ),
-            "workspace_id": context["workspace"]["id"],
-            "connector_id": canonical_connector_id,
-            "environment": environment,
-            "display_name": connector.name,
-            "company_name": context["workspace"]["name"],
-            "status": "credentials_configured",
-            "metadata": {
-                "required_secret_fields": connector.required_secret_fields,
-                "preset": connector.preset_for_environment(environment),
-                "credential_storage": "encrypted_server_vault",
-                "credential_fields": vault_record["fields"],
-                "credential_fingerprints": vault_record["fingerprints"],
-                "credentials_configured": True,
-                "credentials_configured_at": vault_record["configured_at"],
-                "storage": "audit_fallback",
-            },
-            "created_at": now_utc(),
-            "updated_at": now_utc(),
-        }
-        private_profile = {
-            **profile,
-            "metadata": {
-                **profile["metadata"],
-                "server_vault": vault_record,
-            },
-        }
-        self._fallback_private_connector_profiles[profile["id"]] = private_profile
-        self._fallback_record_state_event(
-            workspace_key=context["workspace"]["workspace_key"],
-            client_jti=str(token_payload.get("jti") or ""),
-            event_type="connector.credentials_configured",
-            input_payload={
-                "connector_id": canonical_connector_id,
-                "environment": environment,
-                "credential_fields": vault_record["fields"],
-            },
-            summary={
-                "profile": public_connector_profile(profile),
-                "event_summary": {
-                    "connector_id": canonical_connector_id,
-                    "environment": environment,
-                    "credential_fields": vault_record["fields"],
-                    "status": "credentials_configured",
-                },
-            },
-        )
-        return {
-            "status": "credentials_configured",
-            "connector_id": canonical_connector_id,
-            "environment": environment,
-            "credential_fields": vault_record["fields"],
-            "credential_fingerprints": vault_record["fingerprints"],
-            "configured_at": vault_record["configured_at"],
-        }
 
     def _fallback_record_uploaded_skill(
         self,
@@ -1304,116 +974,6 @@ class SupabaseProductStore:
             **payload,
             "public_mode": True,
             "workspace_id": workspace_id,
-        }
-
-    def get_connector_credentials(
-        self,
-        *,
-        workspace_id: str,
-        connector_id: str,
-        environment: str,
-    ) -> dict[str, str]:
-        connector = connector_by_id(connector_id)
-        if not connector:
-            raise ValueError(f"Unknown connector: {connector_id}")
-        token_payload = public_workspace_token_payload(workspace_id)
-        context = self.workspace_for_token(token_payload)
-        if not context:
-            raise ValueError("Public workspace was not found.")
-
-        profile: dict[str, Any] | None = None
-        try:
-            rows = self._request(
-                "GET",
-                "mercury_connector_profiles",
-                params={
-                    "workspace_id": f"eq.{context['workspace']['id']}",
-                    "connector_id": f"eq.{connector.connector_id}",
-                    "environment": f"eq.{environment}",
-                    "select": "id,connector_id,environment,metadata",
-                    "limit": "1",
-                },
-            )
-            if rows:
-                profile = rows[0]
-        except RuntimeError as exc:
-            if not is_product_schema_error(exc):
-                raise
-            profile_id = stable_id(
-                "connector",
-                context["workspace"]["workspace_key"],
-                connector.connector_id,
-                environment,
-            )
-            profile = self._fallback_private_connector_profiles.get(profile_id)
-
-        if not profile:
-            raise ValueError("Connector credentials are not configured.")
-        vault_record = (profile.get("metadata") or {}).get("server_vault")
-        if not isinstance(vault_record, dict):
-            raise ValueError("Connector credential vault is not configured.")
-        return decrypt_connector_credentials(
-            self.settings,
-            workspace_key_value=context["workspace"]["workspace_key"],
-            vault_record=vault_record,
-        )
-
-    def get_private_connector_context(
-        self,
-        workspace_id: str,
-        connector_id: str,
-    ) -> dict[str, Any]:
-        """Return one ready connector profile and its decrypted server credentials."""
-
-        connector = connector_by_id(connector_id)
-        if not connector:
-            raise ValueError(f"Unknown connector: {connector_id}")
-        token_payload = public_workspace_token_payload(workspace_id)
-        context = self.workspace_for_token(token_payload)
-        if not context:
-            raise ValueError("Workspace was not found.")
-
-        rows = self._request(
-            "GET",
-            "mercury_connector_profiles",
-            params={
-                "workspace_id": f"eq.{context['workspace']['id']}",
-                "connector_id": f"eq.{connector.connector_id}",
-                "select": "id,connector_id,environment,status,metadata",
-                "order": "updated_at.desc",
-            },
-        )
-        ready = [
-            row
-            for row in rows or []
-            if str((row.get("metadata") or {}).get("setup_state") or "").lower()
-            == "ready"
-            and isinstance((row.get("metadata") or {}).get("server_vault"), dict)
-        ]
-        if len(ready) != 1:
-            raise ValueError(
-                f"Exactly one ready {connector.name} connector profile is required."
-            )
-
-        profile = ready[0]
-        environment = str(profile.get("environment") or "").strip().lower()
-        if environment not in connector.environments:
-            raise ValueError(
-                f"Unsupported environment for {connector.connector_id}: {environment}"
-            )
-        credentials = decrypt_connector_credentials(
-            self.settings,
-            workspace_key_value=context["workspace"]["workspace_key"],
-            vault_record=profile["metadata"]["server_vault"],
-        )
-        return {
-            "workspace_uuid": context["workspace"]["id"],
-            "workspace_key": context["workspace"]["workspace_key"],
-            "connector_profile_id": profile["id"],
-            "connector_id": connector.connector_id,
-            "environment": environment,
-            "preset": connector.preset_for_environment(environment),
-            "credentials": credentials,
         }
 
     def upsert_connection(
@@ -1832,14 +1392,14 @@ class SupabaseProductStore:
             },
         )
         existing_profile = (existing_rows or [None])[0]
-        existing_metadata = (existing_profile or {}).get("metadata") or {}
+        existing_metadata = _public_connector_metadata(
+            (existing_profile or {}).get("metadata")
+        )
         merged_metadata = {
             **existing_metadata,
             "required_secret_fields": connector.required_secret_fields,
             "preset": connector.preset_for_environment(environment),
-            "credential_storage": "host_or_user_vault",
-            **(metadata or {}),
-            **_preserved_connector_credential_metadata(existing_metadata),
+            **_public_connector_metadata(metadata),
         }
         payload = {
             "workspace_id": context["workspace"]["id"],
@@ -1874,7 +1434,7 @@ class SupabaseProductStore:
                 "status": row["status"],
             },
         )
-        return _strip_server_only_connector_data(dict(row))
+        return public_connector_profile(dict(row))
 
     def record_uploaded_skill(
         self,

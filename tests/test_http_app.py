@@ -16,8 +16,6 @@ def _clear_live_env(monkeypatch) -> None:
         "MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API",
         "MERCURY_CONNECT_INVITE_CODE",
         "MERCURY_CONNECT_SIGNING_SECRET",
-        "MERCURY_PRIVATE_MCP_PATH",
-        "MERCURY_PRIVATE_MCP_TOKEN",
         "MERCURY_CLOUD_BASE_URL",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -28,17 +26,10 @@ def ready_connector_profile(connector_id: str = "flowaccount") -> dict:
     return {
         "connector_id": connector_id,
         "environment": "production",
-        "status": "ready",
+        "status": "connected",
         "metadata": {
             "setup_state": "ready",
             "enabled_capabilities": ["company.info.read"],
-            "credential_storage": "encrypted_server_vault",
-            "credential_fields": ["client_id", "client_secret"],
-            "credential_fingerprints": {
-                "client_id": "client-id-fp",
-                "client_secret": "client-secret-fp",
-            },
-            "credentials_configured": True,
         },
     }
 
@@ -53,6 +44,8 @@ def test_remote_http_app_exposes_healthz(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
     assert response.json()["mcp_path"] == "/mcp"
+    assert "private_mcp" not in response.json()
+    assert client.post("/private-mcp").status_code == 404
 
 
 def test_public_contest_app_does_not_mount_legacy_http_api(monkeypatch) -> None:
@@ -67,6 +60,7 @@ def test_public_contest_app_does_not_mount_legacy_http_api(monkeypatch) -> None:
     assert client.post("/api/team/invite", json={}).status_code == 404
     assert client.post("/api/skills/upload", json={}).status_code == 404
     assert client.post("/api/flows/run", json={}).status_code == 404
+    assert client.post("/private-mcp").status_code == 404
     status = client.get("/api/status").json()
     assert status["legacy_http_api"] == "disabled"
     assert "dashboard" not in status
@@ -146,7 +140,8 @@ def test_connect_page_and_status(monkeypatch) -> None:
     assert "list_workspace_flows" in status.json()["flow_tools"]
     assert "run_workspace_flow" in status.json()["flow_tools"]
     assert status.json()["dashboard"] == "/api/dashboard"
-    assert status.json()["connector_credentials"] == "/api/connectors/credentials"
+    assert "connector_credentials" not in status.json()
+    assert client.post("/api/connectors/credentials", json={}).status_code == 404
     assert status.json()["flow_validate"] == "/api/flows/validate"
     assert status.json()["flow_import"] == "/api/flows/import"
 

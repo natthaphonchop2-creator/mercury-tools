@@ -380,7 +380,6 @@ def test_release_runtime_dependencies_are_exactly_pinned() -> None:
     assert data["project"]["version"] == "0.2.0"
     assert all("==" in dependency for dependency in dependencies)
     assert dependencies == [
-        "cryptography==49.0.0",
         "httpx==0.28.1",
         "mcp==1.26.0",
         "pydantic==2.13.4",
