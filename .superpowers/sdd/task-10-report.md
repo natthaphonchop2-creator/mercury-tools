@@ -137,3 +137,69 @@ and an append-only local audit ledger without adding network execution.
 - The append-only JSONL ledger now has an owner-only SQLite event index with
   row hashes, byte offsets, ledger fingerprints, streaming stale-index rebuild,
   duplicate detection, and exact bounded lookup beyond the former 8 MiB cap.
+
+## External Review Final Correction
+
+### Changed Files
+
+- `src/mercury_tools/execution/store.py`
+- `src/mercury_tools/local/audit.py`
+- `src/mercury_tools/local/credential_cli.py`
+- `src/mercury_tools/local/credentials.py`
+- `tests/test_request_store.py`
+- `tests/test_local_audit.py`
+- `tests/test_credential_cli.py`
+- `.superpowers/sdd/task-10-report.md`
+
+### RED Evidence
+
+1. Adversarial review suite:
+   `uv run pytest tests/test_request_store.py::test_create_preview_requires_catalog_action_provenance tests/test_request_store.py::test_create_preview_rejects_self_consistent_forged_catalog_binding tests/test_request_store.py::test_create_preview_recomputes_exact_effective_catalog_risk tests/test_local_audit.py::test_audit_ledger_redacts_unknown_semantic_values_in_allowlisted_fields tests/test_local_audit.py::test_repeated_get_keeps_ledger_fingerprint_and_does_not_rebuild tests/test_local_audit.py::test_audit_ledger_recovers_malformed_sqlite_index_from_jsonl tests/test_local_audit.py::test_audit_index_miss_for_present_event_forces_one_rebuild tests/test_local_audit.py::test_audit_ledger_recovers_malicious_index_coordinates_and_hashes tests/test_local_audit.py::test_audit_ledger_non_fcntl_fallback_serializes_cross_process_writers tests/test_credential_cli.py::test_credentials_test_does_not_restore_validation_after_concurrent_clear -q`
+   -> `8 failed, 4 passed in 0.71s`. Failures proved that a bare/forged
+   `PreparedRequest` was accepted, unknown allowlisted values leaked, repeated
+   `get` changed ctime, malformed SQLite was fatal, the non-`fcntl` path did not
+   serialize writers, and a completed probe restored validation after clear.
+2. Isolated current-metadata index checks with same-mode chmod neutralized:
+   `uv run pytest tests/test_local_audit.py::test_audit_index_miss_for_present_event_forces_one_rebuild tests/test_local_audit.py::test_audit_ledger_recovers_malicious_index_coordinates_and_hashes -q`
+   -> `4 failed in 0.22s`. The miss returned `None`; malicious offsets, lengths,
+   and hashes raised `audit_index_corrupt` instead of rebuilding from JSONL.
+
+### Final Correction Delivered
+
+- `LocalRequestStore.create_preview` now requires a revalidated `CatalogAction`
+  and verifies action/version/connector/environment/method/template/rendered
+  path plus the exact recomputed effective risk before SQLite insertion.
+- Audit hardening only calls `fchmod` when mode differs and fingerprints the
+  post-hardening descriptor state. The versioned derivative index validates
+  completeness metadata, event count, byte coverage, row boundaries, hashes,
+  and event identity; it performs one bounded JSONL rebuild on misses or bad
+  coordinates and securely recreates malformed/legacy SQLite under the ledger
+  lock. Duplicate JSONL event IDs remain stable ledger corruption, with no
+  total-ledger scan ceiling.
+- Audit event, failure, state, status, error, outcome, and provider strings now
+  use fixed operational classifications and redact unknown values.
+- The audit ledger uses an owner-only atomic guard-directory process lock when
+  `fcntl` is unavailable.
+- Credential probes capture a keyed, in-memory credential generation snapshot
+  before network I/O, then re-read and compare it under the repository lock
+  before persisting validation. Cleared or changed credentials make the probe
+  result stale; generation material is neither persisted nor printed.
+
+### Final Verification
+
+- Focused Task-10 suite:
+  `uv run pytest tests/test_request_store.py tests/test_local_audit.py tests/test_audit.py tests/test_credential_cli.py tests/test_local_credentials.py tests/test_operation_lock.py tests/test_redaction.py tests/test_local_repository.py -q`
+  -> `329 passed in 2.96s`.
+- Full non-integration: `uv run pytest -q -m 'not integration'`
+  -> `1047 passed, 1 deselected, 1 warning in 4.49s`.
+- Ruff: `uv run ruff check .` -> `All checks passed!`.
+- Diff check: `git diff --check` -> passed with no output.
+- Scope review: only Task-10-owned source/tests and this report changed; no
+  Task 11 executor or network-dispatch implementation was added.
+
+### Commit And Concerns
+
+- Implementation commit: `cacc681` (`fix: complete Task 10 boundary hardening`).
+- Concern: the full suite retains the pre-existing Starlette `httpx`
+  deprecation warning in `tests/test_connector_mcp_tools.py`; no Task-10 test or
+  lint failures remain.
