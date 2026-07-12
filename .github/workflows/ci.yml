@@ -7,10 +7,16 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      MERCURY_LIVE_FLOWACCOUNT: "0"
+      MERCURY_LIVE_PEAK: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --extra dev
       - run: uv run ruff check .
-      - run: uv run pytest -m "not integration"
-
+      - run: uv run pytest -m "not integration" -q
+      - run: uv run pytest tests/integration/test_local_erp_mcp.py -q
+      - run: uv run python scripts/validate_release_plugin.py
+      - run: uv run pytest tests/test_plugin_package.py tests/test_plugin_clean_install.py -q
+      - run: uv run python scripts/smoke_local_plugin.py

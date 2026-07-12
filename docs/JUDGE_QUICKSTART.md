@@ -1,50 +1,53 @@
 # Mercury Finance Judge Quickstart
 
-Mercury Finance installs one repository-local `stdio` MCP server. It uses the
-Mercury `v0.2.0` runtime for FlowAccount and PEAK endpoint search, safe reads,
-and approval-gated writes. The plugin does not register a hosted HTTP MCP and
-does not contain tokens, environment values, or ERP credentials.
+Mercury Finance exposes one repository-local `stdio` MCP. It performs catalog
+search, safe reads, and approval-gated writes locally for FlowAccount, PEAK,
+and repository-configured ERP connectors. It has no web UI, no local LLM, no
+hosted HTTP MCP, and no Cloud credential storage.
 
-## Install After The Task 18 Release
+## Pre-Release Local Check
 
-Use an isolated Codex home for evaluation. Install only the marketplace and
-plugin paths below.
+Task 18 prepares the `v0.2.0` release but does not treat the Git tag as already
+published. Judge the current checkout locally:
 
 ```bash
-export MERCURY_TEST_CODEX_HOME="$(mktemp -d)"
-CODEX_HOME="$MERCURY_TEST_CODEX_HOME" codex plugin marketplace add \
-  natthaphonchop2-creator/mercury-tools \
-  --ref v0.2.0 \
-  --sparse .agents/plugins \
-  --sparse plugins/mercury-finance
-CODEX_HOME="$MERCURY_TEST_CODEX_HOME" codex plugin add mercury-finance@mercury-tools
+uv sync --extra dev
+uv run python scripts/validate_release_plugin.py
+uv run python scripts/smoke_local_plugin.py
+uv run mercury mcp serve-local
 ```
 
-The installed plugin launches exactly this local command through `uvx`:
+The smoke builds a local wheel and starts one local stdio server. It does not
+download a `v0.2.0` Git tag. The remote-tag smoke is intentionally deferred
+until after the Task 18 release creates the immutable tag.
 
-```text
-uvx --from git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.0 mercury mcp serve-local
-```
+## Repository Demo
 
-## Evaluate In A Repository
-
-Open the repository that will own the ERP connection. Mercury stores local
-connection material and its audit ledger in that repository; do not paste
-secrets into chat or plugin configuration.
-
-Use these prompts in Codex:
+Open the repository that will own the ERP connection, then use these prompts:
 
 1. `Set up local FlowAccount access for this repository and verify it.`
 2. `Search the local ERP action catalog and run a safe read action.`
 3. `Preview an approval-gated PEAK write for this repository without executing it.`
 
-Writes require the runtime's returned confirmation contract. A preview does not
-execute an ERP mutation.
+Do not put credentials in chat or plugin configuration. Mercury writes local
+credential material and redacted audit events under the active repository's
+`.mercury/` directory. See [LOCAL_CREDENTIALS.md](LOCAL_CREDENTIALS.md) and
+[ACTION_CATALOG.md](ACTION_CATALOG.md) for the operational sequence.
 
-## Task16 Validation Boundary
+## Marketplace Install After Release
 
-Task 16 validates the `v0.2.0` launcher statically and runs a local wheel-only
-`uvx` CLI and stdio smoke test. The immutable `v0.2.0` tag is available only
-after the Task 18 release, when remote-tag smoke can run. Do not bypass this
-boundary by editing an installed Codex plugin cache; update the repository
-source and reinstall the plugin instead.
+`uvx` must be available through a local [uv installation](https://docs.astral.sh/uv/).
+Only after `v0.2.0` has been created, the GitHub marketplace install is:
+
+```bash
+codex plugin marketplace add natthaphonchop2-creator/mercury-tools \
+  --ref v0.2.0 \
+  --sparse .agents/plugins \
+  --sparse plugins/mercury-finance
+codex plugin add mercury-finance@mercury-tools
+codex mcp list
+```
+
+The expected installed surface is one server named `mercury-finance`. The
+launcher is local `uvx` stdio, not a remote MCP endpoint, and contains no
+client token, provider secret, or Supabase service-role key.
