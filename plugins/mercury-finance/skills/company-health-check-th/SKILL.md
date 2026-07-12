@@ -5,13 +5,14 @@ description: Use when the user asks for company health, revenue, VAT, cash flow,
 
 # Company Health Check TH
 
-Call `connector_status` with the current `workspace_id` first. If workspace or
-connector setup is incomplete, route to `connector-credential-setup-th` and do
-not continue.
+1. Call `credential_status` for the active repository, connector, and environment. Stop
+   and route to local connector setup unless status is connected.
+2. Call `retrieve_context_pack` for the company, period, accounting policy, and requested
+   metrics. Preserve its citations for claims that depend on Mercury knowledge.
+3. Call `search_erp_actions` for each required safe read. Stop on ambiguity.
+4. Call `get_erp_action_schema` for the exact selected action and prepare only its inputs.
+5. Call `run_erp_read`; repeat the search, schema, and read steps only when another metric
+   requires a separate action.
 
-Use `retrieve_workspace_context_pack` for connector-specific accounting
-knowledge and `run_mercury_flow` for a read-only health-check flow. Keep the
-same `workspace_id` throughout the task.
-
-ตอบภาษาไทยสำหรับผู้บริหาร: รายได้ VAT กระแสเงินสด ความเสี่ยง และจุดที่ควรให้
-นักบัญชีตรวจทาน อ้าง evidence สั้น ๆ และไม่ dump audit paths เว้นแต่ผู้ใช้ขอ.
+ตอบภาษาไทยแบบกระชับ: ภาพรวม รายได้ VAT กระแสเงินสด ความเสี่ยง และจุดที่ควรให้
+นักบัญชีตรวจทาน. Do not include evidence counts, audit paths, or verbose evidence unless the user explicitly requests audit detail.

@@ -1,24 +1,21 @@
 ---
 name: connector-setup-guide-th
-description: Use when the user asks which accounting connector to choose or what FlowAccount, PEAK, Express, or custom ERP setup requires
+description: Use when the user needs to choose or configure an accounting or ERP connector
 ---
 
 # Connector Setup Guide TH
 
-Call `connector_status` with the current `workspace_id`. If it returns
-`requires_workspace`, call `create_public_workspace` and retain the returned
-`workspace_id` in this task.
+Confirm the active repository, connector, and environment. Explain connector choices in
+neutral terms. Once the user chooses them, use this gate without skipping or reordering:
 
-Use `list_connectors` to show neutral connector states. After the user chooses
-an ERP and environment, call `start_connector_setup` for exact presets and
-required field names. Never invent requirements from memory.
+1. Call `credential_status` for the active repository, connector, and environment.
+2. If required credentials are missing, stop. Instruct the user to run locally:
+   `mercury credentials setup <connector> --env <environment> --repo-root "<repo>"`
+3. After the user confirms setup is complete, call `credential_status` again.
+4. Ask the user to run locally:
+   `mercury credentials test <connector> --env <environment> --repo-root "<repo>"`
+5. Continue only when the test reports `connected`.
 
-Route FlowAccount to `flowaccount-connector-setup-th`, PEAK to
-`peak-connector-setup-th`, and other ERP/API systems to
-`connector-credential-setup-th`. Call `validate_connector_connection` only
-after all required values have been submitted. Stay on the failed step until
-validation succeeds.
-
-ตอบภาษาไทยแบบ checklist สั้น ๆ: connector, environment, preset, missing field
-names, validation result, enabled read capabilities, and next tool. Never repeat
-raw credentials.
+Never ask for, accept, or paste credentials in chat. Do not proceed while setup is
+missing, unconfirmed, or untested. Respond in concise Thai with connector, environment,
+connection status, and the next local command.

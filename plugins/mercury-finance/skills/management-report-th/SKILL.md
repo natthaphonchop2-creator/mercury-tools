@@ -5,13 +5,14 @@ description: Use when the user asks for Thai management reports, owner summaries
 
 # Management Report TH
 
-Call `connector_status` with the current `workspace_id` first. If setup is
-incomplete, route to `connector-credential-setup-th` and stop.
+1. Call `credential_status` for the active repository, connector, and environment. Stop
+   and route to local connector setup unless status is connected.
+2. Call `retrieve_context_pack` for the company, period, KPIs, accounting policy, and
+   reporting context. Preserve its citations for interpreted claims.
+3. Call `search_erp_actions` for each required safe financial read. Stop on ambiguity.
+4. Call `get_erp_action_schema` for the exact selected action and prepare only its inputs.
+5. Call `run_erp_read`; repeat the search, schema, and read steps only when another report
+   section requires a separate action.
 
-Use `retrieve_workspace_context_pack` for the selected ERP's period, company,
-KPI, VAT, cash, receivable, payable, and evidence context. Use
-`run_mercury_flow` only for a read-only management-report flow and keep the same
-`workspace_id` throughout the task.
-
-ตอบภาษาไทยสำหรับผู้บริหาร: executive summary, key numbers, changes vs prior
-period, risks, actions, and accountant review points. Keep evidence concise.
+ตอบภาษาไทยแบบกระชับสำหรับผู้บริหาร: executive summary, key numbers, เทียบงวดก่อน,
+ความเสี่ยง, actions และจุดที่ควรให้นักบัญชีตรวจทาน. Do not include evidence counts, audit paths, or verbose evidence unless the user explicitly requests audit detail.

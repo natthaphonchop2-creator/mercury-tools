@@ -6,103 +6,132 @@ from mercury_tools.db.product import SKILL_CATALOG_SEED
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = ROOT / "plugins/mercury-finance"
-PRIVATE_PLUGIN_ROOT = ROOT / "plugins/mercury-finance-private"
+SKILLS_ROOT = PLUGIN_ROOT / "skills"
 
-EXPECTED_SKILLS = {
-    "flowaccount-connector-setup-th": [
-        "create_public_workspace",
-        "connector_status",
-        "list_connectors",
-        "start_connector_setup",
-        "submit_connector_credentials",
-        "validate_connector_connection",
-        "retrieve_workspace_context_pack",
-        "search_knowledge",
-    ],
-    "connector-credential-setup-th": [
-        "create_public_workspace",
-        "connector_status",
-        "list_connectors",
-        "start_connector_setup",
-        "submit_connector_credentials",
-        "validate_connector_connection",
-    ],
-    "company-health-check-th": [
-        "connector_status",
-        "retrieve_workspace_context_pack",
-        "run_mercury_flow",
-    ],
-    "vat-summary-th": [
-        "connector_status",
-        "retrieve_workspace_context_pack",
-        "run_mercury_flow",
-    ],
-    "invoice-review-th": [
-        "connector_status",
-        "retrieve_workspace_context_pack",
-        "run_mercury_flow",
-    ],
-    "management-report-th": [
-        "connector_status",
-        "retrieve_workspace_context_pack",
-        "run_mercury_flow",
-    ],
-    "connector-setup-guide-th": [
-        "create_public_workspace",
-        "connector_status",
-        "list_connectors",
-        "start_connector_setup",
-        "validate_connector_connection",
-    ],
-    "peak-connector-setup-th": [
-        "create_public_workspace",
-        "connector_status",
-        "list_connectors",
-        "start_connector_setup",
-        "submit_connector_credentials",
-        "validate_connector_connection",
-    ],
-    "mercury-flow-runner": [
-        "connector_status",
-        "list_workspace_flows",
-        "save_workspace_flow",
-        "run_workspace_flow",
-        "run_mercury_flow",
-    ],
+SETUP_SKILLS = (
+    "connector-setup-guide-th",
+    "connector-credential-setup-th",
+    "flowaccount-connector-setup-th",
+    "peak-connector-setup-th",
+)
+READ_SKILLS = (
+    "company-health-check-th",
+    "vat-summary-th",
+    "invoice-review-th",
+    "management-report-th",
+)
+EXPECTED_DESCRIPTIONS = {
+    "connector-setup-guide-th": (
+        "Use when the user needs to choose or configure an accounting or ERP connector"
+    ),
+    "connector-credential-setup-th": (
+        "Use when an accounting or ERP task is blocked because local connector "
+        "credentials are not ready"
+    ),
+    "flowaccount-connector-setup-th": (
+        "Use when a FlowAccount task needs local connector setup or connection "
+        "troubleshooting"
+    ),
+    "peak-connector-setup-th": (
+        "Use when a PEAK task needs local connector setup or connection troubleshooting"
+    ),
+    "company-health-check-th": (
+        "Use when the user asks for company health, revenue, VAT, cash flow, or "
+        "accounting status summaries"
+    ),
+    "vat-summary-th": (
+        "Use when the user asks for Thai VAT output tax, input tax, filing context, "
+        "or tax-period summaries"
+    ),
+    "invoice-review-th": (
+        "Use when the user asks to review invoices, tax invoices, receipts, missing "
+        "fields, or accounting evidence"
+    ),
+    "management-report-th": (
+        "Use when the user asks for Thai management reports, owner summaries, CFO "
+        "packs, or monthly accounting narratives"
+    ),
+    "mercury-flow-runner": (
+        "Use when the user asks to list, save, preview, or run Mercury Flows for "
+        "accounting workflows"
+    ),
+    "flowaccount-journal-posting-th": (
+        "Use when the user asks to record, draft, post, or approve a FlowAccount "
+        "journal entry"
+    ),
+}
+READ_TOOL_ORDER = (
+    "credential_status",
+    "retrieve_context_pack",
+    "search_erp_actions",
+    "get_erp_action_schema",
+    "run_erp_read",
+)
+PACKAGE_FORBIDDEN_TERMS = {
+    "approve_flowaccount_journal",
+    "connector_status",
+    "create_flowaccount_journal_draft",
+    "create_public_workspace",
+    "list_connectors",
+    "preview_flowaccount_journal",
+    "required_secret_fields",
+    "retrieve_workspace_context_pack",
+    "run_mercury_flow",
+    "start_connector_setup",
+    "submit_connector_credentials",
+    "validate_connector_connection",
+    "workspace_id",
+}
+CREDENTIAL_FIELD_NAMES = {
+    "application_code",
+    "client_id",
+    "client_secret",
+    "connect_id",
+    "connect_key",
+    "user_token",
 }
 
 
+def skill_text(skill_name: str) -> str:
+    return (SKILLS_ROOT / skill_name / "SKILL.md").read_text(encoding="utf-8")
+
+
+def assert_terms_in_order(text: str, terms: tuple[str, ...]) -> None:
+    cursor = 0
+    for term in terms:
+        position = text.find(term, cursor)
+        assert position >= 0, f"missing {term!r} after offset {cursor}"
+        cursor = position + len(term)
+
+
+def frontmatter_description(text: str) -> str:
+    match = re.search(r"(?m)^description: (.+)$", text)
+    assert match is not None
+    return match.group(1)
+
+
 def test_product_catalog_contains_every_bundled_plugin_skill() -> None:
-    bundled = {
-        path.parent.name
-        for root in (PLUGIN_ROOT, PRIVATE_PLUGIN_ROOT)
-        for path in (root / "skills").glob("*/SKILL.md")
-    }
+    bundled = {path.parent.name for path in SKILLS_ROOT.glob("*/SKILL.md")}
     catalog = {row["skill_id"] for row in SKILL_CATALOG_SEED}
 
-    assert catalog == bundled
+    assert catalog == bundled == set(EXPECTED_DESCRIPTIONS)
 
 
-def test_contest_plugin_uses_public_workspace_contract() -> None:
-    combined = "\n".join(
-        path.read_text() for path in sorted((PLUGIN_ROOT / "skills").rglob("SKILL.md"))
+def test_marketplace_contains_exactly_one_mercury_plugin() -> None:
+    marketplace = json.loads(
+        (ROOT / ".agents/plugins/marketplace.json").read_text(encoding="utf-8")
     )
 
-    assert "workspace_id" in combined
-    assert "client_token" not in combined
-    assert "Mercury Connect" not in combined
-
-
-def test_plugin_capabilities_match_public_read_only_runtime() -> None:
-    manifest = json.loads((PLUGIN_ROOT / ".codex-plugin/plugin.json").read_text())
-
-    assert manifest["interface"]["capabilities"] == ["Interactive", "Read"]
+    assert [item["name"] for item in marketplace["plugins"]] == ["mercury-finance"]
+    assert not (ROOT / "plugins/mercury-finance-private").exists()
+    assert not (ROOT / "tests/test_private_mcp.py").exists()
 
 
 def test_marketplace_points_to_plugin_folder() -> None:
-    data = json.loads((ROOT / ".agents/plugins/marketplace.json").read_text())
-    plugins = data["plugins"]
-    mercury = next(item for item in plugins if item["name"] == "mercury-finance")
+    data = json.loads(
+        (ROOT / ".agents/plugins/marketplace.json").read_text(encoding="utf-8")
+    )
+    mercury = data["plugins"][0]
 
     assert data["name"] == "mercury-tools"
     assert data["interface"]["displayName"] == "Mercury Tools"
@@ -113,11 +142,142 @@ def test_marketplace_points_to_plugin_folder() -> None:
     assert mercury["category"] == "Finance"
 
 
-def test_plugin_declares_remote_mcp_without_secret_values() -> None:
-    plugin = json.loads(
-        (ROOT / "plugins/mercury-finance/.codex-plugin/plugin.json").read_text()
+def test_skill_frontmatter_descriptions_are_trigger_only() -> None:
+    for skill_name, expected in EXPECTED_DESCRIPTIONS.items():
+        assert frontmatter_description(skill_text(skill_name)) == expected
+
+
+def test_setup_skills_use_the_exact_local_credential_gate() -> None:
+    required_order = (
+        "credential_status",
+        "If required credentials are missing, stop",
+        "mercury credentials setup",
+        "After the user confirms setup is complete",
+        "credential_status",
+        "mercury credentials test",
+        "Continue only when the test reports `connected`",
     )
-    mcp = json.loads((ROOT / "plugins/mercury-finance/.mcp.json").read_text())
+
+    for skill_name in SETUP_SKILLS:
+        text = skill_text(skill_name)
+        assert_terms_in_order(text, required_order)
+        assert "Never ask for, accept, or paste credentials in chat." in text
+
+
+def test_read_skills_use_only_the_generic_read_sequence() -> None:
+    disallowed_tools = {
+        "preview_erp_write",
+        "confirm_erp_write",
+        "execute_erp_write",
+        "list_workspace_flows",
+        "save_workspace_flow",
+        "run_workspace_flow",
+    }
+
+    for skill_name in READ_SKILLS:
+        text = skill_text(skill_name)
+        assert_terms_in_order(text, READ_TOOL_ORDER)
+        assert "citations" in text
+        assert "ตอบภาษาไทยแบบกระชับ" in text
+        assert "unless the user explicitly requests audit detail" in text
+        assert not any(tool in text for tool in disallowed_tools)
+
+
+def test_journal_skill_uses_bound_generic_write_sequence_once() -> None:
+    text = skill_text("flowaccount-journal-posting-th")
+    required_order = (
+        "required accounting context",
+        "total debit equals total credit",
+        "search_erp_actions",
+        "get_erp_action_schema",
+        "preview_erp_write",
+        "Stop and wait for explicit confirmation",
+        "request_id",
+        "payload_hash",
+        "confirm_erp_write",
+        "execute_erp_write",
+    )
+
+    assert_terms_in_order(text, required_order)
+    assert "Call `execute_erp_write` exactly once" in text
+    assert "A Tier 2 approval is a separate action" in text
+    assert "fresh `preview_erp_write`" in text
+    assert "two separate explicit confirmations" in text
+    assert text.count("confirm_erp_write") == 2
+    assert "get_erp_request_status" in text
+    assert "never replay or retry" in text
+
+
+def test_flow_runner_cannot_confirm_execute_or_retry_writes() -> None:
+    text = skill_text("mercury-flow-runner")
+
+    for tool in (
+        "credential_status",
+        "list_workspace_flows",
+        "save_workspace_flow",
+        "run_workspace_flow",
+    ):
+        assert tool in text
+    assert "read actions or `preview_erp_write`" in text
+    assert "Never self-confirm or execute a write" in text
+    assert "Never retry a write" in text
+    assert "confirm_erp_write" not in text
+    assert "execute_erp_write" not in text
+
+
+def test_public_journal_catalog_tags_exclude_private() -> None:
+    journal = next(
+        row
+        for row in SKILL_CATALOG_SEED
+        if row["skill_id"] == "flowaccount-journal-posting-th"
+    )
+
+    assert journal["tags"] == ["flowaccount", "journal", "write", "thai"]
+
+
+def test_skill_package_has_no_private_or_workspace_tool_terms() -> None:
+    combined = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(SKILLS_ROOT.glob("*/SKILL.md"))
+    )
+
+    assert not PACKAGE_FORBIDDEN_TERMS.intersection(combined.split())
+    for term in PACKAGE_FORBIDDEN_TERMS:
+        assert term not in combined
+
+
+def test_skill_package_has_no_secret_fields_or_credential_chat_flow() -> None:
+    combined = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(SKILLS_ROOT.glob("*/SKILL.md"))
+    ).lower()
+
+    for field_name in CREDENTIAL_FIELD_NAMES:
+        assert field_name not in combined
+    for unsafe_phrase in (
+        "ask the user for credentials",
+        "ask the user to paste",
+        "provide your credentials",
+        "send your credentials",
+        "send credentials in chat",
+        "submit credentials",
+    ):
+        assert unsafe_phrase not in combined
+
+
+def test_plugin_capabilities_match_current_public_manifest() -> None:
+    manifest = json.loads(
+        (PLUGIN_ROOT / ".codex-plugin/plugin.json").read_text(encoding="utf-8")
+    )
+
+    assert manifest["interface"]["capabilities"] == ["Interactive", "Read"]
+
+
+def test_plugin_declares_current_remote_mcp_without_secret_values() -> None:
+    plugin = json.loads(
+        (PLUGIN_ROOT / ".codex-plugin/plugin.json").read_text(encoding="utf-8")
+    )
+    mcp = json.loads((PLUGIN_ROOT / ".mcp.json").read_text(encoding="utf-8"))
     serialized = json.dumps({"plugin": plugin, "mcp": mcp})
 
     assert plugin["name"] == "mercury-finance"
@@ -130,8 +290,8 @@ def test_plugin_declares_remote_mcp_without_secret_values() -> None:
     assert "client_secret" not in serialized
 
 
-def test_judge_quickstart_mentions_plugin_and_no_secrets() -> None:
-    text = (ROOT / "docs/JUDGE_QUICKSTART.md").read_text()
+def test_judge_quickstart_matches_current_public_plugin() -> None:
+    text = (ROOT / "docs/JUDGE_QUICKSTART.md").read_text(encoding="utf-8")
 
     assert "Mercury Finance" in text
     assert "codex plugin marketplace add" in text
@@ -147,75 +307,14 @@ def test_judge_quickstart_mentions_plugin_and_no_secrets() -> None:
     assert "client_secret =" not in text
 
 
-def test_connector_credential_skill_is_gated() -> None:
-    skill = (
-        ROOT
-        / "plugins/mercury-finance/skills/connector-credential-setup-th/SKILL.md"
-    ).read_text()
-
-    assert "Use when" in skill
-    assert "create_public_workspace" in skill
-    assert "workspace_id" in skill
-    assert "Do not proceed" in skill
-    assert "validate_connector_connection" in skill
-
-
-def test_connector_setup_skills_keep_the_gated_public_sequence() -> None:
-    required_order = [
-        "connector_status",
-        "create_public_workspace",
-        "start_connector_setup",
-        "missing_fields",
-        "submit_connector_credentials",
-        "validate_connector_connection",
-        "retrieve_workspace_context_pack",
-    ]
-
-    for skill_name in (
-        "connector-credential-setup-th",
-        "flowaccount-connector-setup-th",
-        "peak-connector-setup-th",
-    ):
-        text = (PLUGIN_ROOT / f"skills/{skill_name}/SKILL.md").read_text()
-        positions = [text.index(item) for item in required_order]
-        assert positions == sorted(positions), skill_name
-
-
-def test_skill_files_are_compact_and_route_to_mcp_tools() -> None:
-    for skill_name, tool_names in EXPECTED_SKILLS.items():
-        skill_path = PLUGIN_ROOT / f"skills/{skill_name}/SKILL.md"
-        skill = skill_path.read_text()
-
-        assert "Use when" in skill
-        assert len(skill.splitlines()) < 80
-        for tool_name in tool_names:
-            assert tool_name in skill
-
-
-def test_hosted_workflow_skills_use_public_workspace_connector_status() -> None:
-    hosted_skill_names = [
-        "company-health-check-th",
-        "vat-summary-th",
-        "invoice-review-th",
-        "management-report-th",
-        "mercury-flow-runner",
-    ]
-
-    for skill_name in hosted_skill_names:
-        skill = (PLUGIN_ROOT / f"skills/{skill_name}/SKILL.md").read_text()
-        assert "connector_status" in skill
-        assert "workspace_id" in skill
-        assert "client_token" not in skill
-
-
 def test_plugin_package_has_no_embedded_secret_env_names_or_values() -> None:
     files = [
         ROOT / ".agents/plugins/marketplace.json",
         PLUGIN_ROOT / ".codex-plugin/plugin.json",
         PLUGIN_ROOT / ".mcp.json",
-        *sorted((PLUGIN_ROOT / "skills").glob("*/SKILL.md")),
+        *sorted(SKILLS_ROOT.glob("*/SKILL.md")),
     ]
-    serialized = "\n".join(file.read_text() for file in files)
+    serialized = "\n".join(file.read_text(encoding="utf-8") for file in files)
     env_names = set(
         re.findall(
             r"\b[A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIALS)"
@@ -231,64 +330,3 @@ def test_plugin_package_has_no_embedded_secret_env_names_or_values() -> None:
     assert "PEAK_CLIENT_SECRET" not in serialized
     assert "sk-" not in serialized
     assert "service_role" not in serialized
-
-
-def test_private_plugin_declares_write_capability_and_bearer_env() -> None:
-    plugin = json.loads(
-        (PRIVATE_PLUGIN_ROOT / ".codex-plugin/plugin.json").read_text()
-    )
-    mcp = json.loads((PRIVATE_PLUGIN_ROOT / ".mcp.json").read_text())
-    server = mcp["mcpServers"]["mercury-finance-private"]
-    serialized = json.dumps({"plugin": plugin, "mcp": mcp})
-
-    assert plugin["name"] == "mercury-finance-private"
-    assert plugin["interface"]["capabilities"] == ["Interactive", "Read", "Write"]
-    assert server["url"] == "https://mercury-tools-mcp.onrender.com/private-mcp"
-    assert server["bearer_token_env_var"] == "MERCURY_PRIVATE_MCP_TOKEN"
-    assert "private-token" not in serialized
-    assert "client_secret" not in serialized
-
-
-def test_private_skill_stops_between_preview_draft_and_approval() -> None:
-    skill = (
-        PRIVATE_PLUGIN_ROOT / "skills/flowaccount-journal-posting-th/SKILL.md"
-    ).read_text()
-    ordered = [
-        "preview_flowaccount_journal",
-        "wait for explicit confirmation",
-        "create_flowaccount_journal_draft",
-        "wait for a new explicit confirmation",
-        "approve_flowaccount_journal",
-    ]
-
-    assert "Use when" in skill
-    assert len(skill.splitlines()) < 80
-    positions = [skill.index(item) for item in ordered]
-    assert positions == sorted(positions)
-    assert "outcome_unknown" in skill
-
-
-def test_marketplace_lists_private_plugin_separately() -> None:
-    data = json.loads((ROOT / ".agents/plugins/marketplace.json").read_text())
-    private = next(
-        item for item in data["plugins"] if item["name"] == "mercury-finance-private"
-    )
-
-    assert private["source"]["path"] == "./plugins/mercury-finance-private"
-    assert private["policy"] == {
-        "installation": "AVAILABLE",
-        "authentication": "ON_INSTALL",
-    }
-    assert private["category"] == "Finance"
-
-
-def test_private_journal_docs_keep_secrets_out_of_git() -> None:
-    text = (ROOT / "docs/PRIVATE_JOURNAL_MCP.md").read_text()
-
-    assert "MERCURY_PRIVATE_MCP_TOKEN" in text
-    assert "preview_flowaccount_journal" in text
-    assert "create_flowaccount_journal_draft" in text
-    assert "approve_flowaccount_journal" in text
-    assert "POST /journal-entries/draft" in text
-    assert "POST /journal-entries/{id}/approve" in text
-    assert "actual-token" not in text

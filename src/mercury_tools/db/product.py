@@ -129,7 +129,7 @@ SKILL_CATALOG_SEED: list[dict[str, Any]] = [
         "status": "available",
         "version": "0.1.0",
         "required_connectors": ["flowaccount"],
-        "tags": ["flowaccount", "journal", "write", "private", "thai"],
+        "tags": ["flowaccount", "journal", "write", "thai"],
     },
 ]
 
