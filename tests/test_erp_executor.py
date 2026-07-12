@@ -330,6 +330,32 @@ def test_request_builder_rejects_user_content_type_overrides(
         )
 
 
+def test_request_builder_allows_declared_raw_content_type_and_writes_raw_body(
+    action_factory: Callable[..., CatalogAction],
+    repository_context: RepositoryContext,
+) -> None:
+    action = action_factory(
+        content_type="text/plain",
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {"Content-Type": {"type": "string"}},
+            "body": {"type": "string"},
+            "files": {},
+        },
+    )
+
+    request = build_request(
+        action,
+        "https://erp.example.com",
+        {"headers": {"Content-Type": "text/plain"}, "body": "plain journal memo"},
+        (repository_context.root,),
+    ).to_httpx_request(AuthContext(headers={}, query={}, expires_at=None))
+
+    assert request.headers["content-type"] == "text/plain"
+    assert request.content == b"plain journal memo"
+
+
 def test_request_builder_replaces_auth_content_type_for_multipart_rendering(
     action_factory: Callable[..., CatalogAction],
     repository_context: RepositoryContext,
@@ -943,6 +969,119 @@ def test_request_builder_rejects_none_for_required_multipart_body(
             action,
             "https://erp.example.com",
             {"body": None},
+            (repository_context.root,),
+        )
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "application/json",
+        "application/x-www-form-urlencoded",
+        "text/plain",
+        "multipart/form-data",
+    ],
+)
+def test_request_builder_treats_optional_none_body_as_absent_for_every_transport(
+    repository_context: RepositoryContext,
+    action_factory: Callable[..., CatalogAction],
+    content_type: str,
+) -> None:
+    action = action_factory(
+        content_type=content_type,
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": {"type": "object", "properties": {}},
+            "files": {},
+        },
+    )
+
+    request = build_request(
+        action,
+        "https://erp.example.com",
+        {"body": None},
+        (repository_context.root,),
+    ).to_httpx_request(AuthContext(headers={}, query={}, expires_at=None))
+
+    assert request.content == b""
+    assert "content-type" not in request.headers
+
+
+@pytest.mark.parametrize(
+    ("content_type", "body_schema"),
+    [
+        ("application/json", {"type": "null", "x-mercury-required": True}),
+        (
+            "application/x-www-form-urlencoded",
+            {"type": "object", "properties": {}, "x-mercury-required": True},
+        ),
+        ("text/plain", {"type": "string", "x-mercury-required": True}),
+        (
+            "multipart/form-data",
+            {"type": "object", "properties": {}, "x-mercury-required": True},
+        ),
+    ],
+)
+def test_request_builder_rejects_none_for_required_body_for_every_transport(
+    repository_context: RepositoryContext,
+    action_factory: Callable[..., CatalogAction],
+    content_type: str,
+    body_schema: dict[str, Any],
+) -> None:
+    action = action_factory(
+        content_type=content_type,
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": body_schema,
+            "files": {},
+        },
+    )
+
+    with pytest.raises(RequestBuildError, match="^required_body_missing$"):
+        build_request(
+            action,
+            "https://erp.example.com",
+            {"body": None},
+            (repository_context.root,),
+        )
+
+
+@pytest.mark.parametrize(
+    "body_schema",
+    [
+        {"type": "object", "properties": {"amount": "not-a-schema"}},
+        {
+            "type": "object",
+            "properties": {
+                "items": {"type": "array", "items": "not-a-schema"},
+            },
+        },
+    ],
+)
+def test_request_builder_rejects_malformed_nested_body_schema(
+    repository_context: RepositoryContext,
+    action_factory: Callable[..., CatalogAction],
+    body_schema: dict[str, Any],
+) -> None:
+    action = action_factory(
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": body_schema,
+            "files": {},
+        },
+    )
+
+    with pytest.raises(RequestBuildError, match="^invalid_action_input_schema$"):
+        build_request(
+            action,
+            "https://erp.example.com",
+            {"body": {}},
             (repository_context.root,),
         )
 

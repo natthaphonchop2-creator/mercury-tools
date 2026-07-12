@@ -66,6 +66,8 @@ def _validate_required_schema_node(
         not is_canonical_schema_name(name) for name in properties
     ):
         raise ValueError("schema_required_contract_invalid")
+    if any(not isinstance(declaration, Mapping) for declaration in properties.values()):
+        raise ValueError("schema_required_contract_invalid")
     if "required" in schema:
         required = schema["required"]
         if (
@@ -78,14 +80,15 @@ def _validate_required_schema_node(
             raise ValueError("schema_required_contract_invalid")
 
     for declaration in properties.values():
-        if isinstance(declaration, Mapping):
-            _validate_required_schema_node(
-                declaration,
-                top_level=False,
-                required_types=required_types,
-            )
-    items = schema.get("items")
-    if isinstance(items, Mapping):
+        _validate_required_schema_node(
+            declaration,
+            top_level=False,
+            required_types=required_types,
+        )
+    if "items" in schema:
+        items = schema["items"]
+        if not isinstance(items, Mapping):
+            raise ValueError("schema_required_contract_invalid")
         _validate_required_schema_node(
             items,
             top_level=False,

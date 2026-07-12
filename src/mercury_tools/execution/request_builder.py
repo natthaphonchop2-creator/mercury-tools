@@ -165,6 +165,7 @@ class RequestTemplate:
             )
         if not self._body_present:
             return httpx.Request(self.method, url, params=query, headers=headers)
+        headers["Content-Type"] = self._content_type
         if media_type == "application/x-www-form-urlencoded" and isinstance(body, Mapping):
             return httpx.Request(
                 self.method,
@@ -172,6 +173,16 @@ class RequestTemplate:
                 params=query,
                 headers=headers,
                 data=dict(body),
+            )
+        if media_type != "application/json" and not media_type.endswith("+json"):
+            if not isinstance(body, str):
+                raise RequestBuildError("invalid_body_value")
+            return httpx.Request(
+                self.method,
+                url,
+                params=query,
+                headers=headers,
+                content=body,
             )
         return httpx.Request(
             self.method,
@@ -221,11 +232,10 @@ def build_request(
     query = _section_mapping(supplied.get("query", {}), "query")
     headers = _section_mapping(supplied.get("headers", {}), "headers")
     files = _section_mapping(supplied.get("files", {}), "files")
-    multipart = _media_type(action.content_type) == "multipart/form-data"
-    body_present = "body" in supplied and not (multipart and supplied["body"] is None)
+    body_present = "body" in supplied and supplied["body"] is not None
     body = _json_copy(supplied["body"] if body_present else {})
 
-    _reject_auth_overrides(query, headers)
+    _reject_auth_overrides(query, headers, content_type=action.content_type)
     _validate_declared_mapping(path, schema["path"], "path")
     _validate_declared_mapping(query, schema["query"], "query")
     idempotency_header = _idempotency_header(action)
@@ -473,10 +483,13 @@ def _multipart_field_value(value: Any) -> str:
         raise RequestBuildError("invalid_body_value") from None
 
 
-def _reject_auth_overrides(query: Mapping[str, Any], headers: Mapping[str, Any]) -> None:
+def _reject_auth_overrides(
+    query: Mapping[str, Any],
+    headers: Mapping[str, Any],
+    *,
+    content_type: str,
+) -> None:
     for name, value in headers.items():
-        if name.casefold() == "content-type":
-            raise RequestBuildError("content_type_override_forbidden")
         if (
             name.casefold() in _FORBIDDEN_HEADERS
             or _looks_like_auth_key(name)
@@ -487,6 +500,11 @@ def _reject_auth_overrides(query: Mapping[str, Any], headers: Mapping[str, Any])
             or "\n" in value
         ):
             raise RequestBuildError("authentication_override_forbidden")
+        if name.casefold() == "content-type" and (
+            _media_type(content_type) == "multipart/form-data"
+            or _media_type(value) != _media_type(content_type)
+        ):
+            raise RequestBuildError("content_type_override_forbidden")
     if any(_looks_like_auth_key(name) for name in query):
         raise RequestBuildError("authentication_override_forbidden")
 
