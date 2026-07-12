@@ -7,9 +7,11 @@ import re
 import secrets
 import stat
 import tempfile
+import unicodedata
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -21,6 +23,7 @@ _ROOT_GITIGNORE_LINES = [
 ]
 _MERCURY_GITIGNORE_LINES = ["credentials.env", "cache/", "audit/"]
 _REPOSITORY_CONFIG_KEYS = {"schema_version", "trusted_hosts", "connectors"}
+_REPOSITORY_CONFIG_OPTIONAL_KEYS = {"validations"}
 _PRIVATE_NETWORK_ENVIRONMENTS = {"local", "gateway"}
 _FORBIDDEN_METADATA_IPS = frozenset(
     {
@@ -54,6 +57,14 @@ _AUTH_PARAMETER_NAME_KEYS = {
     "client_id_name",
     "client_secret_name",
     "key_name",
+}
+_VALIDATION_RECORD_KEYS = {
+    "connector_id",
+    "environment",
+    "company_name",
+    "validation_state",
+    "probe_action",
+    "validated_at",
 }
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
 _OAUTH_SCOPE_PATTERN = re.compile(
@@ -106,6 +117,7 @@ class RepositoryConfig:
     schema_version: int = 1
     trusted_hosts: dict[str, dict[str, tuple[str, ...]]] = field(default_factory=dict)
     connectors: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
+    validations: dict[str, dict[str, dict[str, str | None]]] = field(default_factory=dict)
 
     def allow_private_network(self, connector_id: str, environment: str) -> bool:
         connector = self.connectors.get(connector_id, {})
@@ -532,12 +544,19 @@ def normalize_repository_config(config: RepositoryConfig) -> RepositoryConfig:
             "schema_version": config.schema_version,
             "trusted_hosts": config.trusted_hosts,
             "connectors": config.connectors,
+            "validations": config.validations,
         }
     )
 
 
 def _validated_repository_config(payload: Any) -> RepositoryConfig:
-    if not isinstance(payload, Mapping) or set(payload) != _REPOSITORY_CONFIG_KEYS:
+    if (
+        not isinstance(payload, Mapping)
+        or not _REPOSITORY_CONFIG_KEYS.issubset(payload)
+        or not set(payload).issubset(
+            _REPOSITORY_CONFIG_KEYS | _REPOSITORY_CONFIG_OPTIONAL_KEYS
+        )
+    ):
         raise ValueError("invalid_repository_config")
     schema_version = payload["schema_version"]
     if type(schema_version) is not int or schema_version != 1:
@@ -547,6 +566,7 @@ def _validated_repository_config(payload: Any) -> RepositoryConfig:
         schema_version=schema_version,
         trusted_hosts=trusted_hosts,
         connectors=_load_connectors(payload["connectors"], trusted_hosts),
+        validations=_load_validations(payload.get("validations", {})),
     )
 
 
@@ -590,6 +610,48 @@ def configure_connector(
         schema_version=current.schema_version,
         trusted_hosts=trusted_hosts,
         connectors=connectors,
+        validations=_copy_validations(current.validations),
+    )
+    _write_config_atomic(context.config_path, updated)
+    return updated
+
+
+def record_connector_validation(
+    context: RepositoryContext,
+    *,
+    connector_id: str,
+    environment: str,
+    company_name: str | None,
+    probe_action: str,
+    validated_at: str,
+) -> RepositoryConfig:
+    """Persist the minimal, non-secret outcome of a successful safe probe."""
+
+    record = {
+        "connector_id": connector_id,
+        "environment": environment,
+        "company_name": company_name,
+        "validation_state": "connected",
+        "probe_action": probe_action,
+        "validated_at": validated_at,
+    }
+    validated = _load_validations({connector_id: {environment: record}})
+    current = load_repository_config(context)
+    validations = _copy_validations(current.validations)
+    validations.setdefault(connector_id, {})[environment] = validated[connector_id][
+        environment
+    ]
+    updated = RepositoryConfig(
+        schema_version=current.schema_version,
+        trusted_hosts=_copy_trusted_hosts(current.trusted_hosts),
+        connectors={
+            configured_connector_id: {
+                configured_environment: dict(config)
+                for configured_environment, config in environments.items()
+            }
+            for configured_connector_id, environments in current.connectors.items()
+        },
+        validations=validations,
     )
     _write_config_atomic(context.config_path, updated)
     return updated
@@ -660,7 +722,7 @@ def _reject_duplicate_config_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any
 
 
 def _config_payload(config: RepositoryConfig) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "schema_version": config.schema_version,
         "trusted_hosts": {
             connector_id: {
@@ -670,6 +732,9 @@ def _config_payload(config: RepositoryConfig) -> dict[str, Any]:
         },
         "connectors": config.connectors,
     }
+    if config.validations:
+        payload["validations"] = config.validations
+    return payload
 
 
 def _load_trusted_hosts(value: Any) -> dict[str, dict[str, tuple[str, ...]]]:
@@ -734,6 +799,90 @@ def _copy_trusted_hosts(
             for environment, hosts in environments.items()
         }
         for connector_id, environments in trusted_hosts.items()
+    }
+
+
+def _load_validations(value: Any) -> dict[str, dict[str, dict[str, str | None]]]:
+    if not isinstance(value, Mapping):
+        raise ValueError("invalid_validations")
+    validations: dict[str, dict[str, dict[str, str | None]]] = {}
+    for connector_id, environments in value.items():
+        normalized_connector_id = _validate_connector_identifier(connector_id)
+        if not isinstance(environments, Mapping):
+            raise ValueError("invalid_validations")
+        validations[normalized_connector_id] = {}
+        for environment, record in environments.items():
+            normalized_environment = _validate_connector_identifier(environment)
+            validations[normalized_connector_id][normalized_environment] = (
+                _load_validation_record(
+                    record,
+                    connector_id=normalized_connector_id,
+                    environment=normalized_environment,
+                )
+            )
+    return validations
+
+
+def _load_validation_record(
+    value: Any,
+    *,
+    connector_id: str,
+    environment: str,
+) -> dict[str, str | None]:
+    if not isinstance(value, Mapping) or set(value) != _VALIDATION_RECORD_KEYS:
+        raise ValueError("invalid_validations")
+    if value["connector_id"] != connector_id or value["environment"] != environment:
+        raise ValueError("invalid_validations")
+    if value["validation_state"] != "connected":
+        raise ValueError("invalid_validations")
+    company_name = value["company_name"]
+    if company_name is not None:
+        company_name = _validate_validation_text(company_name)
+    probe_action = _validate_validation_text(value["probe_action"])
+    validated_at = _validate_validation_timestamp(value["validated_at"])
+    return {
+        "connector_id": connector_id,
+        "environment": environment,
+        "company_name": company_name,
+        "validation_state": "connected",
+        "probe_action": probe_action,
+        "validated_at": validated_at,
+    }
+
+
+def _validate_validation_text(value: Any) -> str:
+    if not isinstance(value, str) or not value or len(value) > 256:
+        raise ValueError("invalid_validations")
+    if any(
+        ord(character) < 32
+        or ord(character) == 127
+        or unicodedata.category(character) in {"Cc", "Cf", "Zl", "Zp"}
+        for character in value
+    ):
+        raise ValueError("invalid_validations")
+    return value
+
+
+def _validate_validation_timestamp(value: Any) -> str:
+    text = _validate_validation_text(value)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError("invalid_validations") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("invalid_validations")
+    return text
+
+
+def _copy_validations(
+    validations: Mapping[str, Mapping[str, Mapping[str, str | None]]],
+) -> dict[str, dict[str, dict[str, str | None]]]:
+    return {
+        str(connector_id): {
+            str(environment): dict(record)
+            for environment, record in environments.items()
+        }
+        for connector_id, environments in validations.items()
     }
 
 

@@ -31,6 +31,7 @@ dev = [
 ]
 
 [project.scripts]
+mercury = "mercury_tools.cli:main"
 mercury-tools = "mercury_tools.cli:main"
 
 [tool.setuptools.packages.find]

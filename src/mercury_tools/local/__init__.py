@@ -7,6 +7,7 @@ from mercury_tools.local.repository import (
     ensure_repository_state,
     load_repository_config,
     normalize_repository_config,
+    record_connector_validation,
     resolve_repository_root,
     root_paths,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "ensure_repository_state",
     "load_repository_config",
     "normalize_repository_config",
+    "record_connector_validation",
     "resolve_repository_root",
     "root_paths",
 ]

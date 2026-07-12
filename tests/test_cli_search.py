@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import tomllib
+from pathlib import Path
 from types import SimpleNamespace
 
 
@@ -55,3 +57,17 @@ def test_cli_search_applies_connector_inference(monkeypatch, capsys) -> None:
     assert captured["connector"] == "flowaccount"
     assert payload["inferred_connector"] == "flowaccount"
     assert payload["results"][0]["metadata"]["connector"] == "flowaccount"
+
+
+def test_cli_parser_exposes_local_credential_contract_without_importing_cloud_mcp() -> None:
+    from mercury_tools.cli import build_parser
+
+    parser = build_parser()
+    help_text = parser.format_help()
+    parsed = parser.parse_args(["mcp", "serve-local"])
+    project = tomllib.loads(Path("pyproject.toml").read_text())
+
+    for command in ("credentials", "connector", "mcp", "flow", "search", "doctor"):
+        assert command in help_text
+    assert callable(parsed.func)
+    assert project["project"]["scripts"]["mercury"] == "mercury_tools.cli:main"
