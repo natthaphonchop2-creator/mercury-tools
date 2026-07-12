@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from pathlib import Path
 
 import httpx
 import pytest
@@ -9,8 +10,10 @@ import pytest_asyncio
 from starlette.applications import Starlette
 
 from mercury_tools.catalog.identity import build_action_id, build_version_id
+from mercury_tools.catalog.models import CatalogAction, revalidate_catalog_action
 from mercury_tools.cloud import api as cloud_api
 from mercury_tools.cloud.api import CloudDependencies, cloud_routes
+from mercury_tools.cloud.models import validate_raw_catalog_action_payload
 from mercury_tools.db.product import SKILL_CATALOG_SEED
 from mercury_tools.rag.models import SearchResult
 from mercury_tools.safety.redaction import redact_json
@@ -24,6 +27,7 @@ ORDINARY_DEPENDENCY_ERROR_TYPES = (
     RuntimeError,
     OverflowError,
 )
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class CatalogStoreSpy:
@@ -156,13 +160,16 @@ def cloud_dependencies(action_factory):
         description="Get company",
         input_schema={
             "path": {},
-            "query": {},
+            "query": {"include": {"type": "string", "description": "Related data"}},
             "headers": {},
-            "body": {"type": "object", "properties": {"erp_payload": {"type": "string"}}},
+            "body": {},
             "files": {},
         },
-        examples=({"body": {"erp_payload": "must-not-leak"}},),
-        source_uri="/Users/operator/private/openapi.json",
+        examples=(),
+        success_rules={"status_codes": [200]},
+        error_rules={"status_codes": [400, 404]},
+        response_redaction=("company.tax_id",),
+        source_uri="mercury://catalog/global/flowaccount/source",
     )
     write_action = action_factory()
     rag_store = RagStoreSpy()
@@ -217,7 +224,10 @@ async def test_cloud_api_exposes_only_read_catalog_routes(
     assert response.headers["etag"]
     serialized = json.dumps(response.json())
     assert "must-not-leak" not in serialized
-    assert "erp_payload" not in serialized
+    assert response.json()["actions"][0]["input_schema"] == read_action.model_dump(
+        mode="json"
+    )["input_schema"]
+    assert response.json()["actions"][0]["version_id"] == read_action.version_id
     assert "/Users/" not in serialized
     write_attempt = await client.post("/api/cloud/v1/catalog/actions", json={})
     assert write_attempt.status_code == 405
@@ -848,8 +858,8 @@ async def test_cloud_redacts_supabase_secrets_across_every_public_projection(
             "document": document.json(),
         }
     )
-    assert catalog.status_code == skill.status_code == 200
-    assert search.status_code == document.status_code == 200
+    assert catalog.status_code == 503
+    assert skill.status_code == search.status_code == document.status_code == 200
     assert secret not in rag_store.last_query
     assert secret not in serialized
     assert assignment not in serialized
@@ -1470,7 +1480,8 @@ async def test_cloud_redacts_auth_and_cookie_values_from_every_projection(
     ]
 
     serialized = json.dumps([response.json() for response in responses])
-    assert all(response.status_code == 200 for response in responses)
+    assert responses[0].status_code == 503
+    assert all(response.status_code == 200 for response in responses[1:])
     for secret in (
         "opaque-catalog-auth",
         "opaque-skill-cookie",
@@ -1653,7 +1664,8 @@ async def test_cloud_local_path_representations_never_cross_rag_or_public_projec
         ),
     ]
     serialized = json.dumps([response.json() for response in responses])
-    assert all(response.status_code == 200 for response in responses)
+    assert responses[0].status_code == 503
+    assert all(response.status_code == 200 for response in responses[1:])
     assert value not in serialized
     assert "private.env" not in serialized
 
@@ -1883,6 +1895,129 @@ async def test_cloud_catalog_preserves_endpoint_path_templates(
 
     assert response.status_code == 200
     assert response.json()["actions"][0]["path_template"] == action.path_template
+
+
+@pytest.mark.asyncio
+async def test_cloud_catalog_preserves_executable_contract_and_canonical_version(
+    client, cloud_dependencies, action_factory
+) -> None:
+    _, _, _, catalog_store, _ = cloud_dependencies
+    action = action_factory(
+        path_template="/companies/{company_id}/documents",
+        operation_id="createCompanyDocument",
+        input_schema={
+            "path": {
+                "company_id": {
+                    "type": "string",
+                    "description": "Canonical company identifier",
+                }
+            },
+            "query": {"draft": {"type": "boolean"}},
+            "headers": {},
+            "body": {
+                "type": "object",
+                "properties": {
+                    "reference": {"type": "string"},
+                    "amount": {"type": "number"},
+                },
+                "required": ["reference", "amount"],
+                "additionalProperties": False,
+            },
+            "files": {},
+        },
+        examples=(),
+        idempotency={
+            "header_name": "Idempotency-Key",
+            "source": "body.reference",
+        },
+        success_rules={"status_codes": [200, 201]},
+        error_rules={
+            "status_codes": [400, 409],
+            "body": {"path": "meta.status", "equals": "error"},
+        },
+        response_redaction=("customer.tax_id", "access_token"),
+        source_uri="mercury://catalog/global/flowaccount/source",
+    )
+    catalog_store.actions = [action]
+
+    response = await client.get("/api/cloud/v1/catalog/actions")
+
+    assert response.status_code == 200
+    assert response.json()["actions"] == [action.model_dump(mode="json")]
+
+
+@pytest.mark.parametrize(
+    ("connector", "expected_count"),
+    [("flowaccount", 190), ("peak", 64)],
+)
+def test_public_catalog_validator_accepts_every_builtin_action(
+    connector, expected_count
+) -> None:
+    path = ROOT / "catalog" / "global" / connector / "actions.json"
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    validator = getattr(cloud_api, "validate_public_catalog_action", None)
+
+    assert len(rows) == expected_count
+    assert validator is not None
+    for row in rows:
+        validate_raw_catalog_action_payload(row)
+        action = revalidate_catalog_action(CatalogAction.model_validate(row))
+        validator(action)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (
+            "input_schema",
+            {
+                "path": {},
+                "query": {},
+                "headers": {},
+                "body": {
+                    "type": "object",
+                    "properties": {
+                        "reference": {
+                            "type": "string",
+                            "default": "unsafe-business-default",
+                        }
+                    },
+                },
+                "files": {},
+            },
+        ),
+        (
+            "input_schema",
+            {
+                "path": {},
+                "query": {},
+                "headers": {},
+                "body": {"oneOf": [{"type": "string"}]},
+                "files": {},
+            },
+        ),
+        ("examples", ({"body": {"reference": "INV-PRIVATE"}},)),
+        ("idempotency", {"header": "Idempotency-Key"}),
+        ("success_rules", {"status": [200]}),
+        ("error_rules", {"400": "bad request"}),
+        ("response_redaction", ("../private",)),
+    ],
+)
+async def test_cloud_catalog_rejects_unsafe_or_unsupported_executable_contract(
+    client, cloud_dependencies, field, value
+) -> None:
+    _, read_action, _, catalog_store, _ = cloud_dependencies
+    malicious = read_action.model_copy(update={field: value})
+    malicious = malicious.model_copy(
+        update={"version_id": build_version_id(malicious)}
+    )
+    catalog_store.actions = [malicious]
+
+    response = await client.get("/api/cloud/v1/catalog/actions")
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "service_unavailable"}
 
 
 @pytest.mark.asyncio

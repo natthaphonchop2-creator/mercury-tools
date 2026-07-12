@@ -10,6 +10,7 @@ from mercury_tools.catalog.cache import CatalogCache
 from mercury_tools.catalog.identity import build_action_id, build_version_id
 from mercury_tools.cloud.client import CloudBrainClient
 from mercury_tools.config import DEFAULT_CLOUD_BASE_URL, load_settings
+from mercury_tools.execution.request_builder import build_request
 
 PUBLIC_RESPONSE_ERROR = "cloud_public_response_invalid"
 
@@ -177,6 +178,82 @@ async def test_client_caches_cloud_catalog_by_etag_without_auth_header(
     assert cache.conditional_headers() == {"If-None-Match": '"catalog-v2"'}
     assert dict(seen_requests[0].url.params) == {}
     assert "authorization" not in seen_requests[0].headers
+
+
+@pytest.mark.asyncio
+async def test_client_preserves_global_executable_contract_for_request_validation(
+    repository_context, action_factory
+) -> None:
+    action = _read_action(
+        action_factory,
+        method="POST",
+        path_template="/companies/{company_id}/documents",
+        operation_id="createCompanyDocument",
+        capability="documents.company.create",
+        risk_tier=1,
+        required_confirmations=1,
+        side_effects=("creates_document",),
+        input_schema={
+            "path": {"company_id": {"type": "string"}},
+            "query": {"draft": {"type": "boolean"}},
+            "headers": {},
+            "body": {
+                "type": "object",
+                "properties": {
+                    "reference": {"type": "string"},
+                    "amount": {"type": "number"},
+                },
+                "required": ["reference", "amount"],
+                "additionalProperties": False,
+            },
+            "files": {},
+        },
+        idempotency={
+            "header_name": "Idempotency-Key",
+            "source": "body.reference",
+        },
+        success_rules={"status_codes": [200, 201]},
+        error_rules={
+            "status_codes": [400, 409],
+            "body": {"path": "meta.status", "equals": "error"},
+        },
+        response_redaction=("customer.tax_id", "access_token"),
+        source_uri="mercury://catalog/global/flowaccount/source",
+    )
+    cache = CatalogCache(repository_context)
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=cache,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={"ETag": '"executable"'},
+                json={"actions": [action.model_dump(mode="json")]},
+            )
+        ),
+    )
+    try:
+        fetched = await client.list_actions()
+    finally:
+        await client.aclose()
+
+    assert fetched.actions == (action,)
+    assert cache.list_global() == [action]
+    template = build_request(
+        fetched.actions[0],
+        "https://erp.example.test/v1",
+        {
+            "path": {"company_id": "company-42"},
+            "query": {"draft": True},
+            "body": {"reference": "INV-42", "amount": 100},
+        },
+        (repository_context.root,),
+        environment="production",
+    )
+    assert template.version_id == action.version_id
+    assert template.final_path == "/companies/company-42/documents"
+    assert template.request_inputs["query"] == {"draft": True}
+    assert template.request_inputs["headers"] == {"Idempotency-Key": "INV-42"}
 
 
 @pytest.mark.asyncio
@@ -809,9 +886,17 @@ async def test_client_uses_configured_cloud_base_url_when_not_explicit(
             "input_schema",
             {
                 "path": {},
-                "query": {"secret": {"type": "string"}},
+                "query": {},
                 "headers": {},
-                "body": {},
+                "body": {
+                    "type": "object",
+                    "properties": {
+                        "reference": {
+                            "type": "string",
+                            "default": "unsafe-business-default",
+                        }
+                    },
+                },
                 "files": {},
             },
         ),
@@ -819,7 +904,7 @@ async def test_client_uses_configured_cloud_base_url_when_not_explicit(
         ("idempotency", {"header": "Idempotency-Key"}),
         ("success_rules", {"status": [200]}),
         ("error_rules", {"400": "bad request"}),
-        ("response_redaction", ("$.secret",)),
+        ("response_redaction", ("../private",)),
         ("source_uri", "file:///Users/operator/private/openapi.json"),
         ("source_uri", "mercury://wiki/../../private"),
         (

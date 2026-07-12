@@ -11,7 +11,6 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
 from starlette.concurrency import run_in_threadpool
@@ -19,7 +18,6 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from mercury_tools.catalog.identity import build_version_id
 from mercury_tools.catalog.models import (
     CatalogAction,
     HttpMethod,
@@ -36,7 +34,7 @@ from mercury_tools.cloud.models import (
     is_canonical_public_wiki_uri,
     is_canonical_skill_id,
     sanitize_public_text,
-    validate_public_catalog_identity,
+    validate_public_catalog_action,
     validate_raw_catalog_action_payload,
 )
 from mercury_tools.config import Settings, load_settings
@@ -542,67 +540,10 @@ def _valid_selector(value: str | None, *, required: bool = False) -> bool:
     return bool(_SELECTOR_RE.fullmatch(value))
 
 
-def _public_source_uri(value: str, action: CatalogAction) -> str:
-    parsed = urlparse(value)
-    if parsed.scheme in {"http", "https"} and parsed.netloc:
-        return sanitize_public_text(value)
-    return f"mercury://catalog/{action.connector_id}/{action.action_id}"
-
-
 def _public_catalog_action(action: CatalogAction) -> CatalogAction:
     validated = revalidate_catalog_action(action)
-    _validate_public_action_identity(validated)
-    projected = validated.model_copy(
-        update={
-            "version_id": "",
-            "input_schema": {
-                "path": {},
-                "query": {},
-                "headers": {},
-                "body": {},
-                "files": {},
-            },
-            "examples": (),
-            "idempotency": {},
-            "success_rules": {},
-            "error_rules": {},
-            "response_redaction": (),
-            "source_uri": _public_source_uri(validated.source_uri, validated),
-            "source_hash": (
-                validated.source_hash
-                if re.fullmatch(r"[0-9a-f]{64}", validated.source_hash)
-                else hashlib.sha256(validated.source_hash.encode("utf-8")).hexdigest()
-            ),
-            "environments": tuple(
-                sanitize_public_text(item) for item in validated.environments
-            ),
-            "content_type": sanitize_public_text(validated.content_type),
-            "aliases_th": tuple(sanitize_public_text(item) for item in validated.aliases_th),
-            "aliases_en": tuple(sanitize_public_text(item) for item in validated.aliases_en),
-            "capability": sanitize_public_text(validated.capability),
-            "side_effects": tuple(
-                sanitize_public_text(item) for item in validated.side_effects
-            ),
-            "preflight_action_ids": tuple(
-                item
-                for item in validated.preflight_action_ids
-                if _ACTION_ID_RE.fullmatch(item)
-            ),
-            "description": sanitize_public_text(validated.description),
-        }
-    )
-    projected = CatalogAction.model_validate(
-        {name: getattr(projected, name) for name in CatalogAction.model_fields}
-    )
-    projected = projected.model_copy(update={"version_id": build_version_id(projected)})
-    return revalidate_catalog_action(projected)
-
-
-def _validate_public_action_identity(action: CatalogAction) -> None:
-    try:
-        validate_public_catalog_identity(action)
-    except ValueError:
-        raise ValueError("cloud_catalog_invalid") from None
+    validate_public_catalog_action(validated)
+    return validated
 
 
 def _filter_actions(

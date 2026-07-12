@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import uuid
@@ -11,7 +12,7 @@ from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from mercury_tools.catalog.identity import sanitize_document
+from mercury_tools.catalog.identity import sanitize_document, validate_action_identity
 from mercury_tools.safety.redaction import (
     is_safe_public_http_url,
     redact_absolute_paths,
@@ -26,6 +27,7 @@ _PUBLIC_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 _PUBLIC_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 _CATALOG_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _ACTION_ID_RE = re.compile(r"^act_[0-9a-f]{24}$")
+_ACTION_VERSION_ID_RE = re.compile(r"^av_[0-9a-f]{64}$")
 _VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$")
 _WIKI_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,199}$")
 _CHUNK_FRAGMENT_RE = re.compile(r"^chunk-[0-9]+$")
@@ -91,6 +93,46 @@ _CATALOG_OBSERVED_STATE_VALUES = {
     "failed",
     "outcome_unknown",
 }
+_INPUT_SCHEMA_SECTIONS = {"path", "query", "headers", "body", "files"}
+_SCHEMA_TYPES = {"array", "boolean", "integer", "null", "number", "object", "string"}
+_SCALAR_SCHEMA_TYPES = _SCHEMA_TYPES - {"array", "object"}
+_PARAMETER_SCHEMA_KEYS = {"description", "enum", "type"}
+_BODY_SCHEMA_KEYS = {
+    "additionalProperties",
+    "description",
+    "enum",
+    "items",
+    "properties",
+    "required",
+    "type",
+    "x-mercury-property-descriptions",
+}
+_IDEMPOTENCY_KEYS = {
+    "duplicate_action_id",
+    "failure_values",
+    "header_name",
+    "preflight_inputs",
+    "source",
+    "status_action_id",
+    "status_inputs",
+    "status_result_path",
+    "success_values",
+}
+_REQUEST_INPUT_SECTIONS = {"path", "query", "headers", "body", "files"}
+_HEADER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
+_DATA_PATH_RE = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$")
+_REDACTION_SELECTOR_RE = re.compile(
+    r"^(?:[A-Za-z0-9_-]+|\*)(?:\.(?:[A-Za-z0-9_-]+|\*))*$"
+)
+_AUTH_IDENTIFIER_RE = re.compile(
+    r"(?:api[_-]?key|auth(?:entication|orization)?|cookie|credential|password|"
+    r"proxy[_-]?authorization|secret|set[_-]?cookie|token)",
+    re.IGNORECASE,
+)
+_MAX_SCHEMA_DEPTH = 20
+_MAX_SCHEMA_NODES = 8_192
+_MAX_SCHEMA_NAME_BYTES = 512
+_MAX_RULE_STRING_BYTES = 2_048
 
 
 def sanitize_public_text(value: str, *, redact_paths: bool = True) -> str:
@@ -166,6 +208,432 @@ def validate_raw_catalog_action_payload(value: Any) -> None:
         or isinstance(value["required_confirmations"], bool)
     ):
         raise ValueError("cloud_catalog_invalid")
+    _validate_public_catalog_contract_payload(value)
+
+
+def validate_public_catalog_action(action: Any) -> None:
+    """Admit one canonical executable action without changing its identity."""
+
+    try:
+        validate_action_identity(action)
+        validate_public_catalog_identity(action)
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("cloud_catalog_projection_invalid") from None
+    payload = action.model_dump(mode="json")
+    _validate_public_catalog_contract_payload(payload)
+    if (
+        not _ACTION_VERSION_ID_RE.fullmatch(action.version_id)
+        or not _SHA256_RE.fullmatch(action.source_hash)
+        or not _is_public_catalog_source_uri(action.source_uri)
+    ):
+        raise ValueError("cloud_catalog_projection_invalid")
+    public_text_payload = {**payload, "path_template": ""}
+    serialized = json.dumps(public_text_payload, ensure_ascii=False, sort_keys=True)
+    if sanitize_public_text(serialized) != serialized:
+        raise ValueError("cloud_catalog_projection_invalid")
+
+
+def _validate_public_catalog_contract_payload(payload: Mapping[str, Any]) -> None:
+    try:
+        validate_public_api_path_template(payload["path_template"])
+        _validate_public_input_schema(payload["input_schema"])
+        if payload["examples"] != []:
+            raise ValueError
+        _validate_public_idempotency(
+            payload["idempotency"],
+            input_schema=payload["input_schema"],
+            preflight_action_ids=payload["preflight_action_ids"],
+        )
+        _validate_public_response_rules(payload["success_rules"], error=False)
+        _validate_public_response_rules(payload["error_rules"], error=True)
+        _validate_response_redaction(payload["response_redaction"])
+    except (KeyError, OverflowError, RecursionError, TypeError, ValueError):
+        raise ValueError("cloud_catalog_projection_invalid") from None
+
+
+def _validate_public_input_schema(value: Any) -> None:
+    if not isinstance(value, dict) or set(value) != _INPUT_SCHEMA_SECTIONS:
+        raise ValueError
+    budget = [_MAX_SCHEMA_NODES]
+    for section in ("path", "query", "headers", "files"):
+        declarations = value[section]
+        if not isinstance(declarations, dict):
+            raise ValueError
+        for name, declaration in declarations.items():
+            _validate_schema_name(name)
+            _validate_parameter_schema(
+                declaration,
+                section=section,
+                depth=0,
+                budget=budget,
+            )
+    body = value["body"]
+    if not isinstance(body, dict):
+        raise ValueError
+    if body:
+        _validate_body_schema(body, depth=0, budget=budget)
+        if body.get("type") != "object":
+            raise ValueError
+
+
+def _validate_parameter_schema(
+    value: Any,
+    *,
+    section: str,
+    depth: int,
+    budget: list[int],
+) -> None:
+    _consume_schema_budget(depth, budget)
+    allowed = _PARAMETER_SCHEMA_KEYS | ({"format"} if section == "files" else set())
+    if not isinstance(value, dict) or not value or set(value) - allowed:
+        raise ValueError
+    schema_type = value.get("type")
+    if section == "files":
+        if schema_type != "string" or value.get("format") != "binary":
+            raise ValueError
+    elif schema_type not in _SCALAR_SCHEMA_TYPES:
+        raise ValueError
+    _validate_schema_description(value)
+    _validate_schema_enum(value, schema_type)
+
+
+def _validate_body_schema(value: Any, *, depth: int, budget: list[int]) -> None:
+    _consume_schema_budget(depth, budget)
+    if not isinstance(value, dict) or not value or set(value) - _BODY_SCHEMA_KEYS:
+        raise ValueError
+    schema_type = value.get("type")
+    if schema_type is None and set(value) == {"properties"}:
+        schema_type = "object"
+    if schema_type not in _SCHEMA_TYPES:
+        raise ValueError
+    _validate_schema_description(value)
+    _validate_schema_enum(value, schema_type)
+
+    object_only = {
+        "additionalProperties",
+        "properties",
+        "required",
+        "x-mercury-property-descriptions",
+    }
+    if schema_type != "object" and set(value) & object_only:
+        raise ValueError
+    if schema_type != "array" and "items" in value:
+        raise ValueError
+    if schema_type in {"array", "object"} and "enum" in value:
+        raise ValueError
+
+    if schema_type == "array":
+        if "items" not in value:
+            raise ValueError
+        _validate_body_schema(value["items"], depth=depth + 1, budget=budget)
+        return
+    if schema_type != "object":
+        return
+
+    properties = value.get("properties", {})
+    if not isinstance(properties, dict):
+        raise ValueError
+    for name, declaration in properties.items():
+        _validate_schema_name(name)
+        _validate_body_schema(declaration, depth=depth + 1, budget=budget)
+    if "additionalProperties" in value and value["additionalProperties"] is not False:
+        raise ValueError
+    required = value.get("required", [])
+    if (
+        not isinstance(required, list)
+        or any(not isinstance(name, str) for name in required)
+        or len(required) != len(set(required))
+        or any(name not in properties for name in required)
+    ):
+        raise ValueError
+    descriptions = value.get("x-mercury-property-descriptions", [])
+    if not isinstance(descriptions, list):
+        raise ValueError
+    seen: set[str] = set()
+    for item in descriptions:
+        if not isinstance(item, dict) or set(item) != {"description", "name"}:
+            raise ValueError
+        name = item["name"]
+        _validate_schema_name(name)
+        _validate_safe_text(item["description"], max_bytes=_MAX_PUBLIC_TEXT_BYTES)
+        if name not in properties or name in seen:
+            raise ValueError
+        seen.add(name)
+
+
+def _consume_schema_budget(depth: int, budget: list[int]) -> None:
+    if depth > _MAX_SCHEMA_DEPTH or budget[0] <= 0:
+        raise ValueError
+    budget[0] -= 1
+
+
+def _validate_schema_name(value: Any) -> None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or not _within_limit(value, _MAX_SCHEMA_NAME_BYTES)
+        or value in {".", ".."}
+        or any(character in value for character in ("/", "\\", "=", "%"))
+        or "://" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or sanitize_public_text(value, redact_paths=False) != value
+    ):
+        raise ValueError
+
+
+def _validate_schema_description(value: Mapping[str, Any]) -> None:
+    if "description" in value:
+        _validate_safe_text(value["description"], max_bytes=_MAX_PUBLIC_TEXT_BYTES)
+
+
+def _validate_schema_enum(value: Mapping[str, Any], schema_type: Any) -> None:
+    if "enum" not in value:
+        return
+    enum = value["enum"]
+    if not isinstance(enum, list) or not enum:
+        raise ValueError
+    for index, item in enumerate(enum):
+        if not _scalar_matches_schema_type(item, schema_type):
+            raise ValueError
+        _validate_safe_scalar(item)
+        if any(type(item) is type(previous) and item == previous for previous in enum[:index]):
+            raise ValueError
+
+
+def _scalar_matches_schema_type(value: Any, schema_type: Any) -> bool:
+    matches = {
+        "boolean": isinstance(value, bool),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+        "null": value is None,
+        "number": isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and (not isinstance(value, float) or math.isfinite(value)),
+        "string": isinstance(value, str),
+    }
+    return bool(matches.get(schema_type, False))
+
+
+def _validate_public_idempotency(
+    value: Any,
+    *,
+    input_schema: Mapping[str, Any],
+    preflight_action_ids: Any,
+) -> None:
+    if not isinstance(value, dict) or set(value) - _IDEMPOTENCY_KEYS:
+        raise ValueError
+    if not isinstance(preflight_action_ids, list):
+        raise ValueError
+    header = value.get("header_name")
+    source = value.get("source")
+    if (header is None) != (source is None):
+        raise ValueError
+    if header is not None:
+        if (
+            not isinstance(header, str)
+            or not _HEADER_NAME_RE.fullmatch(header)
+            or _AUTH_IDENTIFIER_RE.search(header)
+            or not isinstance(source, str)
+            or not _DATA_PATH_RE.fullmatch(source)
+        ):
+            raise ValueError
+        declaration = _idempotency_source_schema(input_schema, source)
+        if declaration.get("type") not in {"integer", "string"}:
+            raise ValueError
+
+    for key in ("duplicate_action_id", "status_action_id"):
+        if key in value and (
+            not isinstance(value[key], str) or not _ACTION_ID_RE.fullmatch(value[key])
+        ):
+            raise ValueError
+    duplicate_action_id = value.get("duplicate_action_id")
+    if duplicate_action_id is not None and duplicate_action_id not in preflight_action_ids:
+        raise ValueError
+
+    preflight_inputs = value.get("preflight_inputs", {})
+    if not isinstance(preflight_inputs, dict):
+        raise ValueError
+    for action_id, inputs in preflight_inputs.items():
+        if action_id not in preflight_action_ids or not _ACTION_ID_RE.fullmatch(action_id):
+            raise ValueError
+        _validate_catalog_request_inputs(inputs)
+
+    status_fields = {
+        "failure_values",
+        "status_inputs",
+        "status_result_path",
+        "success_values",
+    }
+    if set(value) & status_fields and "status_action_id" not in value:
+        raise ValueError
+    if "status_inputs" in value:
+        _validate_catalog_request_inputs(value["status_inputs"])
+    if "status_result_path" in value and (
+        not isinstance(value["status_result_path"], str)
+        or not _DATA_PATH_RE.fullmatch(value["status_result_path"])
+    ):
+        raise ValueError
+    for key in ("success_values", "failure_values"):
+        if key in value:
+            items = value[key]
+            if not isinstance(items, list) or not items:
+                raise ValueError
+            for item in items:
+                _validate_safe_scalar(item)
+
+
+def _idempotency_source_schema(
+    input_schema: Mapping[str, Any], source: str
+) -> Mapping[str, Any]:
+    root, *parts = source.split(".")
+    if root not in {"path", "query", "body"} or not parts:
+        raise ValueError
+    current: Any = input_schema[root]
+    if root in {"path", "query"}:
+        current = current.get(parts.pop(0)) if isinstance(current, dict) else None
+    while parts:
+        if not isinstance(current, dict) or current.get("type") != "object":
+            raise ValueError
+        properties = current.get("properties")
+        current = properties.get(parts.pop(0)) if isinstance(properties, dict) else None
+    if not isinstance(current, dict):
+        raise ValueError
+    return current
+
+
+def _validate_catalog_request_inputs(value: Any) -> None:
+    if not isinstance(value, dict) or set(value) - _REQUEST_INPUT_SECTIONS:
+        raise ValueError
+    for section, item in value.items():
+        if section == "body":
+            _validate_safe_json_value(item, depth=0)
+            continue
+        if not isinstance(item, dict):
+            raise ValueError
+        if section == "files" and item:
+            raise ValueError
+        _validate_safe_json_value(item, depth=0)
+    if redact_json(value) != value:
+        raise ValueError
+
+
+def _validate_public_response_rules(value: Any, *, error: bool) -> None:
+    allowed = {"body", "status_codes"} if error else {"status_codes"}
+    if not isinstance(value, dict) or set(value) - allowed:
+        raise ValueError
+    if "status_codes" in value:
+        codes = value["status_codes"]
+        if (
+            not isinstance(codes, list)
+            or not codes
+            or any(
+                not isinstance(code, int)
+                or isinstance(code, bool)
+                or not 100 <= code <= 599
+                for code in codes
+            )
+            or len(codes) != len(set(codes))
+        ):
+            raise ValueError
+    if "body" in value:
+        body = value["body"]
+        if not isinstance(body, dict) or set(body) != {"equals", "path"}:
+            raise ValueError
+        if not isinstance(body["path"], str) or not _DATA_PATH_RE.fullmatch(body["path"]):
+            raise ValueError
+        _validate_safe_scalar(body["equals"])
+
+
+def _validate_response_redaction(value: Any) -> None:
+    if (
+        not isinstance(value, list)
+        or len(value) != len(set(value))
+        or any(
+            not isinstance(selector, str)
+            or not _within_limit(selector, _MAX_RULE_STRING_BYTES)
+            or not _REDACTION_SELECTOR_RE.fullmatch(selector)
+            for selector in value
+        )
+    ):
+        raise ValueError
+
+
+def _validate_safe_json_value(value: Any, *, depth: int) -> None:
+    if depth > _MAX_SCHEMA_DEPTH:
+        raise ValueError
+    if value is None or isinstance(value, bool | int):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError
+        return
+    if isinstance(value, str):
+        _validate_safe_text(value, max_bytes=_MAX_PUBLIC_TEXT_BYTES)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_safe_json_value(item, depth=depth + 1)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _validate_schema_name(key)
+            _validate_safe_json_value(item, depth=depth + 1)
+        return
+    raise ValueError
+
+
+def _validate_safe_scalar(value: Any) -> None:
+    if value is None or isinstance(value, bool | int):
+        return
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return
+        raise ValueError
+    if isinstance(value, str):
+        _validate_safe_text(value, max_bytes=_MAX_RULE_STRING_BYTES)
+        return
+    raise ValueError
+
+
+def _validate_safe_text(value: Any, *, max_bytes: int) -> None:
+    if (
+        not isinstance(value, str)
+        or not _within_limit(value, max_bytes)
+        or any(ord(character) < 32 and character not in "\n\t" for character in value)
+        or sanitize_public_text(value) != value
+    ):
+        raise ValueError
+
+
+def _is_public_catalog_source_uri(value: Any) -> bool:
+    if not isinstance(value, str) or not value or not _within_limit(value, 2_048):
+        return False
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if parsed.scheme in {"http", "https"}:
+        return bool(
+            not parsed.fragment
+            and is_safe_public_http_url(value)
+            and sanitize_public_text(value) == value
+        )
+    if (
+        parsed.scheme != "mercury"
+        or parsed.netloc != "catalog"
+        or parsed.query
+        or parsed.fragment
+        or "%" in value
+        or "\\" in value
+        or not parsed.path.startswith("/")
+    ):
+        return False
+    segments = parsed.path.removeprefix("/").split("/")
+    return bool(
+        segments
+        and all(_WIKI_SEGMENT_RE.fullmatch(segment) for segment in segments)
+        and value == f"mercury://catalog/{'/'.join(segments)}"
+    )
 
 
 def _catalog_action_fields() -> tuple[str, ...]:
@@ -251,6 +719,8 @@ def _valid_decoded_path_template(value: str) -> bool:
     ):
         return False
     segments = value.removeprefix("/").split("/")
+    if segments and segments[-1] == "":
+        segments.pop()
     if not segments or any(not segment for segment in segments):
         return False
     if any(segment in {".", ".."} for segment in segments):

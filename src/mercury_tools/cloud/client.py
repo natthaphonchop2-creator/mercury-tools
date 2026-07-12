@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -30,27 +29,18 @@ from mercury_tools.cloud.models import (
     PublicSkillsEnvelope,
     is_canonical_document_identifier,
     is_canonical_skill_id,
-    sanitize_public_text,
     validate_document_identity,
-    validate_public_api_path_template,
-    validate_public_catalog_identity,
     validate_raw_catalog_action_payload,
     validate_skill_identity,
+)
+from mercury_tools.cloud.models import (
+    validate_public_catalog_action as _validate_shared_public_catalog_action,
 )
 from mercury_tools.config import load_settings
 
 _SELECTOR_RE = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 _ACTION_ID_RE = re.compile(r"^act_[0-9a-f]{24}$")
 _ETAG_RE = re.compile(r'^(?:W/)?"[A-Za-z0-9._:-]{1,128}"$')
-_PUBLIC_INPUT_SCHEMA = {
-    "path": {},
-    "query": {},
-    "headers": {},
-    "body": {},
-    "files": {},
-}
-
-
 @dataclass(frozen=True)
 class CatalogFetchResult:
     actions: tuple[CatalogAction, ...]
@@ -124,7 +114,6 @@ class CloudBrainClient:
             raise ValueError("cloud_catalog_invalid")
         for item in rows:
             validate_raw_catalog_action_payload(item)
-            _validate_public_action_payload_path(item)
         etag = response.headers.get("etag")
         if not isinstance(etag, str) or not _ETAG_RE.fullmatch(etag):
             raise ValueError("cloud_catalog_etag_invalid")
@@ -158,7 +147,6 @@ class CloudBrainClient:
         if not isinstance(payload, dict) or set(payload) != {"action"}:
             raise ValueError("cloud_catalog_invalid")
         validate_raw_catalog_action_payload(payload["action"])
-        _validate_public_action_payload_path(payload["action"])
         action = revalidate_catalog_action(CatalogAction.model_validate(payload["action"]))
         if action.action_id != action_id:
             raise ValueError("cloud_catalog_invalid")
@@ -300,59 +288,7 @@ def _valid_document_identifier(value: str) -> bool:
 
 
 def _validate_public_catalog_action(action: CatalogAction) -> None:
-    payload = action.model_dump(mode="json")
-    try:
-        validate_public_catalog_identity(action)
-    except ValueError:
-        raise ValueError("cloud_catalog_projection_invalid") from None
-    if (
-        payload["input_schema"] != _PUBLIC_INPUT_SCHEMA
-        or payload["examples"] != []
-        or payload["idempotency"] != {}
-        or payload["success_rules"] != {}
-        or payload["error_rules"] != {}
-        or payload["response_redaction"] != []
-        or not re.fullmatch(r"[0-9a-f]{64}", action.source_hash)
-        or any(not _ACTION_ID_RE.fullmatch(item) for item in action.preflight_action_ids)
-        or not _is_public_catalog_source(action)
-    ):
-        raise ValueError("cloud_catalog_projection_invalid")
-    if (
-        sanitize_public_text(action.path_template, redact_paths=False) != action.path_template
-    ):
-        raise ValueError("cloud_catalog_projection_invalid")
-    try:
-        validate_public_api_path_template(action.path_template)
-    except ValueError:
-        raise ValueError("cloud_catalog_projection_invalid") from None
-    public_text_payload = {**payload, "path_template": ""}
-    serialized = json.dumps(public_text_payload, ensure_ascii=False, sort_keys=True)
-    if sanitize_public_text(serialized) != serialized:
-        raise ValueError("cloud_catalog_projection_invalid")
-
-
-def _validate_public_action_payload_path(value: Any) -> None:
-    if not isinstance(value, dict):
-        raise ValueError("cloud_catalog_invalid")
-    try:
-        validate_public_api_path_template(value.get("path_template"))
-    except ValueError:
-        raise ValueError("cloud_catalog_projection_invalid") from None
-
-
-def _is_public_catalog_source(action: CatalogAction) -> bool:
-    source_uri = action.source_uri
-    if source_uri == f"mercury://catalog/{action.connector_id}/{action.action_id}":
-        return True
-    parsed = urlparse(source_uri)
-    return bool(
-        parsed.scheme in {"http", "https"}
-        and parsed.netloc
-        and parsed.username is None
-        and parsed.password is None
-        and not parsed.fragment
-        and sanitize_public_text(source_uri) == source_uri
-    )
+    _validate_shared_public_catalog_action(action)
 
 
 def _validate_public_response(response: httpx.Response, model_type: Any) -> Any:

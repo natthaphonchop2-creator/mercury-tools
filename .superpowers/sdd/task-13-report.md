@@ -649,3 +649,121 @@ The warning is the pre-existing Starlette `TestClient` deprecation warning.
   canonical `mercury://wiki/...` validation after fetch and before public
   projection. Moving the URI restriction into query execution remains a future
   database/RPC change outside Task 13.
+
+## Fix Round 6: Executable Catalog Compatibility
+
+### Status
+
+DONE_WITH_CONCERNS
+
+This compatibility fix starts from `77e5b1a`. It changes only the owned Cloud
+API/client/models tests and this report. No flow, local MCP, plugin, catalog
+generator, or generated catalog file was edited.
+
+### Findings Addressed
+
+1. Replaced the lossy server-side catalog projection with admission of the
+   original canonical `CatalogAction`. Public-safe `action_id`, `version_id`,
+   executable input schema, idempotency metadata, success/error rules,
+   response-redaction selectors, source URI, and source hash now cross the
+   Cloud boundary unchanged. The server no longer recomputes a projected
+   version ID.
+2. Added one shared executable-contract validator used by the API and client.
+   It strictly allowlists parameter, body, file, idempotency, response-rule,
+   redaction-selector, and public source shapes. Unsupported schema composition,
+   references, defaults, examples, unknown keys, malformed status codes,
+   traversal selectors, unsafe paths/URLs, and credential-bearing values fail
+   closed.
+3. Kept schema field names such as `client_secret`, `password`, and
+   `access_token` valid as declarations or redaction selectors while rejecting
+   credential values. This distinction preserves the generated FlowAccount and
+   PEAK contracts without exposing credentials.
+4. The client validates exact raw JSON container and scalar types before
+   `CatalogAction` coercion, revalidates canonical identity, applies the shared
+   public validator, and only then atomically replaces the previous cache.
+5. Added an end-to-end client test proving a fetched global POST action can be
+   passed to `build_request`, validates path/query/body inputs, derives the
+   idempotency header, and retains the canonical version ID.
+6. Added a parameterized validator regression over every generated builtin
+   action: 190 FlowAccount actions and 64 PEAK actions.
+7. Existing catalog redaction tests now assert fail-closed 503 behavior for an
+   unsafe canonical action. Other skill, RAG, and document projections continue
+   to redact and return successful public responses.
+
+### RED Evidence
+
+The inherited RED tests reproduced the compatibility gap exactly:
+
+```text
+$ .venv/bin/pytest -q tests/test_cloud_api.py tests/test_cloud_client.py
+10 failed, 281 passed in 1.26s
+```
+
+The failures covered schema/version loss, executable contract loss, unsupported
+shape admission, examples being stripped instead of rejected, and the local
+client rejecting a canonical executable action.
+
+The added builtin validator test was also observed RED before the shared
+validator existed:
+
+```text
+$ .venv/bin/pytest -q \
+    tests/test_cloud_api.py::test_public_catalog_validator_accepts_every_builtin_action
+2 failed in 0.29s
+```
+
+### GREEN Evidence
+
+Focused Cloud API/client tests:
+
+```text
+$ .venv/bin/pytest -q tests/test_cloud_api.py tests/test_cloud_client.py
+293 passed in 2.09s
+```
+
+Focused Cloud API/client/redaction/hosted/RAG verification after cleanup:
+
+```text
+$ .venv/bin/pytest -q tests/test_cloud_api.py tests/test_cloud_client.py \
+    tests/test_redaction.py tests/test_http_app.py tests/test_mcp_rag_routing.py
+370 passed, 1 warning in 2.02s
+```
+
+Complete non-integration verification:
+
+```text
+$ .venv/bin/pytest -q -m 'not integration'
+1467 passed, 1 deselected, 1 warning in 7.50s
+```
+
+Direct builtin validation:
+
+```text
+flowaccount: 190 validated
+peak: 64 validated
+```
+
+Static verification:
+
+```text
+$ .venv/bin/ruff check .
+All checks passed!
+```
+
+The warning remains the pre-existing Starlette `TestClient` deprecation warning.
+
+### Commit
+
+- Parent: `77e5b1a453e5241a2d0280796ae59cade8373eae`
+- Subject: `fix: preserve executable Cloud catalog actions`
+- Final hash: reported in the completion response because a commit cannot
+  contain its own hash.
+
+### Residual Concern
+
+- The allowlist intentionally fails closed when a future generator introduces a
+  new schema or rule keyword. The two current generator quirks accepted for
+  canonical compatibility are nested object schemas represented as
+  `{"properties": ...}` without an explicit object type and API paths with a
+  trailing slash. Any broader schema evolution requires an explicit validator
+  and request-builder compatibility update.
