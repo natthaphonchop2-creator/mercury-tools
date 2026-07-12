@@ -8,7 +8,10 @@ import pytest
 import pytest_asyncio
 from starlette.applications import Starlette
 
+from mercury_tools.catalog.identity import build_version_id
+from mercury_tools.cloud import api as cloud_api
 from mercury_tools.cloud.api import CloudDependencies, cloud_routes
+from mercury_tools.db.product import SKILL_CATALOG_SEED
 from mercury_tools.rag.models import SearchResult
 
 
@@ -32,8 +35,10 @@ class RagStoreSpy:
         self.last_filters = None
         self.last_document_id = None
         self.thread_id = None
+        self.search_calls = 0
 
     def search_knowledge(self, **kwargs):
+        self.search_calls += 1
         self.last_query = kwargs["query"]
         self.last_filters = kwargs["filters"]
         self.thread_id = threading.get_ident()
@@ -120,10 +125,11 @@ class RagStoreSpy:
 class SkillLoaderSpy:
     def __init__(self) -> None:
         self.calls = []
+        self.markdown = "# VAT\nContact person@example.com."
 
     def __call__(self, skill_id):
         self.calls.append(skill_id)
-        return "# VAT\nContact person@example.com."
+        return self.markdown
 
 
 @pytest.fixture
@@ -556,3 +562,347 @@ async def test_cloud_responses_use_exact_public_projection_keys(
         "source_uri",
         "source_url",
     }
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "mercury://wiki/../../private",
+        "mercury://wiki//private",
+        "mercury://wiki/%2e%2e/private",
+        "mercury://wiki/private/",
+        "mercury://wiki/private\\document",
+        "MERCURY://wiki/private",
+        "mercury://WIKI/private",
+        "mercury://wiki/private?source=legacy",
+        "mercury://wiki/private#chunk-0",
+    ],
+)
+def test_public_wiki_uri_validator_rejects_noncanonical_values(uri) -> None:
+    assert cloud_api.is_canonical_public_wiki_uri(uri) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "mercury://wiki/../../private",
+        "mercury://wiki//private",
+        "mercury://wiki/%2e%2e/private",
+        "mercury://wiki/private/",
+    ],
+)
+async def test_cloud_search_rejects_malformed_reviewed_wiki_rows(
+    client, cloud_dependencies, uri
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    rag_store.search_knowledge = lambda **_kwargs: [
+        SearchResult(
+            chunk_id="malformed-chunk",
+            document_id="malformed-document",
+            document_uri=uri,
+            chunk_uri=f"{uri}#chunk-0",
+            text="must not escape",
+            score=0.99,
+            source_title="Malformed",
+            source_uri=uri,
+            source_url=None,
+            source_path=None,
+            citation={"heading": "Malformed"},
+            metadata={"review_status": "reviewed"},
+        )
+    ]
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": "VAT", "top_k": 4},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "service_unavailable"}
+    assert "must not escape" not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "mercury://wiki/../../private",
+        "mercury://wiki//private",
+        "mercury://wiki/%2e%2e/private",
+    ],
+)
+async def test_cloud_document_rejects_malformed_public_membership(
+    client, cloud_dependencies, uri
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    rag_store.get_document = lambda document_id: {
+        "id": document_id,
+        "document_uri": uri,
+        "title": "Malformed",
+        "body": "private document body",
+        "sha256": "a" * 64,
+        "knowledge_sources": {
+            "title": "Malformed",
+            "source_uri": uri,
+            "source_url": None,
+            "review_status": "reviewed",
+        },
+    }
+
+    response = await client.get(
+        "/api/cloud/v1/documents/11111111-1111-4111-8111-111111111111"
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "service_unavailable"}
+    assert "private document body" not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("jurisdiction", "person@example.com"),
+        ("connector", "0105559999999"),
+        ("doc_type", "Bearer arbitrary-sensitive-material"),
+        ("review_status", "api_key=private-value"),
+        ("connector", "SUPABASE_SERVICE_ROLE_KEY=sb_secret_TASK13_EXAMPLE"),
+        ("doc_type", "/Users/operator/private/wiki.md"),
+        ("effective_date", "2026-02-30"),
+    ],
+)
+async def test_cloud_search_rejects_sensitive_or_noncanonical_filters_before_rag(
+    client, cloud_dependencies, field, value
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    calls_before = rag_store.search_calls
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": "VAT", "filters": {field: value}, "top_k": 4},
+    )
+
+    assert response.status_code == 400
+    assert rag_store.search_calls == calls_before
+    assert value not in rag_store.last_query
+
+
+@pytest.mark.asyncio
+async def test_cloud_search_sanitizes_filters_and_forces_reviewed_before_rag(
+    client, cloud_dependencies
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={
+            "query": "VAT",
+            "filters": {
+                "jurisdiction": "TH",
+                "connector": "flowaccount",
+                "doc_type": "tax",
+                "review_status": "draft",
+                "effective_date": "2026-07-12",
+            },
+            "top_k": 4,
+        },
+    )
+
+    assert response.status_code == 200
+    assert rag_store.last_filters.jurisdiction == "TH"
+    assert rag_store.last_filters.connector == "flowaccount"
+    assert rag_store.last_filters.doc_type == "tax"
+    assert rag_store.last_filters.review_status == "reviewed"
+    assert rag_store.last_filters.effective_date == "2026-07-12"
+
+
+@pytest.mark.asyncio
+async def test_cloud_redacts_supabase_secrets_across_every_public_projection(
+    client, cloud_dependencies
+) -> None:
+    dependencies, read_action, rag_store, catalog_store, skill_loader = cloud_dependencies
+    secret = "sb_secret_TASK13_EXAMPLE"
+    assignment = f"SUPABASE_SERVICE_ROLE_KEY={secret}"
+    tampered = read_action.model_copy(update={"description": assignment})
+    tampered = tampered.model_copy(update={"version_id": build_version_id(tampered)})
+    catalog_store.actions = [tampered]
+    skill_loader.markdown = f"# VAT\nservice_role_key: {secret}"
+    rag_store.search_knowledge = lambda **_kwargs: [
+        SearchResult(
+            chunk_id="chunk-secret",
+            document_id="document-secret",
+            document_uri="mercury://wiki/vat-secret",
+            chunk_uri="mercury://wiki/vat-secret#chunk-0",
+            text=f"Search text {assignment}",
+            score=0.9,
+            source_title="VAT",
+            source_uri="mercury://wiki/vat-secret",
+            source_url=None,
+            source_path=None,
+            citation={"heading": f"service_role_key={secret}"},
+            metadata={"review_status": "reviewed"},
+        )
+    ]
+    rag_store.get_document = lambda document_id: {
+        "id": document_id,
+        "document_uri": "mercury://wiki/vat-secret",
+        "title": "VAT",
+        "body": f"Document {secret}",
+        "sha256": "a" * 64,
+        "knowledge_sources": {
+            "title": "Wiki",
+            "source_uri": "mercury://wiki/vat-secret",
+            "source_url": None,
+            "review_status": "reviewed",
+        },
+    }
+
+    catalog = await client.get("/api/cloud/v1/catalog/actions")
+    skill = await client.get("/api/cloud/v1/skills/vat-summary-th")
+    search = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": assignment, "top_k": 4},
+    )
+    document = await client.get(
+        "/api/cloud/v1/documents/11111111-1111-4111-8111-111111111111"
+    )
+
+    serialized = json.dumps(
+        {
+            "catalog": catalog.json(),
+            "skill": skill.json(),
+            "search": search.json(),
+            "document": document.json(),
+        }
+    )
+    assert catalog.status_code == skill.status_code == 200
+    assert search.status_code == document.status_code == 200
+    assert secret not in rag_store.last_query
+    assert secret not in serialized
+    assert assignment not in serialized
+    assert dependencies.skill_loader.calls == ["vat-summary-th"]
+
+
+@pytest.mark.asyncio
+async def test_cloud_skills_ignore_injected_replacement_for_seeded_id(
+    client, cloud_dependencies
+) -> None:
+    dependencies, _, _, _, skill_loader = cloud_dependencies
+    canonical = next(
+        item for item in SKILL_CATALOG_SEED if item["skill_id"] == "vat-summary-th"
+    )
+    dependencies.skills = (
+        {
+            **canonical,
+            "title": "Injected replacement",
+            "summary": "Injected summary",
+            "version": "999.0.0",
+        },
+    )
+
+    listing = await client.get("/api/cloud/v1/skills")
+    detail = await client.get("/api/cloud/v1/skills/vat-summary-th")
+
+    listed = next(
+        item for item in listing.json()["skills"] if item["skill_id"] == "vat-summary-th"
+    )
+    assert listed["title"] == canonical["title"]
+    assert listed["summary"] == canonical["summary"]
+    assert listed["version"] == canonical["version"]
+    assert detail.json()["title"] == canonical["title"]
+    assert detail.json()["version"] == canonical["version"]
+    assert skill_loader.calls == ["vat-summary-th"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", [None, "not-a-list", {"results": []}])
+async def test_cloud_search_malformed_upstream_returns_constant_503(
+    client, cloud_dependencies, malformed
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    rag_store.search_knowledge = lambda **_kwargs: malformed
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": "VAT", "top_k": 4},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "service_unavailable"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field_value",
+    [
+        {"metadata": None},
+        {"citation": None},
+        {"score": float("nan")},
+    ],
+)
+async def test_cloud_search_malformed_result_returns_constant_503(
+    client, cloud_dependencies, field_value
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    values = {
+        "chunk_id": "chunk-1",
+        "document_id": "document-1",
+        "document_uri": "mercury://wiki/vat",
+        "chunk_uri": "mercury://wiki/vat#chunk-0",
+        "text": "VAT",
+        "score": 0.9,
+        "source_title": "VAT",
+        "source_uri": "mercury://wiki/vat",
+        "source_url": None,
+        "source_path": None,
+        "citation": {"heading": "VAT"},
+        "metadata": {"review_status": "reviewed"},
+    }
+    values.update(field_value)
+    rag_store.search_knowledge = lambda **_kwargs: [SearchResult(**values)]
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": "VAT", "top_k": 4},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "service_unavailable"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"knowledge_sources": "not-a-source"},
+        {"body": {"unexpected": "object"}},
+        {"knowledge_sources": {"review_status": ["reviewed"]}},
+    ],
+)
+async def test_cloud_document_malformed_upstream_returns_constant_503(
+    client, cloud_dependencies, document
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    payload = {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "document_uri": "mercury://wiki/vat",
+        "title": "VAT",
+        "body": "VAT body",
+        "sha256": "a" * 64,
+        "knowledge_sources": {
+            "title": "Wiki",
+            "source_uri": "mercury://wiki/vat",
+            "source_url": None,
+            "review_status": "reviewed",
+        },
+    }
+    payload.update(document)
+    rag_store.get_document = lambda _document_id: payload
+
+    response = await client.get(
+        "/api/cloud/v1/documents/11111111-1111-4111-8111-111111111111"
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"error": "service_unavailable"}

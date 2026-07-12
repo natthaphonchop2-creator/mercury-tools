@@ -135,3 +135,104 @@ The warning is the existing Starlette `TestClient` deprecation warning recommend
 
 - The existing `match_knowledge_chunks` RPC has no source-URI-prefix parameter. Task 13 therefore enforces the public boundary by forcing `review_status="reviewed"` in the store call and then requiring reviewed `mercury://wiki/` document/source metadata before any result is returned. Legacy candidates cannot appear in the API response, but adding a source-prefix argument to a future RPC would move the same boundary into the database query.
 - The suite still reports one pre-existing Starlette `TestClient` deprecation warning. It is unrelated to Task 13 behavior.
+
+## Fix Round: Cloud Boundary Hardening
+
+### Status
+
+DONE_WITH_CONCERNS
+
+This fix round addresses the consolidated Task 13 architecture and adversarial findings without adding Task 14 behavior or changing the seven-route read-only surface.
+
+### Findings Addressed
+
+1. Replaced `startswith("mercury://wiki/")` trust decisions with one strict canonical wiki URI validator. The same validator covers public document request URIs, returned document/source URIs, and search document/source/chunk URIs. It rejects traversal segments, empty/doubled segments, trailing separators, percent-encoded ambiguity, backslashes, query strings, unexpected fragments, and noncanonical scheme/authority casing.
+2. Extended shared redaction for modern `sb_secret_...` values, `SUPABASE_SERVICE_ROLE_KEY`, `service_role_key`, and generic sensitive key/value assignments. The JSON-key policy remains narrow enough to preserve credential containers and nonsecret status metadata.
+3. Added canonical search-filter validation before `SearchFilters`: selector fields use the existing strict selector grammar, `effective_date` must be a canonical ISO date, sensitive values are rejected after defense-in-depth sanitization, and `review_status` is always overwritten with `reviewed` before RAG.
+4. Snapshotted canonical skill metadata from `SKILL_CATALOG_SEED`. Injected `skills` data can no longer replace a seeded title, summary, or version, and only canonical seeded IDs reach the markdown loader.
+5. Added client-side public catalog projection admission. A valid immutable `CatalogAction` is still rejected before cache mutation when it contains ERP schemas/examples, idempotency or success/error rules, response redaction paths, unsafe source URIs, unsafe text, or invalid public projection fields. Existing cached rows are validated before fallback use.
+6. A 200 catalog response now requires a syntactically valid ETag. Missing or malformed ETags raise and preserve the last good snapshot and conditional ETag.
+7. Search and document upstream rows now pass explicit shape, finite-number, canonical URI, public membership, and JSON-serializability checks. Malformed metadata, citations, values, or containers return the constant `503 {"error":"service_unavailable"}` response.
+8. Preserved all prior guarantees: exactly seven read-only routes, wrong methods return 405, lazy Supabase setup, no client Authorization header/repository path/ERP payload/secret, one unfiltered global catalog snapshot with local filters, no stale fallback for 4xx or malformed 200, and fallback only for transport errors, 5xx, and 304.
+
+### Changed Files
+
+- `src/mercury_tools/cloud/api.py`
+- `src/mercury_tools/cloud/client.py`
+- `src/mercury_tools/safety/redaction.py`
+- `tests/test_cloud_api.py`
+- `tests/test_cloud_client.py`
+- `.superpowers/sdd/task-13-report.md`
+
+### RED Evidence
+
+```text
+$ uv run pytest tests/test_cloud_api.py tests/test_cloud_client.py -q
+46 failed, 46 passed in 1.17s
+```
+
+The failures covered all mandatory fix findings: canonical public URI bypasses, unsanitized filters and Supabase secrets, injected seeded-skill replacement, malformed upstream projection failures, untrusted catalog projection admission, and missing/malformed ETag handling.
+
+The first full non-integration run also caught an overbroad shared JSON-key redaction regression:
+
+```text
+$ uv run pytest -m 'not integration' -q
+2 failed, 1191 passed, 1 deselected, 1 warning in 5.72s
+```
+
+The JSON-key matcher was narrowed while retaining text-assignment and service-role redaction. The two affected regressions and the new end-to-end secret test then passed together.
+
+### GREEN Evidence
+
+```text
+$ uv run pytest tests/test_cloud_api.py tests/test_cloud_client.py -q
+92 passed in 0.42s
+```
+
+```text
+$ uv run pytest tests/test_redaction.py -q
+15 passed in 0.02s
+```
+
+```text
+$ uv run pytest tests/test_cloud_api.py tests/test_cloud_client.py \
+    tests/test_http_app.py tests/test_mcp_rag_routing.py tests/test_redaction.py -q
+131 passed, 1 warning in 0.84s
+```
+
+```text
+$ uv run pytest \
+    tests/test_generic_drivers.py::test_terminal_wildcard_redaction_replaces_every_child_value \
+    tests/test_product_fallback.py::test_product_store_audit_fallback_encrypts_connector_credentials \
+    tests/test_cloud_api.py::test_cloud_redacts_supabase_secrets_across_every_public_projection \
+    tests/test_redaction.py -q
+18 passed in 0.15s
+```
+
+```text
+$ uv run pytest -m 'not integration' -q
+1193 passed, 1 deselected, 1 warning in 6.75s
+```
+
+```text
+$ uv run ruff check src/mercury_tools/cloud/api.py \
+    src/mercury_tools/cloud/client.py src/mercury_tools/safety/redaction.py \
+    tests/test_cloud_api.py tests/test_cloud_client.py
+All checks passed!
+```
+
+```text
+$ git diff --check
+<no output>
+```
+
+### Commit
+
+- Parent: `85d0867f156d234f9edbc570e8d85f0319b2b016`
+- Subject: `fix: harden Mercury Cloud Brain boundaries`
+- Final hash: reported in the completion response because a commit cannot contain its own hash.
+
+### Residual Concerns
+
+- `match_knowledge_chunks` still has no source-URI-prefix parameter. This fix retains the forced `review_status="reviewed"` store filter and now applies strict canonical `mercury://wiki/...` membership validation after fetch. No legacy or malformed row can be projected, but a future database/RPC change would be needed to move the URI boundary into query execution.
+- The pre-existing Starlette `TestClient` deprecation warning remains. Integration tests were intentionally excluded by the required full non-integration command.

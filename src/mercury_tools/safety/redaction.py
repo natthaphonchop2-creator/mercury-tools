@@ -10,10 +10,19 @@ from typing import Any
 from urllib.parse import quote, quote_plus, unquote, unquote_plus
 
 TOKEN_RE = re.compile(
-    r"(?i)\b(?:bearer\s+)?(?:sk-[a-z0-9_-]{12,}|gho_[a-z0-9_]{12,}|eyj[a-z0-9_-]{20,}|mc_[a-z0-9_-]{20,}\.[a-z0-9_-]{20,})\b"
+    r"(?i)\b(?:bearer\s+)?(?:sk-[a-z0-9_-]{12,}|gho_[a-z0-9_]{12,}|"
+    r"eyj[a-z0-9_-]{20,}|mc_[a-z0-9_-]{20,}\.[a-z0-9_-]{20,}|"
+    r"sb_secret_[a-z0-9_-]{4,})\b"
 )
 KEY_VALUE_RE = re.compile(
-    r"(?i)\b(api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|password)\s*[:=]\s*([^\s,;]+)"
+    r"(?i)\b((?:[a-z0-9]+[_-])*(?:api[_-]?key|client[_-]?secret|"
+    r"service[_-]?role[_-]?key|private[_-]?key|secret[_-]?key|"
+    r"access[_-]?token|refresh[_-]?token|password|credential|secret|token))"
+    r"\s*[:=]\s*([^\s,;]+)"
+)
+SENSITIVE_KEY_RE = re.compile(
+    r"(?i)(?:secret|token|api[_-]?key|password|"
+    r"service[_-]?role[_-]?key|private[_-]?key)"
 )
 EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 THAI_TAX_ID_RE = re.compile(r"\b\d{13}\b")
@@ -66,7 +75,7 @@ def redact_json(value: Any) -> Any:
             key_text = str(key)
             if (
                 key_text not in SAFE_SECRET_SCHEMA_KEYS
-                and re.search(r"(?i)(secret|token|api[_-]?key|password)", key_text)
+                and SENSITIVE_KEY_RE.search(key_text)
             ):
                 redacted[key] = "[REDACTED]"
             else:

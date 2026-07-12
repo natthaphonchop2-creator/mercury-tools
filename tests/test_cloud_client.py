@@ -6,20 +6,35 @@ import httpx
 import pytest
 
 from mercury_tools.catalog.cache import CatalogCache
+from mercury_tools.catalog.identity import build_version_id
 from mercury_tools.cloud.client import CloudBrainClient
 from mercury_tools.config import DEFAULT_CLOUD_BASE_URL, load_settings
 
 
-def _read_action(action_factory):
-    return action_factory(
-        method="GET",
-        path_template="/company",
-        operation_id="getCompany",
-        capability="company.info.read",
-        risk_tier=0,
-        required_confirmations=0,
-        side_effects=(),
-    )
+def _read_action(action_factory, **overrides):
+    values = {
+        "method": "GET",
+        "path_template": "/company",
+        "operation_id": "getCompany",
+        "capability": "company.info.read",
+        "risk_tier": 0,
+        "required_confirmations": 0,
+        "side_effects": (),
+        "input_schema": {
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": {},
+            "files": {},
+        },
+        "examples": (),
+        "idempotency": {},
+        "success_rules": {},
+        "error_rules": {},
+        "response_redaction": (),
+    }
+    values.update(overrides)
+    return action_factory(**values)
 
 
 @pytest.mark.asyncio
@@ -52,15 +67,12 @@ async def test_client_caches_cloud_catalog_by_etag_without_auth_header(
     repository_context, action_factory
 ) -> None:
     action = _read_action(action_factory)
-    peak_action = action_factory(
+    peak_action = _read_action(
+        action_factory,
         connector_id="peak",
-        method="GET",
         path_template="/contacts",
         operation_id="listContacts",
         capability="contacts.read",
-        risk_tier=0,
-        required_confirmations=0,
-        side_effects=(),
     )
     seen_requests: list[httpx.Request] = []
 
@@ -366,3 +378,116 @@ async def test_client_uses_configured_cloud_base_url_when_not_explicit(
         assert str(client.client.base_url) == "https://configured.example.test/root/"
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (
+            "input_schema",
+            {
+                "path": {},
+                "query": {"secret": {"type": "string"}},
+                "headers": {},
+                "body": {},
+                "files": {},
+            },
+        ),
+        ("examples", ({"body": {"amount": 100}},)),
+        ("idempotency", {"header": "Idempotency-Key"}),
+        ("success_rules", {"status": [200]}),
+        ("error_rules", {"400": "bad request"}),
+        ("response_redaction", ("$.secret",)),
+        ("source_uri", "file:///Users/operator/private/openapi.json"),
+        ("source_uri", "mercury://wiki/../../private"),
+        (
+            "description",
+            "SUPABASE_SERVICE_ROLE_KEY=sb_secret_TASK13_EXAMPLE",
+        ),
+    ],
+)
+async def test_client_rejects_nonpublic_catalog_projection_without_poisoning_cache(
+    repository_context, action_factory, field, value
+) -> None:
+    cached_action = _read_action(action_factory)
+    cache = CatalogCache(repository_context)
+    cache.replace_global([cached_action], etag='"trusted"')
+    malicious = cached_action.model_copy(update={field: value})
+    malicious = malicious.model_copy(update={"version_id": build_version_id(malicious)})
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=cache,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={"ETag": '"malicious"'},
+                json={"actions": [malicious.model_dump(mode="json")]},
+            )
+        ),
+    )
+    try:
+        with pytest.raises(ValueError, match="cloud_catalog_projection_invalid"):
+            await client.list_actions()
+    finally:
+        await client.aclose()
+
+    assert cache.list_global() == [cached_action]
+    assert cache.conditional_headers() == {"If-None-Match": '"trusted"'}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("etag", [None, "unquoted", '"unterminated'])
+async def test_client_rejects_missing_or_malformed_etag_without_mutating_cache(
+    repository_context, action_factory, etag
+) -> None:
+    action = _read_action(action_factory)
+    cache = CatalogCache(repository_context)
+    cache.replace_global([action], etag='"trusted"')
+    headers = {} if etag is None else {"ETag": etag}
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=cache,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers=headers,
+                json={"actions": [action.model_dump(mode="json")]},
+            )
+        ),
+    )
+    try:
+        with pytest.raises(ValueError, match="cloud_catalog_etag_invalid"):
+            await client.list_actions()
+    finally:
+        await client.aclose()
+
+    assert cache.list_global() == [action]
+    assert cache.conditional_headers() == {"If-None-Match": '"trusted"'}
+
+
+@pytest.mark.asyncio
+async def test_client_rejects_sensitive_filters_before_network(repository_context) -> None:
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"results": []})
+
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=CatalogCache(repository_context),
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(ValueError, match="cloud_search_invalid"):
+            await client.search_knowledge(
+                "VAT",
+                filters={
+                    "connector": "SUPABASE_SERVICE_ROLE_KEY=sb_secret_TASK13_EXAMPLE"
+                },
+            )
+    finally:
+        await client.aclose()
+
+    assert requests == []

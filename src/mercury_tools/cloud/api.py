@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 import httpx
 from starlette.concurrency import run_in_threadpool
@@ -40,9 +43,8 @@ _FILTER_FIELDS = {
 }
 _SELECTOR_RE = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 _ACTION_ID_RE = re.compile(r"^act_[0-9a-f]{24}$")
-_PUBLIC_DOCUMENT_URI_RE = re.compile(
-    r"^mercury://wiki/[A-Za-z0-9][A-Za-z0-9._~/-]{0,480}$"
-)
+_WIKI_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,199}$")
+_CHUNK_FRAGMENT_RE = re.compile(r"^chunk-[0-9]+$")
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
 _ABSOLUTE_PATH_RE = re.compile(
     r"(?:(?:/Users|/home|/app|/var|/tmp|/private)/[^\s\"'<>]+|"
@@ -61,7 +63,10 @@ _PUBLIC_SKILL_FIELDS = (
     "required_connectors",
     "tags",
 )
-_SEEDED_SKILL_IDS = frozenset(str(item["skill_id"]) for item in SKILL_CATALOG_SEED)
+_CANONICAL_SKILLS = tuple(deepcopy(SKILL_CATALOG_SEED))
+_CANONICAL_SKILL_IDS = frozenset(
+    str(item["skill_id"]) for item in _CANONICAL_SKILLS
+)
 
 
 @dataclass
@@ -83,7 +88,7 @@ class CloudDependencies:
         return self.rag_store
 
     def _skills(self) -> Sequence[Mapping[str, Any]]:
-        return SKILL_CATALOG_SEED if self.skills is None else self.skills
+        return _CANONICAL_SKILLS
 
     async def list_actions(self, request: Request) -> Response:
         query = list(request.query_params.multi_items())
@@ -198,12 +203,13 @@ class CloudDependencies:
             or not isinstance(top_k, int)
             or isinstance(top_k, bool)
             or not 1 <= top_k <= 20
-            or not _valid_filters(filters)
         ):
             return _bad_request()
         sanitized_query = sanitize_search_query(query)
-        public_filters = dict(filters)
-        public_filters["review_status"] = "reviewed"
+        try:
+            public_filters = sanitize_search_filters(filters)
+        except ValueError:
+            return _bad_request()
         try:
             results = await run_in_threadpool(
                 self._search_knowledge,
@@ -213,11 +219,10 @@ class CloudDependencies:
             )
         except (httpx.HTTPError, RuntimeError, ValueError):
             return _service_unavailable()
-        public_results = [
-            _public_search_result(item)
-            for item in results
-            if _is_public_search_result(item)
-        ][:top_k]
+        try:
+            public_results = _project_public_search_results(results, top_k=top_k)
+        except (TypeError, ValueError, OverflowError):
+            return _service_unavailable()
         return JSONResponse({"results": public_results})
 
     async def get_document(self, request: Request) -> Response:
@@ -228,13 +233,13 @@ class CloudDependencies:
             document = await run_in_threadpool(self._get_document, document_id)
         except (httpx.HTTPError, RuntimeError, ValueError):
             return _service_unavailable()
-        if (
-            not isinstance(document, Mapping)
-            or not _document_identity_matches(document_id, document)
-            or not _is_public_document(document)
-        ):
+        try:
+            public_document = _project_public_document(document_id, document)
+        except (TypeError, ValueError, OverflowError):
+            return _service_unavailable()
+        if public_document is None:
             return _not_found()
-        return JSONResponse(_public_document(document))
+        return JSONResponse(public_document)
 
     def _catalog_actions(self) -> list[CatalogAction]:
         rows = self._catalog_store().list_active_actions()
@@ -264,7 +269,7 @@ class CloudDependencies:
     def _public_skills(self) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         for skill in self._skills():
-            if skill.get("skill_id") not in _SEEDED_SKILL_IDS:
+            if skill.get("skill_id") not in _CANONICAL_SKILL_IDS:
                 continue
             public = {
                 field: _clean_public_value(skill[field])
@@ -308,6 +313,29 @@ def sanitize_search_query(value: str) -> str:
     return sanitize_public_text(value)
 
 
+def sanitize_search_filters(value: Any) -> dict[str, str]:
+    if not isinstance(value, Mapping) or set(value) - _FILTER_FIELDS:
+        raise ValueError("cloud_search_filters_invalid")
+    sanitized: dict[str, str] = {}
+    for key, item in value.items():
+        if not isinstance(item, str) or not item or len(item) > 200:
+            raise ValueError("cloud_search_filters_invalid")
+        if key == "effective_date":
+            try:
+                if date.fromisoformat(item).isoformat() != item:
+                    raise ValueError
+            except ValueError:
+                raise ValueError("cloud_search_filters_invalid") from None
+        elif not _SELECTOR_RE.fullmatch(item):
+            raise ValueError("cloud_search_filters_invalid")
+        clean = sanitize_public_text(item)
+        if clean != item:
+            raise ValueError("cloud_search_filters_invalid")
+        sanitized[key] = clean
+    sanitized["review_status"] = "reviewed"
+    return sanitized
+
+
 def sanitize_public_text(value: str) -> str:
     text = str(sanitize_document(value))
     text = _BEARER_RE.sub("[REDACTED_TOKEN]", text)
@@ -330,6 +358,51 @@ def _public_search_result(result: SearchResult) -> dict[str, Any]:
     }
 
 
+def _project_public_search_results(
+    results: Any,
+    *,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    if not isinstance(results, Sequence) or isinstance(
+        results, (str, bytes, bytearray)
+    ):
+        raise ValueError("cloud_search_results_invalid")
+    public: list[dict[str, Any]] = []
+    for result in results:
+        if not isinstance(result, SearchResult):
+            raise ValueError("cloud_search_result_invalid")
+        _validate_search_result_shape(result)
+        if _is_public_search_result(result):
+            projected = _public_search_result(result)
+            json.dumps(projected, allow_nan=False)
+            public.append(projected)
+            if len(public) == top_k:
+                break
+    return public
+
+
+def _validate_search_result_shape(result: SearchResult) -> None:
+    string_fields = (
+        result.chunk_id,
+        result.document_id,
+        result.document_uri,
+        result.chunk_uri,
+        result.text,
+        result.source_title,
+        result.source_uri,
+    )
+    if (
+        any(not isinstance(item, str) for item in string_fields)
+        or not isinstance(result.citation, Mapping)
+        or not isinstance(result.metadata, Mapping)
+        or (result.source_url is not None and not isinstance(result.source_url, str))
+        or isinstance(result.score, bool)
+        or not isinstance(result.score, (int, float))
+        or not math.isfinite(result.score)
+    ):
+        raise ValueError("cloud_search_result_invalid")
+
+
 def _public_document(document: Mapping[str, Any]) -> dict[str, Any]:
     source = _document_source(document) or {}
     return {
@@ -344,6 +417,54 @@ def _public_document(document: Mapping[str, Any]) -> dict[str, Any]:
             "source_url": _clean_public_value(source.get("source_url")),
         },
     }
+
+
+def _project_public_document(
+    requested: str,
+    document: Any,
+) -> dict[str, Any] | None:
+    if document is None:
+        return None
+    if not isinstance(document, Mapping):
+        raise ValueError("cloud_document_invalid")
+    if not _document_identity_matches(requested, document):
+        return None
+    document_uri = document.get("document_uri")
+    if not isinstance(document_uri, str):
+        raise ValueError("cloud_document_invalid")
+    source = _document_source(document)
+    if source is None:
+        if _looks_like_wiki_uri(document_uri):
+            raise ValueError("cloud_document_invalid")
+        return None
+    source_uri = source.get("source_uri")
+    if not isinstance(source_uri, str):
+        if _looks_like_wiki_uri(document_uri):
+            raise ValueError("cloud_document_invalid")
+        return None
+    document_is_wiki = _looks_like_wiki_uri(document_uri)
+    source_is_wiki = _looks_like_wiki_uri(source_uri)
+    if not document_is_wiki and not source_is_wiki:
+        return None
+    if (
+        not is_canonical_public_wiki_uri(document_uri)
+        or not is_canonical_public_wiki_uri(source_uri)
+    ):
+        raise ValueError("cloud_document_invalid")
+    review_status = source.get("review_status")
+    if not isinstance(review_status, str):
+        raise ValueError("cloud_document_invalid")
+    if review_status != "reviewed":
+        return None
+    for field in ("id", "title", "body", "sha256"):
+        if not isinstance(document.get(field), str):
+            raise ValueError("cloud_document_invalid")
+    if not isinstance(source.get("title"), str) or (
+        source.get("source_url") is not None
+        and not isinstance(source.get("source_url"), str)
+    ):
+        raise ValueError("cloud_document_invalid")
+    return _public_document(document)
 
 
 def _clean_public_value(value: Any) -> Any:
@@ -375,15 +496,6 @@ def _public_citation(citation: Mapping[str, Any]) -> dict[str, Any]:
         )
         if key in citation
     }
-
-
-def _valid_filters(value: Any) -> bool:
-    if not isinstance(value, Mapping) or set(value) - _FILTER_FIELDS:
-        return False
-    return all(
-        item is None or (isinstance(item, str) and bool(item) and len(item) <= 200)
-        for item in value.values()
-    )
 
 
 def _valid_selector(value: str | None, *, required: bool = False) -> bool:
@@ -478,12 +590,57 @@ def _filter_actions(
 
 
 def _is_public_search_result(result: Any) -> bool:
-    return (
-        isinstance(result, SearchResult)
-        and result.document_uri.startswith("mercury://wiki/")
-        and result.source_uri.startswith("mercury://wiki/")
-        and result.metadata.get("review_status") == "reviewed"
-    )
+    document_is_wiki = _looks_like_wiki_uri(result.document_uri)
+    source_is_wiki = _looks_like_wiki_uri(result.source_uri)
+    chunk_is_wiki = _looks_like_wiki_uri(result.chunk_uri)
+    if not document_is_wiki and not source_is_wiki and not chunk_is_wiki:
+        return False
+    if (
+        not is_canonical_public_wiki_uri(result.document_uri)
+        or not is_canonical_public_wiki_uri(result.source_uri)
+        or not is_canonical_public_wiki_uri(result.chunk_uri, allow_chunk=True)
+        or not result.chunk_uri.startswith(f"{result.document_uri}#")
+    ):
+        raise ValueError("cloud_search_result_invalid")
+    return result.metadata.get("review_status") == "reviewed"
+
+
+def is_canonical_public_wiki_uri(
+    value: Any,
+    *,
+    allow_chunk: bool = False,
+) -> bool:
+    if not isinstance(value, str) or not value or len(value) > 520:
+        return False
+    if "%" in value or "\\" in value:
+        return False
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if (
+        parsed.scheme != "mercury"
+        or parsed.netloc != "wiki"
+        or parsed.query
+        or not parsed.path.startswith("/")
+    ):
+        return False
+    if parsed.fragment:
+        if not allow_chunk or not _CHUNK_FRAGMENT_RE.fullmatch(parsed.fragment):
+            return False
+    elif allow_chunk:
+        return False
+    segments = parsed.path.removeprefix("/").split("/")
+    if not segments or any(not _WIKI_SEGMENT_RE.fullmatch(item) for item in segments):
+        return False
+    canonical = f"mercury://wiki/{'/'.join(segments)}"
+    if parsed.fragment:
+        canonical = f"{canonical}#{parsed.fragment}"
+    return canonical == value
+
+
+def _looks_like_wiki_uri(value: Any) -> bool:
+    return isinstance(value, str) and value.casefold().startswith("mercury://wiki")
 
 
 def _valid_document_identifier(value: str) -> bool:
@@ -491,10 +648,7 @@ def _valid_document_identifier(value: str) -> bool:
         return str(uuid.UUID(value)) == value
     except ValueError:
         pass
-    if not _PUBLIC_DOCUMENT_URI_RE.fullmatch(value):
-        return False
-    suffix = value.removeprefix("mercury://wiki/")
-    return ".." not in suffix and "//" not in suffix
+    return is_canonical_public_wiki_uri(value)
 
 
 def _document_source(document: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -510,21 +664,11 @@ def _document_source(document: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return None
 
 
-def _is_public_document(document: Mapping[str, Any]) -> bool:
-    source = _document_source(document)
-    return bool(
-        str(document.get("document_uri") or "").startswith("mercury://wiki/")
-        and source
-        and source.get("review_status") == "reviewed"
-        and str(source.get("source_uri") or "").startswith("mercury://wiki/")
-    )
-
-
 def _document_identity_matches(
     requested: str,
     document: Mapping[str, Any],
 ) -> bool:
-    if requested.startswith("mercury://wiki/"):
+    if is_canonical_public_wiki_uri(requested):
         return document.get("document_uri") == requested
     return str(document.get("id") or "") == requested
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from dataclasses import dataclass
@@ -16,20 +17,23 @@ from mercury_tools.catalog.models import (
     HttpMethod,
     revalidate_catalog_action,
 )
-from mercury_tools.cloud.api import sanitize_search_query
+from mercury_tools.cloud.api import (
+    is_canonical_public_wiki_uri,
+    sanitize_public_text,
+    sanitize_search_filters,
+    sanitize_search_query,
+)
 from mercury_tools.config import load_settings
 
 _SELECTOR_RE = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 _ACTION_ID_RE = re.compile(r"^act_[0-9a-f]{24}$")
-_PUBLIC_DOCUMENT_URI_RE = re.compile(
-    r"^mercury://wiki/[A-Za-z0-9][A-Za-z0-9._~/-]{0,480}$"
-)
-_SEARCH_FILTERS = {
-    "jurisdiction",
-    "connector",
-    "doc_type",
-    "review_status",
-    "effective_date",
+_ETAG_RE = re.compile(r'^(?:W/)?"[A-Za-z0-9._:-]{1,128}"$')
+_PUBLIC_INPUT_SCHEMA = {
+    "path": {},
+    "query": {},
+    "headers": {},
+    "body": {},
+    "files": {},
 }
 
 
@@ -103,11 +107,16 @@ class CloudBrainClient:
         rows = payload["actions"]
         if not isinstance(rows, list):
             raise ValueError("cloud_catalog_invalid")
+        etag = response.headers.get("etag")
+        if not isinstance(etag, str) or not _ETAG_RE.fullmatch(etag):
+            raise ValueError("cloud_catalog_etag_invalid")
         actions = tuple(
             revalidate_catalog_action(CatalogAction.model_validate(item))
             for item in rows
         )
-        self.cache.replace_global(list(actions), response.headers.get("etag"))
+        for action in actions:
+            _validate_public_catalog_action(action)
+        self.cache.replace_global(list(actions), etag)
         return CatalogFetchResult(
             actions=_filter_actions(actions, connector=connector, method=method),
             source="cloud",
@@ -133,6 +142,7 @@ class CloudBrainClient:
         action = revalidate_catalog_action(CatalogAction.model_validate(payload["action"]))
         if action.action_id != action_id:
             raise ValueError("cloud_catalog_invalid")
+        _validate_public_catalog_action(action)
         return action
 
     async def list_connectors(self) -> tuple[dict[str, Any], ...]:
@@ -167,17 +177,17 @@ class CloudBrainClient:
             or not isinstance(top_k, int)
             or isinstance(top_k, bool)
             or not 1 <= top_k <= 20
-            or not _valid_search_filters(filters)
         ):
             raise ValueError("cloud_search_invalid")
+        try:
+            public_filters = sanitize_search_filters(filters or {})
+        except ValueError:
+            raise ValueError("cloud_search_invalid") from None
         response = await self.client.post(
             "/api/cloud/v1/knowledge/search",
             json={
                 "query": sanitize_search_query(query),
-                "filters": {
-                    key: sanitize_search_query(value)
-                    for key, value in (filters or {}).items()
-                },
+                "filters": public_filters,
                 "top_k": top_k,
             },
         )
@@ -201,17 +211,23 @@ class CloudBrainClient:
         connector: str | None,
         method: str | None,
     ) -> tuple[CatalogAction, ...]:
+        actions = tuple(self.cache.list_global())
+        for action in actions:
+            _validate_public_catalog_action(action)
         return _filter_actions(
-            tuple(self.cache.list_global()),
+            actions,
             connector=connector,
             method=method,
         )
 
     def _cached_action(self, action_id: str) -> CatalogAction | None:
-        return next(
+        action = next(
             (item for item in self.cache.list_global() if item.action_id == action_id),
             None,
         )
+        if action is not None:
+            _validate_public_catalog_action(action)
+        return action
 
 
 def _filter_actions(
@@ -240,20 +256,6 @@ def _require_selector(value: str) -> None:
         raise ValueError("cloud_identifier_invalid")
 
 
-def _valid_search_filters(filters: dict[str, str] | None) -> bool:
-    if filters is None:
-        return True
-    if not isinstance(filters, dict) or set(filters) - _SEARCH_FILTERS:
-        return False
-    return all(
-        isinstance(value, str)
-        and bool(value)
-        and len(value) <= 200
-        and bool(_SELECTOR_RE.fullmatch(value))
-        for value in filters.values()
-    )
-
-
 def _valid_document_identifier(value: str) -> bool:
     if not isinstance(value, str):
         return False
@@ -261,7 +263,38 @@ def _valid_document_identifier(value: str) -> bool:
         return str(uuid.UUID(value)) == value
     except ValueError:
         pass
-    if not _PUBLIC_DOCUMENT_URI_RE.fullmatch(value):
-        return False
-    suffix = value.removeprefix("mercury://wiki/")
-    return ".." not in suffix and "//" not in suffix
+    return is_canonical_public_wiki_uri(value)
+
+
+def _validate_public_catalog_action(action: CatalogAction) -> None:
+    payload = action.model_dump(mode="json")
+    if (
+        payload["input_schema"] != _PUBLIC_INPUT_SCHEMA
+        or payload["examples"] != []
+        or payload["idempotency"] != {}
+        or payload["success_rules"] != {}
+        or payload["error_rules"] != {}
+        or payload["response_redaction"] != []
+        or not re.fullmatch(r"[0-9a-f]{64}", action.source_hash)
+        or any(not _ACTION_ID_RE.fullmatch(item) for item in action.preflight_action_ids)
+        or not _is_public_catalog_source(action)
+    ):
+        raise ValueError("cloud_catalog_projection_invalid")
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if sanitize_public_text(serialized) != serialized:
+        raise ValueError("cloud_catalog_projection_invalid")
+
+
+def _is_public_catalog_source(action: CatalogAction) -> bool:
+    source_uri = action.source_uri
+    if source_uri == f"mercury://catalog/{action.connector_id}/{action.action_id}":
+        return True
+    parsed = urlparse(source_uri)
+    return bool(
+        parsed.scheme in {"http", "https"}
+        and parsed.netloc
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.fragment
+        and sanitize_public_text(source_uri) == source_uri
+    )
