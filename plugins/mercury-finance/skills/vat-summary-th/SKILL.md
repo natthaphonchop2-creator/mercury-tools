@@ -5,8 +5,16 @@ description: Use when the user asks for Thai VAT output tax, input tax, filing c
 
 # VAT Summary TH
 
-Use `workspace_connector_status` with `client_token` first. If connector setup is incomplete, route to `connector-credential-setup-th`.
+1. Call `credential_status` for the active repository, connector, and environment. Stop
+   and route to local connector setup unless status is connected.
+2. Call `retrieve_context_pack` for the company, tax period, VAT policy, and filing
+   context. Preserve its citations for tax and accounting claims.
+3. Call `search_erp_actions` with `risk_tier=0` for each required safe VAT or document
+   read. Stop on ambiguity.
+4. Call `get_erp_action_schema` for the exact selected action. Inspect the returned schema
+   and prepare only its inputs.
+5. Call `run_erp_read`; repeat the search, schema, and read steps only when another VAT
+   source requires a separate action.
 
-Use `retrieve_workspace_context_pack` for company, tax period, chart of accounts, invoice, and evidence context. Use `run_mercury_flow` only for an approved VAT summary flow.
-
-ตอบภาษาไทยแบบบัญชีอ่านง่าย แยกภาษีขาย ภาษีซื้อ ยอดสุทธิ ข้อยกเว้น และรายการที่ต้องให้ผู้ทำบัญชีตรวจทาน. Never show raw credentials.
+ตอบภาษาไทยแบบกระชับ: ภาษีขาย ภาษีซื้อ ยอดสุทธิ ข้อยกเว้น และรายการที่ต้องให้
+นักบัญชีตรวจทาน. Do not include evidence counts, audit paths, or verbose evidence unless the user explicitly requests audit detail.

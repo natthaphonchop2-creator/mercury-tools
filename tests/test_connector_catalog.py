@@ -1,4 +1,29 @@
-from mercury_tools.connectors.catalog import connector_by_id, list_connector_summaries
+from mercury_tools.connectors.catalog import (
+    connector_by_id,
+    is_public_capability_allowed,
+    list_connector_summaries,
+)
+
+
+def test_public_policy_allows_reads_and_blocks_mutations() -> None:
+    assert is_public_capability_allowed("company.info.read") is True
+    assert is_public_capability_allowed("documents.invoice.list") is True
+    assert is_public_capability_allowed("documents.invoice.get") is True
+    assert is_public_capability_allowed("auth.token.create") is True
+    assert is_public_capability_allowed("auth.client_token.create") is True
+    assert is_public_capability_allowed("documents.invoice.create") is False
+    assert is_public_capability_allowed("documents.invoice.payment.create") is False
+    assert is_public_capability_allowed("documents.email.send") is False
+    assert is_public_capability_allowed("journal.approve.create") is False
+
+
+def test_connector_manifest_classifies_public_capabilities() -> None:
+    manifest = connector_by_id("flowaccount")
+
+    assert manifest is not None
+    assert "documents.invoice.list" in manifest.read_capabilities
+    assert "documents.invoice.create" in manifest.blocked_capabilities
+    assert set(manifest.read_capabilities).isdisjoint(manifest.blocked_capabilities)
 
 
 def test_flowaccount_manifest_has_presets_and_capabilities() -> None:
@@ -11,10 +36,15 @@ def test_flowaccount_manifest_has_presets_and_capabilities() -> None:
     assert manifest.preset["grant_type"] == "client_credentials"
     assert manifest.preset["scope"] == "flowaccount-api"
     assert manifest.preset["api_base_url"] == "https://openapi.flowaccount.com/v1"
-    assert manifest.preset["token_url"] == "https://openapi.flowaccount.com/token"
+    assert manifest.preset["token_url"] == "https://openapi.flowaccount.com/v1/token"
     assert "company.info.read" in manifest.capabilities
     assert "documents.invoice.list" in manifest.capabilities
-    assert manifest.validation.read_only is True
+    assert "documents.invoice.create" in manifest.capabilities
+    assert "documents.expense.create" in manifest.capabilities
+    assert "journal.draft.create" in manifest.capabilities
+    assert "documents.email.send" in manifest.capabilities
+    assert manifest.validation.safe_probe is True
+    assert manifest.validation.healthcheck_endpoint == "/company/info"
 
 
 def test_peak_manifest_uses_real_open_api_setup_fields() -> None:
@@ -72,3 +102,17 @@ def test_connector_summaries_do_not_include_secrets() -> None:
     assert "client_secret" in serialized
     assert "super-secret" not in serialized
     assert "bearer" not in serialized
+
+
+def test_flowaccount_public_summary_keeps_setup_field_names_and_urls() -> None:
+    manifest = connector_by_id("flowaccount")
+
+    assert manifest is not None
+    summary = manifest.public_summary()
+
+    assert summary["required_secret_fields"] == ["client_id", "client_secret"]
+    assert summary["preset"]["token_url"] == "https://openapi.flowaccount.com/v1/token"
+    assert summary["validation"]["token_url"] == "https://openapi.flowaccount.com/v1/token"
+    assert "documents.invoice.list" in summary["read_capabilities"]
+    assert "documents.invoice.create" in summary["blocked_capabilities"]
+    assert "credential_values" not in summary

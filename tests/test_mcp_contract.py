@@ -1,4 +1,5 @@
-from mercury_tools.product import ConnectRequest, create_client_token
+import pytest
+
 from mercury_tools.prompts import get_prompt
 from mercury_tools.rag.embeddings import HashEmbeddingProvider
 
@@ -7,6 +8,14 @@ def test_mcp_server_imports_and_exposes_server() -> None:
     from mercury_tools.mcp.server import mcp
 
     assert mcp.name == "Mercury Tools"
+
+
+def test_local_mcp_is_a_separate_one_server_surface() -> None:
+    from mercury_tools.mcp.local_server import local_mcp
+    from mercury_tools.mcp.server import mcp
+
+    assert local_mcp.name == "Mercury Finance"
+    assert local_mcp is not mcp
 
 
 def test_prompt_templates_exist() -> None:
@@ -205,8 +214,7 @@ tags: [disabled]
     assert "exactly one" in invalid_unified["message"]
 
 
-def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:
-    from mercury_tools.config import Settings
+def test_mcp_workspace_flow_tools_use_public_workspace_id(monkeypatch) -> None:
     from mercury_tools.flows.templates import COMPANY_HEALTH_TEMPLATE
     from mercury_tools.mcp import server
 
@@ -214,21 +222,7 @@ def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:
     monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
     monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
 
-    token = create_client_token(
-        Settings(
-            supabase_url="https://example.supabase.co",
-            supabase_service_role_key="service-role",
-            openai_api_key="",
-            connect_signing_secret="signing-secret",
-        ),
-        ConnectRequest(
-            email="owner@example.com",
-            company="Demo Co",
-            host_app="codex",
-            invite_code="invite",
-        ),
-        now=1783536613,
-    )
+    workspace_id = "mw_publiccontestworkspace001"
 
     class FakeStore:
         recorded: list[dict] = []
@@ -242,14 +236,15 @@ def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:
             "yaml": COMPANY_HEALTH_TEMPLATE,
         }
 
-        def dashboard(self, _token_payload):
+        def public_dashboard(self, supplied_workspace_id):
+            assert supplied_workspace_id == workspace_id
             return {
                 "workspace": {"name": "Demo Co", "workspace_key": "demo"},
                 "connector_profiles": [
                     {
                         "connector_id": "flowaccount",
                         "environment": "production",
-                        "status": "ready",
+                        "status": "connected",
                         "metadata": {
                             "setup_state": "ready",
                             "enabled_capabilities": ["company.info.read"],
@@ -300,15 +295,15 @@ def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:
     monkeypatch.setattr(server, "_product_store", lambda _settings=None: FakeStore())
     monkeypatch.setattr(server, "_audit", fake_audit)
 
-    listed = server.list_workspace_flows(token)
+    listed = server.list_workspace_flows(workspace_id)
     saved = server.save_workspace_flow_tool(
-        token,
+        workspace_id,
         "Company Health Check",
         COMPANY_HEALTH_TEMPLATE,
         metadata={"source": "test"},
     )
     ran = server.run_workspace_flow_tool(
-        token,
+        workspace_id,
         "workspace-company-health-12345678",
         dry_run=True,
         env={"connector": "flowaccount", "environment": "production"},
@@ -327,5 +322,29 @@ def test_mcp_workspace_flow_tools_use_client_token(monkeypatch) -> None:
     assert ran["variables"]["env"]["environment"] == "production"
     assert ran["run_record"]["env_keys"] == ["connector", "environment"]
     assert audit_events
-    assert all(token not in str(event["input_payload"]) for event in audit_events)
-    assert all("client_token_hash" in event["input_payload"] for event in audit_events)
+    assert all(workspace_id not in str(event["input_payload"]) for event in audit_events)
+    assert all("workspace_id_hash" in event["input_payload"] for event in audit_events)
+
+
+@pytest.mark.asyncio
+async def test_public_mcp_tool_schemas_use_workspace_id() -> None:
+    from mercury_tools.mcp.server import mcp
+
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+
+    assert "create_public_workspace" in tools
+    assert "get_public_workspace" in tools
+    assert "workspace_connector_status" not in tools
+    for name in {
+        "retrieve_workspace_context_pack",
+        "start_connector_setup",
+        "list_workspace_flows",
+        "run_workspace_flow",
+        "save_workspace_flow",
+    }:
+        properties = tools[name].inputSchema["properties"]
+        assert "workspace_id" in properties
+        assert "client_token" not in properties
+
+    for tool in tools.values():
+        assert "client_token" not in tool.inputSchema.get("properties", {}), tool.name

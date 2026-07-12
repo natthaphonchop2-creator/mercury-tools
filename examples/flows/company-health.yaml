@@ -1,6 +1,6 @@
 name: Company Health Check
-description: Read-only Mercury flow for a Thai accounting health-check handoff.
-tags: [accounting, read-only, flowaccount]
+description: Thai accounting health-check handoff with connector endpoint context.
+tags: [accounting, endpoint-capable, flowaccount]
 env:
   jurisdiction: TH
   connector: flowaccount

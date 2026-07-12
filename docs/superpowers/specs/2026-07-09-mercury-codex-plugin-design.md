@@ -1,7 +1,8 @@
 # Mercury Codex Plugin Design
 
 Date: 2026-07-09
-Status: Draft for user review
+Status: Superseded on 2026-07-10
+Superseded by: `2026-07-10-mercury-public-mcp-product-design.md`
 Repo: `mercury-tools`
 
 ## Decision

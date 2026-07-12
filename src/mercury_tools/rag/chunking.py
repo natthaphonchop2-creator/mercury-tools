@@ -13,6 +13,7 @@ from mercury_tools.rag.models import KnowledgeChunk, KnowledgeDocument
 
 FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
+ACTION_ID_RE = re.compile(r"^action_id: (act_[0-9a-f]{24})$", re.MULTILINE)
 
 
 def sha256_text(text: str) -> str:
@@ -36,6 +37,13 @@ def first_heading(body: str, fallback: str) -> str:
 def document_from_markdown(path: Path, *, root: Path | None = None) -> KnowledgeDocument:
     raw = path.read_text(encoding="utf-8")
     metadata, body = parse_frontmatter(raw)
+    doc_type = str(metadata.get("doc_type") or metadata.get("type") or "wiki")
+    review_status = str(metadata.get("review_status") or "draft")
+    if doc_type in {"accounting_standard", "tax"} and review_status == "reviewed":
+        if not metadata.get("source_url"):
+            raise ValueError("reviewed regulated document requires source_url")
+        if not metadata.get("source_verified_at"):
+            raise ValueError("reviewed regulated document requires source_verified_at")
     relative = path.relative_to(root) if root else path.name
     slug = str(relative.with_suffix("")).replace("\\", "/")
     document_uri = str(metadata.get("document_uri") or f"mercury://wiki/{slug}")
@@ -53,8 +61,8 @@ def document_from_markdown(path: Path, *, root: Path | None = None) -> Knowledge
         source_url=metadata.get("source_url"),
         jurisdiction=metadata.get("jurisdiction"),
         connector=metadata.get("connector"),
-        doc_type=str(metadata.get("doc_type") or metadata.get("type") or "wiki"),
-        review_status=str(metadata.get("review_status") or "draft"),
+        doc_type=doc_type,
+        review_status=review_status,
         effective_date=metadata.get("effective_date"),
         metadata=metadata,
     )
@@ -100,11 +108,18 @@ def _window_text(text: str, max_chars: int) -> list[str]:
 
 def chunk_document(document: KnowledgeDocument, *, max_chars: int = 1800) -> list[KnowledgeChunk]:
     chunks: list[KnowledgeChunk] = []
-    source_path = str(document.path) if document.path else None
+    declared_source_path = document.metadata.get("source_path")
+    source_path = (
+        str(declared_source_path)
+        if declared_source_path
+        else (str(document.path) if document.path else None)
+    )
     for heading, section in split_markdown_sections(document.body):
         for text in _window_text(section, max_chars=max_chars):
             index = len(chunks)
             chunk_uri = f"{document.document_uri}#chunk-{index}"
+            action_ids = ACTION_ID_RE.findall(text)
+            action_metadata = {"action_id": action_ids[0]} if len(action_ids) == 1 else {}
             citation = {
                 "source_title": document.source_title,
                 "source_uri": document.source_uri,
@@ -131,8 +146,8 @@ def chunk_document(document: KnowledgeDocument, *, max_chars: int = 1800) -> lis
                         "doc_type": document.doc_type,
                         "review_status": document.review_status,
                         "effective_date": document.effective_date,
+                        **action_metadata,
                     },
                 )
             )
     return chunks
-

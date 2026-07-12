@@ -1,3 +1,6 @@
+import inspect
+import json
+
 import httpx
 import pytest
 
@@ -8,7 +11,8 @@ from mercury_tools.connectors.setup import (
     next_setup_state,
     required_missing_fields,
     resolve_setup_state,
-    validate_connector_read_only,
+    validate_connector_connection_healthcheck,
+    validate_connector_connection_healthcheck_async,
 )
 from mercury_tools.db.product import SupabaseProductStore
 
@@ -36,6 +40,32 @@ def assert_key_fragments_absent(payload: dict, fragments: list[str]) -> None:
         assert all(fragment not in key for key in keys)
 
 
+def legacy_mock_transport(post=None, get=None) -> httpx.MockTransport:
+    """Adapt existing setup assertions to the provider-driver mock transport seam."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        callback = post if request.method == "POST" else get
+        assert callback is not None
+        parameter_names = inspect.signature(callback).parameters
+        kwargs: dict[str, object] = {}
+        if "data" in parameter_names:
+            pairs = httpx.QueryParams(request.content.decode())
+            kwargs["data"] = {key: pairs.get(key) for key in pairs}
+        if "json" in parameter_names:
+            kwargs["json"] = json.loads(request.content)
+        if "headers" in parameter_names:
+            kwargs["headers"] = request.headers
+        if "timeout" in parameter_names:
+            kwargs["timeout"] = 60
+        response = callback(str(request.url), **kwargs)
+        try:
+            return httpx.Response(response.status_code, json=response.json())
+        except ValueError:
+            return httpx.Response(response.status_code, content=b"{")
+
+    return httpx.MockTransport(handler)
+
+
 def test_setup_states_are_ordered_and_explicit() -> None:
     assert CONNECTOR_SETUP_STATES == [
         "not_started",
@@ -44,7 +74,7 @@ def test_setup_states_are_ordered_and_explicit() -> None:
         "awaiting_credentials",
         "credentials_received",
         "validation_failed",
-        "connected_read_only",
+        "connected",
         "ready",
     ]
 
@@ -90,22 +120,20 @@ def test_validate_flowaccount_uses_token_and_company_info(monkeypatch) -> None:
         assert timeout == 60
         return FakeResponse(200, {"companyName": "Demo Books"})
 
-    monkeypatch.setattr("httpx.post", fake_post)
-    monkeypatch.setattr("httpx.get", fake_get)
-
-    result = validate_connector_read_only(
+    result = validate_connector_connection_healthcheck(
         manifest,
         credentials={"client_id": "cid", "client_secret": "csecret"},
         environment="production",
+        transport=legacy_mock_transport(post=fake_post, get=fake_get),
     )
 
-    assert result["status"] == "connected_read_only"
+    assert result["status"] == "connected"
     assert result["company_name"] == "Demo Books"
     assert result["enabled_capabilities"] == manifest.capabilities
     assert "secret-token" not in str(result)
     assert "csecret" not in str(result)
     assert calls == [
-        ("POST", "https://openapi.flowaccount.com/token"),
+        ("POST", "https://openapi.flowaccount.com/v1/token"),
         ("GET", "https://openapi.flowaccount.com/v1/company/info"),
     ]
 
@@ -134,16 +162,14 @@ def test_validate_flowaccount_uses_sandbox_token_and_company_info_urls(
         calls.append(("GET", url))
         return FakeResponse(200, {"companyName": "Sandbox Books"})
 
-    monkeypatch.setattr("httpx.post", fake_post)
-    monkeypatch.setattr("httpx.get", fake_get)
-
-    result = validate_connector_read_only(
+    result = validate_connector_connection_healthcheck(
         manifest,
         credentials={"client_id": "cid", "client_secret": "csecret"},
         environment="sandbox",
+        transport=legacy_mock_transport(post=fake_post, get=fake_get),
     )
 
-    assert result["status"] == "connected_read_only"
+    assert result["status"] == "connected"
     assert result["company_name"] == "Sandbox Books"
     assert calls == [
         ("POST", "https://openapi.flowaccount.com/test/token"),
@@ -219,16 +245,14 @@ def test_validate_peak_uses_hmac_client_token_and_user_read(monkeypatch) -> None
             },
         )
 
-    monkeypatch.setattr("httpx.post", fake_post)
-    monkeypatch.setattr("httpx.get", fake_get)
-
-    result = validate_connector_read_only(
+    result = validate_connector_connection_healthcheck(
         manifest,
         credentials=credentials,
         environment="uat",
+        transport=legacy_mock_transport(post=fake_post, get=fake_get),
     )
 
-    assert result["status"] == "connected_read_only"
+    assert result["status"] == "connected"
     assert result["connector_id"] == "peak"
     assert result["enabled_capabilities"] == manifest.capabilities
     assert result["validation"] == {
@@ -279,10 +303,7 @@ def test_validate_peak_token_failure_sanitizes_provider_echoes(monkeypatch) -> N
     def fake_get(url, headers=None, timeout=60):
         raise AssertionError("read endpoint must not run after token failure")
 
-    monkeypatch.setattr("httpx.post", fake_post)
-    monkeypatch.setattr("httpx.get", fake_get)
-
-    result = validate_connector_read_only(
+    result = validate_connector_connection_healthcheck(
         manifest,
         credentials={
             "connect_id": "peak-connect-id",
@@ -291,10 +312,12 @@ def test_validate_peak_token_failure_sanitizes_provider_echoes(monkeypatch) -> N
             "user_token": "user-token-value",
         },
         environment="uat",
+        transport=legacy_mock_transport(post=fake_post, get=fake_get),
     )
 
     assert result["status"] == "validation_failed"
     assert result["message"] == "PEAK ClientToken request failed."
+    assert result["http_status"] == 200
     assert_values_absent(
         result,
         [
@@ -318,15 +341,14 @@ def test_validate_flowaccount_http_error_returns_sanitized_validation_failed(
             "network failed for client-id-leak and client-secret-leak"
         )
 
-    monkeypatch.setattr("httpx.post", fake_post)
-
-    result = validate_connector_read_only(
+    result = validate_connector_connection_healthcheck(
         manifest,
         credentials={
             "client_id": "client-id-leak",
             "client_secret": "client-secret-leak",
         },
         environment="production",
+        transport=legacy_mock_transport(post=fake_post),
     )
 
     assert result["status"] == "validation_failed"
@@ -352,22 +374,63 @@ def test_validate_flowaccount_invalid_json_returns_sanitized_validation_failed(
     def fake_post(url, data=None, timeout=60):
         return FakeResponse()
 
-    monkeypatch.setattr("httpx.post", fake_post)
-
-    result = validate_connector_read_only(
+    result = validate_connector_connection_healthcheck(
         manifest,
         credentials={
             "client_id": "client-id-leak",
             "client_secret": "client-secret-leak",
         },
         environment="production",
+        transport=legacy_mock_transport(post=fake_post),
     )
 
     assert result["status"] == "validation_failed"
     assert result["http_status"] == 200
-    assert result["error_type"] == "ValueError"
+    assert result["error_type"] == "JSONDecodeError"
     assert "Traceback" not in str(result)
     assert_values_absent(result, ["client-id-leak", "client-secret-leak"])
+
+
+@pytest.mark.asyncio
+async def test_async_healthcheck_preserves_compatibility_result_shape() -> None:
+    manifest = connector_by_id("flowaccount")
+    assert manifest is not None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/token"):
+            return httpx.Response(200, json={"access_token": "access-token"})
+        return httpx.Response(200, json={"companyName": "Async Books"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await validate_connector_connection_healthcheck_async(
+            manifest,
+            credentials={"client_id": "client-id", "client_secret": "client-secret"},
+            environment="production",
+            client=client,
+        )
+
+    assert result == {
+        "status": "connected",
+        "connector_id": "flowaccount",
+        "environment": "production",
+        "company_name": "Async Books",
+        "enabled_capabilities": manifest.capabilities,
+        "validation": {"token_status": 200, "company_info_status": 200},
+    }
+
+
+@pytest.mark.asyncio
+async def test_sync_healthcheck_in_active_loop_requires_async_path() -> None:
+    manifest = connector_by_id("flowaccount")
+    assert manifest is not None
+
+    with pytest.raises(RuntimeError, match="^connector_healthcheck_async_required$"):
+        validate_connector_connection_healthcheck(
+            manifest,
+            credentials={"client_id": "client-id", "client_secret": "client-secret"},
+            environment="production",
+            transport=httpx.MockTransport(lambda request: httpx.Response(500)),
+        )
 
 
 def test_validate_flowaccount_token_failure_sanitizes_provider_response_keys(
@@ -399,15 +462,14 @@ def test_validate_flowaccount_token_failure_sanitizes_provider_response_keys(
     def fake_post(url, data=None, timeout=60):
         return FakeResponse()
 
-    monkeypatch.setattr("httpx.post", fake_post)
-
-    result = validate_connector_read_only(
+    result = validate_connector_connection_healthcheck(
         manifest,
         credentials={
             "client_id": "demo-client-id",
             "client_secret": "super-secret-value",
         },
         environment="production",
+        transport=legacy_mock_transport(post=fake_post),
     )
 
     assert result["status"] == "validation_failed"
@@ -485,26 +547,20 @@ def test_validate_flowaccount_company_info_body_failure_returns_sanitized_valida
             },
         )
 
-    monkeypatch.setattr("httpx.post", fake_post)
-    monkeypatch.setattr("httpx.get", fake_get)
-
-    result = validate_connector_read_only(
+    result = validate_connector_connection_healthcheck(
         manifest,
         credentials={
             "client_id": "demo-client-id",
             "client_secret": "super-secret-value",
         },
         environment="production",
+        transport=legacy_mock_transport(post=fake_post, get=fake_get),
     )
 
     assert result["status"] == "validation_failed"
     assert result["http_status"] == 200
     assert result["message"].startswith("Company info request failed.")
-    assert "provider_response" in result
-    assert_key_fragments_absent(
-        result["provider_response"],
-        ["client_id", "client_secret", "access_token"],
-    )
+    assert "provider_response" not in result
     assert_values_absent(
         result,
         ["demo-client-id", "super-secret-value", "secret-token"],
@@ -583,7 +639,7 @@ def test_resolve_setup_state_covers_declared_states() -> None:
             credentials_received=True,
             validation_status="valid",
         )
-        == "connected_read_only"
+        == "connected"
     )
     assert (
         resolve_setup_state(
@@ -592,7 +648,7 @@ def test_resolve_setup_state_covers_declared_states() -> None:
             missing_fields=[],
             credentials_received=True,
             validation_status="valid",
-            read_only_capability_count=1,
+            validated_capability_count=1,
         )
         == "ready"
     )
@@ -736,14 +792,15 @@ def test_start_connector_setup_stores_setup_metadata() -> None:
     assert profile["metadata"]["setup_state"] == "awaiting_credentials"
     assert profile["metadata"]["required_secret_fields"] == ["client_id", "client_secret"]
     assert profile["metadata"]["preset"]["grant_type"] == "client_credentials"
-    assert profile["metadata"]["capabilities"] == [
-        "company.info.read",
-        "contacts.list",
-        "products.list",
-        "documents.invoice.list",
-        "documents.invoice.get",
-        "tax.vat_summary.read",
-    ]
+    assert profile["metadata"]["preset"]["api_base_url"] == (
+        "https://openapi.flowaccount.com/v1"
+    )
+    assert profile["metadata"]["preset"]["token_url"] == (
+        "https://openapi.flowaccount.com/v1/token"
+    )
+    assert profile["metadata"]["capabilities"] == connector_by_id("flowaccount").capabilities
+    assert "documents.invoice.create" in profile["metadata"]["capabilities"]
+    assert "documents.expense.create" in profile["metadata"]["capabilities"]
 
 
 def test_start_connector_setup_stores_environment_specific_preset() -> None:
@@ -795,7 +852,7 @@ def test_start_connector_setup_supports_custom_erp_setup_target() -> None:
     assert profile["metadata"]["capabilities"] == []
 
 
-def test_ready_connector_profile_metadata_sets_connected_read_only_status() -> None:
+def test_ready_connector_profile_metadata_stays_requires_credentials() -> None:
     store = StoreForSetup()
     profile = store.set_connector_profile(
         token_payload={
@@ -814,123 +871,8 @@ def test_ready_connector_profile_metadata_sets_connected_read_only_status() -> N
         },
     )
 
-    assert profile["status"] == "connected_read_only"
-    assert store.profile_payloads[-1]["status"] == "connected_read_only"
-
-
-def test_product_table_credentials_store_server_vault_on_profile_not_audit() -> None:
-    from mercury_tools.db.product import public_connector_profile
-
-    store = StoreForSetup()
-    token_payload = {
-        "sub": "owner@example.com",
-        "company": "Demo Co",
-        "host_app": "codex",
-        "iat": 0,
-        "exp": 99999,
-        "jti": "token-jti",
-    }
-    store.start_connector_setup(
-        token_payload=token_payload,
-        connector_id="flowaccount",
-        environment="production",
-    )
-
-    result = store.set_connector_credentials(
-        token_payload=token_payload,
-        connector_id="flowaccount",
-        environment="production",
-        credentials={
-            "client_id": "demo-client-id",
-            "client_secret": "super-secret-value",
-        },
-    )
-    patched_metadata = store.profile_patches[-1]["metadata"]
-    server_vault = patched_metadata["server_vault"]
-    public_profile = public_connector_profile(next(iter(store.profiles.values())))
-
-    assert result["status"] == "credentials_configured"
-    assert server_vault["fields"] == ["client_id", "client_secret"]
-    assert "ciphertext" in server_vault
-    assert "super-secret-value" not in str(server_vault)
-    assert "demo-client-id" not in str(server_vault)
-    assert "'server_vault':" not in str(store.audit_events)
-    assert "'vault_record':" not in str(store.audit_events)
-    assert server_vault["ciphertext"] not in str(store.audit_events)
-    assert "'server_vault':" not in str(public_profile)
-    assert server_vault["ciphertext"] not in str(public_profile)
-
-
-def test_product_table_validation_preserves_private_credential_vault_metadata() -> None:
-    from mercury_tools.db.product import public_connector_profile
-
-    store = StoreForSetup()
-    token_payload = {
-        "sub": "owner@example.com",
-        "company": "Demo Co",
-        "host_app": "codex",
-        "iat": 0,
-        "exp": 99999,
-        "jti": "token-jti",
-    }
-    store.start_connector_setup(
-        token_payload=token_payload,
-        connector_id="flowaccount",
-        environment="production",
-    )
-    store.set_connector_credentials(
-        token_payload=token_payload,
-        connector_id="flowaccount",
-        environment="production",
-        credentials={
-            "client_id": "demo-client-id",
-            "client_secret": "super-secret-value",
-        },
-    )
-    credential_metadata = store.profile_patches[-1]["metadata"]
-    server_vault = credential_metadata["server_vault"]
-
-    ready_profile = store.set_connector_profile(
-        token_payload=token_payload,
-        connector_id="flowaccount",
-        environment="production",
-        company_name="Demo Books",
-        metadata={
-            "setup_state": "ready",
-            "enabled_capabilities": ["company.info.read"],
-            "validation": {"token_status": 200, "company_info_status": 200},
-        },
-    )
-    stored_profile = next(iter(store.profiles.values()))
-    stored_metadata = stored_profile["metadata"]
-    public_profile = public_connector_profile(stored_profile)
-
-    assert ready_profile["status"] == "connected_read_only"
-    assert stored_profile["status"] == "connected_read_only"
-    assert stored_metadata["server_vault"]["ciphertext"] == server_vault["ciphertext"]
-    assert stored_metadata["credential_storage"] == "encrypted_server_vault"
-    assert stored_metadata["credential_fields"] == ["client_id", "client_secret"]
-    assert stored_metadata["credential_fingerprints"] == credential_metadata[
-        "credential_fingerprints"
-    ]
-    assert stored_metadata["credentials_configured"] is True
-    assert (
-        stored_metadata["credentials_configured_at"]
-        == credential_metadata["credentials_configured_at"]
-    )
-    assert stored_metadata["setup_state"] == "ready"
-    assert stored_metadata["validation"] == {
-        "token_status": 200,
-        "company_info_status": 200,
-    }
-    assert "'server_vault':" not in str(ready_profile)
-    assert "'server_vault':" not in str(public_profile)
-    assert server_vault["ciphertext"] not in str(ready_profile)
-    assert server_vault["ciphertext"] not in str(public_profile)
-    assert "super-secret-value" not in str(ready_profile)
-    assert "demo-client-id" not in str(public_profile)
-    assert "'server_vault':" not in str(store.audit_events)
-    assert server_vault["ciphertext"] not in str(store.audit_events)
+    assert profile["status"] == "requires_credentials"
+    assert store.profile_payloads[-1]["status"] == "requires_credentials"
 
 
 def test_start_connector_setup_resume_without_company_name_preserves_label() -> None:

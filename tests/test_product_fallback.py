@@ -49,6 +49,37 @@ def token_payload() -> dict:
     }
 
 
+def test_product_store_creates_public_workspace_and_resolves_dashboard() -> None:
+    store = AuditFallbackStore()
+
+    created = store.create_public_workspace("Public Demo Co")
+    dashboard = store.public_dashboard(created["workspace_id"])
+
+    assert created["workspace_id"].startswith("mw_")
+    assert created["workspace"]["name"] == "Public Demo Co"
+    assert dashboard["status"] == "ok"
+    assert dashboard["public_mode"] is True
+    assert dashboard["workspace_id"] == created["workspace_id"]
+    assert dashboard["workspace"]["name"] == "Public Demo Co"
+
+
+def test_public_workspace_creation_seeds_bundled_skill_catalog() -> None:
+    class SeedTrackingStore(AuditFallbackStore):
+        def __init__(self):
+            super().__init__()
+            self.seed_calls = 0
+
+        def seed_skill_catalog(self) -> int:
+            self.seed_calls += 1
+            return 0
+
+    store = SeedTrackingStore()
+
+    store.create_public_workspace("Public Demo Co")
+
+    assert store.seed_calls == 1
+
+
 def test_product_store_uses_audit_fallback_for_workspace_and_dashboard() -> None:
     store = AuditFallbackStore()
     request = ConnectRequest(
@@ -104,39 +135,6 @@ def test_product_store_audit_fallback_persists_connector_and_skill_state() -> No
     }
 
 
-def test_product_store_audit_fallback_normalizes_connector_ids_for_profile_keys() -> None:
-    store = AuditFallbackStore()
-    request = ConnectRequest(
-        email="owner@example.com",
-        company="Demo Co",
-        host_app="codex",
-        invite_code="invite",
-    )
-    store.upsert_connection(request, token_payload())
-
-    store.set_connector_profile(
-        token_payload=token_payload(),
-        connector_id=" FlowAccount ",
-        environment="production",
-        company_name="Demo Co Books",
-    )
-    result = store.set_connector_credentials(
-        token_payload=token_payload(),
-        connector_id="FLOWACCOUNT",
-        environment="production",
-        credentials={
-            "client_id": "demo-client-id",
-            "client_secret": "super-secret-value",
-        },
-    )
-    dashboard = store.dashboard(token_payload())
-
-    assert result["connector_id"] == "flowaccount"
-    assert {profile["connector_id"] for profile in dashboard["connector_profiles"]} == {
-        "flowaccount"
-    }
-
-
 def test_product_store_audit_fallback_records_team_invite() -> None:
     store = AuditFallbackStore()
     request = ConnectRequest(
@@ -159,108 +157,6 @@ def test_product_store_audit_fallback_records_team_invite() -> None:
     invited = next(item for item in dashboard["members"] if item.get("status") == "invited")
     assert invited["role"] == "viewer"
     assert dashboard["events"][0]["event_type"] == "team.member_invited"
-
-
-def test_product_store_audit_fallback_encrypts_connector_credentials() -> None:
-    store = AuditFallbackStore()
-    request = ConnectRequest(
-        email="owner@example.com",
-        company="Demo Co",
-        host_app="codex",
-        invite_code="invite",
-    )
-    store.upsert_connection(request, token_payload())
-
-    result = store.set_connector_credentials(
-        token_payload=token_payload(),
-        connector_id="flowaccount",
-        environment="production",
-        credentials={
-            "client_id": "demo-client-id",
-            "client_secret": "super-secret-value",
-        },
-    )
-    dashboard = store.dashboard(token_payload())
-    serialized_events = str(store.events)
-    profile = dashboard["connector_profiles"][0]
-    private_profile = next(iter(store._fallback_private_connector_profiles.values()))
-    server_vault = private_profile["metadata"]["server_vault"]
-
-    assert result["status"] == "credentials_configured"
-    assert profile["status"] == "credentials_configured"
-    assert profile["metadata"]["credentials_configured"] is True
-    assert "client_id" in result["credential_fields"]
-    assert "ciphertext" in server_vault
-    assert "'server_vault':" not in str(profile)
-    assert server_vault["ciphertext"] not in str(profile)
-    assert "super-secret-value" not in serialized_events
-    assert "demo-client-id" not in serialized_events
-    assert "'server_vault':" not in serialized_events
-    assert "'vault_record':" not in serialized_events
-    assert "ciphertext" not in serialized_events
-
-
-def test_product_store_audit_fallback_validation_preserves_private_vault_metadata() -> None:
-    store = AuditFallbackStore()
-    request = ConnectRequest(
-        email="owner@example.com",
-        company="Demo Co",
-        host_app="codex",
-        invite_code="invite",
-    )
-    store.upsert_connection(request, token_payload())
-    store.set_connector_credentials(
-        token_payload=token_payload(),
-        connector_id="flowaccount",
-        environment="production",
-        credentials={
-            "client_id": "demo-client-id",
-            "client_secret": "super-secret-value",
-        },
-    )
-    initial_private_profile = next(iter(store._fallback_private_connector_profiles.values()))
-    credential_metadata = initial_private_profile["metadata"]
-    server_vault = credential_metadata["server_vault"]
-
-    ready_profile = store.set_connector_profile(
-        token_payload=token_payload(),
-        connector_id="flowaccount",
-        environment="production",
-        company_name="Demo Books",
-        metadata={
-            "setup_state": "ready",
-            "enabled_capabilities": ["company.info.read"],
-            "validation": {"token_status": 200, "company_info_status": 200},
-        },
-    )
-    private_profile = store._fallback_private_connector_profiles[initial_private_profile["id"]]
-    private_metadata = private_profile["metadata"]
-    dashboard_profile = store.dashboard(token_payload())["connector_profiles"][0]
-    serialized_events = str(store.events)
-
-    assert ready_profile["status"] == "connected_read_only"
-    assert private_profile["status"] == "connected_read_only"
-    assert private_metadata["server_vault"]["ciphertext"] == server_vault["ciphertext"]
-    assert private_metadata["credential_storage"] == "encrypted_server_vault"
-    assert private_metadata["credential_fields"] == ["client_id", "client_secret"]
-    assert private_metadata["credential_fingerprints"] == credential_metadata[
-        "credential_fingerprints"
-    ]
-    assert private_metadata["credentials_configured"] is True
-    assert (
-        private_metadata["credentials_configured_at"]
-        == credential_metadata["credentials_configured_at"]
-    )
-    assert private_metadata["setup_state"] == "ready"
-    assert dashboard_profile["status"] == "connected_read_only"
-    assert "'server_vault':" not in str(ready_profile)
-    assert "'server_vault':" not in str(dashboard_profile)
-    assert server_vault["ciphertext"] not in str(ready_profile)
-    assert server_vault["ciphertext"] not in str(dashboard_profile)
-    assert "super-secret-value" not in serialized_events
-    assert "demo-client-id" not in serialized_events
-    assert "'server_vault':" not in serialized_events
-    assert "ciphertext" not in serialized_events
 
 
 def test_product_store_audit_fallback_records_uploaded_skill() -> None:

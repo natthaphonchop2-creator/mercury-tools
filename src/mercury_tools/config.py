@@ -15,6 +15,7 @@ DEFAULT_MCP_TRANSPORT = "streamable-http"
 DEFAULT_MCP_HOST = "0.0.0.0"
 DEFAULT_MCP_PORT = 8000
 DEFAULT_MCP_PATH = "/mcp"
+DEFAULT_CLOUD_BASE_URL = "https://mercury-tools-mcp.onrender.com"
 
 
 @dataclass(frozen=True)
@@ -34,8 +35,10 @@ class Settings:
     public_base_url: str = ""
     http_bearer_token: str = ""
     http_require_auth: bool = False
+    enable_legacy_http_api: bool = False
     connect_invite_code: str = ""
     connect_signing_secret: str = ""
+    cloud_base_url: str = DEFAULT_CLOUD_BASE_URL
 
     @property
     def supabase_configured(self) -> bool:
@@ -128,8 +131,16 @@ def load_settings(*, dotenv_path: str | Path | None = None) -> Settings:
         public_base_url=os.environ.get("MERCURY_TOOLS_PUBLIC_BASE_URL", "").strip().rstrip("/"),
         http_bearer_token=os.environ.get("MERCURY_TOOLS_HTTP_BEARER_TOKEN", "").strip(),
         http_require_auth=_env_bool("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", default=False),
+        enable_legacy_http_api=_env_bool(
+            "MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API",
+            default=False,
+        ),
         connect_invite_code=os.environ.get("MERCURY_CONNECT_INVITE_CODE", "").strip(),
         connect_signing_secret=os.environ.get("MERCURY_CONNECT_SIGNING_SECRET", "").strip(),
+        cloud_base_url=(
+            os.environ.get("MERCURY_CLOUD_BASE_URL", DEFAULT_CLOUD_BASE_URL).strip().rstrip("/")
+            or DEFAULT_CLOUD_BASE_URL
+        ),
     )
 
 

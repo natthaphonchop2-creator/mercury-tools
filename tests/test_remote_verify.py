@@ -98,3 +98,29 @@ def test_remote_verify_reports_openai_key_only_when_openai_embeddings_selected()
 
     assert result.ready is False
     assert "OPENAI_API_KEY on remote service" in result.missing
+
+
+def test_remote_verify_rejects_public_service_with_legacy_http_api_enabled() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/healthz":
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ok",
+                    "supabase": True,
+                    "embedding_provider": "hash",
+                    "embedding_configured": True,
+                    "mcp_path": "/mcp",
+                    "http_auth_required": False,
+                    "http_auth_configured": False,
+                    "legacy_http_api": "enabled",
+                },
+            )
+        return httpx.Response(404)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    result = verify_remote(base_url="https://mercury.example.com", client=client)
+
+    assert result.ready is False
+    assert "disabled legacy HTTP API on public remote service" in result.missing

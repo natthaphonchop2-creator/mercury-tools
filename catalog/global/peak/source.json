@@ -1,0 +1,3641 @@
+{
+  "connector_id": "peak",
+  "driver_suggestion": {
+    "driver_id": "peak_hmac_sha1"
+  },
+  "imported_at": "1970-01-01T00:00:00Z",
+  "imported_version": "builtin-v1",
+  "sanitization": {
+    "document": {
+      "connector_id": "peak",
+      "endpoints": [
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak Billing Note",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "GET",
+          "operation_id": "getPeakBillingNote",
+          "path_template": "/billingnotes"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Billing Note",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakBillingNotes": {
+                  "properties": {
+                    "billingNotes": {
+                      "items": {
+                        "properties": {
+                          "contactId": {
+                            "type": "string"
+                          },
+                          "dueDate": {
+                            "type": "string"
+                          },
+                          "issuedDate": {
+                            "type": "string"
+                          },
+                          "paidPayments": {
+                            "properties": {
+                              "paymentDate": {
+                                "type": "string"
+                              },
+                              "payments": {
+                                "items": {
+                                  "properties": {
+                                    "amount": {
+                                      "type": "integer"
+                                    },
+                                    "paymentMethodId": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "tags": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "transactions": {
+                            "items": {
+                              "properties": {
+                                "amount": {
+                                  "type": "integer"
+                                },
+                                "id": {
+                                  "type": "string"
+                                }
+                              },
+                              "type": "object"
+                            },
+                            "type": "array"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakBillingNote",
+          "path_template": "/billingnotes"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak Billing Note Expense",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "GET",
+          "operation_id": "getPeakBillingNoteExpense",
+          "path_template": "/billingnotesexpenses"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Billing Note Expense",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakBillingNotesExpenses": {
+                  "properties": {
+                    "billingNotesExpenses": {
+                      "items": {
+                        "properties": {
+                          "contactId": {
+                            "type": "string"
+                          },
+                          "dueDate": {
+                            "type": "string"
+                          },
+                          "issuedDate": {
+                            "type": "string"
+                          },
+                          "paidPayments": {
+                            "properties": {
+                              "paymentDate": {
+                                "type": "string"
+                              },
+                              "payments": {
+                                "items": {
+                                  "properties": {
+                                    "amount": {
+                                      "type": "integer"
+                                    },
+                                    "paymentMethodId": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "tags": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "transactions": {
+                            "items": {
+                              "properties": {
+                                "amount": {
+                                  "type": "integer"
+                                },
+                                "id": {
+                                  "type": "string"
+                                }
+                              },
+                              "type": "object"
+                            },
+                            "type": "array"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakBillingNoteExpense",
+          "path_template": "/billingnotesexpenses"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Create Client Token",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakClientToken": {
+                  "properties": {
+                    "connectId": {
+                      "type": "string"
+                    },
+                    "password": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "createClientToken",
+          "path_template": "/clienttoken"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak Contact",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {
+              "code": {
+                "description": "",
+                "type": "string"
+              }
+            }
+          },
+          "method": "GET",
+          "operation_id": "getPeakContact",
+          "path_template": "/contacts"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Contact",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakContacts": {
+                  "properties": {
+                    "contacts": {
+                      "items": {
+                        "properties": {
+                          "address": {
+                            "type": "string"
+                          },
+                          "branchCode": {
+                            "type": "string"
+                          },
+                          "callCenterNumber": {
+                            "type": "string"
+                          },
+                          "contactEmail": {
+                            "type": "string"
+                          },
+                          "contactFirstName": {
+                            "type": "string"
+                          },
+                          "contactLastName": {
+                            "type": "string"
+                          },
+                          "contactNickName": {
+                            "type": "string"
+                          },
+                          "contactPhoneNumber": {
+                            "type": "string"
+                          },
+                          "contactPosition": {
+                            "type": "string"
+                          },
+                          "country": {
+                            "type": "string"
+                          },
+                          "district": {
+                            "type": "string"
+                          },
+                          "email": {
+                            "type": "string"
+                          },
+                          "faxNumber": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "postCode": {
+                            "type": "string"
+                          },
+                          "province": {
+                            "type": "string"
+                          },
+                          "subDistrict": {
+                            "type": "string"
+                          },
+                          "taxNumber": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "type": "integer"
+                          },
+                          "website": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakContact",
+          "path_template": "/contacts"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Contact /w Bank",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakContacts": {
+                  "properties": {
+                    "contacts": {
+                      "items": {
+                        "properties": {
+                          "address": {
+                            "type": "string"
+                          },
+                          "bankAccount": {
+                            "properties": {
+                              "bankAccountName": {
+                                "type": "string"
+                              },
+                              "bankAccountNo": {
+                                "type": "string"
+                              },
+                              "bankBranch": {
+                                "type": "string"
+                              },
+                              "bankId": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "callCenterNumber": {
+                            "type": "string"
+                          },
+                          "contactEmail": {
+                            "type": "string"
+                          },
+                          "contactFirstName": {
+                            "type": "string"
+                          },
+                          "contactLastName": {
+                            "type": "string"
+                          },
+                          "contactNickName": {
+                            "type": "string"
+                          },
+                          "contactPhoneNumber": {
+                            "type": "string"
+                          },
+                          "contactPosition": {
+                            "type": "string"
+                          },
+                          "country": {
+                            "type": "string"
+                          },
+                          "district": {
+                            "type": "string"
+                          },
+                          "email": {
+                            "type": "string"
+                          },
+                          "faxNumber": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "postCode": {
+                            "type": "string"
+                          },
+                          "province": {
+                            "type": "string"
+                          },
+                          "subDistrict": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "type": "integer"
+                          },
+                          "website": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakContactWBank",
+          "path_template": "/contacts"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Edit Peak Contact",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakContacts": {
+                  "properties": {
+                    "contacts": {
+                      "properties": {
+                        "address": {
+                          "type": "string"
+                        },
+                        "branchCode": {
+                          "type": "string"
+                        },
+                        "callCenterNumber": {
+                          "type": "string"
+                        },
+                        "code": {
+                          "type": "string"
+                        },
+                        "contactEmail": {
+                          "type": "string"
+                        },
+                        "contactFirstName": {
+                          "type": "string"
+                        },
+                        "contactLastName": {
+                          "type": "string"
+                        },
+                        "contactNickName": {
+                          "type": "string"
+                        },
+                        "contactPhoneNumber": {
+                          "type": "string"
+                        },
+                        "contactPosition": {
+                          "type": "string"
+                        },
+                        "country": {
+                          "type": "string"
+                        },
+                        "district": {
+                          "type": "string"
+                        },
+                        "email": {
+                          "type": "string"
+                        },
+                        "faxNumber": {
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "postCode": {
+                          "type": "string"
+                        },
+                        "province": {
+                          "type": "string"
+                        },
+                        "subDistrict": {
+                          "type": "string"
+                        },
+                        "taxNumber": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "integer"
+                        },
+                        "website": {
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "id": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "editPeakContact",
+          "path_template": "/contacts/edit"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak Credit Note",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {
+              "code": {
+                "description": "",
+                "type": "string"
+              }
+            }
+          },
+          "method": "GET",
+          "operation_id": "getPeakCreditNote",
+          "path_template": "/creditnotes"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Credit Note",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakCreditNotes": {
+                  "properties": {
+                    "creditNotes": {
+                      "items": {
+                        "properties": {
+                          "goodsReturn": {
+                            "type": "string"
+                          },
+                          "reasonDescription": {
+                            "type": "string"
+                          },
+                          "reasonTypeId": {
+                            "type": "string"
+                          },
+                          "transactionId": {
+                            "type": "string"
+                          },
+                          "transactionTypeId": {
+                            "type": "string"
+                          },
+                          "transactions": {
+                            "properties": {
+                              "issuedDate": {
+                                "type": "string"
+                              },
+                              "products": {
+                                "items": {
+                                  "properties": {
+                                    "discount": {
+                                      "type": "string"
+                                    },
+                                    "id": {
+                                      "type": "string"
+                                    },
+                                    "price": {
+                                      "type": "integer"
+                                    },
+                                    "quantity": {
+                                      "type": "integer"
+                                    },
+                                    "vatType": {
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "type": "object"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakCreditNote",
+          "path_template": "/creditnotes"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Credit Note Full Credit",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakCreditNotes": {
+                  "properties": {
+                    "creditNotes": {
+                      "items": {
+                        "properties": {
+                          "creditNoteType": {
+                            "type": "string"
+                          },
+                          "goodsReturn": {
+                            "type": "string"
+                          },
+                          "isFullCredit": {
+                            "type": "string"
+                          },
+                          "reasonDescription": {
+                            "type": "string"
+                          },
+                          "reasonTypeId": {
+                            "type": "string"
+                          },
+                          "transactionId": {
+                            "type": "string"
+                          },
+                          "transactionTypeId": {
+                            "type": "string"
+                          },
+                          "transactions": {
+                            "properties": {
+                              "issuedDate": {
+                                "type": "string"
+                              },
+                              "tags": {
+                                "items": {
+                                  "type": "string"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "type": "object"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakCreditNoteFullCredit",
+          "path_template": "/creditnotes"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak Credit Note Expense",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "GET",
+          "operation_id": "getPeakCreditNoteExpense",
+          "path_template": "/creditnotesExpenses"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Credit Note Expense",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakCreditNotesExpenses": {
+                  "properties": {
+                    "creditNotesExpenses": {
+                      "items": {
+                        "properties": {
+                          "goodsReturn": {
+                            "type": "string"
+                          },
+                          "reasonDescription": {
+                            "type": "string"
+                          },
+                          "reasonTypeId": {
+                            "type": "string"
+                          },
+                          "transactionId": {
+                            "type": "string"
+                          },
+                          "transactionTypeId": {
+                            "type": "string"
+                          },
+                          "transactions": {
+                            "properties": {
+                              "issuedDate": {
+                                "type": "string"
+                              },
+                              "products": {
+                                "items": {
+                                  "properties": {
+                                    "discount": {
+                                      "type": "string"
+                                    },
+                                    "id": {
+                                      "type": "string"
+                                    },
+                                    "price": {
+                                      "type": "integer"
+                                    },
+                                    "quantity": {
+                                      "type": "integer"
+                                    },
+                                    "vatType": {
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "type": "object"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakCreditNoteExpense",
+          "path_template": "/creditnotesExpenses"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak DailyJournal",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakDailyJournals": {
+                  "properties": {
+                    "dailyJournals": {
+                      "items": {
+                        "properties": {
+                          "description": {
+                            "type": "string"
+                          },
+                          "issuedDate": {
+                            "type": "string"
+                          },
+                          "journalEntries": {
+                            "items": {
+                              "properties": {
+                                "accountCode": {
+                                  "type": "string"
+                                },
+                                "accountSubId": {
+                                  "type": "string"
+                                },
+                                "credit": {
+                                  "type": "string"
+                                },
+                                "debit": {
+                                  "type": "string"
+                                }
+                              },
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "journalTypeId": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakDailyjournal",
+          "path_template": "/dailyjournals"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak DailyJournal",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "GET",
+          "operation_id": "getPeakDailyjournal",
+          "path_template": "/dailyjournals/"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak AccountCode",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "GET",
+          "operation_id": "getPeakAccountcode",
+          "path_template": "/dailyjournals/accountcode"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak Expense",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {
+              "code": {
+                "description": "",
+                "type": "string"
+              }
+            }
+          },
+          "method": "GET",
+          "operation_id": "getPeakExpense",
+          "path_template": "/expenses"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Edit Peak Expense",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakExpenses": {
+                  "properties": {
+                    "expenses": {
+                      "items": {
+                        "properties": {
+                          "contactId": {
+                            "type": "string"
+                          },
+                          "dueDate": {
+                            "type": "string"
+                          },
+                          "issuedDate": {
+                            "type": "string"
+                          },
+                          "istaxInvoice": {
+                            "type": "integer"
+                          },
+                          "paidPayments": {
+                            "properties": {
+                              "paymentDate": {
+                                "type": "string"
+                              },
+                              "payments": {
+                                "items": {
+                                  "properties": {
+                                    "amount": {
+                                      "type": "integer"
+                                    },
+                                    "paymentMethodId": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "products": {
+                            "items": {
+                              "properties": {
+                                "price": {
+                                  "type": "string"
+                                },
+                                "productId": {
+                                  "type": "string"
+                                },
+                                "quantity": {
+                                  "type": "integer"
+                                },
+                                "vatType": {
+                                  "type": "integer"
+                                }
+                              },
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "tags": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "editPeakExpense",
+          "path_template": "/expenses"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Expense",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakExpenses": {
+                  "properties": {
+                    "expenses": {
+                      "items": {
+                        "properties": {
+                          "contactId": {
+                            "type": "string"
+                          },
+                          "dueDate": {
+                            "type": "string"
+                          },
+                          "issuedDate": {
+                            "type": "string"
+                          },
+                          "istaxInvoice": {
+                            "type": "integer"
+                          },
+                          "paidPayments": {
+                            "properties": {
+                              "paymentDate": {
+                                "type": "string"
+                              },
+                              "payments": {
+                                "items": {
+                                  "properties": {
+                                    "amount": {
+                                      "type": "integer"
+                                    },
+                                    "paymentMethodId": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "products": {
+                            "items": {
+                              "properties": {
+                                "price": {
+                                  "type": "string"
+                                },
+                                "productId": {
+                                  "type": "string"
+                                },
+                                "quantity": {
+                                  "type": "integer"
+                                },
+                                "vatType": {
+                                  "type": "integer"
+                                }
+                              },
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "tags": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakExpense",
+          "path_template": "/expenses"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Expense All In One",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakExpenses": {
+                  "properties": {
+                    "expenses": {
+                      "items": {
+                        "properties": {
+                          "contact": {
+                            "properties": {
+                              "address": {
+                                "type": "string"
+                              },
+                              "branchCode": {
+                                "type": "string"
+                              },
+                              "callCenterNumber": {
+                                "type": "string"
+                              },
+                              "code": {
+                                "type": "string"
+                              },
+                              "contactEmail": {
+                                "type": "string"
+                              },
+                              "contactFirstName": {
+                                "type": "string"
+                              },
+                              "contactLastName": {
+                                "type": "string"
+                              },
+                              "contactNickName": {
+                                "type": "string"
+                              },
+                              "contactPhoneNumber": {
+                                "type": "string"
+                              },
+                              "contactPosition": {
+                                "type": "string"
+                              },
+                              "country": {
+                                "type": "string"
+                              },
+                              "district": {
+                                "type": "string"
+                              },
+                              "email": {
+                                "type": "string"
+                              },
+                              "faxNumber": {
+                                "type": "string"
+                              },
+                              "name": {
+                                "type": "string"
+                              },
+                              "postCode": {
+                                "type": "string"
+                              },
+                              "province": {
+                                "type": "string"
+                              },
+                              "subDistrict": {
+                                "type": "string"
+                              },
+                              "taxNumber": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "type": "integer"
+                              },
+                              "website": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "dueDate": {
+                            "type": "string"
+                          },
+                          "issuedDate": {
+                            "type": "string"
+                          },
+                          "istaxInvoice": {
+                            "type": "integer"
+                          },
+                          "paidPayments": {
+                            "properties": {
+                              "paymentDate": {
+                                "type": "string"
+                              },
+                              "payments": {
+                                "items": {
+                                  "properties": {
+                                    "amount": {
+                                      "type": "integer"
+                                    },
+                                    "paymentMethod": {
+                                      "properties": {
+                                        "carringBalanceValue": {
+                                          "type": "string"
+                                        },
+                                        "memo": {
+                                          "type": "string"
+                                        },
+                                        "name": {
+                                          "type": "string"
+                                        },
+                                        "type": {
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "type": "object"
+                                    }
+                                  },
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "products": {
+                            "items": {
+                              "properties": {
+                                "price": {
+                                  "type": "string"
+                                },
+                                "productTemplate": {
+                                  "properties": {
+                                    "carryingBalanceAmount": {
+                                      "type": "integer"
+                                    },
+                                    "carryingBalanceValue": {
+                                      "type": "string"
+                                    },
+                                    "code": {
+                                      "type": "string"
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    },
+                                    "name": {
+                                      "type": "string"
+                                    },
+                                    "purchaseValue": {
+                                      "type": "string"
+                                    },
+                                    "purchaseVattype": {
+                                      "type": "integer"
+                                    },
+                                    "sellValue": {
+                                      "type": "string"
+                                    },
+                                    "sellVatType": {
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "type": "object"
+                                },
+                                "quantity": {
+                                  "type": "integer"
+                                },
+                                "vatType": {
+                                  "type": "integer"
+                                }
+                              },
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "tags": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakExpenseAllInOne",
+          "path_template": "/expenses/allinone"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "ByPurchaseOrder Peak Expense",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakExpenses": {
+                  "properties": {
+                    "expenses": {
+                      "properties": {
+                        "dueDate": {
+                          "type": "string"
+                        },
+                        "issuedDate": {
+                          "type": "string"
+                        },
+                        "istaxInvoice": {
+                          "type": "integer"
+                        },
+                        "paidPayments": {
+                          "properties": {
+                            "paymentDate": {
+                              "type": "string"
+                            },
+                            "payments": {
+                              "items": {
+                                "properties": {
+                                  "amount": {
+                                    "type": "integer"
+                                  },
+                                  "paymentMethodId": {
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object"
+                              },
+                              "type": "array"
+                            }
+                          },
+                          "type": "object"
+                        },
+                        "tags": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "purchaseOrderId": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "bypurchaseorderPeakExpense",
+          "path_template": "/expenses/createbypurchaseorder"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak Expense List",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {
+              "limit": {
+                "description": "",
+                "type": "string"
+              },
+              "page": {
+                "description": "",
+                "type": "string"
+              },
+              "status": {
+                "description": "",
+                "type": "string"
+              }
+            }
+          },
+          "method": "GET",
+          "operation_id": "getPeakExpenseList",
+          "path_template": "/expenses/list"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Peak Expense Payment",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakPaidPayments": {
+                  "properties": {
+                    "paymentDate": {
+                      "type": "string"
+                    },
+                    "payments": {
+                      "items": {
+                        "properties": {
+                          "amount": {
+                            "type": "string"
+                          },
+                          "note": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "transactionId": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "peakExpensePayment",
+          "path_template": "/expenses/paidpayment"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Invitation",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakInvitation": {
+                  "properties": {
+                    "email": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postInvitation",
+          "path_template": "/invitation"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak Invoice",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {
+              "code": {
+                "description": "",
+                "type": "string"
+              }
+            }
+          },
+          "method": "GET",
+          "operation_id": "getPeakInvoice",
+          "path_template": "/invoices"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Invoice",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakInvoices": {
+                  "properties": {
+                    "invoices": {
+                      "items": {
+                        "properties": {
+                          "contactId": {
+                            "type": "string"
+                          },
+                          "dueDate": {
+                            "type": "string"
+                          },
+                          "isTaxInvoice": {
+                            "type": "integer"
+                          },
+                          "issuedDate": {
+                            "type": "string"
+                          },
+                          "paidPayments": {
+                            "properties": {
+                              "paymentDate": {
+                                "type": "string"
+                              },
+                              "payments": {
+                                "items": {
+                                  "properties": {
+                                    "amount": {
+                                      "type": "integer"
+                                    },
+                                    "paymentMethodId": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "products": {
+                            "items": {
+                              "properties": {
+                                "price": {
+                                  "type": "string"
+                                },
+                                "productCode": {
+                                  "type": "string"
+                                },
+                                "quantity": {
+                                  "type": "integer"
+                                },
+                                "vatType": {
+                                  "type": "integer"
+                                }
+                              },
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "tags": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakInvoice",
+          "path_template": "/invoices"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Invoice /w Fee",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakInvoices": {
+                  "properties": {
+                    "invoices": {
+                      "items": {
+                        "properties": {
+                          "contactId": {
+                            "type": "string"
+                          },
+                          "dueDate": {
+                            "type": "string"
+                          },
+                          "issuedDate": {
+                            "type": "string"
+                          },
+                          "istaxInvoice": {
+                            "type": "integer"
+                          },
+                          "paidPayments": {
+                            "properties": {
+                              "paymentDate": {
+                                "type": "string"
+                              },
+                              "payments": {
+                                "items": {
+                                  "properties": {
+                                    "amount": {
+                                      "type": "integer"
+                                    },
+                                    "paymentMethodId": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "products": {
+                            "items": {
+                              "properties": {
+                                "price": {
+                                  "type": "string"
+                                },
+                                "productCode": {
+                                  "type": "string"
+                                },
+                                "quantity": {
+                                  "type": "integer"
+                                },
+                                "vatType": {
+                                  "type": "integer"
+                                }
+                              },
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "tags": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakInvoiceWFee",
+          "path_template": "/invoices"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Approve Peak Invoice",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakInvoices": {
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "approvePeakInvoice",
+          "path_template": "/invoices/approve"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Edit Peak Invoice",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakInvoices": {
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "invoices": {
+                      "properties": {
+                        "code": {
+                          "type": "string"
+                        },
+                        "contactId": {
+                          "type": "string"
+                        },
+                        "discountTotal": {
+                          "type": "string"
+                        },
+                        "dueDate": {
+                          "type": "string"
+                        },
+                        "isTaxInvoice": {
+                          "type": "integer"
+                        },
+                        "issuedDate": {
+                          "type": "string"
+                        },
+                        "paidPayments": {
+                          "type": "null"
+                        },
+                        "products": {
+                          "items": {
+                            "properties": {
+                              "accountCode": {
+                                "type": "string"
+                              },
+                              "accountSubId": {
+                                "type": "null"
+                              },
+                              "description": {
+                                "type": "string"
+                              },
+                              "discount": {
+                                "type": "string"
+                              },
+                              "price": {
+                                "type": "number"
+                              },
+                              "productId": {
+                                "type": "string"
+                              },
+                              "quantity": {
+                                "type": "number"
+                              },
+                              "vatType": {
+                                "type": "integer"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "remark": {
+                          "type": "null"
+                        },
+                        "tags": {
+                          "type": "null"
+                        },
+                        "taxStatus": {
+                          "type": "integer"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "editPeakInvoice",
+          "path_template": "/invoices/edit"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak Invoice List",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {
+              "limit": {
+                "description": "",
+                "type": "string"
+              },
+              "page": {
+                "description": "",
+                "type": "string"
+              },
+              "searchText": {
+                "description": "",
+                "type": "string"
+              },
+              "status": {
+                "description": "",
+                "type": "string"
+              }
+            }
+          },
+          "method": "GET",
+          "operation_id": "getPeakInvoiceList",
+          "path_template": "/invoices/list"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Peak Invoice Payment",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakPaidPayments": {
+                  "properties": {
+                    "paymentDate": {
+                      "type": "string"
+                    },
+                    "payments": {
+                      "items": {
+                        "properties": {
+                          "amount": {
+                            "type": "string"
+                          },
+                          "note": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "transactionId": {
+                      "type": "string"
+                    },
+                    "withholdingTaxAmount": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "peakInvoicePayment",
+          "path_template": "/invoices/paidpayment"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Peak Invoice Payment All In One",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakPaidPayments": {
+                  "properties": {
+                    "paidPayments": {
+                      "properties": {
+                        "paymentDate": {
+                          "type": "string"
+                        },
+                        "payments": {
+                          "items": {
+                            "properties": {
+                              "amount": {
+                                "type": "string"
+                              },
+                              "note": {
+                                "type": "string"
+                              },
+                              "paymentMethod": {
+                                "properties": {
+                                  "carringBalanceValue": {
+                                    "type": "string"
+                                  },
+                                  "code": {
+                                    "type": "string"
+                                  },
+                                  "memo": {
+                                    "type": "string"
+                                  },
+                                  "name": {
+                                    "type": "string"
+                                  },
+                                  "type": {
+                                    "type": "integer"
+                                  }
+                                },
+                                "type": "object"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "withholdingTaxAmount": {
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "transactionId": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "peakInvoicePaymentAllInOne",
+          "path_template": "/invoices/paidpaymentallinone"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Void Peak Invoice Payment",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakPaidPayments": {
+                  "properties": {
+                    "paymentGroupId": {
+                      "type": "integer"
+                    },
+                    "transactionId": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "voidPeakInvoicePayment",
+          "path_template": "/invoices/voidpayment"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak PaymentMethod",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "GET",
+          "operation_id": "getPeakPaymentmethod",
+          "path_template": "/paymentmethods"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak PaymentMethod",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakPaymentMethods": {
+                  "properties": {
+                    "paymentMethods": {
+                      "items": {
+                        "properties": {
+                          "carringBalanceValue": {
+                            "type": "string"
+                          },
+                          "memo": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakPaymentmethod",
+          "path_template": "/paymentmethods"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak Product",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {
+              "code": {
+                "description": "",
+                "type": "string"
+              }
+            }
+          },
+          "method": "GET",
+          "operation_id": "getPeakProduct",
+          "path_template": "/products"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Product",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakProducts": {
+                  "properties": {
+                    "products": {
+                      "items": {
+                        "properties": {
+                          "carryingBalanceAmount": {
+                            "type": "integer"
+                          },
+                          "carryingBalanceValue": {
+                            "type": "string"
+                          },
+                          "description": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "purchaseValue": {
+                            "type": "string"
+                          },
+                          "purchaseVattype": {
+                            "type": "integer"
+                          },
+                          "sellValue": {
+                            "type": "string"
+                          },
+                          "sellVatType": {
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakProduct",
+          "path_template": "/products"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Product /w Account",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakProducts": {
+                  "properties": {
+                    "products": {
+                      "items": {
+                        "properties": {
+                          "carryingBalanceAmount": {
+                            "type": "integer"
+                          },
+                          "carryingBalanceValue": {
+                            "type": "string"
+                          },
+                          "description": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "purchaseValue": {
+                            "type": "string"
+                          },
+                          "purchaseVattype": {
+                            "type": "integer"
+                          },
+                          "sellAccount": {
+                            "type": "string"
+                          },
+                          "sellValue": {
+                            "type": "string"
+                          },
+                          "sellVatType": {
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakProductWAccount",
+          "path_template": "/products"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Edit Peak Product",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakProducts": {
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "products": {
+                      "properties": {
+                        "carryingBalanceAmount": {
+                          "type": "integer"
+                        },
+                        "carryingBalanceValue": {
+                          "type": "string"
+                        },
+                        "code": {
+                          "type": "string"
+                        },
+                        "description": {
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "purchaseValue": {
+                          "type": "string"
+                        },
+                        "purchaseVattype": {
+                          "type": "integer"
+                        },
+                        "sellValue": {
+                          "type": "string"
+                        },
+                        "sellVatType": {
+                          "type": "integer"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "editPeakProduct",
+          "path_template": "/products/edit"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak Purchase Order",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "GET",
+          "operation_id": "getPeakPurchaseOrder",
+          "path_template": "/purchaseorders"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Purchase Order",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakPurchaseOrders": {
+                  "properties": {
+                    "purchaseOrders": {
+                      "items": {
+                        "properties": {
+                          "contactId": {
+                            "type": "string"
+                          },
+                          "dueDate": {
+                            "type": "string"
+                          },
+                          "issuedDate": {
+                            "type": "string"
+                          },
+                          "products": {
+                            "items": {
+                              "properties": {
+                                "price": {
+                                  "type": "string"
+                                },
+                                "productId": {
+                                  "type": "string"
+                                },
+                                "quantity": {
+                                  "type": "integer"
+                                },
+                                "vatType": {
+                                  "type": "integer"
+                                }
+                              },
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "tags": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakPurchaseOrder",
+          "path_template": "/purchaseorders"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak Purchase Order List",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {
+              "limit": {
+                "description": "",
+                "type": "string"
+              },
+              "page": {
+                "description": "",
+                "type": "string"
+              },
+              "status": {
+                "description": "",
+                "type": "string"
+              }
+            }
+          },
+          "method": "GET",
+          "operation_id": "getPeakPurchaseOrderList",
+          "path_template": "/purchaseorders/list"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak Quotation",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "GET",
+          "operation_id": "getPeakQuotation",
+          "path_template": "/quotations"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Quotation",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakQuotations": {
+                  "properties": {
+                    "quotations": {
+                      "items": {
+                        "properties": {
+                          "contactId": {
+                            "type": "string"
+                          },
+                          "dueDate": {
+                            "type": "string"
+                          },
+                          "issuedDate": {
+                            "type": "string"
+                          },
+                          "products": {
+                            "items": {
+                              "properties": {
+                                "price": {
+                                  "type": "string"
+                                },
+                                "productId": {
+                                  "type": "string"
+                                },
+                                "quantity": {
+                                  "type": "integer"
+                                },
+                                "vatType": {
+                                  "type": "number"
+                                }
+                              },
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "tags": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakQuotation",
+          "path_template": "/quotations"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Quotation All In One",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakQuotations": {
+                  "properties": {
+                    "quotations": {
+                      "items": {
+                        "properties": {
+                          "contact": {
+                            "properties": {
+                              "address": {
+                                "type": "string"
+                              },
+                              "branchCode": {
+                                "type": "string"
+                              },
+                              "callCenterNumber": {
+                                "type": "string"
+                              },
+                              "code": {
+                                "type": "string"
+                              },
+                              "contactEmail": {
+                                "type": "string"
+                              },
+                              "contactFirstName": {
+                                "type": "string"
+                              },
+                              "contactLastName": {
+                                "type": "string"
+                              },
+                              "contactNickName": {
+                                "type": "string"
+                              },
+                              "contactPhoneNumber": {
+                                "type": "string"
+                              },
+                              "contactPosition": {
+                                "type": "string"
+                              },
+                              "country": {
+                                "type": "string"
+                              },
+                              "district": {
+                                "type": "string"
+                              },
+                              "email": {
+                                "type": "string"
+                              },
+                              "faxNumber": {
+                                "type": "string"
+                              },
+                              "name": {
+                                "type": "string"
+                              },
+                              "postCode": {
+                                "type": "string"
+                              },
+                              "province": {
+                                "type": "string"
+                              },
+                              "subDistrict": {
+                                "type": "string"
+                              },
+                              "taxNumber": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "type": "integer"
+                              },
+                              "website": {
+                                "type": "string"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "dueDate": {
+                            "type": "string"
+                          },
+                          "issuedDate": {
+                            "type": "string"
+                          },
+                          "products": {
+                            "items": {
+                              "properties": {
+                                "price": {
+                                  "type": "string"
+                                },
+                                "productTemplate": {
+                                  "properties": {
+                                    "carryingBalanceAmount": {
+                                      "type": "integer"
+                                    },
+                                    "carryingBalanceValue": {
+                                      "type": "string"
+                                    },
+                                    "code": {
+                                      "type": "string"
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    },
+                                    "name": {
+                                      "type": "string"
+                                    },
+                                    "purchaseValue": {
+                                      "type": "string"
+                                    },
+                                    "purchaseVattype": {
+                                      "type": "integer"
+                                    },
+                                    "sellValue": {
+                                      "type": "string"
+                                    },
+                                    "sellVatType": {
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "type": "object"
+                                },
+                                "quantity": {
+                                  "type": "integer"
+                                },
+                                "vatType": {
+                                  "type": "integer"
+                                }
+                              },
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "tags": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakQuotationAllInOne",
+          "path_template": "/quotations/allinone"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Edit Peak Quotation",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakQuotations": {
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "quotations": {
+                      "properties": {
+                        "code": {
+                          "type": "string"
+                        },
+                        "contactId": {
+                          "type": "string"
+                        },
+                        "discountTotal": {
+                          "type": "string"
+                        },
+                        "dueDate": {
+                          "type": "string"
+                        },
+                        "issuedDate": {
+                          "type": "string"
+                        },
+                        "products": {
+                          "items": {
+                            "properties": {
+                              "accountCode": {
+                                "type": "string"
+                              },
+                              "accountSubId": {
+                                "type": "null"
+                              },
+                              "description": {
+                                "type": "string"
+                              },
+                              "discount": {
+                                "type": "string"
+                              },
+                              "price": {
+                                "type": "number"
+                              },
+                              "productId": {
+                                "type": "null"
+                              },
+                              "quantity": {
+                                "type": "number"
+                              },
+                              "vatType": {
+                                "type": "integer"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "remark": {
+                          "type": "null"
+                        },
+                        "status": {
+                          "type": "string"
+                        },
+                        "tags": {
+                          "type": "null"
+                        },
+                        "taxStatus": {
+                          "type": "integer"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "editPeakQuotation",
+          "path_template": "/quotations/edit"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak Quotation List",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {
+              "limit": {
+                "description": "",
+                "type": "string"
+              },
+              "page": {
+                "description": "",
+                "type": "string"
+              },
+              "status": {
+                "description": "",
+                "type": "string"
+              }
+            }
+          },
+          "method": "GET",
+          "operation_id": "getPeakQuotationList",
+          "path_template": "/quotations/list"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Void Peak Quotation",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakQuotations": {
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "voidPeakQuotation",
+          "path_template": "/quotations/void"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak Receipt",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {
+              "code": {
+                "description": "",
+                "type": "string"
+              }
+            }
+          },
+          "method": "GET",
+          "operation_id": "getPeakReceipt",
+          "path_template": "/receipts"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Receipt",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakReceipts": {
+                  "properties": {
+                    "receipts": {
+                      "items": {
+                        "properties": {
+                          "contactCode": {
+                            "type": "string"
+                          },
+                          "dueDate": {
+                            "type": "string"
+                          },
+                          "issuedDate": {
+                            "type": "string"
+                          },
+                          "istaxInvoice": {
+                            "type": "integer"
+                          },
+                          "paidPayments": {
+                            "properties": {
+                              "paymentDate": {
+                                "type": "string"
+                              },
+                              "payments": {
+                                "items": {
+                                  "properties": {
+                                    "amount": {
+                                      "type": "number"
+                                    },
+                                    "paymentMethodId": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "products": {
+                            "items": {
+                              "properties": {
+                                "accountCode": {
+                                  "type": "null"
+                                },
+                                "accountSubCode": {
+                                  "type": "null"
+                                },
+                                "accountSubId": {
+                                  "type": "null"
+                                },
+                                "description": {
+                                  "type": "null"
+                                },
+                                "discount": {
+                                  "type": "null"
+                                },
+                                "id": {
+                                  "type": "null"
+                                },
+                                "price": {
+                                  "type": "number"
+                                },
+                                "productCode": {
+                                  "type": "string"
+                                },
+                                "productId": {
+                                  "type": "null"
+                                },
+                                "productTemplate": {
+                                  "type": "null"
+                                },
+                                "quantity": {
+                                  "type": "number"
+                                },
+                                "vatType": {
+                                  "type": "null"
+                                }
+                              },
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "tags": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "taxStatus": {
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakReceipt",
+          "path_template": "/receipts"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Receipt /w Fee",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakReceipts": {
+                  "properties": {
+                    "receipts": {
+                      "items": {
+                        "properties": {
+                          "contactCode": {
+                            "type": "string"
+                          },
+                          "dueDate": {
+                            "type": "string"
+                          },
+                          "issuedDate": {
+                            "type": "string"
+                          },
+                          "istaxInvoice": {
+                            "type": "integer"
+                          },
+                          "paidPayments": {
+                            "properties": {
+                              "paymentDate": {
+                                "type": "string"
+                              },
+                              "payments": {
+                                "items": {
+                                  "properties": {
+                                    "amount": {
+                                      "type": "number"
+                                    },
+                                    "paymentMethodId": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "products": {
+                            "items": {
+                              "properties": {
+                                "price": {
+                                  "type": "number"
+                                },
+                                "productCode": {
+                                  "type": "string"
+                                },
+                                "quantity": {
+                                  "type": "number"
+                                }
+                              },
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "tags": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "taxStatus": {
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakReceiptWFee",
+          "path_template": "/receipts"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Receipt With Cheque",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakReceipts": {
+                  "properties": {
+                    "receipts": {
+                      "items": {
+                        "properties": {
+                          "contactId": {
+                            "type": "string"
+                          },
+                          "dueDate": {
+                            "type": "string"
+                          },
+                          "issuedDate": {
+                            "type": "string"
+                          },
+                          "istaxInvoice": {
+                            "type": "integer"
+                          },
+                          "paidPayments": {
+                            "properties": {
+                              "paymentDate": {
+                                "type": "string"
+                              },
+                              "payments": {
+                                "items": {
+                                  "properties": {
+                                    "cheque": {
+                                      "properties": {
+                                        "accountNo": {
+                                          "type": "string"
+                                        },
+                                        "amount": {
+                                          "type": "string"
+                                        },
+                                        "bankId": {
+                                          "type": "string"
+                                        },
+                                        "branchNo": {
+                                          "type": "string"
+                                        },
+                                        "chequeDate": {
+                                          "type": "string"
+                                        },
+                                        "chequeNo": {
+                                          "type": "string"
+                                        }
+                                      },
+                                      "type": "object"
+                                    },
+                                    "isCheque": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "products": {
+                            "items": {
+                              "properties": {
+                                "price": {
+                                  "type": "string"
+                                },
+                                "productId": {
+                                  "type": "string"
+                                },
+                                "quantity": {
+                                  "type": "integer"
+                                },
+                                "vatType": {
+                                  "type": "integer"
+                                }
+                              },
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "tags": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakReceiptWithCheque",
+          "path_template": "/receipts"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Receipt All In One",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakReceipts": {
+                  "properties": {
+                    "receipts": {
+                      "items": {
+                        "properties": {
+                          "contactId": {
+                            "type": "string"
+                          },
+                          "dueDate": {
+                            "type": "string"
+                          },
+                          "issuedDate": {
+                            "type": "string"
+                          },
+                          "istaxInvoice": {
+                            "type": "integer"
+                          },
+                          "paidPayments": {
+                            "properties": {
+                              "paymentDate": {
+                                "type": "string"
+                              },
+                              "payments": {
+                                "items": {
+                                  "properties": {
+                                    "amount": {
+                                      "type": "integer"
+                                    },
+                                    "paymentMethodId": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "products": {
+                            "items": {
+                              "properties": {
+                                "price": {
+                                  "type": "string"
+                                },
+                                "productId": {
+                                  "type": "string"
+                                },
+                                "quantity": {
+                                  "type": "integer"
+                                },
+                                "vatType": {
+                                  "type": "integer"
+                                }
+                              },
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "tags": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakReceiptAllInOne",
+          "path_template": "/receipts/allinone"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "ByInvoice Peak Receipt ",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakReceipts": {
+                  "properties": {
+                    "invoiceId": {
+                      "type": "string"
+                    },
+                    "paymentGroupId": {
+                      "type": "integer"
+                    },
+                    "receipts": {
+                      "properties": {
+                        "issuedDate": {
+                          "type": "string"
+                        },
+                        "remark": {
+                          "type": "null"
+                        },
+                        "tags": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "byinvoicePeakReceipt",
+          "path_template": "/receipts/createbyinvoice"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Edit Peak Receipt",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakReceipts": {
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "receipts": {
+                      "properties": {
+                        "code": {
+                          "type": "string"
+                        },
+                        "contactId": {
+                          "type": "string"
+                        },
+                        "discountTotal": {
+                          "type": "string"
+                        },
+                        "dueDate": {
+                          "type": "string"
+                        },
+                        "isTaxInvoice": {
+                          "type": "integer"
+                        },
+                        "issuedDate": {
+                          "type": "string"
+                        },
+                        "paidPayments": {
+                          "properties": {
+                            "paymentDate": {
+                              "type": "string"
+                            },
+                            "payments": {
+                              "items": {
+                                "properties": {
+                                  "amount": {
+                                    "type": "number"
+                                  },
+                                  "paymentMethodId": {
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object"
+                              },
+                              "type": "array"
+                            }
+                          },
+                          "type": "object"
+                        },
+                        "products": {
+                          "items": {
+                            "properties": {
+                              "accountCode": {
+                                "type": "string"
+                              },
+                              "accountSubId": {
+                                "type": "null"
+                              },
+                              "description": {
+                                "type": "string"
+                              },
+                              "discount": {
+                                "type": "string"
+                              },
+                              "price": {
+                                "type": "number"
+                              },
+                              "productId": {
+                                "type": "null"
+                              },
+                              "quantity": {
+                                "type": "number"
+                              },
+                              "vatType": {
+                                "type": "integer"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "remark": {
+                          "type": "null"
+                        },
+                        "tags": {
+                          "type": "null"
+                        },
+                        "taxStatus": {
+                          "type": "integer"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "editPeakReceipt",
+          "path_template": "/receipts/edit"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak Receipt List",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {
+              "limit": {
+                "description": "",
+                "type": "string"
+              },
+              "page": {
+                "description": "",
+                "type": "string"
+              },
+              "status": {
+                "description": "",
+                "type": "string"
+              }
+            }
+          },
+          "method": "GET",
+          "operation_id": "getPeakReceiptList",
+          "path_template": "/receipts/list"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Void Peak Receipt",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakReceipts": {
+                  "properties": {
+                    "receiptId": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "voidPeakReceipt",
+          "path_template": "/receipts/void"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Get Peak Service",
+          "input_schema": {
+            "body": {},
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "GET",
+          "operation_id": "getPeakService",
+          "path_template": "/services"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Edit Peak Service",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakServices": {
+                  "properties": {
+                    "services": {
+                      "items": {
+                        "properties": {
+                          "description": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "purchaseValue": {
+                            "type": "string"
+                          },
+                          "purchaseVattype": {
+                            "type": "integer"
+                          },
+                          "sellValue": {
+                            "type": "string"
+                          },
+                          "sellVatType": {
+                            "type": "integer"
+                          },
+                          "website": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "editPeakService",
+          "path_template": "/services"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Service",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakServices": {
+                  "properties": {
+                    "services": {
+                      "items": {
+                        "properties": {
+                          "description": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "purchaseValue": {
+                            "type": "string"
+                          },
+                          "purchaseVattype": {
+                            "type": "integer"
+                          },
+                          "sellValue": {
+                            "type": "string"
+                          },
+                          "sellVatType": {
+                            "type": "integer"
+                          },
+                          "website": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakService",
+          "path_template": "/services"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Service /w Account",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakServices": {
+                  "properties": {
+                    "services": {
+                      "items": {
+                        "properties": {
+                          "description": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "purchaseAccount": {
+                            "type": "string"
+                          },
+                          "purchaseValue": {
+                            "type": "string"
+                          },
+                          "purchaseVattype": {
+                            "type": "integer"
+                          },
+                          "sellAccount": {
+                            "type": "string"
+                          },
+                          "sellValue": {
+                            "type": "string"
+                          },
+                          "sellVatType": {
+                            "type": "integer"
+                          },
+                          "website": {
+                            "type": "string"
+                          }
+                        },
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakServiceWAccount",
+          "path_template": "/services"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Post Peak Tag",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakTags": {
+                  "properties": {
+                    "tags": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "transactionId": {
+                      "type": "string"
+                    },
+                    "transactionTypeId": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "postPeakTag",
+          "path_template": "/tags"
+        },
+        {
+          "confidence": "example_derived",
+          "content_type": "application/json",
+          "description": "Remove Peak Tag",
+          "input_schema": {
+            "body": {
+              "properties": {
+                "PeakTags": {
+                  "properties": {
+                    "tags": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "transactionId": {
+                      "type": "string"
+                    },
+                    "transactionTypeId": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "files": {},
+            "headers": {},
+            "path": {},
+            "query": {}
+          },
+          "method": "POST",
+          "operation_id": "removePeakTag",
+          "path_template": "/tags/remove"
+        }
+      ],
+      "version": "builtin-v1"
+    },
+    "report": {
+      "redacted_values": 326,
+      "safe": true
+    }
+  },
+  "source_hash": "87f375679842585c6b6e7d2015eb4975b8c11676b1c07af9e6c6b68d1fac2d20",
+  "source_id": "src_77ec909757fe9b0c4fb668fc",
+  "source_type": "postman2.1",
+  "source_uri": "mercury://catalog/global/peak/source"
+}

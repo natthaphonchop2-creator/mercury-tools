@@ -116,6 +116,11 @@ def verify_remote(
             and health.get("http_auth_configured") is not True
         ):
             missing.append("MERCURY_TOOLS_HTTP_BEARER_TOKEN on remote service")
+        if (
+            health.get("http_auth_required") is not True
+            and health.get("legacy_http_api") != "disabled"
+        ):
+            missing.append("disabled legacy HTTP API on public remote service")
 
         if health.get("http_auth_required") is True:
             unauthenticated_response = client.get(

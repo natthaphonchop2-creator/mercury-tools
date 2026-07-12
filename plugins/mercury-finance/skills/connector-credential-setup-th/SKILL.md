@@ -1,28 +1,22 @@
 ---
 name: connector-credential-setup-th
-description: Use when a user needs to connect FlowAccount, PEAK Accounting, Express Account, or another ERP/API system before running accounting workflows
+description: Use when an accounting or ERP task is blocked because local connector credentials are not ready
 ---
 
 # Connector Credential Setup TH
 
-## Rule
+Use this gate without skipping or reordering:
 
-Do not proceed to the next setup step until the current step is complete and validated.
+1. Call `credential_status` for the active repository, connector, and environment.
+2. If required credentials are missing, stop. Instruct the user to run locally:
+   `mercury credentials setup <connector> --env <environment> --repo-root "<repo>"`
+3. After the user confirms setup is complete, call `credential_status` again.
+4. If it is still missing or not configured, stop and return to local setup. Do not run
+   the connection test.
+5. Only when the second status is configured, ask the user to run locally:
+   `mercury credentials test <connector> --env <environment> --repo-root "<repo>"`
+6. Continue only when the test reports `connected`.
 
-Do not ask the user to paste API keys, client secrets, bearer tokens, or refresh tokens into normal chat. Use the host app's secure MCP credential path or a server-side credential vault flow.
-
-## Steps
-
-1. Call `list_connectors`.
-2. Ask the user to choose one connector if none is selected.
-3. Call `start_connector_setup` with connector id and environment.
-4. Show preset values that Mercury already knows.
-5. Ask only for required missing credential fields through a secure input path.
-6. Call `submit_connector_credentials`.
-7. Call `validate_connector_connection`.
-8. If validation returns `ready`, continue to the requested accounting workflow.
-9. If validation fails, stay on the failed step and ask for only the missing correction.
-
-## Output
-
-ตอบเป็นภาษาไทยแบบกระชับ ระบุโปรแกรม บริษัทถ้ามี environment, enabled capabilities, และ next safe command. Never show raw credentials.
+Never ask for, accept, or paste credentials in chat. Do not proceed while setup is
+missing, unconfirmed, or untested. On failure, report only the sanitized status and the
+next local command. Respond in concise Thai.

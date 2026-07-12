@@ -9,6 +9,8 @@ from typing import Any
 SUPPORTED_COMMANDS = {
     "assert",
     "connectorStatus",
+    "erpRead",
+    "erpWritePreview",
     "emitReport",
     "getDocument",
     "repeat",
@@ -21,6 +23,8 @@ SUPPORTED_COMMANDS = {
 
 COMMAND_ALIASES = {
     "connector_status": "connectorStatus",
+    "erp_read": "erpRead",
+    "erp_write_preview": "erpWritePreview",
     "emit_report": "emitReport",
     "get_document": "getDocument",
     "retrieve_context_pack": "retrieveContextPack",
@@ -30,10 +34,29 @@ COMMAND_ALIASES = {
     "search_knowledge": "searchKnowledge",
 }
 
+CAPABILITY_ARG_KEYS = (
+    "capability",
+    "requiredCapability",
+    "required_capability",
+    "requiredCapabilities",
+    "required_capabilities",
+)
+
 
 def normalize_command_name(name: str) -> str:
     clean = name.strip()
     return COMMAND_ALIASES.get(clean, clean)
+
+
+def declared_command_capabilities(args: dict[str, Any]) -> list[str]:
+    for key in CAPABILITY_ARG_KEYS:
+        raw = args.get(key)
+        if isinstance(raw, str):
+            value = raw.strip()
+            return [value] if value else []
+        if isinstance(raw, list | tuple | set):
+            return [str(item).strip() for item in raw if str(item).strip()]
+    return []
 
 
 @dataclass(frozen=True)
@@ -108,9 +131,12 @@ class FlowRunResult:
     steps: list[FlowStepResult]
     variables: dict[str, Any] = field(default_factory=dict)
     artifacts: list[dict[str, Any]] = field(default_factory=list)
+    reason: str | None = None
+    capability: str | None = None
+    tainted: bool = field(default=False, repr=False, compare=False)
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "status": self.status,
             "dry_run": self.dry_run,
             "flow": self.flow.as_dict(),
@@ -118,3 +144,8 @@ class FlowRunResult:
             "variables": self.variables,
             "artifacts": self.artifacts,
         }
+        if self.reason is not None:
+            payload["reason"] = self.reason
+        if self.capability is not None:
+            payload["capability"] = self.capability
+        return payload

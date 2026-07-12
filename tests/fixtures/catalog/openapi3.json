@@ -1,0 +1,63 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Example Books",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "https://api.example.test/v1?api_key=fake-openapi-key"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "paths": {
+    "/invoices/{invoice_id}": {
+      "get": {
+        "operationId": "getInvoice",
+        "summary": "Get invoice",
+        "description": "Read one invoice without changing it.",
+        "parameters": [
+          {
+            "name": "invoice_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Invoice identifier",
+              "example": "inv-secret-example"
+            }
+          },
+          {
+            "name": "X-Tenant",
+            "in": "header",
+            "schema": {
+              "type": "string",
+              "default": "tenant-secret"
+            },
+            "example": "tenant-header-secret"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Invoice returned"
+          }
+        }
+      }
+    }
+  },
+  "x-example-contact": "secret@example.com",
+  "x-example-authorization": "Bearer real-openapi-token"
+}

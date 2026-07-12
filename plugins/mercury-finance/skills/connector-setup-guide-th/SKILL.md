@@ -1,14 +1,23 @@
 ---
 name: connector-setup-guide-th
-description: Use when the user asks which accounting connector to use, what setup requires, or how to prepare FlowAccount, PEAK, Express, or ERP access
+description: Use when the user needs to choose or configure an accounting or ERP connector
 ---
 
 # Connector Setup Guide TH
 
-Use `list_connectors` to show current connector options and neutral setup states.
+Confirm the active repository, connector, and environment. Explain connector choices in
+neutral terms. Once the user chooses them, use this gate without skipping or reordering:
 
-If the user chooses a connector, use `start_connector_setup` to get exact required fields and preset values. Do not invent credential requirements from memory.
+1. Call `credential_status` for the active repository, connector, and environment.
+2. If required credentials are missing, stop. Instruct the user to run locally:
+   `mercury credentials setup <connector> --env <environment> --repo-root "<repo>"`
+3. After the user confirms setup is complete, call `credential_status` again.
+4. If it is still missing or not configured, stop and return to local setup. Do not run
+   the connection test.
+5. Only when the second status is configured, ask the user to run locally:
+   `mercury credentials test <connector> --env <environment> --repo-root "<repo>"`
+6. Continue only when the test reports `connected`.
 
-Use `validate_connector_connection` after setup. If credentials are needed, route to `connector-credential-setup-th` and keep the user on the current validated step.
-
-ตอบภาษาไทยแบบ checklist สั้น ๆ: connector, environment, permissions needed, secure input path, validation result, and next safe command. Never ask for secrets in normal chat.
+Never ask for, accept, or paste credentials in chat. Do not proceed while setup is
+missing, unconfirmed, or untested. Respond in concise Thai with connector, environment,
+connection status, and the next local command.

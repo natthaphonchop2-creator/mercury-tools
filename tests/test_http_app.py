@@ -13,27 +13,23 @@ def _clear_live_env(monkeypatch) -> None:
         "OPENAI_API_KEY",
         "MERCURY_TOOLS_PUBLIC_BASE_URL",
         "MERCURY_TOOLS_HTTP_BEARER_TOKEN",
+        "MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API",
         "MERCURY_CONNECT_INVITE_CODE",
         "MERCURY_CONNECT_SIGNING_SECRET",
+        "MERCURY_CLOUD_BASE_URL",
     ):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API", "true")
 
 
 def ready_connector_profile(connector_id: str = "flowaccount") -> dict:
     return {
         "connector_id": connector_id,
         "environment": "production",
-        "status": "ready",
+        "status": "connected",
         "metadata": {
             "setup_state": "ready",
             "enabled_capabilities": ["company.info.read"],
-            "credential_storage": "encrypted_server_vault",
-            "credential_fields": ["client_id", "client_secret"],
-            "credential_fingerprints": {
-                "client_id": "client-id-fp",
-                "client_secret": "client-secret-fp",
-            },
-            "credentials_configured": True,
         },
     }
 
@@ -48,6 +44,45 @@ def test_remote_http_app_exposes_healthz(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
     assert response.json()["mcp_path"] == "/mcp"
+    assert "private_mcp" not in response.json()
+    assert client.post("/private-mcp").status_code == 404
+
+
+def test_public_contest_app_does_not_mount_legacy_http_api(monkeypatch) -> None:
+    monkeypatch.setenv("MERCURY_TOOLS_MCP_PATH", "/mcp")
+    monkeypatch.delenv("MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API", raising=False)
+
+    client = TestClient(create_http_app(require_auth=False), raise_server_exceptions=False)
+
+    assert client.get("/start").status_code == 404
+    assert client.post("/api/connect", json={}).status_code == 404
+    assert client.get("/api/dashboard").status_code == 404
+    assert client.post("/api/team/invite", json={}).status_code == 404
+    assert client.post("/api/skills/upload", json={}).status_code == 404
+    assert client.post("/api/flows/run", json={}).status_code == 404
+    assert client.post("/private-mcp").status_code == 404
+    status = client.get("/api/status").json()
+    assert status["legacy_http_api"] == "disabled"
+    assert "dashboard" not in status
+    assert "skill_upload" not in status
+
+
+def test_public_app_mounts_cloud_reads_without_cloud_write_or_legacy_routes(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MERCURY_TOOLS_MCP_PATH", "/mcp")
+    monkeypatch.delenv("MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API", raising=False)
+
+    client = TestClient(create_http_app(require_auth=False), raise_server_exceptions=False)
+
+    assert client.get("/api/cloud/v1/catalog/actions").status_code == 503
+    assert client.post("/api/cloud/v1/catalog/actions", json={}).status_code == 405
+    assert client.post("/api/cloud/v1/connectors", json={}).status_code == 405
+    assert client.post("/api/cloud/v1/skills", json={}).status_code == 405
+    assert client.post("/api/cloud/v1/documents/document-1", json={}).status_code == 405
+    assert client.post("/api/connect", json={}).status_code == 404
+    assert client.post("/api/flows/run", json={}).status_code == 404
+    assert client.get("/mcp").status_code != 404
 
 
 def test_remote_http_app_allows_public_base_url_host(monkeypatch) -> None:
@@ -105,7 +140,8 @@ def test_connect_page_and_status(monkeypatch) -> None:
     assert "list_workspace_flows" in status.json()["flow_tools"]
     assert "run_workspace_flow" in status.json()["flow_tools"]
     assert status.json()["dashboard"] == "/api/dashboard"
-    assert status.json()["connector_credentials"] == "/api/connectors/credentials"
+    assert "connector_credentials" not in status.json()
+    assert client.post("/api/connectors/credentials", json={}).status_code == 404
     assert status.json()["flow_validate"] == "/api/flows/validate"
     assert status.json()["flow_import"] == "/api/flows/import"
 
@@ -139,7 +175,7 @@ def test_legacy_browser_paths_do_not_expose_setup_console(monkeypatch) -> None:
         assert 'id="connect-form"' not in response.text
 
 
-def test_flows_page_is_read_only_control_plane(monkeypatch) -> None:
+def test_flows_page_is_endpoint_capable_control_plane(monkeypatch) -> None:
     monkeypatch.setenv("MERCURY_CONNECT_INVITE_CODE", "invite-demo")
     monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
 
@@ -422,7 +458,7 @@ def test_workspace_flow_run_blocks_raw_yaml_with_connector_missing_environment(m
 
     connector_flow_missing_environment = (
         "name: FlowAccount Missing Environment\n"
-        "tags: [accounting, read-only, flowaccount]\n"
+        "tags: [accounting, endpoint-capable, flowaccount]\n"
         "env:\n"
         "  connector: flowaccount\n"
         "---\n"

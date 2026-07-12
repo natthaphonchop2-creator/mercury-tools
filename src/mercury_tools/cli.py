@@ -22,9 +22,11 @@ from mercury_tools.flows.workspace import (
     run_workspace_flows,
     workspace_manifest,
 )
+from mercury_tools.local.credential_cli import add_credential_parsers
 from mercury_tools.rag.embeddings import create_embedding_provider
 from mercury_tools.rag.ingest import ingest_wiki
 from mercury_tools.rag.models import SearchFilters
+from mercury_tools.rag.routing import apply_knowledge_routing
 from mercury_tools.rag.service import RagService
 from mercury_tools.remote import DEFAULT_RENDER_URL, DEFAULT_TOKEN_FILE, read_token, verify_remote
 
@@ -52,34 +54,6 @@ def _embedder(args: argparse.Namespace):
     return create_embedding_provider(settings, provider=getattr(args, "embedding_provider", None))
 
 
-def cmd_doctor(_args: argparse.Namespace) -> int:
-    settings = load_settings()
-    _print_json(
-        {
-            "supabase": settings.supabase_configured,
-            "openai": settings.openai_configured,
-            "embedding_provider": settings.embedding_provider,
-            "embedding_configured": settings.embedding_configured,
-            "embedding_model": settings.embedding_model,
-            "embedding_dim": settings.embedding_dim,
-            "mercury_agent_path": (
-                str(settings.mercury_agent_path) if settings.mercury_agent_path else None
-            ),
-            "mercury_home": str(settings.mercury_home) if settings.mercury_home else None,
-            "mcp": {
-                "transport": settings.mcp_transport,
-                "host": settings.mcp_host,
-                "port": settings.mcp_port,
-                "path": settings.mcp_path,
-                "endpoint": settings.mcp_endpoint,
-                "http_auth_required": settings.http_require_auth,
-                "http_auth_configured": settings.http_auth_configured,
-            },
-        }
-    )
-    return 0
-
-
 def cmd_ingest_wiki(args: argparse.Namespace) -> int:
     settings = load_settings()
     stats = ingest_wiki(
@@ -94,12 +68,27 @@ def cmd_ingest_wiki(args: argparse.Namespace) -> int:
 def cmd_search(args: argparse.Namespace) -> int:
     settings = load_settings()
     service = RagService(store=SupabaseRagStore(settings), embedder=_embedder(args))
+    raw_filters = {
+        key: value
+        for key, value in {
+            "jurisdiction": args.jurisdiction,
+            "connector": args.connector,
+            "doc_type": args.doc_type,
+            "review_status": args.review_status,
+            "effective_date": args.effective_date,
+        }.items()
+        if value is not None
+    }
+    applied_filters, inferred_connector, inferred_domain = apply_knowledge_routing(
+        args.query,
+        raw_filters,
+    )
     filters = SearchFilters(
-        jurisdiction=args.jurisdiction,
-        connector=args.connector,
-        doc_type=args.doc_type,
-        review_status=args.review_status,
-        effective_date=args.effective_date,
+        jurisdiction=applied_filters.get("jurisdiction"),
+        connector=applied_filters.get("connector"),
+        doc_type=applied_filters.get("doc_type"),
+        review_status=applied_filters.get("review_status"),
+        effective_date=applied_filters.get("effective_date"),
     )
     results = service.search(args.query, filters=filters, top_k=args.top_k, mode=args.mode)
     payload = [
@@ -109,6 +98,7 @@ def cmd_search(args: argparse.Namespace) -> int:
             "score": result.score,
             "text": result.text,
             "citation": result.citation,
+            "metadata": result.metadata,
             "source_title": result.source_title,
             "source_uri": result.source_uri,
             "source_url": result.source_url,
@@ -117,7 +107,15 @@ def cmd_search(args: argparse.Namespace) -> int:
         for result in results
     ]
     if args.json:
-        _print_json({"query": args.query, "results": payload})
+        _print_json(
+            {
+                "query": args.query,
+                "applied_filters": applied_filters,
+                "inferred_connector": inferred_connector,
+                "inferred_domain": inferred_domain,
+                "results": payload,
+            }
+        )
     else:
         for item in payload:
             print(f"- {item['source_title']} ({item['score']:.3f})")
@@ -141,6 +139,20 @@ def cmd_mcp_serve(args: argparse.Namespace) -> int:
         port=args.port or settings.mcp_port,
         require_auth=require_auth,
     )
+    return 0
+
+
+def cmd_mcp_serve_local(_args: argparse.Namespace) -> int:
+    """Defer the Task 14 local runtime import until this command is executed."""
+
+    try:
+        from mercury_tools.mcp.local_server import serve_local
+    except ModuleNotFoundError as exc:
+        if exc.name != "mercury_tools.mcp.local_server":
+            raise
+        _print_json({"status": "error", "error": "local_runtime_unavailable"})
+        return 1
+    serve_local()
     return 0
 
 
@@ -601,8 +613,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mercury-tools")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    doctor = sub.add_parser("doctor")
-    doctor.set_defaults(func=cmd_doctor)
+    add_credential_parsers(sub)
 
     ingest = sub.add_parser("ingest")
     ingest_sub = ingest.add_subparsers(dest="ingest_command", required=True)
@@ -633,6 +644,8 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--require-auth", action="store_true")
     serve.add_argument("--allow-unauthenticated", action="store_true")
     serve.set_defaults(func=cmd_mcp_serve)
+    serve_local = mcp_sub.add_parser("serve-local")
+    serve_local.set_defaults(func=cmd_mcp_serve_local)
 
     remote = sub.add_parser("remote")
     remote_sub = remote.add_subparsers(dest="remote_command", required=True)

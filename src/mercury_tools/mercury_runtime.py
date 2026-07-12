@@ -1,4 +1,4 @@
-"""Read-only helpers for an installed Mercury Agent runtime."""
+"""Safe public helpers for an installed Mercury Agent runtime."""
 
 from __future__ import annotations
 

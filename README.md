@@ -1,462 +1,136 @@
 # Mercury Tools
 
-Mercury Tools is the MCP and RAG companion repo for Mercury Agent. It exposes
-accounting knowledge, curated LLM Wiki pages, connector metadata, and skill
-prompts to MCP hosts such as Codex, Cursor, and Claude Desktop.
+Mercury Finance is one repository-local `stdio` MCP for accounting and ERP
+work. It gives an MCP host such as Codex a cited knowledge/catalog layer plus
+local FlowAccount, PEAK, and configured-ERP actions. The host remains the AI;
+Mercury does not run a local LLM and does not provide a web UI.
 
-v1 is remote-first and read-oriented:
+## Local Boundary
 
-- Python package with `mercury-tools` CLI
-- MCP server, Streamable HTTP first
-- Supabase Postgres + pgvector RAG store
-- Hybrid search over curated knowledge
-- Context packs with citations for host agents
-- Redacted MCP audit events
-- MCP product layer for workspace setup, connector profiles, skill enablement,
-  skill uploads, and usage events. The AI host remains Codex, Cursor, Claude,
-  or another MCP client.
-- Mercury Flows: Maestro-inspired YAML workflows for accounting agents, with
-  CLI validation/execution and MCP tool access.
+- The installed plugin exposes exactly one server: `mercury-finance`.
+- ERP credentials live only in the selected repository under
+  `.mercury/credentials.env`; they are not sent to Mercury Cloud or stored in
+  Cloud credential storage.
+- ERP request execution, confirmation state, and audit recording happen in
+  the local process. Cloud-backed knowledge and catalog retrieval never receive
+  ERP request bodies or credential values.
+- The local audit ledger is `.mercury/audit/audit.jsonl`. It is append-only and
+  redacts credentials, personal data, request inputs, and provider values.
+- Dotenv files are not a credential source for local ERP execution. Use the
+  `mercury credentials` commands below instead of putting ERP credentials in
+  `.env`, plugin configuration, or chat.
 
-## Quick Start
+## Marketplace Install
+
+The released plugin requires `uvx`, which is included with
+[uv](https://docs.astral.sh/uv/). Confirm it is available before installing:
 
 ```bash
-cd mercury-tools
-cp .env.example .env
+uvx --version
+```
+
+After the release owner creates the immutable `v0.2.0` tag, install the GitHub
+marketplace plugin:
+
+```bash
+codex plugin marketplace add natthaphonchop2-creator/mercury-tools \
+  --ref v0.2.0 \
+  --sparse .agents/plugins \
+  --sparse plugins/mercury-finance
+codex plugin add mercury-finance@mercury-tools
+codex mcp list
+```
+
+The launcher uses `uvx` and the released package. It does not register a
+hosted HTTP MCP, request a Mercury owner token, or configure Cloud credentials.
+Before the tag exists, use the local source checkout and the verification
+commands in [docs/JUDGE_QUICKSTART.md](docs/JUDGE_QUICKSTART.md).
+
+## Repository Setup
+
+For development or a local judge run:
+
+```bash
 uv sync --extra dev
+uv run mercury doctor --repo-root .
+uv run mercury mcp serve-local
 ```
 
-Apply the Supabase migrations in `supabase/migrations/` to your Supabase
-project, then ingest the seed wiki:
+Set up credentials in the repository where the ERP work belongs. The commands
+prompt locally and print field names/status only.
 
 ```bash
-uv run mercury-tools doctor
-uv run mercury-tools ingest wiki --path ./wiki
-uv run mercury-tools search "vat input tax" --json
+uv run mercury credentials setup flowaccount --env production --repo-root .
+uv run mercury credentials status --repo-root .
+uv run mercury credentials test flowaccount --env production --repo-root .
 ```
 
-Create and test a Mercury Flow:
+`credentials test` performs the connector's credential validation and safe GET
+probe only: FlowAccount uses `GET /company/info`; PEAK uses `GET /user`.
+Choose the intended PEAK environment explicitly:
 
 ```bash
-uv run mercury-tools flow init-workspace ./my-mercury-flows
-uv run mercury-tools flow list ./my-mercury-flows
-uv run mercury-tools flow manifest ./my-mercury-flows --json
-uv run mercury-tools flow run-suite ./my-mercury-flows --dry-run
-uv run mercury-tools flow run-suite ./my-mercury-flows --dry-run -e month=2026-09
-uv run mercury-tools flow watch ./my-mercury-flows --dry-run
-uv run mercury-tools flow run-suite ./my-mercury-flows --format junit --output reports/junit.xml
-uv run mercury-tools flow init ./my-flow.yaml --template company-health
-uv run mercury-tools flow validate ./my-flow.yaml
-uv run mercury-tools flow run ./my-flow.yaml --dry-run
-uv run mercury-tools flow list ./examples/flows
-uv run mercury-tools flow run-suite ./examples/flows --dry-run
-uv run mercury-tools flow push ./examples/flows --dry-run
+uv run mercury credentials setup peak --env uat --repo-root .
+uv run mercury credentials test peak --env uat --repo-root .
 ```
 
-Start the remote MCP server locally:
+Clear a single profile only when it is no longer needed:
 
 ```bash
-uv run mercury-tools mcp serve
+uv run mercury credentials clear flowaccount --env production --repo-root .
 ```
 
-The default remote endpoint is:
-
-```text
-http://localhost:8000/mcp
-```
-
-For stdio compatibility:
+To remove every local credential profile for the repository:
 
 ```bash
-uv run mercury-tools mcp serve --transport stdio
+uv run mercury credentials clear --all --repo-root .
 ```
 
-Example local stdio MCP client config:
+`clear --all` unlinks the local credential file and invalidates pending local
+requests. It is not a claim of forensic secure erase from backups, snapshots,
+or storage media. See [docs/LOCAL_CREDENTIALS.md](docs/LOCAL_CREDENTIALS.md).
 
-```json
-{
-  "mcpServers": {
-    "mercury-tools": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "/absolute/path/to/mercury-tools",
-        "run",
-        "mercury-tools",
-        "mcp",
-        "serve",
-        "--transport",
-        "stdio"
-      ]
-    }
-  }
-}
-```
+## Catalogs And Writes
 
-Remote deployment guide:
+Use `import_erp_spec` to import an OpenAPI, Swagger, Postman, or explicit
+endpoint document into the active repository. Repository-configured custom
+hosts require an interactive trusted-host confirmation before the executor can
+call them. Imported actions remain local overlays; they do not publish
+credentials or ERP payloads.
 
-- [docs/REMOTE_DEPLOYMENT.md](docs/REMOTE_DEPLOYMENT.md)
+`search_erp_actions` and `get_erp_action_schema` identify an action before it
+runs. Effective risk tiers govern execution:
 
-Verify the current contest Render deployment:
+- Tier 0 safe GET actions run through `run_erp_read`.
+- Tier 1 writes require `preview_erp_write`, one distinct explicit user
+  confirmation through `confirm_erp_write`, then one `execute_erp_write`.
+- Tier 2 writes, and actions requiring two confirmations, require two distinct
+  confirmations for the same fresh preview before one execution.
+
+Never retry an `outcome_unknown` write. Call `get_erp_request_status`, reconcile
+the provider result through an approved safe status action or manually, then
+create a fresh preview only after the outcome is definite. Full procedures are
+in [docs/ACTION_CATALOG.md](docs/ACTION_CATALOG.md).
+
+## Documentation
+
+- [Judge quickstart](docs/JUDGE_QUICKSTART.md)
+- [Repository-local credentials](docs/LOCAL_CREDENTIALS.md)
+- [Action catalog and confirmation model](docs/ACTION_CATALOG.md)
+- [v0.2.0 release checklist](docs/RELEASE_V0.2.0.md)
+
+## Verification
 
 ```bash
-uv run mercury-tools remote verify \
-  --url https://mercury-tools-mcp.onrender.com
-```
-
-Mercury is MCP/plugin-first. The hosted root page is only a minimal server
-landing page; it is not a browser setup console, dashboard, or chat surface.
-Codex, Cursor, Claude, or another MCP host remains the user-facing AI.
-
-The product API layer exists for host integrations and secure onboarding:
-
-- `GET /api/dashboard`
-- `POST /api/team/invite`
-- `POST /api/connectors/setup`
-- `POST /api/connectors/credentials`
-- `POST /api/skills/enable`
-- `POST /api/skills/upload`
-- `POST /api/flows/validate`
-- `POST /api/flows/save`
-- `POST /api/flows/import`
-- `POST /api/flows/run`
-
-These APIs require a Mercury client token (`mc_...`) issued by a secure
-host/admin onboarding path, not by a browser UX. The contest MCP endpoint is
-public/read-oriented so the GitHub marketplace plugin can connect without a
-manual token step.
-Flow execution APIs are for MCP/CLI/agent integrations and are not surfaced as
-browser-console workflows.
-Connector credentials are not stored in Supabase in v1; connector profiles store
-the selected program, environment, company label, and required secret fields.
-Flow run history stores sanitized summaries only: status, flow title/id, step
-count, artifact count, artifact titles, and runtime env key names. It does not
-store raw connector secrets, runtime env values, full variables, or raw
-accounting payloads.
-
-If the dedicated product tables from `0002_mercury_product_layer.sql` have not
-been applied yet, Mercury falls back to an event-sourced product state stored in
-the existing `mcp_audit_events` table. This keeps the demo usable while the
-database owner applies the full product migration later.
-
-Connector credentials are accepted through MCP tools or host-provided secure
-inputs and encrypted before they are stored in the event-backed vault. Dashboard
-responses show only field names, fingerprints, and configuration status; raw
-credentials are not returned.
-
-## Mercury Flows
-
-Mercury Flows follow the same product idea that makes Maestro easy: readable
-YAML files interpreted at runtime, instead of hard-coded automation scripts.
-For Mercury, the commands are accounting-agent commands rather than UI taps.
-
-Example:
-
-```yaml
-name: Company Health Check
-tags: [accounting, read-only, flowaccount]
-env:
-  jurisdiction: TH
-  connector: flowaccount
----
-- retrieveContextPack:
-    query: "company health check revenue VAT cash flow accounting Thailand"
-    task: "company_health_check_th"
-    filters:
-      jurisdiction: "${jurisdiction}"
-      connector: "${connector}"
-    maxChunks: 8
-    saveAs: context
-- runSkill:
-    skillId: company-health-check-th
-    inputs:
-      context_query: "{{ context.query }}"
-    evidenceMode: true
-    saveAs: skill
-- emitReport:
-    when:
-      equals:
-        value: "${connector}"
-        expected: flowaccount
-    title: "FlowAccount-only handoff"
-    sections:
-      - "This step runs only when the selected connector is FlowAccount."
-- runFlow:
-    label: Production review handoff
-    when:
-      equals:
-        value: "${environment}"
-        expected: production
-    env:
-      review_level: controller
-    commands:
-      - emitReport:
-          title: "Review ${review_level}"
-          sections:
-            - "Only generated for production runs."
-    saveAs: productionReview
-- emitReport:
-    title: "Company health-check context pack"
-    sections:
-      - "Use skill {{ skill.skill_id }} and the cited context pack to answer."
-```
-
-Flow CLI:
-
-- `mercury-tools flow init-workspace <path> --connector flowaccount --month YYYY-MM`
-- `mercury-tools flow init <path> --template company-health`
-- `mercury-tools flow validate <path>`
-- `mercury-tools flow run <path> --dry-run -e month=2026-09`
-- `mercury-tools flow list <workspace> --tag accounting`
-- `mercury-tools flow manifest <workspace> --json`
-- `mercury-tools flow run-suite <workspace> --dry-run --exclude-tag disabled -e month=2026-09`
-- `mercury-tools flow run-suite <workspace> --format junit --output reports/junit.xml`
-- `mercury-tools flow run-suite <workspace> --format html --output reports/flow-report.html`
-- `mercury-tools flow watch <workspace> --dry-run`
-- `mercury-tools flow push <workspace> --url https://mercury-tools-mcp.onrender.com --client-token <mc_...>`
-- `mercury-tools flow cheat-sheet`
-
-MCP and HTTP flow runs also accept runtime env overrides. Values are coerced to
-strings, matching Maestro-style `-e KEY=value` behavior. Host agents should
-prefer `run_mercury_flow`, a single MCP entrypoint that accepts exactly one of
-`flow_yaml`, `flow_files`, or `workspace_flow_id`. `run_flow` and
-`run_flow_files` remain available as lower-level compatibility tools. Audit and
-run history record only the env key names:
-
-```json
-{
-  "flow_yaml": "name: Monthly VAT\n---\n- emitReport:\n    title: \"VAT ${month}\"",
-  "dry_run": true,
-  "env": {
-    "month": "2026-09",
-    "connector": "flowaccount"
-  }
-}
-```
-
-Example `run_mercury_flow` call for a flow pack:
-
-```json
-{
-  "flow_files": {
-    "flows/company-health.yaml": "name: Company Health\\ntags: [accounting]\\n---\\n- emitReport:\\n    title: Company"
-  },
-  "config_yaml": "flows: flows/**/*.yaml\\nincludeTags: [accounting]\\n",
-  "dry_run": true,
-  "env": {
-    "month": "2026-09"
-  }
-}
-```
-
-For host agents, `inspect_flow_files` returns a Maestro-style workspace
-manifest without executing anything. It reports selected/skipped flows,
-available tags, execution order, safe env key names, and the MCP/CLI handoff
-commands. This is the preferred first call when Codex, Cursor, Claude, or
-another agent receives a Mercury flow pack from a user:
-
-```json
-{
-  "flow_files": {
-    "flows/company-health.yaml": "name: Company Health\\ntags: [accounting]\\n---\\n- emitReport:\\n    title: Company"
-  },
-  "config_yaml": "flows: flows/**/*.yaml\\nincludeTags: [accounting]\\n"
-}
-```
-
-Workspace config:
-
-```yaml
-# config.yaml or mercury.yaml
-flows:
-  - "flows/**/*.yaml"
-includeTags: [accounting]
-excludeTags: [disabled]
-testOutputDir: ".mercury/reports"
-env:
-  jurisdiction: TH
-  connector: flowaccount
-  month: "2026-07"
-executionOrder:
-  continueOnFailure: true
-  flowsOrder:
-    - company-health
-    - vat-summary
-```
-
-Like Maestro's `-e KEY=value` runtime parameters, Mercury accepts `-e` or
-`--env` on `flow run`, `flow run-suite`, and `flow watch`. These values are
-strings and override flow/workspace `env` values for that run.
-
-Like Maestro's `when` blocks, Mercury commands can run conditionally. v1 keeps
-this deterministic for accounting workflows: `true`, `exists`, `notExists`,
-`equals`, and `notEquals` are supported, and multiple conditions are ANDed.
-Arbitrary JavaScript evaluation is intentionally not enabled in Mercury v1.
-
-Like Maestro's assertion commands, Mercury `assert` fails a flow when required
-conditions are not met. The assertions are adapted for accounting data and MCP
-tool output instead of mobile UI selectors: `exists`, `notExists`, `equals`,
-`notEquals`, `contains`, `status`, and `minCount` are supported.
-
-```yaml
-- assert:
-    exists: "${connectorState.status}"
-    status:
-      value: "${connectorState.status}"
-      expected: ok
-    minCount:
-      value: "${context.context}"
-      count: 2
-    saveAs: validation
-```
-
-Like Maestro's `repeat`, Mercury can run a small command group more than once.
-Use `times` for a fixed loop, or `while` with Mercury's deterministic conditions.
-When `while` is used without `times`, Mercury caps execution with
-`maxIterations` and defaults that cap to `10`. Each iteration exposes
-`${repeat.index}`, `${repeat.iteration}`, and `${repeat.remaining}`.
-
-```yaml
-- repeat:
-    label: Monthly section draft
-    times: 3
-    commands:
-      - emitReport:
-          title: "Monthly section ${repeat.iteration}"
-          sections:
-            - "Prepare one repeated period handoff."
-    saveAs: monthlySections
-```
-
-Like Maestro's `runFlow`, Mercury can run a subflow file or an inline command
-list. Inline `commands` are useful for small conditional accounting handoffs;
-`label` names the grouped subflow in reports, and `env` inherits parent values
-with per-subflow overrides.
-
-Like Maestro's `retry`, Mercury can retry a small inline command group or flow
-file when a transient connector/RAG step fails. `maxRetries` is bounded to `0`
-through `3` and defaults to `1`; optional `delayMs` waits between attempts.
-Keep retry blocks narrow so real accounting-data issues are not hidden.
-
-```yaml
-- retry:
-    label: Invoice context retry
-    maxRetries: 2
-    delayMs: 500
-    commands:
-      - retrieveContextPack:
-          query: "invoice VAT review"
-          task: invoice_review_th
-          maxChunks: 6
-          saveAs: invoiceContext
-    saveAs: invoiceRetry
-```
-
-This mirrors Maestro's workspace model at the Mercury layer: config, folder
-architecture, tag-based discovery, deterministic execution order, output
-reports, and interpreted execution are separated from the host AI conversation.
-
-`flow init-workspace` creates a runnable starter workspace with:
-
-- `config.yaml`
-- `flows/company-health.yaml`
-- `flows/vat-summary.yaml`
-- `README.md`
-
-When `testOutputDir` is set, `flow run-suite` writes
-`suite-report.json` with the selected flow order, step summaries, artifacts, and
-sanitized variables.
-
-For CI systems, `flow run-suite --format junit --output <path>` writes a JUnit
-XML report. For demo reviews or accountant handoffs,
-`flow run-suite --format html --output <path>` writes a readable HTML report.
-A failed suite exits with code `1` by default; pass `--allow-failures` only when
-a pipeline should collect the report without failing the job.
-
-Flow MCP tools:
-
-- `flow_cheat_sheet`
-- `check_flow_syntax`
-- `run_flow`
-- `run_flow_files`
-- `run_mercury_flow`
-- `save_workspace_flow`
-- `list_workspace_flows`
-- `run_workspace_flow`
-
-`save_workspace_flow`, `list_workspace_flows`, and `run_workspace_flow` use a
-Mercury client token to resolve the correct workspace. They do not require or
-expose the Supabase service role key to the MCP host.
-
-Supported flow commands are read-oriented: `connectorStatus`, `searchKnowledge`,
-`retrieveContextPack`, `getDocument`, `runSkill`, `emitReport`, `assert`,
-`repeat`, `runFlow`, and `retry`. Production accounting writes remain out of
-scope for v1.
-
-## Environment
-
-Required for live RAG:
-
-- `SUPABASE_URL`
-- `SUPABASE_SERVICE_ROLE_KEY`
-- `MERCURY_TOOLS_EMBEDDING_PROVIDER=hash` for the Codex/host-AI demo mode
-- `MERCURY_TOOLS_HTTP_REQUIRE_AUTH=false` for the public contest MCP endpoint
-- `MERCURY_CONNECT_INVITE_CODE` for server-side client-token issuance
-- `MERCURY_CONNECT_SIGNING_SECRET` for per-user client tokens
-
-`OPENAI_API_KEY` is optional and only needed when
-`MERCURY_TOOLS_EMBEDDING_PROVIDER=openai`.
-
-The service role key must stay local/server-side. Do not put it in MCP client
-configs that sync to cloud services.
-
-## MCP Surface
-
-Tools:
-
-- `search_knowledge`
-- `retrieve_context_pack`
-- `get_document`
-- `connector_status`
-- `run_accounting_skill`
-- `flow_cheat_sheet`
-- `check_flow_syntax`
-- `inspect_flow_files`
-- `run_mercury_flow`
-- `run_flow`
-- `run_flow_files`
-- `save_workspace_flow`
-- `list_workspace_flows`
-- `run_workspace_flow`
-
-Resources:
-
-- `mercury://wiki/index`
-- `mercury://wiki/doc/{document_id}`
-- `mercury://skills/{skill_id}`
-- `mercury://flows/cheat-sheet`
-- `mercury://connectors`
-- `mercury://audit/{event_id}`
-
-Prompts:
-
-- `company_health_check_th`
-- `vat_summary_th`
-- `invoice_review_th`
-- `management_report_th`
-- `connector_setup_guide_th`
-
-## Development
-
-```bash
-uv run pytest
+uv sync --extra dev
 uv run ruff check .
-uv run mcp run src/mercury_tools/mcp/server.py
+uv run pytest -m "not integration" -q
+uv run pytest tests/integration/test_local_erp_mcp.py -q
+uv run python scripts/validate_release_plugin.py
+uv run python scripts/smoke_local_plugin.py
 ```
 
-## Mercury Finance Codex Plugin
-
-See `docs/JUDGE_QUICKSTART.md` for the contest install flow. The plugin
-is installed from the GitHub marketplace and connects Codex to the hosted
-Mercury Tools MCP server. Connector credentials stay out of Git. Mercury should
-be used from Codex or another MCP host, not from a browser UI.
+The Task 18 integration test uses only fake Cloud and fake ERP transports.
+Optional live FlowAccount and PEAK probes run only when their explicit
+`MERCURY_LIVE_FLOWACCOUNT=1` or `MERCURY_LIVE_PEAK=1` flag is set, and they are
+limited to credential validation plus the safe GET probe.
