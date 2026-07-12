@@ -194,7 +194,7 @@ _TOKEN_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _AWS_ACCESS_KEY_RE = re.compile(r"\bAKIA[A-Z0-9]{16}\b")
-_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
+_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]{2,}\b")
 _SECRET_FIELD_RE = re.compile(
     r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|"
     r"token|secret|password|authorization)",

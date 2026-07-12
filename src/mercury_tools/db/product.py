@@ -302,15 +302,20 @@ def _strip_legacy_vault_values(value: Any) -> Any:
         return {
             key: _strip_legacy_vault_values(item)
             for key, item in value.items()
-            if str(key).strip().casefold().replace("-", "_") not in LEGACY_VAULT_KEYS
+            if str(key).strip().casefold().replace("-", "_").replace(" ", "_")
+            not in LEGACY_VAULT_KEYS
         }
     if isinstance(value, list):
         return [_strip_legacy_vault_values(item) for item in value]
     return value
 
 
+def public_product_value(value: Any) -> Any:
+    return redact_json(_strip_legacy_vault_values(value))
+
+
 def public_product_event(row: dict[str, Any]) -> dict[str, Any]:
-    return redact_json(_strip_legacy_vault_values(dict(row)))
+    return public_product_value(dict(row))
 
 
 def connector_profile_status_from_metadata(metadata: dict[str, Any] | None) -> str:
@@ -527,7 +532,7 @@ class SupabaseProductStore:
             elif event_type == "flow.run_completed":
                 run = summary.get("flow_run") or {}
                 if run.get("run_id"):
-                    flow_runs.append(run)
+                    flow_runs.append(public_product_value(run))
 
             events.append(
                 {
@@ -1216,11 +1221,13 @@ class SupabaseProductStore:
             ],
             "flows": flows,
             "flow_runs": [
-                {
-                    **((row.get("summary") or {}).get("flow_run") or {}),
-                    "event_id": row.get("id"),
-                    "event_status": row.get("status"),
-                }
+                public_product_value(
+                    {
+                        **((row.get("summary") or {}).get("flow_run") or {}),
+                        "event_id": row.get("id"),
+                        "event_status": row.get("status"),
+                    }
+                )
                 for row in flow_run_events or []
                 if ((row.get("summary") or {}).get("flow_run") or {}).get("run_id")
             ],

@@ -7,7 +7,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from mercury_tools.db.product import public_product_event
+from mercury_tools.db.product import public_product_event, public_product_value
 
 ROOT = Path(__file__).parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -238,6 +238,15 @@ def test_redactor_preserves_documentation_placeholders() -> None:
     assert "YOUR_API_KEY" in redacted
 
 
+def test_redactor_catches_compact_jwt_payloads() -> None:
+    redacted, matches = redact_high_confidence_secret_values(
+        "eyJhbGciOiJIUzI1NiJ9.e30.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    )
+
+    assert matches == 1
+    assert redacted == "[REDACTED]"
+
+
 def test_historical_product_event_recursively_strips_legacy_vault_fields() -> None:
     event = {
         "id": "event-legacy",
@@ -274,6 +283,23 @@ def test_historical_product_event_recursively_strips_legacy_vault_fields() -> No
     assert public["summary"]["details"]["safe_note"] == "keep me"
     assert public["summary"]["details"]["records"][0]["status"] == "ready"
     assert public["metadata"]["source"] == "historical-import"
+
+
+def test_public_flow_run_value_strips_spaced_legacy_vault_keys() -> None:
+    public = public_product_value(
+        {
+            "run_id": "flow-run-1",
+            "details": {
+                "server vault": {"ciphertext": "historical-secret"},
+                "status": "completed",
+            },
+        }
+    )
+
+    assert public == {
+        "run_id": "flow-run-1",
+        "details": {"status": "completed"},
+    }
 
 
 def test_purge_recursively_removes_vault_fields_and_preserves_token_url() -> None:
