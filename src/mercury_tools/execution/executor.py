@@ -393,10 +393,6 @@ class ERPExecutor:
         driver = self.drivers.get(action.connector_id)
         base_url = driver.resolve_base_url(environment)
         allow_private = self._allow_private(action.connector_id, environment)
-        self.network.validate_base_url(
-            base_url,
-            allow_private_network=allow_private,
-        )
         template = build_request(
             action,
             base_url,
@@ -404,6 +400,10 @@ class ERPExecutor:
             self.roots,
             repository_id=repository.repository_id,
             environment=environment,
+        )
+        self.network.validate_base_url(
+            base_url,
+            allow_private_network=allow_private,
         )
         return (
             driver,

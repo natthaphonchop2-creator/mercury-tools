@@ -2007,9 +2007,10 @@ async def test_cloud_catalog_preserves_executable_contract_and_canonical_version
                 "company_id": {
                     "type": "string",
                     "description": "Canonical company identifier",
+                    "required": True,
                 }
             },
-            "query": {"draft": {"type": "boolean"}},
+            "query": {"draft": {"type": "boolean", "required": True}},
             "headers": {},
             "body": {
                 "type": "object",
@@ -2019,6 +2020,7 @@ async def test_cloud_catalog_preserves_executable_contract_and_canonical_version
                 },
                 "required": ["reference", "amount"],
                 "additionalProperties": False,
+                "x-mercury-required": True,
             },
             "files": {},
         },
@@ -2166,6 +2168,48 @@ async def test_cloud_catalog_rejects_unsafe_or_unsupported_executable_contract(
 
     assert response.status_code == 503
     assert response.json() == {"error": "service_unavailable"}
+
+
+@pytest.mark.parametrize(
+    "input_schema",
+    [
+        {
+            "path": {},
+            "query": {"mode": {"type": "string", "required": "true"}},
+            "headers": {},
+            "body": {},
+            "files": {},
+        },
+        {
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": {"type": "object", "x-mercury-required": "true"},
+            "files": {},
+        },
+        {
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "x-mercury-required": True}
+                },
+            },
+            "files": {},
+        },
+    ],
+)
+def test_cloud_raw_catalog_rejects_coercive_or_unknown_required_markers(
+    action_factory,
+    input_schema,
+) -> None:
+    action = action_factory(input_schema=input_schema)
+    raw = action.model_dump(mode="json")
+
+    with pytest.raises(ValueError, match="cloud_catalog"):
+        validate_raw_catalog_action_payload(raw)
 
 
 @pytest.mark.asyncio

@@ -69,6 +69,7 @@ class RequestTemplate:
     repository_id: str | None
     environment: str | None
     _request_inputs: Mapping[str, Any] = field(repr=False)
+    _body_present: bool = field(default=False, repr=False)
     _files: tuple[_BoundFile, ...] = field(default=(), repr=False)
 
     def __post_init__(self) -> None:
@@ -88,7 +89,10 @@ class RequestTemplate:
             "path": self.path_template,
             "query": {"count": len(self._request_inputs["query"])},
             "headers": {"count": len(self._request_inputs["headers"])},
-            "body": _body_summary(self._request_inputs["body"]),
+            "body": _body_summary(
+                self._request_inputs["body"],
+                present=self._body_present,
+            ),
             "files": {"count": len(self._files)},
         }
 
@@ -143,7 +147,7 @@ class RequestTemplate:
                 data=dict(data),
                 files=files,
             )
-        if body is None or body == {}:
+        if not self._body_present:
             return httpx.Request(self.method, url, params=query, headers=headers)
         return httpx.Request(
             self.method,
@@ -193,6 +197,7 @@ def build_request(
     query = _section_mapping(supplied.get("query", {}), "query")
     headers = _section_mapping(supplied.get("headers", {}), "headers")
     files = _section_mapping(supplied.get("files", {}), "files")
+    body_present = "body" in supplied
     body = _json_copy(supplied.get("body", {}))
 
     _reject_auth_overrides(query, headers)
@@ -209,7 +214,7 @@ def build_request(
     ):
         raise RequestBuildError("idempotency_override_forbidden")
     _validate_declared_mapping(headers_for_schema, schema["headers"], "headers")
-    _validate_body(body, schema["body"])
+    _validate_body(body, schema["body"], present=body_present)
     _apply_idempotency(
         action,
         path=path,
@@ -271,6 +276,7 @@ def build_request(
         repository_id=repository_id,
         environment=environment,
         _request_inputs=normalized_inputs,
+        _body_present=body_present,
         _files=bound_files,
     )
 
@@ -355,15 +361,36 @@ def _validate_declared_mapping(values: Mapping[str, Any], schema: Any, section: 
     unknown = set(values) - set(schema)
     if unknown:
         raise RequestBuildError("undeclared_request_input")
+    required: set[str] = set()
+    for name, declaration in schema.items():
+        if not isinstance(name, str) or not isinstance(declaration, Mapping):
+            raise RequestBuildError("invalid_action_input_schema")
+        marker = declaration.get("required", False)
+        if not isinstance(marker, bool):
+            raise RequestBuildError("invalid_action_input_schema")
+        if marker:
+            required.add(name)
+    if required - set(values):
+        error = {
+            "path": "unresolved_path_parameter",
+            "query": "required_query_parameter_missing",
+            "headers": "required_header_parameter_missing",
+        }[section]
+        raise RequestBuildError(error)
     for name, value in values.items():
         declaration = schema[name]
         if isinstance(declaration, Mapping):
             _validate_type(value, declaration, section)
 
 
-def _validate_body(value: Any, schema: Any) -> None:
+def _validate_body(value: Any, schema: Any, *, present: bool) -> None:
     if not isinstance(schema, Mapping):
         raise RequestBuildError("invalid_action_input_schema")
+    _validate_body_required_contract(schema, top_level=True)
+    if schema.get("x-mercury-required", False) and not present:
+        raise RequestBuildError("required_body_missing")
+    if not present:
+        return
     if not schema:
         if value not in ({}, None):
             raise RequestBuildError("undeclared_request_input")
@@ -371,7 +398,7 @@ def _validate_body(value: Any, schema: Any) -> None:
     _validate_type(value, schema, "body")
     if isinstance(value, Mapping):
         required = schema.get("required", ())
-        if isinstance(required, (list, tuple)) and any(name not in value for name in required):
+        if any(name not in value for name in required):
             raise RequestBuildError("required_body_field_missing")
         properties = schema.get("properties")
         if isinstance(properties, Mapping):
@@ -381,6 +408,32 @@ def _validate_body(value: Any, schema: Any) -> None:
                 declaration = properties.get(name)
                 if isinstance(declaration, Mapping):
                     _validate_type(item, declaration, "body")
+
+
+def _validate_body_required_contract(schema: Mapping[str, Any], *, top_level: bool) -> None:
+    if "x-mercury-required" in schema:
+        marker = schema["x-mercury-required"]
+        if not top_level or not isinstance(marker, bool):
+            raise RequestBuildError("invalid_action_input_schema")
+    if "required" in schema:
+        required = schema["required"]
+        properties = schema.get("properties")
+        if (
+            not isinstance(required, (list, tuple))
+            or any(not isinstance(name, str) for name in required)
+            or len(required) != len(set(required))
+            or not isinstance(properties, Mapping)
+            or any(name not in properties for name in required)
+        ):
+            raise RequestBuildError("invalid_action_input_schema")
+    properties = schema.get("properties", {})
+    if isinstance(properties, Mapping):
+        for declaration in properties.values():
+            if isinstance(declaration, Mapping):
+                _validate_body_required_contract(declaration, top_level=False)
+    items = schema.get("items")
+    if isinstance(items, Mapping):
+        _validate_body_required_contract(items, top_level=False)
 
 
 def _validate_type(value: Any, schema: Mapping[str, Any], section: str) -> None:
@@ -507,6 +560,17 @@ def _bound_files(
         raise RequestBuildError("invalid_action_input_schema")
     if set(values) - set(schema):
         raise RequestBuildError("undeclared_request_input")
+    required: set[str] = set()
+    for field_name, declaration in schema.items():
+        if not isinstance(field_name, str) or not isinstance(declaration, Mapping):
+            raise RequestBuildError("invalid_action_input_schema")
+        marker = declaration.get("required", False)
+        if not isinstance(marker, bool):
+            raise RequestBuildError("invalid_action_input_schema")
+        if marker:
+            required.add(field_name)
+    if required - set(values):
+        raise RequestBuildError("required_file_missing")
     bound: list[_BoundFile] = []
     for field_name, value in sorted(values.items()):
         if already_bound:
@@ -710,12 +774,12 @@ def _json_copy(value: Any) -> Any:
         raise RequestBuildError("request_input_not_json") from None
 
 
-def _body_summary(value: Any) -> dict[str, Any]:
+def _body_summary(value: Any, *, present: bool) -> dict[str, Any]:
     if isinstance(value, Mapping):
-        return {"has_body": bool(value), "count": len(value)}
+        return {"has_body": present, "count": len(value)}
     if isinstance(value, (list, tuple)):
-        return {"has_body": bool(value), "count": len(value)}
-    return {"has_body": value is not None, "count": 0}
+        return {"has_body": present, "count": len(value)}
+    return {"has_body": present, "count": 0}
 
 
 __all__ = [

@@ -276,6 +276,231 @@ def test_openapi_precedence_controls_parser_semantics(tmp_path: Path) -> None:
     }
 
 
+def test_openapi_preserves_parameter_and_request_body_required_semantics(
+    tmp_path: Path,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    source_path = tmp_path / "required-openapi.json"
+    source_path.write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.0",
+                "info": {"version": "1"},
+                "paths": {
+                    "/items/{item_id}": {
+                        "parameters": [
+                            {
+                                "name": "item_id",
+                                "in": "path",
+                                "required": True,
+                                "schema": {"type": "string"},
+                            },
+                            {
+                                "name": "mode",
+                                "in": "query",
+                                "required": True,
+                                "schema": {"type": "string"},
+                            },
+                        ],
+                        "post": {
+                            "parameters": [
+                                {
+                                    "name": "X-Request-Mode",
+                                    "in": "header",
+                                    "required": True,
+                                    "schema": {"type": "string"},
+                                }
+                            ],
+                            "requestBody": {
+                                "required": True,
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {"name": {"type": "string"}},
+                                            "required": ["name"],
+                                        }
+                                    }
+                                },
+                            },
+                            "responses": {"201": {"description": "Created"}},
+                        },
+                    }
+                },
+            }
+        )
+    )
+
+    action = import_spec(
+        context,
+        connector_id="custom",
+        source_path=source_path,
+    ).actions[0]
+
+    assert action.input_schema["path"]["item_id"]["required"] is True
+    assert action.input_schema["query"]["mode"]["required"] is True
+    assert action.input_schema["headers"]["X-Request-Mode"]["required"] is True
+    assert action.input_schema["body"]["x-mercury-required"] is True
+    assert action.input_schema["body"]["required"] == ("name",)
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    [
+        {"name": "item_id", "in": "path", "schema": {"type": "string"}},
+        {"name": "item_id", "in": "path", "required": False, "schema": {"type": "string"}},
+        {"name": "mode", "in": "query", "required": "true", "schema": {"type": "string"}},
+        {"name": "session", "in": "cookie", "required": True, "schema": {"type": "string"}},
+        {"name": "mode", "in": "matrix", "required": True, "schema": {"type": "string"}},
+    ],
+)
+def test_openapi_fails_closed_for_invalid_or_unsupported_required_parameters(
+    tmp_path: Path,
+    parameter: dict[str, Any],
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    source_path = tmp_path / "invalid-required-openapi.json"
+    source_path.write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.0",
+                "info": {"version": "1"},
+                "paths": {
+                    "/items/{item_id}": {
+                        "get": {
+                            "parameters": [parameter],
+                            "responses": {"200": {"description": "OK"}},
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="required"):
+        import_spec(context, connector_id="custom", source_path=source_path)
+
+
+def test_openapi_fails_closed_for_non_list_parameter_container(tmp_path: Path) -> None:
+    context = ensure_repository_state(tmp_path)
+    source_path = tmp_path / "invalid-parameter-container.json"
+    source_path.write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.0",
+                "info": {"version": "1"},
+                "paths": {
+                    "/items": {
+                        "get": {
+                            "parameters": {
+                                "name": "mode",
+                                "in": "query",
+                                "required": True,
+                                "schema": {"type": "string"},
+                            },
+                            "responses": {"200": {"description": "OK"}},
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="spec_parameters_invalid"):
+        import_spec(context, connector_id="custom", source_path=source_path)
+
+
+def test_openapi_fails_closed_for_unresolved_request_body_reference(tmp_path: Path) -> None:
+    context = ensure_repository_state(tmp_path)
+    source_path = tmp_path / "request-body-reference.json"
+    source_path.write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.0",
+                "info": {"version": "1"},
+                "paths": {
+                    "/items": {
+                        "post": {
+                            "requestBody": {"$ref": "#/components/requestBodies/Item"},
+                            "responses": {"201": {"description": "Created"}},
+                        }
+                    }
+                },
+                "components": {
+                    "requestBodies": {
+                        "Item": {
+                            "required": True,
+                            "content": {
+                                "application/json": {"schema": {"type": "object"}}
+                            },
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="spec_request_body_reference_unsupported"):
+        import_spec(context, connector_id="custom", source_path=source_path)
+
+
+def test_openapi_multipart_preserves_required_file_and_body_semantics(
+    tmp_path: Path,
+) -> None:
+    context = ensure_repository_state(tmp_path)
+    source_path = tmp_path / "required-multipart-openapi.json"
+    source_path.write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.0",
+                "info": {"version": "1"},
+                "paths": {
+                    "/documents": {
+                        "post": {
+                            "requestBody": {
+                                "required": True,
+                                "content": {
+                                    "multipart/form-data": {
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "document": {
+                                                    "type": "string",
+                                                    "format": "binary",
+                                                },
+                                                "caption": {"type": "string"},
+                                            },
+                                            "required": ["document", "caption"],
+                                        }
+                                    }
+                                },
+                            },
+                            "responses": {"201": {"description": "Created"}},
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    action = import_spec(
+        context,
+        connector_id="custom",
+        source_path=source_path,
+    ).actions[0]
+
+    assert action.content_type == "multipart/form-data"
+    assert action.input_schema["files"] == {
+        "document": {"type": "string", "format": "binary", "required": True}
+    }
+    assert action.input_schema["body"] == {
+        "type": "object",
+        "properties": {"caption": {"type": "string"}},
+        "required": ("caption",),
+        "x-mercury-required": True,
+    }
+
+
 def test_swagger_precedes_postman_marker(tmp_path: Path) -> None:
     context = ensure_repository_state(tmp_path)
     source_path = tmp_path / "swagger-over-postman.json"

@@ -194,8 +194,8 @@ async def test_client_preserves_global_executable_contract_for_request_validatio
         required_confirmations=1,
         side_effects=("creates_document",),
         input_schema={
-            "path": {"company_id": {"type": "string"}},
-            "query": {"draft": {"type": "boolean"}},
+            "path": {"company_id": {"type": "string", "required": True}},
+            "query": {"draft": {"type": "boolean", "required": True}},
             "headers": {},
             "body": {
                 "type": "object",
@@ -205,6 +205,7 @@ async def test_client_preserves_global_executable_contract_for_request_validatio
                 },
                 "required": ["reference", "amount"],
                 "additionalProperties": False,
+                "x-mercury-required": True,
             },
             "files": {},
         },

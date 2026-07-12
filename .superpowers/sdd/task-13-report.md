@@ -898,3 +898,103 @@ The warning remains the pre-existing Starlette `TestClient` deprecation warning.
   escaped JSON-string wrappers, 32 JSON levels, 8,192 JSON nodes, or 64 KiB of
   JSON text. Legitimate content beyond those limits is redacted rather than
   projected. No known in-scope credential or duplicate-catalog bypass remains.
+
+## Task 13-14 Acceptance Fix B: OpenAPI Required Semantics
+
+### Status
+
+IMPLEMENTED
+
+This acceptance fix starts from `af6f80bc3247cb6ec5f39c7b2a5d957db3caddfd` and
+keeps changes inside catalog import, executable request construction, Cloud
+catalog validation/client tests, builtin compatibility tests, and this report.
+Concurrent flow and local-MCP changes were not modified or staged.
+
+### Canonical Contract
+
+- Path, query, header, and file declarations may carry `required: <bool>`.
+  Importers emit the key only when the upstream declaration is `true`; absence
+  remains the backward-compatible optional representation.
+- The whole request body uses root-only `x-mercury-required: <bool>` on the
+  body schema. JSON Schema `required: [property, ...]` remains independently
+  scoped to object properties.
+- OpenAPI path parameters must explicitly declare `required: true`. Required
+  cookie, unknown-location, non-list parameter containers, unresolved request
+  body references, and non-boolean required values fail closed.
+- Multipart binary properties move to `input_schema.files`; required files use
+  the parameter marker, while required non-file properties remain in the body
+  schema and required request-body presence uses the body marker.
+
+Cloud admission accepts these markers only at their canonical locations and
+requires actual booleans. String booleans, nested body markers, and unsupported
+required keys remain invalid. Existing marker-free catalog actions retain the
+same canonical identities and versions.
+
+### RED Evidence
+
+The initial focused reproductions failed as expected:
+
+```text
+OpenAPI required/path/cookie/multipart reproduction: 6 failed
+Request builder/imported preview reproduction:       6 failed
+Cloud executable round-trip reproduction:            2 failed, 3 strict-invalid passed
+Optional body vs property-required reproduction:     1 failed
+Non-list parameter-container reproduction:           1 failed
+Unresolved requestBody reference reproduction:       1 failed
+```
+
+The failures showed required markers missing after import, absent body being
+collapsed into `{}`, missing required inputs reaching network-policy validation,
+and Cloud rejecting the new valid executable contract.
+
+### GREEN Evidence
+
+```text
+$ uv run pytest tests/test_catalog_importers.py tests/test_action_catalog_models.py \
+    tests/test_builtin_action_catalog.py -q
+192 passed
+
+$ uv run pytest tests/test_erp_executor.py tests/test_request_store.py \
+    tests/test_execution_policy.py -q
+115 passed
+
+$ uv run pytest tests/test_cloud_api.py tests/test_cloud_client.py -q
+300 passed
+
+$ uv run pytest -m 'not integration' -q
+1547 passed, 1 deselected, 1 warning
+
+$ uv run ruff check .
+All checks passed!
+
+$ git diff --check
+# no output
+```
+
+The builtin acceptance sweep revalidated and called `build_request` for all 190
+FlowAccount and 64 PEAK actions using synthetic path and required inputs. All
+254 actions built without network dispatch.
+
+### Generated Catalogs
+
+Both builtin builders were run twice from the documented source files. Each run
+reported 190 FlowAccount and 64 PEAK actions, and the first and second generated
+sets were byte-identical, including both endpoint wiki files. The current
+sanitizer recalculated unrelated redaction-report counts, which would churn every
+source hash and action version despite no required metadata change. Those
+unrelated generated changes were excluded so canonical versions remain stable.
+
+Changed generated files: none.
+
+The branch advanced concurrently to parent
+`0fb05d98ffad2cec265864da7dd7a907da571592` before this fix was committed. The
+full verification above was rerun on that parent; its flow/local-MCP commit is
+not part of this fix's staged diff.
+
+### Residual
+
+- OpenAPI component references are not resolved by this importer. Parameter
+  references already fail validation, and request-body references now fail
+  closed instead of silently losing required semantics.
+- The full suite retains the pre-existing Starlette `TestClient` deprecation
+  warning. No in-scope test or lint failure remains.

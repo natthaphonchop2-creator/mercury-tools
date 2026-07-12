@@ -99,11 +99,13 @@ def _input_schema(
 ) -> tuple[dict[str, Any], str]:
     result = empty_input_schema()
     parameters: list[Any] = []
-    if isinstance(shared_parameters, list):
-        parameters.extend(shared_parameters)
+    if not isinstance(shared_parameters, list):
+        raise ValueError("spec_parameters_invalid")
+    parameters.extend(shared_parameters)
     operation_parameters = operation.get("parameters", [])
-    if isinstance(operation_parameters, list):
-        parameters.extend(operation_parameters)
+    if not isinstance(operation_parameters, list):
+        raise ValueError("spec_parameters_invalid")
+    parameters.extend(operation_parameters)
 
     for parameter in parameters:
         if not isinstance(parameter, Mapping):
@@ -122,15 +124,33 @@ def _input_schema(
         entry = dict(schema)
         if isinstance(parameter.get("description"), str):
             entry.setdefault("description", parameter["description"])
+        required = _parameter_required(parameter, location)
+        if required and location not in {"body", "formData", "header", "path", "query"}:
+            raise ValueError("spec_required_parameter_location_unsupported")
         if location == "body":
             result["body"] = dict(schema)
+            if required:
+                result["body"]["x-mercury-required"] = True
         elif location == "formData":
             target = "files" if parameter.get("type") == "file" else "body"
-            result[target].setdefault("type", "object")
-            result[target].setdefault("properties", {})[name] = entry
+            if target == "files":
+                if required:
+                    entry["required"] = True
+                result["files"][name] = entry
+            else:
+                result["body"].setdefault("type", "object")
+                result["body"].setdefault("properties", {})[name] = entry
+                if required:
+                    result["body"].setdefault("required", []).append(name)
         elif location in {"path", "query"}:
+            if required:
+                entry["required"] = True
             result[location][name] = entry
-        elif location in {"header", "cookie"}:
+        elif location == "header":
+            if required:
+                entry["required"] = True
+            result["headers"][name] = entry
+        elif location == "cookie":
             result["headers"][name] = entry
 
     content_type = "application/json"
@@ -141,6 +161,12 @@ def _input_schema(
     else:
         request_body = operation.get("requestBody")
         if isinstance(request_body, Mapping):
+            if "$ref" in request_body:
+                raise ValueError("spec_request_body_reference_unsupported")
+            body_required = _strict_required(
+                request_body,
+                error="spec_request_body_required_invalid",
+            )
             content = request_body.get("content")
             if isinstance(content, Mapping) and content:
                 selected = (
@@ -150,9 +176,67 @@ def _input_schema(
                 )
                 media = content.get(selected)
                 if isinstance(media, Mapping) and isinstance(media.get("schema"), Mapping):
-                    result["body"] = dict(media["schema"])
+                    body_schema = dict(media["schema"])
+                    if selected.casefold() == "multipart/form-data":
+                        body_schema, file_schema = _multipart_schema(body_schema)
+                        result["files"] = file_schema
+                    if body_required:
+                        body_schema["x-mercury-required"] = True
+                    result["body"] = body_schema
                 content_type = selected
+            if body_required and not result["body"]:
+                raise ValueError("spec_required_request_body_schema_missing")
     return result, content_type
+
+
+def _parameter_required(parameter: Mapping[str, Any], location: str) -> bool:
+    required = _strict_required(parameter, error="spec_parameter_required_invalid")
+    if location == "path" and not required:
+        raise ValueError("spec_path_parameter_required")
+    return required
+
+
+def _strict_required(value: Mapping[str, Any], *, error: str) -> bool:
+    if "required" not in value:
+        return False
+    required = value["required"]
+    if not isinstance(required, bool):
+        raise ValueError(error)
+    return required
+
+
+def _multipart_schema(schema: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    properties = schema.get("properties")
+    if not isinstance(properties, Mapping):
+        return schema, {}
+    raw_required = schema.get("required", [])
+    if (
+        not isinstance(raw_required, list)
+        or any(not isinstance(name, str) for name in raw_required)
+        or len(raw_required) != len(set(raw_required))
+    ):
+        raise ValueError("spec_multipart_required_invalid")
+    required = set(raw_required)
+    body_properties: dict[str, Any] = {}
+    files: dict[str, Any] = {}
+    for name, declaration in properties.items():
+        if not isinstance(name, str) or not isinstance(declaration, Mapping):
+            raise ValueError("spec_multipart_schema_invalid")
+        copied = dict(declaration)
+        if copied.get("type") == "string" and copied.get("format") == "binary":
+            if name in required:
+                copied["required"] = True
+            files[name] = copied
+        else:
+            body_properties[name] = copied
+    body = dict(schema)
+    body["properties"] = body_properties
+    body_required = [name for name in raw_required if name in body_properties]
+    if body_required:
+        body["required"] = body_required
+    else:
+        body.pop("required", None)
+    return body, files
 
 
 def _response_codes(responses: Any) -> tuple[tuple[int, ...], tuple[int, ...]]:

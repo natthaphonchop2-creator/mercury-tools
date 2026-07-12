@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 import pytest
 
+from mercury_tools.catalog.importers.service import import_spec
 from mercury_tools.catalog.models import CatalogAction, RiskTier
 from mercury_tools.drivers.base import ConnectorAuthError
 from mercury_tools.drivers.models import AuthContext, ConnectorResult, CredentialField
@@ -505,6 +506,199 @@ async def test_run_read_validates_inputs_before_loading_credentials(
         )
 
     assert executor_parts["credentials"].load_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("missing_section", "expected_error"),
+    [
+        ("query", "required_query_parameter_missing"),
+        ("headers", "required_header_parameter_missing"),
+        ("files", "required_file_missing"),
+        ("body", "required_body_missing"),
+    ],
+)
+def test_request_builder_rejects_missing_required_inputs(
+    repository_context: RepositoryContext,
+    action_factory: Callable[..., CatalogAction],
+    missing_section: str,
+    expected_error: str,
+) -> None:
+    upload = repository_context.root / "document.txt"
+    upload.write_text("document")
+    action = action_factory(
+        input_schema={
+            "path": {},
+            "query": {"mode": {"type": "string", "required": True}},
+            "headers": {"X-Mode": {"type": "string", "required": True}},
+            "body": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+                "x-mercury-required": True,
+            },
+            "files": {
+                "document": {
+                    "type": "string",
+                    "format": "binary",
+                    "required": True,
+                }
+            },
+        },
+        content_type="multipart/form-data",
+    )
+    inputs = {
+        "query": {"mode": "create"},
+        "headers": {"X-Mode": "strict"},
+        "body": {},
+        "files": {"document": str(upload)},
+    }
+    inputs.pop(missing_section)
+
+    with pytest.raises(RequestBuildError, match=f"^{expected_error}$"):
+        build_request(action, "https://erp.example.com", inputs, (repository_context.root,))
+
+
+def test_request_builder_distinguishes_absent_from_present_empty_required_body(
+    repository_context: RepositoryContext,
+    action_factory: Callable[..., CatalogAction],
+) -> None:
+    action = action_factory(
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+                "x-mercury-required": True,
+            },
+            "files": {},
+        }
+    )
+
+    with pytest.raises(RequestBuildError, match="^required_body_missing$"):
+        build_request(action, "https://erp.example.com", {}, (repository_context.root,))
+
+    template = build_request(
+        action,
+        "https://erp.example.com",
+        {"body": {}},
+        (repository_context.root,),
+    )
+    request = template.to_httpx_request(AuthContext(headers={}, query={}, expires_at=None))
+
+    assert request.content == b"{}"
+
+
+def test_request_builder_keeps_optional_body_independent_from_required_properties(
+    repository_context: RepositoryContext,
+    action_factory: Callable[..., CatalogAction],
+) -> None:
+    action = action_factory(
+        input_schema={
+            "path": {},
+            "query": {},
+            "headers": {},
+            "body": {
+                "type": "object",
+                "properties": {"reference": {"type": "string"}},
+                "required": ["reference"],
+                "additionalProperties": False,
+            },
+            "files": {},
+        }
+    )
+
+    template = build_request(action, "https://erp.example.com", {}, (repository_context.root,))
+    request = template.to_httpx_request(AuthContext(headers={}, query={}, expires_at=None))
+
+    assert request.content == b""
+    with pytest.raises(RequestBuildError, match="^required_body_field_missing$"):
+        build_request(
+            action,
+            "https://erp.example.com",
+            {"body": {}},
+            (repository_context.root,),
+        )
+
+
+@pytest.mark.asyncio
+async def test_imported_write_preview_rejects_required_inputs_before_creation(
+    executor_parts: dict[str, Any],
+) -> None:
+    class NetworkSpy:
+        def __init__(self) -> None:
+            self.validate_calls = 0
+
+        def validate_base_url(self, *_: Any, **__: Any) -> None:
+            self.validate_calls += 1
+
+    context = executor_parts["context"]
+    source_path = context.root / "required-preview-openapi.json"
+    source_path.write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.0",
+                "info": {"version": "1"},
+                "paths": {
+                    "/documents": {
+                        "post": {
+                            "parameters": [
+                                {
+                                    "name": "mode",
+                                    "in": "query",
+                                    "required": True,
+                                    "schema": {"type": "string"},
+                                }
+                            ],
+                            "requestBody": {
+                                "required": True,
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {},
+                                            "additionalProperties": False,
+                                        }
+                                    }
+                                },
+                            },
+                            "responses": {"201": {"description": "Created"}},
+                        }
+                    }
+                },
+            }
+        )
+    )
+    action = import_spec(
+        context,
+        connector_id="flowaccount",
+        source_path=source_path,
+    ).actions[0]
+    executor_parts["catalog"] = MutableCatalog((action,))
+    executor = make_executor(executor_parts, lambda request: response(request))
+    network = NetworkSpy()
+    executor.network = network  # type: ignore[assignment]
+
+    with pytest.raises(RequestBuildError, match="^required_query_parameter_missing$"):
+        await executor.preview_write(
+            repository=context,
+            action=action,
+            environment="production",
+            inputs={"body": {}},
+        )
+
+    assert executor_parts["credentials"].load_calls == 0
+    assert network.validate_calls == 0
+    preview = await executor.preview_write(
+        repository=context,
+        action=action,
+        environment="production",
+        inputs={"query": {"mode": "create"}, "body": {}},
+    )
+    assert preview.state.value == "awaiting_confirmation"
+    assert network.validate_calls == 1
 
 
 @pytest.mark.asyncio

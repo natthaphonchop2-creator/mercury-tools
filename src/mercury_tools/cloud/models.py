@@ -95,7 +95,7 @@ _CATALOG_OBSERVED_STATE_VALUES = {
 _INPUT_SCHEMA_SECTIONS = {"path", "query", "headers", "body", "files"}
 _SCHEMA_TYPES = {"array", "boolean", "integer", "null", "number", "object", "string"}
 _SCALAR_SCHEMA_TYPES = _SCHEMA_TYPES - {"array", "object"}
-_PARAMETER_SCHEMA_KEYS = {"description", "enum", "type"}
+_PARAMETER_SCHEMA_KEYS = {"description", "enum", "required", "type"}
 _BODY_SCHEMA_KEYS = {
     "additionalProperties",
     "description",
@@ -104,6 +104,7 @@ _BODY_SCHEMA_KEYS = {
     "properties",
     "required",
     "type",
+    "x-mercury-required",
     "x-mercury-property-descriptions",
 }
 _IDEMPOTENCY_KEYS = {
@@ -299,6 +300,8 @@ def _validate_parameter_schema(
         raise ValueError
     _validate_schema_description(value)
     _validate_schema_enum(value, schema_type)
+    if "required" in value and not isinstance(value["required"], bool):
+        raise ValueError
 
 
 def _validate_body_schema(value: Any, *, depth: int, budget: list[int]) -> None:
@@ -312,6 +315,10 @@ def _validate_body_schema(value: Any, *, depth: int, budget: list[int]) -> None:
         raise ValueError
     _validate_schema_description(value)
     _validate_schema_enum(value, schema_type)
+    if "x-mercury-required" in value and (
+        depth != 0 or not isinstance(value["x-mercury-required"], bool)
+    ):
+        raise ValueError
 
     object_only = {
         "additionalProperties",

@@ -11,6 +11,8 @@ from mercury_tools.catalog.models import (
     revalidate_catalog_action,
     revalidate_catalog_source,
 )
+from mercury_tools.cloud.models import validate_public_catalog_action
+from mercury_tools.execution.request_builder import build_request
 from mercury_tools.rag.chunking import chunk_document, document_from_markdown
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,6 +76,89 @@ def test_every_action_has_valid_identity_routing_and_safety_metadata() -> None:
             assert action.source_hash
             assert action.confidence in ("exact", "example_derived", "inferred")
             assert action.examples == ()
+
+
+def test_every_builtin_action_is_cloud_valid_and_request_buildable(tmp_path: Path) -> None:
+    upload = tmp_path / "synthetic-upload.txt"
+    upload.write_text("synthetic catalog validation input", encoding="utf-8")
+    validated = Counter()
+
+    for connector in ("flowaccount", "peak"):
+        for value in load_actions(connector):
+            action = revalidate_catalog_action(CatalogAction.model_validate(value))
+            validate_public_catalog_action(action)
+            build_request(
+                action,
+                "https://erp.example.test",
+                _synthetic_required_inputs(action, upload),
+                (tmp_path,),
+                environment=action.environments[0],
+            )
+            validated[connector] += 1
+
+    assert validated == {"flowaccount": 190, "peak": 64}
+
+
+def _synthetic_required_inputs(
+    action: CatalogAction,
+    upload: Path,
+) -> dict[str, object]:
+    schema = action.input_schema
+    inputs: dict[str, object] = {}
+    path_names = set(re.findall(r"\{([^{}]+)\}", action.path_template))
+    if path_names:
+        inputs["path"] = {
+            name: _synthetic_schema_value(schema["path"].get(name, {"type": "string"}))
+            for name in sorted(path_names)
+        }
+    for section in ("query", "headers"):
+        required = {
+            name: _synthetic_schema_value(declaration)
+            for name, declaration in schema[section].items()
+            if declaration.get("required") is True
+        }
+        if required:
+            inputs[section] = required
+    required_files = {
+        name: str(upload)
+        for name, declaration in schema["files"].items()
+        if declaration.get("required") is True
+    }
+    if required_files:
+        inputs["files"] = required_files
+    if schema["body"].get("x-mercury-required") is True:
+        inputs["body"] = _synthetic_schema_value(schema["body"])
+    return inputs
+
+
+def _synthetic_schema_value(schema: object) -> object:
+    if not isinstance(schema, dict):
+        return "value"
+    enum = schema.get("enum")
+    if isinstance(enum, tuple) and enum:
+        return enum[0]
+    schema_type = schema.get("type")
+    if schema_type == "object":
+        properties = schema.get("properties", {})
+        required = schema.get("required", ())
+        if not isinstance(properties, dict) or not isinstance(required, tuple):
+            return {}
+        return {
+            name: _synthetic_schema_value(properties[name])
+            for name in required
+            if name in properties
+        }
+    if schema_type == "array":
+        return []
+    if schema_type == "boolean":
+        return True
+    if schema_type == "integer":
+        return 1
+    if schema_type == "number":
+        return 1.0
+    if schema_type == "null":
+        return None
+    return "value"
 
 
 def test_repeated_flowaccount_routes_have_explicit_unique_variants() -> None:
