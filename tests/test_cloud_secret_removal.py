@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from purge_cloud_erp_secrets import (  # noqa: E402, I001
     CONFIRMATION,
     SupabaseRestClient,
+    build_parser,
     redact_high_confidence_secret_values,
     run_purge,
 )
@@ -182,6 +183,15 @@ def test_purge_defaults_to_value_free_dry_run() -> None:
     assert client.patches == []
     assert client.deletions == []
     assert "live-api-key-123456789" not in str(report)
+
+
+def test_purge_cli_accepts_explicit_dry_run_and_rejects_conflicting_modes() -> None:
+    args = build_parser().parse_args(["--dry-run"])
+
+    assert args.dry_run is True
+    assert args.apply is False
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--dry-run", "--apply"])
 
 
 def test_purge_apply_requires_exact_confirmation() -> None:

@@ -396,7 +396,13 @@ def run_purge(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--apply", action="store_true", help="apply the cleanup")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="inspect counts without changing Cloud data (default)",
+    )
+    mode.add_argument("--apply", action="store_true", help="apply the cleanup")
     parser.add_argument("--confirm", default="", help=argparse.SUPPRESS)
     return parser
 
