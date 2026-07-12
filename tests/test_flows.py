@@ -6,9 +6,10 @@ import httpx
 import pytest
 
 from mercury_tools.cli import main
+from mercury_tools.flows import runner as flow_runner
 from mercury_tools.flows.parser import FlowValidationError, parse_flow_text, validate_flow_text
 from mercury_tools.flows.runner import MercuryFlowRunner
-from mercury_tools.flows.templates import COMPANY_HEALTH_TEMPLATE
+from mercury_tools.flows.templates import COMPANY_HEALTH_TEMPLATE, FLOW_CHEAT_SHEET
 from mercury_tools.flows.workspace import (
     discover_workspace_flows,
     run_workspace_flows,
@@ -584,6 +585,241 @@ name: Bad Inline
           title: "bad"
 """
         )
+
+
+def test_flow_parser_supports_erp_commands_and_snake_case_aliases() -> None:
+    flow = parse_flow_text(
+        """
+name: ERP command aliases
+---
+- erp_read:
+    action_id: erp.invoice.list
+    inputs:
+      query:
+        page: 1
+- erp_write_preview:
+    action_id: erp.expense.create
+    inputs:
+      body:
+        reference: EXP-001
+"""
+    )
+
+    assert [command.name for command in flow.commands] == ["erpRead", "erpWritePreview"]
+    assert "erpRead" in FLOW_CHEAT_SHEET
+    assert "erpWritePreview" in FLOW_CHEAT_SHEET
+
+
+def test_flow_runner_calls_injected_erp_read_callback() -> None:
+    calls: list[tuple[str, dict[str, object], str]] = []
+
+    def run_read(action_id: str, inputs: dict[str, object], environment: str) -> dict[str, object]:
+        calls.append((action_id, inputs, environment))
+        return {"status": "ok", "results": [{"invoice_number": "INV-001"}]}
+
+    result = MercuryFlowRunner(erp_read_callback=run_read).run_text(
+        """
+name: ERP read
+env:
+  environment: sandbox
+---
+- erpRead:
+    actionId: erp.invoice.list
+    inputs:
+      query:
+        page: 1
+    saveAs: invoices
+"""
+    )
+
+    assert result.status == "ok"
+    assert calls == [("erp.invoice.list", {"query": {"page": 1}}, "sandbox")]
+    assert result.variables["invoices"]["results"][0]["invoice_number"] == "INV-001"
+
+
+def test_flow_write_preview_is_terminal_and_returns_only_public_summary() -> None:
+    calls: list[tuple[str, dict[str, object], str]] = []
+
+    def preview_write(
+        action_id: str, inputs: dict[str, object], environment: str
+    ) -> dict[str, object]:
+        calls.append((action_id, inputs, environment))
+        return {
+            "request_id": "req_expense_001",
+            "payload_hash": "a" * 64,
+            "request_inputs": {"body": {"api_key": "must-not-leak"}},
+            "sanitized_summary": {"reference": "EXP-001"},
+        }
+
+    result = MercuryFlowRunner(erp_write_preview_callback=preview_write).run_text(
+        """
+name: ERP write preview
+env:
+  environment: production
+---
+- erpWritePreview:
+    actionId: erp.expense.create
+    inputs:
+      body:
+        reference: EXP-001
+    saveAs: preview
+- emitReport:
+    title: This must not run
+"""
+    )
+
+    assert result.status == "confirmation_required"
+    assert calls == [
+        ("erp.expense.create", {"body": {"reference": "EXP-001"}}, "production")
+    ]
+    assert len(result.steps) == 1
+    assert result.steps[0].status == "confirmation_required"
+    assert result.steps[0].output_summary == {
+        "status": "confirmation_required",
+        "request_id": "req_expense_001",
+        "payload_hash": "a" * 64,
+    }
+    assert result.variables["preview"] == result.steps[0].output_summary
+    assert result.artifacts == []
+
+
+def test_nested_flow_preview_propagates_the_public_confirmation_summary() -> None:
+    runner = MercuryFlowRunner(
+        erp_write_preview_callback=lambda *_: {
+            "request_id": "req_nested_001",
+            "payload_hash": "b" * 64,
+            "request_inputs": {"body": {"secret": "must-not-leak"}},
+        }
+    )
+
+    result = runner.run_text(
+        """
+name: Nested ERP write preview
+---
+- runFlow:
+    commands:
+      - erpWritePreview:
+          actionId: erp.expense.create
+          inputs:
+            body:
+              reference: EXP-NESTED-001
+- emitReport:
+    title: This must not run
+"""
+    )
+
+    assert result.status == "confirmation_required"
+    assert len(result.steps) == 1
+    assert result.steps[0].command == "runFlow"
+    assert result.steps[0].output_summary == {
+        "status": "confirmation_required",
+        "request_id": "req_nested_001",
+        "payload_hash": "b" * 64,
+    }
+
+
+def test_flow_runner_rejects_write_preview_in_recursive_retry_before_callback(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "retry.yaml").write_text(
+        """
+name: Retry child
+---
+- runFlow:
+    file: repeat.yaml
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "repeat.yaml").write_text(
+        """
+name: Repeat child
+---
+- repeat:
+    times: 1
+    commands:
+      - runFlow:
+          file: preview.yaml
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "preview.yaml").write_text(
+        """
+name: Preview child
+---
+- erpWritePreview:
+    actionId: erp.expense.create
+    inputs:
+      body:
+        reference: EXP-RETRY-001
+""",
+        encoding="utf-8",
+    )
+    main = tmp_path / "main.yaml"
+    main.write_text(
+        """
+name: Main retry
+---
+- retry:
+    maxRetries: 2
+    file: retry.yaml
+""",
+        encoding="utf-8",
+    )
+    calls: list[object] = []
+    resolved_paths: list[str] = []
+    repository_resolver = flow_runner.repository_flow_path_resolver(tmp_path)
+
+    def resolve_nested_flow(base_dir: Path, raw_path: str) -> Path:
+        resolved_paths.append(raw_path)
+        return repository_resolver(base_dir, raw_path)
+
+    runner = MercuryFlowRunner(
+        erp_write_preview_callback=lambda *_: calls.append("preview") or {},
+        flow_path_resolver=resolve_nested_flow,
+    )
+
+    with pytest.raises(FlowValidationError, match="erpWritePreview cannot run inside retry"):
+        runner.run_path(main)
+
+    assert calls == []
+    assert resolved_paths == ["retry.yaml", "repeat.yaml", "preview.yaml"]
+
+
+def test_flow_runner_resolver_rejects_nested_traversal_and_symlink_escape(tmp_path: Path) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("name: Outside\ncommands: []\n", encoding="utf-8")
+    traversal = root / "traversal.yaml"
+    traversal.write_text(
+        """
+name: Traversal
+---
+- runFlow:
+    file: ../outside.yaml
+""",
+        encoding="utf-8",
+    )
+    symlink = root / "escape.yaml"
+    symlink.symlink_to(outside)
+    symlink_parent = root / "symlink.yaml"
+    symlink_parent.write_text(
+        """
+name: Symlink
+---
+- runFlow:
+    file: escape.yaml
+""",
+        encoding="utf-8",
+    )
+    runner = MercuryFlowRunner(
+        flow_path_resolver=flow_runner.repository_flow_path_resolver(root)
+    )
+
+    with pytest.raises(FlowValidationError, match="path traversal"):
+        runner.run_path(traversal)
+    with pytest.raises(FlowValidationError, match="outside repository root"):
+        runner.run_path(symlink_parent)
 
 
 def test_flow_cli_validate_and_dry_run(tmp_path: Path, capsys) -> None:

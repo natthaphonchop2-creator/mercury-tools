@@ -29,6 +29,40 @@ from mercury_tools.safety.redaction import redact_json
 _TEMPLATE_PATTERN = re.compile(r"\$\{([^}]+)\}|\{\{\s*([^}]+?)\s*\}\}")
 _TEMPLATE_EXACT_PATTERN = re.compile(r"^\s*(?:\$\{([^}]+)\}|\{\{\s*([^}]+?)\s*\}\})\s*$")
 
+ErpReadCallback = Callable[[str, dict[str, Any], str], dict[str, Any]]
+ErpWritePreviewCallback = Callable[[str, dict[str, Any], str], dict[str, Any]]
+FlowPathResolver = Callable[[Path, str], Path]
+
+
+class _RetryMutationError(FlowValidationError):
+    """A policy rejection that retry must propagate without another attempt."""
+
+
+def repository_flow_path_resolver(repository_root: Path) -> FlowPathResolver:
+    """Return a resolver that permits only nested flows inside one repository root."""
+
+    root = Path(repository_root).expanduser().resolve()
+
+    def resolve_nested_flow(base_dir: Path, raw_path: str) -> Path:
+        relative_path = Path(raw_path)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise FlowValidationError("Nested flow path traversal is not allowed.")
+        resolved_base = Path(base_dir).expanduser().resolve()
+        if not resolved_base.is_relative_to(root):
+            raise FlowValidationError("Nested flow base is outside repository root.")
+        resolved_path = (resolved_base / relative_path).resolve()
+        if not resolved_path.is_relative_to(root):
+            raise FlowValidationError("Nested flow path is outside repository root.")
+        return resolved_path
+
+    return resolve_nested_flow
+
+
+def _legacy_flow_path_resolver(base_dir: Path, raw_path: str) -> Path:
+    """Keep hosted relative nested-flow support behind the same containment checks."""
+
+    return repository_flow_path_resolver(base_dir)(base_dir, raw_path)
+
 
 def _get_path(data: dict[str, Any], path: str) -> Any:
     current: Any = data
@@ -98,6 +132,13 @@ def _bounded_int(
 def _summary(payload: Any) -> dict[str, Any]:
     redacted = redact_json(payload)
     if isinstance(redacted, dict):
+        if redacted.get("status") == "confirmation_required":
+            summary = {"status": "confirmation_required"}
+            for key in ("request_id", "payload_hash"):
+                value = redacted.get(key)
+                if isinstance(value, str) and value:
+                    summary[key] = value
+            return summary
         summary: dict[str, Any] = {"keys": sorted(redacted.keys())[:12]}
         if "status" in redacted:
             summary["status"] = redacted["status"]
@@ -254,12 +295,18 @@ class MercuryFlowRunner:
         document_getter: Callable[[str], dict[str, Any] | None] | None = None,
         connector_status_getter: Callable[[], dict[str, Any]] | None = None,
         skill_runner: Callable[[str, dict[str, Any], bool], dict[str, Any]] | None = None,
+        erp_read_callback: ErpReadCallback | None = None,
+        erp_write_preview_callback: ErpWritePreviewCallback | None = None,
+        flow_path_resolver: FlowPathResolver | None = None,
     ) -> None:
         self.dry_run = dry_run
         self.rag_service_factory = rag_service_factory
         self.document_getter = document_getter
         self.connector_status_getter = connector_status_getter
         self.skill_runner = skill_runner
+        self.erp_read_callback = erp_read_callback
+        self.erp_write_preview_callback = erp_write_preview_callback
+        self.flow_path_resolver = flow_path_resolver or _legacy_flow_path_resolver
 
     def run_text(
         self,
@@ -270,10 +317,22 @@ class MercuryFlowRunner:
     ) -> FlowRunResult:
         return self.run_flow(parse_flow_text(text, path=path), env=env)
 
-    def run_path(self, path: Path, *, env: dict[str, Any] | None = None) -> FlowRunResult:
-        return self.run_flow(parse_flow_path(path), env=env)
+    def run_path(
+        self,
+        path: Path,
+        *,
+        env: dict[str, Any] | None = None,
+        _retry_context: bool = False,
+    ) -> FlowRunResult:
+        return self.run_flow(parse_flow_path(path), env=env, _retry_context=_retry_context)
 
-    def run_flow(self, flow: MercuryFlow, *, env: dict[str, Any] | None = None) -> FlowRunResult:
+    def run_flow(
+        self,
+        flow: MercuryFlow,
+        *,
+        env: dict[str, Any] | None = None,
+        _retry_context: bool = False,
+    ) -> FlowRunResult:
         variables: dict[str, Any] = {"env": {**flow.env, **(env or {})}}
         variables.update(variables["env"])
         steps: list[FlowStepResult] = []
@@ -339,22 +398,42 @@ class MercuryFlowRunner:
                     rendered_args,
                     base_dir=base_dir,
                     parent_env=variables["env"],
+                    retry_context=_retry_context,
                 )
             save_as = rendered_args.get("saveAs") or rendered_args.get("save_as")
             if save_as:
                 variables[str(save_as)] = output
             if command.name == "emitReport":
                 artifacts.append(output)
+            terminal_confirmation = (
+                isinstance(output, dict) and output.get("status") == "confirmation_required"
+            )
             steps.append(
                 FlowStepResult(
                     index=sequence,
                     command=command.name,
-                    status="planned" if self.dry_run else "ok",
+                    status=(
+                        "confirmation_required"
+                        if terminal_confirmation
+                        else "planned"
+                        if self.dry_run
+                        else "ok"
+                    ),
                     source=command.source,
                     saved_as=str(save_as) if save_as else None,
                     output_summary=_summary(output),
                 )
             )
+            if terminal_confirmation:
+                return FlowRunResult(
+                    status="confirmation_required",
+                    flow=flow,
+                    dry_run=self.dry_run,
+                    steps=steps,
+                    variables=redact_json(variables),
+                    artifacts=redact_json(artifacts),
+                    reason="confirmation_required",
+                )
 
         return FlowRunResult(
             status="planned" if self.dry_run else "ok",
@@ -372,6 +451,7 @@ class MercuryFlowRunner:
         *,
         base_dir: Path,
         parent_env: dict[str, Any],
+        retry_context: bool,
     ) -> Any:
         if command.name == "connectorStatus":
             if not self.connector_status_getter:
@@ -438,6 +518,22 @@ class MercuryFlowRunner:
             evidence_mode = bool(args.get("evidenceMode") or args.get("evidence_mode"))
             return self.skill_runner(skill_id, inputs, evidence_mode)
 
+        if command.name == "erpRead":
+            if not self.erp_read_callback:
+                raise FlowValidationError("erpRead is not configured for this runner.")
+            action_id, inputs, environment = self._erp_callback_args(args, parent_env, command.name)
+            return self.erp_read_callback(action_id, inputs, environment)
+
+        if command.name == "erpWritePreview":
+            if retry_context:
+                raise _RetryMutationError("erpWritePreview cannot run inside retry.")
+            if not self.erp_write_preview_callback:
+                raise FlowValidationError("erpWritePreview is not configured for this runner.")
+            action_id, inputs, environment = self._erp_callback_args(args, parent_env, command.name)
+            return self._confirmation_required_output(
+                self.erp_write_preview_callback(action_id, inputs, environment)
+            )
+
         if command.name == "assert":
             return self._assert(args)
 
@@ -449,18 +545,21 @@ class MercuryFlowRunner:
             }
 
         if command.name == "runFlow":
-            return self._run_child_flow_command(
+            child_result = self._run_child_flow_command(
                 command_name="runFlow",
                 args=args,
                 base_dir=base_dir,
                 parent_env=parent_env,
-            ).as_dict()
+                retry_context=retry_context,
+            )
+            return self._child_flow_output(child_result)
 
         if command.name == "repeat":
             return self._repeat(
                 args=args,
                 base_dir=base_dir,
                 parent_env=parent_env,
+                retry_context=retry_context,
             )
 
         if command.name == "retry":
@@ -472,6 +571,58 @@ class MercuryFlowRunner:
 
         raise FlowValidationError(f"Unsupported command: {command.name}")
 
+    @staticmethod
+    def _erp_callback_args(
+        args: dict[str, Any],
+        parent_env: dict[str, Any],
+        command_name: str,
+    ) -> tuple[str, dict[str, Any], str]:
+        action_id = str(
+            args.get("actionId") or args.get("action_id") or args.get("value") or ""
+        ).strip()
+        if not action_id:
+            raise FlowValidationError(f"{command_name} requires actionId.")
+        inputs = args.get("inputs") or {}
+        if not isinstance(inputs, dict):
+            raise FlowValidationError(f"{command_name} inputs must be a mapping.")
+        environment = str(
+            args.get("environment") or parent_env.get("environment") or "production"
+        ).strip()
+        if not environment:
+            raise FlowValidationError(f"{command_name} environment must not be empty.")
+        return action_id, inputs, environment
+
+    @staticmethod
+    def _confirmation_required_output(preview: dict[str, Any]) -> dict[str, str]:
+        request_id = preview.get("request_id")
+        payload_hash = preview.get("payload_hash")
+        if not isinstance(request_id, str) or not request_id:
+            raise FlowValidationError("erpWritePreview callback did not return request_id.")
+        if not isinstance(payload_hash, str) or not payload_hash:
+            raise FlowValidationError("erpWritePreview callback did not return payload_hash.")
+        return {
+            "status": "confirmation_required",
+            "request_id": request_id,
+            "payload_hash": payload_hash,
+        }
+
+    @staticmethod
+    def _confirmation_summary_fields(result: FlowRunResult) -> dict[str, str]:
+        if result.status != "confirmation_required" or not result.steps:
+            return {}
+        summary = result.steps[-1].output_summary
+        fields: dict[str, str] = {}
+        for key in ("request_id", "payload_hash"):
+            value = summary.get(key)
+            if isinstance(value, str) and value:
+                fields[key] = value
+        return fields
+
+    def _child_flow_output(self, result: FlowRunResult) -> dict[str, Any]:
+        payload = result.as_dict()
+        payload.update(self._confirmation_summary_fields(result))
+        return payload
+
     def _run_child_flow_command(
         self,
         *,
@@ -479,6 +630,7 @@ class MercuryFlowRunner:
         args: dict[str, Any],
         base_dir: Path,
         parent_env: dict[str, Any],
+        retry_context: bool,
     ) -> FlowRunResult:
         child_env = args.get("env") or {}
         if not isinstance(child_env, dict):
@@ -506,13 +658,19 @@ class MercuryFlowRunner:
                 commands=commands,
                 path=base_dir / f"{label}.{suffix}.yaml",
             )
-            return self.run_flow(child_flow, env=child_env)
+            return self.run_flow(child_flow, env=child_env, _retry_context=retry_context)
         if not raw_path:
             raise FlowValidationError(f"{command_name} requires file/path or commands.")
-        child_path = (base_dir / raw_path).resolve()
-        if not child_path.exists():
+        child_path = self._resolve_nested_flow_path(base_dir, raw_path)
+        return self.run_path(child_path, env=child_env, _retry_context=retry_context)
+
+    def _resolve_nested_flow_path(self, base_dir: Path, raw_path: str) -> Path:
+        child_path = self.flow_path_resolver(base_dir, raw_path)
+        if not isinstance(child_path, Path):
+            raise FlowValidationError("Nested flow resolver must return a Path.")
+        if not child_path.is_file():
             raise FlowValidationError(f"Nested flow does not exist: {raw_path}")
-        return self.run_path(child_path, env=child_env)
+        return child_path
 
     def _repeat(
         self,
@@ -520,6 +678,7 @@ class MercuryFlowRunner:
         args: dict[str, Any],
         base_dir: Path,
         parent_env: dict[str, Any],
+        retry_context: bool,
     ) -> dict[str, Any]:
         times_raw = args.get("times")
         while_condition = args.get("while")
@@ -537,8 +696,8 @@ class MercuryFlowRunner:
             commands = parse_inline_commands(inline_commands, source="repeat.commands")
             if not commands:
                 raise FlowValidationError("repeat commands must include at least one command.")
-        elif not (base_dir / raw_path).resolve().exists():
-            raise FlowValidationError(f"Nested flow does not exist: {raw_path}")
+        else:
+            self._resolve_nested_flow_path(base_dir, raw_path)
 
         if has_times:
             max_iterations = _bounded_int(
@@ -581,8 +740,9 @@ class MercuryFlowRunner:
                 args=args,
                 base_dir=base_dir,
                 parent_env=repeat_env,
+                retry_context=retry_context,
             )
-            result_payload = result.as_dict()
+            result_payload = self._child_flow_output(result)
             results.append(result_payload)
             history.append(
                 {
@@ -591,9 +751,18 @@ class MercuryFlowRunner:
                     "status": result.status,
                 }
             )
+            if result.status == "confirmation_required":
+                stopped_reason = "confirmation required"
+                break
 
-        return {
-            "status": "planned" if self.dry_run else "ok",
+        output = {
+            "status": (
+                "confirmation_required"
+                if results and results[-1]["status"] == "confirmation_required"
+                else "planned"
+                if self.dry_run
+                else "ok"
+            ),
             "iterations": len(results),
             "max_iterations": max_iterations,
             "stopped_reason": stopped_reason,
@@ -601,6 +770,9 @@ class MercuryFlowRunner:
             "results": results,
             "iteration_history": history,
         }
+        if results and results[-1]["status"] == "confirmation_required":
+            output.update(self._confirmation_summary_fields(result))
+        return output
 
     def _retry(
         self,
@@ -633,15 +805,20 @@ class MercuryFlowRunner:
                     args=args,
                     base_dir=base_dir,
                     parent_env=parent_env,
+                    retry_context=True,
                 )
-                return {
+                output = {
                     "status": result.status,
                     "attempts": attempt,
                     "max_retries": max_retries,
                     "delay_ms": delay_ms,
-                    "result": result.as_dict(),
+                    "result": self._child_flow_output(result),
                     "attempt_history": attempts,
                 }
+                output.update(self._confirmation_summary_fields(result))
+                return output
+            except _RetryMutationError:
+                raise
             except Exception as exc:
                 attempts.append(
                     {

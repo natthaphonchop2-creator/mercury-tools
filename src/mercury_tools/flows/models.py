@@ -9,6 +9,8 @@ from typing import Any
 SUPPORTED_COMMANDS = {
     "assert",
     "connectorStatus",
+    "erpRead",
+    "erpWritePreview",
     "emitReport",
     "getDocument",
     "repeat",
@@ -21,6 +23,8 @@ SUPPORTED_COMMANDS = {
 
 COMMAND_ALIASES = {
     "connector_status": "connectorStatus",
+    "erp_read": "erpRead",
+    "erp_write_preview": "erpWritePreview",
     "emit_report": "emitReport",
     "get_document": "getDocument",
     "retrieve_context_pack": "retrieveContextPack",

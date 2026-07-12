@@ -48,6 +48,11 @@ env:
 
 Commands:
 - connectorStatus: read sanitized connector state.
+- erpRead: run a Tier 0 ERP read through the injected local runtime.
+  Args: actionId, inputs, environment, saveAs.
+- erpWritePreview: create one bound ERP write preview through the injected local
+  runtime. This is terminal and returns only confirmation_required, request_id,
+  and payload_hash. Args: actionId, inputs, environment, saveAs.
 - searchKnowledge: run RAG search. Args: query, filters, topK, mode, saveAs.
 - retrieveContextPack: retrieve cited context. Args: query, task, filters, maxChunks, saveAs.
 - getDocument: fetch one indexed document. Args: documentId, saveAs.
@@ -137,6 +142,7 @@ Retry blocks:
 - retry can call file: flaky-step.yaml or commands: [...] inline.
 - maxRetries is 0-3 and defaults to 1, matching Maestro's bounded retry model.
 - Use retry around small transient connector/RAG steps, not whole accounting flows.
+- retry never permits erpWritePreview, including in nested runFlow or repeat blocks.
 - delayMs optionally waits between attempts.
 
 Example:
