@@ -277,6 +277,32 @@ class LocalRequestStore:
             return updated
 
     @repository_locked
+    def resolve_outcome_unknown(
+        self,
+        request_id: str,
+        outcome: str,
+        response_summary: dict[str, Any] | None = None,
+    ) -> PreparedRequest:
+        states = {
+            "succeeded": RequestState.SUCCEEDED,
+            "failed": RequestState.FAILED,
+        }
+        state = states.get(outcome)
+        if state is None:
+            raise RequestStateError("invalid_resolution_outcome")
+        with self._immediate_transaction() as connection:
+            request = self._fetch(connection, request_id)
+            self._require_state(request, RequestState.OUTCOME_UNKNOWN)
+            updated = self._updated(
+                request,
+                state=state,
+                failure_reason="execution_failed" if state is RequestState.FAILED else None,
+                response_summary=response_summary or {},
+            )
+            self._store(connection, updated)
+            return updated
+
+    @repository_locked
     def invalidate_pending(
         self,
         connector_id: str | None = None,

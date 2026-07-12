@@ -107,6 +107,7 @@ _EVENT_VALUES = frozenset(
         "execution_started",
         "invalidated",
         "pre_dispatch_failed",
+        "preflight_completed",
         "preview_created",
     }
 )
@@ -136,6 +137,7 @@ _RESPONSE_SEMANTIC_VALUES = {
         {
             "authentication_failed",
             "authorization_failed",
+            "duplicate_blocked",
             "network_error",
             "provider_error",
             "rate_limited",
