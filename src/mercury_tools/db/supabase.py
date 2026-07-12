@@ -12,6 +12,8 @@ from mercury_tools.config import Settings, require_supabase
 from mercury_tools.rag.models import KnowledgeChunk, KnowledgeDocument, SearchFilters, SearchResult
 from mercury_tools.safety.redaction import redact_json
 
+CHUNK_UPLOAD_BATCH_SIZE = 10
+
 
 class SupabaseRagStore:
     def __init__(self, settings: Settings):
@@ -70,13 +72,19 @@ class SupabaseRagStore:
         )
         return rows[0]
 
-    def _upsert_document(self, document: KnowledgeDocument, source_id: str) -> dict:
+    def _upsert_document(
+        self,
+        document: KnowledgeDocument,
+        source_id: str,
+        *,
+        sha256: str | None = None,
+    ) -> dict:
         payload = {
             "source_id": source_id,
             "document_uri": document.document_uri,
             "title": document.title,
             "body": document.body,
-            "sha256": document.sha256,
+            "sha256": sha256 or document.sha256,
             "effective_date": document.effective_date,
             "metadata": document.metadata,
         }
@@ -96,8 +104,20 @@ class SupabaseRagStore:
         embeddings: list[list[float]],
     ) -> None:
         source = self._upsert_source(document)
-        doc = self._upsert_document(document, source["id"])
-        self._request("DELETE", "knowledge_chunks", params={"document_id": f"eq.{doc['id']}"})
+        existing = self.get_document_by_uri(document.document_uri)
+        if existing is None:
+            doc = self._upsert_document(
+                document,
+                source["id"],
+                sha256=f"incomplete:{document.sha256}",
+            )
+        else:
+            doc = existing
+        self._request(
+            "DELETE",
+            "knowledge_chunks",
+            params={"document_id": f"eq.{doc['id']}"},
+        )
         payload = []
         for chunk, embedding in zip(chunks, embeddings, strict=True):
             payload.append(
@@ -111,8 +131,13 @@ class SupabaseRagStore:
                     "metadata": chunk.metadata,
                 }
             )
-        if payload:
-            self._request("POST", "knowledge_chunks", json=payload)
+        for offset in range(0, len(payload), CHUNK_UPLOAD_BATCH_SIZE):
+            self._request(
+                "POST",
+                "knowledge_chunks",
+                json=payload[offset : offset + CHUNK_UPLOAD_BATCH_SIZE],
+            )
+        self._upsert_document(document, source["id"])
 
     def search_knowledge(
         self,
