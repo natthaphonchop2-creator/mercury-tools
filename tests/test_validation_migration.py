@@ -10,43 +10,140 @@ SEMANTIC_CONTRACTS = (
     Path("catalog/global/peak/semantic-contracts.json"),
 )
 
-LABELLED_SENSITIVE_VALUE_PATTERN = (
-    r"(^|[^a-z0-9])"
-    r"(password[ _-]+value|token[ _-]+value|secret[ _-]+value|"
-    r"credential[ _-]+value|api[ _-]+keys?|client[ _-]+secrets?|"
-    r"passwords?|tokens?|secrets?|credentials?)"
-    r"([[:space:]]*[:=][[:space:]]*|[[:space:]]+)([^[:space:]].*)"
+FORBIDDEN_VALUE_TOKEN_LABELS = (
+    "auth",
+    "authentication",
+    "authorization",
+    "cookie",
+    "credential",
+    "credentials",
+    "file",
+    "header",
+    "headers",
+    "local",
+    "oauth",
+    "password",
+    "passwords",
+    "path",
+    "payload",
+    "raw",
+    "request",
+    "response",
+    "secret",
+    "secrets",
+    "source",
+    "token",
+    "tokens",
 )
-LABELLED_REFERENCE_VALUE_PATTERN = (
-    r"(^|[^a-z0-9])(provider|source)[ _-]+(record|document)"
-    r"([ _-]+id)?"
-    r"([[:space:]]*[:=][[:space:]]*|[[:space:]]+)([^[:space:]].*)"
+FORBIDDEN_VALUE_GROUP_LABELS = (
+    "access key",
+    "access keys",
+    "access token",
+    "access tokens",
+    "api key",
+    "api keys",
+    "api secret",
+    "api secrets",
+    "auth header",
+    "auth headers",
+    "auth token",
+    "auth tokens",
+    "authentication header",
+    "authentication token",
+    "authorization header",
+    "authorization token",
+    "client id",
+    "client secret",
+    "client secrets",
+    "cookie header",
+    "cookie token",
+    "file name",
+    "file path",
+    "id token",
+    "local file",
+    "local path",
+    "oauth token",
+    "provider response",
+    "raw payload",
+    "raw response",
+    "refresh token",
+    "request body",
+    "request payload",
+    "response body",
+    "response payload",
+    "session cookie",
+    "session token",
+    "source file",
+    "source path",
 )
+FORBIDDEN_VALUE_LABELS = (
+    *FORBIDDEN_VALUE_TOKEN_LABELS,
+    *FORBIDDEN_VALUE_GROUP_LABELS,
+)
+PROVIDER_ID_PREFIXES = (
+    "provider",
+    "source",
+    "customer",
+    "contact",
+    "document",
+    "record",
+    "invoice",
+    "payment",
+)
+PROVIDER_REFERENCE_OWNERS = ("provider", "source")
+PROVIDER_REFERENCE_OBJECTS = ("record", "document")
+PROVIDER_ID_KEY_PATTERN = re.compile(
+    rf"^({'|'.join(PROVIDER_ID_PREFIXES)})(_[a-z]+)*_id$"
+)
+
 SAFE_VALUE_STATE_PATTERN = (
     "absent|available|configured|disabled|included|known|missing|needed|omitted|"
     "present|provided|redacted|required|stored|supported|unavailable|unknown"
 )
-SAFE_REFERENCE_TERM_PATTERN = (
-    f"{SAFE_VALUE_STATE_PATTERN}|field|id|identifier|key|number|schema|string"
+SAFE_REFERENCE_TYPE_PATTERN = (
+    "array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|"
+    "truncated|unknown"
+)
+SAFE_REFERENCE_DESCRIPTOR_PATTERN = (
+    rf"([a-z]+[[:space:]]+){{0,3}}({SAFE_REFERENCE_TYPE_PATTERN})"
 )
 SAFE_LIVE_VALIDATION_EXPLANATION_PATTERN = (
     r"are[[:space:]]+not[[:space:]]+available[[:space:]]+"
     r"for[[:space:]]+live[[:space:]]+validation"
 )
-SAFE_SENSITIVE_EXPLANATION_PATTERN = (
-    rf"^(({SAFE_VALUE_STATE_PATTERN})|"
-    rf"({SAFE_LIVE_VALIDATION_EXPLANATION_PATTERN})|"
+SAFE_STATE_EXPLANATION_PATTERN = (
+    rf"(({SAFE_VALUE_STATE_PATTERN})|"
     rf"(are|is|remain|remains|was|were)[[:space:]]+"
     rf"(not[[:space:]]+)?({SAFE_VALUE_STATE_PATTERN})|"
     rf"(cannot|must|should)[[:space:]]+be[[:space:]]+"
-    rf"({SAFE_VALUE_STATE_PATTERN}))[.]?$"
+    rf"({SAFE_VALUE_STATE_PATTERN}))"
+)
+SAFE_LABEL_CONTINUATION_PATTERN = (
+    "body|credential|credentials|document|file|header|headers|id|key|keys|name|"
+    "path|payload|record|response|secret|secrets|token|tokens|value"
+)
+SAFE_CONTROLLED_REQUEST_TAIL_PATTERN = (
+    r"completed[[:space:]]+with[[:space:]]+"
+    r"(the[[:space:]]+reviewed[[:space:]]+expected[[:space:]]+outcome|"
+    r"a[[:space:]]+classified[[:space:]]+failure)|"
+    r"outcome[[:space:]]+could[[:space:]]+not[[:space:]]+be[[:space:]]+proven"
+    r"[[:space:]]+and[[:space:]]+was[[:space:]]+not[[:space:]]+retried"
+)
+SAFE_SENSITIVE_EXPLANATION_PATTERN = (
+    rf"^(({SAFE_STATE_EXPLANATION_PATTERN})|"
+    rf"({SAFE_LIVE_VALIDATION_EXPLANATION_PATTERN})|"
+    rf"(({SAFE_LABEL_CONTINUATION_PATTERN})[ _-]+"
+    rf"({SAFE_STATE_EXPLANATION_PATTERN}))|"
+    rf"((record|document)[ _-]+({SAFE_REFERENCE_DESCRIPTOR_PATTERN}))|"
+    rf"({SAFE_CONTROLLED_REQUEST_TAIL_PATTERN}))[.]?$"
 )
 SAFE_REFERENCE_EXPLANATION_PATTERN = (
-    rf"^(({SAFE_REFERENCE_TERM_PATTERN})|"
+    rf"^(({SAFE_VALUE_STATE_PATTERN})|({SAFE_REFERENCE_DESCRIPTOR_PATTERN})|"
     rf"(are|is|remain|remains|was|were)[[:space:]]+"
-    rf"(not[[:space:]]+)?({SAFE_REFERENCE_TERM_PATTERN})|"
+    rf"(not[[:space:]]+)?"
+    rf"({SAFE_VALUE_STATE_PATTERN}|{SAFE_REFERENCE_DESCRIPTOR_PATTERN})|"
     rf"(cannot|must|should)[[:space:]]+be[[:space:]]+"
-    rf"({SAFE_REFERENCE_TERM_PATTERN}))[.]?$"
+    rf"({SAFE_VALUE_STATE_PATTERN}|{SAFE_REFERENCE_DESCRIPTOR_PATTERN}))[.]?$"
 )
 
 
@@ -68,17 +165,98 @@ def _python_regex(pattern: str) -> str:
     return pattern.replace("[^[:space:]]", r"\S").replace("[[:space:]]", r"\s")
 
 
+def _label_pattern(label: str) -> str:
+    return re.escape(label).replace(r"\ ", r"[ _-]+")
+
+
+def _labelled_forbidden_values() -> tuple[str, ...]:
+    values: list[str] = []
+    for label in FORBIDDEN_VALUE_LABELS:
+        values.extend(
+            (
+                f"{label}: !value",
+                f"{label.replace(' ', '_')} = '#1234'",
+                f"{label} synthetic_value",
+            )
+        )
+    for prefix in PROVIDER_ID_PREFIXES:
+        values.extend(
+            (
+                f"{prefix}_id: #1234",
+                f"{prefix} id = '!value'",
+                f"{prefix} id #1234",
+                f"{prefix}_external_record_id: !value",
+                f"{prefix} external record id = '#1234'",
+            )
+        )
+    for owner in PROVIDER_REFERENCE_OWNERS:
+        for reference in PROVIDER_REFERENCE_OBJECTS:
+            values.extend(
+                (
+                    f"{owner} {reference}: #1234",
+                    f"{owner}_{reference}_id = '#1234'",
+                    f"{owner} {reference} #1234",
+                )
+            )
+    return tuple(dict.fromkeys(values))
+
+
 def _has_labelled_actual_value(value: str) -> bool:
     lowered = value.lower()
-    for match in re.finditer(_python_regex(LABELLED_SENSITIVE_VALUE_PATTERN), lowered):
+    for label in FORBIDDEN_VALUE_LABELS:
+        pattern = (
+            rf"(^|[^a-z0-9])(?:{_label_pattern(label)})"
+            rf"(?:\s*[:=]\s*|\s+)(\S.*)"
+        )
+        for match in re.finditer(pattern, lowered):
+            if not re.fullmatch(
+                _python_regex(SAFE_SENSITIVE_EXPLANATION_PATTERN), match.group(2)
+            ):
+                return True
+
+    provider_id_pattern = (
+        rf"(^|[^a-z0-9])(?:{'|'.join(PROVIDER_ID_PREFIXES)})"
+        rf"(?:[ _-]+[a-z]+)*[ _-]+id"
+        rf"(?:\s*[:=]\s*|\s+)(\S.*)"
+    )
+    for match in re.finditer(provider_id_pattern, lowered):
         if not re.fullmatch(
-            _python_regex(SAFE_SENSITIVE_EXPLANATION_PATTERN), match.group(4)
+            _python_regex(SAFE_REFERENCE_EXPLANATION_PATTERN), match.group(2)
         ):
             return True
-    for match in re.finditer(_python_regex(LABELLED_REFERENCE_VALUE_PATTERN), lowered):
+
+    reference_pattern = (
+        rf"(^|[^a-z0-9])(?:{'|'.join(PROVIDER_REFERENCE_OWNERS)})[ _-]+"
+        rf"(?:{'|'.join(PROVIDER_REFERENCE_OBJECTS)})(?:[ _-]+id)?"
+        rf"(?:\s*[:=]\s*|\s+)(\S.*)"
+    )
+    for match in re.finditer(reference_pattern, lowered):
         if not re.fullmatch(
-            _python_regex(SAFE_REFERENCE_EXPLANATION_PATTERN), match.group(6)
+            _python_regex(SAFE_REFERENCE_EXPLANATION_PATTERN), match.group(2)
         ):
+            return True
+    return False
+
+
+def _has_unsafe_provider_id_assignment(value: object) -> bool:
+    if isinstance(value, list):
+        return any(_has_unsafe_provider_id_assignment(item) for item in value)
+    if not isinstance(value, dict):
+        return False
+
+    for key, item in value.items():
+        separated = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", key)
+        separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", separated)
+        normalized_key = re.sub(r"[^a-z0-9]+", "_", separated.lower()).strip("_")
+        if PROVIDER_ID_KEY_PATTERN.fullmatch(normalized_key) and (
+            not isinstance(item, str)
+            or re.fullmatch(
+                _python_regex(SAFE_REFERENCE_EXPLANATION_PATTERN), item.lower()
+            )
+            is None
+        ):
+            return True
+        if _has_unsafe_provider_id_assignment(item):
             return True
     return False
 
@@ -277,9 +455,6 @@ def test_validation_migration_rejects_unsafe_json_and_text_values() -> None:
         "strpos(lower(value), '://')",
         "'bearer '",
         "'github_pat_'",
-        "'provider_response'",
-        "'raw_payload'",
-        "'request_payload'",
         "'../'",
         "'[[:cntrl:]]'",
     ):
@@ -288,6 +463,11 @@ def test_validation_migration_rejects_unsafe_json_and_text_values() -> None:
     json_body = _function_body(sql, "jsonb_has_forbidden_validation_value")
     assert "jsonb_path_query" in json_body
     assert "jsonb_typeof(nodes.item) in ('number', 'boolean', 'null')" in _compact(json_body)
+    assert "$.**.keyvalue()" in json_body
+    assert "as provider_id_entry(item)" in _compact(json_body)
+    assert "as normalized_provider_id(normalized_key)" in _compact(json_body)
+    assert "(_[a-z]+)*_id$" in json_body
+    assert "provider_id_entry.item->>'value' !~" in _compact(json_body)
     assert "nodes.item #>> '{}' ~ '[[:digit:]]'" not in _compact(json_body)
     assert "([[:digit:]][^[:alnum:]]*){9}" in text_body
     assert "([a-z]+[0-9]+|[0-9]+[a-z]+)" in text_body
@@ -310,18 +490,36 @@ def test_validation_migration_rejects_unsafe_json_and_text_values() -> None:
     assert "public.jsonb_is_safe_validation_semantic_contract(semantic_contract)" in compact
 
 
-def test_validation_migration_rejects_labelled_actual_values_precisely() -> None:
+def test_validation_migration_uses_complete_table_driven_label_contract() -> None:
     text_body = _function_body(_sql(), "validation_text_has_forbidden_value")
     compact = _compact(text_body)
 
-    assert LABELLED_SENSITIVE_VALUE_PATTERN in text_body
-    assert LABELLED_REFERENCE_VALUE_PATTERN in text_body
+    assert "as forbidden_label(label)" in compact
+    assert "replace(forbidden_label.label, ' ', '[ _-]+')" in compact
+    assert "as provider_id_prefix(label)" in compact
+    assert "as reference_owner(label)" in compact
+    assert "as reference_object(label)" in compact
+    forbidden_label_table = text_body.split("]) as forbidden_label(label)", 1)[0].rsplit(
+        "from unnest(array[", 1
+    )[1]
+    for label in FORBIDDEN_VALUE_LABELS:
+        assert f"'{label}'" in forbidden_label_table
+
+    provider_id_table = text_body.split("]) as provider_id_prefix(label)", 1)[0].rsplit(
+        "from unnest(array[", 1
+    )[1]
+    for prefix in PROVIDER_ID_PREFIXES:
+        assert f"'{prefix}'" in provider_id_table
+    assert "unnest(array['provider', 'source']) as reference_owner(label)" in compact
+    assert "unnest(array['record', 'document']) as reference_object(label)" in compact
+
     assert SAFE_SENSITIVE_EXPLANATION_PATTERN in text_body
     assert SAFE_REFERENCE_EXPLANATION_PATTERN in text_body
-    assert "from regexp_matches(" in compact
-    assert "labelled_sensitive.parts[4] !~" in compact
-    assert "labelled_reference.parts[6] !~" in compact
-    assert text_body.count("([^[:space:]].*)") == 2
+    assert "cross join lateral regexp_matches(" in compact
+    assert "labelled_forbidden.parts[4] !~" in compact
+    assert "labelled_provider_id.parts[5] !~" in compact
+    assert "labelled_reference.parts[5] !~" in compact
+    assert text_body.count("([^[:space:]].*)") == 3
 
     unconditional_fragments = text_body.split("from unnest(array[", 1)[1].split(
         "]) as forbidden", 1
@@ -336,6 +534,13 @@ def test_validation_migration_rejects_labelled_actual_values_precisely() -> None
         "refresh token",
         "secret value",
         "source record",
+        "raw payload",
+        "raw response",
+        "request body",
+        "request payload",
+        "response body",
+        "response payload",
+        "provider response",
     ):
         assert f"'{label_only_fragment}'" not in unconditional_fragments
 
@@ -348,6 +553,7 @@ def test_labelled_value_patterns_preserve_all_254_semantic_contracts() -> None:
 
     assert len(contracts) == 254
     for contract in contracts:
+        assert not _has_unsafe_provider_id_assignment(contract)
         for value in _string_values(contract):
             assert not _has_labelled_actual_value(value)
 
@@ -365,33 +571,69 @@ def test_controlled_qualification_summaries_remain_text_safe() -> None:
         assert not _has_labelled_actual_value(summary)
 
 
-def test_labelled_value_contract_covers_punctuation_quotes_and_separators() -> None:
-    for safe_metadata in (
+def test_labelled_value_contract_covers_complete_generated_assignment_matrix() -> None:
+    safe_metadata_values = (
         "provider credentials are not available",
+        "Provider credentials are not available for live validation.",
         "client secret is unavailable",
         "password is redacted",
         "api key should be omitted",
+        "authorization header is unavailable",
+        "raw payload should be redacted",
+        "request payload is omitted",
+        "source path is redacted",
         "provider record identifier",
         "source document string",
-    ):
+        "email:string",
+        "document_id:string",
+        "record_id:string",
+        "provider_id:provider identifier",
+        "provider_external_record_id:provider record identifier",
+        "counterparty_tax_id:counterparty tax identifier",
+    )
+    for safe_metadata in safe_metadata_values:
         assert not _has_labelled_actual_value(safe_metadata)
 
-    for unsafe_value in (
-        "password: !value",
-        "token #synthetic",
-        "secret=!value",
-        "credential = #synthetic",
-        "api-key:!value",
-        "client-secret = !value",
-        'token: "synthetic candidate"',
-        "secret = '#synthetic'",
-        'password: "redacted"',
+    unsafe_values = _labelled_forbidden_values()
+    assert len(unsafe_values) >= 120
+    for reviewer_example in (
+        "authorization_header: !value",
+        "auth header = '#1234'",
+        "client_id: !value",
+        "api_key = '#1234'",
+        'access token: "!value"',
+        "cookie: #1234",
+        "session_token = '#1234'",
+        "raw_payload: !value",
+        "request: #1234",
+        "response = '!value'",
+        "document_id: #1234",
+        "record id = '!value'",
+        "provider_id: #1234",
         "credentials are not available for live validation. !value",
-        "provider record #" + "1234",
-        "source document: '#" + "5678'",
-        "provider record identifier #" + "1234",
+        "provider record identifier #1234",
     ):
+        assert reviewer_example in unsafe_values or _has_labelled_actual_value(
+            reviewer_example
+        )
+
+    for unsafe_value in unsafe_values:
         assert _has_labelled_actual_value(unsafe_value)
+
+    for prefix in PROVIDER_ID_PREFIXES:
+        assert _has_unsafe_provider_id_assignment({f"{prefix}_id": "#1234"})
+        assert not _has_unsafe_provider_id_assignment({f"{prefix}_id": "string"})
+
+    assert not _has_unsafe_provider_id_assignment(
+        {
+            "email": "string",
+            "document_id": "string",
+            "record_id": "string",
+            "counterparty_tax_id": "counterparty tax identifier",
+            "action_id": "act_" + "0" * 24,
+            "version_id": "av_" + "0" * 64,
+        }
+    )
 
 
 def test_validation_value_helpers_allow_only_typed_shapes_and_semantic_metadata() -> None:

@@ -140,20 +140,6 @@ as $function$
         'github_pat_',
         'pk_live_',
         'rk_live_',
-        'raw_payload',
-        'raw payload',
-        'raw_response',
-        'raw response',
-        'request_body',
-        'request body',
-        'request_payload',
-        'request payload',
-        'response_body',
-        'response body',
-        'response_payload',
-        'response payload',
-        'provider_response',
-        'provider response',
         'sk-',
         'sk_',
         'xoxb-',
@@ -164,21 +150,113 @@ as $function$
     )
     or exists (
       select 1
-      from regexp_matches(
+      from unnest(array[
+        'auth',
+        'authentication',
+        'authorization',
+        'cookie',
+        'credential',
+        'credentials',
+        'file',
+        'header',
+        'headers',
+        'local',
+        'oauth',
+        'password',
+        'passwords',
+        'path',
+        'payload',
+        'raw',
+        'request',
+        'response',
+        'secret',
+        'secrets',
+        'source',
+        'token',
+        'tokens',
+        'access key',
+        'access keys',
+        'access token',
+        'access tokens',
+        'api key',
+        'api keys',
+        'api secret',
+        'api secrets',
+        'auth header',
+        'auth headers',
+        'auth token',
+        'auth tokens',
+        'authentication header',
+        'authentication token',
+        'authorization header',
+        'authorization token',
+        'client id',
+        'client secret',
+        'client secrets',
+        'cookie header',
+        'cookie token',
+        'file name',
+        'file path',
+        'id token',
+        'local file',
+        'local path',
+        'oauth token',
+        'provider response',
+        'raw payload',
+        'raw response',
+        'refresh token',
+        'request body',
+        'request payload',
+        'response body',
+        'response payload',
+        'session cookie',
+        'session token',
+        'source file',
+        'source path'
+      ]) as forbidden_label(label)
+      cross join lateral regexp_matches(
         lower(value),
-        '(^|[^a-z0-9])(password[ _-]+value|token[ _-]+value|secret[ _-]+value|credential[ _-]+value|api[ _-]+keys?|client[ _-]+secrets?|passwords?|tokens?|secrets?|credentials?)([[:space:]]*[:=][[:space:]]*|[[:space:]]+)([^[:space:]].*)',
+        '(^|[^a-z0-9])(' ||
+        replace(forbidden_label.label, ' ', '[ _-]+') ||
+        ')([[:space:]]*[:=][[:space:]]*|[[:space:]]+)([^[:space:]].*)',
         'g'
-      ) as labelled_sensitive(parts)
-      where labelled_sensitive.parts[4] !~ '^((absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(are[[:space:]]+not[[:space:]]+available[[:space:]]+for[[:space:]]+live[[:space:]]+validation)|(are|is|remain|remains|was|were)[[:space:]]+(not[[:space:]]+)?(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(cannot|must|should)[[:space:]]+be[[:space:]]+(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown))[.]?$'
+      ) as labelled_forbidden(parts)
+      where labelled_forbidden.parts[4] !~ '^((((absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(are|is|remain|remains|was|were)[[:space:]]+(not[[:space:]]+)?(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(cannot|must|should)[[:space:]]+be[[:space:]]+(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)))|(are[[:space:]]+not[[:space:]]+available[[:space:]]+for[[:space:]]+live[[:space:]]+validation)|((body|credential|credentials|document|file|header|headers|id|key|keys|name|path|payload|record|response|secret|secrets|token|tokens|value)[ _-]+(((absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(are|is|remain|remains|was|were)[[:space:]]+(not[[:space:]]+)?(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(cannot|must|should)[[:space:]]+be[[:space:]]+(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown))))|((record|document)[ _-]+(([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown)))|(completed[[:space:]]+with[[:space:]]+(the[[:space:]]+reviewed[[:space:]]+expected[[:space:]]+outcome|a[[:space:]]+classified[[:space:]]+failure)|outcome[[:space:]]+could[[:space:]]+not[[:space:]]+be[[:space:]]+proven[[:space:]]+and[[:space:]]+was[[:space:]]+not[[:space:]]+retried))[.]?$'
     )
     or exists (
       select 1
-      from regexp_matches(
+      from unnest(array[
+        'provider',
+        'source',
+        'customer',
+        'contact',
+        'document',
+        'record',
+        'invoice',
+        'payment'
+      ]) as provider_id_prefix(label)
+      cross join lateral regexp_matches(
         lower(value),
-        '(^|[^a-z0-9])(provider|source)[ _-]+(record|document)([ _-]+id)?([[:space:]]*[:=][[:space:]]*|[[:space:]]+)([^[:space:]].*)',
+        '(^|[^a-z0-9])(' ||
+        provider_id_prefix.label ||
+        '([ _-]+[a-z]+)*[ _-]+id)' ||
+        '([[:space:]]*[:=][[:space:]]*|[[:space:]]+)([^[:space:]].*)',
+        'g'
+      ) as labelled_provider_id(parts)
+      where labelled_provider_id.parts[5] !~ '^((absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown))|(are|is|remain|remains|was|were)[[:space:]]+(not[[:space:]]+)?(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown|([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown))|(cannot|must|should)[[:space:]]+be[[:space:]]+(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown|([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown)))[.]?$'
+    )
+    or exists (
+      select 1
+      from unnest(array['provider', 'source']) as reference_owner(label)
+      cross join unnest(array['record', 'document']) as reference_object(label)
+      cross join lateral regexp_matches(
+        lower(value),
+        '(^|[^a-z0-9])(' ||
+        reference_owner.label || '[ _-]+' || reference_object.label ||
+        '([ _-]+id)?)([[:space:]]*[:=][[:space:]]*|[[:space:]]+)([^[:space:]].*)',
         'g'
       ) as labelled_reference(parts)
-      where labelled_reference.parts[6] !~ '^((absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown|field|id|identifier|key|number|schema|string)|(are|is|remain|remains|was|were)[[:space:]]+(not[[:space:]]+)?(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown|field|id|identifier|key|number|schema|string)|(cannot|must|should)[[:space:]]+be[[:space:]]+(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown|field|id|identifier|key|number|schema|string))[.]?$'
+      where labelled_reference.parts[5] !~ '^((absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown))|(are|is|remain|remains|was|were)[[:space:]]+(not[[:space:]]+)?(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown|([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown))|(cannot|must|should)[[:space:]]+be[[:space:]]+(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown|([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown)))[.]?$'
     )
     or value ~ '[A-Za-z0-9_-]{8,}[.][A-Za-z0-9_-]{8,}[.][A-Za-z0-9_-]{4,}'
     or value ~ '([[:digit:]][^[:alnum:]]*){9}'
@@ -210,26 +288,61 @@ immutable
 parallel safe
 set search_path = pg_catalog, pg_temp
 as $function$
-  select exists (
-    select 1
-    from jsonb_path_query(
-      coalesce(value, 'null'::jsonb),
-      'lax $.**'
-    ) as nodes(item)
-    where jsonb_typeof(nodes.item) in ('number', 'boolean', 'null')
-      or (
-        jsonb_typeof(nodes.item) = 'string'
-        and (
-          (
-            nodes.item #>> '{}' !~ '^act_[0-9a-f]{24}$'
-            and nodes.item #>> '{}' !~ '^av_[0-9a-f]{64}$'
-            and nodes.item #>> '{}' !~ '^ev_[a-z0-9_]{8,128}$'
-            and nodes.item #>> '{}' !~ '^run_[a-z0-9_]{8,128}$'
-            and public.validation_text_has_forbidden_value(nodes.item #>> '{}')
+  select
+    exists (
+      select 1
+      from jsonb_path_query(
+        coalesce(value, 'null'::jsonb),
+        'lax $.**'
+      ) as nodes(item)
+      where jsonb_typeof(nodes.item) in ('number', 'boolean', 'null')
+        or (
+          jsonb_typeof(nodes.item) = 'string'
+          and (
+            (
+              nodes.item #>> '{}' !~ '^act_[0-9a-f]{24}$'
+              and nodes.item #>> '{}' !~ '^av_[0-9a-f]{64}$'
+              and nodes.item #>> '{}' !~ '^ev_[a-z0-9_]{8,128}$'
+              and nodes.item #>> '{}' !~ '^run_[a-z0-9_]{8,128}$'
+              and public.validation_text_has_forbidden_value(nodes.item #>> '{}')
+            )
           )
         )
-      )
-  );
+    )
+    or exists (
+      select 1
+      from jsonb_path_query(
+        coalesce(value, 'null'::jsonb),
+        'lax $.**.keyvalue()'
+      ) as provider_id_entry(item)
+      cross join lateral (
+        select trim(
+          both '_' from lower(
+            regexp_replace(
+              regexp_replace(
+                regexp_replace(
+                  provider_id_entry.item->>'key',
+                  '([[:upper:]]+)([[:upper:]][[:lower:]])',
+                  '\1_\2',
+                  'g'
+                ),
+                '([[:lower:][:digit:]])([[:upper:]])',
+                '\1_\2',
+                'g'
+              ),
+              '[^[:alnum:]]+',
+              '_',
+              'g'
+            )
+          )
+        )
+      ) as normalized_provider_id(normalized_key)
+      where normalized_provider_id.normalized_key ~ '^(provider|source|customer|contact|document|record|invoice|payment)(_[a-z]+)*_id$'
+        and (
+          jsonb_typeof(provider_id_entry.item->'value') <> 'string'
+          or provider_id_entry.item->>'value' !~ '^((absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown))|(are|is|remain|remains|was|were)[[:space:]]+(not[[:space:]]+)?(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown|([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown))|(cannot|must|should)[[:space:]]+be[[:space:]]+(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown|([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown)))[.]?$'
+        )
+    );
 $function$;
 
 revoke all on function public.jsonb_has_forbidden_validation_value(jsonb)

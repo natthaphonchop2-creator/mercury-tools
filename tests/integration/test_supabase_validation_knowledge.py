@@ -36,6 +36,107 @@ _SEMANTIC_CONTRACT_PATHS = (
     Path("catalog/global/peak/semantic-contracts.json"),
 )
 _SEMANTIC_IDENTITY_FIELDS = {"action_id", "version_id"}
+_FORBIDDEN_VALUE_TOKEN_LABELS = (
+    "auth",
+    "authentication",
+    "authorization",
+    "cookie",
+    "credential",
+    "credentials",
+    "file",
+    "header",
+    "headers",
+    "local",
+    "oauth",
+    "password",
+    "passwords",
+    "path",
+    "payload",
+    "raw",
+    "request",
+    "response",
+    "secret",
+    "secrets",
+    "source",
+    "token",
+    "tokens",
+)
+_FORBIDDEN_VALUE_GROUP_LABELS = (
+    "access key",
+    "access keys",
+    "access token",
+    "access tokens",
+    "api key",
+    "api keys",
+    "api secret",
+    "api secrets",
+    "auth header",
+    "auth headers",
+    "auth token",
+    "auth tokens",
+    "authentication header",
+    "authentication token",
+    "authorization header",
+    "authorization token",
+    "client id",
+    "client secret",
+    "client secrets",
+    "cookie header",
+    "cookie token",
+    "file name",
+    "file path",
+    "id token",
+    "local file",
+    "local path",
+    "oauth token",
+    "provider response",
+    "raw payload",
+    "raw response",
+    "refresh token",
+    "request body",
+    "request payload",
+    "response body",
+    "response payload",
+    "session cookie",
+    "session token",
+    "source file",
+    "source path",
+)
+_FORBIDDEN_VALUE_LABELS = (
+    *_FORBIDDEN_VALUE_TOKEN_LABELS,
+    *_FORBIDDEN_VALUE_GROUP_LABELS,
+)
+_PROVIDER_ID_PREFIXES = (
+    "provider",
+    "source",
+    "customer",
+    "contact",
+    "document",
+    "record",
+    "invoice",
+    "payment",
+)
+_PROVIDER_REFERENCE_OWNERS = ("provider", "source")
+_PROVIDER_REFERENCE_OBJECTS = ("record", "document")
+_SAFE_LABELLED_METADATA = (
+    "provider credentials are not available",
+    "Provider credentials are not available for live validation.",
+    "client secret is unavailable",
+    "password is redacted",
+    "api key should be omitted",
+    "authorization header is unavailable",
+    "raw payload should be redacted",
+    "request payload is omitted",
+    "source path is redacted",
+    "provider record identifier",
+    "source document string",
+    "email:string",
+    "document_id:string",
+    "record_id:string",
+    "provider_id:provider identifier",
+    "provider_external_record_id:provider record identifier",
+    "counterparty_tax_id:counterparty tax identifier",
+)
 
 
 @dataclass(frozen=True)
@@ -185,6 +286,38 @@ def _reviewed_semantic_contracts() -> list[dict[str, object]]:
     return contracts
 
 
+def _labelled_forbidden_values() -> tuple[str, ...]:
+    values: list[str] = []
+    for label in _FORBIDDEN_VALUE_LABELS:
+        values.extend(
+            (
+                f"{label}: !value",
+                f"{label.replace(' ', '_')} = '#1234'",
+                f"{label} synthetic_value",
+            )
+        )
+    for prefix in _PROVIDER_ID_PREFIXES:
+        values.extend(
+            (
+                f"{prefix}_id: #1234",
+                f"{prefix} id = '!value'",
+                f"{prefix} id #1234",
+                f"{prefix}_external_record_id: !value",
+                f"{prefix} external record id = '#1234'",
+            )
+        )
+    for owner in _PROVIDER_REFERENCE_OWNERS:
+        for reference in _PROVIDER_REFERENCE_OBJECTS:
+            values.extend(
+                (
+                    f"{owner} {reference}: #1234",
+                    f"{owner}_{reference}_id = '#1234'",
+                    f"{owner} {reference} #1234",
+                )
+            )
+    return tuple(dict.fromkeys(values))
+
+
 def test_hosted_http_is_rejected_before_credentials_are_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -265,6 +398,27 @@ def test_loopback_http_remains_available(monkeypatch: pytest.MonkeyPatch) -> Non
     environment = _test_environment()
 
     assert environment.rest_url == "http://127.0.0.1:54321/rest/v1"
+
+
+def test_labelled_value_rpc_matrix_covers_complete_contract() -> None:
+    values = _labelled_forbidden_values()
+
+    assert len(values) >= 120
+    for label in _FORBIDDEN_VALUE_LABELS:
+        assert f"{label}: !value" in values
+        assert f"{label.replace(' ', '_')} = '#1234'" in values
+        assert f"{label} synthetic_value" in values
+    for prefix in _PROVIDER_ID_PREFIXES:
+        assert f"{prefix}_id: #1234" in values
+        assert f"{prefix} id = '!value'" in values
+        assert f"{prefix} id #1234" in values
+        assert f"{prefix}_external_record_id: !value" in values
+        assert f"{prefix} external record id = '#1234'" in values
+    for owner in _PROVIDER_REFERENCE_OWNERS:
+        for reference in _PROVIDER_REFERENCE_OBJECTS:
+            assert f"{owner} {reference}: #1234" in values
+            assert f"{owner}_{reference}_id = '#1234'" in values
+            assert f"{owner} {reference} #1234" in values
 
 
 def test_all_reviewed_semantic_contracts_pass_actual_sql_functions() -> None:
@@ -353,19 +507,8 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             _assert_status(response, 200)
             assert response.json() is True
 
-        unsafe_labelled_values = (
-            "password: !value",
-            "token #synthetic",
-            "secret=!value",
-            "credential = #synthetic",
-            "api-key:!value",
-            "client-secret = !value",
-            'token: "synthetic candidate"',
-            "secret = '#synthetic'",
-            "credentials are not available for live validation. !value",
-            "provider record #" + "1234",
-            "source document: '#" + "5678'",
-        )
+        unsafe_labelled_values = _labelled_forbidden_values()
+        assert len(unsafe_labelled_values) >= 120
         for unsafe_value in unsafe_labelled_values:
             response = _guarded_request(
                 client,
@@ -409,6 +552,11 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             {"note": "provider record " + "1234"},
             {"note": "source document " + "5678"},
             {"note": '{"record":' + "9912}"},
+            *({f"{prefix}_id": "#1234"} for prefix in _PROVIDER_ID_PREFIXES),
+            *(
+                {f"{prefix}_external_record_id": "#1234"}
+                for prefix in _PROVIDER_ID_PREFIXES
+            ),
         )
         for unsafe_value in unsafe_json_values:
             response = _guarded_request(
@@ -422,14 +570,7 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             _assert_status(response, 200)
             assert response.json() is True
 
-        for safe_value in (
-            "provider credentials are not available",
-            "client secret is unavailable",
-            "password is redacted",
-            "api key should be omitted",
-            "provider record identifier",
-            "source document string",
-        ):
+        for safe_value in _SAFE_LABELLED_METADATA:
             response = _guarded_request(
                 client,
                 environment,
@@ -480,10 +621,34 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             headers=environment.service_headers,
             json={
                 "value": {
+                    "action_id": "act_" + "0" * 24,
+                    "version_id": "av_" + "0" * 64,
+                }
+            },
+        )
+        _assert_status(response, 200)
+        assert response.json() is False
+
+        response = _guarded_request(
+            client,
+            environment,
+            "POST",
+            f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_value",
+            headers=environment.service_headers,
+            json={
+                "value": {
                     "email": "string",
                     "document_id": "string",
                     "record_id": "string",
                     "counterparty_tax_id": "counterparty tax identifier",
+                    **{
+                        f"{prefix}_id": "string"
+                        for prefix in _PROVIDER_ID_PREFIXES
+                    },
+                    **{
+                        f"{prefix}_external_record_id": "provider record identifier"
+                        for prefix in _PROVIDER_ID_PREFIXES
+                    },
                 }
             },
         )
