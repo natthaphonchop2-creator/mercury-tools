@@ -124,6 +124,34 @@ _LABEL_NORMALIZATION_CASES = (
         "provider external record id",
         ("external", "id", "provider", "record"),
     ),
+    ("numeric_qualified", "client2Id", ("client", "id")),
+    ("numeric_qualified", "api2Key", ("api", "key")),
+    (
+        "forbidden_compound",
+        "documentAuthorizationId",
+        ("authorization", "document", "id"),
+    ),
+    (
+        "forbidden_compound",
+        "sourceTokenId",
+        ("id", "source", "token"),
+    ),
+    (
+        "forbidden_compound",
+        "providerRawPayloadId",
+        ("id", "payload", "provider", "raw"),
+    ),
+)
+_COMPACT_QUALIFIED_ASSIGNMENT_CASES = (
+    ("client.id", "!value"),
+    ("api.key", "#1234"),
+    ("client.public.id", "synthetic_value"),
+    ("api.signing.key", "synthetic_value"),
+)
+_FORBIDDEN_PROVIDER_COMPOUND_LABELS = (
+    "documentAuthorizationId",
+    "sourceTokenId",
+    "providerRawPayloadId",
 )
 _PROVIDER_ID_PREFIXES = (
     "provider",
@@ -342,6 +370,8 @@ def _labelled_forbidden_values() -> tuple[str, ...]:
                 f"{label} synthetic_value",
             )
         )
+    for label, candidate in _COMPACT_QUALIFIED_ASSIGNMENT_CASES:
+        values.append(f"{label}:{candidate}")
     return tuple(dict.fromkeys(values))
 
 
@@ -456,11 +486,15 @@ def test_labelled_value_rpc_matrix_covers_complete_contract() -> None:
         "underscore",
         "hyphen",
         "space",
+        "numeric_qualified",
+        "forbidden_compound",
     }
     for _, label, _ in _LABEL_NORMALIZATION_CASES:
         assert f"{label}: !value" in values
         assert f"{label} = '#1234'" in values
         assert f"{label} synthetic_value" in values
+    for label, candidate in _COMPACT_QUALIFIED_ASSIGNMENT_CASES:
+        assert f"{label}:{candidate}" in values
 
 
 def test_label_normalization_classes_pass_actual_sql_helper() -> None:
@@ -599,6 +633,18 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
                 f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_value",
                 headers=environment.service_headers,
                 json={"value": {"nested": [{unsafe_label: "!value"}]}},
+            )
+            _assert_status(response, 200)
+            assert response.json() is True
+
+        for unsafe_key in _FORBIDDEN_PROVIDER_COMPOUND_LABELS:
+            response = _guarded_request(
+                client,
+                environment,
+                "POST",
+                f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_key",
+                headers=environment.service_headers,
+                json={"value": {"nested": [{unsafe_key: "string"}]}},
             )
             _assert_status(response, 200)
             assert response.json() is True

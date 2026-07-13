@@ -61,7 +61,7 @@ as $function$
     from separated
     cross join lateral regexp_split_to_table(
       separated.value,
-      '[^[:alnum:]]+'
+      '[^A-Za-z]+'
     ) as parts(token)
   )
   select coalesce(
@@ -90,34 +90,6 @@ as $function$
     select public.validation_label_tokens(value) as label_tokens
   )
   select case
-    when (
-      'id' = any(label_tokens)
-      and exists (
-        select 1
-        from unnest(array[
-          'provider',
-          'source',
-          'customer',
-          'contact',
-          'document',
-          'record',
-          'invoice',
-          'payment'
-        ]) as provider_id_prefix(label)
-        where provider_id_prefix.label = any(label_tokens)
-      )
-    ) or (
-      exists (
-        select 1
-        from unnest(array['provider', 'source']) as reference_owner(label)
-        where reference_owner.label = any(label_tokens)
-      )
-      and exists (
-        select 1
-        from unnest(array['record', 'document']) as reference_object(label)
-        where reference_object.label = any(label_tokens)
-      )
-    ) then 'provider_reference'
     when label_tokens && array[
       'auth',
       'authentication',
@@ -191,6 +163,34 @@ as $function$
       ) as forbidden_group(tokens)
       where forbidden_group.tokens <@ label_tokens
     ) then 'forbidden'
+    when (
+      'id' = any(label_tokens)
+      and exists (
+        select 1
+        from unnest(array[
+          'provider',
+          'source',
+          'customer',
+          'contact',
+          'document',
+          'record',
+          'invoice',
+          'payment'
+        ]) as provider_id_prefix(label)
+        where provider_id_prefix.label = any(label_tokens)
+      )
+    ) or (
+      exists (
+        select 1
+        from unnest(array['provider', 'source']) as reference_owner(label)
+        where reference_owner.label = any(label_tokens)
+      )
+      and exists (
+        select 1
+        from unnest(array['record', 'document']) as reference_object(label)
+        where reference_object.label = any(label_tokens)
+      )
+    ) then 'provider_reference'
     else null
   end
   from normalized;
@@ -302,7 +302,7 @@ as $function$
       select 1
       from regexp_matches(
         value,
-        '(^|[^[:alnum:]_-])([[:alnum:]_-]+(?:[[:space:]]+[[:alnum:]_-]+){0,7})[[:space:]]*[:=][[:space:]]*(.+)',
+        '(^|[^[:alnum:]_-])([^[:space:]:=]+(?:[[:space:]]+[^[:space:]:=]+){0,7})[[:space:]]*[:=][[:space:]]*(.+)',
         'g'
       ) as labelled_token_assignment(parts)
       where public.validation_label_assignment_has_forbidden_value(
