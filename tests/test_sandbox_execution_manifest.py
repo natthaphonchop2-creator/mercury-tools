@@ -34,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FLOWACCOUNT_ACTIONS = ROOT / "catalog/global/flowaccount/actions.json"
 FLOWACCOUNT_MANIFEST = ROOT / "catalog/global/flowaccount/sandbox-execution-manifest.json"
 BUILD_SCRIPT = ROOT / "scripts/build_sandbox_manifest.py"
+OUTPUT_UNSAFE = "sandbox_manifest_output_unsafe"
 
 
 @pytest.fixture(scope="module")
@@ -466,7 +467,56 @@ def test_writer_requires_an_existing_output_parent(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(os.name != "posix", reason="dir_fd checks require POSIX")
-def test_writer_rechecks_parent_binding_before_atomic_replace(
+@pytest.mark.parametrize(
+    "missing_capability",
+    [
+        "O_NOFOLLOW",
+        "O_DIRECTORY",
+        "open_dir_fd",
+        "stat_dir_fd",
+        "unlink_dir_fd",
+        "rename_dir_fd",
+        "stat_nofollow",
+    ],
+)
+def test_writer_fails_closed_before_output_when_atomic_capability_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_capability: str,
+) -> None:
+    output = tmp_path / "sandbox-execution-manifest.json"
+    original = b"existing manifest"
+    output.write_bytes(original)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    if missing_capability in {"O_NOFOLLOW", "O_DIRECTORY"}:
+        monkeypatch.delattr(manifest_module.os, missing_capability)
+    elif missing_capability == "stat_nofollow":
+        monkeypatch.setattr(
+            manifest_module.os,
+            "supports_follow_symlinks",
+            manifest_module.os.supports_follow_symlinks - {manifest_module.os.stat},
+        )
+    else:
+        function_name = missing_capability.removesuffix("_dir_fd")
+        monkeypatch.setattr(
+            manifest_module.os,
+            "supports_dir_fd",
+            manifest_module.os.supports_dir_fd - {getattr(manifest_module.os, function_name)},
+        )
+
+    with pytest.raises(ValueError) as raised:
+        write_sandbox_execution_manifest(FLOWACCOUNT_ACTIONS, output)
+
+    assert raised.value.args == (OUTPUT_UNSAFE,)
+    assert output.read_bytes() == original
+    assert not list(tmp_path.glob(".sandbox-execution-manifest-*.tmp"))
+    assert not list(outside.iterdir())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="dir_fd checks require POSIX")
+def test_missing_atomic_capability_prevents_parent_swap_and_all_output_io(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -476,6 +526,54 @@ def test_writer_rechecks_parent_binding_before_atomic_replace(
     outside = tmp_path / "outside"
     outside.mkdir()
     output = parent / "sandbox-execution-manifest.json"
+    original = b"existing manifest"
+    output.write_bytes(original)
+    real_open = manifest_module.os.open
+    swapped = False
+
+    monkeypatch.setattr(
+        manifest_module.os,
+        "supports_dir_fd",
+        manifest_module.os.supports_dir_fd - {manifest_module.os.rename},
+    )
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        name = Path(os.fsdecode(path)).name
+        if not swapped and name.startswith(".sandbox-execution-manifest-"):
+            parent.rename(moved_parent)
+            parent.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(manifest_module.os, "open", racing_open)
+
+    with pytest.raises(ValueError) as raised:
+        write_sandbox_execution_manifest(FLOWACCOUNT_ACTIONS, output)
+
+    assert raised.value.args == (OUTPUT_UNSAFE,)
+    assert not swapped
+    assert output.read_bytes() == original
+    assert not moved_parent.exists()
+    assert not list(parent.glob(".sandbox-execution-manifest-*.tmp"))
+    assert not list(outside.iterdir())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="dir_fd checks require POSIX")
+def test_writer_rechecks_parent_binding_before_atomic_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    moved_parent = tmp_path / "moved-parent"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    output = parent / "sandbox-execution-manifest.json"
+    original = b"existing manifest"
+    output.write_bytes(original)
     real_open = manifest_module.os.open
     swapped = False
 
@@ -497,7 +595,9 @@ def test_writer_rechecks_parent_binding_before_atomic_replace(
 
     assert swapped
     assert not (outside / output.name).exists()
-    assert not (moved_parent / output.name).exists()
+    assert (moved_parent / output.name).read_bytes() == original
+    assert not list(moved_parent.glob(".sandbox-execution-manifest-*.tmp"))
+    assert not list(outside.iterdir())
 
 
 @pytest.mark.skipif(os.name != "posix", reason="symlink checks require POSIX")
@@ -516,7 +616,7 @@ def test_writer_rejects_symlinked_destination_without_touching_target(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="dir_fd checks require POSIX")
-def test_destination_swap_cannot_redirect_atomic_replace(
+def test_destination_swap_cannot_redirect_atomic_rename(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -524,20 +624,21 @@ def test_destination_swap_cannot_redirect_atomic_replace(
     target.write_text("external sentinel", encoding="utf-8")
     output = tmp_path / "sandbox-execution-manifest.json"
     output.write_text("old manifest", encoding="utf-8")
-    real_replace = manifest_module.os.replace
+    real_rename = manifest_module.os.rename
 
-    def racing_replace(source, destination, *args, **kwargs):
+    def racing_rename(source, destination, *args, **kwargs):
         output.unlink()
         output.symlink_to(target)
-        return real_replace(source, destination, *args, **kwargs)
+        return real_rename(source, destination, *args, **kwargs)
 
-    monkeypatch.setattr(manifest_module.os, "replace", racing_replace)
+    monkeypatch.setattr(manifest_module.os, "rename", racing_rename)
 
     write_sandbox_execution_manifest(FLOWACCOUNT_ACTIONS, output)
 
     assert target.read_text(encoding="utf-8") == "external sentinel"
     assert output.is_file()
     assert not output.is_symlink()
+    assert not list(tmp_path.glob(".sandbox-execution-manifest-*.tmp"))
 
 
 def test_generator_is_import_safe_helpful_and_byte_deterministic(tmp_path: Path, actions) -> None:

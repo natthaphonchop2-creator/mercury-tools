@@ -8,7 +8,6 @@ import os
 import re
 import secrets
 import stat
-import tempfile
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
@@ -34,6 +33,10 @@ FLOWACCOUNT_METHOD_COUNTS: dict[HttpMethod, int] = {
     HttpMethod.DELETE: 13,
 }
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+SANDBOX_MANIFEST_OUTPUT_UNSAFE = "sandbox_manifest_output_unsafe"
+
+_ATOMIC_OUTPUT_DIR_FD_FUNCTIONS = (os.open, os.stat, os.unlink, os.rename)
+_ATOMIC_OUTPUT_NOFOLLOW_FUNCTION = os.stat
 
 LIVE_READS = frozenset(
     {
@@ -475,11 +478,21 @@ def _read_regular_file(path: Path, *, error: str) -> bytes:
 
 
 def _atomic_write_regular_file(path: Path, data: bytes) -> None:
-    candidate = Path(path)
-    if os.name == "posix" and hasattr(os, "O_NOFOLLOW"):
-        _atomic_write_regular_file_posix(candidate, data)
-        return
-    _atomic_write_regular_file_fallback(candidate, data)
+    _require_atomic_output_capabilities()
+    _atomic_write_regular_file_posix(Path(path), data)
+
+
+def _require_atomic_output_capabilities() -> None:
+    supports_dir_fd = getattr(os, "supports_dir_fd", ())
+    supports_follow_symlinks = getattr(os, "supports_follow_symlinks", ())
+    if (
+        os.name != "posix"
+        or not getattr(os, "O_NOFOLLOW", 0)
+        or not getattr(os, "O_DIRECTORY", 0)
+        or any(function not in supports_dir_fd for function in _ATOMIC_OUTPUT_DIR_FD_FUNCTIONS)
+        or _ATOMIC_OUTPUT_NOFOLLOW_FUNCTION not in supports_follow_symlinks
+    ):
+        raise ValueError(SANDBOX_MANIFEST_OUTPUT_UNSAFE)
 
 
 def _atomic_write_regular_file_posix(candidate: Path, data: bytes) -> None:
@@ -495,7 +508,7 @@ def _atomic_write_regular_file_posix(candidate: Path, data: bytes) -> None:
         temporary_descriptor = None
         _verify_output_parent_binding(candidate, parent_descriptor)
         _validate_output_destination(parent_descriptor, candidate.name)
-        os.replace(
+        os.rename(
             temporary_name,
             candidate.name,
             src_dir_fd=parent_descriptor,
@@ -506,7 +519,7 @@ def _atomic_write_regular_file_posix(candidate: Path, data: bytes) -> None:
     except ValueError:
         raise
     except OSError:
-        raise ValueError("sandbox_manifest_output_unsafe") from None
+        raise ValueError(SANDBOX_MANIFEST_OUTPUT_UNSAFE) from None
     finally:
         if temporary_descriptor is not None:
             _close_quietly(temporary_descriptor)
@@ -529,12 +542,12 @@ def _open_output_parent(candidate: Path) -> int:
             opened = os.fstat(next_descriptor)
             if not stat.S_ISDIR(opened.st_mode):
                 os.close(next_descriptor)
-                raise ValueError("sandbox_manifest_output_unsafe")
+                raise ValueError(SANDBOX_MANIFEST_OUTPUT_UNSAFE)
             os.close(descriptor)
             descriptor = next_descriptor
         opened = os.fstat(descriptor)
         if not stat.S_ISDIR(opened.st_mode):
-            raise ValueError("sandbox_manifest_output_unsafe")
+            raise ValueError(SANDBOX_MANIFEST_OUTPUT_UNSAFE)
         return descriptor
     except ValueError:
         if "descriptor" in locals():
@@ -543,13 +556,13 @@ def _open_output_parent(candidate: Path) -> int:
     except OSError:
         if "descriptor" in locals():
             _close_quietly(descriptor)
-        raise ValueError("sandbox_manifest_output_unsafe") from None
+        raise ValueError(SANDBOX_MANIFEST_OUTPUT_UNSAFE) from None
 
 
 def _output_path_parts(candidate: Path) -> tuple[str, tuple[str, ...], str]:
     parts = candidate.parts
     if not parts or candidate.name in {"", ".", ".."}:
-        raise ValueError("sandbox_manifest_output_unsafe")
+        raise ValueError(SANDBOX_MANIFEST_OUTPUT_UNSAFE)
     if candidate.is_absolute():
         start = candidate.anchor
         parent_parts = parts[1:-1]
@@ -557,7 +570,7 @@ def _output_path_parts(candidate: Path) -> tuple[str, tuple[str, ...], str]:
         start = "."
         parent_parts = parts[:-1]
     if not start or any(part in {"", ".", ".."} for part in parent_parts):
-        raise ValueError("sandbox_manifest_output_unsafe")
+        raise ValueError(SANDBOX_MANIFEST_OUTPUT_UNSAFE)
     return start, tuple(parent_parts), candidate.name
 
 
@@ -567,7 +580,7 @@ def _verify_output_parent_binding(candidate: Path, expected_descriptor: int) -> 
         expected = os.fstat(expected_descriptor)
         actual = os.fstat(actual_descriptor)
         if (expected.st_dev, expected.st_ino) != (actual.st_dev, actual.st_ino):
-            raise ValueError("sandbox_manifest_output_unsafe")
+            raise ValueError(SANDBOX_MANIFEST_OUTPUT_UNSAFE)
     finally:
         _close_quietly(actual_descriptor)
 
@@ -578,9 +591,9 @@ def _validate_output_destination(parent_descriptor: int, name: str) -> None:
     except FileNotFoundError:
         return
     except OSError:
-        raise ValueError("sandbox_manifest_output_unsafe") from None
+        raise ValueError(SANDBOX_MANIFEST_OUTPUT_UNSAFE) from None
     if not stat.S_ISREG(destination.st_mode):
-        raise ValueError("sandbox_manifest_output_unsafe")
+        raise ValueError(SANDBOX_MANIFEST_OUTPUT_UNSAFE)
 
 
 def _create_output_temporary(parent_descriptor: int) -> tuple[int, str]:
@@ -592,13 +605,13 @@ def _create_output_temporary(parent_descriptor: int) -> tuple[int, str]:
         except FileExistsError:
             continue
         except OSError:
-            raise ValueError("sandbox_manifest_output_unsafe") from None
+            raise ValueError(SANDBOX_MANIFEST_OUTPUT_UNSAFE) from None
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
             os.close(descriptor)
-            raise ValueError("sandbox_manifest_output_unsafe")
+            raise ValueError(SANDBOX_MANIFEST_OUTPUT_UNSAFE)
         return descriptor, name
-    raise ValueError("sandbox_manifest_output_unsafe")
+    raise ValueError(SANDBOX_MANIFEST_OUTPUT_UNSAFE)
 
 
 def _write_and_sync(descriptor: int, data: bytes) -> None:
@@ -606,7 +619,7 @@ def _write_and_sync(descriptor: int, data: bytes) -> None:
     while remaining:
         written = os.write(descriptor, remaining)
         if written <= 0:
-            raise ValueError("sandbox_manifest_output_unsafe")
+            raise ValueError(SANDBOX_MANIFEST_OUTPUT_UNSAFE)
         remaining = remaining[written:]
     os.fsync(descriptor)
 
@@ -614,54 +627,3 @@ def _write_and_sync(descriptor: int, data: bytes) -> None:
 def _close_quietly(descriptor: int) -> None:
     with suppress(OSError):
         os.close(descriptor)
-
-
-def _atomic_write_regular_file_fallback(candidate: Path, data: bytes) -> None:
-    _validate_fallback_output_path(candidate)
-    descriptor: int | None = None
-    temporary: Path | None = None
-    try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=".sandbox-execution-manifest-",
-            suffix=".tmp",
-            dir=candidate.parent,
-        )
-        temporary = Path(temporary_name)
-        _write_and_sync(descriptor, data)
-        os.close(descriptor)
-        descriptor = None
-        _validate_fallback_output_path(candidate)
-        os.replace(temporary, candidate)
-        temporary = None
-    except ValueError:
-        raise
-    except OSError:
-        raise ValueError("sandbox_manifest_output_unsafe") from None
-
-    finally:
-        if descriptor is not None:
-            _close_quietly(descriptor)
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-
-
-def _validate_fallback_output_path(candidate: Path) -> None:
-    start, parent_parts, name = _output_path_parts(candidate)
-    current = Path(start)
-    for part in parent_parts:
-        current /= part
-        try:
-            opened = os.lstat(current)
-        except OSError:
-            raise ValueError("sandbox_manifest_output_unsafe") from None
-        if stat.S_ISLNK(opened.st_mode) or not stat.S_ISDIR(opened.st_mode):
-            raise ValueError("sandbox_manifest_output_unsafe")
-    destination = current / name
-    try:
-        opened = os.lstat(destination)
-    except FileNotFoundError:
-        return
-    except OSError:
-        raise ValueError("sandbox_manifest_output_unsafe") from None
-    if stat.S_ISLNK(opened.st_mode) or not stat.S_ISREG(opened.st_mode):
-        raise ValueError("sandbox_manifest_output_unsafe")
