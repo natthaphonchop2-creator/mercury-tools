@@ -15,6 +15,27 @@ begin
 end;
 $migration$;
 
+create or replace function public.mercury_validation_test_guard_matches(
+  expected_marker text
+)
+returns boolean
+language sql
+stable
+parallel safe
+set search_path = pg_catalog, pg_temp
+as $function$
+  select coalesce(
+    expected_marker ~ '^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$'
+    and current_setting('app.mercury_validation_test_guard', true) = expected_marker,
+    false
+  );
+$function$;
+
+revoke all on function public.mercury_validation_test_guard_matches(text)
+  from public, anon, authenticated;
+grant execute on function public.mercury_validation_test_guard_matches(text)
+  to service_role;
+
 create or replace function public.jsonb_has_forbidden_validation_key(value jsonb)
 returns boolean
 language sql
@@ -148,7 +169,7 @@ as $function$
         '(^|[^a-z0-9])(password[ _-]+value|token[ _-]+value|secret[ _-]+value|credential[ _-]+value|api[ _-]+keys?|client[ _-]+secrets?|passwords?|tokens?|secrets?|credentials?)([[:space:]]*[:=][[:space:]]*|[[:space:]]+)([^[:space:]].*)',
         'g'
       ) as labelled_sensitive(parts)
-      where labelled_sensitive.parts[4] !~ '^((absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(are|is|remain|remains|was|were)[[:space:]]+(not[[:space:]]+)?(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(cannot|must|should)[[:space:]]+be[[:space:]]+(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown))[.]?$'
+      where labelled_sensitive.parts[4] !~ '^((absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(are[[:space:]]+not[[:space:]]+available[[:space:]]+for[[:space:]]+live[[:space:]]+validation)|(are|is|remain|remains|was|were)[[:space:]]+(not[[:space:]]+)?(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(cannot|must|should)[[:space:]]+be[[:space:]]+(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown))[.]?$'
     )
     or exists (
       select 1

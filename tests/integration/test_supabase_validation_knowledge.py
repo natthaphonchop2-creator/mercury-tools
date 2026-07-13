@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
@@ -12,10 +13,14 @@ from urllib.parse import urlparse
 import httpx
 import pytest
 
+from mercury_tools.qualification.templates import SUMMARY_EN, SUMMARY_TH
+
 pytestmark = pytest.mark.integration
 
 _OPT_IN = "MERCURY_SUPABASE_VALIDATION_TEST"
 _ISOLATED_OPT_IN = "MERCURY_SUPABASE_TEST_ISOLATED"
+_GUARD_MARKER_ENV = "MERCURY_SUPABASE_TEST_GUARD"
+_GUARD_RPC = "mercury_validation_test_guard_matches"
 _UNAVAILABLE_REASON = (
     "requires a disposable local or explicitly isolated Supabase environment with "
     "the Task 3 migration applied"
@@ -39,6 +44,8 @@ class _SupabaseTestEnvironment:
     service_headers: dict[str, str]
     anon_headers: dict[str, str]
     authenticated_headers: dict[str, str]
+    requires_server_guard: bool
+    guard_marker: str | None
 
 
 class _RejectCredentialReads(dict[str, str]):
@@ -79,6 +86,14 @@ def _test_environment() -> _SupabaseTestEnvironment:
             f"{_ISOLATED_OPT_IN}=1"
         )
 
+    guard_marker: str | None = None
+    if not is_loopback:
+        guard_marker = os.environ.get(_GUARD_MARKER_ENV, "").strip()
+        if not guard_marker:
+            raise ValueError("supabase_validation_test_guard_marker_required")
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{7,63}", guard_marker) is None:
+            raise ValueError("supabase_validation_test_guard_marker_invalid")
+
     missing = [name for name in _CREDENTIAL_ENV_NAMES if not os.environ.get(name)]
     if missing:
         missing_names = ", ".join(sorted(missing))
@@ -99,6 +114,8 @@ def _test_environment() -> _SupabaseTestEnvironment:
             "apikey": anon_key,
             "Authorization": f"Bearer {authenticated_jwt}",
         },
+        requires_server_guard=not is_loopback,
+        guard_marker=guard_marker,
     )
 
 
@@ -109,6 +126,36 @@ def _assert_status(response: httpx.Response, expected: int | set[int]) -> None:
     )
 
 
+def _require_server_guard(
+    client: httpx.Client,
+    environment: _SupabaseTestEnvironment,
+) -> None:
+    if not environment.requires_server_guard:
+        return
+    if environment.guard_marker is None:
+        raise RuntimeError("supabase_validation_test_guard_configuration_invalid")
+
+    response = client.post(
+        f"{environment.rest_url}/rpc/{_GUARD_RPC}",
+        headers=environment.service_headers,
+        json={"expected_marker": environment.guard_marker},
+    )
+    _assert_status(response, 200)
+    if response.json() is not True:
+        raise RuntimeError("supabase_validation_test_guard_rejected")
+
+
+def _guarded_request(
+    client: httpx.Client,
+    environment: _SupabaseTestEnvironment,
+    method: str,
+    url: str,
+    **kwargs: object,
+) -> httpx.Response:
+    _require_server_guard(client, environment)
+    return client.request(method, url, **kwargs)
+
+
 def _post_rows(
     client: httpx.Client,
     environment: _SupabaseTestEnvironment,
@@ -117,7 +164,10 @@ def _post_rows(
     *,
     prefer: str = "return=minimal",
 ) -> httpx.Response:
-    return client.post(
+    return _guarded_request(
+        client,
+        environment,
+        "POST",
         f"{environment.rest_url}/{table}",
         headers={**environment.service_headers, "Prefer": prefer},
         json=rows,
@@ -151,6 +201,60 @@ def test_hosted_http_is_rejected_before_credentials_are_read(
         _test_environment()
 
 
+def test_hosted_https_requires_guard_marker_before_credentials_are_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guarded_environment = _RejectCredentialReads(
+        {
+            _OPT_IN: "1",
+            _ISOLATED_OPT_IN: "1",
+            "SUPABASE_URL": "https://db.example.invalid",
+        }
+    )
+    monkeypatch.setattr(os, "environ", guarded_environment)
+
+    with pytest.raises(
+        ValueError,
+        match="^supabase_validation_test_guard_marker_required$",
+    ):
+        _test_environment()
+
+
+def test_hosted_guard_failure_prevents_mutation_network_sequence() -> None:
+    requested_paths: list[str] = []
+
+    def reject_guard(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        if request.url.path.endswith(f"/rpc/{_GUARD_RPC}"):
+            return httpx.Response(200, json=False)
+        return httpx.Response(201, json={})
+
+    environment = _SupabaseTestEnvironment(
+        rest_url="https://isolated.example.invalid/rest/v1",
+        service_headers={"Authorization": "Bearer placeholder"},
+        anon_headers={},
+        authenticated_headers={},
+        requires_server_guard=True,
+        guard_marker="synthetic_guard_marker",
+    )
+    transport = httpx.MockTransport(reject_guard)
+    with (
+        httpx.Client(transport=transport, follow_redirects=False) as client,
+        pytest.raises(
+            RuntimeError,
+            match="^supabase_validation_test_guard_rejected$",
+        ),
+    ):
+        _post_rows(
+            client,
+            environment,
+            "erp_action_validation_knowledge",
+            {"synthetic": "row"},
+        )
+
+    assert requested_paths == [f"/rest/v1/rpc/{_GUARD_RPC}"]
+
+
 def test_loopback_http_remains_available(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(_OPT_IN, "1")
     monkeypatch.setenv(_ISOLATED_OPT_IN, "0")
@@ -171,7 +275,10 @@ def test_all_reviewed_semantic_contracts_pass_actual_sql_functions() -> None:
     checked = 0
     with httpx.Client(timeout=10.0, follow_redirects=False) as client:
         for contract in contracts:
-            response = client.post(
+            response = _guarded_request(
+                client,
+                environment,
+                "POST",
                 f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_value",
                 headers=environment.service_headers,
                 json={"value": contract},
@@ -179,7 +286,10 @@ def test_all_reviewed_semantic_contracts_pass_actual_sql_functions() -> None:
             _assert_status(response, 200)
             assert response.json() is False
 
-            response = client.post(
+            response = _guarded_request(
+                client,
+                environment,
+                "POST",
                 f"{environment.rest_url}/rpc/jsonb_is_safe_validation_semantic_contract",
                 headers=environment.service_headers,
                 json={"value": contract},
@@ -189,6 +299,30 @@ def test_all_reviewed_semantic_contracts_pass_actual_sql_functions() -> None:
             checked += 1
 
     assert checked == 254
+
+
+def test_all_controlled_summaries_pass_actual_sql_text_function() -> None:
+    environment = _test_environment()
+    summaries = (*SUMMARY_EN.values(), *SUMMARY_TH.values())
+
+    assert len(summaries) == 16
+    assert "Provider credentials are not available for live validation." in summaries
+    checked = 0
+    with httpx.Client(timeout=10.0, follow_redirects=False) as client:
+        for summary in summaries:
+            response = _guarded_request(
+                client,
+                environment,
+                "POST",
+                f"{environment.rest_url}/rpc/validation_text_has_forbidden_value",
+                headers=environment.service_headers,
+                json={"value": summary},
+            )
+            _assert_status(response, 200)
+            assert response.json() is False
+            checked += 1
+
+    assert checked == 16
 
 
 def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() -> None:
@@ -208,7 +342,10 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             "raw_payload",
             "source_path",
         ):
-            response = client.post(
+            response = _guarded_request(
+                client,
+                environment,
+                "POST",
                 f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_key",
                 headers=environment.service_headers,
                 json={"value": {"nested": [{unsafe_key: "synthetic_value"}]}},
@@ -225,11 +362,15 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             "client-secret = !value",
             'token: "synthetic candidate"',
             "secret = '#synthetic'",
+            "credentials are not available for live validation. !value",
             "provider record #" + "1234",
             "source document: '#" + "5678'",
         )
         for unsafe_value in unsafe_labelled_values:
-            response = client.post(
+            response = _guarded_request(
+                client,
+                environment,
+                "POST",
                 f"{environment.rest_url}/rpc/validation_text_has_forbidden_value",
                 headers=environment.service_headers,
                 json={"value": unsafe_value},
@@ -237,7 +378,10 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             _assert_status(response, 200)
             assert response.json() is True
 
-            response = client.post(
+            response = _guarded_request(
+                client,
+                environment,
+                "POST",
                 f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_value",
                 headers=environment.service_headers,
                 json={"value": {"allowed_metadata": unsafe_value}},
@@ -267,7 +411,10 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             {"note": '{"record":' + "9912}"},
         )
         for unsafe_value in unsafe_json_values:
-            response = client.post(
+            response = _guarded_request(
+                client,
+                environment,
+                "POST",
                 f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_value",
                 headers=environment.service_headers,
                 json={"value": {"allowed_metadata": unsafe_value}},
@@ -283,7 +430,10 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             "provider record identifier",
             "source document string",
         ):
-            response = client.post(
+            response = _guarded_request(
+                client,
+                environment,
+                "POST",
                 f"{environment.rest_url}/rpc/validation_text_has_forbidden_value",
                 headers=environment.service_headers,
                 json={"value": safe_value},
@@ -291,7 +441,10 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             _assert_status(response, 200)
             assert response.json() is False
 
-            response = client.post(
+            response = _guarded_request(
+                client,
+                environment,
+                "POST",
                 f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_value",
                 headers=environment.service_headers,
                 json={"value": {"allowed_metadata": safe_value}},
@@ -299,7 +452,10 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             _assert_status(response, 200)
             assert response.json() is False
 
-        response = client.post(
+        response = _guarded_request(
+            client,
+            environment,
+            "POST",
             f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_key",
             headers=environment.service_headers,
             json={
@@ -316,7 +472,10 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
         _assert_status(response, 200)
         assert response.json() is False
 
-        response = client.post(
+        response = _guarded_request(
+            client,
+            environment,
+            "POST",
             f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_value",
             headers=environment.service_headers,
             json={
@@ -463,7 +622,10 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
         _assert_status(response, 400)
 
         for role_headers in (environment.anon_headers, environment.authenticated_headers):
-            response = client.get(
+            response = _guarded_request(
+                client,
+                environment,
+                "GET",
                 f"{environment.rest_url}/erp_action_validation_knowledge",
                 headers=role_headers,
                 params={"select": "id", "limit": "1"},
@@ -472,7 +634,10 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
 
         mutation_url = f"{environment.rest_url}/erp_action_validation_knowledge"
         mutation_params = {"opaque_evidence_id": f"eq.{evidence_id}"}
-        response = client.patch(
+        response = _guarded_request(
+            client,
+            environment,
+            "PATCH",
             mutation_url,
             headers=environment.service_headers,
             params=mutation_params,
@@ -480,7 +645,10 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
         )
         _assert_status(response, 400)
         assert response.json().get("message") == "erp_validation_evidence_is_append_only"
-        response = client.delete(
+        response = _guarded_request(
+            client,
+            environment,
+            "DELETE",
             mutation_url,
             headers=environment.service_headers,
             params=mutation_params,
@@ -509,7 +677,10 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
 
         observation_url = f"{environment.rest_url}/erp_action_observations"
         observation_params = {"opaque_event_id": f"eq.{observation_id}"}
-        response = client.patch(
+        response = _guarded_request(
+            client,
+            environment,
+            "PATCH",
             observation_url,
             headers=environment.service_headers,
             params=observation_params,
@@ -517,7 +688,10 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
         )
         _assert_status(response, 400)
         assert response.json().get("message") == "erp_validation_evidence_is_append_only"
-        response = client.delete(
+        response = _guarded_request(
+            client,
+            environment,
+            "DELETE",
             observation_url,
             headers=environment.service_headers,
             params=observation_params,

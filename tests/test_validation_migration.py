@@ -2,6 +2,8 @@ import json
 import re
 from pathlib import Path
 
+from mercury_tools.qualification.templates import SUMMARY_EN, SUMMARY_TH
+
 MIGRATION = Path("supabase/migrations/20260713100000_erp_action_validation_knowledge.sql")
 SEMANTIC_CONTRACTS = (
     Path("catalog/global/flowaccount/semantic-contracts.json"),
@@ -27,8 +29,13 @@ SAFE_VALUE_STATE_PATTERN = (
 SAFE_REFERENCE_TERM_PATTERN = (
     f"{SAFE_VALUE_STATE_PATTERN}|field|id|identifier|key|number|schema|string"
 )
+SAFE_LIVE_VALIDATION_EXPLANATION_PATTERN = (
+    r"are[[:space:]]+not[[:space:]]+available[[:space:]]+"
+    r"for[[:space:]]+live[[:space:]]+validation"
+)
 SAFE_SENSITIVE_EXPLANATION_PATTERN = (
     rf"^(({SAFE_VALUE_STATE_PATTERN})|"
+    rf"({SAFE_LIVE_VALIDATION_EXPLANATION_PATTERN})|"
     rf"(are|is|remain|remains|was|were)[[:space:]]+"
     rf"(not[[:space:]]+)?({SAFE_VALUE_STATE_PATTERN})|"
     rf"(cannot|must|should)[[:space:]]+be[[:space:]]+"
@@ -178,6 +185,7 @@ def test_validation_migration_is_service_role_only_without_permissive_policies()
     assert "grant all on table public.erp_action_validation_knowledge to service_role" in compact
     assert "create policy" not in sql
     for function in (
+        "public.mercury_validation_test_guard_matches(text)",
         "public.jsonb_has_forbidden_validation_key(jsonb)",
         "public.validation_text_has_forbidden_value(text)",
         "public.jsonb_has_forbidden_validation_value(jsonb)",
@@ -188,6 +196,25 @@ def test_validation_migration_is_service_role_only_without_permissive_policies()
     ):
         assert f"revoke all on function {function} from public, anon, authenticated" in compact
         assert f"grant execute on function {function} to service_role" in compact
+
+
+def test_validation_migration_has_service_role_only_server_isolation_guard() -> None:
+    sql = _sql()
+    compact = _compact(sql)
+
+    assert (
+        "create or replace function public.mercury_validation_test_guard_matches( "
+        "expected_marker text )"
+    ) in compact
+    body = _function_body(sql, "mercury_validation_test_guard_matches")
+    body_compact = _compact(body)
+    assert "returns boolean language sql stable parallel safe" in body_compact
+    assert "set search_path = pg_catalog, pg_temp" in body_compact
+    assert "current_setting('app.mercury_validation_test_guard', true)" in body_compact
+    assert "expected_marker ~ '^[a-za-z0-9][a-za-z0-9_-]{7,63}$'" in body_compact
+    assert "coalesce(" in body_compact
+    assert "raise" not in body_compact
+    assert "format(" not in body_compact
 
 
 def test_validation_migration_recursively_rejects_normalized_sensitive_key_fragments() -> None:
@@ -325,6 +352,19 @@ def test_labelled_value_patterns_preserve_all_254_semantic_contracts() -> None:
             assert not _has_labelled_actual_value(value)
 
 
+def test_controlled_qualification_summaries_remain_text_safe() -> None:
+    summaries = (*SUMMARY_EN.values(), *SUMMARY_TH.values())
+
+    assert len(SUMMARY_EN) == 8
+    assert len(SUMMARY_TH) == 8
+    assert len(summaries) == 16
+    assert (
+        "Provider credentials are not available for live validation." in summaries
+    )
+    for summary in summaries:
+        assert not _has_labelled_actual_value(summary)
+
+
 def test_labelled_value_contract_covers_punctuation_quotes_and_separators() -> None:
     for safe_metadata in (
         "provider credentials are not available",
@@ -346,6 +386,7 @@ def test_labelled_value_contract_covers_punctuation_quotes_and_separators() -> N
         'token: "synthetic candidate"',
         "secret = '#synthetic'",
         'password: "redacted"',
+        "credentials are not available for live validation. !value",
         "provider record #" + "1234",
         "source document: '#" + "5678'",
         "provider record identifier #" + "1234",
