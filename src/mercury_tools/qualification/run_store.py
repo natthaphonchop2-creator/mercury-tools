@@ -147,10 +147,12 @@ class QualificationRunStore:
                     fixtures=(),
                 )
                 _write_state(self._root, self._run_id, run_fd, initial)
+                _validate_run_directory_binding(self._root, self._run_id, run_fd)
                 self._record = initial
             else:
                 if existing.run_id != self._run_id:
                     raise ValueError("qualification_state_invalid")
+                _validate_run_directory_binding(self._root, self._run_id, run_fd)
                 self._record = existing
         finally:
             os.close(run_fd)
@@ -266,6 +268,55 @@ class QualificationRunStore:
         if changed:
             self._replace(transition_at=now, fixtures=tuple(updated))
 
+    def quarantine_cleanup(self, handle: str, status: CleanupStatus) -> None:
+        checked_handle = validate_fixture_handle(handle)
+        try:
+            checked_status = CleanupStatus(status)
+        except (TypeError, ValueError):
+            raise ValueError("qualification_cleanup_status_invalid") from None
+        reasons = {
+            CleanupStatus.FAILED: "cleanup_failed",
+            CleanupStatus.OUTCOME_UNKNOWN: "outcome_unknown",
+        }
+        reason = reasons.get(checked_status)
+        if reason is None:
+            raise ValueError("qualification_cleanup_status_invalid")
+
+        target = next(
+            (fixture for fixture in self._record.fixtures if fixture.handle == checked_handle),
+            None,
+        )
+        if target is None:
+            raise ValueError("qualification_fixture_missing")
+        if self.state is QualificationRunState.COMPLETED:
+            raise ValueError("qualification_run_finalized")
+        if self.state is QualificationRunState.QUARANTINED:
+            if self.quarantine_reason == reason and target.cleanup_status is checked_status:
+                return
+            raise ValueError("qualification_run_quarantined")
+        if target.cleanup_status is not CleanupStatus.PENDING:
+            raise ValueError("qualification_cleanup_status_conflict")
+
+        now = self._timestamp()
+        updated = tuple(
+            fixture.model_copy(
+                update={
+                    "cleanup_status": checked_status,
+                    "cleanup_updated_at": now,
+                }
+            )
+            if fixture.handle == checked_handle
+            else fixture
+            for fixture in self._record.fixtures
+        )
+        self._replace(
+            transition_at=now,
+            fixtures=updated,
+            state=QualificationRunState.QUARANTINED,
+            publication_allowed=False,
+            quarantine_reason=reason,
+        )
+
     def quarantine(self, reason: str) -> None:
         if reason not in {"cleanup_failed", "outcome_unknown", "process_lost"}:
             raise ValueError("qualification_quarantine_reason_invalid")
@@ -306,9 +357,10 @@ class QualificationRunStore:
         run_fd = _open_run_directory(self._root, self._run_id)
         try:
             _write_state(self._root, self._run_id, run_fd, candidate)
+            _validate_run_directory_binding(self._root, self._run_id, run_fd)
+            self._record = candidate
         finally:
             os.close(run_fd)
-        self._record = candidate
 
     def _timestamp(self) -> datetime:
         try:
@@ -544,6 +596,7 @@ def _write_state(
         _validate_run_directory_binding(root, run_id, run_fd)
         temporary_name = ""
         os.fsync(run_fd)
+        _validate_run_directory_binding(root, run_id, run_fd)
     except ValueError:
         raise
     except OSError:

@@ -4,6 +4,7 @@ import asyncio
 import errno
 import json
 import os
+import stat
 import traceback
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -59,6 +60,18 @@ class MutableClock:
 
     def __call__(self) -> datetime:
         return self.value
+
+
+class SequenceClock:
+    def __init__(self, *values: datetime) -> None:
+        self.values = list(values)
+        self.calls = 0
+
+    def __call__(self) -> datetime:
+        self.calls += 1
+        if not self.values:
+            raise AssertionError("clock sequence exhausted")
+        return self.values.pop(0)
 
 
 def _registry() -> FixtureRegistry:
@@ -216,6 +229,81 @@ def test_unknown_cleanup_outcome_quarantines_and_is_never_retried(
     assert store.cleanup_status(INVOICE_HANDLE) is CleanupStatus.OUTCOME_UNKNOWN
     assert store.cleanup_status(CONTACT_HANDLE) is CleanupStatus.PENDING
     assert _state_payload(tmp_path)["quarantine_reason"] == "outcome_unknown"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_status", "reason"),
+    [
+        (CleanupOutcome.FAILED, CleanupStatus.FAILED, "cleanup_failed"),
+        (
+            CleanupOutcome.OUTCOME_UNKNOWN,
+            CleanupStatus.OUTCOME_UNKNOWN,
+            "outcome_unknown",
+        ),
+    ],
+)
+def test_terminal_cleanup_and_quarantine_use_one_atomic_transition(
+    tmp_path: Path,
+    outcome: CleanupOutcome,
+    expected_status: CleanupStatus,
+    reason: str,
+) -> None:
+    created_at = datetime(2026, 7, 14, 0, 0, tzinfo=UTC)
+    registered_at = created_at + timedelta(seconds=1)
+    terminal_at = created_at + timedelta(seconds=3)
+    rollback_at = created_at + timedelta(seconds=2)
+    clock = SequenceClock(created_at, registered_at, terminal_at, rollback_at)
+    registry = _registry()
+    store = QualificationRunStore(tmp_path, RUN_ID, clock=clock)
+    adapter = RecordingCleanupAdapter(outcomes={INVOICE_HANDLE: outcome})
+    coordinator = CleanupCoordinator(registry, adapter, store)
+
+    report = asyncio.run(coordinator.cleanup())
+    same_coordinator_retry = asyncio.run(coordinator.cleanup())
+    retry_adapter = RecordingCleanupAdapter()
+    new_coordinator_retry = asyncio.run(
+        CleanupCoordinator(registry, retry_adapter, store).cleanup()
+    )
+
+    assert report.run_state is QualificationRunState.QUARANTINED
+    assert report.publication_allowed is False
+    assert store.cleanup_status(INVOICE_HANDLE) is expected_status
+    assert store.cleanup_status(CONTACT_HANDLE) is CleanupStatus.PENDING
+    assert store.quarantine_reason == reason
+    persisted = _state_payload(tmp_path)
+    persisted_fixtures = {fixture["handle"]: fixture for fixture in persisted["fixtures"]}
+    assert persisted["state"] == "quarantined"
+    assert persisted["publication_allowed"] is False
+    assert persisted["quarantine_reason"] == reason
+    assert persisted_fixtures[INVOICE_HANDLE]["cleanup_status"] == expected_status
+    assert persisted_fixtures[CONTACT_HANDLE]["cleanup_status"] == "pending"
+    assert [call[0] for call in adapter.calls] == [INVOICE_HANDLE]
+    assert same_coordinator_retry.attempted_handles == ()
+    assert new_coordinator_retry.attempted_handles == ()
+    assert retry_adapter.calls == []
+    assert clock.calls == 3
+
+
+def test_terminal_transition_error_stops_before_prerequisite_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _registry()
+    store = QualificationRunStore(tmp_path, RUN_ID)
+    adapter = RecordingCleanupAdapter(outcomes={INVOICE_HANDLE: CleanupOutcome.OUTCOME_UNKNOWN})
+
+    def fail_terminal_transition(handle: str, status: CleanupStatus) -> None:
+        raise ValueError("qualification_state_write_failed")
+
+    monkeypatch.setattr(store, "quarantine_cleanup", fail_terminal_transition)
+
+    with pytest.raises(ValueError, match="^qualification_state_write_failed$"):
+        asyncio.run(CleanupCoordinator(registry, adapter, store).cleanup())
+
+    assert [call[0] for call in adapter.calls] == [INVOICE_HANDLE]
+    assert store.cleanup_status(INVOICE_HANDLE) is CleanupStatus.PENDING
+    assert store.cleanup_status(CONTACT_HANDLE) is CleanupStatus.PENDING
+    assert store.publication_allowed is False
 
 
 def test_explicit_unknown_mutation_quarantines_without_cleanup_dispatch(
@@ -397,6 +485,43 @@ def test_run_directory_swap_before_rename_fails_closed_without_touching_outside(
     assert store.state is QualificationRunState.FAILED
     assert store.publication_allowed is False
     assert sentinel.read_text(encoding="utf-8") == "outside sentinel"
+    assert not tuple(moved_run_dir.glob(".state-*.tmp"))
+    assert tuple(outside.iterdir()) == (sentinel,)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="dir_fd checks require POSIX")
+def test_run_directory_swap_during_final_fsync_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = QualificationRunStore(tmp_path, RUN_ID)
+    run_dir = tmp_path / ".mercury" / "validation" / RUN_ID
+    moved_run_dir = tmp_path / "moved-during-fsync"
+    outside = tmp_path / "outside-fsync"
+    outside.mkdir()
+    sentinel = outside / "state.json"
+    sentinel.write_text("outside fsync sentinel", encoding="utf-8")
+    real_fsync = run_store_module.os.fsync
+    real_rename = run_store_module.os.rename
+    swapped = False
+
+    def racing_fsync(descriptor: int) -> None:
+        nonlocal swapped
+        if not swapped and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            real_rename(run_dir, moved_run_dir)
+            run_dir.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(run_store_module.os, "fsync", racing_fsync)
+
+    with pytest.raises(ValueError, match="^qualification_state_path_unsafe$"):
+        store.complete()
+
+    assert swapped is True
+    assert store.state is QualificationRunState.FAILED
+    assert store.publication_allowed is False
+    assert sentinel.read_text(encoding="utf-8") == "outside fsync sentinel"
     assert not tuple(moved_run_dir.glob(".state-*.tmp"))
     assert tuple(outside.iterdir()) == (sentinel,)
 

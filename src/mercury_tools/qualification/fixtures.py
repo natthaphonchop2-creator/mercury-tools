@@ -235,16 +235,14 @@ class CleanupCoordinator:
                 self.run_store.mark_cleanup(fixture.handle, CleanupStatus.CLEANED)
                 cleaned.append(fixture.handle)
             elif outcome is CleanupOutcome.FAILED:
-                self.run_store.mark_cleanup(fixture.handle, CleanupStatus.FAILED)
-                self.run_store.quarantine("cleanup_failed")
+                self.run_store.quarantine_cleanup(fixture.handle, CleanupStatus.FAILED)
                 failed.append(fixture.handle)
                 break
             else:
-                self.run_store.mark_cleanup(
+                self.run_store.quarantine_cleanup(
                     fixture.handle,
                     CleanupStatus.OUTCOME_UNKNOWN,
                 )
-                self.run_store.quarantine("outcome_unknown")
                 outcome_unknown.append(fixture.handle)
                 break
 
