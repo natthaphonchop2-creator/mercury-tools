@@ -13,6 +13,7 @@ import pytest
 from mercury_tools.catalog.importers.service import import_spec
 from mercury_tools.catalog.models import CatalogAction, RiskTier
 from mercury_tools.drivers.base import ConnectorAuthError
+from mercury_tools.drivers.flowaccount import FlowAccountDriver
 from mercury_tools.drivers.models import AuthContext, ConnectorResult, CredentialField
 from mercury_tools.drivers.registry import DriverRegistry
 from mercury_tools.execution.executor import ERPExecutor, ExecutionPolicyError
@@ -22,7 +23,16 @@ from mercury_tools.execution.request_builder import RequestBuildError, build_req
 from mercury_tools.execution.store import LocalRequestStore, RequestStateError
 from mercury_tools.local.audit import AuditLedger
 from mercury_tools.local.repository import RepositoryConfig, RepositoryContext
+from mercury_tools.qualification.manifest import (
+    LIVE_READS,
+    load_sandbox_execution_manifest,
+)
+from mercury_tools.qualification.semantics import load_actions
 from mercury_tools.safety.network import NetworkPolicy
+
+ROOT = Path(__file__).resolve().parents[1]
+FLOWACCOUNT_ACTIONS = ROOT / "catalog/global/flowaccount/actions.json"
+FLOWACCOUNT_MANIFEST = ROOT / "catalog/global/flowaccount/sandbox-execution-manifest.json"
 
 
 class MutableCatalog:
@@ -67,6 +77,25 @@ class CredentialStoreSpy:
         assert environment == "production"
         assert fields == self.fields
         return dict(self.values)
+
+
+class SandboxCredentialStoreSpy:
+    def __init__(self) -> None:
+        self.load_calls = 0
+        self.loaded: dict[str, str] | None = None
+
+    def load(
+        self,
+        connector_id: str,
+        environment: str,
+        fields: tuple[CredentialField, ...],
+    ) -> dict[str, str]:
+        self.load_calls += 1
+        assert connector_id == "flowaccount"
+        assert environment == "sandbox"
+        assert tuple(field.name for field in fields) == ("client_id", "client_secret")
+        self.loaded = {"client_id": "client-id", "client_secret": "client-secret"}
+        return self.loaded
 
 
 class FakeDriver:
@@ -1327,6 +1356,96 @@ async def test_run_read_sends_one_cataloged_request_with_ephemeral_auth(
         "https://erp.example.com/v1/invoices/INV-42?include=items"
     )
     assert requests[0].headers["authorization"] == "Bearer top-secret-token"
+
+
+def flowaccount_sandbox_executor(
+    repository_context: RepositoryContext,
+    action: CatalogAction,
+    credentials: SandboxCredentialStoreSpy,
+) -> ERPExecutor:
+    registry = DriverRegistry()
+    registry.register(FlowAccountDriver())
+    return ERPExecutor(
+        context=repository_context,
+        repository_config=RepositoryConfig(),
+        catalog=MutableCatalog((action,)),
+        drivers=registry,
+        credentials=credentials,
+        request_store=LocalRequestStore(repository_context),
+        audit_ledger=AuditLedger(repository_context.audit_dir / "audit.jsonl"),
+        network=NetworkPolicy(),
+        roots=(repository_context.root,),
+    )
+
+
+@pytest.mark.asyncio
+async def test_flowaccount_sandbox_read_qualifies_and_authorizes_before_dispatch(
+    repository_context: RepositoryContext,
+) -> None:
+    actions = load_actions(FLOWACCOUNT_ACTIONS)
+    action = next(
+        item
+        for item in actions
+        if (item.action_id, item.version_id) in LIVE_READS and item.path_template == "/company/info"
+    )
+    manifest = load_sandbox_execution_manifest(FLOWACCOUNT_MANIFEST, FLOWACCOUNT_ACTIONS)
+    credentials = SandboxCredentialStoreSpy()
+    executor = flowaccount_sandbox_executor(repository_context, action, credentials)
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path == "/test/token":
+            return response(request, payload={"access_token": "sandbox-token"})
+        if len(calls) == 2:
+            return response(request, payload={"companyName": "Example Books"})
+        return response(request, payload={"status": True, "companyName": "Example Books"})
+
+    result = await executor.run_flowaccount_sandbox_read(
+        repository=repository_context,
+        action=action,
+        inputs={},
+        manifest=manifest,
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result.status == "succeeded"
+    assert result.dispatched is True
+    assert calls == ["/test/token", "/test/company/info", "/test/company/info"]
+    assert credentials.load_calls == 1
+    assert credentials.loaded == {}
+
+
+@pytest.mark.asyncio
+async def test_flowaccount_tampered_sandbox_origin_rejects_repository_credentials_and_network(
+    repository_context: RepositoryContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actions = load_actions(FLOWACCOUNT_ACTIONS)
+    action = next(item for item in actions if (item.action_id, item.version_id) in LIVE_READS)
+    manifest = load_sandbox_execution_manifest(FLOWACCOUNT_MANIFEST, FLOWACCOUNT_ACTIONS)
+    credentials = SandboxCredentialStoreSpy()
+    executor = flowaccount_sandbox_executor(repository_context, action, credentials)
+    calls: list[str] = []
+    monkeypatch.setitem(
+        FlowAccountDriver.BASE_URLS,
+        "sandbox",
+        "https://openapi.flowaccount.com/v1",
+    )
+
+    with pytest.raises(ValueError, match="^flowaccount_sandbox_origin_invalid$"):
+        await executor.run_flowaccount_sandbox_read(
+            repository=repository_context,
+            action=action,
+            inputs={},
+            manifest=manifest,
+            transport=httpx.MockTransport(
+                lambda request: calls.append(str(request.url)) or response(request)
+            ),
+        )
+
+    assert credentials.load_calls == 0
+    assert calls == []
 
 
 async def confirmed_request(

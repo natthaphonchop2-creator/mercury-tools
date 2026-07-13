@@ -13,7 +13,8 @@ import httpx
 
 from mercury_tools.catalog.models import CatalogAction, HttpMethod, revalidate_catalog_action
 from mercury_tools.drivers.base import ConnectorAuthError, ConnectorDriver
-from mercury_tools.drivers.models import ConnectorResult
+from mercury_tools.drivers.flowaccount import FlowAccountDriver
+from mercury_tools.drivers.models import AuthContext, ConnectorResult
 from mercury_tools.drivers.registry import DriverRegistry
 from mercury_tools.execution.models import PreparedRequest, RequestState
 from mercury_tools.execution.policy import effective_risk
@@ -27,6 +28,15 @@ from mercury_tools.execution.store import LocalRequestStore, RequestStateError
 from mercury_tools.local.audit import AuditLedger
 from mercury_tools.local.credentials import CredentialStore
 from mercury_tools.local.repository import RepositoryConfig, RepositoryContext
+from mercury_tools.qualification.manifest import (
+    SandboxActionPolicy,
+    SandboxExecutionManifest,
+)
+from mercury_tools.qualification.network import (
+    SandboxOrigins,
+    SandboxTenantBinding,
+    execute_flowaccount_sandbox_action,
+)
 from mercury_tools.safety.network import NetworkPolicy, NetworkPolicyError, ResolvedTarget
 
 
@@ -135,6 +145,86 @@ class ERPExecutor:
             latency_ms=_latency_ms(started),
         )
         return result
+
+    async def run_flowaccount_sandbox_read(
+        self,
+        *,
+        repository: RepositoryContext,
+        action: CatalogAction,
+        inputs: Mapping[str, Any],
+        manifest: SandboxExecutionManifest,
+        expected_tenant: SandboxTenantBinding | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> ConnectorResult:
+        """Qualify one exact FlowAccount sandbox tenant before one reviewed read."""
+        if action.connector_id != "flowaccount":
+            raise ExecutionPolicyError("flowaccount_sandbox_connector_invalid")
+        driver = self.drivers.get(action.connector_id)
+        if not isinstance(driver, FlowAccountDriver):
+            raise ExecutionPolicyError("flowaccount_sandbox_driver_invalid")
+
+        def load_credentials() -> dict[str, str]:
+            fields = driver.credential_fields("sandbox")
+            return self.credentials.load("flowaccount", "sandbox", fields)
+
+        async def request_hook(
+            *,
+            client: httpx.AsyncClient,
+            auth: AuthContext,
+            binding: SandboxTenantBinding,
+            origins: SandboxOrigins,
+            policy: SandboxActionPolicy,
+        ) -> ConnectorResult:
+            del binding, policy
+            started = time.monotonic()
+            dispatched = False
+            try:
+                active = self._require_active_action(action)
+                if repository != self.context:
+                    raise ExecutionPolicyError("repository_mismatch")
+                if active.method is not HttpMethod.GET:
+                    raise ExecutionPolicyError("sandbox_action_requires_safe_read")
+                template = build_request(
+                    active,
+                    origins.api_url,
+                    inputs,
+                    self.roots,
+                    repository_id=repository.repository_id,
+                    environment="sandbox",
+                )
+                request = template.to_httpx_request(auth)
+                response = await client.send(request)
+                dispatched = True
+                result = driver.interpret_response(
+                    action=active,
+                    response=response,
+                    dispatched=True,
+                )
+            except (RequestBuildError, NetworkPolicyError, httpx.TransportError):
+                result = _failed_result(dispatched=dispatched)
+            except Exception:
+                result = _failed_result(dispatched=dispatched)
+            self._audit_result(
+                action=action,
+                environment="sandbox",
+                event="completed",
+                state=result.status,
+                result=result,
+                latency_ms=_latency_ms(started),
+            )
+            return result
+
+        return await execute_flowaccount_sandbox_action(
+            driver=driver,
+            environment="sandbox",
+            load_credentials=load_credentials,
+            action=action,
+            manifest=manifest,
+            request_hook=request_hook,
+            expected_tenant=expected_tenant,
+            transport=transport,
+            network=self.network,
+        )
 
     async def preview_write(
         self,

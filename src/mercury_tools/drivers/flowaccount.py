@@ -17,6 +17,7 @@ from mercury_tools.drivers.models import (
     ConnectorResult,
     CredentialField,
 )
+from mercury_tools.qualification.network import validate_flowaccount_sandbox_origins
 from mercury_tools.safety.redaction import redact_credential_text
 
 
@@ -83,6 +84,48 @@ class FlowAccountDriver(_GenericDriver):
         except ConnectorAuthError as exc:
             return self._failed_probe(environment, {"error": str(exc)})
 
+        return await self._probe_company(
+            environment=environment,
+            credentials=credentials,
+            client=client,
+            auth=auth,
+            token_status=token_status,
+        )
+
+    async def prepare_sandbox_auth_and_probe(
+        self,
+        *,
+        environment: str,
+        credentials: Mapping[str, str],
+        client: httpx.AsyncClient,
+    ) -> tuple[AuthContext, ConnectionProbe]:
+        """Issue one sandbox token and retain it only for the qualified request hook."""
+        if environment != "sandbox":
+            raise ConnectorAuthError("flowaccount_sandbox_environment_invalid")
+        validate_flowaccount_sandbox_origins(self)
+        auth, token_status = await self._prepare_auth_with_status(
+            environment=environment,
+            credentials=credentials,
+            client=client,
+        )
+        probe = await self._probe_company(
+            environment=environment,
+            credentials=credentials,
+            client=client,
+            auth=auth,
+            token_status=token_status,
+        )
+        return auth, probe
+
+    async def _probe_company(
+        self,
+        *,
+        environment: str,
+        credentials: Mapping[str, str],
+        client: httpx.AsyncClient,
+        auth: AuthContext,
+        token_status: int,
+    ) -> ConnectionProbe:
         try:
             response = await client.get(
                 f"{self.resolve_base_url(environment)}/company/info",
