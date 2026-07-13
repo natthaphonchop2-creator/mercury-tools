@@ -5,10 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import secrets
 import stat
 import tempfile
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
@@ -22,7 +25,6 @@ from mercury_tools.catalog.models import (
     revalidate_catalog_action,
 )
 from mercury_tools.qualification.models import StrictSafeModel
-from mercury_tools.qualification.semantics import load_actions
 
 FLOWACCOUNT_ACTION_COUNT = 190
 FLOWACCOUNT_METHOD_COUNTS: dict[HttpMethod, int] = {
@@ -55,6 +57,9 @@ LIVE_READS = frozenset(
 )
 
 _BLOCKED_EFFECT_SEGMENTS = frozenset({"email", "share", "payment", "void", "invite"})
+_ACRONYM_BOUNDARY = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_ALPHABETIC_TOKEN = re.compile(r"[^\W\d_]+")
 
 
 class SandboxDisposition(StrEnum):
@@ -152,8 +157,16 @@ class SandboxExecutionManifest(StrictSafeModel):
 
     def require_executable(self, action: CatalogAction) -> SandboxActionPolicy:
         checked = _validated_action(action)
+        identity = (checked.action_id, checked.version_id)
+        if identity not in LIVE_READS:
+            raise PermissionError("sandbox_action_not_executable")
         policy = self.require_policy(checked.action_id, checked.version_id)
-        if policy.disposition is not SandboxDisposition.SANDBOX_EXECUTABLE:
+        expected = reviewed_policy_for(checked)
+        if (
+            policy.disposition is not SandboxDisposition.SANDBOX_EXECUTABLE
+            or expected.disposition is not SandboxDisposition.SANDBOX_EXECUTABLE
+            or policy != expected
+        ):
             raise PermissionError("sandbox_action_not_executable")
         return policy.validate_against(checked, environment=self.environment)
 
@@ -170,12 +183,12 @@ def classify_blocked_reasons(action: CatalogAction) -> tuple[str, ...]:
     checked = _validated_action(action)
     reasons: set[str] = set()
     capability_segments = tuple(segment.casefold() for segment in checked.capability.split("."))
-    effects = {effect.casefold() for effect in checked.side_effects}
+    semantic_tokens = _action_semantic_tokens(checked)
 
     if checked.method is HttpMethod.DELETE:
         reasons.add("delete")
     for effect in _BLOCKED_EFFECT_SEGMENTS:
-        if effect in capability_segments or effect in effects:
+        if effect in semantic_tokens:
             reasons.add(effect)
     if len(capability_segments) >= 2 and capability_segments[-2:] == ("attachment", "upload"):
         reasons.add("attachment_upload")
@@ -184,6 +197,23 @@ def classify_blocked_reasons(action: CatalogAction) -> tuple[str, ...]:
     if checked.method is not HttpMethod.GET and capability_segments[:1] == ("company",):
         reasons.add("company_mutation")
     return tuple(sorted(reasons))
+
+
+def _action_semantic_tokens(action: CatalogAction) -> frozenset[str]:
+    values = (
+        action.operation_id,
+        action.capability,
+        action.path_template,
+        *action.aliases_en,
+        *action.aliases_th,
+        *action.side_effects,
+    )
+    tokens: set[str] = set()
+    for value in values:
+        split_acronyms = _ACRONYM_BOUNDARY.sub(" ", value)
+        split_camel = _CAMEL_BOUNDARY.sub(" ", split_acronyms)
+        tokens.update(token.casefold() for token in _ALPHABETIC_TOKEN.findall(split_camel))
+    return frozenset(tokens)
 
 
 def reviewed_policy_for(action: CatalogAction) -> SandboxActionPolicy:
@@ -233,14 +263,14 @@ def sha256_file(path: Path) -> str:
 
 def build_sandbox_execution_manifest(catalog_path: Path) -> SandboxExecutionManifest:
     """Build the complete reviewed manifest from immutable FlowAccount actions."""
-    actions = _validated_flowaccount_actions(load_actions(catalog_path))
+    catalog_bytes, actions = _load_catalog_snapshot(catalog_path)
     policies = tuple(
         reviewed_policy_for(action)
         for action in sorted(actions, key=lambda item: (item.action_id, item.version_id))
     )
     return SandboxExecutionManifest(
         environment="sandbox",
-        catalog_sha256=sha256_file(catalog_path),
+        catalog_sha256=hashlib.sha256(catalog_bytes).hexdigest(),
         actions=policies,
     )
 
@@ -270,15 +300,9 @@ def write_sandbox_execution_manifest(
 
 def load_sandbox_execution_manifest(
     path: Path,
-    actions: Sequence[CatalogAction],
-    catalog_path: Path | None = None,
+    catalog_path: Path,
 ) -> SandboxExecutionManifest:
-    """Load a complete policy sidecar and bind it to explicit catalog bytes.
-
-    When ``catalog_path`` is omitted, the only inferred relationship is the
-    ``actions.json`` sibling of the supplied manifest path. Callers may pass a
-    catalog path explicitly to avoid that convenience relationship.
-    """
+    """Load a complete policy sidecar bound to one exact catalog snapshot."""
     manifest_path = Path(path)
     payload = _load_manifest_payload(manifest_path)
     try:
@@ -290,11 +314,8 @@ def load_sandbox_execution_manifest(
     except (TypeError, ValueError):
         raise ValueError("sandbox_manifest_invalid") from None
 
-    checked_actions = _validated_flowaccount_actions(actions)
-    resolved_catalog_path = (
-        Path(catalog_path) if catalog_path is not None else manifest_path.with_name("actions.json")
-    )
-    if manifest.catalog_sha256 != sha256_file(resolved_catalog_path):
+    catalog_bytes, checked_actions = _load_catalog_snapshot(catalog_path)
+    if manifest.catalog_sha256 != hashlib.sha256(catalog_bytes).hexdigest():
         raise ValueError("sandbox_manifest_catalog_mismatch")
 
     expected = {(action.action_id, action.version_id) for action in checked_actions}
@@ -323,6 +344,28 @@ def load_sandbox_execution_manifest(
         if policy != reviewed_policy_for(action):
             raise ValueError("sandbox_manifest_policy_review_mismatch")
     return manifest
+
+
+def _load_catalog_snapshot(path: Path) -> tuple[bytes, tuple[CatalogAction, ...]]:
+    data = _read_regular_file(path, error="sandbox_manifest_catalog_file_unsafe")
+    try:
+        payload = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_json_object)
+    except _DuplicateJsonKey:
+        raise ValueError("sandbox_manifest_catalog_json_duplicate_key") from None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("sandbox_manifest_catalog_invalid") from None
+    if not isinstance(payload, list):
+        raise ValueError("sandbox_manifest_catalog_invalid")
+
+    actions: list[CatalogAction] = []
+    for row in payload:
+        if not isinstance(row, Mapping):
+            raise ValueError("sandbox_manifest_catalog_invalid")
+        try:
+            actions.append(CatalogAction.model_validate(row))
+        except (TypeError, ValidationError, ValueError):
+            raise ValueError("sandbox_manifest_catalog_action_invalid") from None
+    return data, _validated_flowaccount_actions(actions)
 
 
 def _validated_flowaccount_actions(actions: Sequence[CatalogAction]) -> tuple[CatalogAction, ...]:
@@ -433,28 +476,192 @@ def _read_regular_file(path: Path, *, error: str) -> bytes:
 
 def _atomic_write_regular_file(path: Path, data: bytes) -> None:
     candidate = Path(path)
+    if os.name == "posix" and hasattr(os, "O_NOFOLLOW"):
+        _atomic_write_regular_file_posix(candidate, data)
+        return
+    _atomic_write_regular_file_fallback(candidate, data)
+
+
+def _atomic_write_regular_file_posix(candidate: Path, data: bytes) -> None:
+    parent_descriptor: int | None = None
+    temporary_descriptor: int | None = None
+    temporary_name: str | None = None
     try:
-        candidate.parent.mkdir(parents=True, exist_ok=True)
-        if candidate.is_symlink() or (candidate.exists() and not candidate.is_file()):
+        parent_descriptor = _open_output_parent(candidate)
+        _validate_output_destination(parent_descriptor, candidate.name)
+        temporary_descriptor, temporary_name = _create_output_temporary(parent_descriptor)
+        _write_and_sync(temporary_descriptor, data)
+        os.close(temporary_descriptor)
+        temporary_descriptor = None
+        _verify_output_parent_binding(candidate, parent_descriptor)
+        _validate_output_destination(parent_descriptor, candidate.name)
+        os.replace(
+            temporary_name,
+            candidate.name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        temporary_name = None
+        os.fsync(parent_descriptor)
+    except ValueError:
+        raise
+    except OSError:
+        raise ValueError("sandbox_manifest_output_unsafe") from None
+    finally:
+        if temporary_descriptor is not None:
+            _close_quietly(temporary_descriptor)
+        if temporary_name is not None and parent_descriptor is not None:
+            with suppress(OSError):
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+        if parent_descriptor is not None:
+            _close_quietly(parent_descriptor)
+
+
+def _open_output_parent(candidate: Path) -> int:
+    start, parent_parts, _name = _output_path_parts(candidate)
+    flags = (
+        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(start, flags)
+        for part in parent_parts:
+            next_descriptor = os.open(part, flags, dir_fd=descriptor)
+            opened = os.fstat(next_descriptor)
+            if not stat.S_ISDIR(opened.st_mode):
+                os.close(next_descriptor)
+                raise ValueError("sandbox_manifest_output_unsafe")
+            os.close(descriptor)
+            descriptor = next_descriptor
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode):
             raise ValueError("sandbox_manifest_output_unsafe")
+        return descriptor
+    except ValueError:
+        if "descriptor" in locals():
+            _close_quietly(descriptor)
+        raise
+    except OSError:
+        if "descriptor" in locals():
+            _close_quietly(descriptor)
+        raise ValueError("sandbox_manifest_output_unsafe") from None
+
+
+def _output_path_parts(candidate: Path) -> tuple[str, tuple[str, ...], str]:
+    parts = candidate.parts
+    if not parts or candidate.name in {"", ".", ".."}:
+        raise ValueError("sandbox_manifest_output_unsafe")
+    if candidate.is_absolute():
+        start = candidate.anchor
+        parent_parts = parts[1:-1]
+    else:
+        start = "."
+        parent_parts = parts[:-1]
+    if not start or any(part in {"", ".", ".."} for part in parent_parts):
+        raise ValueError("sandbox_manifest_output_unsafe")
+    return start, tuple(parent_parts), candidate.name
+
+
+def _verify_output_parent_binding(candidate: Path, expected_descriptor: int) -> None:
+    actual_descriptor = _open_output_parent(candidate)
+    try:
+        expected = os.fstat(expected_descriptor)
+        actual = os.fstat(actual_descriptor)
+        if (expected.st_dev, expected.st_ino) != (actual.st_dev, actual.st_ino):
+            raise ValueError("sandbox_manifest_output_unsafe")
+    finally:
+        _close_quietly(actual_descriptor)
+
+
+def _validate_output_destination(parent_descriptor: int, name: str) -> None:
+    try:
+        destination = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise ValueError("sandbox_manifest_output_unsafe") from None
+    if not stat.S_ISREG(destination.st_mode):
+        raise ValueError("sandbox_manifest_output_unsafe")
+
+
+def _create_output_temporary(parent_descriptor: int) -> tuple[int, str]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    for _attempt in range(16):
+        name = f".sandbox-execution-manifest-{secrets.token_hex(12)}.tmp"
+        try:
+            descriptor = os.open(name, flags, 0o600, dir_fd=parent_descriptor)
+        except FileExistsError:
+            continue
+        except OSError:
+            raise ValueError("sandbox_manifest_output_unsafe") from None
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            os.close(descriptor)
+            raise ValueError("sandbox_manifest_output_unsafe")
+        return descriptor, name
+    raise ValueError("sandbox_manifest_output_unsafe")
+
+
+def _write_and_sync(descriptor: int, data: bytes) -> None:
+    remaining = memoryview(data)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:
+            raise ValueError("sandbox_manifest_output_unsafe")
+        remaining = remaining[written:]
+    os.fsync(descriptor)
+
+
+def _close_quietly(descriptor: int) -> None:
+    with suppress(OSError):
+        os.close(descriptor)
+
+
+def _atomic_write_regular_file_fallback(candidate: Path, data: bytes) -> None:
+    _validate_fallback_output_path(candidate)
+    descriptor: int | None = None
+    temporary: Path | None = None
+    try:
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=".sandbox-execution-manifest-",
             suffix=".tmp",
             dir=candidate.parent,
         )
+        temporary = Path(temporary_name)
+        _write_and_sync(descriptor, data)
+        os.close(descriptor)
+        descriptor = None
+        _validate_fallback_output_path(candidate)
+        os.replace(temporary, candidate)
+        temporary = None
     except ValueError:
         raise
     except OSError:
         raise ValueError("sandbox_manifest_output_unsafe") from None
 
-    temporary = Path(temporary_name)
+    finally:
+        if descriptor is not None:
+            _close_quietly(descriptor)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _validate_fallback_output_path(candidate: Path) -> None:
+    start, parent_parts, name = _output_path_parts(candidate)
+    current = Path(start)
+    for part in parent_parts:
+        current /= part
+        try:
+            opened = os.lstat(current)
+        except OSError:
+            raise ValueError("sandbox_manifest_output_unsafe") from None
+        if stat.S_ISLNK(opened.st_mode) or not stat.S_ISDIR(opened.st_mode):
+            raise ValueError("sandbox_manifest_output_unsafe")
+    destination = current / name
     try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, candidate)
+        opened = os.lstat(destination)
+    except FileNotFoundError:
+        return
     except OSError:
         raise ValueError("sandbox_manifest_output_unsafe") from None
-    finally:
-        temporary.unlink(missing_ok=True)
+    if stat.S_ISLNK(opened.st_mode) or not stat.S_ISREG(opened.st_mode):
+        raise ValueError("sandbox_manifest_output_unsafe")

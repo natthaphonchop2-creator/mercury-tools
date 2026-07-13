@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from collections import Counter
@@ -12,15 +14,19 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from mercury_tools.catalog.models import HttpMethod, RiskTier
+from mercury_tools.catalog.identity import build_version_id
+from mercury_tools.catalog.models import CatalogAction, HttpMethod, RiskTier
+from mercury_tools.qualification import manifest as manifest_module
 from mercury_tools.qualification.manifest import (
     LIVE_READS,
     SandboxActionPolicy,
     SandboxDisposition,
+    SandboxExecutionManifest,
     classify_blocked_reasons,
     is_multipart_attachment_upload,
     load_sandbox_execution_manifest,
     reviewed_policy_for,
+    write_sandbox_execution_manifest,
 )
 from mercury_tools.qualification.semantics import load_actions
 
@@ -37,11 +43,7 @@ def actions():
 
 @pytest.fixture(scope="module")
 def manifest(actions):
-    return load_sandbox_execution_manifest(
-        FLOWACCOUNT_MANIFEST,
-        actions,
-        catalog_path=FLOWACCOUNT_ACTIONS,
-    )
+    return load_sandbox_execution_manifest(FLOWACCOUNT_MANIFEST, FLOWACCOUNT_ACTIONS)
 
 
 def _manifest_payload() -> dict[str, object]:
@@ -125,8 +127,7 @@ def test_loader_rejects_manifest_hash_and_identity_tricks(
     with pytest.raises(ValueError, match=error):
         load_sandbox_execution_manifest(
             _write_manifest(tmp_path, payload),
-            actions,
-            catalog_path=FLOWACCOUNT_ACTIONS,
+            FLOWACCOUNT_ACTIONS,
         )
 
 
@@ -138,9 +139,47 @@ def test_loader_rejects_duplicate_json_keys_without_echoing_input(
     duplicate.write_text('{"catalog_sha256":"a", "catalog_sha256":"b"}', encoding="utf-8")
 
     with pytest.raises(ValueError, match="sandbox_manifest_json_duplicate_key") as raised:
-        load_sandbox_execution_manifest(duplicate, actions, catalog_path=FLOWACCOUNT_ACTIONS)
+        load_sandbox_execution_manifest(duplicate, FLOWACCOUNT_ACTIONS)
 
     assert '"catalog_sha256":"a"' not in str(raised.value)
+
+
+def _write_version_drifted_catalog(tmp_path: Path) -> tuple[Path, str]:
+    rows = json.loads(FLOWACCOUNT_ACTIONS.read_text(encoding="utf-8"))
+    changed = CatalogAction.model_validate(
+        {**rows[0], "description": "structurally different catalog snapshot"}
+    )
+    changed = changed.model_copy(update={"version_id": build_version_id(changed)})
+    rows[0] = changed.model_dump(mode="json")
+    data = json.dumps(
+        rows,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+        separators=(",", ": "),
+    ).encode("utf-8")
+    path = tmp_path / "actions.json"
+    path.write_bytes(data)
+    return path, hashlib.sha256(data).hexdigest()
+
+
+def test_loader_cannot_accept_stale_actions_separate_from_hashed_catalog(
+    tmp_path: Path,
+    actions,
+) -> None:
+    catalog_path, catalog_sha256 = _write_version_drifted_catalog(tmp_path)
+    payload = _manifest_payload()
+    payload["catalog_sha256"] = catalog_sha256
+    manifest_path = _write_manifest(tmp_path, payload)
+
+    with pytest.raises(TypeError):
+        load_sandbox_execution_manifest(
+            manifest_path,
+            actions,
+            catalog_path=catalog_path,
+        )
+    with pytest.raises(ValueError, match="sandbox_manifest_policy_version_drift"):
+        load_sandbox_execution_manifest(manifest_path, catalog_path)
 
 
 def test_exact_lookup_rejects_unknown_versions_and_non_executable_actions(
@@ -160,6 +199,51 @@ def test_exact_lookup_rejects_unknown_versions_and_non_executable_actions(
         manifest.require_policy(executable.action_id, "av_" + "0" * 64)
     with pytest.raises(PermissionError, match="sandbox_action_not_executable"):
         manifest.require_executable(contract_only)
+
+
+def _direct_executable_manifest(action) -> SandboxExecutionManifest:
+    policy = SandboxActionPolicy(
+        action_id=action.action_id,
+        version_id=action.version_id,
+        disposition=SandboxDisposition.SANDBOX_EXECUTABLE,
+        fixture_builder="fixture_builder",
+        ownership_predicate="owned_fixture",
+        cleanup_action_id=action.action_id,
+        external_effects=action.side_effects,
+        controlled_destination=bool(action.side_effects),
+        max_attempts=1,
+        request_budget=1,
+    )
+    return SandboxExecutionManifest(
+        environment="sandbox",
+        catalog_sha256="0" * 64,
+        actions=(policy,),
+    )
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        lambda action: (
+            action.method is HttpMethod.GET
+            and (action.action_id, action.version_id) not in LIVE_READS
+        ),
+        lambda action: "payment" in action.side_effects,
+        lambda action: action.method is HttpMethod.DELETE,
+        lambda action: action.capability == "company.update",
+        is_multipart_attachment_upload,
+    ],
+    ids=("nonallowlisted_get", "payment", "delete", "company_update", "multipart"),
+)
+def test_direct_models_cannot_bypass_the_exact_live_read_allowlist(
+    actions,
+    selector,
+) -> None:
+    action = next(action for action in actions if selector(action))
+    fabricated = _direct_executable_manifest(action)
+
+    with pytest.raises(PermissionError, match="sandbox_action_not_executable"):
+        fabricated.require_executable(action)
 
 
 def test_only_the_exact_four_safe_reads_are_executable(actions, manifest) -> None:
@@ -204,6 +288,47 @@ def test_blocked_actions_use_explicit_precise_classifications(actions, manifest)
         if reasons:
             assert policy.disposition is SandboxDisposition.BLOCKED_EXTERNAL_EFFECT
             assert policy.blocked_reasons == reasons
+
+
+def _independent_semantic_tokens(action) -> set[str]:
+    values = (
+        action.operation_id,
+        action.capability,
+        action.path_template,
+        *action.aliases_en,
+        *action.aliases_th,
+        *action.side_effects,
+    )
+    tokens: set[str] = set()
+    for value in values:
+        split_acronyms = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", value)
+        split_camel = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", split_acronyms)
+        tokens.update(token.casefold() for token in re.findall(r"[^\W\d_]+", split_camel))
+    return tokens
+
+
+def test_every_structural_payment_action_is_explicitly_blocked(actions, manifest) -> None:
+    policies = {(policy.action_id, policy.version_id): policy for policy in manifest.actions}
+    payment_actions = [
+        action for action in actions if "payment" in _independent_semantic_tokens(action)
+    ]
+
+    assert "act_5d14ee0467a696707d4bc137" in {action.action_id for action in payment_actions}
+    for action in payment_actions:
+        policy = policies[(action.action_id, action.version_id)]
+        assert policy.disposition is SandboxDisposition.BLOCKED_EXTERNAL_EFFECT
+        assert "payment" in policy.blocked_reasons
+
+
+def test_payment_predicate_does_not_match_larger_alphabetic_tokens(action_factory) -> None:
+    repayment = action_factory(
+        operation_id="createRepaymentPlan",
+        capability="documents.repayment.create",
+        path_template="/repayment-plans",
+        aliases_en=("create repayment plan",),
+    )
+
+    assert "payment" not in classify_blocked_reasons(repayment)
 
 
 def test_multipart_detection_requires_precise_media_type_and_file_schema(actions) -> None:
@@ -298,23 +423,121 @@ def test_loader_rejects_symlinked_or_non_regular_files(tmp_path: Path, actions) 
     with pytest.raises(ValueError, match="sandbox_manifest_file_unsafe"):
         load_sandbox_execution_manifest(
             linked_manifest,
-            actions,
-            catalog_path=FLOWACCOUNT_ACTIONS,
+            FLOWACCOUNT_ACTIONS,
         )
 
     directory = tmp_path / "not-a-file"
     directory.mkdir()
     with pytest.raises(ValueError, match="sandbox_manifest_file_unsafe"):
-        load_sandbox_execution_manifest(directory, actions, catalog_path=FLOWACCOUNT_ACTIONS)
+        load_sandbox_execution_manifest(directory, FLOWACCOUNT_ACTIONS)
 
     linked_catalog = tmp_path / "linked-actions.json"
     linked_catalog.symlink_to(FLOWACCOUNT_ACTIONS)
     with pytest.raises(ValueError, match="sandbox_manifest_catalog_file_unsafe"):
-        load_sandbox_execution_manifest(
-            FLOWACCOUNT_MANIFEST,
-            actions,
-            catalog_path=linked_catalog,
+        load_sandbox_execution_manifest(FLOWACCOUNT_MANIFEST, linked_catalog)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="dir_fd checks require POSIX")
+def test_writer_rejects_symlinked_output_ancestor_without_external_write(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    (outside / "nested").mkdir(parents=True)
+    linked = tmp_path / "linked"
+    linked.symlink_to(outside, target_is_directory=True)
+    output = linked / "nested/sandbox-execution-manifest.json"
+
+    with pytest.raises(ValueError, match="sandbox_manifest_output_unsafe"):
+        write_sandbox_execution_manifest(FLOWACCOUNT_ACTIONS, output)
+
+    assert not (outside / "nested/sandbox-execution-manifest.json").exists()
+
+
+def test_writer_requires_an_existing_output_parent(tmp_path: Path) -> None:
+    missing_parent = tmp_path / "missing"
+
+    with pytest.raises(ValueError, match="sandbox_manifest_output_unsafe"):
+        write_sandbox_execution_manifest(
+            FLOWACCOUNT_ACTIONS,
+            missing_parent / "sandbox-execution-manifest.json",
         )
+
+    assert not missing_parent.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="dir_fd checks require POSIX")
+def test_writer_rechecks_parent_binding_before_atomic_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    moved_parent = tmp_path / "moved-parent"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    output = parent / "sandbox-execution-manifest.json"
+    real_open = manifest_module.os.open
+    swapped = False
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        name = Path(os.fsdecode(path)).name
+        if not swapped and name.startswith(".sandbox-execution-manifest-"):
+            parent.rename(moved_parent)
+            parent.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(manifest_module.os, "open", racing_open)
+
+    with pytest.raises(ValueError, match="sandbox_manifest_output_unsafe"):
+        write_sandbox_execution_manifest(FLOWACCOUNT_ACTIONS, output)
+
+    assert swapped
+    assert not (outside / output.name).exists()
+    assert not (moved_parent / output.name).exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="symlink checks require POSIX")
+def test_writer_rejects_symlinked_destination_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target.json"
+    target.write_text("external sentinel", encoding="utf-8")
+    output = tmp_path / "sandbox-execution-manifest.json"
+    output.symlink_to(target)
+
+    with pytest.raises(ValueError, match="sandbox_manifest_output_unsafe"):
+        write_sandbox_execution_manifest(FLOWACCOUNT_ACTIONS, output)
+
+    assert target.read_text(encoding="utf-8") == "external sentinel"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="dir_fd checks require POSIX")
+def test_destination_swap_cannot_redirect_atomic_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "target.json"
+    target.write_text("external sentinel", encoding="utf-8")
+    output = tmp_path / "sandbox-execution-manifest.json"
+    output.write_text("old manifest", encoding="utf-8")
+    real_replace = manifest_module.os.replace
+
+    def racing_replace(source, destination, *args, **kwargs):
+        output.unlink()
+        output.symlink_to(target)
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(manifest_module.os, "replace", racing_replace)
+
+    write_sandbox_execution_manifest(FLOWACCOUNT_ACTIONS, output)
+
+    assert target.read_text(encoding="utf-8") == "external sentinel"
+    assert output.is_file()
+    assert not output.is_symlink()
 
 
 def test_generator_is_import_safe_helpful_and_byte_deterministic(tmp_path: Path, actions) -> None:
@@ -353,7 +576,7 @@ def test_generator_is_import_safe_helpful_and_byte_deterministic(tmp_path: Path,
     assert second.returncode == 0, second.stderr
 
     assert output.read_bytes() == first_bytes
-    generated = load_sandbox_execution_manifest(output, actions, catalog_path=FLOWACCOUNT_ACTIONS)
+    generated = load_sandbox_execution_manifest(output, FLOWACCOUNT_ACTIONS)
     assert len(generated.actions) == 190
     assert "total=190" in first.stdout
     assert "sandbox_executable=4" in first.stdout

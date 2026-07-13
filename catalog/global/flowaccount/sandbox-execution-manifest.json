@@ -974,10 +974,12 @@
     },
     {
       "action_id": "act_5d14ee0467a696707d4bc137",
-      "blocked_reasons": [],
+      "blocked_reasons": [
+        "payment"
+      ],
       "cleanup_action_id": null,
       "controlled_destination": false,
-      "disposition": "contract_only",
+      "disposition": "blocked_external_effect",
       "external_effects": [
         "writes_remote_data"
       ],
