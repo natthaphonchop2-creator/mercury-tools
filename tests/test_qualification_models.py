@@ -66,6 +66,50 @@ def test_validation_knowledge_rejects_credential_bearing_paths():
         valid_record(response_shape={"endpoint": "/v1/bearer synthetic-token"})
 
 
+@pytest.mark.parametrize(
+    "field, summary",
+    [
+        ("summary_th", "ข้อความสรุป public ที่กำหนดเอง"),
+        ("summary_en", "Arbitrary public summary"),
+    ],
+)
+def test_public_approval_requires_controlled_status_summaries(field, summary):
+    with pytest.raises(ValidationError, match="approved_public_summary_not_controlled"):
+        valid_record(approved_public=True, **{field: summary})
+
+
+@pytest.mark.parametrize(
+    "response_shape, error",
+    [
+        ({"email": "person@example.com"}, "approved_public_response_shape_unsafe"),
+        ({"document_id": "provider-document-123"}, "approved_public_response_shape_unsafe"),
+        ({"payload": {"document_id": "string"}}, "approved_public_response_shape_unsafe"),
+        ({"source_path": "string"}, "approved_public_response_shape_unsafe"),
+        ({"access_token": "string"}, "catalog_credentials_unsafe"),
+    ],
+)
+def test_public_approval_rejects_arbitrary_response_shape_content(response_shape, error):
+    with pytest.raises(ValidationError, match=error):
+        valid_record(approved_public=True, response_shape=response_shape)
+
+
+def test_public_approval_keeps_business_field_names_and_type_descriptors():
+    record = valid_record(
+        approved_public=True,
+        response_shape={
+            "data": {
+                "type": "array",
+                "items": {"document_id": "string", "email": "string"},
+            }
+        },
+    )
+
+    assert record.response_shape["data"]["items"] == {
+        "document_id": "string",
+        "email": "string",
+    }
+
+
 def test_validation_knowledge_rejects_invalid_enum_values():
     with pytest.raises(ValidationError):
         valid_record(validation_status="provider_says_maybe")

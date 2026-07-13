@@ -98,6 +98,24 @@ class ValidationKnowledge(StrictSafeModel):
     evaluated_at: datetime
     expires_at: datetime | None = None
 
+    @model_validator(mode="after")
+    def validate_approved_public_content(self) -> ValidationKnowledge:
+        if not self.approved_public:
+            return self
+
+        from mercury_tools.qualification.response_shape import (
+            _validate_approved_public_response_shape,
+        )
+        from mercury_tools.qualification.templates import SUMMARY_EN, SUMMARY_TH
+
+        if (
+            self.summary_th != SUMMARY_TH[self.validation_status]
+            or self.summary_en != SUMMARY_EN[self.validation_status]
+        ):
+            raise ValueError("approved_public_summary_not_controlled")
+        _validate_approved_public_response_shape(self.response_shape)
+        return self
+
 
 class QualificationReport(StrictSafeModel):
     connector_id: str
