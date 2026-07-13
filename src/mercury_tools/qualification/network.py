@@ -28,6 +28,8 @@ SANDBOX_TOKEN_URL = "https://openapi.flowaccount.com/test/token"
 _SANDBOX_HOST = "openapi.flowaccount.com"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REDACTED_LABEL = "[redacted]"
+_TRANSPORT_ELIGIBLE_KEY = "mercury_sandbox_transport_eligible"
+_TRANSPORT_ELIGIBLE_MARKER = object()
 
 T = TypeVar("T")
 T_co = TypeVar("T_co", covariant=True)
@@ -148,6 +150,7 @@ def sandbox_http_client(
             allow_private_network=False,
         )
         request.extensions["mercury_resolved_target"] = target
+        request.extensions[_TRANSPORT_ELIGIBLE_KEY] = _TRANSPORT_ELIGIBLE_MARKER
 
     async def validate_response(response: httpx.Response) -> None:
         target = response.request.extensions.get("mercury_resolved_target")
@@ -172,6 +175,11 @@ def sandbox_http_client(
         trust_env=False,
         event_hooks={"request": [validate_request], "response": [validate_response]},
     )
+
+
+def sandbox_request_transport_eligible(request: httpx.Request) -> bool:
+    """Return whether sandbox validation completed before transport entry."""
+    return request.extensions.get(_TRANSPORT_ELIGIBLE_KEY) is _TRANSPORT_ELIGIBLE_MARKER
 
 
 def require_verified_sandbox_tenant(
@@ -266,6 +274,7 @@ __all__ = [
     "execute_flowaccount_sandbox_action",
     "require_verified_sandbox_tenant",
     "sandbox_http_client",
+    "sandbox_request_transport_eligible",
     "validate_flowaccount_sandbox_origins",
     "validate_sandbox_url",
 ]

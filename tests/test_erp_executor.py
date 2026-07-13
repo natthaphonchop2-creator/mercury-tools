@@ -1481,6 +1481,56 @@ async def test_flowaccount_sandbox_peer_failure_after_transport_is_marked_dispat
 
 
 @pytest.mark.asyncio
+async def test_flowaccount_sandbox_action_dns_rejection_before_transport_is_not_dispatched(
+    repository_context: RepositoryContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actions = load_actions(FLOWACCOUNT_ACTIONS)
+    action = next(
+        item
+        for item in actions
+        if (item.action_id, item.version_id) in LIVE_READS
+        and item.path_template == "/company/info"
+    )
+    manifest = load_sandbox_execution_manifest(FLOWACCOUNT_MANIFEST, FLOWACCOUNT_ACTIONS)
+    credentials = SandboxCredentialStoreSpy()
+    executor = flowaccount_sandbox_executor(repository_context, action, credentials)
+    dns_calls: list[str] = []
+    transport_calls: list[str] = []
+
+    def resolve(host: str, port: int, **_: object) -> list[tuple[object, ...]]:
+        dns_calls.append(host)
+        address = "10.0.0.8" if len(dns_calls) == 3 else "93.184.216.34"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        transport_calls.append(str(request.url))
+        if request.url.path == "/test/token":
+            return response(request, payload={"access_token": "sandbox-token"})
+        return response(request, payload={"companyName": "Example Books"})
+
+    result = await executor.run_flowaccount_sandbox_read(
+        repository=repository_context,
+        action=action,
+        inputs={},
+        manifest=manifest,
+        expected_tenant=sandbox_tenant_binding(),
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert dns_calls == ["openapi.flowaccount.com"] * 3
+    assert transport_calls == [
+        "https://openapi.flowaccount.com/test/token",
+        "https://openapi.flowaccount.com/test/company/info",
+    ]
+    assert result.status == "failed"
+    assert result.dispatched is False
+    assert result.data is None
+
+
+@pytest.mark.asyncio
 async def test_flowaccount_sandbox_request_build_failure_remains_not_dispatched(
     repository_context: RepositoryContext,
 ) -> None:

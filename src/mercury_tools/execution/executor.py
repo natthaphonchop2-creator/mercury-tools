@@ -36,6 +36,7 @@ from mercury_tools.qualification.network import (
     SandboxOrigins,
     SandboxTenantBinding,
     execute_flowaccount_sandbox_action,
+    sandbox_request_transport_eligible,
 )
 from mercury_tools.safety.network import NetworkPolicy, NetworkPolicyError, ResolvedTarget
 
@@ -179,7 +180,7 @@ class ERPExecutor:
         ) -> ConnectorResult:
             del binding, policy
             started = time.monotonic()
-            dispatched = False
+            request: httpx.Request | None = None
             try:
                 active = self._require_active_action(action)
                 if repository != self.context:
@@ -195,7 +196,6 @@ class ERPExecutor:
                     environment="sandbox",
                 )
                 request = template.to_httpx_request(auth)
-                dispatched = True
                 response = await client.send(request)
                 result = driver.interpret_response(
                     action=active,
@@ -203,9 +203,17 @@ class ERPExecutor:
                     dispatched=True,
                 )
             except (RequestBuildError, NetworkPolicyError, httpx.TransportError):
-                result = _failed_result(dispatched=dispatched)
+                result = _failed_result(
+                    dispatched=(
+                        request is not None and sandbox_request_transport_eligible(request)
+                    )
+                )
             except Exception:
-                result = _failed_result(dispatched=dispatched)
+                result = _failed_result(
+                    dispatched=(
+                        request is not None and sandbox_request_transport_eligible(request)
+                    )
+                )
             self._audit_result(
                 action=action,
                 environment="sandbox",
