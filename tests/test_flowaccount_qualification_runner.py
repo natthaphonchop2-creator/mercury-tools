@@ -12,8 +12,10 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
+from mercury_tools.catalog.identity import build_action_id, build_version_id
+from mercury_tools.catalog.models import CatalogAction, revalidate_catalog_action
 from mercury_tools.drivers.flowaccount import FlowAccountDriver
-from mercury_tools.drivers.models import CredentialStatus
+from mercury_tools.drivers.models import ConnectorResult, CredentialStatus
 from mercury_tools.drivers.registry import DriverRegistry
 from mercury_tools.execution.executor import ERPExecutor
 from mercury_tools.execution.store import LocalRequestStore
@@ -38,6 +40,8 @@ from mercury_tools.qualification.manifest import (
     load_sandbox_execution_manifest,
 )
 from mercury_tools.qualification.models import (
+    EvidenceLevel,
+    ExecutionEligibility,
     QualificationRunState,
     ValidationStatus,
 )
@@ -207,6 +211,16 @@ def make_runner(
     )
 
 
+def alternate_identity(action: CatalogAction) -> CatalogAction:
+    values = action.model_dump(mode="python")
+    values["operation_id"] = f"{action.operation_id}_alternate"
+    candidate = CatalogAction.model_validate(values)
+    values["action_id"] = build_action_id(candidate)
+    candidate = CatalogAction.model_validate(values)
+    values["version_id"] = build_version_id(candidate)
+    return revalidate_catalog_action(CatalogAction.model_validate(values))
+
+
 def test_qualification_limits_are_immutable_and_capped() -> None:
     limits = QualificationLimits()
 
@@ -237,6 +251,8 @@ async def test_dry_run_validates_all_contracts_without_credentials_network_or_su
     flowaccount_semantics,
 ) -> None:
     network_calls: list[str] = []
+    validation_root = repository_context.mercury_dir / "validation"
+    state_before = tuple(validation_root.rglob("*")) if validation_root.exists() else ()
     runtime = runtime_for(
         repository_context,
         flowaccount_actions,
@@ -256,7 +272,8 @@ async def test_dry_run_validates_all_contracts_without_credentials_network_or_su
     )
 
     report = await runner.qualify_all(
-        approval=SandboxRunApproval(reads=True, writes=True, dry_run=True)
+        approval=SandboxRunApproval(reads=True, writes=True, dry_run=True),
+        dry_run=False,
     )
 
     identities = [(record.action_id, record.version_id) for record in report.records]
@@ -276,6 +293,103 @@ async def test_dry_run_validates_all_contracts_without_credentials_network_or_su
     )
     assert all(record.latency_ms is None for record in report.records)
     assert report.public_dict()["total"] == 190
+    state_after = tuple(validation_root.rglob("*")) if validation_root.exists() else ()
+    assert state_after == state_before
+
+
+@pytest.mark.asyncio
+async def test_arbitrary_same_size_action_set_is_never_used_for_terminal_coverage(
+    repository_context: RepositoryContext,
+    flowaccount_actions,
+    sandbox_manifest: SandboxExecutionManifest,
+    flowaccount_semantics,
+) -> None:
+    replacement = alternate_identity(flowaccount_actions[0])
+    untrusted_actions = (replacement, *flowaccount_actions[1:])
+    runtime = runtime_for(
+        repository_context,
+        untrusted_actions,
+        credentials=ForbiddenCredentialStore(),
+        repository_config=RepositoryConfig(),
+    )
+    runner = FlowAccountQualificationRunner(
+        runtime,
+        sandbox_manifest,
+        actions=untrusted_actions,
+        semantics=flowaccount_semantics,
+        transport=httpx.MockTransport(
+            lambda request: (_ for _ in ()).throw(AssertionError(str(request.url)))
+        ),
+        clock=lambda: NOW,
+        monotonic=lambda: 0.0,
+        sleeper=no_sleep,
+    )
+
+    report = await runner.qualify_all(
+        approval=SandboxRunApproval(reads=True, writes=False, dry_run=True)
+    )
+
+    expected = {(action.action_id, action.version_id) for action in flowaccount_actions}
+    actual = {(record.action_id, record.version_id) for record in report.records}
+    assert report.run_state is QualificationRunState.FAILED
+    assert actual == expected
+    assert (replacement.action_id, replacement.version_id) not in actual
+    assert {record.validation_status for record in report.records} == {
+        ValidationStatus.BLOCKED_MISSING_PREREQUISITE
+    }
+    assert {record.evidence_level for record in report.records} == {EvidenceLevel.DOCUMENTED}
+    assert {record.execution_eligibility for record in report.records} == {
+        ExecutionEligibility.BLOCKED
+    }
+
+
+@pytest.mark.parametrize("broken_sidecar", ["manifest", "semantics"])
+@pytest.mark.asyncio
+async def test_sidecar_failure_is_blocked_without_synthetic_validated_evidence(
+    broken_sidecar: str,
+    tmp_path: Path,
+    repository_context: RepositoryContext,
+    flowaccount_actions,
+    sandbox_manifest: SandboxExecutionManifest,
+    flowaccount_semantics,
+) -> None:
+    broken = tmp_path / f"{broken_sidecar}.json"
+    broken.write_text("{}\n", encoding="utf-8")
+    runtime = runtime_for(
+        repository_context,
+        flowaccount_actions,
+        credentials=ForbiddenCredentialStore(),
+        repository_config=RepositoryConfig(),
+    )
+    runner = FlowAccountQualificationRunner(
+        runtime,
+        None if broken_sidecar == "manifest" else sandbox_manifest,
+        actions=flowaccount_actions,
+        semantics=None if broken_sidecar == "semantics" else flowaccount_semantics,
+        catalog_path=FLOWACCOUNT_ACTIONS,
+        manifest_path=broken if broken_sidecar == "manifest" else FLOWACCOUNT_MANIFEST,
+        semantics_path=broken if broken_sidecar == "semantics" else FLOWACCOUNT_SEMANTICS,
+        transport=httpx.MockTransport(
+            lambda request: (_ for _ in ()).throw(AssertionError(str(request.url)))
+        ),
+        clock=lambda: NOW,
+        monotonic=lambda: 0.0,
+        sleeper=no_sleep,
+    )
+
+    report = await runner.qualify_all(
+        approval=SandboxRunApproval(reads=True, writes=False, dry_run=True)
+    )
+
+    assert report.run_state is QualificationRunState.FAILED
+    assert len(report.records) == 190
+    assert {record.validation_status for record in report.records} == {
+        ValidationStatus.BLOCKED_MISSING_PREREQUISITE
+    }
+    assert {record.evidence_level for record in report.records} == {EvidenceLevel.DOCUMENTED}
+    assert {record.execution_eligibility for record in report.records} == {
+        ExecutionEligibility.BLOCKED
+    }
 
 
 @pytest.mark.asyncio
@@ -284,8 +398,10 @@ async def test_live_run_uses_one_snapshot_one_probe_and_four_canonical_reads(
     flowaccount_actions,
     sandbox_manifest: SandboxExecutionManifest,
     flowaccount_semantics,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[str, str]] = []
+    audited_results: list[ConnectorResult] = []
     credentials = CredentialSnapshotSpy()
     runtime = runtime_for(
         repository_context,
@@ -303,8 +419,24 @@ async def test_live_run_uses_one_snapshot_one_probe_and_four_canonical_reads(
         return provider_response(
             request,
             200,
-            {"status": True, "data": [{"providerRecordId": "provider-991234567"}]},
+            {
+                "status": True,
+                "data": [
+                    {
+                        "providerRecordId": "provider-991234567",
+                        "rawPayloadMarker": "raw-provider-payload-88224466",
+                    }
+                ],
+            },
         )
+
+    original_audit_result = runtime.executor._audit_result
+
+    def capture_audit_result(**kwargs: Any) -> str:
+        audited_results.append(kwargs["result"])
+        return original_audit_result(**kwargs)
+
+    monkeypatch.setattr(runtime.executor, "_audit_result", capture_audit_result)
 
     runner = make_runner(
         runtime,
@@ -332,11 +464,17 @@ async def test_live_run_uses_one_snapshot_one_probe_and_four_canonical_reads(
     ]
     assert len(calls) == 2 + len(LIVE_READS)
     assert all(method == "GET" for method, _path in calls[2:])
+    assert len(audited_results) == len(LIVE_READS)
+    assert all(result.data is None for result in audited_results)
     public_json = json.dumps(report.public_dict(), ensure_ascii=False, sort_keys=True)
-    assert "issued-sandbox-token" not in public_json
-    assert "provider-991234567" not in public_json
-    assert "Example Books" not in public_json
-    assert "company_label_sha256" not in public_json
+    state_json = runner.run_store.state_path.read_text(encoding="utf-8")
+    audit_json = (repository_context.audit_dir / "audit.jsonl").read_text(encoding="utf-8")
+    for persisted in (public_json, state_json, audit_json):
+        assert "issued-sandbox-token" not in persisted
+        assert "provider-991234567" not in persisted
+        assert "raw-provider-payload-88224466" not in persisted
+        assert "Example Books" not in persisted
+        assert "company_label_sha256" not in persisted
 
 
 @pytest.mark.asyncio
@@ -611,6 +749,15 @@ class FailingCleanupAdapter:
         return CleanupOutcome.FAILED
 
 
+class SuccessfulCleanupAdapter:
+    def __init__(self) -> None:
+        self.provider_ids: list[str] = []
+
+    async def cleanup(self, fixture: FixtureCleanupTarget) -> CleanupOutcome:
+        self.provider_ids.append(fixture.provider_id)
+        return CleanupOutcome.CLEANED
+
+
 @pytest.mark.asyncio
 async def test_cleanup_failure_quarantines_without_persisting_or_reporting_provider_id(
     repository_context: RepositoryContext,
@@ -663,12 +810,132 @@ async def test_cleanup_failure_quarantines_without_persisting_or_reporting_provi
     assert report.run_state is QualificationRunState.QUARANTINED
     assert runner.run_store.publication_allowed is False
     assert len(report.records) == 190
+    assert runner.request_count == 2 + len(LIVE_READS) + 1
+    assert report.http_attempts == runner.request_count
+    assert report.mutation_attempts == 1
     public_json = json.dumps(report.public_dict(), ensure_ascii=False, sort_keys=True)
     state_json = runner.run_store.state_path.read_text(encoding="utf-8")
     audit_json = (repository_context.audit_dir / "audit.jsonl").read_text(encoding="utf-8")
     assert "provider-sensitive-991234567" not in public_json
     assert "provider-sensitive-991234567" not in state_json
     assert "provider-sensitive-991234567" not in audit_json
+
+
+@pytest.mark.asyncio
+async def test_cleanup_uses_shared_rate_total_and_mutation_accounting(
+    repository_context: RepositoryContext,
+    flowaccount_actions,
+    sandbox_manifest: SandboxExecutionManifest,
+    flowaccount_semantics,
+) -> None:
+    run_id = "run_01J00000000000000000000001"
+    fixture_registry = FixtureRegistry(run_id=run_id)
+    fixture_registry.register(
+        provider_id="provider-cleanup-991234567",
+        action_ref=(flowaccount_actions[0].action_id, flowaccount_actions[0].version_id),
+        cleanup_action_ref=(flowaccount_actions[1].action_id, flowaccount_actions[1].version_id),
+    )
+    cleanup = SuccessfulCleanupAdapter()
+    sleeps: list[float] = []
+    runtime = runtime_for(
+        repository_context,
+        flowaccount_actions,
+        credentials=CredentialSnapshotSpy(),
+        repository_config=validation_config(),
+    )
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if request.url.path == "/test/token":
+            return provider_response(request, 200, {"access_token": "issued-sandbox-token"})
+        if call_count == 2:
+            return provider_response(request, 200, {"companyName": "Example Books"})
+        return provider_response(request, 200, {"status": True, "data": []})
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    runner = FlowAccountQualificationRunner(
+        runtime,
+        sandbox_manifest,
+        actions=flowaccount_actions,
+        semantics=flowaccount_semantics,
+        transport=httpx.MockTransport(handler),
+        limits=QualificationLimits(max_total_requests=7),
+        clock=lambda: NOW,
+        monotonic=lambda: 0.0,
+        sleeper=record_sleep,
+        run_id=run_id,
+        fixture_registry=fixture_registry,
+        cleanup_adapter=cleanup,
+    )
+
+    report = await runner.qualify_all(approval=SandboxRunApproval(reads=True, writes=False))
+
+    assert report.run_state is QualificationRunState.COMPLETED
+    assert cleanup.provider_ids == ["provider-cleanup-991234567"]
+    assert runner.request_count == 7
+    assert report.http_attempts == 7
+    assert report.mutation_attempts == 1
+    assert sleeps == [0.5] * 6
+
+
+@pytest.mark.asyncio
+async def test_total_request_budget_blocks_cleanup_before_provider_adapter(
+    repository_context: RepositoryContext,
+    flowaccount_actions,
+    sandbox_manifest: SandboxExecutionManifest,
+    flowaccount_semantics,
+) -> None:
+    run_id = "run_01J00000000000000000000002"
+    fixture_registry = FixtureRegistry(run_id=run_id)
+    fixture_registry.register(
+        provider_id="provider-cleanup-88224466",
+        action_ref=(flowaccount_actions[0].action_id, flowaccount_actions[0].version_id),
+        cleanup_action_ref=(flowaccount_actions[1].action_id, flowaccount_actions[1].version_id),
+    )
+    cleanup = SuccessfulCleanupAdapter()
+    runtime = runtime_for(
+        repository_context,
+        flowaccount_actions,
+        credentials=CredentialSnapshotSpy(),
+        repository_config=validation_config(),
+    )
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if request.url.path == "/test/token":
+            return provider_response(request, 200, {"access_token": "issued-sandbox-token"})
+        if call_count == 2:
+            return provider_response(request, 200, {"companyName": "Example Books"})
+        return provider_response(request, 200, {"status": True, "data": []})
+
+    runner = FlowAccountQualificationRunner(
+        runtime,
+        sandbox_manifest,
+        actions=flowaccount_actions,
+        semantics=flowaccount_semantics,
+        transport=httpx.MockTransport(handler),
+        limits=QualificationLimits(max_total_requests=6),
+        clock=lambda: NOW,
+        monotonic=lambda: 0.0,
+        sleeper=no_sleep,
+        run_id=run_id,
+        fixture_registry=fixture_registry,
+        cleanup_adapter=cleanup,
+    )
+
+    report = await runner.qualify_all(approval=SandboxRunApproval(reads=True, writes=False))
+
+    assert report.run_state is QualificationRunState.QUARANTINED
+    assert cleanup.provider_ids == []
+    assert runner.request_count == 6
+    assert report.http_attempts == 6
+    assert report.mutation_attempts == 0
 
 
 @pytest.mark.asyncio
@@ -748,7 +1015,7 @@ async def test_runner_uses_runtime_transport_when_constructor_transport_is_omitt
 
 
 @pytest.mark.asyncio
-async def test_factory_dry_run_does_not_mutate_or_create_source_repository_state(
+async def test_factory_approval_dry_run_is_sticky_before_source_repository_state_selection(
     tmp_path: Path,
 ) -> None:
     source_root = tmp_path / "source"
@@ -758,14 +1025,44 @@ async def test_factory_dry_run_does_not_mutate_or_create_source_repository_state
     gitignore = source_root / ".gitignore"
     gitignore.write_text("keep-this-line\n", encoding="utf-8")
 
-    runner = create_flowaccount_qualification_runner(source_root, dry_run=True)
+    runner = create_flowaccount_qualification_runner(source_root, dry_run=False)
     report = await runner.qualify_all(
-        approval=SandboxRunApproval(reads=True, writes=False, dry_run=True)
+        approval=SandboxRunApproval(reads=True, writes=False, dry_run=True),
+        dry_run=False,
     )
 
     assert report.run_state is QualificationRunState.COMPLETED
     assert len(report.records) == 190
     assert gitignore.read_text(encoding="utf-8") == "keep-this-line\n"
+    assert not (source_root / ".mercury").exists()
+
+
+@pytest.mark.asyncio
+async def test_requested_catalog_failure_uses_frozen_canonical_terminal_identities(
+    tmp_path: Path,
+    flowaccount_actions,
+) -> None:
+    source_root = tmp_path / "source"
+    catalog_target = source_root / "catalog" / "global" / "flowaccount"
+    catalog_target.parent.mkdir(parents=True)
+    shutil.copytree(ROOT / "catalog" / "global" / "flowaccount", catalog_target)
+    (catalog_target / "actions.json").write_text("[]\n", encoding="utf-8")
+
+    runner = create_flowaccount_qualification_runner(source_root, dry_run=True)
+    report = await runner.qualify_all(
+        approval=SandboxRunApproval(reads=True, writes=False, dry_run=False),
+        dry_run=False,
+    )
+
+    expected = {(action.action_id, action.version_id) for action in flowaccount_actions}
+    actual = {(record.action_id, record.version_id) for record in report.records}
+    assert report.run_state is QualificationRunState.FAILED
+    assert len(report.records) == 190
+    assert actual == expected
+    assert {record.validation_status for record in report.records} == {
+        ValidationStatus.BLOCKED_MISSING_PREREQUISITE
+    }
+    assert {record.evidence_level for record in report.records} == {EvidenceLevel.DOCUMENTED}
     assert not (source_root / ".mercury").exists()
 
 

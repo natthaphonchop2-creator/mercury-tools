@@ -14,7 +14,7 @@ from mercury_tools.qualification.flowaccount import (
     create_flowaccount_qualification_runner,
 )
 from mercury_tools.qualification.manifest import LIVE_READS
-from mercury_tools.qualification.models import QualificationRunState
+from mercury_tools.qualification.models import QualificationRunState, ValidationStatus
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -70,6 +70,11 @@ async def test_live_flowaccount_sandbox_qualification_uses_only_reviewed_safe_re
     assert report.run_state is QualificationRunState.COMPLETED
     assert len(report.records) == 190
     assert len({(record.action_id, record.version_id) for record in report.records}) == 190
+    assert {
+        (record.action_id, record.version_id)
+        for record in report.records
+        if record.validation_status is ValidationStatus.LIVE_SUCCESS
+    } == LIVE_READS
     assert runner.request_count <= 40
     assert len(transport.requests) == 2 + len(LIVE_READS)
     assert transport.requests[0] == (

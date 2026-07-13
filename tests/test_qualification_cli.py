@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -169,3 +170,34 @@ def test_catalog_qualify_prints_only_public_report_and_maps_exit_state(
     assert payload == report.public_dict()
     assert report.public_calls == 2
     assert str(tmp_path) not in json.dumps(payload)
+
+
+def test_catalog_qualify_catalog_failure_prints_190_terminal_records_not_generic_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from mercury_tools import cli
+
+    root = Path(__file__).resolve().parents[1]
+    source_root = tmp_path / "source"
+    catalog_target = source_root / "catalog" / "global" / "flowaccount"
+    catalog_target.parent.mkdir(parents=True)
+    shutil.copytree(root / "catalog" / "global" / "flowaccount", catalog_target)
+    (catalog_target / "actions.json").write_text("[]\n", encoding="utf-8")
+    args = SimpleNamespace(
+        connector="flowaccount",
+        environment="sandbox",
+        all=True,
+        sandbox_writes=False,
+        dry_run=True,
+        repo_root=str(source_root),
+    )
+
+    assert cli.cmd_catalog_qualify(args) == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload.get("error") != "qualification_failed"
+    assert payload["run_state"] == QualificationRunState.FAILED.value
+    assert payload["total"] == 190
+    assert len(payload["records"]) == 190
+    assert not (source_root / ".mercury").exists()

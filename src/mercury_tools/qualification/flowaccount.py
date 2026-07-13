@@ -22,9 +22,12 @@ from mercury_tools.execution.request_builder import RequestBuildError, build_req
 from mercury_tools.local.repository import ensure_repository_state, normalize_repository_config
 from mercury_tools.mcp.local_runtime import LocalMercuryRuntime
 from mercury_tools.qualification.coverage import (
+    FLOWACCOUNT_CANONICAL_IDENTITIES,
     QualificationCoverageReport,
     build_coverage_report,
     build_terminal_record,
+    build_unvalidated_terminal_record,
+    require_canonical_flowaccount_actions,
     safe_response_shape,
 )
 from mercury_tools.qualification.fixtures import (
@@ -40,7 +43,6 @@ from mercury_tools.qualification.manifest import (
     SandboxDisposition,
     SandboxExecutionManifest,
     load_sandbox_execution_manifest,
-    reviewed_policy_for,
 )
 from mercury_tools.qualification.models import (
     ExecutionEligibility,
@@ -62,7 +64,6 @@ from mercury_tools.qualification.planner import FixturePlan, plan_fixture_depend
 from mercury_tools.qualification.response_shape import extract_response_shape
 from mercury_tools.qualification.run_store import QualificationRunStore
 from mercury_tools.qualification.semantics import (
-    contract_for,
     load_actions,
     load_semantic_contracts,
 )
@@ -105,6 +106,30 @@ class _QualificationBudgetExceeded(RuntimeError):
     pass
 
 
+class _EphemeralRunStore:
+    """In-memory run state used when any caller requests dry-run behavior."""
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        self._state = QualificationRunState.FAILED
+
+    @property
+    def state(self) -> QualificationRunState:
+        return self._state
+
+    @property
+    def publication_allowed(self) -> bool:
+        return self._state is QualificationRunState.COMPLETED
+
+    def complete(self) -> None:
+        if self._state is QualificationRunState.QUARANTINED:
+            raise ValueError("qualification_run_quarantined")
+        self._state = QualificationRunState.COMPLETED
+
+    def quarantine(self, _reason: str) -> None:
+        self._state = QualificationRunState.QUARANTINED
+
+
 class _BoundedTransport(httpx.AsyncBaseTransport):
     def __init__(
         self,
@@ -127,9 +152,38 @@ class _BoundedTransport(httpx.AsyncBaseTransport):
         self.requests: list[tuple[str, str]] = []
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        method = request.method.upper()
+        await self._account_attempt(
+            method=method,
+            path=request.url.path,
+            is_token=method == "POST" and request.url.path == "/test/token",
+        )
+        response = await self._delegate.handle_async_request(request)
+        if response.status_code == 429:
+            self.rate_limited = True
+        return response
+
+    async def account_cleanup_attempt(self, *, method: str, action_id: str) -> None:
+        checked_method = method.upper()
+        if checked_method not in {"POST", "PUT", "PATCH", "DELETE"}:
+            raise _QualificationBudgetExceeded("qualification_cleanup_method_invalid")
+        await self._account_attempt(
+            method=checked_method,
+            path=f"cleanup:{action_id}",
+            is_token=False,
+        )
+
+    async def _account_attempt(self, *, method: str, path: str, is_token: bool) -> None:
         if self.request_count >= self._limits.max_total_requests:
             self.budget_exhausted = True
             raise _QualificationBudgetExceeded("qualification_request_budget_exhausted")
+        is_mutation = method in {"POST", "PUT", "PATCH", "DELETE"} and not is_token
+        if is_mutation and self.rate_limited:
+            raise _QualificationBudgetExceeded("qualification_rate_limited")
+        if is_mutation and self.mutation_attempts >= self._limits.max_mutation_attempts:
+            self.mutation_budget_exhausted = True
+            raise _QualificationBudgetExceeded("qualification_mutation_budget_exhausted")
+
         now = self._monotonic()
         if self._last_started is not None:
             minimum_interval = 1.0 / self._limits.requests_per_second
@@ -138,23 +192,35 @@ class _BoundedTransport(httpx.AsyncBaseTransport):
                 await self._sleeper(delay)
                 now = self._monotonic()
         self._last_started = now
-
-        method = request.method.upper()
-        is_token = request.url.path == "/test/token"
-        if method in {"POST", "PUT", "PATCH", "DELETE"} and not is_token:
-            if self.mutation_attempts >= self._limits.max_mutation_attempts:
-                self.mutation_budget_exhausted = True
-                raise _QualificationBudgetExceeded("qualification_mutation_budget_exhausted")
+        if is_mutation:
             self.mutation_attempts += 1
         self.request_count += 1
-        self.requests.append((method, request.url.path))
-        response = await self._delegate.handle_async_request(request)
-        if response.status_code == 429:
-            self.rate_limited = True
-        return response
+        self.requests.append((method, path))
 
     async def aclose(self) -> None:
         await self._delegate.aclose()
+
+
+class _BoundedCleanupAdapter:
+    def __init__(
+        self,
+        delegate: CleanupAdapter,
+        transport: _BoundedTransport,
+        catalog: Any,
+    ) -> None:
+        self._delegate = delegate
+        self._transport = transport
+        self._catalog = catalog
+
+    async def cleanup(self, fixture: FixtureCleanupTarget) -> CleanupOutcome:
+        action = revalidate_catalog_action(
+            self._catalog.require_version(*fixture.cleanup_action_ref)
+        )
+        await self._transport.account_cleanup_attempt(
+            method=action.method.value,
+            action_id=action.action_id,
+        )
+        return await self._delegate.cleanup(fixture)
 
 
 @dataclass(frozen=True)
@@ -187,8 +253,12 @@ class FlowAccountQualificationRunner:
         run_store: QualificationRunStore | None = None,
         fixture_registry: FixtureRegistry | None = None,
         cleanup_adapter: CleanupAdapter | None = None,
+        dry_run: bool = False,
+        runtime_factory: Callable[[], Any] | None = None,
     ) -> None:
         self.runtime = runtime
+        self._runtime_factory = runtime_factory
+        self._constructor_dry_run = bool(dry_run)
         self._provided_manifest = manifest
         self._provided_actions = tuple(actions) if actions is not None else None
         self._provided_semantics = dict(semantics) if semantics is not None else None
@@ -200,15 +270,11 @@ class FlowAccountQualificationRunner:
         self._monotonic = monotonic or time.monotonic
         self._sleeper = sleeper or asyncio.sleep
         self.run_id = run_id or _new_run_id()
-        repository_root = self.runtime.repository.root
-        self.run_store = run_store or QualificationRunStore(
-            repository_root,
-            self.run_id,
-            clock=self._clock,
-        )
+        self._provided_run_store = run_store
+        self._run_store: QualificationRunStore | _EphemeralRunStore | None = None
         self.fixture_registry = fixture_registry or FixtureRegistry(run_id=self.run_id)
         self.cleanup_adapter = cleanup_adapter or _NoMutationCleanupAdapter()
-        if self.fixture_registry.run_id != self.run_store.run_id:
+        if self.fixture_registry.run_id != self.run_id:
             raise ValueError("qualification_run_store_mismatch")
         delegate = transport if transport is not None else getattr(runtime, "transport", None)
         if delegate is None:
@@ -231,6 +297,12 @@ class FlowAccountQualificationRunner:
     def request_methods(self) -> tuple[str, ...]:
         return tuple(method for method, _path in self._transport.requests)
 
+    @property
+    def run_store(self) -> QualificationRunStore | _EphemeralRunStore:
+        if self._run_store is None:
+            raise RuntimeError("qualification_run_store_not_selected")
+        return self._run_store
+
     async def qualify_all(
         self,
         *,
@@ -241,7 +313,10 @@ class FlowAccountQualificationRunner:
             raise ValueError("qualification_runner_already_used")
         self._used = True
         checked_approval = SandboxRunApproval.model_validate(approval)
-        is_dry_run = checked_approval.dry_run if dry_run is None else bool(dry_run)
+        is_dry_run = self._constructor_dry_run or checked_approval.dry_run or bool(dry_run)
+        if not is_dry_run and self._runtime_factory is not None:
+            self.runtime = self._runtime_factory()
+        self._select_run_store(is_dry_run=is_dry_run)
         evaluated_at = self._timestamp()
         records: dict[tuple[str, str], ValidationKnowledge] = {}
         contracts: _Contracts | None = None
@@ -262,10 +337,11 @@ class FlowAccountQualificationRunner:
             try:
                 contracts = self._load_contracts()
             except Exception:
-                contracts = self._fallback_contracts()
                 preflight_failure = preflight_failure or "contract_invalid"
 
-        if is_dry_run or preflight_failure is not None:
+        if contracts is None:
+            self._fill_unvalidated_records(records, evaluated_at=evaluated_at)
+        elif is_dry_run or preflight_failure is not None:
             self._fill_terminal_records(
                 contracts,
                 records,
@@ -277,25 +353,49 @@ class FlowAccountQualificationRunner:
                 ),
             )
 
-        final_state = self.run_store.state
-        if preflight_failure is None:
+        if is_dry_run and preflight_failure is None:
+            self.run_store.complete()
+            final_state = self.run_store.state
+        elif not is_dry_run and preflight_failure is None:
             final_state = await self._cleanup_and_complete()
+        else:
+            final_state = self.run_store.state
 
         if len(records) != FLOWACCOUNT_ACTION_COUNT:
-            self._fill_terminal_records(
-                contracts,
-                records,
-                evaluated_at=evaluated_at,
-                executable_status=ValidationStatus.BLOCKED_MISSING_PREREQUISITE,
-            )
+            if contracts is None:
+                self._fill_unvalidated_records(records, evaluated_at=evaluated_at)
+            else:
+                self._fill_terminal_records(
+                    contracts,
+                    records,
+                    evaluated_at=evaluated_at,
+                    executable_status=ValidationStatus.BLOCKED_MISSING_PREREQUISITE,
+                )
         return build_coverage_report(
-            contracts.actions,
+            contracts.actions if contracts is not None else None,
             tuple(records.values()),
             final_state,
             run_id=self.run_id,
             http_attempts=self._transport.request_count,
             mutation_attempts=self._transport.mutation_attempts,
         )
+
+    def _select_run_store(self, *, is_dry_run: bool) -> None:
+        if self._run_store is not None:
+            raise ValueError("qualification_run_store_already_selected")
+        if is_dry_run:
+            selected: QualificationRunStore | _EphemeralRunStore = _EphemeralRunStore(
+                self.run_id
+            )
+        else:
+            selected = self._provided_run_store or QualificationRunStore(
+                self.runtime.repository.root,
+                self.run_id,
+                clock=self._clock,
+            )
+        if self.fixture_registry.run_id != selected.run_id:
+            raise ValueError("qualification_run_store_mismatch")
+        self._run_store = selected
 
     async def _qualify_live(
         self,
@@ -445,7 +545,7 @@ class FlowAccountQualificationRunner:
                     environment="sandbox",
                     event="completed",
                     state=result.status,
-                    result=result,
+                    result=_audit_safe_result(result),
                     latency_ms=latency_ms,
                 )
             except Exception:
@@ -530,13 +630,12 @@ class FlowAccountQualificationRunner:
         return result
 
     def _load_contracts(self) -> _Contracts:
-        actions = (
+        loaded_actions = (
             tuple(revalidate_catalog_action(action) for action in self._provided_actions)
             if self._provided_actions is not None
             else tuple(load_actions(self._required_path(self.catalog_path)))
         )
-        if len(actions) != FLOWACCOUNT_ACTION_COUNT:
-            raise ValueError("qualification_catalog_coverage_invalid")
+        actions = require_canonical_flowaccount_actions(loaded_actions)
         for action in actions:
             active = revalidate_catalog_action(
                 self.runtime.catalog.require_version(action.action_id, action.version_id)
@@ -566,72 +665,22 @@ class FlowAccountQualificationRunner:
         plan = plan_fixture_dependencies(actions, manifest, semantics)
         return _Contracts(actions=actions, manifest=manifest, semantics=semantics, plan=plan)
 
-    def _fallback_contracts(self) -> _Contracts:
-        if self._provided_actions is not None:
-            actions = tuple(revalidate_catalog_action(action) for action in self._provided_actions)
-        elif self.catalog_path is not None:
-            actions = tuple(load_actions(self.catalog_path))
-        else:
-            actions = tuple(
-                revalidate_catalog_action(action)
-                for action in self.runtime.catalog.list()
-                if action.connector_id == "flowaccount"
+    def _fill_unvalidated_records(
+        self,
+        records: dict[tuple[str, str], ValidationKnowledge],
+        *,
+        evaluated_at: datetime,
+    ) -> None:
+        for identity in FLOWACCOUNT_CANONICAL_IDENTITIES:
+            records.setdefault(
+                identity,
+                build_unvalidated_terminal_record(
+                    identity=identity,
+                    run_id=self.run_id,
+                    run_state=self.run_store.state,
+                    evaluated_at=evaluated_at,
+                ),
             )
-        if len(actions) != FLOWACCOUNT_ACTION_COUNT:
-            raise ValueError("qualification_catalog_coverage_invalid")
-        manifest = SandboxExecutionManifest(
-            environment="sandbox",
-            catalog_sha256="0" * 64,
-            actions=tuple(
-                reviewed_policy_for(action)
-                for action in sorted(
-                    actions,
-                    key=lambda item: (item.action_id, item.version_id),
-                )
-            ),
-        )
-        semantics = {
-            (action.action_id, action.version_id): (
-                self._provided_semantics.get((action.action_id, action.version_id))
-                if self._provided_semantics is not None
-                else contract_for(action)
-            )
-            for action in actions
-        }
-        checked_semantics = {
-            identity: SemanticContract.model_validate(contract or contract_for(action))
-            for identity, action in {
-                (action.action_id, action.version_id): action for action in actions
-            }.items()
-            for contract in (semantics[identity],)
-        }
-        execution_order = tuple(sorted((action.action_id, action.version_id) for action in actions))
-        from mercury_tools.qualification.planner import ActionReference
-
-        plan = FixturePlan(
-            execution_order=tuple(
-                ActionReference(action_id=action_id, version_id=version_id)
-                for action_id, version_id in execution_order
-            ),
-            reviewed_edges=(),
-            recommendations=(),
-            executable_actions=tuple(
-                ActionReference(action_id=action_id, version_id=version_id)
-                for action_id, version_id in execution_order
-                if (action_id, version_id)
-                in {
-                    (policy.action_id, policy.version_id)
-                    for policy in manifest.actions
-                    if policy.disposition is SandboxDisposition.SANDBOX_EXECUTABLE
-                }
-            ),
-        )
-        return _Contracts(
-            actions=actions,
-            manifest=manifest,
-            semantics=checked_semantics,
-            plan=plan,
-        )
 
     def _fill_terminal_records(
         self,
@@ -726,7 +775,11 @@ class FlowAccountQualificationRunner:
         try:
             coordinator = CleanupCoordinator(
                 self.fixture_registry,
-                self.cleanup_adapter,
+                _BoundedCleanupAdapter(
+                    self.cleanup_adapter,
+                    self._transport,
+                    self.runtime.catalog,
+                ),
                 self.run_store,
             )
             await coordinator.cleanup()
@@ -797,12 +850,29 @@ def _status_class(result: ConnectorResult) -> str:
     return "network_error" if result.dispatched else "not_attempted"
 
 
+def _audit_safe_result(result: ConnectorResult) -> ConnectorResult:
+    return ConnectorResult(
+        status=result.status,
+        http_status=result.http_status,
+        data=None,
+        summary="response_sanitized",
+        dispatched=result.dispatched,
+    )
+
+
 def _latency_ms(started: float, finished: float) -> int:
     return max(0, min(int((finished - started) * 1000), 86_400_000))
 
 
 def _new_run_id() -> str:
     return "run_" + "".join(secrets.choice(_OPAQUE_ALPHABET) for _ in range(26))
+
+
+def _load_requested_canonical_actions(path: Path) -> tuple[CatalogAction, ...]:
+    try:
+        return require_canonical_flowaccount_actions(tuple(load_actions(path)))
+    except Exception:
+        return ()
 
 
 def create_flowaccount_qualification_runner(
@@ -820,15 +890,17 @@ def create_flowaccount_qualification_runner(
     catalog_path = root / "catalog" / "global" / "flowaccount" / "actions.json"
     manifest_path = root / "catalog" / "global" / "flowaccount" / "sandbox-execution-manifest.json"
     semantics_path = root / "catalog" / "global" / "flowaccount" / "semantic-contracts.json"
-    actions = tuple(load_actions(catalog_path))
-    temporary_repository: tempfile.TemporaryDirectory[str] | None = None
-    state_root = root
-    if dry_run:
-        temporary_repository = tempfile.TemporaryDirectory(prefix="mercury-qualification-")
-        state_root = Path(temporary_repository.name)
-    context = ensure_repository_state(state_root)
+    actions = _load_requested_canonical_actions(catalog_path)
+    temporary_repository = tempfile.TemporaryDirectory(prefix="mercury-qualification-")
+    context = ensure_repository_state(Path(temporary_repository.name))
     runtime = LocalMercuryRuntime.for_repository(context)
     runtime.catalog.replace(actions)
+
+    def persistent_runtime() -> LocalMercuryRuntime:
+        persistent = LocalMercuryRuntime.for_repository(ensure_repository_state(root))
+        persistent.catalog.replace(actions)
+        return persistent
+
     runner = FlowAccountQualificationRunner(
         runtime,
         actions=actions,
@@ -840,6 +912,8 @@ def create_flowaccount_qualification_runner(
         clock=clock,
         monotonic=monotonic,
         sleeper=sleeper,
+        dry_run=dry_run,
+        runtime_factory=persistent_runtime,
     )
     runner._temporary_repository = temporary_repository
     return runner
