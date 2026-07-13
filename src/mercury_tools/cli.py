@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -23,6 +24,11 @@ from mercury_tools.flows.workspace import (
     workspace_manifest,
 )
 from mercury_tools.local.credential_cli import add_credential_parsers
+from mercury_tools.qualification.flowaccount import (
+    SandboxRunApproval,
+    create_flowaccount_qualification_runner,
+)
+from mercury_tools.qualification.models import QualificationRunState
 from mercury_tools.rag.embeddings import create_embedding_provider
 from mercury_tools.rag.ingest import ingest_wiki
 from mercury_tools.rag.models import SearchFilters, public_search_result_payload
@@ -118,6 +124,42 @@ def cmd_search(args: argparse.Namespace) -> int:
             print(f"  {item['text'][:240].replace(chr(10), ' ')}")
             print(f"  citation: {item['citation']}")
     return 0
+
+
+def cmd_catalog_qualify(args: argparse.Namespace) -> int:
+    if (args.connector, args.environment, args.all) != (
+        "flowaccount",
+        "sandbox",
+        True,
+    ):
+        _print_json(
+            {
+                "status": "error",
+                "error": "qualification_scope_not_supported",
+            }
+        )
+        return 2
+
+    try:
+        runner = create_flowaccount_qualification_runner(
+            Path(args.repo_root),
+            dry_run=bool(args.dry_run),
+        )
+        report = asyncio.run(
+            runner.qualify_all(
+                approval=SandboxRunApproval(
+                    reads=True,
+                    writes=bool(args.sandbox_writes),
+                    dry_run=bool(args.dry_run),
+                ),
+                dry_run=bool(args.dry_run),
+            )
+        )
+    except Exception:
+        _print_json({"status": "error", "error": "qualification_failed"})
+        return 1
+    _print_json(report.public_dict())
+    return 0 if report.run_state is QualificationRunState.COMPLETED else 1
 
 
 def cmd_mcp_serve(args: argparse.Namespace) -> int:
@@ -302,8 +344,7 @@ def cmd_flow_manifest(args: argparse.Namespace) -> int:
         print(f"Mercury flow manifest: {payload['workspace']['root']}")
         print(f"runtime: {payload['runtime_boundary']['primary_runtime']}")
         print(
-            f"flows: {discovery['selected_count']} selected / "
-            f"{discovery['flow_count']} discovered"
+            f"flows: {discovery['selected_count']} selected / {discovery['flow_count']} discovered"
         )
         if discovery["tags"]:
             print("tags: " + ", ".join(discovery["tags"]))
@@ -610,6 +651,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     add_credential_parsers(sub)
+
+    catalog = sub.add_parser("catalog")
+    catalog_sub = catalog.add_subparsers(dest="catalog_command", required=True)
+    qualify = catalog_sub.add_parser("qualify")
+    qualify.add_argument("--connector", required=True)
+    qualify.add_argument("--env", dest="environment", required=True)
+    qualify.add_argument("--all", action="store_true")
+    qualify.add_argument("--sandbox-writes", action="store_true")
+    qualify.add_argument("--dry-run", action="store_true")
+    qualify.add_argument("--repo-root", default=".")
+    qualify.set_defaults(func=cmd_catalog_qualify)
 
     ingest = sub.add_parser("ingest")
     ingest_sub = ingest.add_subparsers(dest="ingest_command", required=True)
