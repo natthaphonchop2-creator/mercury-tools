@@ -1,0 +1,604 @@
+import json
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import httpx
+import pytest
+from pydantic import ValidationError
+
+import mercury_tools.db.validation as validation_module
+from mercury_tools.catalog.models import HttpMethod
+from mercury_tools.config import Settings
+from mercury_tools.db.validation import (
+    CoverageResult,
+    ObservationMetadata,
+    ObservationState,
+    ResolveResult,
+    SupabaseValidationStore,
+    ValidationObservation,
+)
+from mercury_tools.qualification.models import (
+    EvidenceLevel,
+    ExecutionEligibility,
+    QualificationRunState,
+    SemanticContract,
+    ValidationKnowledge,
+    ValidationStatus,
+)
+from mercury_tools.qualification.selection import EvidenceOutcome, EvidenceRequest
+from mercury_tools.qualification.templates import SUMMARY_EN, SUMMARY_TH
+
+NOW = datetime(2026, 7, 13, 12, tzinfo=UTC)
+
+
+class FakeResponse:
+    def __init__(
+        self,
+        status_code: int = 200,
+        body: Any = None,
+        *,
+        text: str | None = None,
+        json_error: ValueError | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self._body = body
+        self._json_error = json_error
+        self.text = text if text is not None else ("" if body is None else json.dumps(body))
+
+    def json(self) -> Any:
+        if self._json_error is not None:
+            raise self._json_error
+        return self._body
+
+
+def _settings(**overrides: Any) -> Settings:
+    values = {
+        "supabase_url": "https://example.supabase.co",
+        "supabase_service_role_key": "test-service-role-key",
+        "openai_api_key": "",
+    }
+    values.update(overrides)
+    return Settings(**values)
+
+
+def _record(**overrides: Any) -> ValidationKnowledge:
+    status = ValidationStatus(overrides.get("validation_status", ValidationStatus.LIVE_SUCCESS))
+    run_number = int(overrides.pop("run_number", 1))
+    action_number = int(overrides.pop("action_number", 1))
+    version_number = int(overrides.pop("version_number", action_number))
+    values = {
+        "opaque_evidence_id": f"ev_{run_number:026d}",
+        "run_id": f"run_{run_number:026d}",
+        "action_id": f"act_{action_number:024x}",
+        "version_id": f"av_{version_number:064x}",
+        "connector_id": "flowaccount",
+        "environment": "sandbox",
+        "validation_status": status,
+        "evidence_level": EvidenceLevel.SANDBOX_OBSERVED,
+        "execution_eligibility": ExecutionEligibility.SANDBOX_READ,
+        "approved_public": True,
+        "summary_th": SUMMARY_TH[status],
+        "summary_en": SUMMARY_EN[status],
+        "prerequisites": ("review_fixture",),
+        "limitations": ("sandbox_only",),
+        "recommended_next_step": "review_accounting_result",
+        "response_shape": {
+            "counterparty_tax_id": "string",
+            "document_id": "string",
+            "email": "string",
+        },
+        "status_class": "2xx",
+        "latency_ms": 25,
+        "semantic_contract": SemanticContract(
+            business_object="invoice",
+            operation="list",
+            accounting_uses=("revenue_review",),
+            output_semantics={"document_id": "document identifier string"},
+        ),
+        "evidence_sha256": f"{run_number:064x}",
+        "reviewed_by": "release_reviewer",
+        "runner_version": "v0.2.1",
+        "run_state": QualificationRunState.COMPLETED,
+        "evaluated_at": NOW - timedelta(hours=1),
+        "expires_at": NOW + timedelta(days=1),
+    }
+    values.update(overrides)
+    values["validation_status"] = status
+    return ValidationKnowledge.model_validate(values)
+
+
+def _request(action_number: int = 1, version_number: int | None = None) -> EvidenceRequest:
+    version_number = action_number if version_number is None else version_number
+    return EvidenceRequest(
+        connector_id="flowaccount",
+        action_id=f"act_{action_number:024x}",
+        version_id=f"av_{version_number:064x}",
+        environment="sandbox",
+    )
+
+
+def _observation(**overrides: Any) -> ValidationObservation:
+    values = {
+        "opaque_event_id": "evt_00000000000000000000000001",
+        "action_id": f"act_{1:024x}",
+        "version_id": f"av_{1:064x}",
+        "connector_id": "flowaccount",
+        "method": HttpMethod.GET,
+        "observed_state": ObservationState.SUCCESS,
+        "status_class": "2xx",
+        "latency_ms": 25,
+        "metadata": ObservationMetadata(
+            source="sandbox_runner",
+            reviewed_by="release_reviewer",
+            note="reviewed_expected_outcome",
+        ),
+    }
+    values.update(overrides)
+    return ValidationObservation.model_validate(values)
+
+
+def _identity(row: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    return (
+        row["connector_id"],
+        row["action_id"],
+        row["version_id"],
+        row["environment"],
+        row["run_id"],
+    )
+
+
+def test_store_reuses_required_supabase_settings() -> None:
+    with pytest.raises(
+        RuntimeError,
+        match="^SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required\\.$",
+    ):
+        SupabaseValidationStore(_settings(supabase_url="", supabase_service_role_key=""))
+
+
+def test_publish_validates_entire_batch_before_first_network_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    invalid = _record(run_number=2, environment="development")
+    monkeypatch.setattr(
+        validation_module.httpx,
+        "request",
+        lambda *args, **kwargs: calls.append({"args": args, **kwargs}),
+    )
+
+    with pytest.raises(ValueError, match="^validation_evidence_invalid$"):
+        SupabaseValidationStore(_settings()).publish([_record(), invalid])
+
+    assert calls == []
+
+
+def test_publish_uses_json_mode_and_exact_append_conflict_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        if method == "GET":
+            return FakeResponse(body=[])
+        return FakeResponse(status_code=201, body=kwargs["json"])
+
+    monkeypatch.setattr(validation_module.httpx, "request", request)
+
+    created = SupabaseValidationStore(_settings()).publish([_record()])
+
+    assert created == 1
+    post = next(call for call in calls if call["method"] == "POST")
+    row = post["json"][0]
+    assert post["params"] == {"on_conflict": "connector_id,action_id,version_id,environment,run_id"}
+    assert post["headers"]["Prefer"] == "resolution=ignore-duplicates,return=representation"
+    assert row["validation_status"] == "live_success"
+    assert row["evidence_level"] == "sandbox_observed"
+    assert row["run_state"] == "completed"
+    assert row["evaluated_at"] == "2026-07-13T11:00:00Z"
+    assert row["expires_at"] == "2026-07-14T12:00:00Z"
+    assert row["prerequisites"] == ["review_fixture"]
+    assert row["semantic_contract"]["accounting_uses"] == ["revenue_review"]
+    assert row["semantic_contract"]["output_semantics"] == {
+        "document_id": "document identifier string"
+    }
+    assert row["response_shape"] == {
+        "counterparty_tax_id": "string",
+        "document_id": "string",
+        "email": "string",
+    }
+    assert type(row["response_shape"]) is dict
+    assert not any(call["method"] in {"PATCH", "PUT", "DELETE"} for call in calls)
+
+
+def test_identical_publish_retry_is_idempotent_and_never_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    stored: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+
+    def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        if method == "GET":
+            matched = [
+                row
+                for row in stored.values()
+                if all(
+                    kwargs["params"][field] == f"eq.{row[field]}"
+                    for field in (
+                        "connector_id",
+                        "action_id",
+                        "version_id",
+                        "environment",
+                        "run_id",
+                    )
+                )
+            ]
+            return FakeResponse(body=matched)
+        inserted = []
+        for row in kwargs["json"]:
+            if _identity(row) not in stored:
+                stored[_identity(row)] = row
+                inserted.append(row)
+        return FakeResponse(status_code=201, body=inserted)
+
+    monkeypatch.setattr(validation_module.httpx, "request", request)
+    store = SupabaseValidationStore(_settings())
+    record = _record()
+
+    assert store.publish([record, record]) == 1
+    assert store.publish([record]) == 0
+    assert sum(call["method"] == "POST" for call in calls) == 1
+    assert not any(call["method"] in {"PATCH", "PUT", "DELETE"} for call in calls)
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    [
+        _record(evidence_sha256="f" * 64),
+        _record(
+            validation_status=ValidationStatus.LIVE_FAILED,
+            summary_th=SUMMARY_TH[ValidationStatus.LIVE_FAILED],
+            summary_en=SUMMARY_EN[ValidationStatus.LIVE_FAILED],
+            run_state=QualificationRunState.FAILED,
+            status_class="4xx",
+        ),
+    ],
+)
+def test_conflicting_duplicate_publish_raises_constant_error_without_update(
+    monkeypatch: pytest.MonkeyPatch,
+    conflict: ValidationKnowledge,
+) -> None:
+    original = _record().model_dump(mode="json")
+    calls: list[str] = []
+
+    def request(method: str, _url: str, **_kwargs: Any) -> FakeResponse:
+        calls.append(method)
+        return FakeResponse(body=[original])
+
+    monkeypatch.setattr(validation_module.httpx, "request", request)
+
+    with pytest.raises(RuntimeError, match="^supabase_validation_conflict$"):
+        SupabaseValidationStore(_settings()).publish([conflict])
+
+    assert calls == ["GET"]
+
+
+def test_conflicting_duplicate_inside_batch_is_rejected_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[Any] = []
+    monkeypatch.setattr(
+        validation_module.httpx,
+        "request",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match="^supabase_validation_conflict$"):
+        SupabaseValidationStore(_settings()).publish([_record(), _record(evidence_sha256="f" * 64)])
+
+    assert calls == []
+
+
+def test_publish_detects_conflict_inserted_during_append_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conflicting = _record(evidence_sha256="f" * 64).model_dump(mode="json")
+    get_count = 0
+
+    def request(method: str, _url: str, **_kwargs: Any) -> FakeResponse:
+        nonlocal get_count
+        if method == "POST":
+            return FakeResponse(status_code=201, body=[])
+        get_count += 1
+        return FakeResponse(body=[] if get_count == 1 else [conflicting])
+
+    monkeypatch.setattr(validation_module.httpx, "request", request)
+
+    with pytest.raises(RuntimeError, match="^supabase_validation_conflict$"):
+        SupabaseValidationStore(_settings()).publish([_record()])
+
+
+def test_record_observation_retries_by_opaque_event_id_without_raw_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    stored: dict[str, dict[str, Any]] = {}
+
+    def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        if method == "GET":
+            event_id = kwargs["params"]["opaque_event_id"].removeprefix("eq.")
+            return FakeResponse(body=[stored[event_id]] if event_id in stored else [])
+        row = kwargs["json"][0]
+        stored.setdefault(row["opaque_event_id"], row)
+        return FakeResponse(status_code=201, body=[row])
+
+    monkeypatch.setattr(validation_module.httpx, "request", request)
+    store = SupabaseValidationStore(_settings())
+    observation = _observation()
+
+    assert store.record_observation(observation) is True
+    assert store.record_observation(observation) is False
+    post = next(call for call in calls if call["method"] == "POST")
+    assert post["params"] == {"on_conflict": "opaque_event_id"}
+    assert post["json"] == [
+        {
+            "opaque_event_id": "evt_00000000000000000000000001",
+            "action_id": f"act_{1:024x}",
+            "version_id": f"av_{1:064x}",
+            "connector_id": "flowaccount",
+            "method": "GET",
+            "observed_state": "success",
+            "status_class": "2xx",
+            "latency_ms": 25,
+            "metadata": {
+                "source": "sandbox_runner",
+                "reviewed_by": "release_reviewer",
+                "note": "reviewed_expected_outcome",
+            },
+        }
+    ]
+    assert sum(call["method"] == "POST" for call in calls) == 1
+
+
+def test_record_observation_rejects_raw_provider_metadata_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[Any] = []
+    secret = "synthetic-provider-body"
+    monkeypatch.setattr(
+        validation_module.httpx,
+        "request",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    unsafe = {
+        **_observation().model_dump(mode="json"),
+        "metadata": {"raw_response": {"provider_body": secret}},
+    }
+
+    with pytest.raises(ValueError, match="^validation_observation_invalid$") as raised:
+        SupabaseValidationStore(_settings()).record_observation(unsafe)
+
+    assert secret not in str(raised.value)
+    assert calls == []
+
+
+def test_record_observation_rejects_provider_json_hidden_in_note_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[Any] = []
+    raw_provider_json = '{"provider_response":{"document_id":"synthetic"}}'
+    monkeypatch.setattr(
+        validation_module.httpx,
+        "request",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    unsafe = {
+        **_observation().model_dump(mode="json"),
+        "metadata": {"note": raw_provider_json},
+    }
+
+    with pytest.raises(ValueError, match="^validation_observation_invalid$") as raised:
+        SupabaseValidationStore(_settings()).record_observation(unsafe)
+
+    assert raw_provider_json not in str(raised.value)
+    assert calls == []
+
+
+def test_conflicting_observation_retry_raises_constant_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    existing = _observation().model_dump(mode="json")
+    monkeypatch.setattr(
+        validation_module.httpx,
+        "request",
+        lambda *_args, **_kwargs: FakeResponse(body=[existing]),
+    )
+
+    with pytest.raises(RuntimeError, match="^supabase_observation_conflict$"):
+        SupabaseValidationStore(_settings()).record_observation(
+            _observation(status_class="4xx", observed_state=ObservationState.FAILED)
+        )
+
+
+def test_resolve_returns_frozen_typed_entries_in_scope_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = {
+        _request(1).action_id: [_record(action_number=1).model_dump(mode="json")],
+        _request(2).action_id: [_record(action_number=2, run_number=2).model_dump(mode="json")],
+    }
+    calls: list[dict[str, Any]] = []
+
+    def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        action_id = kwargs["params"]["action_id"].removeprefix("eq.")
+        return FakeResponse(body=rows[action_id])
+
+    monkeypatch.setattr(validation_module.httpx, "request", request)
+
+    result = SupabaseValidationStore(_settings()).resolve([_request(2), _request(1)], now=NOW)
+
+    assert isinstance(result, ResolveResult)
+    assert tuple(entry.request.action_id for entry in result.entries) == (
+        _request(1).action_id,
+        _request(2).action_id,
+    )
+    assert all(entry.selection.outcome is EvidenceOutcome.LIVE_SUCCESS for entry in result.entries)
+    assert [call["params"]["action_id"] for call in calls] == [
+        f"eq.{_request(1).action_id}",
+        f"eq.{_request(2).action_id}",
+    ]
+    assert all(call["params"]["order"] == "evaluated_at.desc,run_id.desc" for call in calls)
+    with pytest.raises(ValidationError, match="frozen"):
+        result.entries = ()
+
+
+def test_resolve_validates_all_requests_and_now_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[Any] = []
+    monkeypatch.setattr(
+        validation_module.httpx,
+        "request",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(ValueError, match="^evidence_request_invalid$"):
+        SupabaseValidationStore(_settings()).resolve(
+            [_request(), {**_request(2).model_dump(), "environment": "local,or=(id.gt.0)"}],
+            now=NOW,
+        )
+    assert calls == []
+
+    with pytest.raises(ValueError, match="^evidence_timestamp_naive$"):
+        SupabaseValidationStore(_settings()).resolve([_request()], now=datetime(2026, 7, 13, 12))
+    assert calls == []
+
+
+def test_coverage_uses_exact_filters_and_returns_deterministic_typed_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _record(action_number=1, run_number=1, evaluated_at=NOW - timedelta(days=1))
+    tied_low = _record(action_number=2, run_number=2, evaluated_at=NOW)
+    tied_high = _record(action_number=2, run_number=3, evaluated_at=NOW)
+    response_rows = [
+        tied_low.model_dump(mode="json"),
+        first.model_dump(mode="json"),
+        tied_high.model_dump(mode="json"),
+    ]
+    calls: list[dict[str, Any]] = []
+
+    def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        return FakeResponse(body=response_rows)
+
+    monkeypatch.setattr(validation_module.httpx, "request", request)
+
+    result = SupabaseValidationStore(_settings()).coverage("flowaccount", "sandbox")
+
+    assert isinstance(result, CoverageResult)
+    assert result.connector_id == "flowaccount"
+    assert result.environment == "sandbox"
+    assert result.records == (first, tied_high, tied_low)
+    assert list(calls[0]["params"]) == ["connector_id", "environment", "select", "order"]
+    assert calls[0]["params"]["connector_id"] == "eq.flowaccount"
+    assert calls[0]["params"]["environment"] == "eq.sandbox"
+    assert calls[0]["params"]["order"] == (
+        "action_id.asc,version_id.asc,evaluated_at.desc,run_id.desc"
+    )
+    with pytest.raises(ValidationError, match="frozen"):
+        result.records = ()
+
+
+def test_coverage_rejects_unsafe_filter_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[Any] = []
+    secret = "Bearer synthetic-filter-secret"
+    monkeypatch.setattr(
+        validation_module.httpx,
+        "request",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(ValueError, match="^validation_coverage_filter_invalid$") as raised:
+        SupabaseValidationStore(_settings()).coverage(secret, "sandbox")
+
+    assert secret not in str(raised.value)
+    assert calls == []
+
+
+def _non_2xx(secret: str) -> Callable[..., FakeResponse]:
+    return lambda *_args, **_kwargs: FakeResponse(
+        status_code=503,
+        text=f'{{"provider_body":"{secret}"}}',
+    )
+
+
+def _transport_error(secret: str) -> Callable[..., FakeResponse]:
+    def request(*_args: Any, **_kwargs: Any) -> FakeResponse:
+        raise httpx.ConnectError(
+            f"transport failed with {secret}",
+            request=httpx.Request("GET", "https://example.supabase.co"),
+        )
+
+    return request
+
+
+def _malformed_json(secret: str) -> Callable[..., FakeResponse]:
+    return lambda *_args, **_kwargs: FakeResponse(
+        text=f'{{"provider_body":"{secret}"}}',
+        json_error=ValueError(f"malformed {secret}"),
+    )
+
+
+def _wrong_shape(secret: str) -> Callable[..., FakeResponse]:
+    return lambda *_args, **_kwargs: FakeResponse(body={"provider_body": secret})
+
+
+@pytest.mark.parametrize(
+    ("factory", "expected_error"),
+    [
+        (_non_2xx, "supabase_validation_request_failed"),
+        (_transport_error, "supabase_validation_request_failed"),
+        (_malformed_json, "supabase_validation_response_invalid"),
+        (_wrong_shape, "supabase_validation_response_invalid"),
+    ],
+)
+def test_store_errors_never_echo_bodies_exceptions_urls_headers_or_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    factory: Callable[[str], Callable[..., FakeResponse]],
+    expected_error: str,
+) -> None:
+    secret = "synthetic-secret-that-must-not-echo"
+    monkeypatch.setattr(validation_module.httpx, "request", factory(secret))
+
+    with pytest.raises(RuntimeError, match=f"^{expected_error}") as raised:
+        SupabaseValidationStore(_settings()).coverage("flowaccount", "sandbox")
+
+    error = str(raised.value)
+    assert secret not in error
+    assert "example.supabase.co" not in error
+    assert "test-service-role-key" not in error
+
+
+def test_malformed_row_raises_constant_no_echo_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "synthetic-provider-row"
+    monkeypatch.setattr(
+        validation_module.httpx,
+        "request",
+        lambda *_args, **_kwargs: FakeResponse(body=[{"raw_response": {"provider_body": secret}}]),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^supabase_validation_response_invalid$",
+    ) as raised:
+        SupabaseValidationStore(_settings()).coverage("flowaccount", "sandbox")
+
+    assert secret not in str(raised.value)
