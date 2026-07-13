@@ -130,9 +130,11 @@ class QualificationRunStore:
         _require_atomic_state_capabilities()
         self._clock = clock or (lambda: datetime.now(UTC))
         self._state_path = self._root / ".mercury" / "validation" / self._run_id / _STATE_NAME
+        self._runtime_binding_failed = False
 
         run_fd = _open_run_directory(self._root, self._run_id)
         try:
+            self._run_directory_identity = _directory_identity(run_fd)
             existing = _read_state(run_fd)
             recovered = existing is not None
             if existing is None:
@@ -149,11 +151,13 @@ class QualificationRunStore:
                 _write_state(self._root, self._run_id, run_fd, initial)
                 _validate_run_directory_binding(self._root, self._run_id, run_fd)
                 self._record = initial
+                self._validate_runtime_binding()
             else:
                 if existing.run_id != self._run_id:
                     raise ValueError("qualification_state_invalid")
                 _validate_run_directory_binding(self._root, self._run_id, run_fd)
                 self._record = existing
+                self._validate_runtime_binding()
         finally:
             os.close(run_fd)
 
@@ -170,14 +174,17 @@ class QualificationRunStore:
 
     @property
     def state(self) -> QualificationRunState:
+        self._validate_runtime_binding()
         return self._record.state
 
     @property
     def publication_allowed(self) -> bool:
+        self._validate_runtime_binding()
         return self._record.publication_allowed
 
     @property
     def quarantine_reason(self) -> str | None:
+        self._validate_runtime_binding()
         return self._record.quarantine_reason
 
     def record_fixtures(self, fixtures: Sequence[FixtureReference]) -> None:
@@ -225,6 +232,7 @@ class QualificationRunStore:
             )
 
     def cleanup_status(self, handle: str) -> CleanupStatus:
+        self._validate_runtime_binding()
         checked_handle = validate_fixture_handle(handle)
         for fixture in self._record.fixtures:
             if fixture.handle == checked_handle:
@@ -349,18 +357,39 @@ class QualificationRunStore:
         transition_at: datetime | None = None,
         **updates: Any,
     ) -> None:
+        self._validate_runtime_binding()
         timestamp = self._timestamp() if transition_at is None else transition_at
         if timestamp < self._record.updated_at:
             raise ValueError("qualification_clock_regressed")
         updates["updated_at"] = timestamp
         candidate = self._record.model_copy(update=updates)
+        previous = self._record
         run_fd = _open_run_directory(self._root, self._run_id)
         try:
+            _validate_directory_identity(run_fd, self._run_directory_identity)
             _write_state(self._root, self._run_id, run_fd, candidate)
             _validate_run_directory_binding(self._root, self._run_id, run_fd)
             self._record = candidate
+            try:
+                self._validate_runtime_binding()
+            except ValueError:
+                self._record = previous
+                raise
         finally:
             os.close(run_fd)
+
+    def _validate_runtime_binding(self) -> None:
+        if self._runtime_binding_failed:
+            raise ValueError("qualification_state_path_unsafe") from None
+        try:
+            _validate_expected_run_directory_binding(
+                self._root,
+                self._run_id,
+                self._run_directory_identity,
+            )
+        except ValueError:
+            self._runtime_binding_failed = True
+            raise ValueError("qualification_state_path_unsafe") from None
 
     def _timestamp(self) -> datetime:
         try:
@@ -496,6 +525,39 @@ def _validate_run_directory_binding(root: Path, run_id: str, run_fd: int) -> Non
         raise
     except OSError:
         raise ValueError("qualification_state_path_unsafe") from None
+    finally:
+        if lexical_fd >= 0:
+            with suppress(OSError):
+                os.close(lexical_fd)
+
+
+def _directory_identity(descriptor: int) -> tuple[int, int]:
+    try:
+        opened = os.fstat(descriptor)
+    except OSError:
+        raise ValueError("qualification_state_path_unsafe") from None
+    if not stat.S_ISDIR(opened.st_mode):
+        raise ValueError("qualification_state_path_unsafe")
+    return opened.st_dev, opened.st_ino
+
+
+def _validate_directory_identity(
+    descriptor: int,
+    expected: tuple[int, int],
+) -> None:
+    if _directory_identity(descriptor) != expected:
+        raise ValueError("qualification_state_path_unsafe")
+
+
+def _validate_expected_run_directory_binding(
+    root: Path,
+    run_id: str,
+    expected: tuple[int, int],
+) -> None:
+    lexical_fd = -1
+    try:
+        lexical_fd = _open_run_directory(root, run_id, create=False)
+        _validate_directory_identity(lexical_fd, expected)
     finally:
         if lexical_fd >= 0:
             with suppress(OSError):

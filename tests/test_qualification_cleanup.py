@@ -306,6 +306,42 @@ def test_terminal_transition_error_stops_before_prerequisite_cleanup(
     assert store.publication_allowed is False
 
 
+@pytest.mark.parametrize(
+    "outcome",
+    [CleanupOutcome.FAILED, CleanupOutcome.OUTCOME_UNKNOWN],
+)
+def test_terminal_write_failure_halts_live_registry_before_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: CleanupOutcome,
+) -> None:
+    registry = _registry()
+    store = QualificationRunStore(tmp_path, RUN_ID)
+    store.record_fixtures(registry.references)
+    adapter = RecordingCleanupAdapter(outcomes={INVOICE_HANDLE: outcome})
+
+    def fail_rename(*args, **kwargs):
+        raise OSError("simulated terminal state rename failure")
+
+    monkeypatch.setattr(run_store_module.os, "rename", fail_rename)
+
+    with pytest.raises(ValueError, match="^qualification_state_write_failed$"):
+        asyncio.run(CleanupCoordinator(registry, adapter, store).cleanup())
+
+    retry_adapter = RecordingCleanupAdapter()
+    retry_report = asyncio.run(CleanupCoordinator(registry, retry_adapter, store).cleanup())
+
+    assert [call[0] for call in adapter.calls] == [INVOICE_HANDLE]
+    assert retry_adapter.calls == []
+    assert retry_report.attempted_handles == ()
+    assert retry_report.run_state is QualificationRunState.FAILED
+    assert retry_report.publication_allowed is False
+    assert store.cleanup_status(INVOICE_HANDLE) is CleanupStatus.PENDING
+    assert store.cleanup_status(CONTACT_HANDLE) is CleanupStatus.PENDING
+    assert "provider-contact-private-123" not in repr(registry)
+    assert "provider-invoice-private-456" not in repr(registry)
+
+
 def test_explicit_unknown_mutation_quarantines_without_cleanup_dispatch(
     tmp_path: Path,
 ) -> None:
@@ -482,8 +518,10 @@ def test_run_directory_swap_before_rename_fails_closed_without_touching_outside(
         store.complete()
 
     assert swapped is True
-    assert store.state is QualificationRunState.FAILED
-    assert store.publication_allowed is False
+    with pytest.raises(ValueError, match="^qualification_state_path_unsafe$"):
+        _ = store.state
+    with pytest.raises(ValueError, match="^qualification_state_path_unsafe$"):
+        _ = store.publication_allowed
     assert sentinel.read_text(encoding="utf-8") == "outside sentinel"
     assert not tuple(moved_run_dir.glob(".state-*.tmp"))
     assert tuple(outside.iterdir()) == (sentinel,)
@@ -519,10 +557,61 @@ def test_run_directory_swap_during_final_fsync_fails_closed(
         store.complete()
 
     assert swapped is True
-    assert store.state is QualificationRunState.FAILED
-    assert store.publication_allowed is False
+    with pytest.raises(ValueError, match="^qualification_state_path_unsafe$"):
+        _ = store.state
+    with pytest.raises(ValueError, match="^qualification_state_path_unsafe$"):
+        _ = store.publication_allowed
     assert sentinel.read_text(encoding="utf-8") == "outside fsync sentinel"
     assert not tuple(moved_run_dir.glob(".state-*.tmp"))
+    assert tuple(outside.iterdir()) == (sentinel,)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="dir_fd checks require POSIX")
+def test_run_directory_swap_after_final_check_never_authorizes_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = QualificationRunStore(tmp_path, RUN_ID)
+    run_dir = tmp_path / ".mercury" / "validation" / RUN_ID
+    moved_run_dir = tmp_path / "moved-after-final-check"
+    outside = tmp_path / "outside-after-final-check"
+    outside.mkdir()
+    sentinel = outside / "state.json"
+    sentinel.write_text("outside post-check sentinel", encoding="utf-8")
+    real_validate = run_store_module._validate_run_directory_binding
+    real_rename = run_store_module.os.rename
+    validation_calls = 0
+
+    def racing_validate(root: Path, run_id: str, run_fd: int) -> None:
+        nonlocal validation_calls
+        real_validate(root, run_id, run_fd)
+        validation_calls += 1
+        if validation_calls == 4:
+            real_rename(run_dir, moved_run_dir)
+            run_dir.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(
+        run_store_module,
+        "_validate_run_directory_binding",
+        racing_validate,
+    )
+
+    with pytest.raises(ValueError, match="^qualification_state_path_unsafe$"):
+        store.complete()
+
+    with pytest.raises(ValueError, match="^qualification_state_path_unsafe$"):
+        _ = store.state
+    with pytest.raises(ValueError, match="^qualification_state_path_unsafe$"):
+        _ = store.publication_allowed
+
+    registry = FixtureRegistry(run_id=RUN_ID)
+    adapter = RecordingCleanupAdapter()
+    with pytest.raises(ValueError, match="^qualification_state_path_unsafe$"):
+        asyncio.run(CleanupCoordinator(registry, adapter, store).cleanup())
+
+    assert validation_calls == 4
+    assert adapter.calls == []
+    assert sentinel.read_text(encoding="utf-8") == "outside post-check sentinel"
     assert tuple(outside.iterdir()) == (sentinel,)
 
 

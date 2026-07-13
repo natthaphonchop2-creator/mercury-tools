@@ -97,6 +97,7 @@ class FixtureRegistry:
         self._run_id = validate_run_id(run_id)
         self._fixtures: dict[str, FixtureCleanupTarget] = {}
         self._claimed_handles: set[str] = set()
+        self._cleanup_halted = False
 
     @property
     def run_id(self) -> str:
@@ -182,6 +183,13 @@ class FixtureRegistry:
         self._claimed_handles.add(checked_handle)
         return True
 
+    @property
+    def cleanup_halted(self) -> bool:
+        return self._cleanup_halted
+
+    def halt_cleanup(self) -> None:
+        self._cleanup_halted = True
+
     def __repr__(self) -> str:
         return f"FixtureRegistry(run_id={self.run_id!r}, handles={tuple(sorted(self._fixtures))!r})"
 
@@ -206,6 +214,8 @@ class CleanupCoordinator:
         self.run_store = run_store
 
     async def cleanup(self) -> CleanupReport:
+        if self.registry.cleanup_halted:
+            return self._report()
         if self.run_store.state is QualificationRunState.QUARANTINED:
             return self._report()
 
@@ -235,10 +245,12 @@ class CleanupCoordinator:
                 self.run_store.mark_cleanup(fixture.handle, CleanupStatus.CLEANED)
                 cleaned.append(fixture.handle)
             elif outcome is CleanupOutcome.FAILED:
+                self.registry.halt_cleanup()
                 self.run_store.quarantine_cleanup(fixture.handle, CleanupStatus.FAILED)
                 failed.append(fixture.handle)
                 break
             else:
+                self.registry.halt_cleanup()
                 self.run_store.quarantine_cleanup(
                     fixture.handle,
                     CleanupStatus.OUTCOME_UNKNOWN,
