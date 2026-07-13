@@ -13,36 +13,34 @@ LABELLED_SENSITIVE_VALUE_PATTERN = (
     r"(password[ _-]+value|token[ _-]+value|secret[ _-]+value|"
     r"credential[ _-]+value|api[ _-]+keys?|client[ _-]+secrets?|"
     r"passwords?|tokens?|secrets?|credentials?)"
-    r"( *[:=] *| +)([a-z0-9_.$+/-]+)"
-    r"( +([a-z]+))?( +([a-z]+))?"
+    r"([[:space:]]*[:=][[:space:]]*|[[:space:]]+)([^[:space:]].*)"
 )
 LABELLED_REFERENCE_VALUE_PATTERN = (
     r"(^|[^a-z0-9])(provider|source)[ _-]+(record|document)"
-    r"([ _-]+id)?( *[:=] *| +)([a-z0-9_.$+/-]+)"
-    r"( +([a-z]+))?( +([a-z]+))?"
+    r"([ _-]+id)?"
+    r"([[:space:]]*[:=][[:space:]]*|[[:space:]]+)([^[:space:]].*)"
 )
-SAFE_VALUE_STATES = {
-    "absent",
-    "available",
-    "configured",
-    "disabled",
-    "included",
-    "known",
-    "missing",
-    "needed",
-    "omitted",
-    "present",
-    "provided",
-    "redacted",
-    "required",
-    "stored",
-    "supported",
-    "unavailable",
-    "unknown",
-}
-SAFE_REFERENCE_DESCRIPTORS = {"field", "id", "identifier", "key", "number", "schema", "string"}
-COPULAS = {"are", "is", "remain", "remains", "was", "were"}
-MODALS = {"cannot", "must", "should"}
+SAFE_VALUE_STATE_PATTERN = (
+    "absent|available|configured|disabled|included|known|missing|needed|omitted|"
+    "present|provided|redacted|required|stored|supported|unavailable|unknown"
+)
+SAFE_REFERENCE_TERM_PATTERN = (
+    f"{SAFE_VALUE_STATE_PATTERN}|field|id|identifier|key|number|schema|string"
+)
+SAFE_SENSITIVE_EXPLANATION_PATTERN = (
+    rf"^(({SAFE_VALUE_STATE_PATTERN})|"
+    rf"(are|is|remain|remains|was|were)[[:space:]]+"
+    rf"(not[[:space:]]+)?({SAFE_VALUE_STATE_PATTERN})|"
+    rf"(cannot|must|should)[[:space:]]+be[[:space:]]+"
+    rf"({SAFE_VALUE_STATE_PATTERN}))[.]?$"
+)
+SAFE_REFERENCE_EXPLANATION_PATTERN = (
+    rf"^(({SAFE_REFERENCE_TERM_PATTERN})|"
+    rf"(are|is|remain|remains|was|were)[[:space:]]+"
+    rf"(not[[:space:]]+)?({SAFE_REFERENCE_TERM_PATTERN})|"
+    rf"(cannot|must|should)[[:space:]]+be[[:space:]]+"
+    rf"({SAFE_REFERENCE_TERM_PATTERN}))[.]?$"
+)
 
 
 def _sql() -> str:
@@ -59,43 +57,20 @@ def _function_body(sql: str, name: str) -> str:
     )[0]
 
 
-def _labelled_match_is_safe(
-    match: re.Match[str],
-    *,
-    first_group: int,
-    second_group: int,
-    third_group: int,
-    descriptors: set[str] = frozenset(),
-) -> bool:
-    first = match.group(first_group)
-    second = match.group(second_group)
-    third = match.group(third_group)
-    safe_terms = SAFE_VALUE_STATES | descriptors
-    return (
-        first in safe_terms
-        or (first in COPULAS and second in safe_terms)
-        or (first in COPULAS and second == "not" and third in safe_terms)
-        or (first in MODALS and second == "be" and third in safe_terms)
-    )
+def _python_regex(pattern: str) -> str:
+    return pattern.replace("[^[:space:]]", r"\S").replace("[[:space:]]", r"\s")
 
 
 def _has_labelled_actual_value(value: str) -> bool:
     lowered = value.lower()
-    for match in re.finditer(LABELLED_SENSITIVE_VALUE_PATTERN, lowered):
-        if not _labelled_match_is_safe(
-            match,
-            first_group=4,
-            second_group=6,
-            third_group=8,
+    for match in re.finditer(_python_regex(LABELLED_SENSITIVE_VALUE_PATTERN), lowered):
+        if not re.fullmatch(
+            _python_regex(SAFE_SENSITIVE_EXPLANATION_PATTERN), match.group(4)
         ):
             return True
-    for match in re.finditer(LABELLED_REFERENCE_VALUE_PATTERN, lowered):
-        if not _labelled_match_is_safe(
-            match,
-            first_group=6,
-            second_group=8,
-            third_group=10,
-            descriptors=SAFE_REFERENCE_DESCRIPTORS,
+    for match in re.finditer(_python_regex(LABELLED_REFERENCE_VALUE_PATTERN), lowered):
+        if not re.fullmatch(
+            _python_regex(SAFE_REFERENCE_EXPLANATION_PATTERN), match.group(6)
         ):
             return True
     return False
@@ -314,18 +289,12 @@ def test_validation_migration_rejects_labelled_actual_values_precisely() -> None
 
     assert LABELLED_SENSITIVE_VALUE_PATTERN in text_body
     assert LABELLED_REFERENCE_VALUE_PATTERN in text_body
+    assert SAFE_SENSITIVE_EXPLANATION_PATTERN in text_body
+    assert SAFE_REFERENCE_EXPLANATION_PATTERN in text_body
     assert "from regexp_matches(" in compact
-    assert "labelled_sensitive.parts[4]" in compact
-    assert "labelled_sensitive.parts[6]" in compact
-    assert "labelled_sensitive.parts[8]" in compact
-    assert "labelled_reference.parts[6]" in compact
-    assert "labelled_reference.parts[8]" in compact
-    assert "labelled_reference.parts[10]" in compact
-    assert compact.count("where not coalesce(") >= 2
-    for safe_state in SAFE_VALUE_STATES:
-        assert f"'{safe_state}'" in text_body
-    for descriptor in SAFE_REFERENCE_DESCRIPTORS:
-        assert f"'{descriptor}'" in text_body
+    assert "labelled_sensitive.parts[4] !~" in compact
+    assert "labelled_reference.parts[6] !~" in compact
+    assert text_body.count("([^[:space:]].*)") == 2
 
     unconditional_fragments = text_body.split("from unnest(array[", 1)[1].split(
         "]) as forbidden", 1
@@ -355,23 +324,31 @@ def test_labelled_value_patterns_preserve_all_254_semantic_contracts() -> None:
         for value in _string_values(contract):
             assert not _has_labelled_actual_value(value)
 
+
+def test_labelled_value_contract_covers_punctuation_quotes_and_separators() -> None:
     for safe_metadata in (
         "provider credentials are not available",
         "client secret is unavailable",
+        "password is redacted",
+        "api key should be omitted",
         "provider record identifier",
         "source document string",
     ):
         assert not _has_labelled_actual_value(safe_metadata)
 
     for unsafe_value in (
-        "password synthetic_value",
-        "token synthetic_value",
-        "secret synthetic_value",
-        "credential synthetic_value",
-        "api-key synthetic_value",
-        "client-secret synthetic_value",
-        "provider record " + "1234",
-        "source document " + "5678",
+        "password: !value",
+        "token #synthetic",
+        "secret=!value",
+        "credential = #synthetic",
+        "api-key:!value",
+        "client-secret = !value",
+        'token: "synthetic candidate"',
+        "secret = '#synthetic'",
+        'password: "redacted"',
+        "provider record #" + "1234",
+        "source document: '#" + "5678'",
+        "provider record identifier #" + "1234",
     ):
         assert _has_labelled_actual_value(unsafe_value)
 

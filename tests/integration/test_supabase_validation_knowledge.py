@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from ipaddress import ip_address
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
@@ -24,6 +26,11 @@ _CREDENTIAL_ENV_NAMES = {
     "SUPABASE_ANON_KEY",
     "SUPABASE_AUTHENTICATED_TEST_JWT",
 }
+_SEMANTIC_CONTRACT_PATHS = (
+    Path("catalog/global/flowaccount/semantic-contracts.json"),
+    Path("catalog/global/peak/semantic-contracts.json"),
+)
+_SEMANTIC_IDENTITY_FIELDS = {"action_id", "version_id"}
 
 
 @dataclass(frozen=True)
@@ -117,6 +124,17 @@ def _post_rows(
     )
 
 
+def _reviewed_semantic_contracts() -> list[dict[str, object]]:
+    contracts: list[dict[str, object]] = []
+    for path in _SEMANTIC_CONTRACT_PATHS:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for row in payload["contracts"]:
+            contracts.append(
+                {key: value for key, value in row.items() if key not in _SEMANTIC_IDENTITY_FIELDS}
+            )
+    return contracts
+
+
 def test_hosted_http_is_rejected_before_credentials_are_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -145,6 +163,34 @@ def test_loopback_http_remains_available(monkeypatch: pytest.MonkeyPatch) -> Non
     assert environment.rest_url == "http://127.0.0.1:54321/rest/v1"
 
 
+def test_all_reviewed_semantic_contracts_pass_actual_sql_functions() -> None:
+    environment = _test_environment()
+    contracts = _reviewed_semantic_contracts()
+
+    assert len(contracts) == 254
+    checked = 0
+    with httpx.Client(timeout=10.0, follow_redirects=False) as client:
+        for contract in contracts:
+            response = client.post(
+                f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_value",
+                headers=environment.service_headers,
+                json={"value": contract},
+            )
+            _assert_status(response, 200)
+            assert response.json() is False
+
+            response = client.post(
+                f"{environment.rest_url}/rpc/jsonb_is_safe_validation_semantic_contract",
+                headers=environment.service_headers,
+                json={"value": contract},
+            )
+            _assert_status(response, 200)
+            assert response.json() is True
+            checked += 1
+
+    assert checked == 254
+
+
 def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() -> None:
     environment = _test_environment()
     suffix = uuid.uuid4().hex
@@ -166,6 +212,35 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
                 f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_key",
                 headers=environment.service_headers,
                 json={"value": {"nested": [{unsafe_key: "synthetic_value"}]}},
+            )
+            _assert_status(response, 200)
+            assert response.json() is True
+
+        unsafe_labelled_values = (
+            "password: !value",
+            "token #synthetic",
+            "secret=!value",
+            "credential = #synthetic",
+            "api-key:!value",
+            "client-secret = !value",
+            'token: "synthetic candidate"',
+            "secret = '#synthetic'",
+            "provider record #" + "1234",
+            "source document: '#" + "5678'",
+        )
+        for unsafe_value in unsafe_labelled_values:
+            response = client.post(
+                f"{environment.rest_url}/rpc/validation_text_has_forbidden_value",
+                headers=environment.service_headers,
+                json={"value": unsafe_value},
+            )
+            _assert_status(response, 200)
+            assert response.json() is True
+
+            response = client.post(
+                f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_value",
+                headers=environment.service_headers,
+                json={"value": {"allowed_metadata": unsafe_value}},
             )
             _assert_status(response, 200)
             assert response.json() is True
@@ -203,9 +278,19 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
         for safe_value in (
             "provider credentials are not available",
             "client secret is unavailable",
+            "password is redacted",
+            "api key should be omitted",
             "provider record identifier",
             "source document string",
         ):
+            response = client.post(
+                f"{environment.rest_url}/rpc/validation_text_has_forbidden_value",
+                headers=environment.service_headers,
+                json={"value": safe_value},
+            )
+            _assert_status(response, 200)
+            assert response.json() is False
+
             response = client.post(
                 f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_value",
                 headers=environment.service_headers,
@@ -353,7 +438,7 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             **record,
             "opaque_evidence_id": f"ev_{suffix[2:28]}",
             "run_id": f"run_{suffix[2:28]}",
-            "limitations": ["provider record " + "1234"],
+            "limitations": ["provider record #" + "1234"],
         }
         response = _post_rows(
             client,
@@ -367,7 +452,7 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             **record,
             "opaque_evidence_id": f"ev_{suffix[3:29]}",
             "run_id": f"run_{suffix[3:29]}",
-            "summary_en": "password synthetic_placeholder",
+            "summary_en": "password: !value",
         }
         response = _post_rows(
             client,
