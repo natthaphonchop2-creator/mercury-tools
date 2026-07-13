@@ -241,8 +241,10 @@ def test_catalog_contains_no_source_credentials_or_personal_examples() -> None:
         for path in (
             "catalog/global/flowaccount/source.json",
             "catalog/global/flowaccount/actions.json",
+            "catalog/global/flowaccount/semantic-contracts.json",
             "catalog/global/peak/source.json",
             "catalog/global/peak/actions.json",
+            "catalog/global/peak/semantic-contracts.json",
         )
     )
 
