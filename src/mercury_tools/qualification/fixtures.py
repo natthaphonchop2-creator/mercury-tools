@@ -93,13 +93,8 @@ class CleanupReport(StrictSafeModel):
 class FixtureRegistry:
     """Hold provider identifiers only for the lifetime of this process."""
 
-    def __init__(self, *, run_id: str, prefix: str | None = None) -> None:
+    def __init__(self, *, run_id: str) -> None:
         self._run_id = validate_run_id(run_id)
-        if prefix is not None and (
-            not isinstance(prefix, str) or not prefix or len(prefix) > 128 or "\x00" in prefix
-        ):
-            raise ValueError("fixture_prefix_invalid")
-        self._prefix = prefix
         self._fixtures: dict[str, FixtureCleanupTarget] = {}
         self._claimed_handles: set[str] = set()
 
@@ -243,6 +238,7 @@ class CleanupCoordinator:
                 self.run_store.mark_cleanup(fixture.handle, CleanupStatus.FAILED)
                 self.run_store.quarantine("cleanup_failed")
                 failed.append(fixture.handle)
+                break
             else:
                 self.run_store.mark_cleanup(
                     fixture.handle,
@@ -250,6 +246,7 @@ class CleanupCoordinator:
                 )
                 self.run_store.quarantine("outcome_unknown")
                 outcome_unknown.append(fixture.handle)
+                break
 
         if not failed and not outcome_unknown:
             self.run_store.complete()

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
+import traceback
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -50,8 +53,16 @@ class RecordingCleanupAdapter:
         return self.outcomes.get(fixture.handle, CleanupOutcome.CLEANED)
 
 
+class MutableClock:
+    def __init__(self, value: datetime) -> None:
+        self.value = value
+
+    def __call__(self) -> datetime:
+        return self.value
+
+
 def _registry() -> FixtureRegistry:
-    registry = FixtureRegistry(run_id=RUN_ID, prefix="MERCURY-V021")
+    registry = FixtureRegistry(run_id=RUN_ID)
     registry.register(
         handle=CONTACT_HANDLE,
         provider_id="provider-contact-private-123",
@@ -132,7 +143,6 @@ def test_cleanup_runs_once_in_reverse_dependency_order_and_persists_opaque_state
     for private_value in (
         "provider-contact-private-123",
         "provider-invoice-private-456",
-        "MERCURY-V021",
         "company",
         "credential",
         "token",
@@ -174,12 +184,14 @@ def test_cleanup_failure_quarantines_run_and_keeps_report_payload_free(
 
     report = asyncio.run(CleanupCoordinator(registry, adapter, store).cleanup())
 
-    assert report.attempted_handles == (INVOICE_HANDLE, CONTACT_HANDLE)
+    assert report.attempted_handles == (INVOICE_HANDLE,)
     assert report.failed_handles == (INVOICE_HANDLE,)
-    assert report.cleaned_handles == (CONTACT_HANDLE,)
+    assert report.cleaned_handles == ()
     assert report.run_state is QualificationRunState.QUARANTINED
     assert report.publication_allowed is False
     assert store.publication_allowed is False
+    assert store.cleanup_status(CONTACT_HANDLE) is CleanupStatus.PENDING
+    assert [call[0] for call in adapter.calls] == [INVOICE_HANDLE]
     assert _state_payload(tmp_path)["quarantine_reason"] == "cleanup_failed"
     assert "provider-private-999" not in report.model_dump_json()
     assert "provider-private-999" not in json.dumps(_state_payload(tmp_path))
@@ -200,8 +212,9 @@ def test_unknown_cleanup_outcome_quarantines_and_is_never_retried(
     assert first.run_state is QualificationRunState.QUARANTINED
     assert first.publication_allowed is False
     assert second.attempted_handles == ()
-    assert [call[0] for call in adapter.calls].count(INVOICE_HANDLE) == 1
+    assert [call[0] for call in adapter.calls] == [INVOICE_HANDLE]
     assert store.cleanup_status(INVOICE_HANDLE) is CleanupStatus.OUTCOME_UNKNOWN
+    assert store.cleanup_status(CONTACT_HANDLE) is CleanupStatus.PENDING
     assert _state_payload(tmp_path)["quarantine_reason"] == "outcome_unknown"
 
 
@@ -234,6 +247,44 @@ def test_process_loss_quarantines_pending_state_instead_of_resuming_cleanup(
     assert recovered.state is QualificationRunState.QUARANTINED
     assert recovered.publication_allowed is False
     assert _state_payload(tmp_path)["quarantine_reason"] == "process_lost"
+
+
+@pytest.mark.parametrize("transition", ["record", "cleanup", "quarantine", "complete"])
+def test_state_transitions_reject_backwards_clock_before_write(
+    tmp_path: Path,
+    transition: str,
+) -> None:
+    created_at = datetime(2026, 7, 14, 0, 0, tzinfo=UTC)
+    later = created_at + timedelta(seconds=2)
+    backwards = created_at + timedelta(seconds=1)
+    clock = MutableClock(created_at)
+    store = QualificationRunStore(tmp_path, RUN_ID, clock=clock)
+    registry = _registry()
+
+    clock.value = later
+    if transition == "record":
+        store.record_fixtures((registry.references[0],))
+    else:
+        store.record_fixtures(registry.references)
+        if transition == "complete":
+            store.mark_cleanup(CONTACT_HANDLE, CleanupStatus.CLEANED)
+            store.mark_cleanup(INVOICE_HANDLE, CleanupStatus.CLEANED)
+
+    before = store.state_path.read_bytes()
+    clock.value = backwards
+
+    with pytest.raises(ValueError) as raised:
+        if transition == "record":
+            store.record_fixtures(registry.references)
+        elif transition == "cleanup":
+            store.mark_cleanup(INVOICE_HANDLE, CleanupStatus.CLEANED)
+        elif transition == "quarantine":
+            store.quarantine("cleanup_failed")
+        else:
+            store.complete()
+
+    assert raised.value.args == ("qualification_clock_regressed",)
+    assert store.state_path.read_bytes() == before
 
 
 @pytest.mark.parametrize(
@@ -312,6 +363,76 @@ def test_atomic_write_failure_keeps_previous_fail_closed_state(
     assert _state_payload(tmp_path) == previous
     run_dir = tmp_path / ".mercury" / "validation" / RUN_ID
     assert not tuple(run_dir.glob(".state-*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="dir_fd checks require POSIX")
+def test_run_directory_swap_before_rename_fails_closed_without_touching_outside(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = QualificationRunStore(tmp_path, RUN_ID)
+    run_dir = tmp_path / ".mercury" / "validation" / RUN_ID
+    moved_run_dir = tmp_path / "moved-run"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "state.json"
+    sentinel.write_text("outside sentinel", encoding="utf-8")
+    real_rename = run_store_module.os.rename
+    swapped = False
+
+    def racing_rename(source, destination, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and destination == "state.json":
+            real_rename(run_dir, moved_run_dir)
+            run_dir.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return real_rename(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(run_store_module.os, "rename", racing_rename)
+
+    with pytest.raises(ValueError, match="^qualification_state_path_unsafe$"):
+        store.complete()
+
+    assert swapped is True
+    assert store.state is QualificationRunState.FAILED
+    assert store.publication_allowed is False
+    assert sentinel.read_text(encoding="utf-8") == "outside sentinel"
+    assert not tuple(moved_run_dir.glob(".state-*.tmp"))
+    assert tuple(outside.iterdir()) == (sentinel,)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="filesystem error probe requires POSIX")
+def test_external_path_errors_have_no_cause_or_traceback_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = QualificationRunStore(tmp_path, RUN_ID)
+    real_open = run_store_module.os.open
+    private_path = tmp_path / "private-review-path"
+
+    def failing_open(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is None and os.fspath(path) == os.fspath(tmp_path):
+            raise FileNotFoundError(errno.ENOENT, "review probe", private_path)
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(run_store_module.os, "open", failing_open)
+
+    with pytest.raises(ValueError) as raised:
+        store.complete()
+
+    assert raised.value.args == ("qualification_state_path_unsafe",)
+    assert raised.value.__cause__ is None
+    rendered = "".join(
+        traceback.format_exception(
+            type(raised.value),
+            raised.value,
+            raised.value.__traceback__,
+        )
+    )
+    assert str(tmp_path) not in rendered
+    assert str(private_path) not in rendered
 
 
 @pytest.mark.skipif(os.name != "posix", reason="dir_fd checks require POSIX")

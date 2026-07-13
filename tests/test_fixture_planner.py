@@ -1,21 +1,35 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from mercury_tools.catalog.models import CatalogAction
+from mercury_tools.qualification import planner as planner_module
 from mercury_tools.qualification.manifest import (
-    SandboxActionPolicy,
     SandboxDisposition,
     SandboxExecutionManifest,
+    load_sandbox_execution_manifest,
+    reviewed_policy_for,
 )
 from mercury_tools.qualification.models import SemanticContract
 from mercury_tools.qualification.planner import (
     plan_fixture_dependencies,
     stable_topological_sort,
 )
+from mercury_tools.qualification.semantics import (
+    load_actions,
+    load_semantic_contracts,
+)
+
+ROOT = Path(__file__).resolve().parents[1]
+FLOWACCOUNT_CATALOG = ROOT / "catalog/global/flowaccount/actions.json"
+FLOWACCOUNT_MANIFEST = ROOT / "catalog/global/flowaccount/sandbox-execution-manifest.json"
+FLOWACCOUNT_SEMANTICS = ROOT / "catalog/global/flowaccount/semantic-contracts.json"
 
 
 def _actions(action_factory: Callable[..., CatalogAction]) -> tuple[CatalogAction, ...]:
@@ -44,38 +58,35 @@ def _actions(action_factory: Callable[..., CatalogAction]) -> tuple[CatalogActio
 def _manifest(
     actions: Sequence[CatalogAction],
     *,
-    prerequisites: dict[tuple[str, str], tuple[str, ...]] | None = None,
-    executable: frozenset[tuple[str, str]] = frozenset(),
+    policy_updates: dict[tuple[str, str], dict[str, Any]] | None = None,
+    catalog_sha256: str | None = None,
 ) -> SandboxExecutionManifest:
-    prerequisites = prerequisites or {}
-    policies: list[SandboxActionPolicy] = []
-    for action in actions:
-        identity = (action.action_id, action.version_id)
-        is_executable = identity in executable
-        policies.append(
-            SandboxActionPolicy(
-                action_id=action.action_id,
-                version_id=action.version_id,
-                disposition=(
-                    SandboxDisposition.SANDBOX_EXECUTABLE
-                    if is_executable
-                    else SandboxDisposition.CONTRACT_ONLY
-                ),
-                prerequisites=prerequisites.get(identity, ()),
-                fixture_builder="build_fixture" if is_executable else None,
-                ownership_predicate="fixture_owned" if is_executable else None,
-                cleanup_action_id=action.action_id if is_executable else None,
-                external_effects=action.side_effects if is_executable else (),
-                controlled_destination=is_executable,
-                max_attempts=1 if is_executable else 0,
-                request_budget=1 if is_executable else 0,
-            )
-        )
+    policy_updates = policy_updates or {}
+    policies = []
+    for action in sorted(actions, key=lambda item: (item.action_id, item.version_id)):
+        policy = reviewed_policy_for(action)
+        updates = policy_updates.get((action.action_id, action.version_id))
+        policies.append(policy.model_copy(update=updates) if updates else policy)
     return SandboxExecutionManifest(
         environment="sandbox",
-        catalog_sha256="a" * 64,
-        actions=tuple(reversed(policies)),
+        catalog_sha256=catalog_sha256 or _catalog_sha256(actions),
+        actions=tuple(policies),
     )
+
+
+def _catalog_sha256(actions: Sequence[CatalogAction]) -> str:
+    payload = [action.model_dump(mode="json") for action in actions]
+    snapshot = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode()
+    return hashlib.sha256(snapshot).hexdigest()
 
 
 def _semantics(
@@ -96,12 +107,25 @@ def _semantics(
 
 def test_only_reviewed_manifest_edges_authorize_execution(
     action_factory: Callable[..., CatalogAction],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     actions = _actions(action_factory)
     prerequisite, dependent, semantic_target = actions
     manifest = _manifest(
         actions,
-        prerequisites={(dependent.action_id, dependent.version_id): (prerequisite.action_id,)},
+        policy_updates={
+            (dependent.action_id, dependent.version_id): {
+                "prerequisites": (prerequisite.action_id,)
+            }
+        },
+    )
+    canonical_by_identity = {
+        (policy.action_id, policy.version_id): policy for policy in manifest.actions
+    }
+    monkeypatch.setattr(
+        planner_module,
+        "reviewed_policy_for",
+        lambda action: canonical_by_identity[(action.action_id, action.version_id)],
     )
     semantics = _semantics(
         actions,
@@ -161,12 +185,84 @@ def test_planner_cannot_widen_task6_executable_policy(
     action = _actions(action_factory)[0]
     manifest = _manifest(
         (action,),
-        executable=frozenset({(action.action_id, action.version_id)}),
+        policy_updates={
+            (action.action_id, action.version_id): {
+                "disposition": SandboxDisposition.SANDBOX_EXECUTABLE,
+                "fixture_builder": "build_fixture",
+                "ownership_predicate": "fixture_owned",
+                "cleanup_action_id": action.action_id,
+                "controlled_destination": True,
+                "max_attempts": 1,
+                "request_budget": 1,
+            }
+        },
     )
 
-    plan = plan_fixture_dependencies((action,), manifest, _semantics((action,)))
+    with pytest.raises(ValueError) as raised:
+        plan_fixture_dependencies((action,), manifest, _semantics((action,)))
 
-    assert plan.executable_actions == ()
+    assert raised.value.args == ("fixture_plan_manifest_policy_mismatch",)
+
+
+def test_forged_prerequisite_and_fixture_fields_never_create_authorizing_edge(
+    action_factory: Callable[..., CatalogAction],
+) -> None:
+    actions = _actions(action_factory)
+    prerequisite, dependent, _ = actions
+    forged = _manifest(
+        actions,
+        policy_updates={
+            (dependent.action_id, dependent.version_id): {
+                "prerequisites": (prerequisite.action_id,),
+                "fixture_builder": "forged_fixture_builder",
+                "ownership_predicate": "forged_ownership",
+                "cleanup_action_id": prerequisite.action_id,
+            }
+        },
+    )
+
+    with pytest.raises(ValueError) as raised:
+        plan_fixture_dependencies(actions, forged, _semantics(actions))
+
+    assert raised.value.args == ("fixture_plan_manifest_policy_mismatch",)
+
+
+def test_forged_catalog_hash_is_rejected_without_echo(
+    action_factory: Callable[..., CatalogAction],
+) -> None:
+    actions = _actions(action_factory)
+    forged_hash = "f" * 64
+
+    with pytest.raises(ValueError) as raised:
+        plan_fixture_dependencies(
+            actions,
+            _manifest(actions, catalog_sha256=forged_hash),
+            _semantics(actions),
+        )
+
+    assert raised.value.args == ("fixture_plan_manifest_catalog_mismatch",)
+    assert forged_hash not in str(raised.value)
+
+
+def test_catalog_hash_preserves_caller_action_order(
+    action_factory: Callable[..., CatalogAction],
+) -> None:
+    actions = _actions(action_factory)
+    manifest = _manifest(actions)
+
+    with pytest.raises(ValueError, match="^fixture_plan_manifest_catalog_mismatch$"):
+        plan_fixture_dependencies(tuple(reversed(actions)), manifest, _semantics(actions))
+
+
+def test_builtin_catalog_manifest_and_semantics_are_canonical() -> None:
+    actions = load_actions(FLOWACCOUNT_CATALOG)
+    manifest = load_sandbox_execution_manifest(FLOWACCOUNT_MANIFEST, FLOWACCOUNT_CATALOG)
+    semantics = load_semantic_contracts(FLOWACCOUNT_SEMANTICS, actions)
+
+    plan = plan_fixture_dependencies(actions, manifest, semantics)
+
+    assert len(plan.execution_order) == len(actions) == 190
+    assert plan.reviewed_edges == ()
 
 
 @pytest.mark.parametrize(
@@ -205,6 +301,7 @@ def test_topological_sort_uses_stable_exact_identity_ties() -> None:
 
 def test_action_id_only_prerequisite_cannot_select_between_versions(
     action_factory: Callable[..., CatalogAction],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     first = action_factory(description="First reviewed version")
     second = action_factory(description="Second reviewed version")
@@ -216,7 +313,17 @@ def test_action_id_only_prerequisite_cannot_select_between_versions(
     actions = (first, second, dependent)
     manifest = _manifest(
         actions,
-        prerequisites={(dependent.action_id, dependent.version_id): (first.action_id,)},
+        policy_updates={
+            (dependent.action_id, dependent.version_id): {"prerequisites": (first.action_id,)}
+        },
+    )
+    canonical_by_identity = {
+        (policy.action_id, policy.version_id): policy for policy in manifest.actions
+    }
+    monkeypatch.setattr(
+        planner_module,
+        "reviewed_policy_for",
+        lambda action: canonical_by_identity[(action.action_id, action.version_id)],
     )
 
     with pytest.raises(ValueError, match="^fixture_plan_node_ambiguous$"):

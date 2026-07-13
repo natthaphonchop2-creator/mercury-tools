@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
 import heapq
+import json
 import re
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from typing import Literal, TypeAlias
 
 from mercury_tools.catalog.models import CatalogAction, revalidate_catalog_action
-from mercury_tools.qualification.manifest import SandboxExecutionManifest
+from mercury_tools.qualification.manifest import (
+    SandboxExecutionManifest,
+    reviewed_policy_for,
+)
 from mercury_tools.qualification.models import SemanticContract, StrictSafeModel
 
 ActionIdentity: TypeAlias = tuple[str, str]
@@ -186,6 +191,17 @@ def _validated_manifest(
     manifest_identities = {(policy.action_id, policy.version_id) for policy in checked.actions}
     if manifest_identities != set(actions):
         raise ValueError("fixture_plan_manifest_identity_mismatch")
+
+    if checked.catalog_sha256 != _catalog_snapshot_sha256(tuple(actions.values())):
+        raise ValueError("fixture_plan_manifest_catalog_mismatch")
+    try:
+        expected_policies = tuple(
+            reviewed_policy_for(actions[identity]) for identity in sorted(actions)
+        )
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("fixture_plan_manifest_invalid") from None
+    if checked.actions != expected_policies:
+        raise ValueError("fixture_plan_manifest_policy_mismatch")
     try:
         for policy in checked.actions:
             policy.validate_against(
@@ -195,6 +211,24 @@ def _validated_manifest(
     except (KeyError, TypeError, ValueError):
         raise ValueError("fixture_plan_manifest_identity_mismatch") from None
     return checked
+
+
+def _catalog_snapshot_sha256(actions: Sequence[CatalogAction]) -> str:
+    payload = [action.model_dump(mode="json") for action in actions]
+    try:
+        serialized = (
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        raise ValueError("fixture_plan_catalog_invalid") from None
+    return hashlib.sha256(serialized).hexdigest()
 
 
 def _validated_semantics(

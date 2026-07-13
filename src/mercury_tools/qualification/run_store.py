@@ -146,7 +146,7 @@ class QualificationRunStore:
                     updated_at=now,
                     fixtures=(),
                 )
-                _write_state(run_fd, initial)
+                _write_state(self._root, self._run_id, run_fd, initial)
                 self._record = initial
             else:
                 if existing.run_id != self._run_id:
@@ -217,7 +217,10 @@ class QualificationRunStore:
             raise ValueError("qualification_fixture_invalid") from None
 
         if changed:
-            self._replace(fixtures=tuple(existing[key] for key in sorted(existing)))
+            self._replace(
+                transition_at=now,
+                fixtures=tuple(existing[key] for key in sorted(existing)),
+            )
 
     def cleanup_status(self, handle: str) -> CleanupStatus:
         checked_handle = validate_fixture_handle(handle)
@@ -261,7 +264,7 @@ class QualificationRunStore:
         if not found:
             raise ValueError("qualification_fixture_missing")
         if changed:
-            self._replace(fixtures=tuple(updated))
+            self._replace(transition_at=now, fixtures=tuple(updated))
 
     def quarantine(self, reason: str) -> None:
         if reason not in {"cleanup_failed", "outcome_unknown", "process_lost"}:
@@ -289,12 +292,20 @@ class QualificationRunStore:
             quarantine_reason=None,
         )
 
-    def _replace(self, **updates: Any) -> None:
-        updates["updated_at"] = self._timestamp()
+    def _replace(
+        self,
+        *,
+        transition_at: datetime | None = None,
+        **updates: Any,
+    ) -> None:
+        timestamp = self._timestamp() if transition_at is None else transition_at
+        if timestamp < self._record.updated_at:
+            raise ValueError("qualification_clock_regressed")
+        updates["updated_at"] = timestamp
         candidate = self._record.model_copy(update=updates)
         run_fd = _open_run_directory(self._root, self._run_id)
         try:
-            _write_state(run_fd, candidate)
+            _write_state(self._root, self._run_id, run_fd, candidate)
         finally:
             os.close(run_fd)
         self._record = candidate
@@ -368,7 +379,7 @@ def _require_atomic_state_capabilities() -> None:
         raise ValueError("qualification_state_path_unsafe")
 
 
-def _open_run_directory(root: Path, run_id: str) -> int:
+def _open_run_directory(root: Path, run_id: str, *, create: bool = True) -> int:
     nofollow = getattr(os, "O_NOFOLLOW", None)
     directory = getattr(os, "O_DIRECTORY", None)
     if nofollow is None or directory is None:
@@ -384,7 +395,7 @@ def _open_run_directory(root: Path, run_id: str) -> int:
         if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
             raise OSError(errno.ESTALE, "root binding changed")
         for name in (".mercury", "validation", run_id):
-            next_fd = _ensure_open_directory(current_fd, name)
+            next_fd = _open_child_directory(current_fd, name, create=create)
             os.close(current_fd)
             current_fd = next_fd
         return current_fd
@@ -393,16 +404,17 @@ def _open_run_directory(root: Path, run_id: str) -> int:
             with suppress(OSError):
                 os.close(current_fd)
         raise
-    except OSError as exc:
+    except OSError:
         if current_fd >= 0:
             with suppress(OSError):
                 os.close(current_fd)
-        raise ValueError("qualification_state_path_unsafe") from exc
+        raise ValueError("qualification_state_path_unsafe") from None
 
 
-def _ensure_open_directory(parent_fd: int, name: str) -> int:
-    with suppress(FileExistsError):
-        os.mkdir(name, 0o700, dir_fd=parent_fd)
+def _open_child_directory(parent_fd: int, name: str, *, create: bool) -> int:
+    if create:
+        with suppress(FileExistsError):
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
     state = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
         raise ValueError("qualification_state_path_unsafe")
@@ -415,8 +427,27 @@ def _ensure_open_directory(parent_fd: int, name: str) -> int:
     if (opened.st_dev, opened.st_ino) != (state.st_dev, state.st_ino):
         os.close(child_fd)
         raise ValueError("qualification_state_path_unsafe")
-    os.fchmod(child_fd, 0o700)
+    if create:
+        os.fchmod(child_fd, 0o700)
     return child_fd
+
+
+def _validate_run_directory_binding(root: Path, run_id: str, run_fd: int) -> None:
+    lexical_fd = -1
+    try:
+        lexical_fd = _open_run_directory(root, run_id, create=False)
+        expected = os.fstat(run_fd)
+        current = os.fstat(lexical_fd)
+        if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+            raise ValueError("qualification_state_path_unsafe")
+    except ValueError:
+        raise
+    except OSError:
+        raise ValueError("qualification_state_path_unsafe") from None
+    finally:
+        if lexical_fd >= 0:
+            with suppress(OSError):
+                os.close(lexical_fd)
 
 
 def _read_state(run_fd: int) -> _PersistedRun | None:
@@ -424,8 +455,8 @@ def _read_state(run_fd: int) -> _PersistedRun | None:
         state = os.stat(_STATE_NAME, dir_fd=run_fd, follow_symlinks=False)
     except FileNotFoundError:
         return None
-    except OSError as exc:
-        raise ValueError("qualification_state_path_unsafe") from exc
+    except OSError:
+        raise ValueError("qualification_state_path_unsafe") from None
     if stat.S_ISLNK(state.st_mode) or not stat.S_ISREG(state.st_mode):
         raise ValueError("qualification_state_path_unsafe")
     try:
@@ -457,7 +488,12 @@ def _read_state(run_fd: int) -> _PersistedRun | None:
         raise ValueError("qualification_state_invalid") from None
 
 
-def _write_state(run_fd: int, record: _PersistedRun) -> None:
+def _write_state(
+    root: Path,
+    run_id: str,
+    run_fd: int,
+    record: _PersistedRun,
+) -> None:
     payload = (
         json.dumps(
             record.model_dump(mode="json"),
@@ -498,18 +534,20 @@ def _write_state(run_fd: int, record: _PersistedRun) -> None:
         os.close(descriptor)
         descriptor = -1
         _validate_state_target(run_fd)
+        _validate_run_directory_binding(root, run_id, run_fd)
         os.rename(
             temporary_name,
             _STATE_NAME,
             src_dir_fd=run_fd,
             dst_dir_fd=run_fd,
         )
+        _validate_run_directory_binding(root, run_id, run_fd)
         temporary_name = ""
         os.fsync(run_fd)
     except ValueError:
         raise
-    except OSError as exc:
-        raise ValueError("qualification_state_write_failed") from exc
+    except OSError:
+        raise ValueError("qualification_state_write_failed") from None
     finally:
         if descriptor >= 0:
             with suppress(OSError):
@@ -524,8 +562,8 @@ def _validate_state_target(run_fd: int) -> None:
         state = os.stat(_STATE_NAME, dir_fd=run_fd, follow_symlinks=False)
     except FileNotFoundError:
         return
-    except OSError as exc:
-        raise ValueError("qualification_state_path_unsafe") from exc
+    except OSError:
+        raise ValueError("qualification_state_path_unsafe") from None
     if stat.S_ISLNK(state.st_mode) or not stat.S_ISREG(state.st_mode):
         raise ValueError("qualification_state_path_unsafe")
 
