@@ -299,50 +299,76 @@ as $function$
       where strpos(lower(value), forbidden.fragment) > 0
     )
     or exists (
-      select 1
-      from regexp_matches(
-        value,
-        '(^|[^[:alnum:]_-])([^[:space:]:=]+(?:[[:space:]]+[^[:space:]:=]+){0,7})[[:space:]]*[:=][[:space:]]*(.+)',
-        'g'
-      ) as labelled_token_assignment(parts)
-      where public.validation_label_assignment_has_forbidden_value(
-        labelled_token_assignment.parts[2],
-        labelled_token_assignment.parts[3]
+      with delimiter_positions as (
+        select assignment_delimiters.delimiter_index
+        from generate_series(
+          1,
+          least(char_length(coalesce(value, '')), 512)
+        ) as assignment_delimiters(delimiter_index)
+        where substr(
+          coalesce(value, ''),
+          assignment_delimiters.delimiter_index,
+          1
+        ) in (':', '=')
+      ),
+      segmented_delimiters as (
+        select
+          delimiter_index,
+          lag(delimiter_index, 1, 0) over (
+            order by delimiter_index
+          ) as previous_delimiter_index
+        from delimiter_positions
+      ),
+      labelled_token_assignments as (
+        select
+          btrim(
+            substr(
+              left(coalesce(value, ''), 512),
+              previous_delimiter_index + 1,
+              delimiter_index - previous_delimiter_index - 1
+            )
+          ) as label,
+          btrim(
+            substr(
+              left(coalesce(value, ''), 512),
+              delimiter_index + 1
+            )
+          ) as candidate
+        from segmented_delimiters
       )
+      select 1
+      from labelled_token_assignments
+      where labelled_token_assignments.label <> ''
+        and labelled_token_assignments.candidate <> ''
+        and public.validation_label_assignment_has_forbidden_value(
+          labelled_token_assignments.label,
+          labelled_token_assignments.candidate
+        )
     )
     or exists (
       with assignment_words as (
         select array_agg(words.word order by words.ordinality) as parts
         from regexp_split_to_table(
-          btrim(value),
+          btrim(left(coalesce(value, ''), 512)),
           '[[:space:]]+'
         ) with ordinality as words(word, ordinality)
       ),
       label_candidates as (
         select
-          start_positions.start_index,
-          end_positions.end_index,
+          split_positions.split_index,
           array_to_string(
-            assignment_words.parts[
-              start_positions.start_index:end_positions.end_index
-            ],
+            assignment_words.parts[1:split_positions.split_index],
             ' '
           ) as label,
-          regexp_replace(
-            array_to_string(
-              assignment_words.parts[
-                end_positions.end_index + 1:array_length(assignment_words.parts, 1)
-              ],
-              ' '
-            ),
-            '^[[:space:]]*[:=][[:space:]]*',
-            ''
+          array_to_string(
+            assignment_words.parts[
+              split_positions.split_index + 1:array_length(assignment_words.parts, 1)
+            ],
+            ' '
           ) as candidate,
           public.validation_label_kind(
             array_to_string(
-              assignment_words.parts[
-                start_positions.start_index:end_positions.end_index
-              ],
+              assignment_words.parts[1:split_positions.split_index],
               ' '
             )
           ) as label_kind
@@ -350,34 +376,25 @@ as $function$
         cross join lateral generate_series(
           1,
           greatest(array_length(assignment_words.parts, 1) - 1, 0)
-        ) as start_positions(start_index)
-        cross join lateral generate_series(
-          start_positions.start_index,
-          least(
-            start_positions.start_index + 7,
-            array_length(assignment_words.parts, 1) - 1
-          )
-        ) as end_positions(end_index)
+        ) as split_positions(split_index)
       ),
-      preferred_candidates as (
-        select distinct on (start_index)
-          start_index,
+      preferred_candidate as (
+        select
+          split_index,
           label,
           candidate,
           label_kind
         from label_candidates
         where label_kind is not null
           and candidate <> ''
-        order by
-          start_index,
-          case label_kind when 'provider_reference' then 0 else 1 end,
-          end_index
+        order by split_index
+        limit 1
       )
       select 1
-      from preferred_candidates
+      from preferred_candidate
       where public.validation_label_assignment_has_forbidden_value(
-        preferred_candidates.label,
-        preferred_candidates.candidate
+        preferred_candidate.label,
+        preferred_candidate.candidate
       )
     )
     or value ~ '[A-Za-z0-9_-]{8,}[.][A-Za-z0-9_-]{8,}[.][A-Za-z0-9_-]{4,}'

@@ -122,6 +122,52 @@ COMPACT_QUALIFIED_ASSIGNMENT_CASES = (
     ("client.public.id", "synthetic_value"),
     ("api.signing.key", "synthetic_value"),
 )
+LONG_QUALIFIED_ASSIGNMENT_CASES = (
+    (
+        "space",
+        "client alpha beta gamma delta epsilon zeta eta theta iota id",
+        ": ",
+        "!value",
+    ),
+    (
+        "space",
+        "api alpha beta gamma delta epsilon zeta eta theta iota key",
+        " = ",
+        "#1234",
+    ),
+    (
+        "punctuation",
+        "client.alpha beta.gamma delta epsilon zeta eta theta iota kappa lambda.id",
+        ":",
+        "!value",
+    ),
+    (
+        "punctuation",
+        "api.alpha beta.gamma delta epsilon zeta eta theta iota kappa lambda.key",
+        "=",
+        "#1234",
+    ),
+    (
+        "space",
+        "client alpha beta gamma delta epsilon zeta eta theta iota id",
+        " ",
+        "!value",
+    ),
+    (
+        "punctuation",
+        "api.alpha beta.gamma delta epsilon zeta eta theta iota kappa lambda.key",
+        " ",
+        "#1234",
+    ),
+)
+LONG_SAFE_LABELLED_METADATA = (
+    "client alpha beta gamma delta epsilon zeta eta theta iota id: unavailable",
+    "client alpha beta gamma delta epsilon zeta eta theta iota id unavailable",
+    (
+        "provider.alpha beta.gamma delta epsilon zeta eta theta iota kappa "
+        "lambda.id: provider record identifier"
+    ),
+)
 FORBIDDEN_PROVIDER_COMPOUND_LABELS = (
     "documentAuthorizationId",
     "sourceTokenId",
@@ -298,13 +344,15 @@ def _labelled_forbidden_values() -> tuple[str, ...]:
         )
     for label, candidate in COMPACT_QUALIFIED_ASSIGNMENT_CASES:
         values.append(f"{label}:{candidate}")
+    for _, label, separator, candidate in LONG_QUALIFIED_ASSIGNMENT_CASES:
+        values.append(f"{label}{separator}{candidate}")
     return tuple(dict.fromkeys(values))
 
 
 def _has_labelled_actual_value(value: str) -> bool:
     explicit_pattern = (
         r"(^|[^A-Za-z0-9_-])"
-        r"([^\s:=]+(?:\s+[^\s:=]+){0,7})"
+        r"([^:=]{1,512})"
         r"\s*[:=]\s*(\S.*)"
     )
     for match in re.finditer(explicit_pattern, value):
@@ -312,18 +360,17 @@ def _has_labelled_actual_value(value: str) -> bool:
             return True
 
     words = value.split()
-    for start in range(max(0, len(words) - 1)):
-        candidates: list[tuple[int, int, str, str]] = []
-        for end in range(start, min(len(words) - 1, start + 8)):
-            label = " ".join(words[start : end + 1])
-            kind = _label_kind(label)
-            if kind is not None:
-                priority = 0 if kind == "provider_reference" else 1
-                candidates.append((priority, end, label, " ".join(words[end + 1 :])))
-        if candidates:
-            _, _, label, candidate = min(candidates)
-            if _labelled_candidate_is_forbidden(label, candidate):
-                return True
+    candidates: list[tuple[int, str, str]] = []
+    for split_index in range(1, len(words)):
+        label = " ".join(words[:split_index])
+        if _label_kind(label) is not None:
+            candidates.append(
+                (split_index, label, " ".join(words[split_index:]))
+            )
+    if candidates:
+        _, label, candidate = min(candidates)
+        if _labelled_candidate_is_forbidden(label, candidate):
+            return True
 
     lowered = value.lower()
     for label in FORBIDDEN_VALUE_LABELS:
@@ -649,7 +696,7 @@ def test_validation_migration_uses_complete_table_driven_label_contract() -> Non
         assert f"'{prefix}'" in kind_body
     assert SAFE_SENSITIVE_EXPLANATION_PATTERN in assignment_body
     assert SAFE_REFERENCE_EXPLANATION_PATTERN in assignment_body
-    assert "as labelled_token_assignment(parts)" in compact_text
+    assert "labelled_token_assignments as (" in compact_text
     assert "public.validation_label_assignment_has_forbidden_value(" in compact_text
     assert "replace(forbidden_label.label, ' ', '[ _-]+')" not in compact_text
 
@@ -707,10 +754,12 @@ def test_validation_migration_uses_task_1_equivalent_label_token_binding() -> No
         "then 'provider_reference'"
     )
 
-    assert "labelled_token_assignment.parts[2]" in compact_text_body
-    assert "labelled_token_assignment.parts[3]" in compact_text_body
-    assert "([^[:space:]:=]+(?:[[:space:]]+[^[:space:]:=]+){0,7})" in text_body
-    assert "([[:alnum:]_-]+(?:[[:space:]]+[[:alnum:]_-]+){0,7})" not in text_body
+    assert "as assignment_delimiters(delimiter_index)" in compact_text_body
+    assert "lag(delimiter_index, 1, 0)" in compact_text_body
+    assert "least(char_length(coalesce(value, '')), 512)" in compact_text_body
+    assert "labelled_token_assignments.label" in compact_text_body
+    assert "labelled_token_assignments.candidate" in compact_text_body
+    assert "regexp_matches(" not in compact_text_body
     assert "public.validation_label_assignment_has_forbidden_value(" in compact_text_body
     assert "jsonb_typeof(labelled_entry.item->'value')" in compact_json_body
     assert "public.validation_label_assignment_has_forbidden_value(" in compact_json_body
@@ -770,6 +819,43 @@ def test_final_review_matrix_binds_complete_labels_without_reference_masking() -
         assert not _has_forbidden_label_key({label: "string"})
 
 
+def test_long_assignment_matrix_has_no_semantic_word_window() -> None:
+    sql = _sql()
+    text_body = _function_body(sql, "validation_text_has_forbidden_value")
+    compact_text_body = _compact(text_body)
+    unsafe_values = _labelled_forbidden_values()
+
+    assert {case_type for case_type, *_ in LONG_QUALIFIED_ASSIGNMENT_CASES} == {
+        "space",
+        "punctuation",
+    }
+    assert any(
+        separator.strip() == ""
+        for _, _, separator, _ in LONG_QUALIFIED_ASSIGNMENT_CASES
+    )
+    assert any(
+        separator.strip() in {":", "="}
+        for _, _, separator, _ in LONG_QUALIFIED_ASSIGNMENT_CASES
+    )
+    for _, label, separator, candidate in LONG_QUALIFIED_ASSIGNMENT_CASES:
+        assignment = f"{label}{separator}{candidate}"
+        assert len(label.split()) > 8
+        assert _label_kind(label) == "forbidden"
+        assert assignment in unsafe_values
+        assert _has_labelled_actual_value(assignment)
+
+    for safe_metadata in LONG_SAFE_LABELLED_METADATA:
+        assert len(safe_metadata.split()) > 8
+        assert not _has_labelled_actual_value(safe_metadata)
+
+    assert "char_length(value) > 512" in compact_text_body
+    assert "assignment_words.parts[1:split_positions.split_index]" in compact_text_body
+    assert "as split_positions(split_index)" in compact_text_body
+    assert "start_positions" not in text_body
+    assert "start_index + 7" not in compact_text_body
+    assert "{0,7}" not in text_body
+
+
 def test_labelled_value_patterns_preserve_all_254_semantic_contracts() -> None:
     contracts: list[dict[str, object]] = []
     for path in SEMANTIC_CONTRACTS:
@@ -816,6 +902,7 @@ def test_labelled_value_contract_covers_complete_generated_assignment_matrix() -
         "provider_id:provider identifier",
         "provider_external_record_id:provider record identifier",
         "counterparty_tax_id:counterparty tax identifier",
+        *LONG_SAFE_LABELLED_METADATA,
     )
     for safe_metadata in safe_metadata_values:
         assert not _has_labelled_actual_value(safe_metadata)
