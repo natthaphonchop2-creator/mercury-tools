@@ -245,7 +245,7 @@ class QualificationRunStore:
             checked_status = CleanupStatus(status)
         except (TypeError, ValueError):
             raise ValueError("qualification_cleanup_status_invalid") from None
-        if checked_status is CleanupStatus.PENDING:
+        if checked_status is not CleanupStatus.CLEANED:
             raise ValueError("qualification_cleanup_status_invalid")
 
         now = self._timestamp()

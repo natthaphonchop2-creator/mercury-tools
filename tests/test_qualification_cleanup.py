@@ -284,6 +284,38 @@ def test_terminal_cleanup_and_quarantine_use_one_atomic_transition(
     assert clock.calls == 3
 
 
+@pytest.mark.parametrize(
+    "status",
+    [
+        CleanupStatus.PENDING,
+        CleanupStatus.FAILED,
+        CleanupStatus.OUTCOME_UNKNOWN,
+    ],
+)
+def test_mark_cleanup_rejects_non_cleaned_status_without_skipping_fixture(
+    tmp_path: Path,
+    status: CleanupStatus,
+) -> None:
+    registry = _registry()
+    store = QualificationRunStore(tmp_path, RUN_ID)
+    store.record_fixtures(registry.references)
+    before = store.state_path.read_bytes()
+
+    with pytest.raises(ValueError) as raised:
+        store.mark_cleanup(INVOICE_HANDLE, status)
+
+    assert raised.value.args == ("qualification_cleanup_status_invalid",)
+    assert store.cleanup_status(INVOICE_HANDLE) is CleanupStatus.PENDING
+    assert store.state_path.read_bytes() == before
+
+    adapter = RecordingCleanupAdapter()
+    report = asyncio.run(CleanupCoordinator(registry, adapter, store).cleanup())
+
+    assert [call[0] for call in adapter.calls] == [INVOICE_HANDLE, CONTACT_HANDLE]
+    assert report.run_state is QualificationRunState.COMPLETED
+    assert report.publication_allowed is True
+
+
 def test_terminal_transition_error_stops_before_prerequisite_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -340,6 +372,41 @@ def test_terminal_write_failure_halts_live_registry_before_retry(
     assert store.cleanup_status(CONTACT_HANDLE) is CleanupStatus.PENDING
     assert "provider-contact-private-123" not in repr(registry)
     assert "provider-invoice-private-456" not in repr(registry)
+
+
+def test_cleaned_write_failure_halts_registry_and_all_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _registry()
+    store = QualificationRunStore(tmp_path, RUN_ID)
+    store.record_fixtures(registry.references)
+    adapter = RecordingCleanupAdapter()
+    coordinator = CleanupCoordinator(registry, adapter, store)
+
+    def fail_rename(*args, **kwargs):
+        raise OSError("simulated cleaned state rename failure")
+
+    monkeypatch.setattr(run_store_module.os, "rename", fail_rename)
+
+    with pytest.raises(ValueError, match="^qualification_state_write_failed$"):
+        asyncio.run(coordinator.cleanup())
+
+    same_coordinator_retry = asyncio.run(coordinator.cleanup())
+    retry_adapter = RecordingCleanupAdapter()
+    new_coordinator_retry = asyncio.run(
+        CleanupCoordinator(registry, retry_adapter, store).cleanup()
+    )
+
+    assert registry.cleanup_halted is True
+    assert [call[0] for call in adapter.calls] == [INVOICE_HANDLE]
+    assert retry_adapter.calls == []
+    assert same_coordinator_retry.attempted_handles == ()
+    assert new_coordinator_retry.attempted_handles == ()
+    assert store.state is QualificationRunState.FAILED
+    assert store.cleanup_status(INVOICE_HANDLE) is CleanupStatus.PENDING
+    assert store.cleanup_status(CONTACT_HANDLE) is CleanupStatus.PENDING
+    assert store.publication_allowed is False
 
 
 def test_explicit_unknown_mutation_quarantines_without_cleanup_dispatch(

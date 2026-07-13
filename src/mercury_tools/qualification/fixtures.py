@@ -241,25 +241,33 @@ class CleanupCoordinator:
             except Exception:
                 outcome = CleanupOutcome.FAILED
 
-            if outcome is CleanupOutcome.CLEANED:
-                self.run_store.mark_cleanup(fixture.handle, CleanupStatus.CLEANED)
-                cleaned.append(fixture.handle)
-            elif outcome is CleanupOutcome.FAILED:
+            try:
+                if outcome is CleanupOutcome.CLEANED:
+                    self.run_store.mark_cleanup(fixture.handle, CleanupStatus.CLEANED)
+                    cleaned.append(fixture.handle)
+                elif outcome is CleanupOutcome.FAILED:
+                    self.registry.halt_cleanup()
+                    self.run_store.quarantine_cleanup(fixture.handle, CleanupStatus.FAILED)
+                    failed.append(fixture.handle)
+                    break
+                else:
+                    self.registry.halt_cleanup()
+                    self.run_store.quarantine_cleanup(
+                        fixture.handle,
+                        CleanupStatus.OUTCOME_UNKNOWN,
+                    )
+                    outcome_unknown.append(fixture.handle)
+                    break
+            except Exception:
                 self.registry.halt_cleanup()
-                self.run_store.quarantine_cleanup(fixture.handle, CleanupStatus.FAILED)
-                failed.append(fixture.handle)
-                break
-            else:
-                self.registry.halt_cleanup()
-                self.run_store.quarantine_cleanup(
-                    fixture.handle,
-                    CleanupStatus.OUTCOME_UNKNOWN,
-                )
-                outcome_unknown.append(fixture.handle)
-                break
+                raise
 
         if not failed and not outcome_unknown:
-            self.run_store.complete()
+            try:
+                self.run_store.complete()
+            except Exception:
+                self.registry.halt_cleanup()
+                raise
         return self._report(
             attempted=tuple(attempted),
             cleaned=tuple(cleaned),
