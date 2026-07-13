@@ -34,6 +34,7 @@ FORBIDDEN_VALUE_TOKEN_LABELS = (
     "source",
     "token",
     "tokens",
+    "uri",
 )
 FORBIDDEN_VALUE_GROUP_LABELS = (
     "access key",
@@ -79,6 +80,24 @@ FORBIDDEN_VALUE_GROUP_LABELS = (
 FORBIDDEN_VALUE_LABELS = (
     *FORBIDDEN_VALUE_TOKEN_LABELS,
     *FORBIDDEN_VALUE_GROUP_LABELS,
+)
+LABEL_NORMALIZATION_CASES = (
+    ("camel", "clientId", ("client", "id")),
+    ("camel", "authorizationHeader", ("authorization", "header")),
+    ("camel", "rawPayload", ("payload", "raw")),
+    ("camel", "providerExternalRecordId", ("external", "id", "provider", "record")),
+    ("acronym", "APIKey", ("api", "key")),
+    ("acronym", "APISigningKey", ("api", "key", "signing")),
+    ("qualified_token", "client_public_id", ("client", "id", "public")),
+    ("qualified_token", "api_signing_key", ("api", "key", "signing")),
+    ("underscore", "authorization_header", ("authorization", "header")),
+    ("hyphen", "raw-payload", ("payload", "raw")),
+    ("space", "api signing key", ("api", "key", "signing")),
+    (
+        "space",
+        "provider external record id",
+        ("external", "id", "provider", "record"),
+    ),
 )
 PROVIDER_ID_PREFIXES = (
     "provider",
@@ -169,6 +188,49 @@ def _label_pattern(label: str) -> str:
     return re.escape(label).replace(r"\ ", r"[ _-]+")
 
 
+def _label_tokens(value: str) -> frozenset[str]:
+    separated = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", value)
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", separated)
+    return frozenset(re.findall(r"[A-Za-z0-9]+", separated.lower()))
+
+
+def _label_kind(value: str) -> str | None:
+    tokens = _label_tokens(value)
+    is_provider_reference = (
+        "id" in tokens and not tokens.isdisjoint(PROVIDER_ID_PREFIXES)
+    ) or (
+        not tokens.isdisjoint(PROVIDER_REFERENCE_OWNERS)
+        and not tokens.isdisjoint(PROVIDER_REFERENCE_OBJECTS)
+    )
+    if is_provider_reference:
+        return "provider_reference"
+    if not tokens.isdisjoint(FORBIDDEN_VALUE_TOKEN_LABELS) or any(
+        _label_tokens(group) <= tokens for group in FORBIDDEN_VALUE_GROUP_LABELS
+    ):
+        return "forbidden"
+    return None
+
+
+def _labelled_candidate_is_forbidden(label: str, candidate: str) -> bool:
+    kind = _label_kind(label)
+    candidate = re.sub(r"^\s*[:=]\s*", "", candidate).lower()
+    if kind == "provider_reference":
+        return (
+            re.fullmatch(
+                _python_regex(SAFE_REFERENCE_EXPLANATION_PATTERN), candidate
+            )
+            is None
+        )
+    if kind == "forbidden":
+        return (
+            re.fullmatch(
+                _python_regex(SAFE_SENSITIVE_EXPLANATION_PATTERN), candidate
+            )
+            is None
+        )
+    return False
+
+
 def _labelled_forbidden_values() -> tuple[str, ...]:
     values: list[str] = []
     for label in FORBIDDEN_VALUE_LABELS:
@@ -198,10 +260,41 @@ def _labelled_forbidden_values() -> tuple[str, ...]:
                     f"{owner} {reference} #1234",
                 )
             )
+    for _, label, _ in LABEL_NORMALIZATION_CASES:
+        values.extend(
+            (
+                f"{label}: !value",
+                f"{label} = '#1234'",
+                f"{label} synthetic_value",
+            )
+        )
     return tuple(dict.fromkeys(values))
 
 
 def _has_labelled_actual_value(value: str) -> bool:
+    explicit_pattern = (
+        r"(^|[^A-Za-z0-9_-])"
+        r"([A-Za-z0-9_-]+(?:\s+[A-Za-z0-9_-]+){0,7})"
+        r"\s*[:=]\s*(\S.*)"
+    )
+    for match in re.finditer(explicit_pattern, value):
+        if _labelled_candidate_is_forbidden(match.group(2), match.group(3)):
+            return True
+
+    words = value.split()
+    for start in range(max(0, len(words) - 1)):
+        candidates: list[tuple[int, int, str, str]] = []
+        for end in range(start, min(len(words) - 1, start + 8)):
+            label = " ".join(words[start : end + 1])
+            kind = _label_kind(label)
+            if kind is not None:
+                priority = 0 if kind == "provider_reference" else 1
+                candidates.append((priority, end, label, " ".join(words[end + 1 :])))
+        if candidates:
+            _, _, label, candidate = min(candidates)
+            if _labelled_candidate_is_forbidden(label, candidate):
+                return True
+
     lowered = value.lower()
     for label in FORBIDDEN_VALUE_LABELS:
         pattern = (
@@ -259,6 +352,17 @@ def _has_unsafe_provider_id_assignment(value: object) -> bool:
         if _has_unsafe_provider_id_assignment(item):
             return True
     return False
+
+
+def _has_forbidden_label_key(value: object) -> bool:
+    if isinstance(value, list):
+        return any(_has_forbidden_label_key(item) for item in value)
+    if not isinstance(value, dict):
+        return False
+    return any(
+        _label_kind(key) == "forbidden" or _has_forbidden_label_key(item)
+        for key, item in value.items()
+    )
 
 
 def _string_values(value: object):
@@ -398,25 +502,27 @@ def test_validation_migration_has_service_role_only_server_isolation_guard() -> 
 def test_validation_migration_recursively_rejects_normalized_sensitive_key_fragments() -> None:
     sql = _sql()
     compact = _compact(sql)
+    key_body = _function_body(sql, "jsonb_has_forbidden_validation_key")
 
     assert "jsonb_path_query" in sql
     assert "$.**.keyvalue()" in sql
-    assert "regexp_replace" in sql
-    for fragment in (
+    assert "public.validation_label_kind(keys.item->>'key') = 'forbidden'" in _compact(
+        key_body
+    )
+    for token in (
         "authorization",
         "token",
         "secret",
         "password",
-        "api_key",
-        "client_id",
-        "client_secret",
         "path",
         "uri",
         "raw",
         "payload",
         "response",
     ):
-        assert f"'{fragment}'" in sql
+        assert f"'{token}'" in sql
+    for group in ("api key", "client id", "client secret"):
+        assert f"'{group}'" in sql
 
     assert "constraint erp_validation_public_json_safe check" in compact
     for column in ("prerequisites", "limitations", "response_shape", "semantic_contract"):
@@ -464,10 +570,10 @@ def test_validation_migration_rejects_unsafe_json_and_text_values() -> None:
     assert "jsonb_path_query" in json_body
     assert "jsonb_typeof(nodes.item) in ('number', 'boolean', 'null')" in _compact(json_body)
     assert "$.**.keyvalue()" in json_body
-    assert "as provider_id_entry(item)" in _compact(json_body)
-    assert "as normalized_provider_id(normalized_key)" in _compact(json_body)
-    assert "(_[a-z]+)*_id$" in json_body
-    assert "provider_id_entry.item->>'value' !~" in _compact(json_body)
+    assert "as labelled_entry(item)" in _compact(json_body)
+    assert "public.validation_label_assignment_has_forbidden_value(" in json_body
+    assert "labelled_entry.item->>'key'" in json_body
+    assert "labelled_entry.item->>'value'" in json_body
     assert "nodes.item #>> '{}' ~ '[[:digit:]]'" not in _compact(json_body)
     assert "([[:digit:]][^[:alnum:]]*){9}" in text_body
     assert "([a-z]+[0-9]+|[0-9]+[a-z]+)" in text_body
@@ -491,35 +597,31 @@ def test_validation_migration_rejects_unsafe_json_and_text_values() -> None:
 
 
 def test_validation_migration_uses_complete_table_driven_label_contract() -> None:
-    text_body = _function_body(_sql(), "validation_text_has_forbidden_value")
-    compact = _compact(text_body)
+    sql = _sql()
+    kind_body = _function_body(sql, "validation_label_kind")
+    assignment_body = _function_body(
+        sql, "validation_label_assignment_has_forbidden_value"
+    )
+    text_body = _function_body(sql, "validation_text_has_forbidden_value")
+    compact_kind = _compact(kind_body)
+    compact_text = _compact(text_body)
 
-    assert "as forbidden_label(label)" in compact
-    assert "replace(forbidden_label.label, ' ', '[ _-]+')" in compact
-    assert "as provider_id_prefix(label)" in compact
-    assert "as reference_owner(label)" in compact
-    assert "as reference_object(label)" in compact
-    forbidden_label_table = text_body.split("]) as forbidden_label(label)", 1)[0].rsplit(
-        "from unnest(array[", 1
-    )[1]
-    for label in FORBIDDEN_VALUE_LABELS:
-        assert f"'{label}'" in forbidden_label_table
-
-    provider_id_table = text_body.split("]) as provider_id_prefix(label)", 1)[0].rsplit(
-        "from unnest(array[", 1
-    )[1]
+    assert "label_tokens && array[" in compact_kind
+    assert "forbidden_group.tokens <@ label_tokens" in compact_kind
+    assert "as provider_id_prefix(label)" in compact_kind
+    assert "as reference_owner(label)" in compact_kind
+    assert "as reference_object(label)" in compact_kind
+    for label in FORBIDDEN_VALUE_TOKEN_LABELS:
+        assert f"'{label}'" in kind_body
+    for label in FORBIDDEN_VALUE_GROUP_LABELS:
+        assert f"'{label}'" in kind_body
     for prefix in PROVIDER_ID_PREFIXES:
-        assert f"'{prefix}'" in provider_id_table
-    assert "unnest(array['provider', 'source']) as reference_owner(label)" in compact
-    assert "unnest(array['record', 'document']) as reference_object(label)" in compact
-
-    assert SAFE_SENSITIVE_EXPLANATION_PATTERN in text_body
-    assert SAFE_REFERENCE_EXPLANATION_PATTERN in text_body
-    assert "cross join lateral regexp_matches(" in compact
-    assert "labelled_forbidden.parts[4] !~" in compact
-    assert "labelled_provider_id.parts[5] !~" in compact
-    assert "labelled_reference.parts[5] !~" in compact
-    assert text_body.count("([^[:space:]].*)") == 3
+        assert f"'{prefix}'" in kind_body
+    assert SAFE_SENSITIVE_EXPLANATION_PATTERN in assignment_body
+    assert SAFE_REFERENCE_EXPLANATION_PATTERN in assignment_body
+    assert "as labelled_token_assignment(parts)" in compact_text
+    assert "public.validation_label_assignment_has_forbidden_value(" in compact_text
+    assert "replace(forbidden_label.label, ' ', '[ _-]+')" not in compact_text
 
     unconditional_fragments = text_body.split("from unnest(array[", 1)[1].split(
         "]) as forbidden", 1
@@ -545,6 +647,71 @@ def test_validation_migration_uses_complete_table_driven_label_contract() -> Non
         assert f"'{label_only_fragment}'" not in unconditional_fragments
 
 
+def test_validation_migration_uses_task_1_equivalent_label_token_binding() -> None:
+    sql = _sql()
+    token_body = _function_body(sql, "validation_label_tokens")
+    kind_body = _function_body(sql, "validation_label_kind")
+    text_body = _function_body(sql, "validation_text_has_forbidden_value")
+    json_body = _function_body(sql, "jsonb_has_forbidden_validation_value")
+    compact_token_body = _compact(token_body)
+    compact_kind_body = _compact(kind_body)
+    compact_text_body = _compact(text_body)
+    compact_json_body = _compact(json_body)
+
+    acronym_boundary = "'([[:upper:]]+)([[:upper:]][[:lower:]])'"
+    camel_boundary = "'([[:lower:][:digit:]])([[:upper:]])'"
+    lowercase = "lower(label_parts.token)"
+    assert acronym_boundary in token_body
+    assert camel_boundary in token_body
+    assert "regexp_split_to_table" in token_body
+    assert "'[^[:alnum:]]+'" in token_body
+    assert token_body.index(acronym_boundary) < token_body.index(lowercase)
+    assert token_body.index(camel_boundary) < token_body.index(lowercase)
+    assert "array_agg(distinct lower(label_parts.token)" in compact_token_body
+
+    assert "public.validation_label_tokens(value)" in compact_kind_body
+    assert "label_tokens && array[" in compact_kind_body
+    assert "forbidden_group.tokens <@ label_tokens" in compact_kind_body
+
+    assert "labelled_token_assignment.parts[2]" in compact_text_body
+    assert "labelled_token_assignment.parts[3]" in compact_text_body
+    assert "public.validation_label_assignment_has_forbidden_value(" in compact_text_body
+    assert "jsonb_typeof(labelled_entry.item->'value')" in compact_json_body
+    assert "public.validation_label_assignment_has_forbidden_value(" in compact_json_body
+
+
+def test_label_normalization_matrix_covers_review_6_classes() -> None:
+    classes = {
+        normalization_class
+        for normalization_class, _, _ in LABEL_NORMALIZATION_CASES
+    }
+    labels = {label for _, label, _ in LABEL_NORMALIZATION_CASES}
+
+    assert classes == {
+        "camel",
+        "acronym",
+        "qualified_token",
+        "underscore",
+        "hyphen",
+        "space",
+    }
+    assert {
+        "client_public_id",
+        "api_signing_key",
+        "clientId",
+        "authorizationHeader",
+        "rawPayload",
+        "providerExternalRecordId",
+    } <= labels
+
+    unsafe_values = _labelled_forbidden_values()
+    for _, label, expected_tokens in LABEL_NORMALIZATION_CASES:
+        assert tuple(sorted(_label_tokens(label))) == expected_tokens
+        assert f"{label}: !value" in unsafe_values
+        assert f"{label} = '#1234'" in unsafe_values
+        assert f"{label} synthetic_value" in unsafe_values
+
+
 def test_labelled_value_patterns_preserve_all_254_semantic_contracts() -> None:
     contracts: list[dict[str, object]] = []
     for path in SEMANTIC_CONTRACTS:
@@ -553,6 +720,7 @@ def test_labelled_value_patterns_preserve_all_254_semantic_contracts() -> None:
 
     assert len(contracts) == 254
     for contract in contracts:
+        assert not _has_forbidden_label_key(contract)
         assert not _has_unsafe_provider_id_assignment(contract)
         for value in _string_values(contract):
             assert not _has_labelled_actual_value(value)

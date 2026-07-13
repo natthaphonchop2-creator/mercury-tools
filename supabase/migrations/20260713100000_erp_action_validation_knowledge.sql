@@ -36,6 +36,197 @@ revoke all on function public.mercury_validation_test_guard_matches(text)
 grant execute on function public.mercury_validation_test_guard_matches(text)
   to service_role;
 
+create or replace function public.validation_label_tokens(value text)
+returns text[]
+language sql
+immutable
+parallel safe
+set search_path = pg_catalog, pg_temp
+as $function$
+  with separated as (
+    select regexp_replace(
+      regexp_replace(
+        coalesce(value, ''),
+        '([[:upper:]]+)([[:upper:]][[:lower:]])',
+        '\1 \2',
+        'g'
+      ),
+      '([[:lower:][:digit:]])([[:upper:]])',
+      '\1 \2',
+      'g'
+    ) as value
+  ),
+  label_parts as (
+    select parts.token
+    from separated
+    cross join lateral regexp_split_to_table(
+      separated.value,
+      '[^[:alnum:]]+'
+    ) as parts(token)
+  )
+  select coalesce(
+    array_agg(distinct
+      lower(label_parts.token)
+      order by lower(label_parts.token)
+    ) filter (where label_parts.token <> ''),
+    array[]::text[]
+  )
+  from label_parts;
+$function$;
+
+revoke all on function public.validation_label_tokens(text)
+  from public, anon, authenticated;
+grant execute on function public.validation_label_tokens(text)
+  to service_role;
+
+create or replace function public.validation_label_kind(value text)
+returns text
+language sql
+immutable
+parallel safe
+set search_path = pg_catalog, pg_temp
+as $function$
+  with normalized as (
+    select public.validation_label_tokens(value) as label_tokens
+  )
+  select case
+    when (
+      'id' = any(label_tokens)
+      and exists (
+        select 1
+        from unnest(array[
+          'provider',
+          'source',
+          'customer',
+          'contact',
+          'document',
+          'record',
+          'invoice',
+          'payment'
+        ]) as provider_id_prefix(label)
+        where provider_id_prefix.label = any(label_tokens)
+      )
+    ) or (
+      exists (
+        select 1
+        from unnest(array['provider', 'source']) as reference_owner(label)
+        where reference_owner.label = any(label_tokens)
+      )
+      and exists (
+        select 1
+        from unnest(array['record', 'document']) as reference_object(label)
+        where reference_object.label = any(label_tokens)
+      )
+    ) then 'provider_reference'
+    when label_tokens && array[
+      'auth',
+      'authentication',
+      'authorization',
+      'cookie',
+      'credential',
+      'credentials',
+      'file',
+      'header',
+      'headers',
+      'local',
+      'oauth',
+      'password',
+      'passwords',
+      'path',
+      'payload',
+      'raw',
+      'request',
+      'response',
+      'secret',
+      'secrets',
+      'source',
+      'token',
+      'tokens',
+      'uri'
+    ] or exists (
+      select 1
+      from unnest(array[
+        'access key',
+        'access keys',
+        'access token',
+        'access tokens',
+        'api key',
+        'api keys',
+        'api secret',
+        'api secrets',
+        'auth header',
+        'auth headers',
+        'auth token',
+        'auth tokens',
+        'authentication header',
+        'authentication token',
+        'authorization header',
+        'authorization token',
+        'client id',
+        'client secret',
+        'client secrets',
+        'cookie header',
+        'cookie token',
+        'file name',
+        'file path',
+        'id token',
+        'local file',
+        'local path',
+        'oauth token',
+        'provider response',
+        'raw payload',
+        'raw response',
+        'refresh token',
+        'request body',
+        'request payload',
+        'response body',
+        'response payload',
+        'session cookie',
+        'session token',
+        'source file',
+        'source path'
+      ]) as forbidden_label(label)
+      cross join lateral (
+        select public.validation_label_tokens(forbidden_label.label)
+      ) as forbidden_group(tokens)
+      where forbidden_group.tokens <@ label_tokens
+    ) then 'forbidden'
+    else null
+  end
+  from normalized;
+$function$;
+
+revoke all on function public.validation_label_kind(text)
+  from public, anon, authenticated;
+grant execute on function public.validation_label_kind(text)
+  to service_role;
+
+create or replace function public.validation_label_assignment_has_forbidden_value(
+  label text,
+  candidate text
+)
+returns boolean
+language sql
+immutable
+parallel safe
+set search_path = pg_catalog, pg_temp
+as $function$
+  select case public.validation_label_kind(label)
+    when 'provider_reference' then
+      candidate is null
+      or lower(candidate) !~ '^((absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown))|(are|is|remain|remains|was|were)[[:space:]]+(not[[:space:]]+)?(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown|([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown))|(cannot|must|should)[[:space:]]+be[[:space:]]+(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown|([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown)))[.]?$'
+    when 'forbidden' then
+      candidate is null
+      or lower(candidate) !~ '^((((absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(are|is|remain|remains|was|were)[[:space:]]+(not[[:space:]]+)?(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(cannot|must|should)[[:space:]]+be[[:space:]]+(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)))|(are[[:space:]]+not[[:space:]]+available[[:space:]]+for[[:space:]]+live[[:space:]]+validation)|((body|credential|credentials|document|file|header|headers|id|key|keys|name|path|payload|record|response|secret|secrets|token|tokens|value)[ _-]+(((absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(are|is|remain|remains|was|were)[[:space:]]+(not[[:space:]]+)?(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(cannot|must|should)[[:space:]]+be[[:space:]]+(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown))))|((record|document)[ _-]+(([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown)))|(completed[[:space:]]+with[[:space:]]+(the[[:space:]]+reviewed[[:space:]]+expected[[:space:]]+outcome|a[[:space:]]+classified[[:space:]]+failure)|outcome[[:space:]]+could[[:space:]]+not[[:space:]]+be[[:space:]]+proven[[:space:]]+and[[:space:]]+was[[:space:]]+not[[:space:]]+retried))[.]?$'
+    else false
+  end;
+$function$;
+
+revoke all on function public.validation_label_assignment_has_forbidden_value(text, text)
+  from public, anon, authenticated;
+grant execute on function public.validation_label_assignment_has_forbidden_value(text, text)
+  to service_role;
+
 create or replace function public.jsonb_has_forbidden_validation_key(value jsonb)
 returns boolean
 language sql
@@ -49,48 +240,7 @@ as $function$
       coalesce(value, 'null'::jsonb),
       'lax $.**.keyvalue()'
     ) as keys(item)
-    cross join lateral (
-      select trim(
-        both '_' from lower(
-          regexp_replace(
-            regexp_replace(
-              regexp_replace(
-                keys.item->>'key',
-                '([[:upper:]]+)([[:upper:]][[:lower:]])',
-                '\1_\2',
-                'g'
-              ),
-              '([[:lower:][:digit:]])([[:upper:]])',
-              '\1_\2',
-              'g'
-            ),
-            '[^[:alnum:]]+',
-            '_',
-            'g'
-          )
-        )
-      ) as normalized_key
-    ) as normalized
-    cross join unnest(array[
-      'authorization',
-      'token',
-      'secret',
-      'password',
-      'api_key',
-      'apikey',
-      'client_id',
-      'clientid',
-      'client_secret',
-      'clientsecret',
-      'path',
-      'uri',
-      'raw',
-      'payload',
-      'response'
-    ]) as forbidden(fragment)
-    where normalized.normalized_key ~ (
-      '(^|_)' || forbidden.fragment || '(_|$)'
-    )
+    where public.validation_label_kind(keys.item->>'key') = 'forbidden'
   );
 $function$;
 
@@ -150,113 +300,85 @@ as $function$
     )
     or exists (
       select 1
-      from unnest(array[
-        'auth',
-        'authentication',
-        'authorization',
-        'cookie',
-        'credential',
-        'credentials',
-        'file',
-        'header',
-        'headers',
-        'local',
-        'oauth',
-        'password',
-        'passwords',
-        'path',
-        'payload',
-        'raw',
-        'request',
-        'response',
-        'secret',
-        'secrets',
-        'source',
-        'token',
-        'tokens',
-        'access key',
-        'access keys',
-        'access token',
-        'access tokens',
-        'api key',
-        'api keys',
-        'api secret',
-        'api secrets',
-        'auth header',
-        'auth headers',
-        'auth token',
-        'auth tokens',
-        'authentication header',
-        'authentication token',
-        'authorization header',
-        'authorization token',
-        'client id',
-        'client secret',
-        'client secrets',
-        'cookie header',
-        'cookie token',
-        'file name',
-        'file path',
-        'id token',
-        'local file',
-        'local path',
-        'oauth token',
-        'provider response',
-        'raw payload',
-        'raw response',
-        'refresh token',
-        'request body',
-        'request payload',
-        'response body',
-        'response payload',
-        'session cookie',
-        'session token',
-        'source file',
-        'source path'
-      ]) as forbidden_label(label)
-      cross join lateral regexp_matches(
-        lower(value),
-        '(^|[^a-z0-9])(' ||
-        replace(forbidden_label.label, ' ', '[ _-]+') ||
-        ')([[:space:]]*[:=][[:space:]]*|[[:space:]]+)([^[:space:]].*)',
+      from regexp_matches(
+        value,
+        '(^|[^[:alnum:]_-])([[:alnum:]_-]+(?:[[:space:]]+[[:alnum:]_-]+){0,7})[[:space:]]*[:=][[:space:]]*(.+)',
         'g'
-      ) as labelled_forbidden(parts)
-      where labelled_forbidden.parts[4] !~ '^((((absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(are|is|remain|remains|was|were)[[:space:]]+(not[[:space:]]+)?(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(cannot|must|should)[[:space:]]+be[[:space:]]+(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)))|(are[[:space:]]+not[[:space:]]+available[[:space:]]+for[[:space:]]+live[[:space:]]+validation)|((body|credential|credentials|document|file|header|headers|id|key|keys|name|path|payload|record|response|secret|secrets|token|tokens|value)[ _-]+(((absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(are|is|remain|remains|was|were)[[:space:]]+(not[[:space:]]+)?(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(cannot|must|should)[[:space:]]+be[[:space:]]+(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown))))|((record|document)[ _-]+(([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown)))|(completed[[:space:]]+with[[:space:]]+(the[[:space:]]+reviewed[[:space:]]+expected[[:space:]]+outcome|a[[:space:]]+classified[[:space:]]+failure)|outcome[[:space:]]+could[[:space:]]+not[[:space:]]+be[[:space:]]+proven[[:space:]]+and[[:space:]]+was[[:space:]]+not[[:space:]]+retried))[.]?$'
+      ) as labelled_token_assignment(parts)
+      where public.validation_label_assignment_has_forbidden_value(
+        labelled_token_assignment.parts[2],
+        labelled_token_assignment.parts[3]
+      )
     )
     or exists (
+      with assignment_words as (
+        select array_agg(words.word order by words.ordinality) as parts
+        from regexp_split_to_table(
+          btrim(value),
+          '[[:space:]]+'
+        ) with ordinality as words(word, ordinality)
+      ),
+      label_candidates as (
+        select
+          start_positions.start_index,
+          end_positions.end_index,
+          array_to_string(
+            assignment_words.parts[
+              start_positions.start_index:end_positions.end_index
+            ],
+            ' '
+          ) as label,
+          regexp_replace(
+            array_to_string(
+              assignment_words.parts[
+                end_positions.end_index + 1:array_length(assignment_words.parts, 1)
+              ],
+              ' '
+            ),
+            '^[[:space:]]*[:=][[:space:]]*',
+            ''
+          ) as candidate,
+          public.validation_label_kind(
+            array_to_string(
+              assignment_words.parts[
+                start_positions.start_index:end_positions.end_index
+              ],
+              ' '
+            )
+          ) as label_kind
+        from assignment_words
+        cross join lateral generate_series(
+          1,
+          greatest(array_length(assignment_words.parts, 1) - 1, 0)
+        ) as start_positions(start_index)
+        cross join lateral generate_series(
+          start_positions.start_index,
+          least(
+            start_positions.start_index + 7,
+            array_length(assignment_words.parts, 1) - 1
+          )
+        ) as end_positions(end_index)
+      ),
+      preferred_candidates as (
+        select distinct on (start_index)
+          start_index,
+          label,
+          candidate,
+          label_kind
+        from label_candidates
+        where label_kind is not null
+          and candidate <> ''
+        order by
+          start_index,
+          case label_kind when 'provider_reference' then 0 else 1 end,
+          end_index
+      )
       select 1
-      from unnest(array[
-        'provider',
-        'source',
-        'customer',
-        'contact',
-        'document',
-        'record',
-        'invoice',
-        'payment'
-      ]) as provider_id_prefix(label)
-      cross join lateral regexp_matches(
-        lower(value),
-        '(^|[^a-z0-9])(' ||
-        provider_id_prefix.label ||
-        '([ _-]+[a-z]+)*[ _-]+id)' ||
-        '([[:space:]]*[:=][[:space:]]*|[[:space:]]+)([^[:space:]].*)',
-        'g'
-      ) as labelled_provider_id(parts)
-      where labelled_provider_id.parts[5] !~ '^((absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown))|(are|is|remain|remains|was|were)[[:space:]]+(not[[:space:]]+)?(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown|([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown))|(cannot|must|should)[[:space:]]+be[[:space:]]+(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown|([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown)))[.]?$'
-    )
-    or exists (
-      select 1
-      from unnest(array['provider', 'source']) as reference_owner(label)
-      cross join unnest(array['record', 'document']) as reference_object(label)
-      cross join lateral regexp_matches(
-        lower(value),
-        '(^|[^a-z0-9])(' ||
-        reference_owner.label || '[ _-]+' || reference_object.label ||
-        '([ _-]+id)?)([[:space:]]*[:=][[:space:]]*|[[:space:]]+)([^[:space:]].*)',
-        'g'
-      ) as labelled_reference(parts)
-      where labelled_reference.parts[5] !~ '^((absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown))|(are|is|remain|remains|was|were)[[:space:]]+(not[[:space:]]+)?(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown|([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown))|(cannot|must|should)[[:space:]]+be[[:space:]]+(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown|([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown)))[.]?$'
+      from preferred_candidates
+      where public.validation_label_assignment_has_forbidden_value(
+        preferred_candidates.label,
+        preferred_candidates.candidate
+      )
     )
     or value ~ '[A-Za-z0-9_-]{8,}[.][A-Za-z0-9_-]{8,}[.][A-Za-z0-9_-]{4,}'
     or value ~ '([[:digit:]][^[:alnum:]]*){9}'
@@ -314,34 +436,15 @@ as $function$
       from jsonb_path_query(
         coalesce(value, 'null'::jsonb),
         'lax $.**.keyvalue()'
-      ) as provider_id_entry(item)
-      cross join lateral (
-        select trim(
-          both '_' from lower(
-            regexp_replace(
-              regexp_replace(
-                regexp_replace(
-                  provider_id_entry.item->>'key',
-                  '([[:upper:]]+)([[:upper:]][[:lower:]])',
-                  '\1_\2',
-                  'g'
-                ),
-                '([[:lower:][:digit:]])([[:upper:]])',
-                '\1_\2',
-                'g'
-              ),
-              '[^[:alnum:]]+',
-              '_',
-              'g'
-            )
-          )
-        )
-      ) as normalized_provider_id(normalized_key)
-      where normalized_provider_id.normalized_key ~ '^(provider|source|customer|contact|document|record|invoice|payment)(_[a-z]+)*_id$'
-        and (
-          jsonb_typeof(provider_id_entry.item->'value') <> 'string'
-          or provider_id_entry.item->>'value' !~ '^((absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown)|(([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown))|(are|is|remain|remains|was|were)[[:space:]]+(not[[:space:]]+)?(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown|([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown))|(cannot|must|should)[[:space:]]+be[[:space:]]+(absent|available|configured|disabled|included|known|missing|needed|omitted|present|provided|redacted|required|stored|supported|unavailable|unknown|([a-z]+[[:space:]]+){0,3}(array|boolean|field|id|identifier|integer|key|null|number|object|schema|string|truncated|unknown)))[.]?$'
-        )
+      ) as labelled_entry(item)
+      where public.validation_label_assignment_has_forbidden_value(
+        labelled_entry.item->>'key',
+        case
+          when jsonb_typeof(labelled_entry.item->'value') = 'string'
+            then labelled_entry.item->>'value'
+          else null
+        end
+      )
     );
 $function$;
 

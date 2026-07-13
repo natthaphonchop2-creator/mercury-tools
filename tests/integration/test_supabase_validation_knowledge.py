@@ -60,6 +60,7 @@ _FORBIDDEN_VALUE_TOKEN_LABELS = (
     "source",
     "token",
     "tokens",
+    "uri",
 )
 _FORBIDDEN_VALUE_GROUP_LABELS = (
     "access key",
@@ -105,6 +106,24 @@ _FORBIDDEN_VALUE_GROUP_LABELS = (
 _FORBIDDEN_VALUE_LABELS = (
     *_FORBIDDEN_VALUE_TOKEN_LABELS,
     *_FORBIDDEN_VALUE_GROUP_LABELS,
+)
+_LABEL_NORMALIZATION_CASES = (
+    ("camel", "clientId", ("client", "id")),
+    ("camel", "authorizationHeader", ("authorization", "header")),
+    ("camel", "rawPayload", ("payload", "raw")),
+    ("camel", "providerExternalRecordId", ("external", "id", "provider", "record")),
+    ("acronym", "APIKey", ("api", "key")),
+    ("acronym", "APISigningKey", ("api", "key", "signing")),
+    ("qualified_token", "client_public_id", ("client", "id", "public")),
+    ("qualified_token", "api_signing_key", ("api", "key", "signing")),
+    ("underscore", "authorization_header", ("authorization", "header")),
+    ("hyphen", "raw-payload", ("payload", "raw")),
+    ("space", "api signing key", ("api", "key", "signing")),
+    (
+        "space",
+        "provider external record id",
+        ("external", "id", "provider", "record"),
+    ),
 )
 _PROVIDER_ID_PREFIXES = (
     "provider",
@@ -315,6 +334,14 @@ def _labelled_forbidden_values() -> tuple[str, ...]:
                     f"{owner} {reference} #1234",
                 )
             )
+    for _, label, _ in _LABEL_NORMALIZATION_CASES:
+        values.extend(
+            (
+                f"{label}: !value",
+                f"{label} = '#1234'",
+                f"{label} synthetic_value",
+            )
+        )
     return tuple(dict.fromkeys(values))
 
 
@@ -419,6 +446,38 @@ def test_labelled_value_rpc_matrix_covers_complete_contract() -> None:
             assert f"{owner} {reference}: #1234" in values
             assert f"{owner}_{reference}_id = '#1234'" in values
             assert f"{owner} {reference} #1234" in values
+    assert {
+        normalization_class
+        for normalization_class, _, _ in _LABEL_NORMALIZATION_CASES
+    } == {
+        "camel",
+        "acronym",
+        "qualified_token",
+        "underscore",
+        "hyphen",
+        "space",
+    }
+    for _, label, _ in _LABEL_NORMALIZATION_CASES:
+        assert f"{label}: !value" in values
+        assert f"{label} = '#1234'" in values
+        assert f"{label} synthetic_value" in values
+
+
+def test_label_normalization_classes_pass_actual_sql_helper() -> None:
+    environment = _test_environment()
+
+    with httpx.Client(timeout=10.0, follow_redirects=False) as client:
+        for _, label, expected_tokens in _LABEL_NORMALIZATION_CASES:
+            response = _guarded_request(
+                client,
+                environment,
+                "POST",
+                f"{environment.rest_url}/rpc/validation_label_tokens",
+                headers=environment.service_headers,
+                json={"value": label},
+            )
+            _assert_status(response, 200)
+            assert response.json() == list(expected_tokens)
 
 
 def test_all_reviewed_semantic_contracts_pass_actual_sql_functions() -> None:
@@ -528,6 +587,18 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
                 f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_value",
                 headers=environment.service_headers,
                 json={"value": {"allowed_metadata": unsafe_value}},
+            )
+            _assert_status(response, 200)
+            assert response.json() is True
+
+        for _, unsafe_label, _ in _LABEL_NORMALIZATION_CASES:
+            response = _guarded_request(
+                client,
+                environment,
+                "POST",
+                f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_value",
+                headers=environment.service_headers,
+                json={"value": {"nested": [{unsafe_label: "!value"}]}},
             )
             _assert_status(response, 200)
             assert response.json() is True
