@@ -1,6 +1,9 @@
 from pathlib import Path
 
 MIGRATION = Path("supabase/migrations/20260711090000_erp_action_catalog.sql")
+VALIDATION_MIGRATION = Path(
+    "supabase/migrations/20260713100000_erp_action_validation_knowledge.sql"
+)
 
 
 def test_catalog_migration_has_normalized_immutable_service_role_only_contract() -> None:
@@ -43,3 +46,13 @@ def test_catalog_migration_has_required_indexes_and_checks() -> None:
     assert "source_type in ('openapi3', 'swagger2', 'postman2.1', 'documentation')" in sql
     assert "observed_state in ('success', 'failed', 'outcome_unknown')" in sql
     assert "latency_ms is null or latency_ms >= 0" in sql
+
+
+def test_validation_migration_extends_version_identity_without_rewriting_catalog_history() -> None:
+    catalog_sql = MIGRATION.read_text(encoding="utf-8").lower()
+    validation_sql = VALIDATION_MIGRATION.read_text(encoding="utf-8").lower()
+
+    assert "unique (action_id, version_id)" in catalog_sql
+    assert "alter table public.erp_action_versions" in validation_sql
+    assert "erp_action_versions_connector_identity_unique" in validation_sql
+    assert "unique (connector_id, action_id, version_id)" in validation_sql
