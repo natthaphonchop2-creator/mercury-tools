@@ -113,18 +113,6 @@ as $function$
       from unnest(array[
         'bearer ',
         'basic ',
-        'access_token',
-        'access token',
-        'api_key',
-        'api key',
-        'auth_token',
-        'auth token',
-        'client_credential',
-        'client credential',
-        'client_secret',
-        'client secret',
-        'credential_value',
-        'credential value',
         'digest ',
         'gho_',
         'ghp_',
@@ -145,19 +133,109 @@ as $function$
         'response payload',
         'provider_response',
         'provider response',
-        'source_record',
-        'source record',
-        'secret_value',
-        'secret value',
         'sk-',
         'sk_',
-        'refresh_token',
-        'refresh token',
         'xoxb-',
         'xoxp-',
         'ya29.'
       ]) as forbidden(fragment)
       where strpos(lower(value), forbidden.fragment) > 0
+    )
+    or exists (
+      select 1
+      from regexp_matches(
+        lower(value),
+        '(^|[^a-z0-9])(password[ _-]+value|token[ _-]+value|secret[ _-]+value|credential[ _-]+value|api[ _-]+keys?|client[ _-]+secrets?|passwords?|tokens?|secrets?|credentials?)( *[:=] *| +)([a-z0-9_.$+/-]+)( +([a-z]+))?( +([a-z]+))?',
+        'g'
+      ) as labelled_sensitive(parts)
+      where not coalesce(
+        labelled_sensitive.parts[4] = any (array[
+          'absent', 'available', 'configured', 'disabled', 'included',
+          'known', 'missing', 'needed', 'omitted', 'present', 'provided',
+          'redacted', 'required', 'stored', 'supported', 'unavailable', 'unknown'
+        ])
+        or (
+          labelled_sensitive.parts[4] = any (array[
+            'are', 'is', 'remain', 'remains', 'was', 'were'
+          ])
+          and labelled_sensitive.parts[6] = any (array[
+            'absent', 'available', 'configured', 'disabled', 'included',
+            'known', 'missing', 'needed', 'omitted', 'present', 'provided',
+            'redacted', 'required', 'stored', 'supported', 'unavailable', 'unknown'
+          ])
+        )
+        or (
+          labelled_sensitive.parts[4] = any (array[
+            'are', 'is', 'remain', 'remains', 'was', 'were'
+          ])
+          and labelled_sensitive.parts[6] = 'not'
+          and labelled_sensitive.parts[8] = any (array[
+            'absent', 'available', 'configured', 'disabled', 'included',
+            'known', 'missing', 'needed', 'omitted', 'present', 'provided',
+            'redacted', 'required', 'stored', 'supported', 'unavailable', 'unknown'
+          ])
+        )
+        or (
+          labelled_sensitive.parts[4] = any (array['cannot', 'must', 'should'])
+          and labelled_sensitive.parts[6] = 'be'
+          and labelled_sensitive.parts[8] = any (array[
+            'absent', 'available', 'configured', 'disabled', 'included',
+            'known', 'missing', 'needed', 'omitted', 'present', 'provided',
+            'redacted', 'required', 'stored', 'supported', 'unavailable', 'unknown'
+          ])
+        ),
+        false
+      )
+    )
+    or exists (
+      select 1
+      from regexp_matches(
+        lower(value),
+        '(^|[^a-z0-9])(provider|source)[ _-]+(record|document)([ _-]+id)?( *[:=] *| +)([a-z0-9_.$+/-]+)( +([a-z]+))?( +([a-z]+))?',
+        'g'
+      ) as labelled_reference(parts)
+      where not coalesce(
+        labelled_reference.parts[6] = any (array[
+          'absent', 'available', 'configured', 'disabled', 'field', 'id',
+          'identifier', 'included', 'key', 'known', 'missing', 'needed',
+          'number', 'omitted', 'present', 'provided', 'redacted', 'required',
+          'schema', 'stored', 'string', 'supported', 'unavailable', 'unknown'
+        ])
+        or (
+          labelled_reference.parts[6] = any (array[
+            'are', 'is', 'remain', 'remains', 'was', 'were'
+          ])
+          and labelled_reference.parts[8] = any (array[
+            'absent', 'available', 'configured', 'disabled', 'field', 'id',
+            'identifier', 'included', 'key', 'known', 'missing', 'needed',
+            'number', 'omitted', 'present', 'provided', 'redacted', 'required',
+            'schema', 'stored', 'string', 'supported', 'unavailable', 'unknown'
+          ])
+        )
+        or (
+          labelled_reference.parts[6] = any (array[
+            'are', 'is', 'remain', 'remains', 'was', 'were'
+          ])
+          and labelled_reference.parts[8] = 'not'
+          and labelled_reference.parts[10] = any (array[
+            'absent', 'available', 'configured', 'disabled', 'field', 'id',
+            'identifier', 'included', 'key', 'known', 'missing', 'needed',
+            'number', 'omitted', 'present', 'provided', 'redacted', 'required',
+            'schema', 'stored', 'string', 'supported', 'unavailable', 'unknown'
+          ])
+        )
+        or (
+          labelled_reference.parts[6] = any (array['cannot', 'must', 'should'])
+          and labelled_reference.parts[8] = 'be'
+          and labelled_reference.parts[10] = any (array[
+            'absent', 'available', 'configured', 'disabled', 'field', 'id',
+            'identifier', 'included', 'key', 'known', 'missing', 'needed',
+            'number', 'omitted', 'present', 'provided', 'redacted', 'required',
+            'schema', 'stored', 'string', 'supported', 'unavailable', 'unknown'
+          ])
+        ),
+        false
+      )
     )
     or value ~ '[A-Za-z0-9_-]{8,}[.][A-Za-z0-9_-]{8,}[.][A-Za-z0-9_-]{4,}'
     or value ~ '([[:digit:]][^[:alnum:]]*){9}'

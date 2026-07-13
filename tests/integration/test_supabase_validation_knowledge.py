@@ -181,6 +181,14 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             {"note": "client_credential synthetic_placeholder"},
             {"note": "raw_payload synthetic_placeholder"},
             {"note": "source_record synthetic_placeholder"},
+            {"note": "password synthetic_placeholder"},
+            {"note": "token synthetic_placeholder"},
+            {"note": "secret synthetic_placeholder"},
+            {"note": "credential synthetic_placeholder"},
+            {"note": "api-key synthetic_placeholder"},
+            {"note": "client-secret synthetic_placeholder"},
+            {"note": "provider record " + "1234"},
+            {"note": "source document " + "5678"},
             {"note": '{"record":' + "9912}"},
         )
         for unsafe_value in unsafe_json_values:
@@ -191,6 +199,20 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             )
             _assert_status(response, 200)
             assert response.json() is True
+
+        for safe_value in (
+            "provider credentials are not available",
+            "client secret is unavailable",
+            "provider record identifier",
+            "source document string",
+        ):
+            response = client.post(
+                f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_value",
+                headers=environment.service_headers,
+                json={"value": {"allowed_metadata": safe_value}},
+            )
+            _assert_status(response, 200)
+            assert response.json() is False
 
         response = client.post(
             f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_key",
@@ -271,9 +293,13 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             "run_state": "completed",
             "approved_public": True,
             "summary_th": "synthetic_th_summary",
-            "summary_en": "synthetic_en_summary",
+            "summary_en": "provider credentials are not available",
             "prerequisites": ["synthetic_prerequisite"],
-            "limitations": ["synthetic_limitation", "review phase 1/2 when ready"],
+            "limitations": [
+                "synthetic_limitation",
+                "review phase 1/2 when ready",
+                "source record identifier",
+            ],
             "recommended_next_step": "synthetic_next_step",
             "response_shape": {
                 "data": {
@@ -290,6 +316,7 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
                 "output_semantics": {
                     "counterparty_tax_id": "counterparty tax identifier",
                     "document_id": "synthetic document identifier",
+                    "provider_record": "provider record identifier",
                     "record_id": "synthetic record identifier",
                 },
             },
@@ -326,7 +353,7 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             **record,
             "opaque_evidence_id": f"ev_{suffix[2:28]}",
             "run_id": f"run_{suffix[2:28]}",
-            "response_shape": {"document_id": "synthetic-record-" + "9912"},
+            "limitations": ["provider record " + "1234"],
         }
         response = _post_rows(
             client,
@@ -340,7 +367,7 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             **record,
             "opaque_evidence_id": f"ev_{suffix[3:29]}",
             "run_id": f"run_{suffix[3:29]}",
-            "summary_en": "synthetic" + "@" + "example.invalid",
+            "summary_en": "password synthetic_placeholder",
         }
         response = _post_rows(
             client,

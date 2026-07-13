@@ -1,7 +1,48 @@
+import json
 import re
 from pathlib import Path
 
 MIGRATION = Path("supabase/migrations/20260713100000_erp_action_validation_knowledge.sql")
+SEMANTIC_CONTRACTS = (
+    Path("catalog/global/flowaccount/semantic-contracts.json"),
+    Path("catalog/global/peak/semantic-contracts.json"),
+)
+
+LABELLED_SENSITIVE_VALUE_PATTERN = (
+    r"(^|[^a-z0-9])"
+    r"(password[ _-]+value|token[ _-]+value|secret[ _-]+value|"
+    r"credential[ _-]+value|api[ _-]+keys?|client[ _-]+secrets?|"
+    r"passwords?|tokens?|secrets?|credentials?)"
+    r"( *[:=] *| +)([a-z0-9_.$+/-]+)"
+    r"( +([a-z]+))?( +([a-z]+))?"
+)
+LABELLED_REFERENCE_VALUE_PATTERN = (
+    r"(^|[^a-z0-9])(provider|source)[ _-]+(record|document)"
+    r"([ _-]+id)?( *[:=] *| +)([a-z0-9_.$+/-]+)"
+    r"( +([a-z]+))?( +([a-z]+))?"
+)
+SAFE_VALUE_STATES = {
+    "absent",
+    "available",
+    "configured",
+    "disabled",
+    "included",
+    "known",
+    "missing",
+    "needed",
+    "omitted",
+    "present",
+    "provided",
+    "redacted",
+    "required",
+    "stored",
+    "supported",
+    "unavailable",
+    "unknown",
+}
+SAFE_REFERENCE_DESCRIPTORS = {"field", "id", "identifier", "key", "number", "schema", "string"}
+COPULAS = {"are", "is", "remain", "remains", "was", "were"}
+MODALS = {"cannot", "must", "should"}
 
 
 def _sql() -> str:
@@ -16,6 +57,60 @@ def _function_body(sql: str, name: str) -> str:
     return sql.split(f"create or replace function public.{name}", 1)[1].split(
         "$function$;", 1
     )[0]
+
+
+def _labelled_match_is_safe(
+    match: re.Match[str],
+    *,
+    first_group: int,
+    second_group: int,
+    third_group: int,
+    descriptors: set[str] = frozenset(),
+) -> bool:
+    first = match.group(first_group)
+    second = match.group(second_group)
+    third = match.group(third_group)
+    safe_terms = SAFE_VALUE_STATES | descriptors
+    return (
+        first in safe_terms
+        or (first in COPULAS and second in safe_terms)
+        or (first in COPULAS and second == "not" and third in safe_terms)
+        or (first in MODALS and second == "be" and third in safe_terms)
+    )
+
+
+def _has_labelled_actual_value(value: str) -> bool:
+    lowered = value.lower()
+    for match in re.finditer(LABELLED_SENSITIVE_VALUE_PATTERN, lowered):
+        if not _labelled_match_is_safe(
+            match,
+            first_group=4,
+            second_group=6,
+            third_group=8,
+        ):
+            return True
+    for match in re.finditer(LABELLED_REFERENCE_VALUE_PATTERN, lowered):
+        if not _labelled_match_is_safe(
+            match,
+            first_group=6,
+            second_group=8,
+            third_group=10,
+            descriptors=SAFE_REFERENCE_DESCRIPTORS,
+        ):
+            return True
+    return False
+
+
+def _string_values(value: object):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, list):
+        for item in value:
+            yield from _string_values(item)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield key
+            yield from _string_values(item)
 
 
 def test_validation_migration_defines_strict_version_bound_knowledge() -> None:
@@ -179,10 +274,10 @@ def test_validation_migration_rejects_unsafe_json_and_text_values() -> None:
         "strpos(value, '@')",
         "strpos(lower(value), '://')",
         "'bearer '",
-        "'client_credential'",
         "'github_pat_'",
+        "'provider_response'",
         "'raw_payload'",
-        "'source_record'",
+        "'request_payload'",
         "'../'",
         "'[[:cntrl:]]'",
     ):
@@ -211,6 +306,74 @@ def test_validation_migration_rejects_unsafe_json_and_text_values() -> None:
     assert "public.jsonb_is_safe_validation_string_array(limitations)" in compact
     assert "public.jsonb_is_safe_validation_response_shape(response_shape)" in compact
     assert "public.jsonb_is_safe_validation_semantic_contract(semantic_contract)" in compact
+
+
+def test_validation_migration_rejects_labelled_actual_values_precisely() -> None:
+    text_body = _function_body(_sql(), "validation_text_has_forbidden_value")
+    compact = _compact(text_body)
+
+    assert LABELLED_SENSITIVE_VALUE_PATTERN in text_body
+    assert LABELLED_REFERENCE_VALUE_PATTERN in text_body
+    assert "from regexp_matches(" in compact
+    assert "labelled_sensitive.parts[4]" in compact
+    assert "labelled_sensitive.parts[6]" in compact
+    assert "labelled_sensitive.parts[8]" in compact
+    assert "labelled_reference.parts[6]" in compact
+    assert "labelled_reference.parts[8]" in compact
+    assert "labelled_reference.parts[10]" in compact
+    assert compact.count("where not coalesce(") >= 2
+    for safe_state in SAFE_VALUE_STATES:
+        assert f"'{safe_state}'" in text_body
+    for descriptor in SAFE_REFERENCE_DESCRIPTORS:
+        assert f"'{descriptor}'" in text_body
+
+    unconditional_fragments = text_body.split("from unnest(array[", 1)[1].split(
+        "]) as forbidden", 1
+    )[0]
+    for label_only_fragment in (
+        "access token",
+        "api key",
+        "auth token",
+        "client credential",
+        "client secret",
+        "credential value",
+        "refresh token",
+        "secret value",
+        "source record",
+    ):
+        assert f"'{label_only_fragment}'" not in unconditional_fragments
+
+
+def test_labelled_value_patterns_preserve_all_254_semantic_contracts() -> None:
+    contracts: list[dict[str, object]] = []
+    for path in SEMANTIC_CONTRACTS:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        contracts.extend(payload["contracts"])
+
+    assert len(contracts) == 254
+    for contract in contracts:
+        for value in _string_values(contract):
+            assert not _has_labelled_actual_value(value)
+
+    for safe_metadata in (
+        "provider credentials are not available",
+        "client secret is unavailable",
+        "provider record identifier",
+        "source document string",
+    ):
+        assert not _has_labelled_actual_value(safe_metadata)
+
+    for unsafe_value in (
+        "password synthetic_value",
+        "token synthetic_value",
+        "secret synthetic_value",
+        "credential synthetic_value",
+        "api-key synthetic_value",
+        "client-secret synthetic_value",
+        "provider record " + "1234",
+        "source document " + "5678",
+    ):
+        assert _has_labelled_actual_value(unsafe_value)
 
 
 def test_validation_value_helpers_allow_only_typed_shapes_and_semantic_metadata() -> None:
