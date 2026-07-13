@@ -78,6 +78,339 @@ revoke all on function public.jsonb_has_forbidden_validation_key(jsonb)
 grant execute on function public.jsonb_has_forbidden_validation_key(jsonb)
   to service_role;
 
+create or replace function public.validation_text_has_forbidden_value(value text)
+returns boolean
+language sql
+immutable
+parallel safe
+set search_path = pg_catalog, pg_temp
+as $function$
+  select
+    value is null
+    or char_length(value) > 512
+    or value ~ '[[:cntrl:]]'
+    or strpos(value, '@') > 0
+    or strpos(lower(value), '://') > 0
+    or strpos(value, '../') > 0
+    or strpos(value, './') > 0
+    or strpos(value, '~/') > 0
+    or strpos(value, chr(92)) > 0
+    or strpos(value, chr(8725)) > 0
+    or strpos(value, chr(65295)) > 0
+    or regexp_replace(
+      regexp_replace(
+        lower(value),
+        '(debit/credit|input/output)',
+        '',
+        'g'
+      ),
+      '[0-9]{1,4}/[0-9]{1,2}(/[0-9]{1,4})?',
+      '',
+      'g'
+    ) ~ '/'
+    or exists (
+      select 1
+      from unnest(array[
+        'bearer ',
+        'basic ',
+        'access_token',
+        'access token',
+        'api_key',
+        'api key',
+        'auth_token',
+        'auth token',
+        'client_credential',
+        'client credential',
+        'client_secret',
+        'client secret',
+        'credential_value',
+        'credential value',
+        'digest ',
+        'gho_',
+        'ghp_',
+        'github_pat_',
+        'pk_live_',
+        'rk_live_',
+        'raw_payload',
+        'raw payload',
+        'raw_response',
+        'raw response',
+        'request_body',
+        'request body',
+        'request_payload',
+        'request payload',
+        'response_body',
+        'response body',
+        'response_payload',
+        'response payload',
+        'provider_response',
+        'provider response',
+        'source_record',
+        'source record',
+        'secret_value',
+        'secret value',
+        'sk-',
+        'sk_',
+        'refresh_token',
+        'refresh token',
+        'xoxb-',
+        'xoxp-',
+        'ya29.'
+      ]) as forbidden(fragment)
+      where strpos(lower(value), forbidden.fragment) > 0
+    )
+    or value ~ '[A-Za-z0-9_-]{8,}[.][A-Za-z0-9_-]{8,}[.][A-Za-z0-9_-]{4,}'
+    or value ~ '([[:digit:]][^[:alnum:]]*){9}'
+    or btrim(value) ~ '^[[:digit:]]+$'
+    or lower(value) ~ (
+      '(^|[^a-z0-9])[a-z][a-z0-9]*[-_][a-z0-9_-]*'
+      '[[:digit:]][a-z0-9_-]*($|[^a-z0-9])'
+    )
+    or (
+      lower(value) ~ (
+        '(^|[^a-z0-9])([a-z]+[0-9]+|[0-9]+[a-z]+)'
+        '[a-z0-9]*($|[^a-z0-9])'
+      )
+      and btrim(lower(value)) !~ '^[1-5]xx$'
+    )
+    or left(btrim(value), 1) in ('{', '[')
+    or value ~ '"[^"]+"[[:space:]]*:';
+$function$;
+
+revoke all on function public.validation_text_has_forbidden_value(text)
+  from public, anon, authenticated;
+grant execute on function public.validation_text_has_forbidden_value(text)
+  to service_role;
+
+create or replace function public.jsonb_has_forbidden_validation_value(value jsonb)
+returns boolean
+language sql
+immutable
+parallel safe
+set search_path = pg_catalog, pg_temp
+as $function$
+  select exists (
+    select 1
+    from jsonb_path_query(
+      coalesce(value, 'null'::jsonb),
+      'lax $.**'
+    ) as nodes(item)
+    where jsonb_typeof(nodes.item) in ('number', 'boolean', 'null')
+      or (
+        jsonb_typeof(nodes.item) = 'string'
+        and (
+          (
+            nodes.item #>> '{}' !~ '^act_[0-9a-f]{24}$'
+            and nodes.item #>> '{}' !~ '^av_[0-9a-f]{64}$'
+            and nodes.item #>> '{}' !~ '^ev_[a-z0-9_]{8,128}$'
+            and nodes.item #>> '{}' !~ '^run_[a-z0-9_]{8,128}$'
+            and public.validation_text_has_forbidden_value(nodes.item #>> '{}')
+          )
+        )
+      )
+  );
+$function$;
+
+revoke all on function public.jsonb_has_forbidden_validation_value(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.jsonb_has_forbidden_validation_value(jsonb)
+  to service_role;
+
+create or replace function public.jsonb_is_safe_validation_string_array(value jsonb)
+returns boolean
+language sql
+immutable
+parallel safe
+set search_path = pg_catalog, pg_temp
+as $function$
+  select
+    jsonb_typeof(value) = 'array'
+    and not exists (
+      select 1
+      from jsonb_array_elements(
+        case
+          when jsonb_typeof(value) = 'array' then value
+          else '[]'::jsonb
+        end
+      ) as elements(item)
+      where jsonb_typeof(elements.item) <> 'string'
+        or public.jsonb_has_forbidden_validation_value(elements.item)
+    );
+$function$;
+
+revoke all on function public.jsonb_is_safe_validation_string_array(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.jsonb_is_safe_validation_string_array(jsonb)
+  to service_role;
+
+create or replace function public.jsonb_is_safe_validation_response_shape(value jsonb)
+returns boolean
+language sql
+immutable
+parallel safe
+set search_path = pg_catalog, pg_temp
+as $function$
+  select
+    coalesce(jsonb_typeof(value) = 'object', false)
+    and not public.jsonb_has_forbidden_validation_key(value)
+    and not public.jsonb_has_forbidden_validation_value(value)
+    and not exists (
+      select 1
+      from jsonb_path_query(value, 'lax $.**') as nodes(item)
+      where jsonb_typeof(nodes.item) not in ('object', 'string')
+        or (
+          jsonb_typeof(nodes.item) = 'string'
+          and nodes.item #>> '{}' not in (
+            'boolean', 'integer', 'null', 'number', 'string', 'truncated', 'unknown', 'array'
+          )
+        )
+    )
+    and not exists (
+      select 1
+      from jsonb_path_query(value, 'lax $.**.keyvalue()') as entries(item)
+      where char_length(entries.item->>'key') > 64
+        or entries.item->>'key' !~ '^[A-Za-z][A-Za-z0-9]*(_[A-Za-z0-9]+)*$'
+        or entries.item->>'key' ~ '[[:digit:]]{6,}'
+    );
+$function$;
+
+revoke all on function public.jsonb_is_safe_validation_response_shape(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.jsonb_is_safe_validation_response_shape(jsonb)
+  to service_role;
+
+create or replace function public.jsonb_is_safe_validation_semantic_contract(value jsonb)
+returns boolean
+language plpgsql
+immutable
+parallel safe
+set search_path = pg_catalog, pg_temp
+as $function$
+declare
+  array_field text;
+  array_item jsonb;
+  semantic_entry record;
+begin
+  if value is null or jsonb_typeof(value) <> 'object' then
+    return false;
+  end if;
+
+  if public.jsonb_has_forbidden_validation_key(value)
+    or public.jsonb_has_forbidden_validation_value(value)
+    or not value ? 'business_object'
+    or not value ? 'operation'
+    or value - array[
+      'business_object',
+      'operation',
+      'accounting_uses',
+      'output_semantics',
+      'join_keys',
+      'next_action_ids',
+      'required_external_capabilities',
+      'optional_external_capabilities',
+      'fallbacks'
+    ] <> '{}'::jsonb
+  then
+    return false;
+  end if;
+
+  if jsonb_typeof(value->'business_object') <> 'string'
+    or value->>'business_object' !~ '^[a-z][a-z0-9]*(_[a-z0-9]+)*$'
+    or jsonb_typeof(value->'operation') <> 'string'
+    or value->>'operation' !~ '^[a-z][a-z0-9]*(_[a-z0-9]+)*$'
+  then
+    return false;
+  end if;
+
+  foreach array_field in array array[
+    'accounting_uses',
+    'join_keys',
+    'fallbacks'
+  ] loop
+    if value ? array_field then
+      if jsonb_typeof(value->array_field) <> 'array' then
+        return false;
+      end if;
+      for array_item in
+        select elements.item
+        from jsonb_array_elements(value->array_field) as elements(item)
+      loop
+        if jsonb_typeof(array_item) <> 'string'
+          or array_item #>> '{}' !~ '^[a-z][a-z0-9]*(_[a-z0-9]+)*$'
+        then
+          return false;
+        end if;
+      end loop;
+    end if;
+  end loop;
+
+  if value ? 'next_action_ids' then
+    if jsonb_typeof(value->'next_action_ids') <> 'array' then
+      return false;
+    end if;
+    for array_item in
+      select elements.item
+      from jsonb_array_elements(value->'next_action_ids') as elements(item)
+    loop
+      if jsonb_typeof(array_item) <> 'string'
+        or array_item #>> '{}' !~ '^act_[0-9a-f]{24}$'
+      then
+        return false;
+      end if;
+    end loop;
+  end if;
+
+  foreach array_field in array array[
+    'required_external_capabilities',
+    'optional_external_capabilities'
+  ] loop
+    if value ? array_field then
+      if jsonb_typeof(value->array_field) <> 'array' then
+        return false;
+      end if;
+      for array_item in
+        select elements.item
+        from jsonb_array_elements(value->array_field) as elements(item)
+      loop
+        if jsonb_typeof(array_item) <> 'string'
+          or array_item #>> '{}' !~ (
+            '^[a-z][a-z0-9_]{0,31}'
+            '([.][a-z][a-z0-9_]{0,31}){2,5}$'
+          )
+        then
+          return false;
+        end if;
+      end loop;
+    end if;
+  end loop;
+
+  if value ? 'output_semantics' then
+    if jsonb_typeof(value->'output_semantics') <> 'object' then
+      return false;
+    end if;
+    for semantic_entry in
+      select entries.key, entries.item
+      from jsonb_each(value->'output_semantics') as entries(key, item)
+    loop
+      if semantic_entry.key !~ '^[a-z][a-z0-9]*(_[a-z0-9]+)*$'
+        or jsonb_typeof(semantic_entry.item) <> 'string'
+        or semantic_entry.item #>> '{}' !~ '^[a-z]+( [a-z]+)+$'
+        or char_length(semantic_entry.item #>> '{}') > 128
+      then
+        return false;
+      end if;
+    end loop;
+  end if;
+
+  return true;
+end;
+$function$;
+
+revoke all on function public.jsonb_is_safe_validation_semantic_contract(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.jsonb_is_safe_validation_semantic_contract(jsonb)
+  to service_role;
+
 create table public.erp_action_validation_knowledge (
   id uuid primary key default gen_random_uuid(),
   opaque_evidence_id text not null unique check (
@@ -153,6 +486,22 @@ create table public.erp_action_validation_knowledge (
     and not public.jsonb_has_forbidden_validation_key(limitations)
     and not public.jsonb_has_forbidden_validation_key(response_shape)
     and not public.jsonb_has_forbidden_validation_key(semantic_contract)
+  ),
+  constraint erp_validation_public_value_safe check (
+    not public.validation_text_has_forbidden_value(summary_th)
+    and not public.validation_text_has_forbidden_value(summary_en)
+    and not public.validation_text_has_forbidden_value(recommended_next_step)
+    and not public.validation_text_has_forbidden_value(status_class)
+    and not public.validation_text_has_forbidden_value(reviewed_by)
+    and not public.validation_text_has_forbidden_value(runner_version)
+    and not public.jsonb_has_forbidden_validation_value(prerequisites)
+    and not public.jsonb_has_forbidden_validation_value(limitations)
+    and not public.jsonb_has_forbidden_validation_value(response_shape)
+    and not public.jsonb_has_forbidden_validation_value(semantic_contract)
+    and public.jsonb_is_safe_validation_string_array(prerequisites)
+    and public.jsonb_is_safe_validation_string_array(limitations)
+    and public.jsonb_is_safe_validation_response_shape(response_shape)
+    and public.jsonb_is_safe_validation_semantic_contract(semantic_contract)
   )
 );
 

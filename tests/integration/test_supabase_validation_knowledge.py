@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
+from ipaddress import ip_address
 from urllib.parse import urlparse
 
 import httpx
@@ -12,16 +14,16 @@ pytestmark = pytest.mark.integration
 
 _OPT_IN = "MERCURY_SUPABASE_VALIDATION_TEST"
 _ISOLATED_OPT_IN = "MERCURY_SUPABASE_TEST_ISOLATED"
-_REQUIRED_ENV = (
-    "SUPABASE_URL",
-    "SUPABASE_SERVICE_ROLE_KEY",
-    "SUPABASE_ANON_KEY",
-    "SUPABASE_AUTHENTICATED_TEST_JWT",
-)
 _UNAVAILABLE_REASON = (
     "requires a disposable local or explicitly isolated Supabase environment with "
     "the Task 3 migration applied"
 )
+
+_CREDENTIAL_ENV_NAMES = {
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "SUPABASE_ANON_KEY",
+    "SUPABASE_AUTHENTICATED_TEST_JWT",
+}
 
 
 @dataclass(frozen=True)
@@ -32,22 +34,48 @@ class _SupabaseTestEnvironment:
     authenticated_headers: dict[str, str]
 
 
+class _RejectCredentialReads(dict[str, str]):
+    def get(self, key: str, default: str | None = None) -> str | None:
+        if key in _CREDENTIAL_ENV_NAMES:
+            raise AssertionError("credential_read_before_https_validation")
+        return super().get(key, default)
+
+    def __getitem__(self, key: str) -> str:
+        if key in _CREDENTIAL_ENV_NAMES:
+            raise AssertionError("credential_read_before_https_validation")
+        return super().__getitem__(key)
+
+
 def _test_environment() -> _SupabaseTestEnvironment:
     if os.environ.get(_OPT_IN) != "1":
         pytest.skip(f"{_UNAVAILABLE_REASON}; set {_OPT_IN}=1 to opt in")
 
-    missing = [name for name in _REQUIRED_ENV if not os.environ.get(name)]
-    if missing:
-        pytest.skip(f"{_UNAVAILABLE_REASON}; missing environment names: {', '.join(missing)}")
+    supabase_url = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+    if not supabase_url:
+        pytest.skip(f"{_UNAVAILABLE_REASON}; missing environment names: SUPABASE_URL")
 
-    supabase_url = os.environ["SUPABASE_URL"].rstrip("/")
-    hostname = (urlparse(supabase_url).hostname or "").lower()
-    is_loopback = hostname in {"127.0.0.1", "::1", "localhost"}
+    parsed_url = urlparse(supabase_url)
+    hostname = (parsed_url.hostname or "").lower()
+    if parsed_url.scheme not in {"http", "https"} or not hostname:
+        raise ValueError("supabase_validation_test_url_invalid")
+
+    is_loopback = hostname == "localhost"
+    if not is_loopback:
+        with suppress(ValueError):
+            is_loopback = ip_address(hostname).is_loopback
+
+    if not is_loopback and parsed_url.scheme != "https":
+        raise ValueError("supabase_validation_test_https_required")
     if not is_loopback and os.environ.get(_ISOLATED_OPT_IN) != "1":
         pytest.skip(
             f"{_UNAVAILABLE_REASON}; non-loopback environments require "
             f"{_ISOLATED_OPT_IN}=1"
         )
+
+    missing = [name for name in _CREDENTIAL_ENV_NAMES if not os.environ.get(name)]
+    if missing:
+        missing_names = ", ".join(sorted(missing))
+        pytest.skip(f"{_UNAVAILABLE_REASON}; missing environment names: {missing_names}")
 
     service_key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
     anon_key = os.environ["SUPABASE_ANON_KEY"]
@@ -89,6 +117,34 @@ def _post_rows(
     )
 
 
+def test_hosted_http_is_rejected_before_credentials_are_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guarded_environment = _RejectCredentialReads(
+        {
+            _OPT_IN: "1",
+            _ISOLATED_OPT_IN: "1",
+            "SUPABASE_URL": "http://db.example.invalid",
+        }
+    )
+    monkeypatch.setattr(os, "environ", guarded_environment)
+
+    with pytest.raises(ValueError, match="^supabase_validation_test_https_required$"):
+        _test_environment()
+
+
+def test_loopback_http_remains_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(_OPT_IN, "1")
+    monkeypatch.setenv(_ISOLATED_OPT_IN, "0")
+    monkeypatch.setenv("SUPABASE_URL", "http://127.0.0.1:54321")
+    for name in _CREDENTIAL_ENV_NAMES:
+        monkeypatch.setenv(name, "placeholder")
+
+    environment = _test_environment()
+
+    assert environment.rest_url == "http://127.0.0.1:54321/rest/v1"
+
+
 def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() -> None:
     environment = _test_environment()
     suffix = uuid.uuid4().hex
@@ -114,6 +170,28 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             _assert_status(response, 200)
             assert response.json() is True
 
+        unsafe_json_values = (
+            {"email": "synthetic" + "@" + "example.invalid"},
+            {"counterparty_tax_id": "0" * 13},
+            {"document_id": "synthetic-record-" + "9912"},
+            {"record_id": "synthetic" + "9912"},
+            {"note": "https:" + "//example.invalid/synthetic"},
+            {"note": ".." + "/synthetic/provider"},
+            {"note": "Bearer" + " synthetic_placeholder"},
+            {"note": "client_credential synthetic_placeholder"},
+            {"note": "raw_payload synthetic_placeholder"},
+            {"note": "source_record synthetic_placeholder"},
+            {"note": '{"record":' + "9912}"},
+        )
+        for unsafe_value in unsafe_json_values:
+            response = client.post(
+                f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_value",
+                headers=environment.service_headers,
+                json={"value": {"allowed_metadata": unsafe_value}},
+            )
+            _assert_status(response, 200)
+            assert response.json() is True
+
         response = client.post(
             f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_key",
             headers=environment.service_headers,
@@ -123,8 +201,23 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
                         "document_id": "string",
                         "email": "string",
                         "record_id": "string",
-                        "counterparty_tax_id": "string",
+                        "counterparty_tax_id": "counterparty tax identifier",
                     }
+                }
+            },
+        )
+        _assert_status(response, 200)
+        assert response.json() is False
+
+        response = client.post(
+            f"{environment.rest_url}/rpc/jsonb_has_forbidden_validation_value",
+            headers=environment.service_headers,
+            json={
+                "value": {
+                    "email": "string",
+                    "document_id": "string",
+                    "record_id": "string",
+                    "counterparty_tax_id": "counterparty tax identifier",
                 }
             },
         )
@@ -176,11 +269,11 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             "evidence_level": "contract_validated",
             "execution_eligibility": "discovery_only",
             "run_state": "completed",
-            "approved_public": False,
+            "approved_public": True,
             "summary_th": "synthetic_th_summary",
             "summary_en": "synthetic_en_summary",
             "prerequisites": ["synthetic_prerequisite"],
-            "limitations": ["synthetic_limitation"],
+            "limitations": ["synthetic_limitation", "review phase 1/2 when ready"],
             "recommended_next_step": "synthetic_next_step",
             "response_shape": {
                 "data": {
@@ -195,9 +288,9 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
                 "business_object": "synthetic_document",
                 "operation": "read",
                 "output_semantics": {
-                    "counterparty_tax_id": "string",
-                    "document_id": "string",
-                    "record_id": "string",
+                    "counterparty_tax_id": "counterparty tax identifier",
+                    "document_id": "synthetic document identifier",
+                    "record_id": "synthetic record identifier",
                 },
             },
             "evidence_sha256": "b" * 64,
@@ -226,6 +319,34 @@ def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() 
             environment,
             "erp_action_validation_knowledge",
             unsafe_record,
+        )
+        _assert_status(response, 400)
+
+        unsafe_value_record = {
+            **record,
+            "opaque_evidence_id": f"ev_{suffix[2:28]}",
+            "run_id": f"run_{suffix[2:28]}",
+            "response_shape": {"document_id": "synthetic-record-" + "9912"},
+        }
+        response = _post_rows(
+            client,
+            environment,
+            "erp_action_validation_knowledge",
+            unsafe_value_record,
+        )
+        _assert_status(response, 400)
+
+        unsafe_text_record = {
+            **record,
+            "opaque_evidence_id": f"ev_{suffix[3:29]}",
+            "run_id": f"run_{suffix[3:29]}",
+            "summary_en": "synthetic" + "@" + "example.invalid",
+        }
+        response = _post_rows(
+            client,
+            environment,
+            "erp_action_validation_knowledge",
+            unsafe_text_record,
         )
         _assert_status(response, 400)
 
