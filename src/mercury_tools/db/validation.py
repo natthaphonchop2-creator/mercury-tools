@@ -36,6 +36,7 @@ _OBSERVATION_SELECT = (
     "opaque_event_id,action_id,version_id,connector_id,method,observed_state,"
     "status_class,latency_ms,metadata"
 )
+_OBSERVATION_BINDING_SELECT = "connector_id,action_id,version_id"
 
 
 class ObservationState(StrEnum):
@@ -44,25 +45,30 @@ class ObservationState(StrEnum):
     OUTCOME_UNKNOWN = "outcome_unknown"
 
 
+class ObservationSource(StrEnum):
+    SANDBOX_RUNNER = "sandbox_runner"
+    CONTRACT_VALIDATOR = "contract_validator"
+    MANUAL_REVIEW = "manual_review"
+
+
+class ObservationReviewerRole(StrEnum):
+    RELEASE_REVIEWER = "release_reviewer"
+    ACCOUNTANT_REVIEWER = "accountant_reviewer"
+    POLICY_REVIEWER = "policy_reviewer"
+
+
+class ObservationNote(StrEnum):
+    REVIEWED_EXPECTED_OUTCOME = "reviewed_expected_outcome"
+    CLASSIFIED_FAILURE = "classified_failure"
+    OUTCOME_NOT_PROVEN = "outcome_not_proven"
+    CONTRACT_ONLY = "contract_only"
+    CLEANUP_VERIFIED = "cleanup_verified"
+
+
 class ObservationMetadata(StrictSafeModel):
-    source: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=200,
-        pattern=_SAFE_TOKEN_PATTERN,
-    )
-    reviewed_by: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=200,
-        pattern=_SAFE_TOKEN_PATTERN,
-    )
-    note: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=200,
-        pattern=_SAFE_TOKEN_PATTERN,
-    )
+    source: ObservationSource | None = None
+    reviewed_by: ObservationReviewerRole | None = None
+    note: ObservationNote | None = None
 
 
 class ValidationObservation(StrictSafeModel):
@@ -87,6 +93,20 @@ class ValidationObservation(StrictSafeModel):
     )
     latency_ms: int | None = Field(default=None, ge=0)
     metadata: ObservationMetadata = Field(default_factory=ObservationMetadata)
+
+
+class ObservationActionVersionBinding(StrictSafeModel):
+    connector_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=_SAFE_TOKEN_PATTERN,
+    )
+    action_id: str = Field(min_length=1, max_length=200, pattern=_SAFE_TOKEN_PATTERN)
+    version_id: str = Field(min_length=1, max_length=200, pattern=_SAFE_TOKEN_PATTERN)
+
+    @property
+    def scope_key(self) -> tuple[str, str, str]:
+        return self.connector_id, self.action_id, self.version_id
 
 
 class ResolutionEntry(StrictSafeModel):
@@ -138,7 +158,10 @@ class SupabaseValidationStore:
             "POST",
             "erp_action_validation_knowledge",
             headers={"Prefer": "resolution=ignore-duplicates,return=representation"},
-            params={"on_conflict": "connector_id,action_id,version_id,environment,run_id"},
+            params={
+                "on_conflict": "connector_id,action_id,version_id,environment,run_id",
+                "select": _VALIDATION_SELECT,
+            },
             json=[_validation_payload(record) for record in pending],
         )
         returned = _validation_response_rows(response)
@@ -172,11 +195,15 @@ class SupabaseValidationStore:
                 raise RuntimeError("supabase_observation_conflict")
             return False
 
+        self._require_observation_binding(validated)
         response = self._request(
             "POST",
             "erp_action_observations",
             headers={"Prefer": "resolution=ignore-duplicates,return=representation"},
-            params={"on_conflict": "opaque_event_id"},
+            params={
+                "on_conflict": "opaque_event_id",
+                "select": _OBSERVATION_SELECT,
+            },
             json=[_observation_payload(validated)],
         )
         returned = _observation_response_rows(response)
@@ -281,6 +308,30 @@ class SupabaseValidationStore:
             raise RuntimeError("supabase_validation_response_invalid")
         return rows[0] if rows else None
 
+    def _require_observation_binding(self, observation: ValidationObservation) -> None:
+        response = self._request(
+            "GET",
+            "erp_action_versions",
+            params={
+                "connector_id": f"eq.{observation.connector_id}",
+                "action_id": f"eq.{observation.action_id}",
+                "version_id": f"eq.{observation.version_id}",
+                "select": _OBSERVATION_BINDING_SELECT,
+                "limit": "2",
+            },
+        )
+        bindings = _observation_binding_response_rows(response)
+        if not bindings:
+            raise RuntimeError("supabase_observation_scope_mismatch")
+        if len(bindings) != 1:
+            raise RuntimeError("supabase_validation_response_invalid")
+        if bindings[0].scope_key != (
+            observation.connector_id,
+            observation.action_id,
+            observation.version_id,
+        ):
+            raise RuntimeError("supabase_observation_scope_mismatch")
+
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = f"{self.base_url}/{path.lstrip('/')}"
         headers = {**self.headers, **kwargs.pop("headers", {})}
@@ -289,7 +340,7 @@ class SupabaseValidationStore:
         except httpx.HTTPError:
             raise RuntimeError("supabase_validation_request_failed") from None
         if response.status_code >= 300:
-            raise RuntimeError(f"supabase_validation_request_failed: HTTP {response.status_code}")
+            raise RuntimeError("supabase_validation_request_failed")
         if not response.text:
             return None
         try:
@@ -405,6 +456,17 @@ def _observation_response_rows(value: Any) -> tuple[ValidationObservation, ...]:
     try:
         return tuple(_validated_observation(row) for row in value)
     except ValueError:
+        raise RuntimeError("supabase_validation_response_invalid") from None
+
+
+def _observation_binding_response_rows(
+    value: Any,
+) -> tuple[ObservationActionVersionBinding, ...]:
+    if not isinstance(value, list):
+        raise RuntimeError("supabase_validation_response_invalid")
+    try:
+        return tuple(ObservationActionVersionBinding.model_validate(row) for row in value)
+    except (TypeError, ValueError):
         raise RuntimeError("supabase_validation_response_invalid") from None
 
 

@@ -52,6 +52,28 @@ class FakeResponse:
         return self._body
 
 
+def _table_name(url: str) -> str:
+    return url.rsplit("/", 1)[-1]
+
+
+def _postgrest_insert_representation(
+    rows: list[dict[str, Any]],
+    select: str | None,
+) -> list[dict[str, Any]]:
+    server_rows = [
+        {
+            **row,
+            "id": f"server-generated-{index}",
+            "created_at": "2026-07-13T12:00:00Z",
+        }
+        for index, row in enumerate(rows, start=1)
+    ]
+    if select is None:
+        return server_rows
+    columns = select.split(",")
+    return [{column: row[column] for column in columns} for row in server_rows]
+
+
 def _settings(**overrides: Any) -> Settings:
     values = {
         "supabase_url": "https://example.supabase.co",
@@ -148,6 +170,14 @@ def _identity(row: dict[str, Any]) -> tuple[str, str, str, str, str]:
     )
 
 
+def _binding_row(observation: ValidationObservation) -> dict[str, str]:
+    return {
+        "connector_id": observation.connector_id,
+        "action_id": observation.action_id,
+        "version_id": observation.version_id,
+    }
+
+
 def test_store_reuses_required_supabase_settings() -> None:
     with pytest.raises(
         RuntimeError,
@@ -182,7 +212,13 @@ def test_publish_uses_json_mode_and_exact_append_conflict_identity(
         calls.append({"method": method, "url": url, **kwargs})
         if method == "GET":
             return FakeResponse(body=[])
-        return FakeResponse(status_code=201, body=kwargs["json"])
+        return FakeResponse(
+            status_code=201,
+            body=_postgrest_insert_representation(
+                kwargs["json"],
+                kwargs["params"].get("select"),
+            ),
+        )
 
     monkeypatch.setattr(validation_module.httpx, "request", request)
 
@@ -191,7 +227,10 @@ def test_publish_uses_json_mode_and_exact_append_conflict_identity(
     assert created == 1
     post = next(call for call in calls if call["method"] == "POST")
     row = post["json"][0]
-    assert post["params"] == {"on_conflict": "connector_id,action_id,version_id,environment,run_id"}
+    assert post["params"] == {
+        "on_conflict": "connector_id,action_id,version_id,environment,run_id",
+        "select": ",".join(ValidationKnowledge.model_fields),
+    }
     assert post["headers"]["Prefer"] == "resolution=ignore-duplicates,return=representation"
     assert row["validation_status"] == "live_success"
     assert row["evidence_level"] == "sandbox_observed"
@@ -325,24 +364,39 @@ def test_record_observation_retries_by_opaque_event_id_without_raw_payload(
 ) -> None:
     calls: list[dict[str, Any]] = []
     stored: dict[str, dict[str, Any]] = {}
+    observation = _observation()
 
     def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
         calls.append({"method": method, "url": url, **kwargs})
-        if method == "GET":
+        table = _table_name(url)
+        if method == "GET" and table == "erp_action_observations":
             event_id = kwargs["params"]["opaque_event_id"].removeprefix("eq.")
             return FakeResponse(body=[stored[event_id]] if event_id in stored else [])
+        if method == "GET" and table == "erp_action_versions":
+            return FakeResponse(body=[_binding_row(observation)])
         row = kwargs["json"][0]
         stored.setdefault(row["opaque_event_id"], row)
-        return FakeResponse(status_code=201, body=[row])
+        return FakeResponse(
+            status_code=201,
+            body=_postgrest_insert_representation(
+                [row],
+                kwargs["params"].get("select"),
+            ),
+        )
 
     monkeypatch.setattr(validation_module.httpx, "request", request)
     store = SupabaseValidationStore(_settings())
-    observation = _observation()
 
     assert store.record_observation(observation) is True
     assert store.record_observation(observation) is False
     post = next(call for call in calls if call["method"] == "POST")
-    assert post["params"] == {"on_conflict": "opaque_event_id"}
+    assert post["params"] == {
+        "on_conflict": "opaque_event_id",
+        "select": (
+            "opaque_event_id,action_id,version_id,connector_id,method,observed_state,"
+            "status_class,latency_ms,metadata"
+        ),
+    }
     assert post["json"] == [
         {
             "opaque_event_id": "evt_00000000000000000000000001",
@@ -361,6 +415,19 @@ def test_record_observation_retries_by_opaque_event_id_without_raw_payload(
         }
     ]
     assert sum(call["method"] == "POST" for call in calls) == 1
+    assert [(_table_name(call["url"]), call["method"]) for call in calls] == [
+        ("erp_action_observations", "GET"),
+        ("erp_action_versions", "GET"),
+        ("erp_action_observations", "POST"),
+        ("erp_action_observations", "GET"),
+    ]
+    assert calls[1]["params"] == {
+        "connector_id": "eq.flowaccount",
+        "action_id": f"eq.act_{1:024x}",
+        "version_id": f"eq.av_{1:064x}",
+        "select": "connector_id,action_id,version_id",
+        "limit": "2",
+    }
 
 
 def test_record_observation_rejects_raw_provider_metadata_before_network(
@@ -405,6 +472,148 @@ def test_record_observation_rejects_provider_json_hidden_in_note_before_network(
 
     assert raw_provider_json not in str(raised.value)
     assert calls == []
+
+
+@pytest.mark.parametrize("field", ["source", "reviewed_by", "note"])
+def test_record_observation_rejects_provider_record_like_metadata_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    calls: list[Any] = []
+    provider_record = "provider_record_482916375"
+    monkeypatch.setattr(
+        validation_module.httpx,
+        "request",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    observation = _observation().model_dump(mode="json")
+    observation["metadata"][field] = provider_record
+
+    with pytest.raises(ValueError, match="^validation_observation_invalid$") as raised:
+        SupabaseValidationStore(_settings()).record_observation(observation)
+
+    assert provider_record not in str(raised.value)
+    assert calls == []
+
+
+def test_observation_requires_exact_connector_action_version_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        table = _table_name(url)
+        if table == "erp_action_observations" and method == "GET":
+            return FakeResponse(body=[])
+        if table == "erp_action_versions" and method == "GET":
+            return FakeResponse(body=[])
+        raise AssertionError("observation_insert_must_not_run")
+
+    monkeypatch.setattr(validation_module.httpx, "request", request)
+
+    with pytest.raises(RuntimeError, match="^supabase_observation_scope_mismatch$"):
+        SupabaseValidationStore(_settings()).record_observation(_observation(connector_id="peak"))
+
+    assert [(_table_name(call["url"]), call["method"]) for call in calls] == [
+        ("erp_action_observations", "GET"),
+        ("erp_action_versions", "GET"),
+    ]
+
+
+def test_observation_binding_rejects_a_valid_row_for_a_different_connector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    observation = _observation(connector_id="peak")
+    mismatched = _binding_row(_observation(connector_id="flowaccount"))
+
+    def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        if _table_name(url) == "erp_action_observations":
+            return FakeResponse(body=[])
+        return FakeResponse(body=[mismatched])
+
+    monkeypatch.setattr(validation_module.httpx, "request", request)
+
+    with pytest.raises(RuntimeError, match="^supabase_observation_scope_mismatch$"):
+        SupabaseValidationStore(_settings()).record_observation(observation)
+
+    assert all(call["method"] == "GET" for call in calls)
+
+
+@pytest.mark.parametrize(
+    "binding_body",
+    [
+        {"connector_id": "flowaccount"},
+        [
+            {
+                "connector_id": "flowaccount",
+                "action_id": f"act_{1:024x}",
+                "version_id": f"av_{1:064x}",
+                "id": "unexpected-server-column",
+            }
+        ],
+        [
+            {
+                "connector_id": "flowaccount",
+                "action_id": f"act_{1:024x}",
+                "version_id": f"av_{1:064x}",
+            },
+            {
+                "connector_id": "flowaccount",
+                "action_id": f"act_{1:024x}",
+                "version_id": f"av_{1:064x}",
+            },
+        ],
+    ],
+)
+def test_observation_binding_wrong_shapes_fail_closed_before_insert(
+    monkeypatch: pytest.MonkeyPatch,
+    binding_body: Any,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        if _table_name(url) == "erp_action_observations":
+            return FakeResponse(body=[])
+        return FakeResponse(body=binding_body)
+
+    monkeypatch.setattr(validation_module.httpx, "request", request)
+
+    with pytest.raises(RuntimeError, match="^supabase_validation_response_invalid$"):
+        SupabaseValidationStore(_settings()).record_observation(_observation())
+
+    assert all(call["method"] == "GET" for call in calls)
+
+
+def test_observation_binding_malformed_json_is_constant_and_no_echo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    secret = "synthetic-binding-provider-body"
+
+    def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        if _table_name(url) == "erp_action_observations":
+            return FakeResponse(body=[])
+        return FakeResponse(
+            text=f'{{"provider_body":"{secret}"}}',
+            json_error=ValueError(secret),
+        )
+
+    monkeypatch.setattr(validation_module.httpx, "request", request)
+
+    with pytest.raises(
+        RuntimeError,
+        match="^supabase_validation_response_invalid$",
+    ) as raised:
+        SupabaseValidationStore(_settings()).record_observation(_observation())
+
+    assert str(raised.value) == "supabase_validation_response_invalid"
+    assert secret not in str(raised.value)
+    assert all(call["method"] == "GET" for call in calls)
 
 
 def test_conflicting_observation_retry_raises_constant_error(
@@ -580,6 +789,7 @@ def test_store_errors_never_echo_bodies_exceptions_urls_headers_or_credentials(
         SupabaseValidationStore(_settings()).coverage("flowaccount", "sandbox")
 
     error = str(raised.value)
+    assert error == expected_error
     assert secret not in error
     assert "example.supabase.co" not in error
     assert "test-service-role-key" not in error
