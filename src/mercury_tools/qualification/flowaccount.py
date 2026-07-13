@@ -70,6 +70,7 @@ from mercury_tools.qualification.semantics import (
 from mercury_tools.safety.network import NetworkPolicyError
 
 _OPAQUE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+_EARLY_FAILURE_EVALUATED_AT = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 class SandboxRunApproval(StrictSafeModel):
@@ -128,6 +129,31 @@ class _EphemeralRunStore:
 
     def quarantine(self, _reason: str) -> None:
         self._state = QualificationRunState.QUARANTINED
+
+
+class _EarlyFailureQualificationRunner:
+    """Dependency-free runner returned when repository setup cannot start."""
+
+    def __init__(self) -> None:
+        self.run_id = _new_run_id()
+
+    @property
+    def request_count(self) -> int:
+        return 0
+
+    @property
+    def request_methods(self) -> tuple[str, ...]:
+        return ()
+
+    async def qualify_all(
+        self,
+        *,
+        approval: SandboxRunApproval,
+        dry_run: bool | None = None,
+    ) -> QualificationCoverageReport:
+        SandboxRunApproval.model_validate(approval)
+        del dry_run
+        return build_flowaccount_preflight_failure_report(run_id=self.run_id)
 
 
 class _BoundedTransport(httpx.AsyncBaseTransport):
@@ -312,12 +338,15 @@ class FlowAccountQualificationRunner:
         if self._used:
             raise ValueError("qualification_runner_already_used")
         self._used = True
-        checked_approval = SandboxRunApproval.model_validate(approval)
-        is_dry_run = self._constructor_dry_run or checked_approval.dry_run or bool(dry_run)
-        if not is_dry_run and self._runtime_factory is not None:
-            self.runtime = self._runtime_factory()
-        self._select_run_store(is_dry_run=is_dry_run)
-        evaluated_at = self._timestamp()
+        try:
+            checked_approval = SandboxRunApproval.model_validate(approval)
+            is_dry_run = self._constructor_dry_run or checked_approval.dry_run or bool(dry_run)
+            if not is_dry_run and self._runtime_factory is not None:
+                self.runtime = self._runtime_factory()
+            self._select_run_store(is_dry_run=is_dry_run)
+            evaluated_at = self._timestamp()
+        except Exception:
+            return build_flowaccount_preflight_failure_report(run_id=self.run_id)
         records: dict[tuple[str, str], ValidationKnowledge] = {}
         contracts: _Contracts | None = None
         preflight_failure: str | None = None
@@ -875,6 +904,31 @@ def _load_requested_canonical_actions(path: Path) -> tuple[CatalogAction, ...]:
         return ()
 
 
+def build_flowaccount_preflight_failure_report(
+    *,
+    run_id: str | None = None,
+) -> QualificationCoverageReport:
+    """Terminalize frozen coverage without relying on setup-time dependencies."""
+    selected_run_id = run_id or _new_run_id()
+    records = tuple(
+        build_unvalidated_terminal_record(
+            identity=identity,
+            run_id=selected_run_id,
+            run_state=QualificationRunState.FAILED,
+            evaluated_at=_EARLY_FAILURE_EVALUATED_AT,
+        )
+        for identity in FLOWACCOUNT_CANONICAL_IDENTITIES
+    )
+    return build_coverage_report(
+        None,
+        records,
+        QualificationRunState.FAILED,
+        run_id=selected_run_id,
+        http_attempts=0,
+        mutation_attempts=0,
+    )
+
+
 def create_flowaccount_qualification_runner(
     repository_root: Path,
     *,
@@ -884,6 +938,31 @@ def create_flowaccount_qualification_runner(
     clock: Callable[[], datetime] | None = None,
     monotonic: Callable[[], float] | None = None,
     sleeper: Callable[[float], Awaitable[None]] | None = None,
+) -> FlowAccountQualificationRunner | _EarlyFailureQualificationRunner:
+    """Bind a runner, or return frozen terminal coverage when setup cannot start."""
+    try:
+        return _create_flowaccount_qualification_runner(
+            repository_root,
+            dry_run=dry_run,
+            transport=transport,
+            limits=limits,
+            clock=clock,
+            monotonic=monotonic,
+            sleeper=sleeper,
+        )
+    except Exception:
+        return _EarlyFailureQualificationRunner()
+
+
+def _create_flowaccount_qualification_runner(
+    repository_root: Path,
+    *,
+    dry_run: bool,
+    transport: httpx.AsyncBaseTransport | None,
+    limits: QualificationLimits | None,
+    clock: Callable[[], datetime] | None,
+    monotonic: Callable[[], float] | None,
+    sleeper: Callable[[float], Awaitable[None]] | None,
 ) -> FlowAccountQualificationRunner:
     """Bind a runner to one repository and the checked-in canonical sidecars."""
     root = Path(repository_root).expanduser().resolve(strict=True)
@@ -923,5 +1002,6 @@ __all__ = [
     "FlowAccountQualificationRunner",
     "QualificationLimits",
     "SandboxRunApproval",
+    "build_flowaccount_preflight_failure_report",
     "create_flowaccount_qualification_runner",
 ]

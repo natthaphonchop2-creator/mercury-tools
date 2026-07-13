@@ -26,6 +26,7 @@ from mercury_tools.flows.workspace import (
 from mercury_tools.local.credential_cli import add_credential_parsers
 from mercury_tools.qualification.flowaccount import (
     SandboxRunApproval,
+    build_flowaccount_preflight_failure_report,
     create_flowaccount_qualification_runner,
 )
 from mercury_tools.qualification.models import QualificationRunState
@@ -156,8 +157,7 @@ def cmd_catalog_qualify(args: argparse.Namespace) -> int:
             )
         )
     except Exception:
-        _print_json({"status": "error", "error": "qualification_failed"})
-        return 1
+        report = build_flowaccount_preflight_failure_report()
     _print_json(report.public_dict())
     return 0 if report.run_state is QualificationRunState.COMPLETED else 1
 

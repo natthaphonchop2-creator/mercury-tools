@@ -221,6 +221,31 @@ def alternate_identity(action: CatalogAction) -> CatalogAction:
     return revalidate_catalog_action(CatalogAction.model_validate(values))
 
 
+def assert_early_preflight_failure(
+    report: Any,
+    actions: tuple[CatalogAction, ...],
+    *,
+    forbidden: tuple[str, ...] = (),
+) -> None:
+    expected = {(action.action_id, action.version_id) for action in actions}
+    actual = {(record.action_id, record.version_id) for record in report.records}
+    assert report.run_state is QualificationRunState.FAILED
+    assert len(report.records) == 190
+    assert actual == expected
+    assert {record.validation_status for record in report.records} == {
+        ValidationStatus.BLOCKED_MISSING_PREREQUISITE
+    }
+    assert {record.evidence_level for record in report.records} == {EvidenceLevel.DOCUMENTED}
+    assert {record.execution_eligibility for record in report.records} == {
+        ExecutionEligibility.BLOCKED
+    }
+    assert report.http_attempts == 0
+    assert report.mutation_attempts == 0
+    serialized = json.dumps(report.public_dict(), ensure_ascii=False, sort_keys=True)
+    for value in forbidden:
+        assert value not in serialized
+
+
 def test_qualification_limits_are_immutable_and_capped() -> None:
     limits = QualificationLimits()
 
@@ -241,6 +266,142 @@ def test_qualification_limits_are_immutable_and_capped() -> None:
         QualificationLimits(max_mutation_attempts=2)
     with pytest.raises(ValidationError):
         QualificationLimits(max_total_requests=41)
+
+
+@pytest.mark.asyncio
+async def test_runtime_factory_failure_terminalizes_all_frozen_identities(
+    repository_context: RepositoryContext,
+    flowaccount_actions,
+    sandbox_manifest: SandboxExecutionManifest,
+    flowaccount_semantics,
+) -> None:
+    calls: list[str] = []
+    runtime = runtime_for(
+        repository_context,
+        flowaccount_actions,
+        credentials=ForbiddenCredentialStore(),
+        repository_config=RepositoryConfig(),
+    )
+
+    def fail_runtime_factory() -> Any:
+        raise RuntimeError(
+            "runtime-factory-sensitive https://provider.invalid /Users/private/runtime.json"
+        )
+
+    runner = FlowAccountQualificationRunner(
+        runtime,
+        sandbox_manifest,
+        actions=flowaccount_actions,
+        semantics=flowaccount_semantics,
+        transport=httpx.MockTransport(
+            lambda request: calls.append(str(request.url)) or provider_response(request, 500, {})
+        ),
+        clock=lambda: NOW,
+        monotonic=lambda: 0.0,
+        sleeper=no_sleep,
+        runtime_factory=fail_runtime_factory,
+    )
+
+    report = await runner.qualify_all(
+        approval=SandboxRunApproval(reads=True, writes=False, dry_run=False)
+    )
+
+    assert_early_preflight_failure(
+        report,
+        flowaccount_actions,
+        forbidden=("runtime-factory-sensitive", "provider.invalid", "/Users/private"),
+    )
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_run_store_initialization_failure_terminalizes_all_frozen_identities(
+    repository_context: RepositoryContext,
+    flowaccount_actions,
+    sandbox_manifest: SandboxExecutionManifest,
+    flowaccount_semantics,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    runtime = runtime_for(
+        repository_context,
+        flowaccount_actions,
+        credentials=ForbiddenCredentialStore(),
+        repository_config=RepositoryConfig(),
+    )
+
+    def fail_run_store(*_args: object, **_kwargs: object) -> Any:
+        raise RuntimeError(
+            "run-store-sensitive https://state.invalid /Users/private/state.json"
+        )
+
+    monkeypatch.setattr(
+        "mercury_tools.qualification.flowaccount.QualificationRunStore",
+        fail_run_store,
+    )
+    runner = FlowAccountQualificationRunner(
+        runtime,
+        sandbox_manifest,
+        actions=flowaccount_actions,
+        semantics=flowaccount_semantics,
+        transport=httpx.MockTransport(
+            lambda request: calls.append(str(request.url)) or provider_response(request, 500, {})
+        ),
+        clock=lambda: NOW,
+        monotonic=lambda: 0.0,
+        sleeper=no_sleep,
+    )
+
+    report = await runner.qualify_all(
+        approval=SandboxRunApproval(reads=True, writes=False, dry_run=False)
+    )
+
+    assert_early_preflight_failure(
+        report,
+        flowaccount_actions,
+        forbidden=("run-store-sensitive", "state.invalid", "/Users/private"),
+    )
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_clock_terminalizes_in_sticky_dry_run_without_persistent_state(
+    repository_context: RepositoryContext,
+    flowaccount_actions,
+    sandbox_manifest: SandboxExecutionManifest,
+    flowaccount_semantics,
+) -> None:
+    calls: list[str] = []
+    validation_root = repository_context.mercury_dir / "validation"
+    state_before = tuple(validation_root.rglob("*")) if validation_root.exists() else ()
+    runtime = runtime_for(
+        repository_context,
+        flowaccount_actions,
+        credentials=ForbiddenCredentialStore(),
+        repository_config=RepositoryConfig(),
+    )
+    runner = FlowAccountQualificationRunner(
+        runtime,
+        sandbox_manifest,
+        actions=flowaccount_actions,
+        semantics=flowaccount_semantics,
+        transport=httpx.MockTransport(
+            lambda request: calls.append(str(request.url)) or provider_response(request, 500, {})
+        ),
+        clock=lambda: datetime(2026, 7, 14, 9, 30),
+        monotonic=lambda: 0.0,
+        sleeper=no_sleep,
+    )
+
+    report = await runner.qualify_all(
+        approval=SandboxRunApproval(reads=True, writes=True, dry_run=True),
+        dry_run=False,
+    )
+
+    assert_early_preflight_failure(report, flowaccount_actions)
+    state_after = tuple(validation_root.rglob("*")) if validation_root.exists() else ()
+    assert state_after == state_before
+    assert calls == []
 
 
 @pytest.mark.asyncio
