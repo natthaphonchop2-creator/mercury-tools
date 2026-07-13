@@ -834,7 +834,6 @@ class PublicValidationMetadata(StrictPublicModel):
         "blocked_missing_prerequisite",
         "blocked_external_effect",
         "unsupported_by_sandbox",
-        "outcome_unknown",
     ]
     evidence_level: Literal[
         "documented",

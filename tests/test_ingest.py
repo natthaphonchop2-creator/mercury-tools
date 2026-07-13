@@ -24,6 +24,20 @@ def test_ingest_skips_unchanged_documents(tmp_path: Path) -> None:
 
 
 def test_ingest_documents_publishes_generated_validation_documents() -> None:
+    metadata = {
+        "jurisdiction": "TH",
+        "connector": "flowaccount",
+        "doc_type": "endpoint_validation",
+        "review_status": "reviewed",
+        "action_id": "act_1234567890abcdef12345678",
+        "version_id": "av_" + "1" * 64,
+        "environment": "sandbox",
+        "capability": "documents.invoice.list",
+        "accounting_use": ["revenue_review"],
+        "validation_status": "contract_validated",
+        "evidence_level": "contract_validated",
+        "approval_state": "approved_public",
+    }
     document = KnowledgeDocument(
         document_uri="mercury://wiki/validation/flowaccount/action/version/run",
         title="Validation",
@@ -31,6 +45,11 @@ def test_ingest_documents_publishes_generated_validation_documents() -> None:
         sha256="1" * 64,
         source_uri="mercury://wiki/validation/flowaccount/action/version/run",
         source_title="Validation",
+        jurisdiction="TH",
+        connector="flowaccount",
+        doc_type="endpoint_validation",
+        review_status="reviewed",
+        metadata=metadata,
     )
     store = InMemoryRagStore()
 
@@ -47,3 +66,4 @@ def test_ingest_documents_publishes_generated_validation_documents() -> None:
         "chunks": 1,
     }
     assert store.documents[document.document_uri]["sha256"] == document.sha256
+    assert store.documents[document.document_uri]["metadata"] == metadata

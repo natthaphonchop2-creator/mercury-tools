@@ -199,6 +199,112 @@ name: Validation Metadata
     assert "private-value" not in str(payload)
 
 
+def test_flow_context_pack_carries_only_safe_general_metadata() -> None:
+    from mercury_tools.rag.models import ContextPack, SearchResult
+
+    class FakeService:
+        def context_pack(self, query, *, task, filters, max_chunks):
+            return ContextPack(
+                query=query,
+                task=task,
+                results=[
+                    SearchResult(
+                        chunk_id="chunk-1",
+                        document_id="document-1",
+                        document_uri="mercury://wiki/tax/vat",
+                        chunk_uri="mercury://wiki/tax/vat#chunk-0",
+                        text="VAT",
+                        score=1.0,
+                        source_title="VAT",
+                        source_uri="mercury://wiki/tax/vat",
+                        source_url=None,
+                        source_path="/Users/operator/private/vat.md",
+                        citation={
+                            "heading": "VAT",
+                            "provider_record_id": "provider-private-value",
+                        },
+                        metadata={
+                            "jurisdiction": "TH",
+                            "doc_type": "tax",
+                            "review_status": "reviewed",
+                            "provider_record_id": "provider-private-value",
+                        },
+                    )
+                ],
+            )
+
+    payload = MercuryFlowRunner(
+        rag_service_factory=lambda: FakeService(),
+    ).run_text(
+        """
+name: Safe Context Metadata
+---
+- retrieveContextPack:
+    query: VAT
+    saveAs: evidence
+"""
+    ).as_dict()
+
+    context = payload["variables"]["evidence"]["context"][0]
+    assert context["metadata"] == {
+        "jurisdiction": "TH",
+        "doc_type": "tax",
+        "review_status": "reviewed",
+    }
+    assert "source_path" not in context
+    assert "provider-private-value" not in str(payload)
+
+
+def test_flow_context_pack_rejects_partial_validation_metadata_without_echo() -> None:
+    from mercury_tools.rag.models import ContextPack, SearchResult
+
+    unsafe_value = "provider-private-value"
+    validation_uri = "mercury://wiki/validation/flowaccount/action/version/run"
+
+    class FakeService:
+        def context_pack(self, query, *, task, filters, max_chunks):
+            return ContextPack(
+                query=query,
+                task=task,
+                results=[
+                    SearchResult(
+                        chunk_id="chunk-validation",
+                        document_id="document-validation",
+                        document_uri=validation_uri,
+                        chunk_uri=f"{validation_uri}#chunk-0",
+                        text="Unapproved validation",
+                        score=1.0,
+                        source_title="Validation",
+                        source_uri=validation_uri,
+                        source_url=None,
+                        source_path=None,
+                        citation={},
+                        metadata={
+                            "review_status": "reviewed",
+                            "provider_record_id": unsafe_value,
+                        },
+                    )
+                ],
+            )
+
+    runner = MercuryFlowRunner(rag_service_factory=lambda: FakeService())
+
+    with pytest.raises(
+        FlowValidationError,
+        match="^knowledge_metadata_invalid$",
+    ) as raised:
+        runner.run_text(
+            """
+name: Invalid Context Metadata
+---
+- retrieveContextPack:
+    query: qualified evidence
+"""
+        )
+
+    assert unsafe_value not in str(raised.value)
+
+
 def test_flow_runner_blocks_mutation_capability_before_connector_dispatch() -> None:
     calls: list[str] = []
     runner = MercuryFlowRunner(

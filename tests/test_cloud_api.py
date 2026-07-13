@@ -852,9 +852,13 @@ async def test_cloud_search_projects_only_typed_approved_validation_metadata(
             score=0.99,
             source_title="Endpoint validation",
             source_uri=document_uri,
-            source_url=None,
+            source_url="https://provider.example.test/private",
             source_path="/Users/operator/private.md",
-            citation={"heading": "Validation", "source_path": "/Users/operator/private.md"},
+            citation={
+                "heading": "Validation",
+                "source_url": "https://provider.example.test/private",
+                "source_path": "/Users/operator/private.md",
+            },
             metadata=metadata,
         )
     ]
@@ -866,7 +870,9 @@ async def test_cloud_search_projects_only_typed_approved_validation_metadata(
 
     assert response.status_code == 200
     assert response.json()["results"][0]["metadata"] == _validation_metadata()
+    assert response.json()["results"][0]["source_url"] is None
     assert "private-value" not in response.text
+    assert "provider.example.test" not in response.text
     assert "/Users/" not in response.text
 
 
@@ -908,6 +914,95 @@ async def test_cloud_search_does_not_infer_approval_from_reviewed_status(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("document_uri", "metadata"),
+    [
+        (
+            "mercury://wiki/validation/flowaccount/action/version/run",
+            {"review_status": "reviewed"},
+        ),
+        (
+            "mercury://wiki/general/partial-validation",
+            {
+                "doc_type": "endpoint_validation",
+                "review_status": "reviewed",
+            },
+        ),
+        (
+            "mercury://wiki/general/wrong-validation",
+            _validation_metadata(capability="Bearer private-value"),
+        ),
+    ],
+)
+async def test_cloud_search_fails_closed_for_partial_or_wrong_validation_shape(
+    client,
+    cloud_dependencies,
+    document_uri,
+    metadata,
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    rag_store.search_knowledge = lambda **_kwargs: [
+        SearchResult(
+            chunk_id="chunk-validation",
+            document_id="document-validation",
+            document_uri=document_uri,
+            chunk_uri=f"{document_uri}#chunk-0",
+            text="Must not become public",
+            score=0.99,
+            source_title="Validation",
+            source_uri=document_uri,
+            source_url=None,
+            source_path=None,
+            citation={"heading": "Validation"},
+            metadata={**metadata, "provider_record_id": "provider-private-value"},
+        )
+    ]
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": "qualified evidence", "filters": {}, "top_k": 4},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"results": []}
+    assert "provider-private-value" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_cloud_search_keeps_general_reviewed_knowledge_without_approval(
+    client,
+    cloud_dependencies,
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    document_uri = "mercury://wiki/tax/vat"
+    rag_store.search_knowledge = lambda **_kwargs: [
+        SearchResult(
+            chunk_id="chunk-general",
+            document_id="document-general",
+            document_uri=document_uri,
+            chunk_uri=f"{document_uri}#chunk-0",
+            text="Reviewed VAT guidance",
+            score=0.99,
+            source_title="VAT",
+            source_uri=document_uri,
+            source_url=None,
+            source_path=None,
+            citation={"heading": "VAT"},
+            metadata={"doc_type": "tax", "review_status": "reviewed"},
+        )
+    ]
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": "VAT", "filters": {}, "top_k": 4},
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()["results"]) == 1
+    assert "metadata" not in response.json()["results"][0]
+
+
+@pytest.mark.asyncio
 async def test_cloud_document_projects_only_typed_approved_validation_metadata(
     client,
     cloud_dependencies,
@@ -929,8 +1024,9 @@ async def test_cloud_document_projects_only_typed_approved_validation_metadata(
         "knowledge_sources": {
             "title": "Endpoint validation",
             "source_uri": document_uri,
-            "source_url": None,
+            "source_url": "https://provider.example.test/private",
             "review_status": "reviewed",
+            "doc_type": "endpoint_validation",
         },
     }
 
@@ -938,7 +1034,73 @@ async def test_cloud_document_projects_only_typed_approved_validation_metadata(
 
     assert response.status_code == 200
     assert response.json()["metadata"] == _validation_metadata()
+    assert response.json()["source"]["source_url"] is None
     assert "private-value" not in response.text
+    assert "provider.example.test" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_cloud_document_fails_closed_from_trusted_validation_source_type(
+    client,
+    cloud_dependencies,
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    document_id = "11111111-1111-4111-8111-111111111111"
+    document_uri = "mercury://wiki/validation/flowaccount/action/version/run"
+    rag_store.get_document = lambda _document_id: {
+        "id": document_id,
+        "document_uri": document_uri,
+        "title": "Endpoint validation",
+        "body": "Must not become public",
+        "sha256": "1" * 64,
+        "metadata": {
+            "review_status": "reviewed",
+            "provider_record_id": "provider-private-value",
+        },
+        "knowledge_sources": {
+            "title": "Endpoint validation",
+            "source_uri": document_uri,
+            "source_url": None,
+            "review_status": "reviewed",
+            "doc_type": "endpoint_validation",
+        },
+    }
+
+    response = await client.get(f"/api/cloud/v1/documents/{document_id}")
+
+    assert response.status_code == 404
+    assert "provider-private-value" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_cloud_document_keeps_general_reviewed_source_without_approval(
+    client,
+    cloud_dependencies,
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    document_id = "11111111-1111-4111-8111-111111111111"
+    document_uri = "mercury://wiki/tax/vat"
+    rag_store.get_document = lambda _document_id: {
+        "id": document_id,
+        "document_uri": document_uri,
+        "title": "VAT",
+        "body": "Reviewed VAT guidance",
+        "sha256": "1" * 64,
+        "metadata": {"doc_type": "tax", "review_status": "reviewed"},
+        "knowledge_sources": {
+            "title": "VAT",
+            "source_uri": document_uri,
+            "source_url": None,
+            "review_status": "reviewed",
+            "doc_type": "tax",
+        },
+    }
+
+    response = await client.get(f"/api/cloud/v1/documents/{document_id}")
+
+    assert response.status_code == 200
+    assert response.json()["body"] == "Reviewed VAT guidance"
+    assert "metadata" not in response.json()
 
 
 @pytest.mark.asyncio

@@ -7,7 +7,7 @@ from mercury_tools.rag.models import (
     KnowledgeDocument,
     SearchFilters,
     SearchResult,
-    project_approved_validation_metadata,
+    project_public_knowledge_metadata,
 )
 
 
@@ -31,7 +31,12 @@ class InMemoryRagStore:
             "title": document.title,
             "sha256": document.sha256,
             "body": document.body,
-            "metadata": project_approved_validation_metadata(document.metadata) or {},
+            "metadata": project_public_knowledge_metadata(
+                document.metadata,
+                document_uri=document.document_uri,
+                source_uri=document.source_uri,
+                doc_type=document.doc_type,
+            ),
         }
         self.chunks = [
             chunk for chunk in self.chunks if chunk["document_uri"] != document.document_uri
@@ -92,10 +97,15 @@ class InMemoryRagStore:
                 continue
             if filters.accounting_use:
                 accounting_uses = metadata.get("accounting_use")
-                if (
-                    not isinstance(accounting_uses, (list, tuple))
-                    or filters.accounting_use not in accounting_uses
+                if isinstance(accounting_uses, str):
+                    accounting_use_matches = accounting_uses == filters.accounting_use
+                elif isinstance(accounting_uses, (list, tuple)) and all(
+                    isinstance(item, str) for item in accounting_uses
                 ):
+                    accounting_use_matches = filters.accounting_use in accounting_uses
+                else:
+                    accounting_use_matches = False
+                if not accounting_use_matches:
                     continue
             score = 1.0 if query_lower in row["chunk_text"].lower() else 0.1
             rows.append((score, row))

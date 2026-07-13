@@ -16,11 +16,14 @@ from mercury_tools.config import load_settings
 from mercury_tools.db.supabase import SupabaseRagStore
 from mercury_tools.db.validation import SupabaseValidationStore
 from mercury_tools.qualification.publisher import (
+    REVIEWER_ROLES,
     CatalogDefinitions,
     ReviewedValidationReport,
     load_catalog_definitions,
+    revalidate_reviewed_report,
     validation_documents,
 )
+from mercury_tools.rag.chunking import chunk_document
 from mercury_tools.rag.embeddings import EmbeddingProvider, create_embedding_provider
 from mercury_tools.rag.ingest import RagStore, ingest_documents
 
@@ -46,27 +49,26 @@ def publish_reviewed_report(
     report: ReviewedValidationReport,
     *,
     catalog: CatalogDefinitions,
+    reviewer_role: str,
     validation_store: ValidationStore,
     rag_store: RagStore | None,
     embedder: EmbeddingProvider | None,
-    require_approved: bool,
     ingest_rag: bool,
 ) -> PublicationStats:
-    try:
-        validated = ReviewedValidationReport.model_validate(report)
-    except (TypeError, ValueError):
-        raise ValueError("reviewed_validation_report_invalid") from None
-    if require_approved and any(
-        not record.approved_public for record in validated.records
-    ):
-        raise ValueError("validation_records_not_approved")
+    validated = revalidate_reviewed_report(
+        report,
+        reviewer_role=reviewer_role,
+        catalog=catalog,
+    )
     if ingest_rag and (rag_store is None or embedder is None):
         raise ValueError("validation_rag_dependencies_missing")
 
+    documents = validation_documents(validated.records, catalog=catalog)
+    for document in documents:
+        chunk_document(document)
     inserted = validation_store.publish(validated.records)
     rag_stats = None
     if ingest_rag:
-        documents = validation_documents(validated.records, catalog=catalog)
         rag_stats = ingest_documents(
             documents,
             store=rag_store,
@@ -95,7 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Publish endpoint validation knowledge.")
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--catalog-root", type=Path, default=_DEFAULT_CATALOG_ROOT)
-    parser.add_argument("--require-approved", action="store_true")
+    parser.add_argument("--reviewer-role", choices=sorted(REVIEWER_ROLES), required=True)
     parser.add_argument("--ingest-rag", action="store_true")
     return parser
 
@@ -105,20 +107,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         report = _read_reviewed_report(args.input)
         catalog = load_catalog_definitions(args.catalog_root)
+        report = revalidate_reviewed_report(
+            report,
+            reviewer_role=args.reviewer_role,
+            catalog=catalog,
+        )
         settings = load_settings()
         rag_store = SupabaseRagStore(settings) if args.ingest_rag else None
         embedder = create_embedding_provider(settings) if args.ingest_rag else None
         stats = publish_reviewed_report(
             report,
             catalog=catalog,
+            reviewer_role=args.reviewer_role,
             validation_store=SupabaseValidationStore(settings),
             rag_store=rag_store,
             embedder=embedder,
-            require_approved=args.require_approved,
             ingest_rag=args.ingest_rag,
         )
-    except (RuntimeError, ValueError) as error:
-        code = str(error) if _SAFE_ERROR.fullmatch(str(error)) else "validation_publish_failed"
+    except Exception as error:
+        code = _public_error_code(error)
         print(code, file=sys.stderr)
         return 1
     print(
@@ -133,6 +140,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     )
     return 0
+
+
+def _public_error_code(error: Exception) -> str:
+    if isinstance(error, (RuntimeError, ValueError)):
+        candidate = str(error)
+        if _SAFE_ERROR.fullmatch(candidate):
+            return candidate
+    return "validation_publish_failed"
 
 
 if __name__ == "__main__":

@@ -45,8 +45,8 @@ from mercury_tools.mercury_runtime import skill_markdown
 from mercury_tools.rag.models import (
     SearchFilters,
     SearchResult,
-    is_validation_metadata_candidate,
-    project_approved_validation_metadata,
+    is_validation_knowledge,
+    project_public_knowledge_metadata,
 )
 from mercury_tools.safety.redaction import redact_json
 
@@ -412,6 +412,16 @@ def sanitize_search_filters(value: Any) -> dict[str, str]:
 
 
 def _public_search_result(result: SearchResult) -> dict[str, Any]:
+    validation = is_validation_knowledge(
+        result.metadata,
+        document_uri=result.document_uri,
+        source_uri=result.source_uri,
+    )
+    metadata = project_public_knowledge_metadata(
+        result.metadata,
+        document_uri=result.document_uri,
+        source_uri=result.source_uri,
+    )
     payload = {
         "chunk_id": result.chunk_id,
         "document_id": result.document_id,
@@ -421,11 +431,17 @@ def _public_search_result(result: SearchResult) -> dict[str, Any]:
         "score": result.score,
         "source_title": sanitize_public_text(result.source_title),
         "source_uri": sanitize_public_text(result.source_uri),
-        "source_url": sanitize_public_text(result.source_url) if result.source_url else None,
-        "citation": _public_citation(result.citation),
+        "source_url": (
+            None
+            if validation or not result.source_url
+            else sanitize_public_text(result.source_url)
+        ),
+        "citation": _public_citation(
+            result.citation,
+            include_source_url=not validation,
+        ),
     }
-    metadata = project_approved_validation_metadata(result.metadata)
-    if metadata is not None:
+    if validation:
         payload["metadata"] = metadata
     return payload
 
@@ -485,6 +501,18 @@ def _validate_search_result_shape(result: SearchResult) -> None:
 
 def _public_document(document: Mapping[str, Any]) -> dict[str, Any]:
     source = _document_source(document) or {}
+    validation = is_validation_knowledge(
+        document.get("metadata"),
+        document_uri=document.get("document_uri"),
+        source_uri=source.get("source_uri"),
+        doc_type=source.get("doc_type"),
+    )
+    metadata = project_public_knowledge_metadata(
+        document.get("metadata"),
+        document_uri=document.get("document_uri"),
+        source_uri=source.get("source_uri"),
+        doc_type=source.get("doc_type"),
+    )
     payload = {
         "id": _clean_public_value(document.get("id")),
         "document_uri": _clean_public_value(document.get("document_uri")),
@@ -494,11 +522,12 @@ def _public_document(document: Mapping[str, Any]) -> dict[str, Any]:
         "source": {
             "title": _clean_public_value(source.get("title")),
             "source_uri": _clean_public_value(source.get("source_uri")),
-            "source_url": _clean_public_value(source.get("source_url")),
+            "source_url": (
+                None if validation else _clean_public_value(source.get("source_url"))
+            ),
         },
     }
-    metadata = project_approved_validation_metadata(document.get("metadata"))
-    if metadata is not None:
+    if validation:
         payload["metadata"] = metadata
     return payload
 
@@ -540,10 +569,14 @@ def _project_public_document(
         raise ValueError("cloud_document_invalid")
     if review_status != "reviewed":
         return None
-    metadata = document.get("metadata")
-    if is_validation_metadata_candidate(metadata) and (
-        project_approved_validation_metadata(metadata) is None
-    ):
+    try:
+        project_public_knowledge_metadata(
+            document.get("metadata"),
+            document_uri=document_uri,
+            source_uri=source_uri,
+            doc_type=source.get("doc_type"),
+        )
+    except ValueError:
         return None
     for field in ("id", "title", "body", "sha256"):
         if not isinstance(document.get(field), str):
@@ -573,7 +606,11 @@ def _clean_public_value(value: Any) -> Any:
     return redact_json(value)
 
 
-def _public_citation(citation: Mapping[str, Any]) -> dict[str, Any]:
+def _public_citation(
+    citation: Mapping[str, Any],
+    *,
+    include_source_url: bool,
+) -> dict[str, Any]:
     return {
         key: _clean_public_value(citation[key])
         for key in (
@@ -586,7 +623,7 @@ def _public_citation(citation: Mapping[str, Any]) -> dict[str, Any]:
             "page",
             "section",
         )
-        if key in citation
+        if key in citation and (include_source_url or key != "source_url")
     }
 
 
@@ -631,8 +668,14 @@ def _is_public_search_result(result: Any) -> bool:
         raise ValueError("cloud_search_result_invalid")
     if result.metadata.get("review_status") != "reviewed":
         return False
-    if is_validation_metadata_candidate(result.metadata):
-        return project_approved_validation_metadata(result.metadata) is not None
+    try:
+        project_public_knowledge_metadata(
+            result.metadata,
+            document_uri=result.document_uri,
+            source_uri=result.source_uri,
+        )
+    except ValueError:
+        return False
     return True
 
 

@@ -116,6 +116,52 @@ def test_local_flow_result_carries_only_approved_validation_metadata() -> None:
     assert "private-value" not in str(vars(result))
 
 
+def test_local_flow_result_preserves_only_safe_general_metadata() -> None:
+    result = local_server._flow_result(
+        {
+            "chunk_id": "chunk-1",
+            "document_uri": "mercury://wiki/tax/vat",
+            "source_uri": "mercury://wiki/tax/vat",
+            "metadata": {
+                "jurisdiction": "TH",
+                "doc_type": "tax",
+                "review_status": "reviewed",
+                "provider_record_id": "provider-private-value",
+            },
+        }
+    )
+
+    assert result.metadata == {
+        "jurisdiction": "TH",
+        "doc_type": "tax",
+        "review_status": "reviewed",
+    }
+    assert "provider-private-value" not in str(vars(result))
+
+
+def test_local_flow_result_rejects_partial_validation_metadata_without_echo() -> None:
+    unsafe_value = "provider-private-value"
+    validation_uri = "mercury://wiki/validation/flowaccount/action/version/run"
+
+    with pytest.raises(
+        ValueError,
+        match="^public_knowledge_metadata_invalid$",
+    ) as raised:
+        local_server._flow_result(
+            {
+                "chunk_id": "chunk-validation",
+                "document_uri": validation_uri,
+                "source_uri": validation_uri,
+                "metadata": {
+                    "review_status": "reviewed",
+                    "provider_record_id": unsafe_value,
+                },
+            }
+        )
+
+    assert unsafe_value not in str(raised.value)
+
+
 @pytest.mark.asyncio
 async def test_local_runtime_rejects_unknown_search_filter_before_cloud() -> None:
     runtime = object.__new__(LocalMercuryRuntime)

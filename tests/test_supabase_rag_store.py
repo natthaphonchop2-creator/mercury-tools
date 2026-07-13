@@ -205,6 +205,148 @@ def test_supabase_request_failure_is_constant_and_does_not_echo_body(monkeypatch
     assert secret_body not in str(raised.value)
 
 
+def test_supabase_malformed_json_error_is_constant_and_does_not_echo(monkeypatch) -> None:
+    store = object.__new__(SupabaseRagStore)
+    store.base_url = "https://example.test/rest/v1"
+    store.headers = {}
+    unsafe_value = "/Users/operator/private/provider-response.json"
+
+    class MalformedResponse:
+        status_code = 200
+        text = "not-json"
+
+        def json(self):
+            raise TypeError(unsafe_value)
+
+    monkeypatch.setattr(
+        "mercury_tools.db.supabase.httpx.request",
+        lambda *args, **kwargs: MalformedResponse(),
+    )
+
+    with pytest.raises(RuntimeError, match="^supabase_rag_response_invalid$") as raised:
+        store._request("GET", "knowledge_documents")
+
+    assert unsafe_value not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("method_name", "response"),
+    [
+        ("get_document_by_uri", {"id": "provider-private-value"}),
+        ("get_document", "provider-private-value"),
+    ],
+)
+def test_supabase_document_reads_reject_malformed_success_rows_without_echo(
+    monkeypatch,
+    method_name: str,
+    response: object,
+) -> None:
+    store = object.__new__(SupabaseRagStore)
+    monkeypatch.setattr(store, "_request", lambda *args, **kwargs: response)
+
+    with pytest.raises(RuntimeError, match="^supabase_rag_response_invalid$") as raised:
+        getattr(store, method_name)("provider-private-value")
+
+    assert "provider-private-value" not in str(raised.value)
+
+
+def test_supabase_source_upsert_rejects_empty_success_rows() -> None:
+    store = object.__new__(SupabaseRagStore)
+    store.headers = {}
+    store._request = lambda *args, **kwargs: []
+
+    with pytest.raises(RuntimeError, match="^supabase_rag_response_invalid$"):
+        store._upsert_source(_document())
+
+
+def test_supabase_document_upsert_rejects_invalid_id_without_echo() -> None:
+    store = object.__new__(SupabaseRagStore)
+    store.headers = {}
+    unsafe_value = "/Users/operator/private/document-id"
+    store._request = lambda *args, **kwargs: [{"id": [unsafe_value]}]
+
+    with pytest.raises(RuntimeError, match="^supabase_rag_response_invalid$") as raised:
+        store._upsert_document(_document(), "source-1")
+
+    assert unsafe_value not in str(raised.value)
+
+
+def test_supabase_chunk_upsert_rejects_malformed_success_response_before_hash_commit(
+    monkeypatch,
+) -> None:
+    store = object.__new__(SupabaseRagStore)
+    document = _document()
+    committed = False
+
+    monkeypatch.setattr(store, "_upsert_source", lambda _: {"id": "source-1"})
+    monkeypatch.setattr(
+        store,
+        "get_document_by_uri",
+        lambda _: {"id": "document-1", "sha256": "previous"},
+    )
+
+    def upsert_document(*args, **kwargs):
+        nonlocal committed
+        committed = True
+        return {"id": "document-1"}
+
+    def request(method, path, **kwargs):
+        if method == "POST" and path == "knowledge_chunks":
+            return {"raw_payload": "/Users/operator/private/chunk.json"}
+        return None
+
+    monkeypatch.setattr(store, "_upsert_document", upsert_document)
+    monkeypatch.setattr(store, "_request", request)
+
+    with pytest.raises(RuntimeError, match="^supabase_rag_response_invalid$") as raised:
+        store.upsert_document_with_chunks(document, _chunks(1), [[0.0, 1.0]])
+
+    assert not committed
+    assert "/Users/operator/private" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"chunk_id": "provider-private-value"},
+        [{"chunk_id": "provider-private-value"}],
+        [
+            {
+                "chunk_id": "chunk-1",
+                "document_id": "document-1",
+                "document_uri": "mercury://wiki/test",
+                "chunk_uri": "mercury://wiki/test#chunk-0",
+                "chunk_text": "body",
+                "score": 1.0,
+                "source_title": "Test",
+                "source_uri": "mercury://wiki/test",
+                "source_url": None,
+                "source_path": None,
+                "citation": ["provider-private-value"],
+                "metadata": {},
+            }
+        ],
+    ],
+)
+def test_supabase_search_rejects_malformed_success_rows_without_echo(
+    monkeypatch,
+    response: object,
+) -> None:
+    store = object.__new__(SupabaseRagStore)
+    monkeypatch.setattr(store, "_request", lambda *args, **kwargs: response)
+
+    with pytest.raises(RuntimeError, match="^supabase_rag_response_invalid$") as raised:
+        store.search_knowledge(
+            query="test",
+            query_embedding=None,
+            filters=SearchFilters(),
+            top_k=5,
+            mode="keyword",
+        )
+
+    assert "provider-private-value" not in str(raised.value)
+
+
 def test_rag_filter_migration_replaces_old_signature_without_overload() -> None:
     sql = MIGRATION.read_text(encoding="utf-8")
     old_signature = (

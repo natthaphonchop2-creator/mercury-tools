@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any
+
+from mercury_tools.safety.redaction import redact_absolute_paths, redact_text
 
 _SELECTOR = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 _ACTION_ID = re.compile(r"^act_[0-9a-f]{24}$")
@@ -23,7 +26,6 @@ _VALIDATION_STATUSES = frozenset(
         "blocked_missing_prerequisite",
         "blocked_external_effect",
         "unsupported_by_sandbox",
-        "outcome_unknown",
     }
 )
 _EVIDENCE_LEVELS = frozenset(
@@ -48,6 +50,28 @@ VALIDATION_METADATA_FIELDS = (
     "evidence_level",
     "approval_state",
 )
+GENERAL_PUBLIC_METADATA_FIELDS = (
+    "jurisdiction",
+    "connector",
+    "doc_type",
+    "review_status",
+    "effective_date",
+    "action_id",
+)
+PUBLIC_CITATION_FIELDS = (
+    "chunk_id",
+    "source_title",
+    "source_uri",
+    "source_url",
+    "heading",
+    "chunk_index",
+    "page",
+    "section",
+)
+_VALIDATION_ONLY_METADATA_FIELDS = frozenset(VALIDATION_METADATA_FIELDS) - frozenset(
+    GENERAL_PUBLIC_METADATA_FIELDS
+)
+_VALIDATION_URI_PREFIX = "mercury://wiki/validation/"
 
 
 @dataclass(frozen=True)
@@ -124,8 +148,24 @@ class SearchFilters:
 
 
 def is_validation_metadata_candidate(value: Any) -> bool:
-    return isinstance(value, Mapping) and (
-        value.get("doc_type") == "endpoint_validation" or "approval_state" in value
+    return isinstance(value, Mapping) and bool(
+        value.get("doc_type") == "endpoint_validation"
+        or set(value).intersection(_VALIDATION_ONLY_METADATA_FIELDS)
+    )
+
+
+def is_validation_knowledge(
+    value: Any,
+    *,
+    document_uri: str | None = None,
+    source_uri: str | None = None,
+    doc_type: str | None = None,
+) -> bool:
+    return bool(
+        doc_type == "endpoint_validation"
+        or is_validation_metadata_candidate(value)
+        or _is_validation_uri(document_uri)
+        or _is_validation_uri(source_uri)
     )
 
 
@@ -133,11 +173,12 @@ def project_approved_validation_metadata(value: Any) -> dict[str, Any] | None:
     """Return only typed approved validation metadata; never infer approval."""
     if not is_validation_metadata_candidate(value):
         return None
-    if (
-        value.get("review_status") != "reviewed"
-        or value.get("approval_state") != "approved_public"
-    ):
-        return None
+    return _require_approved_validation_metadata(value)
+
+
+def _require_approved_validation_metadata(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("validation_metadata_invalid")
 
     try:
         projected = {field: value[field] for field in VALIDATION_METADATA_FIELDS}
@@ -146,6 +187,8 @@ def project_approved_validation_metadata(value: Any) -> dict[str, Any] | None:
             projected["jurisdiction"] != "TH"
             or projected["connector"] not in {"flowaccount", "peak"}
             or projected["doc_type"] != "endpoint_validation"
+            or projected["review_status"] != "reviewed"
+            or projected["approval_state"] != "approved_public"
             or not isinstance(accounting_uses, Sequence)
             or isinstance(accounting_uses, (str, bytes, bytearray))
             or len(accounting_uses) > 128
@@ -170,6 +213,125 @@ def project_approved_validation_metadata(value: Any) -> dict[str, Any] | None:
         return projected
     except (KeyError, TypeError, ValueError):
         raise ValueError("validation_metadata_invalid") from None
+
+
+def project_public_knowledge_metadata(
+    value: Any,
+    *,
+    document_uri: str | None = None,
+    source_uri: str | None = None,
+    doc_type: str | None = None,
+) -> dict[str, Any]:
+    """Project one fail-closed public metadata shape without arbitrary fields."""
+    validation = is_validation_knowledge(
+        value,
+        document_uri=document_uri,
+        source_uri=source_uri,
+        doc_type=doc_type,
+    )
+    try:
+        if validation:
+            return _require_approved_validation_metadata(value)
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise ValueError
+        projected = {
+            field: value[field]
+            for field in GENERAL_PUBLIC_METADATA_FIELDS
+            if field in value and value[field] is not None
+        }
+        SearchFilters(
+            jurisdiction=projected.get("jurisdiction"),
+            connector=projected.get("connector"),
+            doc_type=projected.get("doc_type"),
+            review_status=projected.get("review_status"),
+            effective_date=projected.get("effective_date"),
+            action_id=projected.get("action_id"),
+        )
+        return projected
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("public_knowledge_metadata_invalid") from None
+
+
+def public_search_result_payload(
+    result: Any,
+    *,
+    include_document_id: bool = False,
+) -> dict[str, Any]:
+    """Serialize one search result through public field and metadata allowlists."""
+    try:
+        metadata = project_public_knowledge_metadata(
+            result.metadata,
+            document_uri=result.document_uri,
+            source_uri=result.source_uri,
+        )
+        validation = is_validation_knowledge(
+            result.metadata,
+            document_uri=result.document_uri,
+            source_uri=result.source_uri,
+        )
+        score = result.score
+        if (
+            isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not math.isfinite(score)
+        ):
+            raise ValueError
+        payload: dict[str, Any] = {
+            "chunk_id": _public_result_text(result.chunk_id),
+            "document_uri": _public_result_text(result.document_uri),
+            "score": score,
+            "text": _public_result_text(result.text),
+            "citation": _public_citation(result.citation, validation=validation),
+            "metadata": metadata,
+            "source_title": _public_result_text(result.source_title),
+            "source_uri": _public_result_text(result.source_uri),
+        }
+        if include_document_id:
+            payload["document_id"] = _public_result_text(result.document_id)
+        if not validation:
+            payload["source_url"] = (
+                _public_result_text(result.source_url)
+                if result.source_url is not None
+                else None
+            )
+        return payload
+    except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+        raise ValueError("public_knowledge_metadata_invalid") from None
+
+
+def _public_citation(value: Any, *, validation: bool) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError
+    projected: dict[str, Any] = {}
+    for citation_field in PUBLIC_CITATION_FIELDS:
+        if citation_field not in value or (
+            validation and citation_field == "source_url"
+        ):
+            continue
+        item = value[citation_field]
+        if isinstance(item, str):
+            projected[citation_field] = _public_result_text(item)
+        elif item is None or (
+            isinstance(item, (int, float)) and not isinstance(item, bool)
+        ):
+            projected[citation_field] = item
+        else:
+            raise ValueError
+    return projected
+
+
+def _public_result_text(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError
+    return redact_absolute_paths(redact_text(value))
+
+
+def _is_validation_uri(value: Any) -> bool:
+    return isinstance(value, str) and value.casefold().startswith(
+        _VALIDATION_URI_PREFIX
+    )
 
 
 @dataclass(frozen=True)
@@ -232,19 +394,7 @@ class ContextPack:
             "query": self.query,
             "task": self.task,
             "context": [
-                {
-                    "chunk_id": result.chunk_id,
-                    "document_id": result.document_id,
-                    "document_uri": result.document_uri,
-                    "text": result.text,
-                    "score": result.score,
-                    "citation": result.citation,
-                    "source_title": result.source_title,
-                    "source_uri": result.source_uri,
-                    "source_url": result.source_url,
-                    "source_path": result.source_path,
-                    "metadata": result.metadata,
-                }
+                public_search_result_payload(result, include_document_id=True)
                 for result in self.results
             ],
         }

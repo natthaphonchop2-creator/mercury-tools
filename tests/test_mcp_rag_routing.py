@@ -16,9 +16,18 @@ def _result(connector: str) -> SearchResult:
         source_title=f"{connector} endpoint dictionary",
         source_uri=f"mercury://wiki/connectors/{connector}",
         source_url=None,
-        source_path=f"connectors/{connector}.md",
-        citation={"chunk_id": "chunk-1", "heading": "Endpoints"},
-        metadata={"connector": connector, "doc_type": "endpoint_dictionary"},
+        source_path=f"/Users/operator/private/{connector}.md",
+        citation={
+            "chunk_id": "chunk-1",
+            "heading": "Endpoints",
+            "provider_record_id": "provider-private-value",
+        },
+        metadata={
+            "connector": connector,
+            "doc_type": "endpoint_dictionary",
+            "provider_record_id": "provider-private-value",
+            "raw_payload": {"email": "person@example.test"},
+        },
     )
 
 
@@ -54,6 +63,8 @@ def test_search_knowledge_applies_inferred_connector_and_returns_metadata(monkey
         "connector": "flowaccount",
         "doc_type": "endpoint_dictionary",
     }
+    assert "source_path" not in payload["results"][0]
+    assert "provider-private-value" not in str(payload)
 
 
 def test_retrieve_context_pack_preserves_explicit_connector_filter(monkeypatch) -> None:
@@ -82,7 +93,12 @@ def test_retrieve_context_pack_preserves_explicit_connector_filter(monkeypatch) 
     }
     assert payload["inferred_connector"] is None
     assert payload["inferred_domain"] == "connector_endpoint"
-    assert payload["context"][0]["metadata"]["connector"] == "peak"
+    assert payload["context"][0]["metadata"] == {
+        "connector": "peak",
+        "doc_type": "endpoint_dictionary",
+    }
+    assert "source_path" not in payload["context"][0]
+    assert "provider-private-value" not in str(payload)
 
 
 def test_search_knowledge_routes_standard_without_connector_filter(monkeypatch) -> None:
@@ -185,4 +201,46 @@ def test_search_knowledge_rejects_unknown_filter_without_echo(monkeypatch) -> No
         )
 
     assert calls == []
+    assert unsafe_value not in str(raised.value)
+
+
+def test_search_knowledge_rejects_partial_validation_metadata_without_echo(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    unsafe_value = "provider-private-value"
+    validation_uri = "mercury://wiki/validation/flowaccount/action/version/run"
+
+    class FakeService:
+        def search(self, query, *, filters, top_k, mode):
+            return [
+                SearchResult(
+                    chunk_id="chunk-validation",
+                    document_id="document-validation",
+                    document_uri=validation_uri,
+                    chunk_uri=f"{validation_uri}#chunk-0",
+                    text="Unapproved validation",
+                    score=1.0,
+                    source_title="Validation",
+                    source_uri=validation_uri,
+                    source_url=None,
+                    source_path=None,
+                    citation={},
+                    metadata={
+                        "review_status": "reviewed",
+                        "provider_record_id": unsafe_value,
+                    },
+                )
+            ]
+
+    monkeypatch.setattr(server, "_service", lambda: FakeService())
+    monkeypatch.setattr(server, "_audit", lambda *args, **kwargs: None)
+
+    with pytest.raises(
+        ValueError,
+        match="^public_knowledge_metadata_invalid$",
+    ) as raised:
+        server.search_knowledge("qualified evidence")
+
     assert unsafe_value not in str(raised.value)

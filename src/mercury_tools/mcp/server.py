@@ -51,7 +51,13 @@ from mercury_tools.product import (
 from mercury_tools.prompts import get_prompt
 from mercury_tools.rag.chunking import chunk_document, sha256_text
 from mercury_tools.rag.embeddings import create_embedding_provider
-from mercury_tools.rag.models import ContextPack, KnowledgeDocument, SearchFilters, SearchResult
+from mercury_tools.rag.models import (
+    ContextPack,
+    KnowledgeDocument,
+    SearchFilters,
+    SearchResult,
+    public_search_result_payload,
+)
 from mercury_tools.rag.routing import apply_knowledge_routing, infer_knowledge_domain
 from mercury_tools.rag.service import MIN_RELEVANCE_SCORE, RagService
 from mercury_tools.safety.redaction import redact_json
@@ -127,21 +133,7 @@ def _filters(filters: dict[str, Any] | None) -> SearchFilters:
 
 
 def _serialize_search_results(results: list[SearchResult]) -> list[dict[str, Any]]:
-    return [
-        {
-            "chunk_id": result.chunk_id,
-            "document_uri": result.document_uri,
-            "score": result.score,
-            "text": result.text,
-            "citation": result.citation,
-            "metadata": result.metadata,
-            "source_title": result.source_title,
-            "source_uri": result.source_uri,
-            "source_url": result.source_url,
-            "source_path": result.source_path,
-        }
-        for result in results
-    ]
+    return [public_search_result_payload(result) for result in results]
 
 
 def _merge_search_results(

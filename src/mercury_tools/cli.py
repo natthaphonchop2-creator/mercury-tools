@@ -25,7 +25,7 @@ from mercury_tools.flows.workspace import (
 from mercury_tools.local.credential_cli import add_credential_parsers
 from mercury_tools.rag.embeddings import create_embedding_provider
 from mercury_tools.rag.ingest import ingest_wiki
-from mercury_tools.rag.models import SearchFilters
+from mercury_tools.rag.models import SearchFilters, public_search_result_payload
 from mercury_tools.rag.routing import apply_knowledge_routing
 from mercury_tools.rag.service import RagService
 from mercury_tools.remote import DEFAULT_RENDER_URL, DEFAULT_TOKEN_FILE, read_token, verify_remote
@@ -101,21 +101,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         accounting_use=applied_filters.get("accounting_use"),
     )
     results = service.search(args.query, filters=filters, top_k=args.top_k, mode=args.mode)
-    payload = [
-        {
-            "chunk_id": result.chunk_id,
-            "document_uri": result.document_uri,
-            "score": result.score,
-            "text": result.text,
-            "citation": result.citation,
-            "metadata": result.metadata,
-            "source_title": result.source_title,
-            "source_uri": result.source_uri,
-            "source_url": result.source_url,
-            "source_path": result.source_path,
-        }
-        for result in results
-    ]
+    payload = [public_search_result_payload(result) for result in results]
     if args.json:
         _print_json(
             {

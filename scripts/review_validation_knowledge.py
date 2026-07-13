@@ -68,7 +68,16 @@ def review_inputs(
             ),
         )
     )
-    return ReviewedValidationReport(records=records, reviewer_role=reviewer_role)
+    source_reports = tuple(
+        source_report
+        for connector_id in sorted(reviewed_by_connector)
+        for source_report in reviewed_by_connector[connector_id].source_reports
+    )
+    return ReviewedValidationReport(
+        records=records,
+        reviewer_role=reviewer_role,
+        source_reports=source_reports,
+    )
 
 
 def write_reviewed_report(report: ReviewedValidationReport, output_path: Path) -> None:

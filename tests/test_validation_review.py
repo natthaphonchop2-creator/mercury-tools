@@ -50,8 +50,8 @@ def _record(
     *,
     run_id: str,
     environment: str,
+    status: ValidationStatus = ValidationStatus.CONTRACT_VALIDATED,
 ) -> ValidationKnowledge:
-    status = ValidationStatus.CONTRACT_VALIDATED
     return ValidationKnowledge.model_validate(
         {
             "opaque_evidence_id": f"ev_{index:026d}",
@@ -87,12 +87,22 @@ def _record(
     )
 
 
-def _report(connector_id: str) -> tuple[QualificationReport, CatalogDefinitions]:
+def _report(
+    connector_id: str,
+    *,
+    status: ValidationStatus = ValidationStatus.CONTRACT_VALIDATED,
+) -> tuple[QualificationReport, CatalogDefinitions]:
     actions = _actions(connector_id)
     run_id = "run_" + "1" * 26
     environment = "sandbox"
     records = tuple(
-        _record(action, index, run_id=run_id, environment=environment)
+        _record(
+            action,
+            index,
+            run_id=run_id,
+            environment=environment,
+            status=status,
+        )
         for index, action in enumerate(actions, start=1)
     )
     return (
@@ -130,6 +140,44 @@ def test_review_promotes_exact_connector_coverage(
     assert len(reviewed.records) == expected_count
     assert all(record.approved_public for record in reviewed.records)
     assert all(record.reviewed_by == reviewer_role for record in reviewed.records)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        ValidationStatus.LIVE_SUCCESS,
+        ValidationStatus.LIVE_FAILED,
+        ValidationStatus.CONTRACT_VALIDATED,
+        ValidationStatus.BLOCKED_MISSING_CREDENTIALS,
+        ValidationStatus.BLOCKED_MISSING_PREREQUISITE,
+        ValidationStatus.BLOCKED_EXTERNAL_EFFECT,
+        ValidationStatus.UNSUPPORTED_BY_SANDBOX,
+    ],
+)
+def test_review_allows_controlled_completed_outcome_policy(
+    status: ValidationStatus,
+) -> None:
+    report, catalog = _report("peak", status=status)
+
+    reviewed = review_validation_report(
+        report,
+        reviewer_role="release_reviewer",
+        catalog=catalog,
+    )
+
+    assert {record.validation_status for record in reviewed.records} == {status}
+    assert all(record.approved_public for record in reviewed.records)
+
+
+def test_review_rejects_completed_outcome_unknown_without_promotion() -> None:
+    report, catalog = _report("peak", status=ValidationStatus.OUTCOME_UNKNOWN)
+
+    with pytest.raises(ValueError, match="^validation_outcome_not_publishable$"):
+        review_validation_report(
+            report,
+            reviewer_role="release_reviewer",
+            catalog=catalog,
+        )
 
 
 def test_review_rejects_free_form_reviewer_identity() -> None:

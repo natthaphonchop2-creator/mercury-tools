@@ -13,6 +13,7 @@ from mercury_tools.db.memory import InMemoryRagStore
 from mercury_tools.qualification.models import (
     EvidenceLevel,
     ExecutionEligibility,
+    QualificationReport,
     QualificationRunState,
     SemanticContract,
     ValidationKnowledge,
@@ -21,8 +22,10 @@ from mercury_tools.qualification.models import (
 from mercury_tools.qualification.publisher import (
     CatalogDefinitions,
     ReviewedValidationReport,
+    review_validation_report,
     validation_documents,
 )
+from mercury_tools.qualification.semantics import load_actions
 from mercury_tools.qualification.templates import SUMMARY_EN, SUMMARY_TH
 from mercury_tools.rag.chunking import chunk_document
 
@@ -72,6 +75,35 @@ def _record(catalog_action, *, approved_public: bool) -> ValidationKnowledge:
             "evaluated_at": datetime(2026, 7, 13, tzinfo=UTC),
             "expires_at": None,
         }
+    )
+
+
+def _complete_reviewed_connector(
+    connector_id: str = "peak",
+    *,
+    reviewer_role: str = "release_reviewer",
+) -> tuple[ReviewedValidationReport, CatalogDefinitions]:
+    actions = tuple(
+        load_actions(ROOT / "catalog" / "global" / connector_id / "actions.json")
+    )
+    catalog = CatalogDefinitions(actions)
+    records = tuple(
+        _record(action, approved_public=False) for action in actions
+    )
+    report = QualificationReport(
+        connector_id=connector_id,
+        environment="sandbox",
+        run_id="run_" + "2" * 26,
+        run_state=QualificationRunState.COMPLETED,
+        records=records,
+    )
+    return (
+        review_validation_report(
+            report,
+            reviewer_role=reviewer_role,
+            catalog=catalog,
+        ),
+        catalog,
     )
 
 
@@ -210,17 +242,11 @@ def test_validation_chunk_revalidates_allowlisted_metadata_values(
         chunk_document(malformed)
 
 
-def test_publish_script_publishes_approved_ledger_and_rag_with_injected_stores(
-    catalog_action,
-) -> None:
+def test_publish_script_revalidates_complete_report_before_ledger_and_rag() -> None:
     from mercury_tools.rag.embeddings import HashEmbeddingProvider
 
     script = _load_script("publish_validation_knowledge")
-    record = _record(catalog_action, approved_public=True)
-    reviewed = ReviewedValidationReport(
-        records=(record,),
-        reviewer_role="release_reviewer",
-    )
+    reviewed, catalog = _complete_reviewed_connector()
     validation_calls = []
 
     class ValidationStore:
@@ -231,36 +257,204 @@ def test_publish_script_publishes_approved_ledger_and_rag_with_injected_stores(
     rag_store = InMemoryRagStore()
     stats = script.publish_reviewed_report(
         reviewed,
-        catalog=CatalogDefinitions([catalog_action]),
+        catalog=catalog,
+        reviewer_role="release_reviewer",
         validation_store=ValidationStore(),
         rag_store=rag_store,
         embedder=HashEmbeddingProvider(),
-        require_approved=True,
         ingest_rag=True,
     )
 
-    assert validation_calls == [(record,)]
-    assert stats.validation_rows_inserted == 1
-    assert stats.rag_documents_inserted_or_updated == 1
-    assert stats.rag_chunks == 1
-    [stored] = rag_store.documents.values()
-    assert stored["metadata"]["approval_state"] == "approved_public"
-
-
-def test_publish_script_require_approved_rejects_unapproved_records(catalog_action) -> None:
-    script = _load_script("publish_validation_knowledge")
-    reviewed = ReviewedValidationReport(
-        records=(_record(catalog_action, approved_public=False),),
-        reviewer_role="release_reviewer",
+    assert validation_calls == [reviewed.records]
+    assert stats.validation_rows_inserted == 64
+    assert stats.rag_documents_inserted_or_updated == 64
+    assert stats.rag_chunks == 64
+    assert all(
+        stored["metadata"]["approval_state"] == "approved_public"
+        for stored in rag_store.documents.values()
     )
 
-    with pytest.raises(ValueError, match="^validation_records_not_approved$"):
+
+@pytest.mark.parametrize("approved_public", [False, True])
+def test_publish_script_rejects_forged_partial_report_before_write(
+    catalog_action,
+    approved_public: bool,
+) -> None:
+    script = _load_script("publish_validation_knowledge")
+    reviewed = ReviewedValidationReport(
+        records=(_record(catalog_action, approved_public=approved_public),),
+        reviewer_role="release_reviewer",
+    )
+    validation_calls = []
+
+    class ValidationStore:
+        def publish(self, records):
+            validation_calls.append(tuple(records))
+            return len(records)
+
+    with pytest.raises(ValueError, match="^reviewed_validation_report_invalid$"):
         script.publish_reviewed_report(
             reviewed,
             catalog=CatalogDefinitions([catalog_action]),
-            validation_store=object(),
+            reviewer_role="release_reviewer",
+            validation_store=ValidationStore(),
             rag_store=None,
             embedder=None,
-            require_approved=True,
             ingest_rag=False,
         )
+
+    assert validation_calls == []
+
+
+def test_publish_script_rejects_mismatched_controlled_reviewer_before_write() -> None:
+    script = _load_script("publish_validation_knowledge")
+    reviewed, catalog = _complete_reviewed_connector()
+    forged = ReviewedValidationReport(
+        records=reviewed.records,
+        reviewer_role="accountant_reviewer",
+    )
+    validation_calls = []
+
+    class ValidationStore:
+        def publish(self, records):
+            validation_calls.append(tuple(records))
+            return len(records)
+
+    with pytest.raises(ValueError, match="^reviewed_validation_report_invalid$"):
+        script.publish_reviewed_report(
+            forged,
+            catalog=catalog,
+            reviewer_role="release_reviewer",
+            validation_store=ValidationStore(),
+            rag_store=None,
+            embedder=None,
+            ingest_rag=False,
+        )
+
+    assert validation_calls == []
+
+
+def test_publish_script_rejects_duplicate_source_report_before_write() -> None:
+    script = _load_script("publish_validation_knowledge")
+    reviewed, catalog = _complete_reviewed_connector()
+    forged = ReviewedValidationReport(
+        records=(*reviewed.records, *reviewed.records),
+        reviewer_role=reviewed.reviewer_role,
+        source_reports=(*reviewed.source_reports, *reviewed.source_reports),
+    )
+    validation_calls = []
+
+    class ValidationStore:
+        def publish(self, records):
+            validation_calls.append(tuple(records))
+            return len(records)
+
+    with pytest.raises(ValueError, match="^reviewed_validation_report_invalid$"):
+        script.publish_reviewed_report(
+            forged,
+            catalog=catalog,
+            reviewer_role="release_reviewer",
+            validation_store=ValidationStore(),
+            rag_store=None,
+            embedder=None,
+            ingest_rag=False,
+        )
+
+    assert validation_calls == []
+
+
+def test_publish_cli_requires_controlled_reviewer_and_has_no_approval_bypass() -> None:
+    script = _load_script("publish_validation_knowledge")
+    parser = script.build_parser()
+
+    assert "--require-approved" not in parser.format_help()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--input", "reviewed.json"])
+    parsed = parser.parse_args(
+        [
+            "--input",
+            "reviewed.json",
+            "--reviewer-role",
+            "release_reviewer",
+        ]
+    )
+    assert parsed.reviewer_role == "release_reviewer"
+
+
+def test_publish_cli_rejects_forged_input_before_dependencies(
+    catalog_action,
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    script = _load_script("publish_validation_knowledge")
+    forged = ReviewedValidationReport(
+        records=(_record(catalog_action, approved_public=True),),
+        reviewer_role="release_reviewer",
+    )
+    input_path = tmp_path / "forged.json"
+    input_path.write_text(forged.model_dump_json(), encoding="utf-8")
+    dependency_calls = []
+    monkeypatch.setattr(
+        script,
+        "load_settings",
+        lambda: dependency_calls.append("settings") or object(),
+    )
+
+    exit_code = script.main(
+        [
+            "--input",
+            str(input_path),
+            "--catalog-root",
+            str(ROOT / "catalog" / "global"),
+            "--reviewer-role",
+            "release_reviewer",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert dependency_calls == []
+    assert captured.out == ""
+    assert captured.err.strip() == "reviewed_validation_report_invalid"
+
+
+def test_publish_cli_maps_unexpected_dependency_error_to_constant_without_echo(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    script = _load_script("publish_validation_knowledge")
+    reviewed, _ = _complete_reviewed_connector()
+    input_path = tmp_path / "reviewed.json"
+    input_path.write_text(reviewed.model_dump_json(), encoding="utf-8")
+    unsafe_value = "/Users/operator/private/provider-response.json"
+    store_calls = []
+
+    def fail_settings():
+        raise OSError(unsafe_value)
+
+    monkeypatch.setattr(script, "load_settings", fail_settings)
+    monkeypatch.setattr(
+        script,
+        "SupabaseValidationStore",
+        lambda settings: store_calls.append(settings),
+    )
+
+    exit_code = script.main(
+        [
+            "--input",
+            str(input_path),
+            "--catalog-root",
+            str(ROOT / "catalog" / "global"),
+            "--reviewer-role",
+            "release_reviewer",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert store_calls == []
+    assert captured.out == ""
+    assert captured.err.strip() == "validation_publish_failed"
+    assert unsafe_value not in captured.err

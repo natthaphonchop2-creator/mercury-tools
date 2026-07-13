@@ -329,6 +329,10 @@ def _is_controlled_summary_path(path: tuple[str, ...]) -> bool:
     return len(path) == 1 and path[0] in {"summary_en", "summary_th"}
 
 
+def _is_controlled_validation_status(value: str, path: tuple[str, ...]) -> bool:
+    return path == ("validation_status",) and value in ValidationStatus
+
+
 def _is_unsafe_public_string(value: str, path: tuple[str, ...]) -> bool:
     if (
         not value
@@ -352,6 +356,7 @@ def _is_unsafe_public_string(value: str, path: tuple[str, ...]) -> bool:
         or _has_unsafe_public_path_token(value)
         or (
             not _is_controlled_summary_path(path)
+            and not _is_controlled_validation_status(value, path)
             and _has_forbidden_public_label(value)
         )
     )

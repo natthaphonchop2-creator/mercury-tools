@@ -28,7 +28,7 @@ from mercury_tools.flows.parser import (
 )
 from mercury_tools.rag.models import (
     SearchFilters,
-    project_approved_validation_metadata,
+    public_search_result_payload,
 )
 from mercury_tools.safety.redaction import redact_json
 
@@ -524,24 +524,10 @@ def _filters(raw: dict[str, Any] | None) -> SearchFilters:
 
 
 def _search_result_payload(result: Any) -> dict[str, Any]:
-    payload = {
-        "chunk_id": result.chunk_id,
-        "document_uri": result.document_uri,
-        "score": result.score,
-        "text": result.text,
-        "citation": result.citation,
-        "source_title": result.source_title,
-        "source_uri": result.source_uri,
-        "source_url": result.source_url,
-        "source_path": result.source_path,
-    }
     try:
-        metadata = project_approved_validation_metadata(result.metadata)
+        return public_search_result_payload(result)
     except ValueError:
         raise FlowValidationError("knowledge_metadata_invalid") from None
-    if metadata is not None:
-        payload["metadata"] = metadata
-    return payload
 
 
 def _is_present(value: Any) -> bool:
@@ -937,7 +923,10 @@ class MercuryFlowRunner:
                 filters=_filters(args.get("filters")),
                 max_chunks=int(args.get("maxChunks") or args.get("max_chunks") or 12),
             )
-            return _CommandOutput(pack.as_dict())
+            try:
+                return _CommandOutput(pack.as_dict())
+            except ValueError:
+                raise FlowValidationError("knowledge_metadata_invalid") from None
 
         if command.name == "getDocument":
             if not self.document_getter:
