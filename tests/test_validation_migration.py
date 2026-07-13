@@ -168,6 +168,46 @@ LONG_SAFE_LABELLED_METADATA = (
         "lambda.id: provider record identifier"
     ),
 )
+REPEATED_DELIMITER_ASSIGNMENT_CASES = (
+    ("short_colon", "client:id", ":", "!value"),
+    ("short_mixed", "api=key", ":", "#1234"),
+    ("numeric_camel", "client2:Id", "=", "!value"),
+    ("acronym_mixed", "API=signing:Key", ":", "#1234"),
+    (
+        "long_space",
+        "client:alpha beta gamma delta epsilon zeta eta theta iota:id",
+        ":",
+        "!value",
+    ),
+    (
+        "long_mixed_punctuation",
+        "api=alpha beta.gamma delta epsilon zeta eta theta iota:key",
+        "=",
+        "#1234",
+    ),
+)
+REPEATED_DELIMITER_SAFE_CASES = (
+    ("state_colon", "client:id", ":", "unavailable"),
+    ("state_mixed", "api=key", ":", "omitted"),
+    ("numeric_camel_state", "client2:Id", "=", "redacted"),
+    ("typed_reference", "provider:external:id", ":", "string"),
+    (
+        "long_state",
+        "client:alpha beta gamma delta epsilon zeta eta theta iota:id",
+        ":",
+        "unavailable",
+    ),
+    (
+        "long_typed_reference",
+        "provider=alpha beta.gamma delta epsilon zeta eta theta iota:id",
+        ":",
+        "provider record identifier",
+    ),
+)
+REPEATED_DELIMITER_SAFE_METADATA = tuple(
+    f"{label}{separator}{candidate}"
+    for _, label, separator, candidate in REPEATED_DELIMITER_SAFE_CASES
+)
 FORBIDDEN_PROVIDER_COMPOUND_LABELS = (
     "documentAuthorizationId",
     "sourceTokenId",
@@ -346,17 +386,19 @@ def _labelled_forbidden_values() -> tuple[str, ...]:
         values.append(f"{label}:{candidate}")
     for _, label, separator, candidate in LONG_QUALIFIED_ASSIGNMENT_CASES:
         values.append(f"{label}{separator}{candidate}")
+    for _, label, separator, candidate in REPEATED_DELIMITER_ASSIGNMENT_CASES:
+        values.append(f"{label}{separator}{candidate}")
     return tuple(dict.fromkeys(values))
 
 
 def _has_labelled_actual_value(value: str) -> bool:
-    explicit_pattern = (
-        r"(^|[^A-Za-z0-9_-])"
-        r"([^:=]{1,512})"
-        r"\s*[:=]\s*(\S.*)"
-    )
-    for match in re.finditer(explicit_pattern, value):
-        if _labelled_candidate_is_forbidden(match.group(2), match.group(3)):
+    bounded_value = value[:512]
+    for delimiter_index, character in enumerate(bounded_value):
+        if character not in {":", "="}:
+            continue
+        label = bounded_value[:delimiter_index].strip()
+        candidate = bounded_value[delimiter_index + 1 :].strip()
+        if label and candidate and _labelled_candidate_is_forbidden(label, candidate):
             return True
 
     words = value.split()
@@ -755,10 +797,14 @@ def test_validation_migration_uses_task_1_equivalent_label_token_binding() -> No
     )
 
     assert "as assignment_delimiters(delimiter_index)" in compact_text_body
-    assert "lag(delimiter_index, 1, 0)" in compact_text_body
     assert "least(char_length(coalesce(value, '')), 512)" in compact_text_body
+    assert "from delimiter_positions" in compact_text_body
+    assert "delimiter_positions.delimiter_index - 1" in compact_text_body
     assert "labelled_token_assignments.label" in compact_text_body
     assert "labelled_token_assignments.candidate" in compact_text_body
+    assert "segmented_delimiters" not in compact_text_body
+    assert "previous_delimiter_index" not in compact_text_body
+    assert "lag(" not in compact_text_body
     assert "regexp_matches(" not in compact_text_body
     assert "public.validation_label_assignment_has_forbidden_value(" in compact_text_body
     assert "jsonb_typeof(labelled_entry.item->'value')" in compact_json_body
@@ -856,6 +902,44 @@ def test_long_assignment_matrix_has_no_semantic_word_window() -> None:
     assert "{0,7}" not in text_body
 
 
+def test_repeated_delimiters_keep_cumulative_bounded_label_context() -> None:
+    sql = _sql()
+    text_body = _function_body(sql, "validation_text_has_forbidden_value")
+    unsafe_values = _labelled_forbidden_values()
+
+    assert {
+        case_type for case_type, *_ in REPEATED_DELIMITER_ASSIGNMENT_CASES
+    } == {
+        "short_colon",
+        "short_mixed",
+        "numeric_camel",
+        "acronym_mixed",
+        "long_space",
+        "long_mixed_punctuation",
+    }
+    for _, label, separator, candidate in REPEATED_DELIMITER_ASSIGNMENT_CASES:
+        assignment = f"{label}{separator}{candidate}"
+        assert len(assignment) <= 512
+        assert _label_kind(label) == "forbidden"
+        assert assignment in unsafe_values
+        assert _has_labelled_actual_value(assignment)
+
+    for _, label, separator, candidate in REPEATED_DELIMITER_SAFE_CASES:
+        assignment = f"{label}{separator}{candidate}"
+        assert len(assignment) <= 512
+        assert not _has_labelled_actual_value(assignment)
+
+    for reviewer_example in ("client:id:!value", "api=key:#1234"):
+        assert reviewer_example in unsafe_values
+        assert reviewer_example.lower() not in sql
+
+    assert "from delimiter_positions" in text_body
+    assert "delimiter_positions.delimiter_index - 1" in text_body
+    assert "segmented_delimiters" not in text_body
+    assert "previous_delimiter_index" not in text_body
+    assert "lag(" not in text_body
+
+
 def test_labelled_value_patterns_preserve_all_254_semantic_contracts() -> None:
     contracts: list[dict[str, object]] = []
     for path in SEMANTIC_CONTRACTS:
@@ -903,6 +987,7 @@ def test_labelled_value_contract_covers_complete_generated_assignment_matrix() -
         "provider_external_record_id:provider record identifier",
         "counterparty_tax_id:counterparty tax identifier",
         *LONG_SAFE_LABELLED_METADATA,
+        *REPEATED_DELIMITER_SAFE_METADATA,
     )
     for safe_metadata in safe_metadata_values:
         assert not _has_labelled_actual_value(safe_metadata)

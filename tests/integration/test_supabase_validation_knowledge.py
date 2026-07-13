@@ -194,6 +194,46 @@ _LONG_SAFE_LABELLED_METADATA = (
         "lambda.id: provider record identifier"
     ),
 )
+_REPEATED_DELIMITER_ASSIGNMENT_CASES = (
+    ("short_colon", "client:id", ":", "!value"),
+    ("short_mixed", "api=key", ":", "#1234"),
+    ("numeric_camel", "client2:Id", "=", "!value"),
+    ("acronym_mixed", "API=signing:Key", ":", "#1234"),
+    (
+        "long_space",
+        "client:alpha beta gamma delta epsilon zeta eta theta iota:id",
+        ":",
+        "!value",
+    ),
+    (
+        "long_mixed_punctuation",
+        "api=alpha beta.gamma delta epsilon zeta eta theta iota:key",
+        "=",
+        "#1234",
+    ),
+)
+_REPEATED_DELIMITER_SAFE_CASES = (
+    ("state_colon", "client:id", ":", "unavailable"),
+    ("state_mixed", "api=key", ":", "omitted"),
+    ("numeric_camel_state", "client2:Id", "=", "redacted"),
+    ("typed_reference", "provider:external:id", ":", "string"),
+    (
+        "long_state",
+        "client:alpha beta gamma delta epsilon zeta eta theta iota:id",
+        ":",
+        "unavailable",
+    ),
+    (
+        "long_typed_reference",
+        "provider=alpha beta.gamma delta epsilon zeta eta theta iota:id",
+        ":",
+        "provider record identifier",
+    ),
+)
+_REPEATED_DELIMITER_SAFE_METADATA = tuple(
+    f"{label}{separator}{candidate}"
+    for _, label, separator, candidate in _REPEATED_DELIMITER_SAFE_CASES
+)
 _FORBIDDEN_PROVIDER_COMPOUND_LABELS = (
     "documentAuthorizationId",
     "sourceTokenId",
@@ -230,6 +270,7 @@ _SAFE_LABELLED_METADATA = (
     "provider_external_record_id:provider record identifier",
     "counterparty_tax_id:counterparty tax identifier",
     *_LONG_SAFE_LABELLED_METADATA,
+    *_REPEATED_DELIMITER_SAFE_METADATA,
 )
 
 
@@ -421,6 +462,8 @@ def _labelled_forbidden_values() -> tuple[str, ...]:
         values.append(f"{label}:{candidate}")
     for _, label, separator, candidate in _LONG_QUALIFIED_ASSIGNMENT_CASES:
         values.append(f"{label}{separator}{candidate}")
+    for _, label, separator, candidate in _REPEATED_DELIMITER_ASSIGNMENT_CASES:
+        values.append(f"{label}{separator}{candidate}")
     return tuple(dict.fromkeys(values))
 
 
@@ -559,6 +602,21 @@ def test_labelled_value_rpc_matrix_covers_complete_contract() -> None:
     for _, label, separator, candidate in _LONG_QUALIFIED_ASSIGNMENT_CASES:
         assert len(label.split()) > 8
         assert f"{label}{separator}{candidate}" in values
+    assert {
+        case_type
+        for case_type, *_ in _REPEATED_DELIMITER_ASSIGNMENT_CASES
+    } == {
+        "short_colon",
+        "short_mixed",
+        "numeric_camel",
+        "acronym_mixed",
+        "long_space",
+        "long_mixed_punctuation",
+    }
+    for _, label, separator, candidate in _REPEATED_DELIMITER_ASSIGNMENT_CASES:
+        assignment = f"{label}{separator}{candidate}"
+        assert len(assignment) <= 512
+        assert assignment in values
 
 
 def test_long_label_assignment_matrix_passes_actual_sql_helpers() -> None:
@@ -611,6 +669,57 @@ def test_long_label_assignment_matrix_passes_actual_sql_helpers() -> None:
             )
             _assert_status(response, 200)
             assert response.json() is False
+
+
+def test_repeated_delimiter_matrix_passes_actual_sql_helpers() -> None:
+    environment = _test_environment()
+
+    with httpx.Client(timeout=10.0, follow_redirects=False) as client:
+        for _, label, separator, candidate in _REPEATED_DELIMITER_ASSIGNMENT_CASES:
+            unsafe_value = f"{label}{separator}{candidate}"
+            for payload in (
+                unsafe_value,
+                {"allowed_metadata": unsafe_value},
+                {"nested": [{label: candidate}]},
+            ):
+                rpc = (
+                    "validation_text_has_forbidden_value"
+                    if isinstance(payload, str)
+                    else "jsonb_has_forbidden_validation_value"
+                )
+                response = _guarded_request(
+                    client,
+                    environment,
+                    "POST",
+                    f"{environment.rest_url}/rpc/{rpc}",
+                    headers=environment.service_headers,
+                    json={"value": payload},
+                )
+                _assert_status(response, 200)
+                assert response.json() is True
+
+        for _, label, separator, candidate in _REPEATED_DELIMITER_SAFE_CASES:
+            safe_value = f"{label}{separator}{candidate}"
+            for payload in (
+                safe_value,
+                {"allowed_metadata": safe_value},
+                {"nested": [{label: candidate}]},
+            ):
+                rpc = (
+                    "validation_text_has_forbidden_value"
+                    if isinstance(payload, str)
+                    else "jsonb_has_forbidden_validation_value"
+                )
+                response = _guarded_request(
+                    client,
+                    environment,
+                    "POST",
+                    f"{environment.rest_url}/rpc/{rpc}",
+                    headers=environment.service_headers,
+                    json={"value": payload},
+                )
+                _assert_status(response, 200)
+                assert response.json() is False
 
 
 def test_label_normalization_classes_pass_actual_sql_helper() -> None:

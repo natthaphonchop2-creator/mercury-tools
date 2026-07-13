@@ -311,30 +311,21 @@ as $function$
           1
         ) in (':', '=')
       ),
-      segmented_delimiters as (
-        select
-          delimiter_index,
-          lag(delimiter_index, 1, 0) over (
-            order by delimiter_index
-          ) as previous_delimiter_index
-        from delimiter_positions
-      ),
       labelled_token_assignments as (
         select
           btrim(
-            substr(
+            left(
               left(coalesce(value, ''), 512),
-              previous_delimiter_index + 1,
-              delimiter_index - previous_delimiter_index - 1
+              delimiter_positions.delimiter_index - 1
             )
           ) as label,
           btrim(
             substr(
               left(coalesce(value, ''), 512),
-              delimiter_index + 1
+              delimiter_positions.delimiter_index + 1
             )
           ) as candidate
-        from segmented_delimiters
+        from delimiter_positions
       )
       select 1
       from labelled_token_assignments
