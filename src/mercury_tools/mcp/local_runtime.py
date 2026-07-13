@@ -26,7 +26,10 @@ from mercury_tools.local.repository import (
     RepositoryContext,
     load_repository_config,
 )
+from mercury_tools.rag.models import SearchFilters
 from mercury_tools.safety.redaction import redact_json
+
+_SEARCH_FILTER_FIELDS = frozenset(SearchFilters.__dataclass_fields__)
 
 
 class LocalActionCatalog:
@@ -201,7 +204,11 @@ class LocalMercuryRuntime:
         filters: dict[str, str] | None = None,
         top_k: int = 8,
     ) -> tuple[dict[str, Any], ...]:
-        return await self.cloud.search_knowledge(query, filters=filters, top_k=top_k)
+        return await self.cloud.search_knowledge(
+            query,
+            filters=_knowledge_search_filters(filters),
+            top_k=top_k,
+        )
 
     async def get_document(self, document_id: str) -> dict[str, Any] | None:
         return await self.cloud.get_document(document_id)
@@ -365,3 +372,18 @@ def _semantic_action_id(result: Mapping[str, Any]) -> str | None:
     if isinstance(section, str) and section.startswith("act_"):
         return section
     return None
+
+
+def _knowledge_search_filters(
+    filters: Mapping[str, str] | None,
+) -> dict[str, str] | None:
+    if filters is None:
+        return None
+    if not isinstance(filters, Mapping) or set(filters) - _SEARCH_FILTER_FIELDS:
+        raise ValueError("cloud_search_invalid")
+    copied = dict(filters)
+    try:
+        SearchFilters(**copied)
+    except (TypeError, ValueError):
+        raise ValueError("cloud_search_invalid") from None
+    return copied

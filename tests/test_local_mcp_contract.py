@@ -61,6 +61,81 @@ EXPECTED_PROMPTS = {
     "management_report_th",
     "connector_setup_guide_th",
 }
+
+
+def test_local_flow_adapter_routes_exact_validation_filters() -> None:
+    filters = SimpleNamespace(
+        jurisdiction="TH",
+        connector="flowaccount",
+        doc_type="endpoint_validation",
+        review_status="reviewed",
+        effective_date=None,
+        action_id="act_1234567890abcdef12345678",
+        version_id="av_" + "1" * 64,
+        environment="sandbox",
+        capability="documents.invoice.list",
+        accounting_use="revenue_review",
+    )
+
+    assert local_server._flow_filters(filters) == {
+        "jurisdiction": "TH",
+        "connector": "flowaccount",
+        "doc_type": "endpoint_validation",
+        "review_status": "reviewed",
+        "action_id": "act_1234567890abcdef12345678",
+        "version_id": "av_" + "1" * 64,
+        "environment": "sandbox",
+        "capability": "documents.invoice.list",
+        "accounting_use": "revenue_review",
+    }
+
+
+def test_local_flow_result_carries_only_approved_validation_metadata() -> None:
+    metadata = {
+        "jurisdiction": "TH",
+        "connector": "flowaccount",
+        "doc_type": "endpoint_validation",
+        "review_status": "reviewed",
+        "action_id": "act_1234567890abcdef12345678",
+        "version_id": "av_" + "1" * 64,
+        "environment": "sandbox",
+        "capability": "documents.invoice.list",
+        "accounting_use": ["revenue_review"],
+        "validation_status": "contract_validated",
+        "evidence_level": "contract_validated",
+        "approval_state": "approved_public",
+    }
+    result = local_server._flow_result(
+        {
+            "chunk_id": "chunk-1",
+            "metadata": {**metadata, "raw_response": "private-value"},
+        }
+    )
+
+    assert result.metadata == metadata
+    assert "private-value" not in str(vars(result))
+
+
+@pytest.mark.asyncio
+async def test_local_runtime_rejects_unknown_search_filter_before_cloud() -> None:
+    runtime = object.__new__(LocalMercuryRuntime)
+    calls = []
+
+    class FakeCloud:
+        async def search_knowledge(self, query, *, filters, top_k):
+            calls.append(filters)
+            return ()
+
+    runtime.cloud = FakeCloud()
+
+    with pytest.raises(ValueError, match="^cloud_search_invalid$") as raised:
+        await runtime.search_knowledge(
+            "qualified evidence",
+            filters={"raw_response": "private-value"},
+        )
+
+    assert calls == []
+    assert "private-value" not in str(raised.value)
 READ_ONLY_TOOLS = {
     "search_knowledge",
     "retrieve_context_pack",

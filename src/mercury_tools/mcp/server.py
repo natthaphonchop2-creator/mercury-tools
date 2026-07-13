@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -61,6 +62,7 @@ from mercury_tools.workspaces import (
 
 mcp = FastMCP("Mercury Tools")
 
+_SEARCH_FILTER_FIELDS = frozenset(SearchFilters.__dataclass_fields__)
 MAX_MCP_FLOW_FILES = 50
 MAX_MCP_FLOW_FILE_CHARS = 500_000
 CONNECTOR_ENV_KEYS = ("connector", "connector_id", "accounting_connector", "erp_connector")
@@ -114,14 +116,14 @@ def _audit(tool_name: str, input_payload: dict[str, Any], output_summary: dict[s
 
 
 def _filters(filters: dict[str, Any] | None) -> SearchFilters:
-    filters = filters or {}
-    return SearchFilters(
-        jurisdiction=filters.get("jurisdiction"),
-        connector=filters.get("connector"),
-        doc_type=filters.get("doc_type"),
-        review_status=filters.get("review_status"),
-        effective_date=filters.get("effective_date"),
-    )
+    if filters is None:
+        return SearchFilters()
+    if not isinstance(filters, Mapping) or set(filters) - _SEARCH_FILTER_FIELDS:
+        raise ValueError("search_filters_invalid")
+    try:
+        return SearchFilters(**dict(filters))
+    except (TypeError, ValueError):
+        raise ValueError("search_filters_invalid") from None
 
 
 def _serialize_search_results(results: list[SearchResult]) -> list[dict[str, Any]]:

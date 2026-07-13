@@ -32,6 +32,25 @@ ORDINARY_DEPENDENCY_ERROR_TYPES = (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _validation_metadata(**overrides):
+    metadata = {
+        "jurisdiction": "TH",
+        "connector": "flowaccount",
+        "doc_type": "endpoint_validation",
+        "review_status": "reviewed",
+        "action_id": "act_1234567890abcdef12345678",
+        "version_id": "av_" + "1" * 64,
+        "environment": "sandbox",
+        "capability": "documents.invoice.list",
+        "accounting_use": ["revenue_review"],
+        "validation_status": "contract_validated",
+        "evidence_level": "contract_validated",
+        "approval_state": "approved_public",
+    }
+    metadata.update(overrides)
+    return metadata
+
+
 class CatalogStoreSpy:
     def __init__(self, actions) -> None:
         self.actions = list(actions)
@@ -788,6 +807,11 @@ async def test_cloud_search_sanitizes_filters_and_forces_reviewed_before_rag(
                 "doc_type": "tax",
                 "review_status": "draft",
                 "effective_date": "2026-07-12",
+                "action_id": "act_1234567890abcdef12345678",
+                "version_id": "av_" + "1" * 64,
+                "environment": "sandbox",
+                "capability": "documents.invoice.list",
+                "accounting_use": "revenue_review",
             },
             "top_k": 4,
         },
@@ -799,6 +823,122 @@ async def test_cloud_search_sanitizes_filters_and_forces_reviewed_before_rag(
     assert rag_store.last_filters.doc_type == "tax"
     assert rag_store.last_filters.review_status == "reviewed"
     assert rag_store.last_filters.effective_date == "2026-07-12"
+    assert rag_store.last_filters.action_id == "act_1234567890abcdef12345678"
+    assert rag_store.last_filters.version_id == "av_" + "1" * 64
+    assert rag_store.last_filters.environment == "sandbox"
+    assert rag_store.last_filters.capability == "documents.invoice.list"
+    assert rag_store.last_filters.accounting_use == "revenue_review"
+
+
+@pytest.mark.asyncio
+async def test_cloud_search_projects_only_typed_approved_validation_metadata(
+    client,
+    cloud_dependencies,
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    document_uri = (
+        "mercury://wiki/validation/flowaccount/"
+        "act_1234567890abcdef12345678/"
+        f"av_{'1' * 64}/run_{'2' * 26}"
+    )
+    metadata = _validation_metadata(raw_response="private-value")
+    rag_store.search_knowledge = lambda **_kwargs: [
+        SearchResult(
+            chunk_id="chunk-validation",
+            document_id="document-validation",
+            document_uri=document_uri,
+            chunk_uri=f"{document_uri}#chunk-0",
+            text="Reviewed endpoint validation.",
+            score=0.99,
+            source_title="Endpoint validation",
+            source_uri=document_uri,
+            source_url=None,
+            source_path="/Users/operator/private.md",
+            citation={"heading": "Validation", "source_path": "/Users/operator/private.md"},
+            metadata=metadata,
+        )
+    ]
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": "qualified evidence", "filters": {}, "top_k": 4},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["results"][0]["metadata"] == _validation_metadata()
+    assert "private-value" not in response.text
+    assert "/Users/" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_cloud_search_does_not_infer_approval_from_reviewed_status(
+    client,
+    cloud_dependencies,
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    document_uri = (
+        "mercury://wiki/validation/flowaccount/"
+        "act_1234567890abcdef12345678/"
+        f"av_{'1' * 64}/run_{'2' * 26}"
+    )
+    rag_store.search_knowledge = lambda **_kwargs: [
+        SearchResult(
+            chunk_id="chunk-validation",
+            document_id="document-validation",
+            document_uri=document_uri,
+            chunk_uri=f"{document_uri}#chunk-0",
+            text="Unapproved endpoint validation.",
+            score=0.99,
+            source_title="Endpoint validation",
+            source_uri=document_uri,
+            source_url=None,
+            source_path=None,
+            citation={"heading": "Validation"},
+            metadata=_validation_metadata(approval_state="pending_review"),
+        )
+    ]
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": "qualified evidence", "filters": {}, "top_k": 4},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"results": []}
+
+
+@pytest.mark.asyncio
+async def test_cloud_document_projects_only_typed_approved_validation_metadata(
+    client,
+    cloud_dependencies,
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    document_id = "11111111-1111-4111-8111-111111111111"
+    document_uri = (
+        "mercury://wiki/validation/flowaccount/"
+        "act_1234567890abcdef12345678/"
+        f"av_{'1' * 64}/run_{'2' * 26}"
+    )
+    rag_store.get_document = lambda _document_id: {
+        "id": document_id,
+        "document_uri": document_uri,
+        "title": "Endpoint validation",
+        "body": "Reviewed endpoint validation.",
+        "sha256": "1" * 64,
+        "metadata": _validation_metadata(raw_response="private-value"),
+        "knowledge_sources": {
+            "title": "Endpoint validation",
+            "source_uri": document_uri,
+            "source_url": None,
+            "review_status": "reviewed",
+        },
+    }
+
+    response = await client.get(f"/api/cloud/v1/documents/{document_id}")
+
+    assert response.status_code == 200
+    assert response.json()["metadata"] == _validation_metadata()
+    assert "private-value" not in response.text
 
 
 @pytest.mark.asyncio

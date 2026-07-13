@@ -94,6 +94,23 @@ def _public_search_result() -> dict:
     }
 
 
+def _public_validation_metadata() -> dict:
+    return {
+        "jurisdiction": "TH",
+        "connector": "flowaccount",
+        "doc_type": "endpoint_validation",
+        "review_status": "reviewed",
+        "action_id": "act_1234567890abcdef12345678",
+        "version_id": "av_" + "1" * 64,
+        "environment": "sandbox",
+        "capability": "documents.invoice.list",
+        "accounting_use": ["revenue_review"],
+        "validation_status": "contract_validated",
+        "evidence_level": "contract_validated",
+        "approval_state": "approved_public",
+    }
+
+
 def _public_document(document_id: str) -> dict:
     return {
         "id": document_id,
@@ -856,6 +873,45 @@ async def test_client_redacts_sensitive_search_text_before_network(repository_co
     assert "person@example.com" not in serialized
     assert "0105559999999" not in serialized
     assert "private-value" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_client_routes_exact_filters_and_accepts_typed_validation_metadata(
+    repository_context,
+) -> None:
+    captured = {}
+    public_result = {
+        **_public_search_result(),
+        "metadata": _public_validation_metadata(),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, json={"results": [public_result]})
+
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=CatalogCache(repository_context),
+        transport=httpx.MockTransport(handler),
+    )
+    filters = {
+        "connector": "flowaccount",
+        "action_id": "act_1234567890abcdef12345678",
+        "version_id": "av_" + "1" * 64,
+        "environment": "sandbox",
+        "capability": "documents.invoice.list",
+        "accounting_use": "revenue_review",
+    }
+    try:
+        [result] = await client.search_knowledge(
+            "qualified evidence",
+            filters=filters,
+        )
+    finally:
+        await client.aclose()
+
+    assert captured["filters"] == {**filters, "review_status": "reviewed"}
+    assert result["metadata"] == _public_validation_metadata()
 
 
 def test_cloud_base_url_defaults_and_loads_from_environment(monkeypatch) -> None:

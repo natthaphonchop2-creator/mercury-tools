@@ -49,6 +49,11 @@ def test_cli_search_applies_connector_inference(monkeypatch, capsys) -> None:
             doc_type=None,
             review_status=None,
             effective_date=None,
+            action_id=None,
+            version_id=None,
+            environment=None,
+            capability=None,
+            accounting_use=None,
             top_k=8,
             mode="hybrid",
             json=True,
@@ -60,6 +65,53 @@ def test_cli_search_applies_connector_inference(monkeypatch, capsys) -> None:
     assert captured["connector"] == "flowaccount"
     assert payload["inferred_connector"] == "flowaccount"
     assert payload["results"][0]["metadata"]["connector"] == "flowaccount"
+
+
+def test_cli_search_routes_exact_validation_filters(monkeypatch, capsys) -> None:
+    from mercury_tools import cli
+
+    captured = {}
+
+    class FakeService:
+        def __init__(self, *, store, embedder):
+            pass
+
+        def search(self, query, *, filters, top_k, mode):
+            captured["filters"] = filters
+            return []
+
+    monkeypatch.setattr(cli, "load_settings", lambda: object())
+    monkeypatch.setattr(cli, "SupabaseRagStore", lambda settings: object())
+    monkeypatch.setattr(cli, "_embedder", lambda args: object())
+    monkeypatch.setattr(cli, "RagService", FakeService)
+
+    exit_code = cli.cmd_search(
+        argparse.Namespace(
+            query="qualified evidence",
+            jurisdiction=None,
+            connector="flowaccount",
+            doc_type="endpoint_validation",
+            review_status="reviewed",
+            effective_date=None,
+            action_id="act_1234567890abcdef12345678",
+            version_id="av_" + "1" * 64,
+            environment="sandbox",
+            capability="documents.invoice.list",
+            accounting_use="revenue_review",
+            top_k=8,
+            mode="hybrid",
+            json=True,
+        )
+    )
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out)["results"] == []
+    filters = captured["filters"]
+    assert filters.action_id == "act_1234567890abcdef12345678"
+    assert filters.version_id == "av_" + "1" * 64
+    assert filters.environment == "sandbox"
+    assert filters.capability == "documents.invoice.list"
+    assert filters.accounting_use == "revenue_review"
 
 
 def test_cli_parser_exposes_local_credential_contract_without_importing_cloud_mcp() -> None:

@@ -30,14 +30,18 @@ class SupabaseRagStore:
         url = f"{self.base_url}/{path.lstrip('/')}"
         extra_headers = kwargs.pop("headers", {})
         headers = {**self.headers, **extra_headers}
-        response = httpx.request(method, url, headers=headers, timeout=60, **kwargs)
+        try:
+            response = httpx.request(method, url, headers=headers, timeout=60, **kwargs)
+        except httpx.HTTPError:
+            raise RuntimeError("supabase_rag_request_failed") from None
         if response.status_code >= 300:
-            raise RuntimeError(
-                f"Supabase request failed: HTTP {response.status_code} {response.text[:300]}"
-            )
+            raise RuntimeError("supabase_rag_request_failed")
         if not response.text:
             return None
-        return response.json()
+        try:
+            return response.json()
+        except ValueError:
+            raise RuntimeError("supabase_rag_response_invalid") from None
 
     def get_document_by_uri(self, document_uri: str) -> dict | None:
         rows = self._request(

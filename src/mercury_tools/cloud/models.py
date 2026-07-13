@@ -6,7 +6,7 @@ import math
 import re
 import uuid
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -16,6 +16,7 @@ from mercury_tools.catalog.schema_contract import (
     is_canonical_schema_name,
     validate_required_schema_contract,
 )
+from mercury_tools.rag.models import project_approved_validation_metadata
 from mercury_tools.safety.redaction import (
     is_safe_public_http_url,
     redact_absolute_paths,
@@ -815,6 +816,47 @@ class PublicCitation(StrictPublicModel):
         return self
 
 
+class PublicValidationMetadata(StrictPublicModel):
+    jurisdiction: Literal["TH"]
+    connector: Literal["flowaccount", "peak"]
+    doc_type: Literal["endpoint_validation"]
+    review_status: Literal["reviewed"]
+    action_id: str
+    version_id: str
+    environment: Literal["sandbox", "test", "uat", "production"]
+    capability: str
+    accounting_use: list[str]
+    validation_status: Literal[
+        "live_success",
+        "live_failed",
+        "contract_validated",
+        "blocked_missing_credentials",
+        "blocked_missing_prerequisite",
+        "blocked_external_effect",
+        "unsupported_by_sandbox",
+        "outcome_unknown",
+    ]
+    evidence_level: Literal[
+        "documented",
+        "contract_validated",
+        "sandbox_observed",
+        "accountant_reviewed",
+    ]
+    approval_state: Literal["approved_public"]
+
+    @model_validator(mode="after")
+    def validate_metadata(self) -> PublicValidationMetadata:
+        try:
+            projected = project_approved_validation_metadata(
+                self.model_dump(mode="python")
+            )
+        except ValueError:
+            raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR) from None
+        if projected is None:
+            raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
+        return self
+
+
 class PublicSearchResult(StrictPublicModel):
     chunk_id: str
     document_id: str
@@ -826,6 +868,10 @@ class PublicSearchResult(StrictPublicModel):
     source_uri: str
     source_url: str | None
     citation: PublicCitation
+    metadata: PublicValidationMetadata | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def validate_search_result(self) -> PublicSearchResult:
@@ -864,6 +910,10 @@ class PublicDocument(StrictPublicModel):
     body: str
     sha256: str
     source: PublicDocumentSource
+    metadata: PublicValidationMetadata | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def validate_document(self) -> PublicDocument:

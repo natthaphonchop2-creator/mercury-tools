@@ -6,7 +6,7 @@ import os
 import re
 import stat
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -26,7 +26,10 @@ from mercury_tools.flows.parser import (
     parse_flow_text,
     parse_inline_commands,
 )
-from mercury_tools.rag.models import SearchFilters
+from mercury_tools.rag.models import (
+    SearchFilters,
+    project_approved_validation_metadata,
+)
 from mercury_tools.safety.redaction import redact_json
 
 _TEMPLATE_PATTERN = re.compile(r"\$\{([^}]+)\}|\{\{\s*([^}]+?)\s*\}\}")
@@ -45,6 +48,7 @@ _CLOUD_BOUND_COMMANDS = frozenset(
 _TAINTED_VALUE_SUMMARY = {"status": "erp_derived_value_withheld"}
 _MAX_FLOW_BYTES = 500_000
 _INLINE_FLOW_FILENAME = ".mercury-inline-flow.yaml"
+_SEARCH_FILTER_FIELDS = frozenset(SearchFilters.__dataclass_fields__)
 
 
 @dataclass(frozen=True)
@@ -509,14 +513,35 @@ def _summary(payload: Any) -> dict[str, Any]:
 
 
 def _filters(raw: dict[str, Any] | None) -> SearchFilters:
-    raw = raw or {}
-    return SearchFilters(
-        jurisdiction=raw.get("jurisdiction"),
-        connector=raw.get("connector"),
-        doc_type=raw.get("doc_type"),
-        review_status=raw.get("review_status"),
-        effective_date=raw.get("effective_date"),
-    )
+    if raw is None:
+        return SearchFilters()
+    if not isinstance(raw, Mapping) or set(raw) - _SEARCH_FILTER_FIELDS:
+        raise FlowValidationError("knowledge_filters_invalid")
+    try:
+        return SearchFilters(**dict(raw))
+    except (TypeError, ValueError):
+        raise FlowValidationError("knowledge_filters_invalid") from None
+
+
+def _search_result_payload(result: Any) -> dict[str, Any]:
+    payload = {
+        "chunk_id": result.chunk_id,
+        "document_uri": result.document_uri,
+        "score": result.score,
+        "text": result.text,
+        "citation": result.citation,
+        "source_title": result.source_title,
+        "source_uri": result.source_uri,
+        "source_url": result.source_url,
+        "source_path": result.source_path,
+    }
+    try:
+        metadata = project_approved_validation_metadata(result.metadata)
+    except ValueError:
+        raise FlowValidationError("knowledge_metadata_invalid") from None
+    if metadata is not None:
+        payload["metadata"] = metadata
+    return payload
 
 
 def _is_present(value: Any) -> bool:
@@ -900,20 +925,7 @@ class MercuryFlowRunner:
             return _CommandOutput(
                 {
                     "query": query,
-                    "results": [
-                        {
-                            "chunk_id": result.chunk_id,
-                            "document_uri": result.document_uri,
-                            "score": result.score,
-                            "text": result.text,
-                            "citation": result.citation,
-                            "source_title": result.source_title,
-                            "source_uri": result.source_uri,
-                            "source_url": result.source_url,
-                            "source_path": result.source_path,
-                        }
-                        for result in results
-                    ],
+                    "results": [_search_result_payload(result) for result in results],
                 }
             )
 

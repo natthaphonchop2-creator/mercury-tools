@@ -76,6 +76,11 @@ def cmd_search(args: argparse.Namespace) -> int:
             "doc_type": args.doc_type,
             "review_status": args.review_status,
             "effective_date": args.effective_date,
+            "action_id": args.action_id,
+            "version_id": args.version_id,
+            "environment": args.environment,
+            "capability": args.capability,
+            "accounting_use": args.accounting_use,
         }.items()
         if value is not None
     }
@@ -89,6 +94,11 @@ def cmd_search(args: argparse.Namespace) -> int:
         doc_type=applied_filters.get("doc_type"),
         review_status=applied_filters.get("review_status"),
         effective_date=applied_filters.get("effective_date"),
+        action_id=applied_filters.get("action_id"),
+        version_id=applied_filters.get("version_id"),
+        environment=applied_filters.get("environment"),
+        capability=applied_filters.get("capability"),
+        accounting_use=applied_filters.get("accounting_use"),
     )
     results = service.search(args.query, filters=filters, top_k=args.top_k, mode=args.mode)
     payload = [
@@ -632,6 +642,11 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--doc-type")
     search.add_argument("--review-status")
     search.add_argument("--effective-date")
+    search.add_argument("--action-id")
+    search.add_argument("--version-id")
+    search.add_argument("--environment")
+    search.add_argument("--capability")
+    search.add_argument("--accounting-use")
     search.add_argument("--embedding-provider", choices=["openai", "hash"])
     search.set_defaults(func=cmd_search)
 

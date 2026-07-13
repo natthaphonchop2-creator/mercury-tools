@@ -42,7 +42,12 @@ from mercury_tools.db.catalog import SupabaseCatalogStore
 from mercury_tools.db.product import SKILL_CATALOG_SEED
 from mercury_tools.db.supabase import SupabaseRagStore
 from mercury_tools.mercury_runtime import skill_markdown
-from mercury_tools.rag.models import SearchFilters, SearchResult
+from mercury_tools.rag.models import (
+    SearchFilters,
+    SearchResult,
+    is_validation_metadata_candidate,
+    project_approved_validation_metadata,
+)
 from mercury_tools.safety.redaction import redact_json
 
 _FILTER_FIELDS = {
@@ -51,9 +56,17 @@ _FILTER_FIELDS = {
     "doc_type",
     "review_status",
     "effective_date",
+    "action_id",
+    "version_id",
+    "environment",
+    "capability",
+    "accounting_use",
 }
 _SELECTOR_RE = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 _ACTION_ID_RE = re.compile(r"^act_[0-9a-f]{24}$")
+_VERSION_ID_RE = re.compile(r"^av_[0-9a-f]{64}$")
+_DOTTED_TERM_RE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$")
+_ENVIRONMENTS = frozenset({"sandbox", "test", "uat", "production"})
 _PUBLIC_RESULT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _PRIVATE_KEY_RE = re.compile(r"(?i)(?:repository|source)?_?path|credential")
 _PUBLIC_SKILL_FIELDS = (
@@ -368,7 +381,27 @@ def sanitize_search_filters(value: Any) -> dict[str, str]:
                     raise ValueError
             except ValueError:
                 raise ValueError("cloud_search_filters_invalid") from None
-        elif not _SELECTOR_RE.fullmatch(item):
+        elif (
+            (key == "action_id" and _ACTION_ID_RE.fullmatch(item) is None)
+            or (key == "version_id" and _VERSION_ID_RE.fullmatch(item) is None)
+            or (key == "environment" and item not in _ENVIRONMENTS)
+            or (
+                key in {"capability", "accounting_use"}
+                and _DOTTED_TERM_RE.fullmatch(item) is None
+            )
+            or (
+                key
+                not in {
+                    "effective_date",
+                    "action_id",
+                    "version_id",
+                    "environment",
+                    "capability",
+                    "accounting_use",
+                }
+                and not _SELECTOR_RE.fullmatch(item)
+            )
+        ):
             raise ValueError("cloud_search_filters_invalid")
         clean = sanitize_public_text(item)
         if clean != item:
@@ -379,7 +412,7 @@ def sanitize_search_filters(value: Any) -> dict[str, str]:
 
 
 def _public_search_result(result: SearchResult) -> dict[str, Any]:
-    return {
+    payload = {
         "chunk_id": result.chunk_id,
         "document_id": result.document_id,
         "document_uri": sanitize_public_text(result.document_uri),
@@ -391,6 +424,10 @@ def _public_search_result(result: SearchResult) -> dict[str, Any]:
         "source_url": sanitize_public_text(result.source_url) if result.source_url else None,
         "citation": _public_citation(result.citation),
     }
+    metadata = project_approved_validation_metadata(result.metadata)
+    if metadata is not None:
+        payload["metadata"] = metadata
+    return payload
 
 
 def _project_public_search_results(
@@ -448,7 +485,7 @@ def _validate_search_result_shape(result: SearchResult) -> None:
 
 def _public_document(document: Mapping[str, Any]) -> dict[str, Any]:
     source = _document_source(document) or {}
-    return {
+    payload = {
         "id": _clean_public_value(document.get("id")),
         "document_uri": _clean_public_value(document.get("document_uri")),
         "title": _clean_public_value(document.get("title")),
@@ -460,6 +497,10 @@ def _public_document(document: Mapping[str, Any]) -> dict[str, Any]:
             "source_url": _clean_public_value(source.get("source_url")),
         },
     }
+    metadata = project_approved_validation_metadata(document.get("metadata"))
+    if metadata is not None:
+        payload["metadata"] = metadata
+    return payload
 
 
 def _project_public_document(
@@ -498,6 +539,11 @@ def _project_public_document(
     if not isinstance(review_status, str):
         raise ValueError("cloud_document_invalid")
     if review_status != "reviewed":
+        return None
+    metadata = document.get("metadata")
+    if is_validation_metadata_candidate(metadata) and (
+        project_approved_validation_metadata(metadata) is None
+    ):
         return None
     for field in ("id", "title", "body", "sha256"):
         if not isinstance(document.get(field), str):
@@ -583,7 +629,11 @@ def _is_public_search_result(result: Any) -> bool:
         or not result.chunk_uri.startswith(f"{result.document_uri}#")
     ):
         raise ValueError("cloud_search_result_invalid")
-    return result.metadata.get("review_status") == "reviewed"
+    if result.metadata.get("review_status") != "reviewed":
+        return False
+    if is_validation_metadata_candidate(result.metadata):
+        return project_approved_validation_metadata(result.metadata) is not None
+    return True
 
 
 def _looks_like_wiki_uri(value: Any) -> bool:

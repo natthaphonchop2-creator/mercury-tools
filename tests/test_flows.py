@@ -82,6 +82,123 @@ def test_flow_runner_executes_with_injected_services() -> None:
     assert payload["variables"]["skill"]["skill_id"] == "company-health-check-th"
 
 
+def test_flow_runner_routes_exact_validation_filters() -> None:
+    captured = {}
+
+    class FakeService:
+        def search(self, query, *, filters, top_k, mode):
+            captured["filters"] = filters
+            return []
+
+    result = MercuryFlowRunner(
+        rag_service_factory=lambda: FakeService(),
+    ).run_text(
+        """
+name: Exact Validation Search
+---
+- searchKnowledge:
+    query: qualified evidence
+    filters:
+      action_id: act_1234567890abcdef12345678
+      version_id: av_1111111111111111111111111111111111111111111111111111111111111111
+      environment: sandbox
+      capability: documents.invoice.list
+      accounting_use: revenue_review
+"""
+    )
+
+    assert result.status == "ok"
+    filters = captured["filters"]
+    assert filters.action_id == "act_1234567890abcdef12345678"
+    assert filters.version_id == "av_" + "1" * 64
+    assert filters.environment == "sandbox"
+    assert filters.capability == "documents.invoice.list"
+    assert filters.accounting_use == "revenue_review"
+
+
+def test_flow_runner_rejects_unknown_search_filter_without_echo() -> None:
+    calls = []
+
+    class FakeService:
+        def search(self, query, *, filters, top_k, mode):
+            calls.append(filters)
+            return []
+
+    unsafe_value = "private-value-must-not-echo"
+    runner = MercuryFlowRunner(rag_service_factory=lambda: FakeService())
+
+    with pytest.raises(FlowValidationError, match="^knowledge_filters_invalid$") as raised:
+        runner.run_text(
+            f"""
+name: Invalid Validation Search
+---
+- searchKnowledge:
+    query: qualified evidence
+    filters:
+      raw_response: {unsafe_value}
+"""
+        )
+
+    assert calls == []
+    assert unsafe_value not in str(raised.value)
+
+
+def test_flow_search_output_carries_only_approved_validation_metadata() -> None:
+    from mercury_tools.rag.models import SearchResult
+
+    metadata = {
+        "jurisdiction": "TH",
+        "connector": "flowaccount",
+        "doc_type": "endpoint_validation",
+        "review_status": "reviewed",
+        "action_id": "act_1234567890abcdef12345678",
+        "version_id": "av_" + "1" * 64,
+        "environment": "sandbox",
+        "capability": "documents.invoice.list",
+        "accounting_use": ["revenue_review"],
+        "validation_status": "contract_validated",
+        "evidence_level": "contract_validated",
+        "approval_state": "approved_public",
+    }
+
+    class FakeService:
+        def search(self, query, *, filters, top_k, mode):
+            return [
+                SearchResult(
+                    chunk_id="chunk-1",
+                    document_id="document-1",
+                    document_uri="mercury://wiki/validation/flowaccount/action/version/run",
+                    chunk_uri=(
+                        "mercury://wiki/validation/flowaccount/action/version/run#chunk-0"
+                    ),
+                    text="Qualified evidence",
+                    score=1.0,
+                    source_title="Validation",
+                    source_uri="mercury://wiki/validation/flowaccount/action/version/run",
+                    source_url=None,
+                    source_path=None,
+                    citation={},
+                    metadata={**metadata, "raw_response": "private-value"},
+                )
+            ]
+
+    payload = MercuryFlowRunner(
+        rag_service_factory=lambda: FakeService(),
+    ).run_text(
+        """
+name: Validation Metadata
+---
+- searchKnowledge:
+    query: qualified evidence
+    saveAs: evidence
+"""
+    ).as_dict()
+
+    result = payload["variables"]["evidence"]["results"][0]
+    assert result["metadata"] == metadata
+    assert "private-value" not in str(payload)
+
+
 def test_flow_runner_blocks_mutation_capability_before_connector_dispatch() -> None:
     calls: list[str] = []
     runner = MercuryFlowRunner(

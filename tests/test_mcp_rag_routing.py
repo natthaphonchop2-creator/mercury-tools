@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from mercury_tools.rag.models import ContextPack, SearchResult
 
 
@@ -123,3 +125,64 @@ def test_retrieve_context_pack_reports_no_relevant_knowledge(monkeypatch) -> Non
     assert payload["status"] == "no_relevant_knowledge"
     assert payload["minimum_score"] == 0.20
     assert payload["context"] == []
+
+
+def test_search_knowledge_routes_exact_filters_without_mutating_input(monkeypatch) -> None:
+    from mercury_tools.mcp import server
+
+    captured = {}
+
+    class FakeService:
+        def search(self, query, *, filters, top_k, mode):
+            captured.update(filters=filters)
+            return []
+
+    monkeypatch.setattr(server, "_service", lambda: FakeService())
+    monkeypatch.setattr(server, "_audit", lambda *args, **kwargs: None)
+    original = {
+        "action_id": "act_1234567890abcdef12345678",
+        "version_id": "av_" + "1" * 64,
+        "environment": "sandbox",
+        "capability": "documents.invoice.list",
+        "accounting_use": "revenue_review",
+    }
+
+    payload = server.search_knowledge("qualified evidence", filters=original)
+
+    filters = captured["filters"]
+    assert filters.action_id == original["action_id"]
+    assert filters.version_id == original["version_id"]
+    assert filters.environment == "sandbox"
+    assert filters.capability == "documents.invoice.list"
+    assert filters.accounting_use == "revenue_review"
+    assert payload["applied_filters"] == original
+    assert original == {
+        "action_id": "act_1234567890abcdef12345678",
+        "version_id": "av_" + "1" * 64,
+        "environment": "sandbox",
+        "capability": "documents.invoice.list",
+        "accounting_use": "revenue_review",
+    }
+
+
+def test_search_knowledge_rejects_unknown_filter_without_echo(monkeypatch) -> None:
+    from mercury_tools.mcp import server
+
+    calls = []
+
+    class FakeService:
+        def search(self, query, *, filters, top_k, mode):
+            calls.append(filters)
+            return []
+
+    monkeypatch.setattr(server, "_service", lambda: FakeService())
+    unsafe_value = "private-value-must-not-echo"
+
+    with pytest.raises(ValueError, match="^search_filters_invalid$") as raised:
+        server.search_knowledge(
+            "qualified evidence",
+            filters={"raw_response": unsafe_value},
+        )
+
+    assert calls == []
+    assert unsafe_value not in str(raised.value)

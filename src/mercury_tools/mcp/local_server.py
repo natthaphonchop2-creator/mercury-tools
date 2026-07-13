@@ -30,6 +30,7 @@ from mercury_tools.local.repository import (
 )
 from mercury_tools.mcp.local_runtime import LocalMercuryRuntime
 from mercury_tools.prompts import PROMPTS, get_prompt
+from mercury_tools.rag.models import project_approved_validation_metadata
 from mercury_tools.safety.redaction import redact_json
 
 local_mcp = FastMCP("Mercury Finance")
@@ -777,6 +778,11 @@ def _flow_filters(filters: Any) -> dict[str, str]:
             "doc_type",
             "review_status",
             "effective_date",
+            "action_id",
+            "version_id",
+            "environment",
+            "capability",
+            "accounting_use",
         )
     }
     return {name: value for name, value in values.items() if isinstance(value, str) and value}
@@ -795,7 +801,7 @@ def _flow_result(result: Mapping[str, Any]) -> SimpleNamespace:
         source_uri=result.get("source_uri"),
         source_url=result.get("source_url"),
         source_path=None,
-        metadata={},
+        metadata=project_approved_validation_metadata(result.get("metadata")) or {},
     )
 
 

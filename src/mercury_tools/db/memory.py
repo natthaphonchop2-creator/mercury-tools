@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from mercury_tools.rag.models import KnowledgeChunk, KnowledgeDocument, SearchFilters, SearchResult
+from mercury_tools.rag.models import (
+    KnowledgeChunk,
+    KnowledgeDocument,
+    SearchFilters,
+    SearchResult,
+    project_approved_validation_metadata,
+)
 
 
 class InMemoryRagStore:
@@ -25,6 +31,7 @@ class InMemoryRagStore:
             "title": document.title,
             "sha256": document.sha256,
             "body": document.body,
+            "metadata": project_approved_validation_metadata(document.metadata) or {},
         }
         self.chunks = [
             chunk for chunk in self.chunks if chunk["document_uri"] != document.document_uri
@@ -69,6 +76,27 @@ class InMemoryRagStore:
                 continue
             if filters.review_status and metadata.get("review_status") != filters.review_status:
                 continue
+            if (
+                filters.effective_date
+                and metadata.get("effective_date") is not None
+                and metadata.get("effective_date") > filters.effective_date
+            ):
+                continue
+            if filters.action_id and metadata.get("action_id") != filters.action_id:
+                continue
+            if filters.version_id and metadata.get("version_id") != filters.version_id:
+                continue
+            if filters.environment and metadata.get("environment") != filters.environment:
+                continue
+            if filters.capability and metadata.get("capability") != filters.capability:
+                continue
+            if filters.accounting_use:
+                accounting_uses = metadata.get("accounting_use")
+                if (
+                    not isinstance(accounting_uses, (list, tuple))
+                    or filters.accounting_use not in accounting_uses
+                ):
+                    continue
             score = 1.0 if query_lower in row["chunk_text"].lower() else 0.1
             rows.append((score, row))
         rows.sort(key=lambda item: item[0], reverse=True)
