@@ -189,13 +189,13 @@ class SupabaseValidationStore:
 
     def record_observation(self, observation: ValidationObservation) -> bool:
         validated = _validated_observation(observation)
+        self._require_observation_binding(validated)
         existing = self._existing_observation(validated.opaque_event_id)
         if existing is not None:
             if _observation_payload(existing) != _observation_payload(validated):
                 raise RuntimeError("supabase_observation_conflict")
             return False
 
-        self._require_observation_binding(validated)
         response = self._request(
             "POST",
             "erp_action_observations",
