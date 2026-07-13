@@ -109,6 +109,49 @@ async def test_flowaccount_sandbox_auth_and_probe_reuses_one_token() -> None:
 
 
 @pytest.mark.asyncio
+async def test_flowaccount_sandbox_requests_use_the_validated_origin_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class MutatingCredentials(dict[str, str]):
+        def __getitem__(self, key: str) -> str:
+            monkeypatch.setitem(
+                FlowAccountDriver.BASE_URLS,
+                "sandbox",
+                "https://openapi.flowaccount.com/v1",
+            )
+            monkeypatch.setitem(
+                FlowAccountDriver.TOKEN_URLS,
+                "sandbox",
+                "https://openapi.flowaccount.com/v1/token",
+            )
+            return super().__getitem__(key)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if request.url.path == "/test/token":
+            return httpx.Response(200, json={"access_token": "sandbox-token"})
+        return httpx.Response(200, json={"companyName": "Sandbox Books"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        _, probe = await FlowAccountDriver().prepare_sandbox_auth_and_probe(
+            environment="sandbox",
+            credentials=MutatingCredentials(
+                client_id="client-id",
+                client_secret="client-secret",
+            ),
+            client=client,
+        )
+
+    assert probe.status == "connected"
+    assert calls == [
+        "https://openapi.flowaccount.com/test/token",
+        "https://openapi.flowaccount.com/test/company/info",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_flowaccount_sandbox_auth_and_probe_rejects_wrong_environment_before_network() -> (
     None
 ):

@@ -27,6 +27,7 @@ from mercury_tools.qualification.manifest import (
     LIVE_READS,
     load_sandbox_execution_manifest,
 )
+from mercury_tools.qualification.network import SandboxTenantBinding
 from mercury_tools.qualification.semantics import load_actions
 from mercury_tools.safety.network import NetworkPolicy
 
@@ -96,6 +97,15 @@ class SandboxCredentialStoreSpy:
         assert tuple(field.name for field in fields) == ("client_id", "client_secret")
         self.loaded = {"client_id": "client-id", "client_secret": "client-secret"}
         return self.loaded
+
+
+def sandbox_tenant_binding(company_label: str = "Example Books") -> SandboxTenantBinding:
+    sanitized = " ".join(company_label.split()).casefold()
+    return SandboxTenantBinding(
+        connector_id="flowaccount",
+        environment="sandbox",
+        company_label_sha256=hashlib.sha256(sanitized.encode("utf-8")).hexdigest(),
+    )
 
 
 class FakeDriver:
@@ -194,6 +204,11 @@ class TokenDriver(FakeDriver):
 class PeerStream:
     def get_extra_info(self, name: str) -> tuple[str, int] | None:
         return ("93.184.216.34", 443) if name == "server_addr" else None
+
+
+class MismatchedPeerStream:
+    def get_extra_info(self, name: str) -> tuple[str, int] | None:
+        return ("93.184.216.35", 443) if name == "server_addr" else None
 
 
 def response(
@@ -1406,6 +1421,7 @@ async def test_flowaccount_sandbox_read_qualifies_and_authorizes_before_dispatch
         action=action,
         inputs={},
         manifest=manifest,
+        expected_tenant=sandbox_tenant_binding(),
         transport=httpx.MockTransport(handler),
     )
 
@@ -1414,6 +1430,94 @@ async def test_flowaccount_sandbox_read_qualifies_and_authorizes_before_dispatch
     assert calls == ["/test/token", "/test/company/info", "/test/company/info"]
     assert credentials.load_calls == 1
     assert credentials.loaded == {}
+
+
+@pytest.mark.asyncio
+async def test_flowaccount_sandbox_peer_failure_after_transport_is_marked_dispatched(
+    repository_context: RepositoryContext,
+) -> None:
+    actions = load_actions(FLOWACCOUNT_ACTIONS)
+    action = next(
+        item
+        for item in actions
+        if (item.action_id, item.version_id) in LIVE_READS
+        and item.path_template == "/company/info"
+    )
+    manifest = load_sandbox_execution_manifest(FLOWACCOUNT_MANIFEST, FLOWACCOUNT_ACTIONS)
+    credentials = SandboxCredentialStoreSpy()
+    executor = flowaccount_sandbox_executor(repository_context, action, credentials)
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if request.url.path == "/test/token":
+            return response(request, payload={"access_token": "sandbox-token"})
+        if len(calls) == 2:
+            return response(request, payload={"companyName": "Example Books"})
+        return httpx.Response(
+            200,
+            request=request,
+            json={"raw": "must-not-be-returned"},
+            extensions={"network_stream": MismatchedPeerStream()},
+        )
+
+    result = await executor.run_flowaccount_sandbox_read(
+        repository=repository_context,
+        action=action,
+        inputs={},
+        manifest=manifest,
+        expected_tenant=sandbox_tenant_binding(),
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert calls == [
+        "https://openapi.flowaccount.com/test/token",
+        "https://openapi.flowaccount.com/test/company/info",
+        "https://openapi.flowaccount.com/test/company/info",
+    ]
+    assert result.status == "failed"
+    assert result.dispatched is True
+    assert result.data is None
+
+
+@pytest.mark.asyncio
+async def test_flowaccount_sandbox_request_build_failure_remains_not_dispatched(
+    repository_context: RepositoryContext,
+) -> None:
+    actions = load_actions(FLOWACCOUNT_ACTIONS)
+    action = next(
+        item
+        for item in actions
+        if (item.action_id, item.version_id) in LIVE_READS
+        and item.path_template == "/company/info"
+    )
+    manifest = load_sandbox_execution_manifest(FLOWACCOUNT_MANIFEST, FLOWACCOUNT_ACTIONS)
+    credentials = SandboxCredentialStoreSpy()
+    executor = flowaccount_sandbox_executor(repository_context, action, credentials)
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if request.url.path == "/test/token":
+            return response(request, payload={"access_token": "sandbox-token"})
+        return response(request, payload={"companyName": "Example Books"})
+
+    result = await executor.run_flowaccount_sandbox_read(
+        repository=repository_context,
+        action=action,
+        inputs={"query": {"unexpected": "value"}},
+        manifest=manifest,
+        expected_tenant=sandbox_tenant_binding(),
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert calls == [
+        "https://openapi.flowaccount.com/test/token",
+        "https://openapi.flowaccount.com/test/company/info",
+    ]
+    assert result.status == "failed"
+    assert result.dispatched is False
+    assert result.data is None
 
 
 @pytest.mark.asyncio
@@ -1439,6 +1543,48 @@ async def test_flowaccount_tampered_sandbox_origin_rejects_repository_credential
             action=action,
             inputs={},
             manifest=manifest,
+            expected_tenant=sandbox_tenant_binding(),
+            transport=httpx.MockTransport(
+                lambda request: calls.append(str(request.url)) or response(request)
+            ),
+        )
+
+    assert credentials.load_calls == 0
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_flowaccount_sandbox_executor_requires_expected_tenant_before_credentials(
+    repository_context: RepositoryContext,
+) -> None:
+    actions = load_actions(FLOWACCOUNT_ACTIONS)
+    action = next(item for item in actions if (item.action_id, item.version_id) in LIVE_READS)
+    manifest = load_sandbox_execution_manifest(FLOWACCOUNT_MANIFEST, FLOWACCOUNT_ACTIONS)
+    credentials = SandboxCredentialStoreSpy()
+    executor = flowaccount_sandbox_executor(repository_context, action, credentials)
+    calls: list[str] = []
+
+    with pytest.raises(TypeError):
+        await executor.run_flowaccount_sandbox_read(
+            repository=repository_context,
+            action=action,
+            inputs={},
+            manifest=manifest,
+            transport=httpx.MockTransport(
+                lambda request: calls.append(str(request.url)) or response(request)
+            ),
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="^flowaccount_sandbox_expected_tenant_invalid$",
+    ):
+        await executor.run_flowaccount_sandbox_read(
+            repository=repository_context,
+            action=action,
+            inputs={},
+            manifest=manifest,
+            expected_tenant=None,  # type: ignore[arg-type]
             transport=httpx.MockTransport(
                 lambda request: calls.append(str(request.url)) or response(request)
             ),

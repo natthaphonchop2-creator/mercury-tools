@@ -101,12 +101,14 @@ def validate_sandbox_url(value: str, *, expected: str) -> str:
 def validate_flowaccount_sandbox_origins(driver: FlowAccountDriver) -> SandboxOrigins:
     """Bind a FlowAccount driver to the exact sandbox API and token paths."""
     try:
-        api_url = driver.BASE_URLS["sandbox"]
+        configured_api_url = driver.BASE_URLS["sandbox"]
         token_url = driver.TOKEN_URLS["sandbox"]
-    except (AttributeError, KeyError, TypeError):
+        resolved_api_url = driver.resolve_base_url("sandbox")
+    except (AttributeError, KeyError, TypeError, ValueError):
         raise ValueError("flowaccount_sandbox_origin_invalid") from None
+    validate_sandbox_url(configured_api_url, expected=SANDBOX_API_URL)
     return SandboxOrigins(
-        api_url=validate_sandbox_url(api_url, expected=SANDBOX_API_URL),
+        api_url=validate_sandbox_url(resolved_api_url, expected=SANDBOX_API_URL),
         token_url=validate_sandbox_url(token_url, expected=SANDBOX_TOKEN_URL),
     )
 
@@ -207,11 +209,13 @@ async def execute_flowaccount_sandbox_action(
     action: CatalogAction,
     manifest: SandboxExecutionManifest,
     request_hook: SandboxRequestHook[T],
-    expected_tenant: SandboxTenantBinding | None = None,
+    expected_tenant: SandboxTenantBinding,
     transport: httpx.AsyncBaseTransport | None = None,
     network: NetworkPolicy | None = None,
 ) -> T:
     """Qualify one sandbox tenant, authorize one exact action, then invoke its request hook."""
+    if not isinstance(expected_tenant, SandboxTenantBinding):
+        raise ValueError("flowaccount_sandbox_expected_tenant_invalid")
     if environment != "sandbox":
         raise ValueError("flowaccount_sandbox_environment_invalid")
     origins = validate_flowaccount_sandbox_origins(driver)
@@ -227,6 +231,7 @@ async def execute_flowaccount_sandbox_action(
                 environment=environment,
                 credentials=credentials,
                 client=client,
+                origins=origins,
             )
             binding = require_verified_sandbox_tenant(probe, expected=expected_tenant)
             if not isinstance(manifest, SandboxExecutionManifest):

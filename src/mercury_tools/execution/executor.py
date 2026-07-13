@@ -153,10 +153,12 @@ class ERPExecutor:
         action: CatalogAction,
         inputs: Mapping[str, Any],
         manifest: SandboxExecutionManifest,
-        expected_tenant: SandboxTenantBinding | None = None,
+        expected_tenant: SandboxTenantBinding,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> ConnectorResult:
         """Qualify one exact FlowAccount sandbox tenant before one reviewed read."""
+        if not isinstance(expected_tenant, SandboxTenantBinding):
+            raise ValueError("flowaccount_sandbox_expected_tenant_invalid")
         if action.connector_id != "flowaccount":
             raise ExecutionPolicyError("flowaccount_sandbox_connector_invalid")
         driver = self.drivers.get(action.connector_id)
@@ -193,8 +195,8 @@ class ERPExecutor:
                     environment="sandbox",
                 )
                 request = template.to_httpx_request(auth)
-                response = await client.send(request)
                 dispatched = True
+                response = await client.send(request)
                 result = driver.interpret_response(
                     action=active,
                     response=response,

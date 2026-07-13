@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import socket
 from collections.abc import Awaitable, Callable
 from dataclasses import fields
@@ -74,6 +75,15 @@ def sandbox_manifest() -> SandboxExecutionManifest:
     return load_sandbox_execution_manifest(FLOWACCOUNT_MANIFEST, FLOWACCOUNT_ACTIONS)
 
 
+def tenant_binding(company_label: str = "Example Books") -> SandboxTenantBinding:
+    sanitized = " ".join(company_label.split()).casefold()
+    return SandboxTenantBinding(
+        connector_id="flowaccount",
+        environment="sandbox",
+        company_label_sha256=hashlib.sha256(sanitized.encode("utf-8")).hexdigest(),
+    )
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
@@ -133,10 +143,40 @@ async def test_production_origin_is_rejected_before_credentials_or_network(
             action=action_factory(),
             manifest=object(),
             request_hook=request_hook,
+            expected_tenant=tenant_binding(),
             transport=transport,
         )
 
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_captured_production_base_url_is_rejected_after_class_map_restoration(
+    monkeypatch: pytest.MonkeyPatch,
+    action_factory: Callable[..., Any],
+) -> None:
+    production_url = "https://openapi.flowaccount.com/v1"
+    monkeypatch.setitem(FlowAccountDriver.BASE_URLS, "sandbox", production_url)
+    driver = FlowAccountDriver()
+    monkeypatch.setitem(FlowAccountDriver.BASE_URLS, "sandbox", SANDBOX_API_URL)
+    calls: list[str] = []
+
+    with pytest.raises(ValueError, match="^flowaccount_sandbox_origin_invalid$") as raised:
+        await execute_flowaccount_sandbox_action(
+            driver=driver,
+            environment="sandbox",
+            load_credentials=lambda: calls.append("credentials") or {},
+            action=action_factory(),
+            manifest=object(),
+            request_hook=_unused_hook(),
+            expected_tenant=tenant_binding(),
+            transport=httpx.MockTransport(
+                lambda request: calls.append("network") or httpx.Response(500)
+            ),
+        )
+
+    assert calls == []
+    assert production_url not in str(raised.value)
 
 
 def test_verified_tenant_binding_contains_only_sanitized_identity_hash() -> None:
@@ -197,6 +237,66 @@ def test_tenant_binding_rejects_invalid_hash_without_echoing_it() -> None:
 
 
 @pytest.mark.asyncio
+async def test_omitted_expected_tenant_cannot_read_credentials_or_dispatch(
+    flowaccount_actions,
+    sandbox_manifest: SandboxExecutionManifest,
+) -> None:
+    action = next(
+        item for item in flowaccount_actions if (item.action_id, item.version_id) in LIVE_READS
+    )
+    calls: list[str] = []
+    sensitive_label = "Omitted Tenant"
+    sensitive_hash = tenant_binding(sensitive_label).company_label_sha256
+
+    with pytest.raises(TypeError) as raised:
+        await execute_flowaccount_sandbox_action(
+            driver=FlowAccountDriver(),
+            environment="sandbox",
+            load_credentials=lambda: calls.append("credentials") or {},
+            action=action,
+            manifest=sandbox_manifest,
+            request_hook=_unused_hook(),
+            transport=httpx.MockTransport(
+                lambda request: calls.append("network") or httpx.Response(500)
+            ),
+        )
+
+    assert calls == []
+    assert sensitive_label not in str(raised.value)
+    assert sensitive_hash not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_invalid_expected_tenant_fails_with_constant_error_before_credentials(
+    flowaccount_actions,
+    sandbox_manifest: SandboxExecutionManifest,
+) -> None:
+    action = next(
+        item for item in flowaccount_actions if (item.action_id, item.version_id) in LIVE_READS
+    )
+    calls: list[str] = []
+
+    with pytest.raises(
+        ValueError,
+        match="^flowaccount_sandbox_expected_tenant_invalid$",
+    ):
+        await execute_flowaccount_sandbox_action(
+            driver=FlowAccountDriver(),
+            environment="sandbox",
+            load_credentials=lambda: calls.append("credentials") or {},
+            action=action,
+            manifest=sandbox_manifest,
+            request_hook=_unused_hook(),
+            expected_tenant=None,  # type: ignore[arg-type]
+            transport=httpx.MockTransport(
+                lambda request: calls.append("network") or httpx.Response(500)
+            ),
+        )
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
 async def test_orchestration_orders_probe_binding_manifest_and_request_hook(
     monkeypatch: pytest.MonkeyPatch,
     flowaccount_actions,
@@ -250,6 +350,7 @@ async def test_orchestration_orders_probe_binding_manifest_and_request_hook(
         action=action,
         manifest=sandbox_manifest,
         request_hook=request_hook,
+        expected_tenant=tenant_binding(),
         transport=httpx.MockTransport(handler),
     )
 
@@ -277,7 +378,11 @@ async def test_tenant_mismatch_fails_before_action_request(
         )
         return provider_response(request, 200, payload)
 
-    with pytest.raises(ValueError, match="^flowaccount_sandbox_tenant_mismatch$"):
+    expected = tenant_binding("Approved Tenant")
+    with pytest.raises(
+        ValueError,
+        match="^flowaccount_sandbox_tenant_mismatch$",
+    ) as raised:
         await execute_flowaccount_sandbox_action(
             driver=FlowAccountDriver(),
             environment="sandbox",
@@ -288,11 +393,13 @@ async def test_tenant_mismatch_fails_before_action_request(
             action=action,
             manifest=sandbox_manifest,
             request_hook=_unused_hook(),
-            expected_tenant=SandboxTenantBinding("flowaccount", "sandbox", "0" * 64),
+            expected_tenant=expected,
             transport=httpx.MockTransport(handler),
         )
 
     assert calls == ["/test/token", "/test/company/info"]
+    assert "Unexpected Tenant" not in str(raised.value)
+    assert expected.company_label_sha256 not in str(raised.value)
 
 
 @pytest.mark.asyncio
@@ -327,6 +434,7 @@ async def test_redirected_probe_is_not_followed_and_fails_before_action(
             action=action,
             manifest=sandbox_manifest,
             request_hook=_unused_hook(),
+            expected_tenant=tenant_binding(),
             transport=httpx.MockTransport(handler),
         )
 
@@ -363,6 +471,7 @@ async def test_manifest_denial_fails_before_action_request(
             action=action,
             manifest=sandbox_manifest,
             request_hook=_unused_hook(),
+            expected_tenant=tenant_binding(),
             transport=httpx.MockTransport(handler),
         )
 
@@ -383,6 +492,7 @@ async def test_wrong_environment_fails_before_credentials_and_network(
             action=action_factory(),
             manifest=object(),
             request_hook=_unused_hook(),
+            expected_tenant=tenant_binding(),
             transport=httpx.MockTransport(
                 lambda request: calls.append("network") or httpx.Response(500)
             ),
@@ -416,6 +526,7 @@ async def test_credential_loader_error_is_sanitized_before_network(
             action=action,
             manifest=sandbox_manifest,
             request_hook=_unused_hook(),
+            expected_tenant=tenant_binding(),
             transport=httpx.MockTransport(
                 lambda request: calls.append(str(request.url)) or httpx.Response(500)
             ),
@@ -460,6 +571,7 @@ async def test_request_hook_error_does_not_expose_provider_or_request_values(
             action=action,
             manifest=sandbox_manifest,
             request_hook=failing_hook,
+            expected_tenant=tenant_binding(),
             transport=httpx.MockTransport(handler),
         )
 
