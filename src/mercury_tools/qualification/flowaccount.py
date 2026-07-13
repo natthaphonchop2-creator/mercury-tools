@@ -7,7 +7,6 @@ import secrets
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,6 +16,7 @@ import httpx
 from pydantic import Field, model_validator
 
 from mercury_tools.catalog.models import CatalogAction, HttpMethod, revalidate_catalog_action
+from mercury_tools.drivers.base import ConnectorAuthError
 from mercury_tools.drivers.flowaccount import FlowAccountDriver
 from mercury_tools.drivers.models import AuthContext, ConnectionProbe, ConnectorResult
 from mercury_tools.execution.request_builder import RequestBuildError, build_request
@@ -58,12 +58,15 @@ from mercury_tools.qualification.network import (
     SandboxTenantBinding,
     require_verified_sandbox_tenant,
     sandbox_http_client,
-    sandbox_request_transport_eligible,
     validate_flowaccount_sandbox_origins,
 )
 from mercury_tools.qualification.planner import FixturePlan, plan_fixture_dependencies
 from mercury_tools.qualification.response_shape import extract_response_shape
-from mercury_tools.qualification.run_store import QualificationRunStore
+from mercury_tools.qualification.run_store import (
+    CleanupStatus,
+    FixtureReference,
+    QualificationRunStore,
+)
 from mercury_tools.qualification.semantics import (
     load_actions,
     load_semantic_contracts,
@@ -130,6 +133,41 @@ class _EphemeralRunStore:
 
     def quarantine(self, _reason: str) -> None:
         self._state = QualificationRunState.QUARANTINED
+
+
+class _DeferredCompletionRunStore(QualificationRunStore):
+    """Expose cleanup state while deferring its publication transition."""
+
+    def __init__(self, delegate: QualificationRunStore) -> None:
+        self._delegate = delegate
+        self.completion_requested = False
+
+    @property
+    def run_id(self) -> str:
+        return self._delegate.run_id
+
+    @property
+    def state(self) -> QualificationRunState:
+        return self._delegate.state
+
+    @property
+    def publication_allowed(self) -> bool:
+        return self._delegate.publication_allowed
+
+    def record_fixtures(self, fixtures: Sequence[FixtureReference]) -> None:
+        self._delegate.record_fixtures(fixtures)
+
+    def cleanup_status(self, handle: str) -> CleanupStatus:
+        return self._delegate.cleanup_status(handle)
+
+    def mark_cleanup(self, handle: str, status: CleanupStatus) -> None:
+        self._delegate.mark_cleanup(handle, status)
+
+    def quarantine_cleanup(self, handle: str, status: CleanupStatus) -> None:
+        self._delegate.quarantine_cleanup(handle, status)
+
+    def complete(self) -> None:
+        self.completion_requested = True
 
 
 class _EarlyFailureQualificationRunner:
@@ -407,10 +445,9 @@ class FlowAccountQualificationRunner:
             )
 
         if is_dry_run and preflight_failure is None:
-            self.run_store.complete()
-            final_state = self.run_store.state
+            final_state = QualificationRunState.COMPLETED
         elif not is_dry_run and preflight_failure is None:
-            final_state = await self._cleanup_and_complete()
+            final_state = await self._cleanup_before_terminal_report()
         else:
             final_state = self.run_store.state
 
@@ -424,7 +461,7 @@ class FlowAccountQualificationRunner:
                     evaluated_at=evaluated_at,
                     executable_status=ValidationStatus.BLOCKED_MISSING_PREREQUISITE,
                 )
-        return build_coverage_report(
+        report = build_coverage_report(
             contracts.actions if contracts is not None else None,
             tuple(records.values()),
             final_state,
@@ -432,6 +469,10 @@ class FlowAccountQualificationRunner:
             http_attempts=self._transport.request_count,
             mutation_attempts=self._transport.mutation_attempts,
         )
+        report.public_dict()
+        if final_state is QualificationRunState.COMPLETED:
+            self._persist_completion()
+        return report
 
     def _select_run_store(self, *, is_dry_run: bool) -> None:
         if self._run_store is not None:
@@ -463,7 +504,7 @@ class FlowAccountQualificationRunner:
         try:
             driver = self._driver()
             origins = validate_flowaccount_sandbox_origins(driver)
-        except Exception:
+        except ValueError:
             return None, "origin_invalid", records
 
         snapshot = None
@@ -483,6 +524,7 @@ class FlowAccountQualificationRunner:
                 transport=self._transport,
                 network=getattr(self.runtime.executor, "network", None),
             ) as client:
+                auth_attempts_before = self._transport.request_count
                 try:
                     auth, probe = await driver.prepare_sandbox_auth_and_probe(
                         environment="sandbox",
@@ -490,9 +532,17 @@ class FlowAccountQualificationRunner:
                         client=client,
                         origins=origins,
                     )
+                except ConnectorAuthError:
+                    return None, "tenant_or_auth_failed", records
+                except ValueError:
+                    if self._transport.request_count > auth_attempts_before:
+                        raise
+                    return None, "tenant_or_auth_failed", records
+
+                try:
                     expected = self._expected_tenant(driver)
                     require_verified_sandbox_tenant(probe, expected=expected)
-                except Exception:
+                except ValueError:
                     return None, "tenant_or_auth_failed", records
 
                 try:
@@ -639,7 +689,6 @@ class FlowAccountQualificationRunner:
     ) -> ConnectorResult:
         result = ConnectorResult("failed", 0, None, "request_failed", False)
         for _attempt in range(self.limits.max_read_attempts):
-            request: httpx.Request | None = None
             try:
                 active = revalidate_catalog_action(
                     self.runtime.catalog.require_version(action.action_id, action.version_id)
@@ -654,12 +703,12 @@ class FlowAccountQualificationRunner:
                     environment="sandbox",
                 )
                 request = template.to_httpx_request(auth)
+            except (RequestBuildError, NetworkPolicyError, TypeError, ValueError):
+                continue
+
+            attempts_before = self._transport.request_count
+            try:
                 response = await client.send(request)
-                return self._driver().interpret_response(
-                    action=active,
-                    response=response,
-                    dispatched=True,
-                )
             except _QualificationBudgetExceeded:
                 return ConnectorResult(
                     status="failed",
@@ -668,14 +717,8 @@ class FlowAccountQualificationRunner:
                     summary="request_failed",
                     dispatched=False,
                 )
-            except (
-                RequestBuildError,
-                NetworkPolicyError,
-                httpx.HTTPError,
-                TypeError,
-                ValueError,
-            ):
-                dispatched = request is not None and sandbox_request_transport_eligible(request)
+            except (NetworkPolicyError, httpx.HTTPError):
+                dispatched = self._transport.request_count > attempts_before
                 result = ConnectorResult(
                     status="failed",
                     http_status=0,
@@ -685,6 +728,13 @@ class FlowAccountQualificationRunner:
                 )
                 if dispatched:
                     return result
+                continue
+
+            return self._driver().interpret_response(
+                action=active,
+                response=response,
+                dispatched=True,
+            )
         return result
 
     def _load_contracts(self) -> _Contracts:
@@ -789,9 +839,18 @@ class FlowAccountQualificationRunner:
             if dispatched
             else QualificationRunState.FAILED
         )
+        if dispatched:
+            self.fixture_registry.halt_cleanup()
         if dispatched and self._run_store is not None:
-            with suppress(Exception):
+            try:
                 self.run_store.quarantine("outcome_unknown")
+                if (
+                    self.run_store.state is not QualificationRunState.QUARANTINED
+                    or self.run_store.publication_allowed
+                ):
+                    raise ValueError("qualification_terminal_transition_incomplete")
+            except Exception:
+                raise RuntimeError("qualification_terminal_transition_failed") from None
 
         records = self._runner_failure_records(
             evaluated_at=evaluated_at,
@@ -920,7 +979,11 @@ class FlowAccountQualificationRunner:
             latency_ms=latency_ms,
         )
 
-    async def _cleanup_and_complete(self) -> QualificationRunState:
+    async def _cleanup_before_terminal_report(self) -> QualificationRunState:
+        store = self.run_store
+        if not isinstance(store, QualificationRunStore):
+            raise ValueError("qualification_run_store_invalid")
+        deferred_store = _DeferredCompletionRunStore(store)
         try:
             coordinator = CleanupCoordinator(
                 self.fixture_registry,
@@ -929,13 +992,31 @@ class FlowAccountQualificationRunner:
                     self._transport,
                     self.runtime.catalog,
                 ),
-                self.run_store,
+                deferred_store,
             )
             await coordinator.cleanup()
         except Exception:
-            if self.run_store.state is not QualificationRunState.QUARANTINED:
-                self.run_store.quarantine("cleanup_failed")
-        return self.run_store.state
+            if store.state is not QualificationRunState.QUARANTINED:
+                store.quarantine("cleanup_failed")
+        if store.state is QualificationRunState.QUARANTINED:
+            return store.state
+        return (
+            QualificationRunState.COMPLETED
+            if deferred_store.completion_requested
+            else store.state
+        )
+
+    def _persist_completion(self) -> None:
+        try:
+            self.run_store.complete()
+            if (
+                self.run_store.state is not QualificationRunState.COMPLETED
+                or not self.run_store.publication_allowed
+            ):
+                raise ValueError("qualification_terminal_transition_incomplete")
+        except Exception:
+            self.fixture_registry.halt_cleanup()
+            raise RuntimeError("qualification_terminal_transition_failed") from None
 
     def _expected_tenant(self, driver: FlowAccountDriver) -> SandboxTenantBinding:
         config = normalize_repository_config(self.runtime.repository_config)

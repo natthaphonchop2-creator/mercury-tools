@@ -758,6 +758,187 @@ async def test_post_dispatch_failure_preserves_attempts_and_quarantines_safely(
         assert "Example Books" not in persisted
 
 
+@pytest.mark.parametrize(
+    ("failure_phase", "expected_attempts"),
+    [
+        ("token", 1),
+        ("probe", 2),
+        ("action", 3),
+    ],
+)
+@pytest.mark.asyncio
+async def test_unexpected_response_parser_failure_after_dispatch_reaches_quarantine(
+    failure_phase: str,
+    expected_attempts: int,
+    repository_context: RepositoryContext,
+    flowaccount_actions,
+    sandbox_manifest: SandboxExecutionManifest,
+    flowaccount_semantics,
+) -> None:
+    calls: list[tuple[str, str]] = []
+    failure_detail = (
+        "parser-sensitive https://parser.invalid "
+        "/Users/private/provider-response.json Secret Parser Company"
+    )
+
+    class ParserFailureResponse(httpx.Response):
+        def json(self, **_kwargs: Any) -> Any:
+            raise TypeError(failure_detail)
+
+    def parser_failure_response(request: httpx.Request) -> httpx.Response:
+        return ParserFailureResponse(
+            200,
+            request=request,
+            json={"rawPayloadMarker": "raw-parser-payload-445566"},
+            extensions={"network_stream": PeerStream()},
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/test/token":
+            if failure_phase == "token":
+                return parser_failure_response(request)
+            return provider_response(request, 200, {"access_token": "issued-sandbox-token"})
+        if len(calls) == 2:
+            if failure_phase == "probe":
+                return parser_failure_response(request)
+            return provider_response(request, 200, {"companyName": "Example Books"})
+        if failure_phase == "action" and len(calls) == 3:
+            return parser_failure_response(request)
+        return provider_response(request, 200, {"status": True, "data": []})
+
+    credentials = CredentialSnapshotSpy()
+    runtime = runtime_for(
+        repository_context,
+        flowaccount_actions,
+        credentials=credentials,
+        repository_config=validation_config(),
+    )
+    runner = make_runner(
+        runtime,
+        sandbox_manifest,
+        flowaccount_actions,
+        flowaccount_semantics,
+        transport=httpx.MockTransport(handler),
+    )
+
+    report = await runner.qualify_all(
+        approval=SandboxRunApproval(reads=True, writes=False)
+    )
+
+    expected_identities = {
+        (action.action_id, action.version_id) for action in flowaccount_actions
+    }
+    actual_identities = {
+        (record.action_id, record.version_id) for record in report.records
+    }
+    assert report.run_state is QualificationRunState.QUARANTINED
+    assert runner.run_store.state is QualificationRunState.QUARANTINED
+    assert runner.run_store.publication_allowed is False
+    assert report.http_attempts == runner.request_count == expected_attempts
+    assert report.mutation_attempts == 0
+    assert len(calls) == expected_attempts
+    assert len(report.records) == 190
+    assert actual_identities == expected_identities
+    assert credentials.loaded == {}
+    if failure_phase == "action":
+        assert ValidationStatus.OUTCOME_UNKNOWN in {
+            record.validation_status for record in report.records
+        }
+
+    public_json = json.dumps(report.public_dict(), ensure_ascii=False, sort_keys=True)
+    state_json = runner.run_store.state_path.read_text(encoding="utf-8")
+    audit_path = repository_context.audit_dir / "audit.jsonl"
+    audit_json = audit_path.read_text(encoding="utf-8") if audit_path.exists() else ""
+    for persisted in (public_json, state_json, audit_json):
+        assert "parser-sensitive" not in persisted
+        assert "parser.invalid" not in persisted
+        assert "/Users/private" not in persisted
+        assert "Secret Parser Company" not in persisted
+        assert "raw-parser-payload-445566" not in persisted
+        assert "issued-sandbox-token" not in persisted
+        assert "Example Books" not in persisted
+
+
+@pytest.mark.asyncio
+async def test_report_and_quarantine_transition_failure_never_enable_publication(
+    repository_context: RepositoryContext,
+    flowaccount_actions,
+    sandbox_manifest: SandboxExecutionManifest,
+    flowaccount_semantics,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+    runtime = runtime_for(
+        repository_context,
+        flowaccount_actions,
+        credentials=CredentialSnapshotSpy(),
+        repository_config=validation_config(),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/test/token":
+            return provider_response(request, 200, {"access_token": "issued-sandbox-token"})
+        if len(calls) == 2:
+            return provider_response(request, 200, {"companyName": "Example Books"})
+        return provider_response(request, 200, {"status": True, "data": []})
+
+    runner = make_runner(
+        runtime,
+        sandbox_manifest,
+        flowaccount_actions,
+        flowaccount_semantics,
+        transport=httpx.MockTransport(handler),
+    )
+    publication_during_report: list[bool] = []
+
+    def fail_report(*_args: object, **_kwargs: object) -> Any:
+        publication_during_report.append(runner.run_store.publication_allowed)
+        raise RuntimeError(
+            "report-sensitive https://report.invalid /Users/private/report.json"
+        )
+
+    def fail_quarantine(*_args: object, **_kwargs: object) -> Any:
+        raise OSError(
+            "transition-sensitive https://state.invalid /Users/private/state.json"
+        )
+
+    monkeypatch.setattr(
+        "mercury_tools.qualification.flowaccount.build_coverage_report",
+        fail_report,
+    )
+    monkeypatch.setattr(
+        "mercury_tools.qualification.run_store.QualificationRunStore.quarantine",
+        fail_quarantine,
+    )
+
+    with pytest.raises(RuntimeError, match="^qualification_terminal_transition_failed$"):
+        await runner.qualify_all(
+            approval=SandboxRunApproval(reads=True, writes=False)
+        )
+
+    assert publication_during_report == [False]
+    assert runner.request_count == 2 + len(LIVE_READS)
+    assert runner.run_store.state is QualificationRunState.FAILED
+    assert runner.run_store.publication_allowed is False
+    assert runner.fixture_registry.cleanup_halted is True
+    state_json = runner.run_store.state_path.read_text(encoding="utf-8")
+    state_payload = json.loads(state_json)
+    assert state_payload["state"] == QualificationRunState.FAILED.value
+    assert state_payload["publication_allowed"] is False
+    for forbidden in (
+        "report-sensitive",
+        "report.invalid",
+        "transition-sensitive",
+        "state.invalid",
+        "/Users/private",
+        "issued-sandbox-token",
+        "Example Books",
+    ):
+        assert forbidden not in state_json
+
+
 @pytest.mark.asyncio
 async def test_missing_expected_local_tenant_still_terminalizes_all_actions_without_dispatch(
     repository_context: RepositoryContext,
