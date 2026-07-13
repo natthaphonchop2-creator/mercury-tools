@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -40,6 +42,23 @@ def _chunks(count: int) -> list[KnowledgeChunk]:
         )
         for index in range(count)
     ]
+
+
+def _search_row(score: object) -> dict[str, object]:
+    return {
+        "chunk_id": "chunk-1",
+        "document_id": "document-1",
+        "document_uri": "mercury://wiki/test",
+        "chunk_uri": "mercury://wiki/test#chunk-0",
+        "chunk_text": "body",
+        "score": score,
+        "source_title": "Test",
+        "source_uri": "mercury://wiki/test",
+        "source_url": None,
+        "source_path": None,
+        "citation": {},
+        "metadata": {},
+    }
 
 
 def test_chunk_uploads_are_bounded_and_document_sha_commits_last(monkeypatch) -> None:
@@ -347,6 +366,108 @@ def test_supabase_search_rejects_malformed_success_rows_without_echo(
     assert "provider-private-value" not in str(raised.value)
 
 
+@pytest.mark.parametrize(
+    "score",
+    [
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        10**10000,
+        Decimal("1e10000"),
+    ],
+    ids=("nan", "positive_infinity", "negative_infinity", "huge_int", "decimal"),
+)
+def test_supabase_search_rejects_nonfinite_or_unconvertible_scores_without_echo(
+    monkeypatch,
+    score: object,
+) -> None:
+    store = object.__new__(SupabaseRagStore)
+    unsafe_value = "/Users/operator/private/score-response.json"
+    row = _search_row(score)
+    row["citation"] = {"source_path": unsafe_value}
+    monkeypatch.setattr(store, "_request", lambda *args, **kwargs: [row])
+
+    with pytest.raises(RuntimeError, match="^supabase_rag_response_invalid$") as raised:
+        store.search_knowledge(
+            query="test",
+            query_embedding=None,
+            filters=SearchFilters(),
+            top_k=5,
+            mode="keyword",
+        )
+
+    assert unsafe_value not in str(raised.value)
+
+
+def test_supabase_search_rejects_1e400_from_successful_json_without_body_echo(
+    monkeypatch,
+) -> None:
+    store = object.__new__(SupabaseRagStore)
+    store.base_url = "https://example.test/rest/v1"
+    store.headers = {}
+    unsafe_value = "/Users/operator/private/score-response.json"
+    row = _search_row(0)
+    row["citation"] = {"source_path": unsafe_value}
+    raw_body = json.dumps([row], separators=(",", ":")).replace(
+        '"score":0',
+        '"score":1e400',
+    )
+
+    class SuccessfulResponse:
+        status_code = 200
+        text = raw_body
+
+        def json(self):
+            return json.loads(self.text)
+
+    monkeypatch.setattr(
+        "mercury_tools.db.supabase.httpx.request",
+        lambda *args, **kwargs: SuccessfulResponse(),
+    )
+
+    with pytest.raises(RuntimeError, match="^supabase_rag_response_invalid$") as raised:
+        store.search_knowledge(
+            query="test",
+            query_embedding=None,
+            filters=SearchFilters(),
+            top_k=5,
+            mode="keyword",
+        )
+
+    assert unsafe_value not in str(raised.value)
+    assert raw_body not in str(raised.value)
+
+
+@pytest.mark.parametrize("error_type", [TypeError, ValueError])
+def test_supabase_search_normalizes_numeric_conversion_errors_without_echo(
+    monkeypatch,
+    error_type: type[Exception],
+) -> None:
+    store = object.__new__(SupabaseRagStore)
+    unsafe_value = "/Users/operator/private/score-conversion.json"
+
+    class InvalidNumeric(int):
+        def __float__(self):
+            raise error_type(unsafe_value)
+
+    monkeypatch.setattr(
+        store,
+        "_request",
+        lambda *args, **kwargs: [_search_row(InvalidNumeric(1))],
+    )
+
+    with pytest.raises(RuntimeError, match="^supabase_rag_response_invalid$") as raised:
+        store.search_knowledge(
+            query="test",
+            query_embedding=None,
+            filters=SearchFilters(),
+            top_k=5,
+            mode="keyword",
+        )
+
+    assert unsafe_value not in str(raised.value)
+
+
 def test_rag_filter_migration_replaces_old_signature_without_overload() -> None:
     sql = MIGRATION.read_text(encoding="utf-8")
     old_signature = (
@@ -375,7 +496,16 @@ def test_rag_filter_migration_replaces_old_signature_without_overload() -> None:
     ):
         assert parameter in sql
     assert "c.metadata ->> 'action_id' = filter_action_id" in sql
-    assert "c.metadata -> 'accounting_use' ? filter_accounting_use" in sql
+    assert "case pg_catalog.jsonb_typeof(" in sql
+    assert "when 'string' then" in sql
+    assert "c.metadata ->> 'accounting_use' = filter_accounting_use" in sql
+    assert "when 'array' then" in sql
+    assert sql.count("from pg_catalog.jsonb_array_elements(") == 2
+    assert "is distinct from 'string'" in sql
+    assert "where accounting_use_item.value =" in sql
+    assert "pg_catalog.to_jsonb(filter_accounting_use)" in sql
+    assert "else false" in sql
+    assert "c.metadata -> 'accounting_use' ? filter_accounting_use" not in sql
     assert "set search_path = pg_catalog, public, pg_temp" in sql
     assert "from public, anon, authenticated" in sql
     assert "to service_role" in sql

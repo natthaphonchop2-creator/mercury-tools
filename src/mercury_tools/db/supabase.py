@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from typing import Any
 
 import httpx
@@ -56,8 +57,14 @@ def _search_result_from_row(row: dict[str, Any]) -> SearchResult:
     )
     if any(not isinstance(row.get(field), str) for field in string_fields):
         raise RuntimeError("supabase_rag_response_invalid")
-    score = row.get("score")
-    if isinstance(score, bool) or not isinstance(score, (int, float)):
+    raw_score = row.get("score")
+    if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
+        raise RuntimeError("supabase_rag_response_invalid")
+    try:
+        score = float(raw_score)
+    except (TypeError, ValueError, OverflowError):
+        raise RuntimeError("supabase_rag_response_invalid") from None
+    if not math.isfinite(score):
         raise RuntimeError("supabase_rag_response_invalid")
     if any(
         value is not None and not isinstance(value, str)
@@ -75,7 +82,7 @@ def _search_result_from_row(row: dict[str, Any]) -> SearchResult:
             document_uri=row["document_uri"],
             chunk_uri=row["chunk_uri"],
             text=row["chunk_text"],
-            score=float(score),
+            score=score,
             source_title=row["source_title"],
             source_uri=row["source_uri"],
             source_url=row.get("source_url"),
@@ -83,7 +90,7 @@ def _search_result_from_row(row: dict[str, Any]) -> SearchResult:
             citation=citation,
             metadata=metadata,
         )
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise RuntimeError("supabase_rag_response_invalid") from None
 
 

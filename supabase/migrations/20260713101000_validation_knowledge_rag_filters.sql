@@ -113,7 +113,29 @@ as $function$
       and (filter_capability is null or c.metadata ->> 'capability' = filter_capability)
       and (
         filter_accounting_use is null
-        or c.metadata -> 'accounting_use' ? filter_accounting_use
+        or case pg_catalog.jsonb_typeof(c.metadata -> 'accounting_use')
+          when 'string' then
+            c.metadata ->> 'accounting_use' = filter_accounting_use
+          when 'array' then (
+            not exists (
+              select 1
+              from pg_catalog.jsonb_array_elements(
+                c.metadata -> 'accounting_use'
+              ) as accounting_use_item(value)
+              where pg_catalog.jsonb_typeof(accounting_use_item.value)
+                is distinct from 'string'
+            )
+            and exists (
+              select 1
+              from pg_catalog.jsonb_array_elements(
+                c.metadata -> 'accounting_use'
+              ) as accounting_use_item(value)
+              where accounting_use_item.value =
+                pg_catalog.to_jsonb(filter_accounting_use)
+            )
+          )
+          else false
+        end
       )
   )
   select

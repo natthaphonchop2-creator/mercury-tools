@@ -258,15 +258,24 @@ def test_memory_store_applies_every_exact_validation_filter() -> None:
     [
         ("revenue_review", True),
         (["revenue_review"], True),
+        (["vat_output_review", "revenue_review"], True),
+        (["revenue_review", "revenue_review"], True),
         (("revenue_review",), True),
         ("revenue_review_extra", False),
         (["revenue_review_extra"], False),
+        ([], False),
         ({"revenue_review": True}, False),
         (123, False),
+        (1.5, False),
+        (True, False),
+        (None, False),
         (["revenue_review", 123], False),
+        ([123, "revenue_review"], False),
+        (["revenue_review", None], False),
+        ([["revenue_review"]], False),
     ],
 )
-def test_memory_accounting_use_matches_sql_scalar_and_array_semantics(
+def test_memory_accounting_use_matches_strict_supabase_json_shape_matrix(
     metadata_value: object,
     matches: bool,
 ) -> None:
