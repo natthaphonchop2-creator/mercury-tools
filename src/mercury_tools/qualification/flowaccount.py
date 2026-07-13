@@ -7,6 +7,7 @@ import secrets
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -313,6 +314,7 @@ class FlowAccountQualificationRunner:
             monotonic=self._monotonic,
             sleeper=self._sleeper,
         )
+        self._dispatched_action_identities: set[tuple[str, str]] = set()
         self._used = False
 
     @property
@@ -346,7 +348,29 @@ class FlowAccountQualificationRunner:
             self._select_run_store(is_dry_run=is_dry_run)
             evaluated_at = self._timestamp()
         except Exception:
-            return build_flowaccount_preflight_failure_report(run_id=self.run_id)
+            return self._terminalize_runner_failure(
+                evaluated_at=_EARLY_FAILURE_EVALUATED_AT,
+                use_validated_contracts=False,
+            )
+        try:
+            return await self._qualify_selected_run(
+                approval=checked_approval,
+                is_dry_run=is_dry_run,
+                evaluated_at=evaluated_at,
+            )
+        except Exception:
+            return self._terminalize_runner_failure(
+                evaluated_at=evaluated_at,
+                use_validated_contracts=True,
+            )
+
+    async def _qualify_selected_run(
+        self,
+        *,
+        approval: SandboxRunApproval,
+        is_dry_run: bool,
+        evaluated_at: datetime,
+    ) -> QualificationCoverageReport:
         records: dict[tuple[str, str], ValidationKnowledge] = {}
         contracts: _Contracts | None = None
         preflight_failure: str | None = None
@@ -358,7 +382,7 @@ class FlowAccountQualificationRunner:
                 preflight_failure = "contract_invalid"
         else:
             contracts, preflight_failure, records = await self._qualify_live(
-                checked_approval,
+                approval,
                 evaluated_at,
             )
 
@@ -528,13 +552,18 @@ class FlowAccountQualificationRunner:
                 continue
 
             started = self._monotonic()
-            result = await self._dispatch_safe_read(
-                action,
-                policy,
-                client=client,
-                auth=auth,
-                origins=origins,
-            )
+            attempts_before = self._transport.request_count
+            try:
+                result = await self._dispatch_safe_read(
+                    action,
+                    policy,
+                    client=client,
+                    auth=auth,
+                    origins=origins,
+                )
+            finally:
+                if self._transport.request_count > attempts_before:
+                    self._dispatched_action_identities.add(identity)
             latency_ms = _latency_ms(started, self._monotonic())
             if self._transport.budget_exhausted:
                 records[identity] = self._record(
@@ -747,6 +776,97 @@ class FlowAccountQualificationRunner:
                     contracts.semantics[identity],
                     evaluated_at,
                 )
+
+    def _terminalize_runner_failure(
+        self,
+        *,
+        evaluated_at: datetime,
+        use_validated_contracts: bool,
+    ) -> QualificationCoverageReport:
+        dispatched = self._transport.request_count > 0 or self._transport.mutation_attempts > 0
+        run_state = (
+            QualificationRunState.QUARANTINED
+            if dispatched
+            else QualificationRunState.FAILED
+        )
+        if dispatched and self._run_store is not None:
+            with suppress(Exception):
+                self.run_store.quarantine("outcome_unknown")
+
+        records = self._runner_failure_records(
+            evaluated_at=evaluated_at,
+            run_state=run_state,
+            use_validated_contracts=use_validated_contracts,
+        )
+        return QualificationCoverageReport(
+            connector_id="flowaccount",
+            environment="sandbox",
+            run_id=self.run_id,
+            run_state=run_state,
+            http_attempts=self._transport.request_count,
+            mutation_attempts=self._transport.mutation_attempts,
+            records=records,
+        )
+
+    def _runner_failure_records(
+        self,
+        *,
+        evaluated_at: datetime,
+        run_state: QualificationRunState,
+        use_validated_contracts: bool,
+    ) -> tuple[ValidationKnowledge, ...]:
+        if use_validated_contracts and self._run_store is not None:
+            try:
+                contracts = self._load_contracts()
+                policies = {
+                    (policy.action_id, policy.version_id): policy
+                    for policy in contracts.manifest.actions
+                }
+                records: list[ValidationKnowledge] = []
+                for action in contracts.actions:
+                    identity = (action.action_id, action.version_id)
+                    policy = policies[identity]
+                    if identity in self._dispatched_action_identities:
+                        record = self._record(
+                            action,
+                            contracts.semantics[identity],
+                            evaluated_at,
+                            policy=policy,
+                            status=ValidationStatus.OUTCOME_UNKNOWN,
+                            eligibility=ExecutionEligibility.BLOCKED,
+                            status_class="unknown",
+                        )
+                    elif policy.disposition is SandboxDisposition.SANDBOX_EXECUTABLE:
+                        record = self._record(
+                            action,
+                            contracts.semantics[identity],
+                            evaluated_at,
+                            policy=policy,
+                            status=ValidationStatus.BLOCKED_MISSING_PREREQUISITE,
+                            eligibility=ExecutionEligibility.BLOCKED,
+                        )
+                    else:
+                        record = self._policy_record(
+                            action,
+                            policy,
+                            contracts.semantics[identity],
+                            evaluated_at,
+                        )
+                    records.append(record.model_copy(update={"run_state": run_state}))
+                if len(records) == FLOWACCOUNT_ACTION_COUNT:
+                    return tuple(records)
+            except Exception:
+                pass
+
+        return tuple(
+            build_unvalidated_terminal_record(
+                identity=identity,
+                run_id=self.run_id,
+                run_state=run_state,
+                evaluated_at=evaluated_at,
+            )
+            for identity in FLOWACCOUNT_CANONICAL_IDENTITIES
+        )
 
     def _policy_record(
         self,

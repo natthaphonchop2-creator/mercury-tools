@@ -146,6 +146,9 @@ def cmd_catalog_qualify(args: argparse.Namespace) -> int:
             Path(args.repo_root),
             dry_run=bool(args.dry_run),
         )
+    except Exception:
+        report = build_flowaccount_preflight_failure_report()
+    else:
         report = asyncio.run(
             runner.qualify_all(
                 approval=SandboxRunApproval(
@@ -156,8 +159,6 @@ def cmd_catalog_qualify(args: argparse.Namespace) -> int:
                 dry_run=bool(args.dry_run),
             )
         )
-    except Exception:
-        report = build_flowaccount_preflight_failure_report()
     _print_json(report.public_dict())
     return 0 if report.run_state is QualificationRunState.COMPLETED else 1
 

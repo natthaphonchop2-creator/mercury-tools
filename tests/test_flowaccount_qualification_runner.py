@@ -638,6 +638,126 @@ async def test_live_run_uses_one_snapshot_one_probe_and_four_canonical_reads(
         assert "company_label_sha256" not in persisted
 
 
+@pytest.mark.parametrize(
+    ("failure_phase", "expected_attempts"),
+    [
+        ("processing", 3),
+        ("audit", 3),
+        ("reporting", 6),
+    ],
+)
+@pytest.mark.asyncio
+async def test_post_dispatch_failure_preserves_attempts_and_quarantines_safely(
+    failure_phase: str,
+    expected_attempts: int,
+    repository_context: RepositoryContext,
+    flowaccount_actions,
+    sandbox_manifest: SandboxExecutionManifest,
+    flowaccount_semantics,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+    runtime = runtime_for(
+        repository_context,
+        flowaccount_actions,
+        credentials=CredentialSnapshotSpy(),
+        repository_config=validation_config(),
+    )
+    failure_detail = (
+        "post-dispatch-sensitive https://post-dispatch.invalid "
+        "/Users/private/provider-result.json Secret Example Company"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/test/token":
+            return provider_response(request, 200, {"access_token": "issued-sandbox-token"})
+        if len(calls) == 2:
+            return provider_response(request, 200, {"companyName": "Example Books"})
+        return provider_response(
+            request,
+            200,
+            {
+                "status": True,
+                "data": [
+                    {
+                        "providerRecordId": "provider-991234567",
+                        "rawPayloadMarker": "raw-provider-payload-88224466",
+                    }
+                ],
+            },
+        )
+
+    def fail_post_dispatch(*_args: object, **_kwargs: object) -> Any:
+        raise RuntimeError(failure_detail)
+
+    if failure_phase == "processing":
+        monkeypatch.setattr(
+            "mercury_tools.qualification.flowaccount.extract_response_shape",
+            fail_post_dispatch,
+        )
+    elif failure_phase == "audit":
+        monkeypatch.setattr(runtime.executor, "_audit_result", fail_post_dispatch)
+    else:
+        monkeypatch.setattr(
+            "mercury_tools.qualification.flowaccount.build_coverage_report",
+            fail_post_dispatch,
+        )
+
+    runner = make_runner(
+        runtime,
+        sandbox_manifest,
+        flowaccount_actions,
+        flowaccount_semantics,
+        transport=httpx.MockTransport(handler),
+    )
+
+    report = await runner.qualify_all(
+        approval=SandboxRunApproval(reads=True, writes=False)
+    )
+
+    expected_identities = {
+        (action.action_id, action.version_id) for action in flowaccount_actions
+    }
+    actual_identities = {
+        (record.action_id, record.version_id) for record in report.records
+    }
+    unknown_records = [
+        record
+        for record in report.records
+        if record.validation_status is ValidationStatus.OUTCOME_UNKNOWN
+    ]
+    assert report.run_state is QualificationRunState.QUARANTINED
+    assert runner.run_store.state is QualificationRunState.QUARANTINED
+    assert runner.run_store.publication_allowed is False
+    assert len(report.records) == 190
+    assert actual_identities == expected_identities
+    assert report.http_attempts == runner.request_count == expected_attempts
+    assert report.mutation_attempts == 0
+    assert len(calls) == expected_attempts
+    assert unknown_records
+    assert all(
+        record.evidence_level is EvidenceLevel.SANDBOX_OBSERVED
+        and record.execution_eligibility is ExecutionEligibility.BLOCKED
+        and record.response_shape == {}
+        for record in unknown_records
+    )
+
+    public_json = json.dumps(report.public_dict(), ensure_ascii=False, sort_keys=True)
+    state_json = runner.run_store.state_path.read_text(encoding="utf-8")
+    audit_path = repository_context.audit_dir / "audit.jsonl"
+    audit_json = audit_path.read_text(encoding="utf-8") if audit_path.exists() else ""
+    for persisted in (public_json, state_json, audit_json):
+        assert "post-dispatch-sensitive" not in persisted
+        assert "post-dispatch.invalid" not in persisted
+        assert "/Users/private" not in persisted
+        assert "Secret Example Company" not in persisted
+        assert "issued-sandbox-token" not in persisted
+        assert "provider-991234567" not in persisted
+        assert "raw-provider-payload-88224466" not in persisted
+        assert "Example Books" not in persisted
+
+
 @pytest.mark.asyncio
 async def test_missing_expected_local_tenant_still_terminalizes_all_actions_without_dispatch(
     repository_context: RepositoryContext,

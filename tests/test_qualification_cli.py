@@ -295,3 +295,34 @@ def test_catalog_qualify_factory_exception_terminalizes_instead_of_generic_json(
         payload,
         forbidden=("factory-sensitive", "factory.invalid", "/Users/private", str(tmp_path)),
     )
+
+
+def test_catalog_qualify_does_not_rewrite_exception_after_runner_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from mercury_tools import cli
+
+    class PostRunnerFailure:
+        async def qualify_all(self, **_kwargs: object) -> Any:
+            raise RuntimeError("post-runner-sensitive")
+
+    monkeypatch.setattr(
+        cli,
+        "create_flowaccount_qualification_runner",
+        lambda *_args, **_kwargs: PostRunnerFailure(),
+    )
+    args = SimpleNamespace(
+        connector="flowaccount",
+        environment="sandbox",
+        all=True,
+        sandbox_writes=False,
+        dry_run=False,
+        repo_root=str(tmp_path),
+    )
+
+    with pytest.raises(RuntimeError, match="post-runner-sensitive"):
+        cli.cmd_catalog_qualify(args)
+
+    assert capsys.readouterr().out == ""
