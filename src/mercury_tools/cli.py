@@ -313,6 +313,58 @@ def cmd_release_scan_secrets(args: argparse.Namespace) -> int:
     return 0 if report.passed else 1
 
 
+def cmd_release_build_artifacts(args: argparse.Namespace) -> int:
+    from mercury_tools.release.artifacts import build_release_artifacts
+    from mercury_tools.release.scanner import ReleaseGateError
+
+    try:
+        manifest = build_release_artifacts(
+            Path(args.repo_root),
+            version=args.version,
+            output=Path(args.output),
+        )
+    except ReleaseGateError as exc:
+        _print_json({"status": "error", "error": str(exc)})
+        return 1
+    _print_json({"status": "ok", "manifest": manifest.as_dict()})
+    return 0
+
+
+def cmd_release_verify(args: argparse.Namespace) -> int:
+    from mercury_tools.release.scanner import ReleaseGateError
+    from mercury_tools.release.verify import verify_release
+
+    try:
+        verification = verify_release(
+            root=Path(args.repo_root),
+            version=args.version,
+            artifacts=Path(args.artifacts),
+        )
+    except ReleaseGateError as exc:
+        _print_json({"status": "error", "error": str(exc)})
+        return 1
+    _print_json({"status": "ok", "verification": verification.as_dict()})
+    return 0
+
+
+def cmd_release_build_public_staging(args: argparse.Namespace) -> int:
+    from mercury_tools.release.scanner import ReleaseGateError
+    from mercury_tools.release.verify import build_public_staging
+
+    try:
+        staging = build_public_staging(
+            root=Path(args.repo_root),
+            version=args.version,
+            output=Path(args.output),
+            artifacts=Path(args.artifacts) if args.artifacts else None,
+        )
+    except ReleaseGateError as exc:
+        _print_json({"status": "error", "error": str(exc)})
+        return 1
+    _print_json({"status": "ok", "staging": staging.as_dict()})
+    return 0
+
+
 def cmd_mcp_serve(args: argparse.Namespace) -> int:
     from mercury_tools.mcp.server import serve
 
@@ -855,6 +907,25 @@ def build_parser() -> argparse.ArgumentParser:
         default="MERCURY_PUBLIC_MCP_TOKEN",
     )
     scan_secrets.set_defaults(func=cmd_release_scan_secrets)
+
+    build_artifacts = release_sub.add_parser("build-artifacts")
+    build_artifacts.add_argument("--version", required=True)
+    build_artifacts.add_argument("--output", default="dist")
+    build_artifacts.add_argument("--repo-root", default=".")
+    build_artifacts.set_defaults(func=cmd_release_build_artifacts)
+
+    release_verify = release_sub.add_parser("verify")
+    release_verify.add_argument("--version", required=True)
+    release_verify.add_argument("--artifacts", required=True)
+    release_verify.add_argument("--repo-root", default=".")
+    release_verify.set_defaults(func=cmd_release_verify)
+
+    build_public_staging = release_sub.add_parser("build-public-staging")
+    build_public_staging.add_argument("--version", required=True)
+    build_public_staging.add_argument("--output", default="public-staging")
+    build_public_staging.add_argument("--artifacts")
+    build_public_staging.add_argument("--repo-root", default=".")
+    build_public_staging.set_defaults(func=cmd_release_build_public_staging)
 
     ingest = sub.add_parser("ingest")
     ingest_sub = ingest.add_subparsers(dest="ingest_command", required=True)
