@@ -332,6 +332,7 @@ def cloud_dependencies(action_factory):
             },
         ),
         skill_loader=skill_loader,
+        clock=lambda: NOW,
     )
     return dependencies, read_action, rag_store, catalog_store, skill_loader
 
@@ -454,6 +455,57 @@ async def test_cloud_validation_resolve_marks_missing_evidence_unavailable(
     dependencies, action, *_ = cloud_dependencies
     validation_store = ValidationStoreSpy()
     dependencies.validation_store = validation_store
+    app = Starlette(routes=cloud_routes(dependencies))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://cloud.example.test",
+    ) as http:
+        response = await http.post(
+            "/api/cloud/v1/catalog/validation/resolve",
+            json={
+                "requests": [
+                    {
+                        "connector_id": action.connector_id,
+                        "action_id": action.action_id,
+                        "version_id": action.version_id,
+                        "environment": "sandbox",
+                    }
+                ]
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "selections": [
+            {
+                "selected": None,
+                "blocking_conditions": ["validation_unavailable"],
+            }
+        ]
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["contract_executable", "future_evaluation"])
+async def test_cloud_validation_resolve_downgrades_inadmissible_selected_evidence(
+    cloud_dependencies,
+    case: str,
+) -> None:
+    dependencies, action, *_ = cloud_dependencies
+    record = _validation_record(action)
+    if case == "contract_executable":
+        record = record.model_copy(
+            update={"execution_eligibility": ExecutionEligibility.SANDBOX_READ}
+        )
+    else:
+        record = record.model_copy(
+            update={
+                "evaluated_at": datetime(2099, 1, 1, tzinfo=UTC),
+                "expires_at": datetime(2099, 1, 2, tzinfo=UTC),
+            }
+        )
+    dependencies.validation_store = ValidationStoreSpy((record,))
     app = Starlette(routes=cloud_routes(dependencies))
 
     async with httpx.AsyncClient(

@@ -105,6 +105,10 @@ _ORDINARY_DEPENDENCY_ERRORS = (
 )
 
 
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 @dataclass
 class CloudDependencies:
     settings: Settings | None = None
@@ -113,6 +117,7 @@ class CloudDependencies:
     validation_store: Any | None = None
     skills: Sequence[Mapping[str, Any]] | None = None
     skill_loader: Callable[[str], str | None] = skill_markdown
+    clock: Callable[[], datetime] | None = None
 
     def _catalog_store(self) -> Any:
         if self.catalog_store is None:
@@ -196,7 +201,7 @@ class CloudDependencies:
             return _bad_request()
 
         try:
-            resolved_at = datetime.now(UTC)
+            resolved_at = (self.clock or _utc_now)()
             resolved = await run_in_threadpool(
                 self._validation_store().resolve,
                 evidence_requests,
@@ -445,7 +450,7 @@ def _ordered_public_evidence_selections(
         raise ValueError("cloud_validation_response_invalid")
 
     return tuple(
-        _public_evidence_selection(request, by_scope[request.scope_key])
+        _public_evidence_selection(request, by_scope[request.scope_key], now=now)
         for request in batch.requests
     )
 
@@ -453,6 +458,8 @@ def _ordered_public_evidence_selections(
 def _public_evidence_selection(
     request: PublicEvidenceRequest,
     selection: EvidenceSelection,
+    *,
+    now: datetime,
 ) -> PublicEvidenceSelection:
     selected = selection.selected
     if selected is None:
@@ -474,6 +481,13 @@ def _public_evidence_selection(
             for field in PublicValidationEvidence.model_fields
         }
     )
+    if not evidence.is_admissible_at(now):
+        return PublicEvidenceSelection.model_validate(
+            {
+                "selected": None,
+                "blocking_conditions": ("validation_unavailable",),
+            }
+        )
     return PublicEvidenceSelection.model_validate(
         {"selected": evidence, "blocking_conditions": ()}
     )

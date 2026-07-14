@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -14,6 +15,7 @@ from mercury_tools.execution.request_builder import build_request
 from mercury_tools.qualification.selection import EvidenceRequest
 
 PUBLIC_RESPONSE_ERROR = "cloud_public_response_invalid"
+NOW = datetime(2026, 7, 14, 9, tzinfo=UTC)
 
 
 class ThreadTrackingCache:
@@ -217,6 +219,7 @@ async def test_client_resolves_action_evidence_in_one_exact_batch(
         base_url="https://cloud.example.test",
         cache=CatalogCache(repository_context),
         transport=httpx.MockTransport(handler),
+        clock=lambda: NOW,
     )
     try:
         selections = await client.resolve_validations(requests)
@@ -263,6 +266,136 @@ async def test_client_returns_unavailable_blockers_when_validation_cloud_is_unav
 
     assert selection.selected is None
     assert selection.blocking_conditions == ("validation_unavailable",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "request_environment"),
+    [
+        (
+            {
+                "validation_status": "live_failed",
+                "evidence_level": "sandbox_observed",
+                "execution_eligibility": "sandbox_read",
+            },
+            "sandbox",
+        ),
+        (
+            {
+                "validation_status": "contract_validated",
+                "evidence_level": "contract_validated",
+                "execution_eligibility": "sandbox_read",
+            },
+            "sandbox",
+        ),
+        (
+            {"expires_at": "2026-07-14T08:30:00Z"},
+            "sandbox",
+        ),
+        (
+            {
+                "evaluated_at": "2026-07-14T10:00:00Z",
+                "expires_at": "2026-07-14T11:00:00Z",
+            },
+            "sandbox",
+        ),
+        (
+            {
+                "environment": "production",
+                "validation_status": "live_success",
+                "evidence_level": "sandbox_observed",
+                "execution_eligibility": "sandbox_read",
+            },
+            "production",
+        ),
+    ],
+    ids=(
+        "failed-status-cannot-execute",
+        "contract-cannot-widen-eligibility",
+        "expired-replay",
+        "future-evaluation",
+        "sandbox-evidence-cannot-authorize-production",
+    ),
+)
+async def test_client_downgrades_inadmissible_selected_evidence_with_injected_clock(
+    repository_context,
+    action_factory,
+    overrides: dict,
+    request_environment: str,
+) -> None:
+    action = _read_action(action_factory)
+    evidence = {
+        **_public_validation_evidence(action, environment=request_environment),
+        **overrides,
+    }
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=CatalogCache(repository_context),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "selections": [
+                        {
+                            "selected": evidence,
+                            "blocking_conditions": [],
+                        }
+                    ]
+                },
+            )
+        ),
+        clock=lambda: NOW,
+    )
+    try:
+        selection = await client.resolve_validations(
+            (_evidence_request(action, environment=request_environment),)
+        )
+    finally:
+        await client.aclose()
+
+    assert len(selection) == 1
+    assert selection[0].selected is None
+    assert selection[0].blocking_conditions == ("validation_unavailable",)
+
+
+@pytest.mark.asyncio
+async def test_client_accepts_current_coherent_live_success_evidence(
+    repository_context,
+    action_factory,
+) -> None:
+    action = _read_action(action_factory)
+    evidence = {
+        **_public_validation_evidence(action),
+        "validation_status": "live_success",
+        "evidence_level": "sandbox_observed",
+        "execution_eligibility": "sandbox_read",
+    }
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=CatalogCache(repository_context),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "selections": [
+                        {
+                            "selected": evidence,
+                            "blocking_conditions": [],
+                        }
+                    ]
+                },
+            )
+        ),
+        clock=lambda: NOW,
+    )
+    try:
+        selection = await client.resolve_validations((_evidence_request(action),))
+    finally:
+        await client.aclose()
+
+    assert selection[0].selected is not None
+    assert selection[0].selected.validation_status.value == "live_success"
+    assert selection[0].selected.execution_eligibility.value == "sandbox_read"
 
 
 @pytest.mark.asyncio

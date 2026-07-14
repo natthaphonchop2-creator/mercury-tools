@@ -1,6 +1,7 @@
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -30,6 +31,11 @@ from mercury_tools.qualification.selection import EvidenceOutcome, EvidenceReque
 from mercury_tools.qualification.templates import SUMMARY_EN, SUMMARY_TH
 
 NOW = datetime(2026, 7, 13, 12, tzinfo=UTC)
+ROOT = Path(__file__).resolve().parents[1]
+BATCH_RESOLVE_MIGRATION = (
+    ROOT
+    / "supabase/migrations/20260714120000_resolve_erp_action_validation_batch.sql"
+)
 
 
 class FakeResponse:
@@ -676,37 +682,116 @@ def test_conflicting_observation_retry_raises_constant_error(
     ]
 
 
-def test_resolve_returns_frozen_typed_entries_in_scope_order(
+def test_resolve_uses_one_set_based_request_and_preserves_request_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rows = {
-        _request(1).action_id: [_record(action_number=1).model_dump(mode="json")],
-        _request(2).action_id: [_record(action_number=2, run_number=2).model_dump(mode="json")],
-    }
+    requested = (_request(2), _request(1))
+    rows = [
+        {
+            "request_index": 1,
+            **requested[1].model_dump(mode="json"),
+            "records": [],
+        },
+        {
+            "request_index": 0,
+            **requested[0].model_dump(mode="json"),
+            "records": [
+                _record(action_number=2, run_number=2).model_dump(mode="json")
+            ],
+        },
+    ]
     calls: list[dict[str, Any]] = []
 
     def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
         calls.append({"method": method, "url": url, **kwargs})
-        action_id = kwargs["params"]["action_id"].removeprefix("eq.")
-        return FakeResponse(body=rows[action_id])
+        return FakeResponse(body=rows)
 
     monkeypatch.setattr(validation_module.httpx, "request", request)
 
-    result = SupabaseValidationStore(_settings()).resolve([_request(2), _request(1)], now=NOW)
+    result = SupabaseValidationStore(_settings()).resolve(requested, now=NOW)
 
     assert isinstance(result, ResolveResult)
     assert tuple(entry.request.action_id for entry in result.entries) == (
-        _request(1).action_id,
         _request(2).action_id,
+        _request(1).action_id,
     )
-    assert all(entry.selection.outcome is EvidenceOutcome.LIVE_SUCCESS for entry in result.entries)
-    assert [call["params"]["action_id"] for call in calls] == [
-        f"eq.{_request(1).action_id}",
-        f"eq.{_request(2).action_id}",
-    ]
-    assert all(call["params"]["order"] == "evaluated_at.desc,run_id.desc" for call in calls)
+    assert result.entries[0].selection.outcome is EvidenceOutcome.LIVE_SUCCESS
+    assert result.entries[1].selection.outcome is EvidenceOutcome.NO_EVIDENCE
+    assert len(calls) == 1
+    assert calls[0]["method"] == "POST"
+    assert _table_name(calls[0]["url"]) == "resolve_erp_action_validation_batch"
+    assert calls[0]["json"] == {
+        "p_requests": [request.model_dump(mode="json") for request in requested],
+        "p_now": NOW.isoformat(),
+    }
+    assert "params" not in calls[0]
     with pytest.raises(ValidationError, match="frozen"):
         result.entries = ()
+
+
+def test_resolve_accepts_exactly_one_hundred_scopes_in_one_backend_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested = tuple(_request(index) for index in range(1, 101))
+    calls: list[dict[str, Any]] = []
+
+    def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        return FakeResponse(
+            body=[
+                {
+                    "request_index": index,
+                    **evidence_request.model_dump(mode="json"),
+                    "records": [],
+                }
+                for index, evidence_request in reversed(tuple(enumerate(requested)))
+            ]
+        )
+
+    monkeypatch.setattr(validation_module.httpx, "request", request)
+
+    result = SupabaseValidationStore(_settings()).resolve(requested, now=NOW)
+
+    assert len(result.entries) == 100
+    assert tuple(entry.request for entry in result.entries) == requested
+    assert all(
+        entry.selection.outcome is EvidenceOutcome.NO_EVIDENCE
+        for entry in result.entries
+    )
+    assert len(calls) == 1
+    assert len(calls[0]["json"]["p_requests"]) == 100
+
+
+@pytest.mark.parametrize(
+    "row_update",
+    [
+        {"connector_id": "peak"},
+        {"request_index": True},
+        {"private_field": "must-not-be-accepted"},
+    ],
+)
+def test_resolve_rejects_non_exact_rpc_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    row_update: dict[str, Any],
+) -> None:
+    evidence_request = _request()
+    row = {
+        "request_index": 0,
+        **evidence_request.model_dump(mode="json"),
+        "records": [],
+        **row_update,
+    }
+    monkeypatch.setattr(
+        validation_module.httpx,
+        "request",
+        lambda *_args, **_kwargs: FakeResponse(body=[row]),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^supabase_validation_response_invalid$",
+    ):
+        SupabaseValidationStore(_settings()).resolve((evidence_request,), now=NOW)
 
 
 def test_resolve_validates_all_requests_and_now_before_network(
@@ -729,6 +814,33 @@ def test_resolve_validates_all_requests_and_now_before_network(
     with pytest.raises(ValueError, match="^evidence_timestamp_naive$"):
         SupabaseValidationStore(_settings()).resolve([_request()], now=datetime(2026, 7, 13, 12))
     assert calls == []
+
+    with pytest.raises(ValueError, match="^evidence_request_invalid$"):
+        SupabaseValidationStore(_settings()).resolve([_request()] * 2, now=NOW)
+    assert calls == []
+
+    with pytest.raises(ValueError, match="^evidence_request_invalid$"):
+        SupabaseValidationStore(_settings()).resolve(
+            [_request(index) for index in range(1, 102)],
+            now=NOW,
+        )
+    assert calls == []
+
+
+def test_batch_resolve_migration_is_bounded_set_based_and_service_role_only() -> None:
+    sql = BATCH_RESOLVE_MIGRATION.read_text(encoding="utf-8").lower()
+
+    assert "function public.resolve_erp_action_validation_batch" in sql
+    assert "jsonb_array_length(p_requests) between 1 and 100" in sql
+    assert "jsonb_array_elements(p_requests) with ordinality" in sql
+    assert "left join lateral" in sql
+    assert "knowledge.connector_id = parsed.connector_id" in sql
+    assert "knowledge.action_id = parsed.action_id" in sql
+    assert "knowledge.version_id = parsed.version_id" in sql
+    assert "knowledge.environment = parsed.environment" in sql
+    assert "revoke all on function public.resolve_erp_action_validation_batch" in sql
+    assert "grant execute on function public.resolve_erp_action_validation_batch" in sql
+    assert "to service_role" in sql
 
 
 def test_coverage_uses_exact_filters_and_returns_deterministic_typed_order(

@@ -92,28 +92,31 @@ def _public_selection(
     semantic: SemanticContract | None = None,
     environment: str = "sandbox",
     evidence_number: int = 1,
+    evidence_overrides: dict[str, object] | None = None,
 ) -> PublicEvidenceSelection:
     contract = semantic or _semantic_contract()
+    evidence_payload = {
+        "action_id": action.action_id,
+        "version_id": action.version_id,
+        "connector_id": action.connector_id,
+        "environment": environment,
+        "validation_status": ValidationStatus.CONTRACT_VALIDATED,
+        "evidence_level": EvidenceLevel.CONTRACT_VALIDATED,
+        "execution_eligibility": ExecutionEligibility.DISCOVERY_ONLY,
+        "summary_th": "Endpoint contract validation completed.",
+        "summary_en": "Endpoint contract validated without a provider call.",
+        "limitations": ("provider_call_not_observed",),
+        "prerequisites": ("configure_sandbox",),
+        "recommended_next_step": "complete_sandbox_validation",
+        "semantic_contract": contract,
+        "opaque_evidence_id": f"ev_{evidence_number:026d}",
+        "evidence_sha256": f"{evidence_number:064x}",
+        "evaluated_at": NOW,
+        "expires_at": NOW + timedelta(days=1),
+    }
+    evidence_payload.update(evidence_overrides or {})
     evidence = PublicValidationEvidence.model_validate(
-        {
-            "action_id": action.action_id,
-            "version_id": action.version_id,
-            "connector_id": action.connector_id,
-            "environment": environment,
-            "validation_status": ValidationStatus.CONTRACT_VALIDATED,
-            "evidence_level": EvidenceLevel.CONTRACT_VALIDATED,
-            "execution_eligibility": ExecutionEligibility.DISCOVERY_ONLY,
-            "summary_th": "Endpoint contract validation completed.",
-            "summary_en": "Endpoint contract validated without a provider call.",
-            "limitations": ("provider_call_not_observed",),
-            "prerequisites": ("configure_sandbox",),
-            "recommended_next_step": "complete_sandbox_validation",
-            "semantic_contract": contract,
-            "opaque_evidence_id": f"ev_{evidence_number:026d}",
-            "evidence_sha256": f"{evidence_number:064x}",
-            "evaluated_at": NOW,
-            "expires_at": NOW + timedelta(days=1),
-        }
+        evidence_payload
     )
     return PublicEvidenceSelection.model_validate(
         {"selected": evidence, "blocking_conditions": ()}
@@ -293,6 +296,7 @@ async def test_runtime_batches_exact_action_context_resolution(action_factory) -
         (first.action_id, first.version_id): first_semantic,
         (second.action_id, second.version_id): second_semantic,
     }
+    runtime._clock = lambda: NOW
 
     contexts = await runtime.action_contexts((second, first), environment=None)
 
@@ -485,6 +489,63 @@ async def test_runtime_rejects_selected_evidence_semantics_that_differ_from_side
     assert len(calls) == 1
     assert context["semantic_contract"] == semantic.model_dump(mode="json")
     assert context["validation"] == {
+        "selected": None,
+        "blocking_conditions": ["validation_unavailable"],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("evidence_overrides", "clock_now"),
+    [
+        (
+            {
+                "validation_status": ValidationStatus.LIVE_FAILED,
+                "evidence_level": EvidenceLevel.SANDBOX_OBSERVED,
+                "execution_eligibility": ExecutionEligibility.SANDBOX_READ,
+            },
+            NOW,
+        ),
+        ({}, NOW + timedelta(days=2)),
+        (
+            {
+                "evaluated_at": NOW + timedelta(hours=1),
+                "expires_at": NOW + timedelta(hours=2),
+            },
+            NOW,
+        ),
+    ],
+    ids=("contradictory", "expired-replay", "future-evaluation"),
+)
+async def test_runtime_downgrades_inadmissible_selected_evidence(
+    action_factory,
+    evidence_overrides: dict[str, object],
+    clock_now: datetime,
+) -> None:
+    action = action_factory()
+    semantic = _semantic_contract(operation="create")
+
+    class FakeCloud:
+        async def resolve_validations(self, requests):
+            return (
+                _public_selection(
+                    action,
+                    semantic=semantic,
+                    evidence_overrides=evidence_overrides,
+                ),
+            )
+
+    runtime = object.__new__(LocalMercuryRuntime)
+    runtime.cloud = FakeCloud()
+    runtime.repository_config = RepositoryConfig()
+    runtime.semantic_contracts = {
+        (action.action_id, action.version_id): semantic,
+    }
+    runtime._clock = lambda: clock_now
+
+    contexts = await runtime.action_contexts((action,), environment="sandbox")
+
+    assert contexts[(action.action_id, action.version_id)]["validation"] == {
         "selected": None,
         "blocking_conditions": ["validation_unavailable"],
     }
@@ -1293,6 +1354,7 @@ async def test_connector_status_enrichment_exposes_count_only_validation_coverag
     runtime.semantic_contracts = {
         (action.action_id, action.version_id): semantic,
     }
+    runtime._clock = lambda: NOW
     try:
         rows = await runtime.enriched_connector_summaries(
             connector="flowaccount",

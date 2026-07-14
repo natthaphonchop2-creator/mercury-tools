@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+import json
+import re
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from datetime import UTC, datetime
 from functools import lru_cache
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -32,11 +36,7 @@ from mercury_tools.local.repository import (
     load_repository_config,
 )
 from mercury_tools.qualification.models import SemanticContract
-from mercury_tools.qualification.semantics import (
-    load_actions,
-    load_semantic_contracts,
-    require_semantic_contract,
-)
+from mercury_tools.qualification.semantics import require_semantic_contract
 from mercury_tools.rag.models import DOCUMENTED_SEARCH_FILTER_FIELDS, SearchFilters
 from mercury_tools.safety.redaction import redact_json
 
@@ -50,6 +50,9 @@ _UNAVAILABLE_BLOCKERS = frozenset(
     }
 )
 _BUILTIN_CONNECTORS = ("flowaccount", "peak")
+_BUILTIN_SEMANTIC_COUNTS = {"flowaccount": 190, "peak": 64}
+_SEMANTIC_ACTION_ID_RE = re.compile(r"^act_[0-9a-f]{24}$")
+_SEMANTIC_VERSION_ID_RE = re.compile(r"^av_[0-9a-f]{64}$")
 _ActionContextKey = tuple[str, str, str | None]
 
 
@@ -106,6 +109,7 @@ class LocalMercuryRuntime:
         request_store: LocalRequestStore,
         audit: AuditLedger,
         executor: ERPExecutor,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.repository = repository
         self.repository_config = repository_config
@@ -119,6 +123,7 @@ class LocalMercuryRuntime:
         self.request_store = request_store
         self.audit = audit
         self.executor = executor
+        self._clock = clock or _utc_now
 
     @classmethod
     def for_repository(cls, context: RepositoryContext) -> LocalMercuryRuntime:
@@ -289,6 +294,7 @@ class LocalMercuryRuntime:
             except (httpx.HTTPError, OSError, RuntimeError, TypeError, ValueError):
                 selections = tuple(_unavailable_selection() for _item in batch)
 
+            validation_now = _runtime_validation_now(self)
             for item, raw_selection in zip(batch, selections, strict=True):
                 key, action, selected_environment, semantic, _request = item
                 try:
@@ -298,6 +304,7 @@ class LocalMercuryRuntime:
                         selected_environment,
                         semantic,
                         selection,
+                        now=validation_now,
                     )
                 except (TypeError, ValueError):
                     selection = _unavailable_selection()
@@ -582,23 +589,60 @@ def _checked_in_semantic_contracts() -> tuple[
     tuple[tuple[str, str], SemanticContract],
     ...,
 ]:
-    catalog_root = Path(__file__).resolve().parents[3] / "catalog" / "global"
-    if not catalog_root.is_dir():
-        return ()
-
     result: dict[tuple[str, str], SemanticContract] = {}
+    package_root = resources.files("mercury_tools.catalog").joinpath("global")
     for connector_id in _BUILTIN_CONNECTORS:
-        connector_root = catalog_root / connector_id
-        actions_path = connector_root / "actions.json"
-        semantics_path = connector_root / "semantic-contracts.json"
-        if not actions_path.is_file() or not semantics_path.is_file():
-            raise ValueError("semantic_contracts_missing")
-        actions = load_actions(actions_path)
-        contracts = load_semantic_contracts(semantics_path, actions)
+        contracts = _load_packaged_semantic_contracts(
+            package_root.joinpath(connector_id, "semantic-contracts.json"),
+            expected_count=_BUILTIN_SEMANTIC_COUNTS[connector_id],
+        )
         if set(result).intersection(contracts):
             raise ValueError("semantic_contract_identity_duplicate")
         result.update(contracts)
+    if len(result) != sum(_BUILTIN_SEMANTIC_COUNTS.values()):
+        raise ValueError("semantic_contract_coverage_incomplete")
     return tuple(sorted(result.items()))
+
+
+def _load_packaged_semantic_contracts(
+    sidecar: Any,
+    *,
+    expected_count: int,
+) -> dict[tuple[str, str], SemanticContract]:
+    try:
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise ValueError("semantic_contracts_missing") from None
+    if not isinstance(payload, Mapping) or set(payload) != {"contracts"}:
+        raise ValueError("semantic_contracts_invalid")
+    rows = payload["contracts"]
+    if not isinstance(rows, list):
+        raise ValueError("semantic_contracts_invalid")
+
+    contracts: dict[tuple[str, str], SemanticContract] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise ValueError("semantic_contracts_invalid")
+        fields = dict(row)
+        action_id = fields.pop("action_id", None)
+        version_id = fields.pop("version_id", None)
+        if (
+            not isinstance(action_id, str)
+            or _SEMANTIC_ACTION_ID_RE.fullmatch(action_id) is None
+            or not isinstance(version_id, str)
+            or _SEMANTIC_VERSION_ID_RE.fullmatch(version_id) is None
+        ):
+            raise ValueError("semantic_contract_identity_invalid")
+        identity = (action_id, version_id)
+        if identity in contracts:
+            raise ValueError("semantic_contract_identity_duplicate")
+        try:
+            contracts[identity] = SemanticContract.model_validate(fields)
+        except (TypeError, ValueError):
+            raise ValueError("semantic_contracts_invalid") from None
+    if len(contracts) != expected_count:
+        raise ValueError("semantic_contract_coverage_incomplete")
+    return contracts
 
 
 def _blocked_action_context(
@@ -636,6 +680,8 @@ def _validate_runtime_selection(
     environment: str,
     semantic: SemanticContract,
     selection: PublicEvidenceSelection,
+    *,
+    now: datetime,
 ) -> None:
     selected = selection.selected
     if selected is None:
@@ -656,6 +702,17 @@ def _validate_runtime_selection(
         or selected.semantic_contract != semantic
     ):
         raise ValueError("cloud_validation_response_invalid")
+    if not selected.is_admissible_at(now):
+        raise ValueError("cloud_validation_response_invalid")
+
+
+def _runtime_validation_now(runtime: LocalMercuryRuntime) -> datetime:
+    clock = getattr(runtime, "_clock", None)
+    return clock() if callable(clock) else _utc_now()
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 def _semantic_action_id(result: Mapping[str, Any]) -> str | None:

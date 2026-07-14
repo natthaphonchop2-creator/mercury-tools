@@ -6,7 +6,7 @@ import math
 import re
 import uuid
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import unquote, urlsplit
 
@@ -935,6 +935,34 @@ class PublicValidationEvidence(StrictPublicModel):
             raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
         return self
 
+    def is_admissible_at(self, now: datetime) -> bool:
+        """Return whether this evidence may be exposed as the selected result now."""
+
+        normalized_now = _normalize_public_evidence_time(now)
+        evaluated_at = self.evaluated_at.astimezone(UTC)
+        expires_at = self.expires_at.astimezone(UTC) if self.expires_at is not None else None
+        if evaluated_at > normalized_now or (
+            expires_at is not None and expires_at <= normalized_now
+        ):
+            return False
+        if self.validation_status is ValidationStatus.CONTRACT_VALIDATED:
+            return (
+                self.evidence_level is EvidenceLevel.CONTRACT_VALIDATED
+                and self.execution_eligibility is ExecutionEligibility.DISCOVERY_ONLY
+            )
+        if self.validation_status is not ValidationStatus.LIVE_SUCCESS:
+            return False
+        return (
+            self.environment == "sandbox"
+            and self.evidence_level
+            in {EvidenceLevel.SANDBOX_OBSERVED, EvidenceLevel.ACCOUNTANT_REVIEWED}
+            and self.execution_eligibility
+            in {
+                ExecutionEligibility.SANDBOX_READ,
+                ExecutionEligibility.SANDBOX_WRITE_WITH_APPROVAL,
+            }
+        )
+
 
 class PublicEvidenceSelection(StrictPublicModel):
     selected: PublicValidationEvidence | None
@@ -952,6 +980,12 @@ class PublicEvidenceSelection(StrictPublicModel):
         ):
             raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
         return self
+
+
+def _normalize_public_evidence_time(value: datetime) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
+    return value.astimezone(UTC)
 
 
 class PublicValidationResolveRequest(StrictPublicModel):

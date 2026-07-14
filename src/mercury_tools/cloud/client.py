@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import quote, urlparse
 
@@ -61,6 +62,7 @@ class CloudBrainClient:
         cache: CatalogCache,
         base_url: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.cache = cache
         resolved_base_url = base_url or load_settings().cloud_base_url
@@ -79,6 +81,7 @@ class CloudBrainClient:
             transport=transport,
             timeout=30,
         )
+        self._clock = clock or _utc_now
 
     async def __aenter__(self) -> CloudBrainClient:
         return self
@@ -181,6 +184,8 @@ class CloudBrainClient:
         )
         if len(envelope.selections) != len(batch.requests):
             raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
+        admitted: list[PublicEvidenceSelection] = []
+        now = self._clock()
         for request, selection in zip(
             batch.requests,
             envelope.selections,
@@ -193,7 +198,11 @@ class CloudBrainClient:
                 selection.selected.environment,
             ):
                 raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
-        return envelope.selections
+            if selection.selected is not None and not selection.selected.is_admissible_at(now):
+                admitted.append(_unavailable_selection())
+            else:
+                admitted.append(selection)
+        return tuple(admitted)
 
     async def resolve_validation(
         self,
@@ -379,12 +388,17 @@ def _validation_request_batch(
 
 
 def _unavailable_selections(count: int) -> tuple[PublicEvidenceSelection, ...]:
-    return tuple(
-        PublicEvidenceSelection.model_validate(
-            {
-                "selected": None,
-                "blocking_conditions": ("validation_unavailable",),
-            }
-        )
-        for _ in range(count)
+    return tuple(_unavailable_selection() for _ in range(count))
+
+
+def _unavailable_selection() -> PublicEvidenceSelection:
+    return PublicEvidenceSelection.model_validate(
+        {
+            "selected": None,
+            "blocking_conditions": ("validation_unavailable",),
+        }
     )
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)

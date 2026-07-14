@@ -37,6 +37,14 @@ _OBSERVATION_SELECT = (
     "status_class,latency_ms,metadata"
 )
 _OBSERVATION_BINDING_SELECT = "connector_id,action_id,version_id"
+_BATCH_RESOLUTION_KEYS = {
+    "request_index",
+    "connector_id",
+    "action_id",
+    "version_id",
+    "environment",
+    "records",
+}
 
 
 class ObservationState(StrEnum):
@@ -228,22 +236,26 @@ class SupabaseValidationStore:
     ) -> ResolveResult:
         normalized_now = normalize_evidence_time(now)
         validated_requests = _validated_requests(requests)
-        ordered_requests = sorted(validated_requests, key=lambda item: item.scope_key)
+        response = self._request(
+            "POST",
+            "rpc/resolve_erp_action_validation_batch",
+            json={
+                "p_requests": [
+                    request.model_dump(mode="json") for request in validated_requests
+                ],
+                "p_now": normalized_now.isoformat(),
+            },
+        )
+        records_by_request = _batch_resolution_response_rows(
+            response,
+            validated_requests,
+        )
         entries: list[ResolutionEntry] = []
-        for request in ordered_requests:
-            response = self._request(
-                "GET",
-                "erp_action_validation_knowledge",
-                params={
-                    "connector_id": f"eq.{request.connector_id}",
-                    "action_id": f"eq.{request.action_id}",
-                    "version_id": f"eq.{request.version_id}",
-                    "environment": f"eq.{request.environment}",
-                    "select": _VALIDATION_SELECT,
-                    "order": "evaluated_at.desc,run_id.desc",
-                },
-            )
-            records = _validation_response_rows(response)
+        for request, records in zip(
+            validated_requests,
+            records_by_request,
+            strict=True,
+        ):
             try:
                 selection = select_evidence(records, request=request, now=normalized_now)
             except ValueError:
@@ -415,7 +427,13 @@ def _validated_requests(requests: Sequence[EvidenceRequest]) -> tuple[EvidenceRe
     if isinstance(requests, (str, bytes, bytearray)) or not isinstance(requests, Sequence):
         raise ValueError("evidence_request_invalid")
     try:
-        return tuple(EvidenceRequest.model_validate(request) for request in requests)
+        validated = tuple(EvidenceRequest.model_validate(request) for request in requests)
+        if not 1 <= len(validated) <= 100:
+            raise ValueError
+        scopes = tuple(request.scope_key for request in validated)
+        if len(set(scopes)) != len(scopes):
+            raise ValueError
+        return validated
     except (TypeError, ValueError):
         raise ValueError("evidence_request_invalid") from None
 
@@ -448,6 +466,42 @@ def _validation_response_rows(value: Any) -> tuple[ValidationKnowledge, ...]:
         return tuple(_validated_validation(row) for row in value)
     except ValueError:
         raise RuntimeError("supabase_validation_response_invalid") from None
+
+
+def _batch_resolution_response_rows(
+    value: Any,
+    requests: Sequence[EvidenceRequest],
+) -> tuple[tuple[ValidationKnowledge, ...], ...]:
+    if not isinstance(value, list) or len(value) != len(requests):
+        raise RuntimeError("supabase_validation_response_invalid")
+    indexed: dict[int, tuple[ValidationKnowledge, ...]] = {}
+    for row in value:
+        if not isinstance(row, dict) or set(row) != _BATCH_RESOLUTION_KEYS:
+            raise RuntimeError("supabase_validation_response_invalid")
+        request_index = row["request_index"]
+        if (
+            isinstance(request_index, bool)
+            or not isinstance(request_index, int)
+            or request_index < 0
+            or request_index >= len(requests)
+            or request_index in indexed
+        ):
+            raise RuntimeError("supabase_validation_response_invalid")
+        expected = requests[request_index]
+        if (
+            row["connector_id"],
+            row["action_id"],
+            row["version_id"],
+            row["environment"],
+        ) != expected.scope_key:
+            raise RuntimeError("supabase_validation_response_invalid")
+        records = _validation_response_rows(row["records"])
+        if any(not expected.matches(record) for record in records):
+            raise RuntimeError("supabase_validation_response_invalid")
+        indexed[request_index] = records
+    if set(indexed) != set(range(len(requests))):
+        raise RuntimeError("supabase_validation_response_invalid")
+    return tuple(indexed[index] for index in range(len(requests)))
 
 
 def _observation_response_rows(value: Any) -> tuple[ValidationObservation, ...]:

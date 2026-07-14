@@ -36,6 +36,9 @@ mercury-tools = "mercury_tools.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"mercury_tools.catalog" = ["global/*/semantic-contracts.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [

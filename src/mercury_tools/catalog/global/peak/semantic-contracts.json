@@ -1,0 +1,1309 @@
+{
+  "contracts": [
+    {
+      "accounting_uses": [
+        "accounts_receivable_reconciliation",
+        "revenue_review",
+        "vat_output_review"
+      ],
+      "action_id": "act_0114957a3922dc0f46a99907",
+      "business_object": "invoice",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "issue_date",
+        "due_date",
+        "total_amount",
+        "tax_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "invoice identifier",
+        "document_number": "invoice number",
+        "due_date": "invoice due date",
+        "issue_date": "invoice issue date",
+        "tax_amount": "output tax amount",
+        "total_amount": "gross invoice amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_e90f0f57aa76ffc8d44b6eadd1fd6df5df9a3b2216e5b4873c56f607c84e185b"
+    },
+    {
+      "accounting_uses": [
+        "accounts_payable_reconciliation",
+        "expense_review",
+        "vat_input_review"
+      ],
+      "action_id": "act_0b47bbf8bcc51ceada745adc",
+      "business_object": "expense",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "expense_date",
+        "total_amount",
+        "tax_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "expense document identifier",
+        "document_number": "expense document number",
+        "expense_date": "expense document date",
+        "tax_amount": "input tax amount",
+        "total_amount": "gross expense amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_64c34c16981733e9610a7b75a4ee436bc9353dc5855847fb6c0bca560598e4fb"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_0dcc727c86ca16631816ed12",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_efd1473944186910b40174f8ed5c3e14760842cd976d257c7a546b80cc68bdc4"
+    },
+    {
+      "accounting_uses": [
+        "accounts_receivable_reconciliation",
+        "cash_receipt_review"
+      ],
+      "action_id": "act_260661133c4f8b1fbbeeadac",
+      "business_object": "receipt",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "receipt_date",
+        "total_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "void",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "receipt identifier",
+        "document_number": "receipt number",
+        "receipt_date": "receipt date",
+        "total_amount": "gross receipt amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_45e3354092406838198cebc27088d4a17bab3f5b67fdb8e3916a1bc0573a65ec"
+    },
+    {
+      "accounting_uses": [
+        "accounts_receivable_reconciliation",
+        "revenue_review",
+        "vat_output_review"
+      ],
+      "action_id": "act_308b782f3c276b9a0dd818d3",
+      "business_object": "invoice",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "issue_date",
+        "due_date",
+        "total_amount",
+        "tax_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "void",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "invoice identifier",
+        "document_number": "invoice number",
+        "due_date": "invoice due date",
+        "issue_date": "invoice issue date",
+        "tax_amount": "output tax amount",
+        "total_amount": "gross invoice amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_ad8a337c9a7ec0772f3086aba4417a0a5f6fd35d7dbaef6bc2082f27e83acb4b"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_3863cfee28a4ce0ab4f65ab9",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_9f3558d396f85dbf67b2b6f33149b83d2de9fd87338ac77296da6677de4d6fea"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_3c4cc6c07a8ffa418232c909",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "get",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_925aec344cbec2e51c697fc8ed9e8c3694dafe084aa1490367a0b0ea3781aa9a"
+    },
+    {
+      "accounting_uses": [
+        "accounts_receivable_reconciliation",
+        "cash_receipt_review"
+      ],
+      "action_id": "act_3f63028cae55eb90783e7be5",
+      "business_object": "receipt",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "receipt_date",
+        "total_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "receipt identifier",
+        "document_number": "receipt number",
+        "receipt_date": "receipt date",
+        "total_amount": "gross receipt amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_69d2b44a34525755f6412007a7b77fd734a87b062a20a3075b8e401c9b726cac"
+    },
+    {
+      "accounting_uses": [
+        "accounts_receivable_reconciliation",
+        "cash_receipt_review"
+      ],
+      "action_id": "act_402bb61694a153488b29ab33",
+      "business_object": "receipt",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "receipt_date",
+        "total_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "receipt identifier",
+        "document_number": "receipt number",
+        "receipt_date": "receipt date",
+        "total_amount": "gross receipt amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_426f74c9a69838ccf860b9a4e7b012427bb054b9e53290467e855b17d5e8c7c2"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_41394a4923b15a4c53cf644d",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_9d45a828d94cc245966e5b84f06237f4593441cba965d8638ce463ccb7d4a4cf"
+    },
+    {
+      "accounting_uses": [
+        "accounts_receivable_reconciliation",
+        "revenue_review",
+        "vat_output_review"
+      ],
+      "action_id": "act_46c9288523202918dd477367",
+      "business_object": "invoice",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "issue_date",
+        "due_date",
+        "total_amount",
+        "tax_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "invoice identifier",
+        "document_number": "invoice number",
+        "due_date": "invoice due date",
+        "issue_date": "invoice issue date",
+        "tax_amount": "output tax amount",
+        "total_amount": "gross invoice amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_232d5f124f25a1919bcfc532cd11b13a4297bf2f269aa7bd939e3a9cb9158ff5"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_46db1343db1c07b58d37cf3e",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_49b3f621d6d203832725a9e41048a8fe1f238c4e0104380a44b9b3140235b4e3"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_4ec1db144d0b79dbdc133236",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "get",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_43d6d67e148ce3f1a22093b403f8e7623f40a1cfb0b49b66d533725d47b81487"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_5ab58230233fb4cff85d36ff",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_b0a1656158d5d61217e14425079bce567b4f83461666e5ebe0d2c139e15b9a2d"
+    },
+    {
+      "accounting_uses": [
+        "accounts_payable_reconciliation",
+        "expense_review",
+        "vat_input_review"
+      ],
+      "action_id": "act_5ccd2472984a6e8007989784",
+      "business_object": "expense",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "expense_date",
+        "total_amount",
+        "tax_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "update",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "expense document identifier",
+        "document_number": "expense document number",
+        "expense_date": "expense document date",
+        "tax_amount": "input tax amount",
+        "total_amount": "gross expense amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_fcaf0996c0741992aa8834cb312eff44d07f978339950e6a236aafbfae53397d"
+    },
+    {
+      "accounting_uses": [
+        "accounts_receivable_reconciliation",
+        "revenue_review",
+        "vat_output_review"
+      ],
+      "action_id": "act_5d022ddce93542bed3ba3c55",
+      "business_object": "invoice",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "issue_date",
+        "due_date",
+        "total_amount",
+        "tax_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "invoice identifier",
+        "document_number": "invoice number",
+        "due_date": "invoice due date",
+        "issue_date": "invoice issue date",
+        "tax_amount": "output tax amount",
+        "total_amount": "gross invoice amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_5cf9adec93819b0a4e6a70ee73354837efd6a81ca9a57df602aafe321526f4f7"
+    },
+    {
+      "accounting_uses": [
+        "counterparty_matching"
+      ],
+      "action_id": "act_6aa9e1aeb5c70e874a3a2b19",
+      "business_object": "contacts",
+      "fallbacks": [],
+      "join_keys": [
+        "contact_id",
+        "counterparty_tax_id"
+      ],
+      "next_action_ids": [],
+      "operation": "update",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "counterparty_tax_id": "counterparty tax identifier"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_c88df2a2ff7072c5841588542601cbe7a922f4092573f8c359651ce0d31685c7"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_6e49e877eb897677e2eb5b15",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "list",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_2cc96c450746945131c19eb3524333ad1673675ed382356fc406f7a3de57a7cd"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_6eca4e9dd9b68da50839acc2",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_a5f787fa68a7f806aee01305379cc1c749c86b101037acd1c134128ed32c8e70"
+    },
+    {
+      "accounting_uses": [
+        "accounts_receivable_reconciliation",
+        "cash_receipt_review"
+      ],
+      "action_id": "act_7284bd508c7d69b2062caf86",
+      "business_object": "receipt",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "receipt_date",
+        "total_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "get",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "receipt identifier",
+        "document_number": "receipt number",
+        "receipt_date": "receipt date",
+        "total_amount": "gross receipt amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_3cf9bfc8de12027f273a440aad0d41f1bc7c643703c4030f5f0e4118386cf6ff"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_7771eabbe70dd3c4cb2db76f",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "get",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_5ec713eea2450448adf233566e1f379804f8c833a9ce5fff3f8dcacdd31f01bd"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_86726c451fa0efd2550e9991",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "get",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_1fefc350b2828a4f708dc1110f2063c3d3900081ab81c7931298659281d403b7"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_88d77abde2055b5bc7d1dd13",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "get",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_4d240b35b1b0da28d29a553a08052d731cc10d39611e5216732b2f687e9671e5"
+    },
+    {
+      "accounting_uses": [
+        "accounts_payable_reconciliation",
+        "expense_review",
+        "vat_input_review"
+      ],
+      "action_id": "act_8db2ad5402e03ff26f75d826",
+      "business_object": "expense",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "expense_date",
+        "total_amount",
+        "tax_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "expense document identifier",
+        "document_number": "expense document number",
+        "expense_date": "expense document date",
+        "tax_amount": "input tax amount",
+        "total_amount": "gross expense amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_49f42dce3250346e7ece1d58a428603efdbdec0fe21c20e3624d1238767fa4a6"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_8fcd208ff82ccc6429492e75",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_7fb0e6e4b7032730f882bc7057b290345988d706ced797b4e80c99d69ee9de4f"
+    },
+    {
+      "accounting_uses": [
+        "accounts_payable_reconciliation",
+        "expense_review",
+        "vat_input_review"
+      ],
+      "action_id": "act_926b428b4b14729473e0e0c0",
+      "business_object": "expense",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "expense_date",
+        "total_amount",
+        "tax_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "list",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "expense document identifier",
+        "document_number": "expense document number",
+        "expense_date": "expense document date",
+        "tax_amount": "input tax amount",
+        "total_amount": "gross expense amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_e9b8c7ceadd7c41a4629cdde534e2c2860de757134d8da65d3ae37ea9e51aaae"
+    },
+    {
+      "accounting_uses": [
+        "accounts_receivable_reconciliation",
+        "revenue_review",
+        "vat_output_review"
+      ],
+      "action_id": "act_92c9d694f30bc103781a62ee",
+      "business_object": "invoice",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "issue_date",
+        "due_date",
+        "total_amount",
+        "tax_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "invoice identifier",
+        "document_number": "invoice number",
+        "due_date": "invoice due date",
+        "issue_date": "invoice issue date",
+        "tax_amount": "output tax amount",
+        "total_amount": "gross invoice amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_785284030716a1fd303018d44e0dd30a529b03e16c2050739da51887310133ac"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_93a09cc8c33bbcb6f9ac3679",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_18410c8b6ef21f3e22a1566fd9d5bdd5fd81e43b295e4c57f03cfb1a5b341faa"
+    },
+    {
+      "accounting_uses": [
+        "accounts_receivable_reconciliation",
+        "revenue_review",
+        "vat_output_review"
+      ],
+      "action_id": "act_93fa566f5267d83e04faba9e",
+      "business_object": "invoice",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "issue_date",
+        "due_date",
+        "total_amount",
+        "tax_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "update",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "invoice identifier",
+        "document_number": "invoice number",
+        "due_date": "invoice due date",
+        "issue_date": "invoice issue date",
+        "tax_amount": "output tax amount",
+        "total_amount": "gross invoice amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_b68db796eca6cc05263da138c22b97543bb5b86beda3fd865216c61ce3fa7365"
+    },
+    {
+      "accounting_uses": [
+        "accounts_payable_reconciliation",
+        "expense_review",
+        "vat_input_review"
+      ],
+      "action_id": "act_97010c84618ec71bd7944a7b",
+      "business_object": "expense",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "expense_date",
+        "total_amount",
+        "tax_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "expense document identifier",
+        "document_number": "expense document number",
+        "expense_date": "expense document date",
+        "tax_amount": "input tax amount",
+        "total_amount": "gross expense amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_54ef41085a72594e463e78e2adb232e82f8ddff144ec4bad5a9e3d6f27e11b6e"
+    },
+    {
+      "accounting_uses": [
+        "accounts_receivable_reconciliation",
+        "cash_receipt_review"
+      ],
+      "action_id": "act_97c2fd64b9ffb9e25179c49d",
+      "business_object": "receipt",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "receipt_date",
+        "total_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "receipt identifier",
+        "document_number": "receipt number",
+        "receipt_date": "receipt date",
+        "total_amount": "gross receipt amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_1e6a7690dd1dbc4355511da3072d7f1007061ad0584422edb84273b927a81364"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_987d7da49b5c2152305f4fcd",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "void",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_dc27cf11dd36fce7de32fbce2e8e98e319b8b8c2a30cdf3d11daf32dfd2dd932"
+    },
+    {
+      "accounting_uses": [
+        "accounts_payable_reconciliation",
+        "expense_review",
+        "vat_input_review"
+      ],
+      "action_id": "act_9e8c8d5a1fe33e4a9c28cef1",
+      "business_object": "expense",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "expense_date",
+        "total_amount",
+        "tax_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "get",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "expense document identifier",
+        "document_number": "expense document number",
+        "expense_date": "expense document date",
+        "tax_amount": "input tax amount",
+        "total_amount": "gross expense amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_ff825691bca5afc1ff26d32c7d3187eb800b765ca141a1551f4df1da93b3f4b1"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_a739859a3ff8941fa0a6c25c",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "update",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_a6f49e25549cd6a23dbcd92fb4fa015e72da454f620831dcf2c721783c0e7f2a"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_a7f3097c2a8e59319c0dd716",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_fc52ce410834f3b8ef8765f50d728e950daaae3532db5634c4b69eeb36d3723a"
+    },
+    {
+      "accounting_uses": [
+        "counterparty_matching"
+      ],
+      "action_id": "act_a854ec32e2b7ac849f11deeb",
+      "business_object": "contacts",
+      "fallbacks": [],
+      "join_keys": [
+        "contact_id",
+        "counterparty_tax_id"
+      ],
+      "next_action_ids": [],
+      "operation": "get",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "counterparty_tax_id": "counterparty tax identifier"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_2981d281c7e87500e3f69ba6983ff29f46d465edeecfb81132c819613174904b"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_a86f5ab29488d2109529cfdb",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_40ca39dda84fff81fe0807cef514918d2cc3cb72120f379b75d97667ec8fca0c"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_ab53b5325bebc62984f4516b",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_de5a2a991b1a14274f1dc023bf6b409f315901717e2de449e7d16f64a70a78a9"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_ae4c4adac955fc15bf85865f",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_f4298735030d1cf9418c18932ebd9ca392eed0512f8e9dc7d831d981c19e74ab"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_b76683cad7af033640036e7c",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "get",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_0cd6a8b4a0fd0ea9586cc3e04da267f13d9b4dfd075744ae6da514f6a997ffc3"
+    },
+    {
+      "accounting_uses": [
+        "accounts_payable_reconciliation",
+        "expense_review",
+        "vat_input_review"
+      ],
+      "action_id": "act_baa0f8fc773de48ffe631499",
+      "business_object": "expense",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "expense_date",
+        "total_amount",
+        "tax_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "expense document identifier",
+        "document_number": "expense document number",
+        "expense_date": "expense document date",
+        "tax_amount": "input tax amount",
+        "total_amount": "gross expense amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_addb9843ea052124c5c3b76e471992be7e76745443e006a204e85ccfce023766"
+    },
+    {
+      "accounting_uses": [
+        "accounts_receivable_reconciliation",
+        "revenue_review",
+        "vat_output_review"
+      ],
+      "action_id": "act_bd70b00e0df3d157d22fb1a1",
+      "business_object": "invoice",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "issue_date",
+        "due_date",
+        "total_amount",
+        "tax_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "get",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "invoice identifier",
+        "document_number": "invoice number",
+        "due_date": "invoice due date",
+        "issue_date": "invoice issue date",
+        "tax_amount": "output tax amount",
+        "total_amount": "gross invoice amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_63fe4bcf9dc737a03677aa013bc729b5d0b891e7f5bc2459f37335dba0f5066a"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_c022b664b9954b24789e0d5d",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "get",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_5fcbb88fa7dda38d868b23d6a03a1a2d90e1610d1307b986120e1382a62b7910"
+    },
+    {
+      "accounting_uses": [
+        "accounts_receivable_reconciliation",
+        "cash_receipt_review"
+      ],
+      "action_id": "act_c0fb09d59ce450c3819a9521",
+      "business_object": "receipt",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "receipt_date",
+        "total_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "receipt identifier",
+        "document_number": "receipt number",
+        "receipt_date": "receipt date",
+        "total_amount": "gross receipt amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_24d7e1e075d9a9bc73df29abe509aeae6192ffbe6bbcdcb347236f66021ec188"
+    },
+    {
+      "accounting_uses": [
+        "accounts_receivable_reconciliation",
+        "cash_receipt_review"
+      ],
+      "action_id": "act_c2feb6d508c7ad482c11a468",
+      "business_object": "receipt",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "receipt_date",
+        "total_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "update",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "receipt identifier",
+        "document_number": "receipt number",
+        "receipt_date": "receipt date",
+        "total_amount": "gross receipt amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_dc13337ef05ecd11cf9f96d268e39d2c9052f6cf7754941cd8199cfa6676cfbd"
+    },
+    {
+      "accounting_uses": [
+        "accounts_receivable_reconciliation",
+        "cash_receipt_review"
+      ],
+      "action_id": "act_c4af9d26172dd61c9a9e4432",
+      "business_object": "receipt",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "receipt_date",
+        "total_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "receipt identifier",
+        "document_number": "receipt number",
+        "receipt_date": "receipt date",
+        "total_amount": "gross receipt amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_30d136bf4ce01df411bec6e1eefb1231c1b192f0f23aedf069b9c7c1da93f246"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_c5b0baafb0d76261e443457c",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "delete",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_309d6faf7293a0efa9c1674c78348ef1a2c67ba9ada0d433e9e0b400a07e63dd"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_cbe47f843982380a2f6e3bf5",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_6d89b22e8f3bb88b85ee5703a1052b00d3ffc43b8418be6e5f50861ace662548"
+    },
+    {
+      "accounting_uses": [
+        "accounts_receivable_reconciliation",
+        "revenue_review",
+        "vat_output_review"
+      ],
+      "action_id": "act_ccc3343c893ddeb9a4d4a207",
+      "business_object": "invoice",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "issue_date",
+        "due_date",
+        "total_amount",
+        "tax_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "list",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "invoice identifier",
+        "document_number": "invoice number",
+        "due_date": "invoice due date",
+        "issue_date": "invoice issue date",
+        "tax_amount": "output tax amount",
+        "total_amount": "gross invoice amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_3123b9451db9b6d22a5462ccd54f86cdd3bdf3c180d0c1e226a7c3bdfb95e53a"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_cfea2f8629ca1587e64c87cd",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "update",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_2dd329eeb5c11c23035ac83cd454616179a8ed1105fcb52e0cc49603b455fc23"
+    },
+    {
+      "accounting_uses": [
+        "counterparty_matching"
+      ],
+      "action_id": "act_d1034a254d9cc65822cc83c9",
+      "business_object": "contacts",
+      "fallbacks": [],
+      "join_keys": [
+        "contact_id",
+        "counterparty_tax_id"
+      ],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "counterparty_tax_id": "counterparty tax identifier"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_5ff413f0c4e9f98fd08880dddedde7476614f25bdbddf0863277b05131f8c30a"
+    },
+    {
+      "accounting_uses": [
+        "counterparty_matching"
+      ],
+      "action_id": "act_d14adea3e772e3f406ba790e",
+      "business_object": "contacts",
+      "fallbacks": [],
+      "join_keys": [
+        "contact_id",
+        "counterparty_tax_id"
+      ],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "counterparty_tax_id": "counterparty tax identifier"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_f2bd081dc2067351eeb62cf1b2dd060ffafeb33267a03015fb59d1301a9d8453"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_d1aa008c401d40255ca0738e",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "get",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_8da87567c98b9516f3b1544d6a9ed4ce3221a8351b9405831bb4bee48e44cf6e"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_d1d6ef93ff84247b17baa719",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "get",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_3b4842aada8bf8dbea88e14ee706fd3f72263bfb8cd73dbfe25bbb69afcf87f6"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_d34838c6775859ea15830d5d",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_219c776f6a04c9f2171cdee9374d2f86f4f06f88e076eb50e40266285cd74099"
+    },
+    {
+      "accounting_uses": [
+        "accounts_receivable_reconciliation",
+        "cash_receipt_review"
+      ],
+      "action_id": "act_dbb5a5862c26dec57ef1a220",
+      "business_object": "receipt",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "receipt_date",
+        "total_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "list",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "receipt identifier",
+        "document_number": "receipt number",
+        "receipt_date": "receipt date",
+        "total_amount": "gross receipt amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_749ee62799630ab9a93acb2f8f3c032d9d7b9e1519099527835dff14c3b6f613"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_e370123e4fd83afb6490cdf9",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "get",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_195369104f5c56d7e688d27ef193d20e8dd301d579084bf06698e44e6564ab09"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_e4744c138983b7fd8fd9b402",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_3a19d251a67a38310d1588f78af5b892050441d94a9af3064eb06297547cbb0b"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_e5ebcd779f494d89d8e53d2e",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "get",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_fe4a0379ed6537a2399bf5764958ae516153a6666258f193d881f9c009b79616"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_e705bc1495702ad0914e3494",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "update",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_628c8f5f4831fb719fd601a9732dfab1c17fa089b452327089951da636295b0b"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_eaadd03ba498084a17d266fa",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_188115eac24b83b988635daa3609c2ac36c04a40b608bfcb0a40e89d535bd461"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_ed12fe4f9e2c080243869ffa",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "list",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_549b0147da22d0d31f53bf5a7b0f64d77131a59dfb05337bbaaa2013e511e333"
+    },
+    {
+      "accounting_uses": [
+        "accounts_receivable_reconciliation",
+        "revenue_review",
+        "vat_output_review"
+      ],
+      "action_id": "act_ef839e82267a176b9fc738b8",
+      "business_object": "invoice",
+      "fallbacks": [],
+      "join_keys": [
+        "document_id",
+        "document_number",
+        "contact_id",
+        "issue_date",
+        "due_date",
+        "total_amount",
+        "tax_amount"
+      ],
+      "next_action_ids": [],
+      "operation": "approve",
+      "optional_external_capabilities": [],
+      "output_semantics": {
+        "contact_id": "counterparty identifier",
+        "document_id": "invoice identifier",
+        "document_number": "invoice number",
+        "due_date": "invoice due date",
+        "issue_date": "invoice issue date",
+        "tax_amount": "output tax amount",
+        "total_amount": "gross invoice amount"
+      },
+      "required_external_capabilities": [],
+      "version_id": "av_fe59716b6fa42ae39c362e37a229ae04a2207badd0e36523100a539d57420145"
+    },
+    {
+      "accounting_uses": [],
+      "action_id": "act_f087bdd426544f61eb91387a",
+      "business_object": "general",
+      "fallbacks": [],
+      "join_keys": [],
+      "next_action_ids": [],
+      "operation": "create",
+      "optional_external_capabilities": [],
+      "output_semantics": {},
+      "required_external_capabilities": [],
+      "version_id": "av_d0475609954bed84beb0fa68aecb891b02d4a2cd4aa2205db64f415b8145d57b"
+    }
+  ]
+}
