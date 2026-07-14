@@ -180,7 +180,7 @@ def _complete_inspection(surface: str, *chunks: bytes) -> HostedInspection:
             ),
             complete=True,
             page_count=1,
-            record_count=len(material) if index == 0 else 0,
+            record_count=0,
             request_count=0 if name in hosted_module._PARENT_COUNT_RECEIPTS else 1,
             parent_record_count=(
                 0 if name in hosted_module._PARENT_COUNT_RECEIPTS else None

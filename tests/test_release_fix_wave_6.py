@@ -30,6 +30,11 @@ from mercury_tools.release.scanner import CommandResult, SubprocessCommandRunner
 _MARKER = b"ghp_W6a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5"
 _WIKI_SURFACE = "github_packages_pages_wiki"
 _BOUNDARY_BLOCKER = f"hosted_archive_boundary_invalid:{_WIKI_SURFACE}"
+_STRICT_WIKI_BLOB = b"safe reachable wiki payload"
+_STRICT_WIKI_BLOB_OID = hashlib.sha1(  # noqa: S324 - Git SHA-1 object identity.
+    f"blob {len(_STRICT_WIKI_BLOB)}\0".encode("ascii") + _STRICT_WIKI_BLOB,
+    usedforsecurity=False,
+).hexdigest()
 
 
 def _policy(**updates: object) -> SecretScanPolicy:
@@ -209,9 +214,13 @@ def _empty_archive_receipt(name: str) -> HostedReceipt:
 
 
 def _default_wiki_query(*, present: bool = True) -> HostedReceipt:
+    remote_refs = (
+        f"{_STRICT_WIKI_BLOB_OID}\tHEAD\n"
+        f"{_STRICT_WIKI_BLOB_OID}\trefs/heads/main\n"
+    ).encode("ascii")
     return HostedReceipt(
         name="github_wiki_query",
-        chunks=(b"wiki ref inventory",),
+        chunks=(remote_refs,) if present else (),
         complete=True,
         page_count=1,
         record_count=1 if present else 0,
@@ -323,14 +332,32 @@ def _inventory_manifest(
     *,
     reachable_object_count: int,
     reachable_blob_count: int,
+    command_entries: list[dict[str, object]] | None = None,
 ) -> bytes:
+    commands = command_entries or []
+    remote_refs = {
+        "HEAD": _STRICT_WIKI_BLOB_OID,
+        "refs/heads/main": _STRICT_WIKI_BLOB_OID,
+    }
+    ref_payload = json.dumps(
+        sorted(remote_refs.items()),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
     return json.dumps(
         {
             "schema_version": 1,
-            "remote_ref_count": 1,
-            "remote_ref_digest": hashlib.sha256(b"safe refs").hexdigest(),
+            "object_format": "sha1",
+            "remote_ref_count": len(remote_refs),
+            "remote_ref_digest": hashlib.sha256(ref_payload).hexdigest(),
             "reachable_object_count": reachable_object_count,
             "reachable_blob_count": reachable_blob_count,
+            "reachable_tag_count": sum(
+                entry.get("object_type") == "wiki_reachable_tag"
+                for entry in payload_entries
+            ),
+            "command_object_count": len(commands),
+            "command_objects": commands,
             "payload_object_count": len(payload_entries),
             "payload_objects": payload_entries,
         },
@@ -342,12 +369,29 @@ def _inventory_manifest(
 def _strict_wiki_declaration() -> tuple[
     tuple[bytes, ...], tuple[HostedObjectBoundary, ...]
 ]:
-    command = b"safe clone command output"
-    blob = b"safe reachable wiki payload"
-    blob_oid = hashlib.sha1(  # noqa: S324 - Git object identity is SHA-1 by format.
-        f"blob {len(blob)}\0".encode("ascii") + blob,
-        usedforsecurity=False,
-    ).hexdigest()
+    blob = _STRICT_WIKI_BLOB
+    blob_oid = _STRICT_WIKI_BLOB_OID
+    local_refs = f"refs/heads/main\t{blob_oid}\t\n".encode("ascii")
+    head = f"{blob_oid}\n".encode("ascii")
+    command_chunks = (
+        b"safe clone command output",
+        local_refs,
+        head,
+        local_refs,
+        head,
+    )
+    command_boundaries = tuple(
+        _typed_boundary(
+            (data,),
+            object_type="wiki_command_output",
+            object_id=object_id,
+        )
+        for object_id, data in zip(
+            hosted_module._WIKI_COMMAND_OBJECT_ORDER,
+            command_chunks,
+            strict=True,
+        )
+    )
     blob_entry = {
         "object_type": "wiki_reachable_blob",
         "object_id": f"git/blob/{blob_oid}",
@@ -356,16 +400,21 @@ def _strict_wiki_declaration() -> tuple[
     }
     inventory = _inventory_manifest(
         [blob_entry],
-        reachable_object_count=3,
+        reachable_object_count=1,
         reachable_blob_count=1,
+        command_entries=[
+            {
+                "object_type": boundary.object_type,
+                "object_id": boundary.object_id,
+                "byte_count": boundary.byte_count,
+                "content_sha256": boundary.content_sha256,
+            }
+            for boundary in command_boundaries
+        ],
     )
-    chunks = (command, inventory, blob)
+    chunks = (*command_chunks, inventory, blob)
     boundaries = (
-        _typed_boundary(
-            (command,),
-            object_type="wiki_command_output",
-            object_id="wiki/command/clone",
-        ),
+        *command_boundaries,
         _typed_boundary(
             (inventory,),
             object_type="wiki_mirror_inventory",
@@ -423,16 +472,27 @@ def test_false_wiki_logical_object_declarations_block(failure: str) -> None:
     chunks, boundaries = _strict_wiki_declaration()
     expected_count = len(boundaries)
     material = list(boundaries)
+    payload_index = next(
+        index
+        for index, boundary in enumerate(material)
+        if boundary.object_type == "wiki_reachable_blob"
+    )
     if failure == "count":
         expected_count -= 1
     elif failure == "duplicate-identity":
-        material[2] = replace(material[2], object_id=material[0].object_id)
+        material[payload_index] = replace(
+            material[payload_index], object_id=material[0].object_id
+        )
     elif failure == "digest":
-        material[2] = replace(material[2], content_sha256="0" * 64)
+        material[payload_index] = replace(
+            material[payload_index], content_sha256="0" * 64
+        )
     elif failure == "missing-identity":
-        material[2] = replace(material[2], object_id=None)
+        material[payload_index] = replace(material[payload_index], object_id=None)
     else:
-        material[2] = replace(material[2], object_id=f"git/blob/{'f' * 40}")
+        material[payload_index] = replace(
+            material[payload_index], object_id=f"git/blob/{'f' * 40}"
+        )
 
     result = _scan_wiki(
         _declared_wiki_download(
