@@ -169,9 +169,9 @@ def build_public_staging(
     """Create a one-commit, history-free staging repository from ``git archive`` only."""
 
     destination = _prepare_output_destination(output)
-    candidate = load_release_candidate(root, version=version, require_clean=True)
-    candidate_digest = source_tree_digest(candidate.entries)
     try:
+        candidate = load_release_candidate(root, version=version, require_clean=True)
+        candidate_digest = source_tree_digest(candidate.entries)
         with materialize_release_candidate(candidate) as snapshot:
             _require_immutable_plugin_ref(snapshot, version)
             _require_exact_local_mcp_tools(snapshot)
@@ -210,17 +210,19 @@ def build_public_staging(
                     raise ReleaseGateError("staging_tree_digest_mismatch")
                 _ensure_candidate_unchanged(candidate)
                 _publish_owned_directory(stage, destination)
+        return PublicStaging(
+            path=output,
+            version=version,
+            commit_sha=candidate.commit_sha,
+            candidate_tree_digest=candidate_digest,
+            staged_tree_digest=candidate_digest,
+        )
     except ReleaseGateError:
         raise
     except OSError as exc:
         raise ReleaseGateError("staging_build_failed") from exc
-    return PublicStaging(
-        path=output,
-        version=version,
-        commit_sha=candidate.commit_sha,
-        candidate_tree_digest=candidate_digest,
-        staged_tree_digest=candidate_digest,
-    )
+    finally:
+        destination.close()
 
 
 def _require_immutable_plugin_ref(root: Path, version: str) -> None:
@@ -289,13 +291,15 @@ def _require_artifacts_match_expected(
     expected_artifacts: Path,
     expected_manifest: ReleaseArtifactManifest,
 ) -> None:
+    submitted_manifest = load_release_artifact_manifest(artifacts / MANIFEST_FILE_NAME)
+    if submitted_manifest.builder_provenance != expected_manifest.builder_provenance:
+        raise ReleaseGateError("artifact_candidate_mismatch")
     _require_exact_artifact_set(artifacts, expected_manifest)
     for artifact in expected_manifest.artifacts:
         _require_normalized_archive(
             artifacts / artifact.file_name,
             expected_manifest.build_epoch,
         )
-    submitted_manifest = load_release_artifact_manifest(artifacts / MANIFEST_FILE_NAME)
     if submitted_manifest.as_dict() != expected_manifest.as_dict():
         raise ReleaseGateError("artifact_candidate_mismatch")
     _require_files_equal(
