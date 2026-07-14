@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import stat
 import sys
@@ -18,9 +19,11 @@ from mercury_tools.release.artifacts import (
     ReleaseArtifactManifest,
     ReleaseCandidate,
     _build_artifact_set,
+    _decode_stored_gzip,
     _ensure_candidate_unchanged,
     _prepare_output_destination,
     _publish_owned_directory,
+    _ReleaseGitRunner,
     _strict_json_loads,
     _write_candidate_tree,
     _zip_datetime,
@@ -401,7 +404,7 @@ def _require_normalized_zip(path: Path, epoch: int) -> None:
                 expected_mode = stat.S_IFREG | 0o644
                 if (
                     entry.create_system != 3
-                    or entry.compress_type != zipfile.ZIP_DEFLATED
+                    or entry.compress_type != zipfile.ZIP_STORED
                     or entry.extra
                     or (entry.external_attr >> 16) != expected_mode
                     or entry.date_time != _zip_datetime(epoch)
@@ -420,13 +423,16 @@ def _require_normalized_tar_gz(path: Path, epoch: int) -> None:
             len(payload) < 10
             or payload[:2] != b"\x1f\x8b"
             or payload[3] != 0
-            or payload[8] != 2
+            or payload[8] != 0
             or payload[9] != 255
         ):
             raise ReleaseGateError("artifact_archive_metadata_invalid")
         if int.from_bytes(payload[4:8], "little") != epoch:
             raise ReleaseGateError("artifact_archive_metadata_invalid")
-        with tarfile.open(path, mode="r:gz") as archive:
+        with tarfile.open(
+            fileobj=io.BytesIO(_decode_stored_gzip(payload)),
+            mode="r:",
+        ) as archive:
             entries = archive.getmembers()
             names = [entry.name for entry in entries]
             try:
@@ -455,7 +461,7 @@ def _require_normalized_tar_gz(path: Path, epoch: int) -> None:
                     raise ReleaseGateError("artifact_archive_metadata_invalid")
     except ReleaseGateError:
         raise
-    except (OSError, tarfile.TarError) as exc:
+    except (OSError, ValueError, tarfile.TarError) as exc:
         raise ReleaseGateError("artifact_archive_metadata_invalid") from exc
 
 
@@ -468,35 +474,35 @@ def _require_staging_scanner_gate(
 
 
 def _initialize_history_free_repository(stage: Path, epoch: int) -> None:
-    environment = {
-        "GIT_AUTHOR_DATE": f"{epoch} +0000",
-        "GIT_COMMITTER_DATE": f"{epoch} +0000",
-    }
-    runner = SubprocessCommandRunner(
-        environment=environment,
-        max_output_bytes=_MAX_COMMAND_OUTPUT,
-        timeout_seconds=60.0,
-    )
+    initializer = _ReleaseGitRunner.for_new_repository(stage)
+    result = initializer.run_unbound(("init", "--initial-branch=main"))
+    if result.exit_code != 0:
+        raise ReleaseGateError("staging_repository_init_failed")
+    runner = _ReleaseGitRunner.for_repository(stage)
     commands = (
-        ("git", "init", "--initial-branch=main"),
-        ("git", "config", "user.name", "Mercury Release"),
-        ("git", "config", "user.email", "release@mercury.invalid"),
-        ("git", "add", "--all"),
-        ("git", "commit", "--quiet", "-m", "Mercury public staging"),
+        ("config", "user.name", "Mercury Release"),
+        ("config", "user.email", "release@mercury.invalid"),
+        ("add", "--all"),
     )
     for command in commands:
-        result = runner.run(command, cwd=stage)
+        result = runner.run(command)
         if result.exit_code != 0:
             raise ReleaseGateError("staging_repository_init_failed")
+    result = runner.run(
+        ("commit", "--quiet", "-m", "Mercury public staging"),
+        extra_environment={
+            "GIT_AUTHOR_DATE": f"{epoch} +0000",
+            "GIT_COMMITTER_DATE": f"{epoch} +0000",
+        },
+    )
+    if result.exit_code != 0:
+        raise ReleaseGateError("staging_repository_init_failed")
 
 
 def _require_single_new_commit(stage: Path, source_commit_sha: str) -> None:
-    runner = SubprocessCommandRunner(
-        max_output_bytes=_MAX_COMMAND_OUTPUT,
-        timeout_seconds=60.0,
-    )
-    count = runner.run(("git", "rev-list", "--all", "--count"), cwd=stage)
-    commits = runner.run(("git", "rev-list", "--all"), cwd=stage)
+    runner = _ReleaseGitRunner.for_repository(stage)
+    count = runner.run(("rev-list", "--all", "--count"))
+    commits = runner.run(("rev-list", "--all"))
     if (
         count.exit_code != 0
         or commits.exit_code != 0

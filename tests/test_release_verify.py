@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gzip
 import hashlib
 import inspect
 import io
@@ -23,7 +22,10 @@ from test_release_artifacts import (
 
 from mercury_tools import cli
 from mercury_tools.release import artifacts as release_artifacts
-from mercury_tools.release.artifacts import _zip_datetime, build_release_artifacts
+from mercury_tools.release.artifacts import (
+    _zip_datetime,
+    build_release_artifacts,
+)
 from mercury_tools.release.scanner import ReleaseGateError
 from mercury_tools.release.verify import (
     build_public_staging,
@@ -81,29 +83,22 @@ def _write_normalized_zip(path: Path, members: list[tuple[str, bytes]], epoch: i
     with zipfile.ZipFile(
         path,
         mode="w",
-        compression=zipfile.ZIP_DEFLATED,
-        compresslevel=9,
+        compression=zipfile.ZIP_STORED,
         strict_timestamps=True,
     ) as archive:
         for name, data in members:
             info = zipfile.ZipInfo(name, date_time=_zip_datetime(epoch))
             info.create_system = 3
-            info.compress_type = zipfile.ZIP_DEFLATED
+            info.compress_type = zipfile.ZIP_STORED
             info.external_attr = (stat.S_IFREG | 0o644) << 16
             info.flag_bits |= 0x800
-            archive.writestr(info, data, compress_type=zipfile.ZIP_DEFLATED)
+            archive.writestr(info, data, compress_type=zipfile.ZIP_STORED)
 
 
 def _write_normalized_tar(path: Path, members: list[tuple[str, bytes]], epoch: int) -> None:
     with (
         path.open("wb") as raw,
-        gzip.GzipFile(
-            filename="",
-            mode="wb",
-            fileobj=raw,
-            mtime=epoch,
-            compresslevel=9,
-        ) as compressed,
+        release_artifacts._DeterministicGzipWriter(raw, epoch) as compressed,
         tarfile.open(
             fileobj=compressed,
             mode="w",

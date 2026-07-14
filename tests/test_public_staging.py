@@ -52,6 +52,39 @@ def test_public_staging_is_history_free_and_matches_reviewed_archive(
     assert calls[0][2].name == "expected-artifacts"
 
 
+def test_public_staging_ignores_caller_git_template_and_global_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_release_tree(tmp_path)
+    output = tmp_path / "public-staging"
+    template = tmp_path / "poison-template"
+    hooks = template / "hooks"
+    hooks.mkdir(parents=True)
+    marker = tmp_path / "template-hook-ran"
+    hook = hooks / "pre-commit"
+    hook.write_text(
+        f"#!/bin/sh\nprintf '%s' hook > '{marker}'\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    global_config = tmp_path / "poison.gitconfig"
+    global_config.write_text(
+        f"[init]\n\ttemplateDir = {template}\n[core]\n\thooksPath = {hooks}\n",
+        encoding="utf-8",
+    )
+    install_task13_runner(monkeypatch)
+    monkeypatch.setenv("GIT_TEMPLATE_DIR", str(template))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    monkeypatch.setenv("HOME", str(tmp_path / "poison-home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "poison-xdg"))
+
+    build_public_staging(root=root, version="0.2.1", output=output)
+
+    assert not marker.exists()
+    assert (output / ".git").is_dir()
+
+
 def test_public_staging_rejects_untracked_candidate_content(tmp_path: Path) -> None:
     root = make_release_tree(tmp_path)
     (root / "untracked-local-file.txt").write_text("must not stage", encoding="utf-8")
