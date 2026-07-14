@@ -23,6 +23,7 @@ from mercury_tools.local.audit import AuditLedger
 from mercury_tools.local.credentials import CredentialSnapshot
 from mercury_tools.local.repository import RepositoryConfig, RepositoryContext
 from mercury_tools.mcp.local_runtime import LocalActionCatalog
+from mercury_tools.qualification import flowaccount as flowaccount_module
 from mercury_tools.qualification.fixtures import (
     CleanupOutcome,
     FixtureCleanupTarget,
@@ -45,6 +46,7 @@ from mercury_tools.qualification.models import (
     QualificationRunState,
     ValidationStatus,
 )
+from mercury_tools.qualification.run_store import QualificationRunStore
 from mercury_tools.qualification.semantics import load_actions, load_semantic_contracts
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -606,6 +608,18 @@ async def test_live_run_uses_one_snapshot_one_probe_and_four_canonical_reads(
         flowaccount_semantics,
         transport=httpx.MockTransport(handler),
     )
+    original_build_report = flowaccount_module.build_coverage_report
+    publication_during_report: list[bool] = []
+
+    def capture_publication_during_report(*args: Any, **kwargs: Any) -> Any:
+        publication_during_report.append(runner.run_store.publication_allowed)
+        return original_build_report(*args, **kwargs)
+
+    monkeypatch.setattr(
+        flowaccount_module,
+        "build_coverage_report",
+        capture_publication_during_report,
+    )
 
     report = await runner.qualify_all(approval=SandboxRunApproval(reads=True, writes=False))
 
@@ -615,6 +629,8 @@ async def test_live_run_uses_one_snapshot_one_probe_and_four_canonical_reads(
         if record.validation_status is ValidationStatus.LIVE_SUCCESS
     ]
     assert report.run_state is QualificationRunState.COMPLETED
+    assert publication_during_report == [False]
+    assert runner.run_store.publication_allowed is True
     assert len(report.records) == 190
     assert {(record.action_id, record.version_id) for record in live} == LIVE_READS
     assert credentials.snapshot_calls == 1
@@ -629,6 +645,12 @@ async def test_live_run_uses_one_snapshot_one_probe_and_four_canonical_reads(
     assert all(result.data is None for result in audited_results)
     public_json = json.dumps(report.public_dict(), ensure_ascii=False, sort_keys=True)
     state_json = runner.run_store.state_path.read_text(encoding="utf-8")
+    state_payload = json.loads(state_json)
+    assert state_payload["state"] == QualificationRunState.COMPLETED.value
+    assert state_payload["publication_allowed"] is False
+    reopened = QualificationRunStore(runtime.repository.root, runner.run_id)
+    assert reopened.state is QualificationRunState.COMPLETED
+    assert reopened.publication_allowed is False
     audit_json = (repository_context.audit_dir / "audit.jsonl").read_text(encoding="utf-8")
     for persisted in (public_json, state_json, audit_json):
         assert "issued-sandbox-token" not in persisted

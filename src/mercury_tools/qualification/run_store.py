@@ -86,6 +86,8 @@ class _PersistedRun(StrictSafeModel):
         _require_utc_timestamp(self.updated_at)
         if self.updated_at < self.created_at:
             raise ValueError("qualification_state_invalid")
+        if self.publication_allowed:
+            raise ValueError("qualification_state_invalid")
         handles = tuple(fixture.handle for fixture in self.fixtures)
         if handles != tuple(sorted(handles)) or len(handles) != len(set(handles)):
             raise ValueError("qualification_state_invalid")
@@ -97,16 +99,13 @@ class _PersistedRun(StrictSafeModel):
         ):
             raise ValueError("qualification_state_invalid")
         if self.state is QualificationRunState.QUARANTINED:
-            if self.quarantine_reason is None or self.publication_allowed:
+            if self.quarantine_reason is None:
                 raise ValueError("qualification_state_invalid")
         elif self.quarantine_reason is not None:
             raise ValueError("qualification_state_invalid")
-        if self.state is QualificationRunState.COMPLETED:
-            if not self.publication_allowed or any(
-                fixture.cleanup_status is not CleanupStatus.CLEANED for fixture in self.fixtures
-            ):
-                raise ValueError("qualification_state_invalid")
-        elif self.publication_allowed:
+        if self.state is QualificationRunState.COMPLETED and any(
+            fixture.cleanup_status is not CleanupStatus.CLEANED for fixture in self.fixtures
+        ):
             raise ValueError("qualification_state_invalid")
         return self
 
@@ -131,6 +130,7 @@ class QualificationRunStore:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._state_path = self._root / ".mercury" / "validation" / self._run_id / _STATE_NAME
         self._runtime_binding_failed = False
+        self._runtime_publication_granted = False
 
         run_fd = _open_run_directory(self._root, self._run_id)
         try:
@@ -180,7 +180,10 @@ class QualificationRunStore:
     @property
     def publication_allowed(self) -> bool:
         self._validate_runtime_binding()
-        return self._record.publication_allowed
+        return (
+            self._record.state is QualificationRunState.COMPLETED
+            and self._runtime_publication_granted
+        )
 
     @property
     def quarantine_reason(self) -> str | None:
@@ -347,9 +350,10 @@ class QualificationRunStore:
             raise ValueError("qualification_cleanup_incomplete")
         self._replace(
             state=QualificationRunState.COMPLETED,
-            publication_allowed=True,
+            publication_allowed=False,
             quarantine_reason=None,
         )
+        self._runtime_publication_granted = True
 
     def _replace(
         self,
@@ -357,12 +361,15 @@ class QualificationRunStore:
         transition_at: datetime | None = None,
         **updates: Any,
     ) -> None:
+        self._runtime_publication_granted = False
         self._validate_runtime_binding()
         timestamp = self._timestamp() if transition_at is None else transition_at
         if timestamp < self._record.updated_at:
             raise ValueError("qualification_clock_regressed")
         updates["updated_at"] = timestamp
-        candidate = self._record.model_copy(update=updates)
+        candidate = _PersistedRun.model_validate(
+            {**self._record.model_dump(mode="python"), **updates}
+        )
         previous = self._record
         run_fd = _open_run_directory(self._root, self._run_id)
         try:

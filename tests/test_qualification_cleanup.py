@@ -113,6 +113,7 @@ def test_cleanup_runs_once_in_reverse_dependency_order_and_persists_opaque_state
     assert report.outcome_unknown_handles == ()
     assert report.run_state is QualificationRunState.COMPLETED
     assert report.publication_allowed is True
+    assert store.publication_allowed is True
 
     repeated = asyncio.run(CleanupCoordinator(registry, adapter, store).cleanup())
     assert repeated.attempted_handles == ()
@@ -131,7 +132,7 @@ def test_cleanup_runs_once_in_reverse_dependency_order_and_persists_opaque_state
         "updated_at",
     }
     assert payload["state"] == "completed"
-    assert payload["publication_allowed"] is True
+    assert payload["publication_allowed"] is False
     assert [fixture["handle"] for fixture in payload["fixtures"]] == [
         CONTACT_HANDLE,
         INVOICE_HANDLE,
@@ -164,6 +165,11 @@ def test_cleanup_runs_once_in_reverse_dependency_order_and_persists_opaque_state
         "@",
     ):
         assert private_value not in serialized
+
+    reopened = QualificationRunStore(tmp_path, RUN_ID)
+    assert reopened.state is QualificationRunState.COMPLETED
+    assert reopened.publication_allowed is False
+    assert _state_payload(tmp_path)["publication_allowed"] is False
 
 
 def test_registry_public_references_and_cleanup_report_never_expose_provider_ids(
@@ -552,6 +558,75 @@ def test_atomic_write_failure_keeps_previous_fail_closed_state(
     assert store.state is QualificationRunState.FAILED
     assert store.publication_allowed is False
     assert _state_payload(tmp_path) == previous
+    run_dir = tmp_path / ".mercury" / "validation" / RUN_ID
+    assert not tuple(run_dir.glob(".state-*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="dir_fd checks require POSIX")
+@pytest.mark.parametrize(
+    ("failure_phase", "expected_error"),
+    [
+        ("post_rename_binding", "qualification_state_path_unsafe"),
+        ("directory_fsync", "qualification_state_write_failed"),
+    ],
+)
+def test_failed_completion_and_quarantine_never_persist_publication_permission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_phase: str,
+    expected_error: str,
+) -> None:
+    store = QualificationRunStore(tmp_path, RUN_ID)
+    real_validate = run_store_module._validate_run_directory_binding
+    real_fsync = run_store_module.os.fsync
+    binding_checks = 0
+    directory_fsync_failed = False
+
+    def fail_after_rename_binding(root: Path, run_id: str, run_fd: int) -> None:
+        nonlocal binding_checks
+        real_validate(root, run_id, run_fd)
+        binding_checks += 1
+        if binding_checks >= 2:
+            raise ValueError("qualification_state_path_unsafe")
+
+    def fail_directory_fsync_then_quarantine_write(descriptor: int) -> None:
+        nonlocal directory_fsync_failed
+        is_directory = stat.S_ISDIR(os.fstat(descriptor).st_mode)
+        if is_directory and not directory_fsync_failed:
+            directory_fsync_failed = True
+            raise OSError(errno.EIO, "simulated directory fsync failure")
+        if directory_fsync_failed and not is_directory:
+            raise OSError(errno.EIO, "simulated quarantine write failure")
+        real_fsync(descriptor)
+
+    with monkeypatch.context() as faults:
+        if failure_phase == "post_rename_binding":
+            faults.setattr(
+                run_store_module,
+                "_validate_run_directory_binding",
+                fail_after_rename_binding,
+            )
+        else:
+            faults.setattr(run_store_module.os, "fsync", fail_directory_fsync_then_quarantine_write)
+
+        with pytest.raises(ValueError, match=f"^{expected_error}$"):
+            store.complete()
+
+        after_completion = _state_payload(tmp_path)
+        assert after_completion["state"] == QualificationRunState.COMPLETED.value
+        assert after_completion["publication_allowed"] is False
+
+        with pytest.raises(ValueError, match=f"^{expected_error}$"):
+            store.quarantine("cleanup_failed")
+
+        assert _state_payload(tmp_path) == after_completion
+
+    assert store.state is QualificationRunState.FAILED
+    assert store.publication_allowed is False
+    reopened = QualificationRunStore(tmp_path, RUN_ID)
+    assert reopened.state is QualificationRunState.COMPLETED
+    assert reopened.publication_allowed is False
+    assert _state_payload(tmp_path)["publication_allowed"] is False
     run_dir = tmp_path / ".mercury" / "validation" / RUN_ID
     assert not tuple(run_dir.glob(".state-*.tmp"))
 
