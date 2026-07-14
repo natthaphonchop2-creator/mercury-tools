@@ -21,6 +21,7 @@ from typing import Protocol
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
+from mcp.types import InitializeResult
 
 from mercury_tools.release.models import (
     BUILTIN_SCANNER_VERSION,
@@ -35,9 +36,12 @@ from mercury_tools.release.scanner import (
     _canonical_archive_member,
     _deduplicate_findings,
     _is_forbidden_path,
+    _parse_local_refs,
     _path_finding,
     _read_stream_exact,
     _scan_bytes,
+    _scan_reachable_blobs,
+    _tar_entry_is_safe_type,
     _zip_entry_is_safe_type,
 )
 
@@ -111,6 +115,8 @@ _PARENT_COUNT_RECEIPTS = frozenset(
 _VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 _RECEIPT_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 _PACKAGE_TYPES = ("container", "docker", "maven", "npm", "nuget", "rubygems")
+_MCP_PROTOCOL_VERSION = "2025-11-25"
+_SUPPORTED_MCP_PROTOCOL_VERSIONS = frozenset({_MCP_PROTOCOL_VERSION})
 
 
 @dataclass(frozen=True, repr=False)
@@ -124,6 +130,7 @@ class HostedReceipt:
     parent_record_count: int | None = None
     exit_codes: tuple[int, ...] = ()
     status_codes: tuple[int, ...] = ()
+    findings: tuple[SecretFinding, ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True, repr=False)
@@ -306,9 +313,7 @@ def _scan_hosted_tar(
                 canonical = _canonical_archive_member(entry.name)
                 if (
                     canonical is None
-                    or entry.issym()
-                    or entry.islnk()
-                    or not (entry.isfile() or entry.isdir())
+                    or not _tar_entry_is_safe_type(entry)
                 ):
                     blockers.append(_hosted_archive_code("unsafe", surface))
                     continue
@@ -497,21 +502,63 @@ def _valid_pages_records(records: list[object]) -> bool:
     )
 
 
-def _valid_git_ref_map(output: bytes) -> bool:
-    refs: set[bytes] = set()
-    if not output:
+def _valid_git_ref_name(value: str) -> bool:
+    peeled = value.endswith("^{}")
+    candidate = value.removesuffix("^{}") if peeled else value
+    if not candidate.startswith("refs/") or candidate.endswith(("/", ".")):
         return False
+    if any(character in candidate for character in " ~^:?*[\\\r\n\0"):
+        return False
+    parts = candidate.split("/")
+    return (
+        len(parts) >= 3
+        and all(
+            part
+            and not part.startswith(".")
+            and not part.endswith(".lock")
+            and ".." not in part
+            for part in parts
+        )
+        and (not peeled or candidate.startswith("refs/tags/"))
+    )
+
+
+def _parse_git_ref_map(output: bytes) -> dict[str, str]:
+    refs: dict[str, str] = {}
+    if not output:
+        raise ValueError("empty_git_ref_inventory")
     for line in output.splitlines():
         parts = line.split(b"\t", 1)
         if (
             len(parts) != 2
             or re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", parts[0]) is None
-            or not parts[1].startswith((b"HEAD", b"refs/"))
-            or parts[1] in refs
         ):
-            return False
-        refs.add(parts[1])
+            raise ValueError("malformed_git_ref_inventory")
+        ref = parts[1].decode("utf-8", errors="strict")
+        if (ref != "HEAD" and not _valid_git_ref_name(ref)) or ref in refs:
+            raise ValueError("malformed_git_ref_inventory")
+        refs[ref] = parts[0].decode("ascii")
+    if "HEAD" not in refs or not any(ref.startswith("refs/") for ref in refs):
+        raise ValueError("incomplete_git_ref_inventory")
+    for ref in refs:
+        if ref.endswith("^{}") and ref.removesuffix("^{}") not in refs:
+            raise ValueError("orphaned_peeled_git_ref")
+    return refs
+
+
+def _valid_git_ref_map(output: bytes) -> bool:
+    try:
+        _parse_git_ref_map(output)
+    except (UnicodeError, ValueError):
+        return False
     return True
+
+
+def _parse_head_oid(output: bytes) -> str:
+    match = re.fullmatch(rb"([0-9a-f]{40}|[0-9a-f]{64})\n?", output)
+    if match is None:
+        raise ValueError("malformed_git_head")
+    return match.group(1).decode("ascii")
 
 
 class GhApiHostedClient:
@@ -672,6 +719,9 @@ class GhApiHostedClient:
             ),
             status_codes=tuple(
                 code for receipt in material for code in receipt.status_codes
+            ),
+            findings=_deduplicate_findings(
+                [finding for receipt in material for finding in receipt.findings]
             ),
         )
 
@@ -1002,11 +1052,14 @@ class GhApiHostedClient:
             )
         except Exception:
             query_result = CommandResult(127, b"", b"")
-        refs_valid = _valid_git_ref_map(query_result.stdout)
+        try:
+            remote_refs = _parse_git_ref_map(query_result.stdout)
+        except (UnicodeError, ValueError):
+            remote_refs = {}
         query = HostedReceipt(
             name="github_wiki_query",
             chunks=_command_chunks(query_result),
-            complete=query_result.exit_code == 0 and refs_valid,
+            complete=query_result.exit_code == 0 and bool(remote_refs),
             page_count=1,
             record_count=1,
             request_count=1,
@@ -1018,45 +1071,118 @@ class GhApiHostedClient:
                 query,
                 parent_record_count=1,
             )
-        with tempfile.TemporaryDirectory(prefix="mercury-wiki-scan-") as temporary:
-            clone = Path(temporary) / "wiki.git"
+        chunks: list[bytes] = []
+        exit_codes: list[int] = []
+        inventory_findings: tuple[SecretFinding, ...] = ()
+        complete = True
+
+        def run_command(
+            argv: tuple[str, ...],
+            *,
+            cwd: Path | None = None,
+        ) -> CommandResult:
+            remaining = policy.max_hosted_receipt_bytes - sum(map(len, chunks))
+            if remaining <= 0:
+                return CommandResult(127, b"", b"")
             try:
-                clone_result = self._command_runner.run(
-                    ("git", "clone", "--mirror", wiki_url, str(clone)),
-                    max_output_bytes=policy.max_hosted_receipt_bytes,
-                    timeout_seconds=300.0,
-                )
-                used_bytes = sum(len(chunk) for chunk in _command_chunks(clone_result))
-                content_result = self._command_runner.run(
-                    (
-                        "git",
-                        "log",
-                        "--all",
-                        "--full-history",
-                        "--no-ext-diff",
-                        "--no-renames",
-                        "--format=",
-                        "-p",
-                    ),
-                    cwd=clone,
-                    max_output_bytes=max(
-                        1,
-                        policy.max_hosted_receipt_bytes - used_bytes,
-                    ),
+                result = self._command_runner.run(
+                    argv,
+                    cwd=cwd,
+                    max_output_bytes=remaining,
                     timeout_seconds=300.0,
                 )
             except Exception:
-                clone_result = CommandResult(127, b"", b"")
-                content_result = CommandResult(127, b"", b"")
+                result = CommandResult(127, b"", b"")
+            chunks.extend(_command_chunks(result))
+            exit_codes.append(result.exit_code)
+            return result
+
+        with tempfile.TemporaryDirectory(prefix="mercury-wiki-scan-") as temporary:
+            clone = Path(temporary) / "wiki.git"
+            clone_result = run_command(
+                ("git", "clone", "--mirror", wiki_url, str(clone))
+            )
+            complete = clone_result.exit_code == 0
+            local_refs: dict[str, str] = {}
+            if complete:
+                refs_result = run_command(
+                    (
+                        "git",
+                        "for-each-ref",
+                        "--format=%(refname)%09%(objectname)%09%(*objectname)",
+                    ),
+                    cwd=clone,
+                )
+                head_result = run_command(
+                    ("git", "rev-parse", "--verify", "HEAD"),
+                    cwd=clone,
+                )
+                try:
+                    local_refs = _parse_local_refs(refs_result.stdout)
+                    local_map = {
+                        "HEAD": _parse_head_oid(head_result.stdout),
+                        **local_refs,
+                    }
+                except Exception:
+                    local_map = {}
+                complete = (
+                    refs_result.exit_code == 0
+                    and head_result.exit_code == 0
+                    and local_map == remote_refs
+                )
+            inventory_evidence: list[str] = []
+            inventory_exit_codes: list[int] = []
+            inventory_blockers: list[str] = []
+            inventory = None
+            if complete:
+                inventory = _scan_reachable_blobs(
+                    self._command_runner,
+                    clone,
+                    policy,
+                    ref_oids=local_refs.values(),
+                    evidence_hashes=inventory_evidence,
+                    exit_codes=inventory_exit_codes,
+                    blockers=inventory_blockers,
+                )
+                exit_codes.extend(inventory_exit_codes)
+                complete = inventory is not None and not inventory_blockers
+            if complete and inventory is not None:
+                final_refs_result = run_command(
+                    (
+                        "git",
+                        "for-each-ref",
+                        "--format=%(refname)%09%(objectname)%09%(*objectname)",
+                    ),
+                    cwd=clone,
+                )
+                final_head_result = run_command(
+                    ("git", "rev-parse", "--verify", "HEAD"),
+                    cwd=clone,
+                )
+                try:
+                    final_map = {
+                        "HEAD": _parse_head_oid(final_head_result.stdout),
+                        **_parse_local_refs(final_refs_result.stdout),
+                    }
+                except Exception:
+                    final_map = {}
+                complete = (
+                    final_refs_result.exit_code == 0
+                    and final_head_result.exit_code == 0
+                    and final_map == remote_refs
+                )
+                chunks.extend(inventory.public_payloads)
+                inventory_findings = inventory.findings
         download = HostedReceipt(
             name="github_wiki_download",
-            chunks=(*_command_chunks(clone_result), *_command_chunks(content_result)),
-            complete=clone_result.exit_code == 0 and content_result.exit_code == 0,
-            page_count=2,
+            chunks=tuple(chunks),
+            complete=complete,
+            page_count=1,
             record_count=1,
             request_count=1,
             parent_record_count=1,
-            exit_codes=(clone_result.exit_code, content_result.exit_code),
+            exit_codes=tuple(exit_codes),
+            findings=inventory_findings,
         )
         if sum(len(chunk) for chunk in download.chunks) > policy.max_hosted_receipt_bytes:
             download = HostedReceipt(
@@ -1068,6 +1194,7 @@ class GhApiHostedClient:
                 request_count=download.request_count,
                 parent_record_count=download.parent_record_count,
                 exit_codes=download.exit_codes,
+                findings=download.findings,
             )
         return query, download
 
@@ -1171,6 +1298,28 @@ def _mcp_result(body: bytes, *, request_id: int) -> dict[str, object]:
     ):
         raise ValueError("invalid_mcp_response")
     return payload["result"]  # type: ignore[return-value]
+
+
+def _validate_mcp_initialize_result(result: dict[str, object]) -> InitializeResult:
+    parsed = InitializeResult.model_validate(result)
+    protocol_version = parsed.protocolVersion
+    server_info = parsed.serverInfo
+    if (
+        not isinstance(protocol_version, str)
+        or protocol_version not in _SUPPORTED_MCP_PROTOCOL_VERSIONS
+        or parsed.capabilities.tools is None
+        or not server_info.name.strip()
+        or not server_info.version.strip()
+        or len(server_info.name) > 255
+        or len(server_info.version) > 255
+        or any(
+            character in value
+            for value in (server_info.name, server_info.version)
+            for character in "\r\n\0"
+        )
+    ):
+        raise ValueError("invalid_mcp_initialize_result")
+    return parsed
 
 
 @functools.lru_cache(maxsize=1)
@@ -1758,7 +1907,7 @@ class PublicMcpHostedClient:
                     "id": 1,
                     "method": "initialize",
                     "params": {
-                        "protocolVersion": "2025-11-25",
+                        "protocolVersion": _MCP_PROTOCOL_VERSION,
                         "capabilities": {},
                         "clientInfo": {
                             "name": "mercury-release-secret-gate",
@@ -1776,12 +1925,11 @@ class PublicMcpHostedClient:
                 if session_id is None:
                     raise ValueError
             result = _mcp_result(response.body, request_id=1)
-            if not isinstance(result.get("protocolVersion"), str):
-                raise ValueError
-            initialize_complete = 200 <= response.status_code < 300
+            _validate_mcp_initialize_result(result)
+            initialize_complete = response.status_code == 200
         except Exception:
             initialize_complete = False
-        if any(not 200 <= status < 300 for status in initialize_statuses):
+        if any(status != 200 for status in initialize_statuses):
             initialize_complete = False
         if sum(len(chunk) for chunk in initialize_chunks) > policy.max_hosted_receipt_bytes:
             initialize_complete = False
@@ -1817,7 +1965,7 @@ class PublicMcpHostedClient:
                 initialized_chunks.append(response.body)
                 initialized_statuses.append(response.status_code)
                 if (
-                    not 200 <= response.status_code < 300
+                    response.status_code != 202
                     or response.body
                     or not _mcp_session_header_matches(response.headers, session_id)
                 ):
@@ -2114,6 +2262,13 @@ def scan_hosted_surface(
         )
         if not valid_exit_codes or not valid_status_codes:
             blockers.append(f"hosted_receipt_malformed:{surface}")
+        valid_findings = isinstance(receipt.findings, tuple) and all(
+            isinstance(finding, SecretFinding) for finding in receipt.findings
+        )
+        if not valid_findings:
+            blockers.append(f"hosted_receipt_malformed:{surface}")
+        else:
+            findings.extend(receipt.findings)
         if (
             valid_exit_codes
             and valid_status_codes

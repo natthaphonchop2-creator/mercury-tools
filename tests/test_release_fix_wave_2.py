@@ -136,6 +136,14 @@ def _public_tool_records() -> list[dict[str, object]]:
     return records
 
 
+def _valid_initialize_result() -> dict[str, object]:
+    return {
+        "protocolVersion": "2025-11-25",
+        "capabilities": {"tools": {}},
+        "serverInfo": {"name": "test-server", "version": "1.0.0"},
+    }
+
+
 def _mcp_transport(
     tools: list[dict[str, object]],
     *,
@@ -153,7 +161,7 @@ def _mcp_transport(
             payload = {
                 "jsonrpc": "2.0",
                 "id": response_id if response_id is not None else body["id"],
-                "result": {"protocolVersion": "2025-11-25"},
+                "result": _valid_initialize_result(),
             }
             return HostedHttpResponse(
                 200,
@@ -175,7 +183,10 @@ def _mcp_transport(
 
 def _write_zip(path: Path, member: str = "safe.txt", data: bytes = b"safe") -> None:
     with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr(member, data)
+        info = zipfile.ZipInfo(member)
+        info.create_system = 3
+        info.external_attr = (stat.S_IFREG | 0o644) << 16
+        archive.writestr(info, data)
 
 
 def _write_artifact_set(root: Path) -> None:
@@ -292,7 +303,10 @@ def test_github_actions_parent_child_records_are_exact(malformed_kind: str) -> N
         if "/actions/artifacts/2/zip" in route:
             buffer = io.BytesIO()
             with zipfile.ZipFile(buffer, "w") as archive:
-                archive.writestr("safe.txt", b"safe")
+                info = zipfile.ZipInfo("safe.txt")
+                info.create_system = 3
+                info.external_attr = (stat.S_IFREG | 0o644) << 16
+                archive.writestr(info, b"safe")
             return CommandResult(0, buffer.getvalue(), b"")
         if "/actions/caches?" in route:
             return _gh_json(argv, {"total_count": 0, "actions_caches": []})

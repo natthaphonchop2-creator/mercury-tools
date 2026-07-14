@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import shutil
+import stat
 import zipfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -41,6 +42,18 @@ from mercury_tools.release.models import (
     SecretScanRequest,
 )
 from mercury_tools.release.scanner import CommandResult, build_blocked_report, scan_public_release
+
+
+def _write_regular_zip_member(
+    archive: zipfile.ZipFile,
+    name: str,
+    data: bytes,
+) -> None:
+    info = zipfile.ZipInfo(name)
+    info.create_system = 3
+    info.compress_type = archive.compression
+    info.external_attr = (stat.S_IFREG | 0o644) << 16
+    archive.writestr(info, data)
 
 
 class FakeHostedClient:
@@ -191,6 +204,14 @@ def _public_tool_records() -> list[dict[str, object]]:
         dict(record)
         for record in hosted_module._compiled_public_mcp_inventory().values()
     ]
+
+
+def _valid_initialize_result() -> dict[str, object]:
+    return {
+        "protocolVersion": "2025-11-25",
+        "capabilities": {"tools": {}},
+        "serverInfo": {"name": "test-server", "version": "1.0.0"},
+    }
 
 
 def test_inaccessible_hosted_surface_blocks_release(tmp_path: Path) -> None:
@@ -419,7 +440,7 @@ def test_gh_adapter_uses_compiled_release_asset_inventory_and_downloads_content(
         "w",
         compression=zipfile.ZIP_DEFLATED,
     ) as archive:
-        archive.writestr("release/config.txt", raw_value)
+        _write_regular_zip_member(archive, "release/config.txt", raw_value)
     releases_route = "repos/example/mercury-tools/releases?per_page=100"
     assets_route = "repos/example/mercury-tools/releases/11/assets?per_page=100"
     download_route = "repos/example/mercury-tools/releases/assets/22"
@@ -503,11 +524,11 @@ def test_hosted_archive_receipts_preflight_aliases_and_uncompressed_budget(
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         if duplicate:
-            archive.writestr("same/path.txt", b"safe")
-            archive.writestr("same//path.txt", b"safe alias")
+            _write_regular_zip_member(archive, "same/path.txt", b"safe")
+            _write_regular_zip_member(archive, "same//path.txt", b"safe alias")
         else:
-            archive.writestr("one.txt", b"a" * 6)
-            archive.writestr("two.txt", b"b" * 6)
+            _write_regular_zip_member(archive, "one.txt", b"a" * 6)
+            _write_regular_zip_member(archive, "two.txt", b"b" * 6)
     surface = "github_releases_and_assets"
     inspection = HostedInspection(
         receipts=(
@@ -550,13 +571,16 @@ def test_hosted_archive_receipts_preflight_aliases_and_uncompressed_budget(
     assert blocker in result.blockers
 
 
-def test_gh_wiki_download_reads_every_historical_diff() -> None:
-    historical_value = "gh" + "p_" + "W1x2Y3z4A5b6C7d8E9f0G1h2I3j4"
+def test_gh_wiki_download_rejects_clone_without_object_inventory() -> None:
+    oid = b"a" * 40
     runner = FakeCommandRunner(
         {
-            "ls-remote": CommandResult(0, b"a" * 40 + b"\trefs/heads/main\n", b""),
+            "ls-remote": CommandResult(
+                0,
+                oid + b"\tHEAD\n" + oid + b"\trefs/heads/main\n",
+                b"",
+            ),
             "clone": CommandResult(0, b"", b""),
-            "log": CommandResult(0, historical_value.encode(), b""),
         }
     )
     client = GhApiHostedClient(
@@ -568,9 +592,8 @@ def test_gh_wiki_download_reads_every_historical_diff() -> None:
     query, download = client._wiki_receipts(_policy())
 
     assert query.complete is True
-    assert download.complete is True
-    assert any(call[:3] == ("git", "log", "--all") for call in runner.calls)
-    assert historical_value.encode() in tuple(download.chunks)
+    assert download.complete is False
+    assert not any(call[:2] == ("git", "log") for call in runner.calls)
 
 
 def test_gh_adapter_proves_fixed_pr_actions_packages_pages_wiki_empty_receipts() -> None:
@@ -814,7 +837,7 @@ def test_marketplace_and_public_mcp_adapters_scan_fixed_http_receipts() -> None:
         if body["method"] == "notifications/initialized":
             return HostedHttpResponse(202, b"", {})
         result = (
-            {"protocolVersion": "2025-11-25"}
+            _valid_initialize_result()
             if body["method"] == "initialize"
             else {"tools": tools}
         )
@@ -859,7 +882,7 @@ def test_public_mcp_adapter_follows_tools_cursor_until_all_20_tools_are_scanned(
         if method == "notifications/initialized":
             return HostedHttpResponse(202, b"", {})
         if method == "initialize":
-            result = {"protocolVersion": "2025-11-25"}
+            result = _valid_initialize_result()
         elif method == "tools/list" and parameters == {}:
             result = {"tools": first_tools, "nextCursor": "next-page"}
         elif method == "tools/list" and parameters == {"cursor": "next-page"}:
@@ -897,7 +920,7 @@ def test_public_mcp_adapter_rejects_a_tools_page_over_the_record_budget() -> Non
         if body["method"] == "notifications/initialized":
             return HostedHttpResponse(202, b"", {})
         result = (
-            {"protocolVersion": "2025-11-25"}
+            _valid_initialize_result()
             if body["method"] == "initialize"
             else {"tools": tools}
         )
@@ -940,7 +963,7 @@ def test_public_mcp_adapter_handles_sse_session_handshake_without_persisting_ses
                 {
                     "jsonrpc": "2.0",
                     "id": body["id"],
-                    "result": {"protocolVersion": "2025-11-25"},
+                    "result": _valid_initialize_result(),
                 }
             )
             return HostedHttpResponse(

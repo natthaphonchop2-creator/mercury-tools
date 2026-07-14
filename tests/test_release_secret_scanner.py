@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -122,7 +123,19 @@ class GitScannerRunner:
 
 def _write_zip(path: Path, name: str = "README.txt", data: bytes = b"safe fixture") -> None:
     with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr(name, data)
+        _write_regular_zip_member(archive, name, data)
+
+
+def _write_regular_zip_member(
+    archive: zipfile.ZipFile,
+    name: str,
+    data: bytes,
+) -> None:
+    info = zipfile.ZipInfo(name)
+    info.create_system = 3
+    info.compress_type = archive.compression
+    info.external_attr = (stat.S_IFREG | 0o644) << 16
+    archive.writestr(info, data)
 
 
 def _write_tar(path: Path, name: str = "README.txt", data: bytes = b"safe fixture") -> None:
@@ -828,8 +841,8 @@ def test_archive_rejects_duplicate_canonical_member_aliases_before_scanning(
     target = artifacts / "mercury-tools-source.zip"
     if archive_format == "zip":
         with zipfile.ZipFile(target, "w") as archive:
-            archive.writestr("same/path.txt", b"safe")
-            archive.writestr("same//path.txt", b"safe alias")
+            _write_regular_zip_member(archive, "same/path.txt", b"safe")
+            _write_regular_zip_member(archive, "same//path.txt", b"safe alias")
     else:
         target.unlink()
         target = artifacts / "mercury-tools-source.tar.gz"
@@ -854,8 +867,8 @@ def test_archive_rejects_unicode_normalization_member_aliases(
     artifacts = tmp_path / "dist"
     _write_complete_artifact_set(artifacts)
     with zipfile.ZipFile(artifacts / "mercury-tools-source.zip", "w") as archive:
-        archive.writestr("caf\u00e9.txt", b"safe")
-        archive.writestr("cafe\u0301.txt", b"safe alias")
+        _write_regular_zip_member(archive, "caf\u00e9.txt", b"safe")
+        _write_regular_zip_member(archive, "cafe\u0301.txt", b"safe alias")
 
     result = scan_artifacts(artifacts, scan_request.policy)
 
@@ -869,8 +882,8 @@ def test_archive_cumulative_uncompressed_budget_blocks_before_member_reads(
     artifacts = tmp_path / "dist"
     _write_complete_artifact_set(artifacts)
     with zipfile.ZipFile(artifacts / "mercury-tools-source.zip", "w") as archive:
-        archive.writestr("one.txt", b"a" * 6)
-        archive.writestr("two.txt", b"b" * 6)
+        _write_regular_zip_member(archive, "one.txt", b"a" * 6)
+        _write_regular_zip_member(archive, "two.txt", b"b" * 6)
     policy = scan_request.policy.model_copy(
         update={"max_archive_member_bytes": 8, "max_archive_uncompressed_bytes": 10}
     )
@@ -969,10 +982,10 @@ def test_fresh_clone_fetches_all_ref_classes_and_scans_reachable_history(
     assert "+refs/tags/*:refs/tags/*" in fetch
     assert "+refs/pull/*/head:refs/remotes/pull/*/head" in fetch
     assert any(
-        len(call) >= 4 and call[1] == "rev-list" and call[-1] == "--all"
+        call[1:3] == ("rev-list", "--objects") and "--stdin" in call
         for call in runner.calls
     )
-    assert any(call[1:3] == ("ls-tree", "-rzt") for call in runner.calls)
+    assert any(call[1:3] == ("ls-tree", "-z") for call in runner.calls)
     assert any(
         Path(call[0]).name == "gitleaks" and "--log-opts=--all" in call
         for call in runner.calls

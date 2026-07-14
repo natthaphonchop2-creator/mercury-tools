@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import bz2
 import contextlib
 import hashlib
 import io
 import json
+import lzma
 import math
 import os
 import re
@@ -14,14 +16,16 @@ import selectors
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import tarfile
 import tempfile
 import time
 import unicodedata
 import zipfile
+import zlib
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -862,6 +866,14 @@ class _TraversalError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class _TraversedEntry:
+    path: Path
+    name: str
+    parent_descriptor: int
+    metadata: os.stat_result
+
+
 @dataclass
 class _ByteBudget:
     limit: int
@@ -909,77 +921,100 @@ def _walk_directory(
     before = os.fstat(descriptor)
     if not stat.S_ISDIR(before.st_mode):
         raise OSError("directory_changed")
-    _verify_directory_identity(directory, before)
-    with os.scandir(descriptor) as iterator:
-        entries = sorted(iterator, key=lambda entry: entry.name)
+    entries, manifest = _directory_manifest(descriptor)
     after_enumeration = os.fstat(descriptor)
-    if _stat_identity(after_enumeration) != _stat_identity(before):
+    if _manifest_identity(after_enumeration) != _manifest_identity(before):
         raise OSError("directory_changed")
-    _verify_directory_identity(directory, before)
 
-    for entry in entries:
-        if skip_git and entry.name == ".git":
+    for name, metadata in entries:
+        if skip_git and name == ".git":
             continue
-        if not entry.name or "/" in entry.name or entry.name in {".", ".."}:
-            raise OSError("directory_entry_invalid")
-        child = directory / entry.name
-        metadata = entry.stat(follow_symlinks=False)
-        current = child.lstat()
-        if _stat_identity(current) != _stat_identity(metadata):
-            raise OSError("directory_entry_changed")
-        yield child
+        child = directory / name
+        traversed = _TraversedEntry(
+            path=child,
+            name=name,
+            parent_descriptor=descriptor,
+            metadata=metadata,
+        )
+        yield traversed
         if not stat.S_ISDIR(metadata.st_mode):
             continue
-        child_descriptor = os.open(entry.name, flags, dir_fd=descriptor)
+        child_descriptor = os.open(name, flags, dir_fd=descriptor)
         try:
             opened = os.fstat(child_descriptor)
-            if _stat_identity(opened) != _stat_identity(metadata):
+            if _manifest_identity(opened) != _manifest_identity(metadata):
                 raise OSError("directory_changed")
-            _verify_directory_identity(child, opened)
             yield from _walk_directory(
                 child_descriptor,
                 child,
                 skip_git=skip_git,
                 flags=flags,
             )
-            _verify_directory_identity(child, opened)
+            _verify_traversed_entry(traversed)
         finally:
             os.close(child_descriptor)
 
+    _entries_after, manifest_after = _directory_manifest(descriptor)
+    if manifest_after != manifest:
+        raise OSError("directory_manifest_changed")
     after_walk = os.fstat(descriptor)
-    if _stat_identity(after_walk) != _stat_identity(before):
+    if _manifest_identity(after_walk) != _manifest_identity(before):
         raise OSError("directory_changed")
-    _verify_directory_identity(directory, before)
 
 
-def _stat_identity(metadata: os.stat_result) -> tuple[int, int, int]:
-    return metadata.st_dev, metadata.st_ino, metadata.st_mode
+def _directory_manifest(
+    descriptor: int,
+) -> tuple[list[tuple[str, os.stat_result]], tuple[tuple[str, tuple[int, ...]], ...]]:
+    with os.scandir(descriptor) as iterator:
+        names = sorted(entry.name for entry in iterator)
+    entries: list[tuple[str, os.stat_result]] = []
+    for name in names:
+        if not name or "/" in name or name in {".", ".."}:
+            raise OSError("directory_entry_invalid")
+        metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        entries.append((name, metadata))
+    manifest = tuple((name, _manifest_identity(metadata)) for name, metadata in entries)
+    return entries, manifest
+
+
+def _manifest_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
 
 
 def _verify_directory_identity(path: Path, expected: os.stat_result) -> None:
     current = path.lstat()
     if (
         not stat.S_ISDIR(current.st_mode)
-        or _stat_identity(current) != _stat_identity(expected)
+        or _manifest_identity(current) != _manifest_identity(expected)
     ):
         raise OSError("directory_changed")
 
 
 def _read_regular_file(
-    path: Path,
-    metadata: os.stat_result,
+    entry: _TraversedEntry,
     *,
     max_bytes: int,
 ) -> bytes:
+    metadata = entry.metadata
     if metadata.st_size > max_bytes:
         raise _BudgetExceeded
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(
+        entry.name,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=entry.parent_descriptor,
+    )
     try:
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISREG(opened.st_mode)
-            or _stat_identity(opened) != _stat_identity(metadata)
-            or opened.st_size != metadata.st_size
+            or _manifest_identity(opened) != _manifest_identity(metadata)
         ):
             raise OSError("file_changed")
         chunks: list[bytes] = []
@@ -993,25 +1028,22 @@ def _read_regular_file(
         if os.read(descriptor, 1):
             raise _BudgetExceeded
         closed_over = os.fstat(descriptor)
-        if (
-            _stat_identity(closed_over) != _stat_identity(opened)
-            or closed_over.st_size != opened.st_size
-        ):
+        if _manifest_identity(closed_over) != _manifest_identity(opened):
             raise OSError("file_changed")
-        _verify_regular_file_identity(path, metadata)
+        _verify_traversed_entry(entry)
         return b"".join(chunks)
     finally:
         os.close(descriptor)
 
 
-def _verify_regular_file_identity(path: Path, expected: os.stat_result) -> None:
-    current = path.lstat()
-    if (
-        not stat.S_ISREG(current.st_mode)
-        or _stat_identity(current) != _stat_identity(expected)
-        or current.st_size != expected.st_size
-    ):
-        raise OSError("file_changed")
+def _verify_traversed_entry(entry: _TraversedEntry) -> None:
+    current = os.stat(
+        entry.name,
+        dir_fd=entry.parent_descriptor,
+        follow_symlinks=False,
+    )
+    if _manifest_identity(current) != _manifest_identity(entry.metadata):
+        raise OSError("directory_entry_changed")
 
 
 def scan_filesystem(root: Path, _policy: SecretScanPolicy) -> FilesystemScanResult:
@@ -1030,7 +1062,7 @@ def scan_filesystem(root: Path, _policy: SecretScanPolicy) -> FilesystemScanResu
     paths = _walk_paths(root, skip_git=True)
     while True:
         try:
-            path = next(paths)
+            entry = next(paths)
         except StopIteration:
             break
         except _TraversalError:
@@ -1040,15 +1072,12 @@ def scan_filesystem(root: Path, _policy: SecretScanPolicy) -> FilesystemScanResu
         if entry_count > _policy.max_filesystem_entries:
             blockers.append("filesystem_entry_limit")
             break
+        path = entry.path
         relative = path.relative_to(root)
         relative_name = relative.as_posix()
         if _is_forbidden_path(PurePosixPath(relative_name)):
             findings.append(_path_finding("forbidden_path", relative_name))
-        try:
-            metadata = path.lstat()
-        except OSError:
-            blockers.append("filesystem_read_failed")
-            continue
+        metadata = entry.metadata
         if stat.S_ISLNK(metadata.st_mode):
             blockers.append("filesystem_symlink")
             continue
@@ -1060,8 +1089,7 @@ def scan_filesystem(root: Path, _policy: SecretScanPolicy) -> FilesystemScanResu
                 continue
             byte_budget.reserve(metadata.st_size)
             data = _read_regular_file(
-                path,
-                metadata,
+                entry,
                 max_bytes=_policy.max_file_bytes,
             )
         except _BudgetExceeded:
@@ -1108,7 +1136,7 @@ def scan_artifacts(root: Path, policy: SecretScanPolicy) -> ArtifactScanResult:
     paths = _walk_paths(root)
     while True:
         try:
-            path = next(paths)
+            entry = next(paths)
         except StopIteration:
             break
         except _TraversalError:
@@ -1118,68 +1146,77 @@ def scan_artifacts(root: Path, policy: SecretScanPolicy) -> ArtifactScanResult:
         if entry_count > policy.max_artifact_entries:
             blockers.append("artifact_entry_limit")
             break
+        path = entry.path
         relative_name = path.relative_to(root).as_posix()
         if _is_forbidden_path(PurePosixPath(relative_name)):
             findings.append(_path_finding("forbidden_path", relative_name))
-        try:
-            metadata = path.lstat()
-        except OSError:
-            blockers.append("artifact_read_failed")
-            continue
+        metadata = entry.metadata
         if stat.S_ISLNK(metadata.st_mode):
             blockers.append("artifact_symlink")
             continue
         if not stat.S_ISREG(metadata.st_mode):
             continue
         kind = _artifact_kind(path)
+        if kind is not None:
+            discovered[path] = kind
         try:
             artifact_bytes.reserve(metadata.st_size)
         except _BudgetExceeded:
             blockers.append("artifact_aggregate_too_large")
-            if kind is not None:
-                discovered[path] = kind
             continue
-        if kind is None:
-            try:
-                if metadata.st_size > policy.max_file_bytes:
-                    blockers.append("artifact_sidecar_too_large")
-                    continue
-                data = _read_regular_file(
-                    path,
-                    metadata,
-                    max_bytes=policy.max_file_bytes,
-                )
-                evidence_hashes.append(hashlib.sha256(data).hexdigest())
-                findings.extend(_scan_bytes(data, relative_name, policy))
-            except (_BudgetExceeded, OSError):
-                blockers.append("artifact_sidecar_read_failed")
-            continue
-        discovered[path] = kind
         if metadata.st_size > policy.max_archive_bytes:
-            blockers.append(f"artifact_too_large:{kind.value}")
+            blockers.append(
+                f"artifact_too_large:{kind.value}"
+                if kind is not None
+                else "artifact_sidecar_too_large"
+            )
             continue
         try:
             data = _read_regular_file(
-                path,
-                metadata,
+                entry,
                 max_bytes=policy.max_archive_bytes,
             )
             evidence_hashes.append(hashlib.sha256(data).hexdigest())
         except (_BudgetExceeded, OSError):
-            blockers.append(f"artifact_read_failed:{kind.value}")
+            blockers.append(
+                f"artifact_read_failed:{kind.value}"
+                if kind is not None
+                else "artifact_sidecar_read_failed"
+            )
             continue
-        archive_findings, archive_blockers = _scan_archive(
-            _ArtifactSnapshot(name=path.name, data=data),
-            kind,
-            policy,
-            archive_bytes,
-        )
-        findings.extend(archive_findings)
-        blockers.extend(archive_blockers)
+        archive_format = _detect_archive_format(data)
+        if kind is None and archive_format is None:
+            if _archive_like_name(path.name):
+                blockers.append("artifact_opaque_sidecar")
+                findings.extend(_scan_bytes(data, relative_name, policy))
+            elif metadata.st_size > policy.max_file_bytes:
+                blockers.append("artifact_sidecar_too_large")
+            else:
+                findings.extend(_scan_bytes(data, relative_name, policy))
+        elif archive_format == "opaque":
+            findings.extend(_scan_bytes(data, relative_name, policy))
+            blockers.append(
+                "artifact_opaque_sidecar"
+                if kind is None
+                else f"artifact_read_failed:{kind.value}"
+            )
+        else:
+            archive_findings, archive_blockers = _scan_archive(
+                _ArtifactSnapshot(name=path.name, data=data),
+                kind,
+                policy,
+                archive_bytes,
+            )
+            findings.extend(archive_findings)
+            blockers.extend(archive_blockers)
         try:
-            _verify_regular_file_identity(path, metadata)
+            _verify_traversed_entry(entry)
         except OSError:
-            blockers.append(f"artifact_read_failed:{kind.value}")
+            blockers.append(
+                f"artifact_read_failed:{kind.value}"
+                if kind is not None
+                else "artifact_sidecar_read_failed"
+            )
     paths.close()
 
     kinds = tuple(kind for kind in ArtifactKind if kind in discovered.values())
@@ -1276,7 +1313,7 @@ def scan_git_repository(
                 object_count,
                 blob_count,
             )
-        checkout_ref, _local_refs = ref_sets
+        checkout_ref, local_refs = ref_sets
         checkout_result = _run_and_record(
             runner,
             ("git", "checkout", "--force", "--detach", checkout_ref),
@@ -1300,13 +1337,15 @@ def scan_git_repository(
             runner,
             clone,
             policy,
+            ref_oids=local_refs.values(),
             evidence_hashes=evidence_hashes,
             exit_codes=exit_codes,
             blockers=blockers,
         )
         if inventory is not None:
-            inventory_findings, object_count, blob_count = inventory
-            findings.extend(inventory_findings)
+            object_count = inventory.object_count
+            blob_count = inventory.blob_count
+            findings.extend(inventory.findings)
 
         checkout_scan = scan_filesystem(clone, policy)
         findings.extend(checkout_scan.findings)
@@ -1557,110 +1596,100 @@ def _valid_ref_namespace(
     return True
 
 
+@dataclass(frozen=True, repr=False)
+class _GitReachableInventory:
+    findings: tuple[SecretFinding, ...]
+    public_payloads: tuple[bytes, ...] = field(repr=False)
+    object_count: int
+    blob_count: int
+
+
+@dataclass(frozen=True, repr=False)
+class _GitObject:
+    object_type: str
+    size: int
+    data: bytes = field(repr=False)
+
+
 def _scan_reachable_blobs(
     runner: CommandRunner,
     clone: Path,
     policy: SecretScanPolicy,
     *,
+    ref_oids: Iterable[str],
     evidence_hashes: list[str],
     exit_codes: list[int],
     blockers: list[str],
-) -> tuple[list[SecretFinding], int, int] | None:
-    commit_result = _run_and_record(
+) -> _GitReachableInventory | None:
+    roots = tuple(sorted(set(ref_oids)))
+    if not roots or any(
+        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid) is None for oid in roots
+    ):
+        blockers.append("git_object_inventory_malformed")
+        return None
+
+    graph_result = _run_and_record(
         runner,
         (
             "git",
             "rev-list",
-            f"--max-count={policy.max_git_commits + 1}",
-            "--all",
+            "--objects",
+            "-z",
+            "--stdin",
         ),
         cwd=clone,
+        input_bytes=("\n".join(roots) + "\n").encode("ascii"),
         evidence_hashes=evidence_hashes,
         exit_codes=exit_codes,
-        blocker_scope="git_commit_inventory",
+        blocker_scope="git_object_graph_inventory",
         blockers=blockers,
     )
-    if commit_result is None or commit_result.exit_code != 0:
-        return None
-    try:
-        commits = tuple(
-            line.decode("ascii", errors="strict")
-            for line in commit_result.stdout.splitlines()
-            if line
-        )
-    except UnicodeError:
-        blockers.append("git_commit_inventory_malformed")
-        return None
-    if not commits or any(
-        not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)
-        for commit in commits
-    ):
-        blockers.append("git_commit_inventory_malformed")
-        return None
-    if len(commits) > policy.max_git_commits:
-        blockers.append("git_commit_limit")
+    if graph_result is None or graph_result.exit_code != 0:
         return None
 
-    findings: list[SecretFinding] = []
-    oid_paths: dict[str, set[str]] = {}
-    reachable_oids = set(commits)
-    tree_entry_count = 0
-    for commit in commits:
-        tree_result = _run_and_record(
-            runner,
-            ("git", "ls-tree", "-rzt", "--full-tree", commit),
-            cwd=clone,
-            evidence_hashes=evidence_hashes,
-            exit_codes=exit_codes,
-            blocker_scope="git_tree_inventory",
-            blockers=blockers,
-        )
-        if tree_result is None or tree_result.exit_code != 0:
-            return None
-        try:
-            records = [record for record in tree_result.stdout.split(b"\0") if record]
-            for record in records:
-                tree_entry_count += 1
-                if tree_entry_count > policy.max_git_tree_entries:
-                    blockers.append("git_tree_entry_limit")
-                    return None
-                metadata_raw, separator, path_raw = record.partition(b"\t")
-                metadata = metadata_raw.decode("ascii", errors="strict").split()
-                path = path_raw.decode("utf-8", errors="strict")
-                if separator != b"\t" or len(metadata) != 3:
+    graph_paths: dict[str, set[str]] = {}
+    graph_oids: list[str] = []
+    try:
+        last_oid: str | None = None
+        for raw_record in graph_result.stdout.split(b"\0"):
+            if not raw_record:
+                continue
+            if raw_record.startswith(b"path="):
+                if last_oid is None or graph_paths[last_oid]:
                     raise ValueError
-                mode, object_type, oid = metadata
-                candidate_path = PurePosixPath(path)
+                path = raw_record.removeprefix(b"path=").decode(
+                    "utf-8",
+                    errors="strict",
+                )
+                candidate = PurePosixPath(path)
                 if (
                     not path
-                    or candidate_path.is_absolute()
+                    or candidate.is_absolute()
                     or "\\" in path
-                    or ".." in candidate_path.parts
-                    or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid)
+                    or ".." in candidate.parts
                 ):
                     raise ValueError
-                reachable_oids.add(oid)
-                if _is_forbidden_path(candidate_path):
-                    findings.append(_path_finding("forbidden_path", path))
-                if mode == "120000" and object_type == "blob":
-                    blockers.append("git_tree_symlink")
-                    continue
-                if mode == "160000" and object_type == "commit":
-                    blockers.append("git_tree_gitlink")
-                    continue
-                if object_type == "tree" and mode == "040000":
-                    continue
-                if object_type != "blob" or mode not in {"100644", "100755"}:
-                    blockers.append("git_tree_mode_unsafe")
-                    continue
-                oid_paths.setdefault(oid, set()).add(path)
-        except (UnicodeError, ValueError):
-            blockers.append("git_tree_inventory_malformed")
-            return None
+                graph_paths[last_oid].add(path)
+                continue
+            oid = raw_record.decode("ascii", errors="strict")
+            if (
+                re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid) is None
+                or oid in graph_paths
+            ):
+                raise ValueError
+            graph_paths[oid] = set()
+            graph_oids.append(oid)
+            last_oid = oid
+    except (UnicodeError, ValueError):
+        blockers.append("git_object_inventory_malformed")
+        return None
+    if not graph_oids or not set(roots).issubset(graph_paths):
+        blockers.append("git_object_inventory_incomplete")
+        return None
+    if len(graph_oids) > policy.max_git_commits + policy.max_git_tree_entries:
+        blockers.append("git_object_limit")
+        return None
 
-    blobs = tuple(sorted(oid_paths))
-    if not blobs:
-        return findings, len(reachable_oids), 0
     type_result = _run_and_record(
         runner,
         (
@@ -1669,7 +1698,7 @@ def _scan_reachable_blobs(
             "--batch-check=%(objectname) %(objecttype) %(objectsize)",
         ),
         cwd=clone,
-        input_bytes=("\n".join(blobs) + "\n").encode("ascii"),
+        input_bytes=("\n".join(graph_oids) + "\n").encode("ascii"),
         evidence_hashes=evidence_hashes,
         exit_codes=exit_codes,
         blocker_scope="git_object_type_inventory",
@@ -1677,52 +1706,252 @@ def _scan_reachable_blobs(
     )
     if type_result is None or type_result.exit_code != 0:
         return None
-    blob_sizes: dict[str, int] = {}
+    object_metadata: dict[str, tuple[str, int]] = {}
     try:
         for line in type_result.stdout.splitlines():
             parts = line.decode("ascii", errors="strict").split()
             if (
                 len(parts) != 3
-                or parts[1] != "blob"
+                or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", parts[0]) is None
+                or parts[1] not in {"blob", "commit", "tag", "tree"}
                 or not parts[2].isdigit()
+                or parts[0] in object_metadata
             ):
                 raise ValueError
-            blob_sizes[parts[0]] = int(parts[2])
+            object_metadata[parts[0]] = parts[1], int(parts[2])
     except (UnicodeError, ValueError):
         blockers.append("git_object_inventory_malformed")
         return None
-    if set(blob_sizes) != set(blobs):
+    if set(object_metadata) != set(graph_oids):
         blockers.append("git_object_inventory_incomplete")
         return None
 
+    commits = tuple(
+        oid for oid in graph_oids if object_metadata[oid][0] == "commit"
+    )
+    if len(commits) > policy.max_git_commits:
+        blockers.append("git_commit_limit")
+        return None
+
+    objects: dict[str, _GitObject] = {}
     blob_budget = _ByteBudget(policy.max_git_blob_bytes)
-    for oid in blobs:
-        size = blob_sizes[oid]
+    metadata_budget = _ByteBudget(policy.max_git_blob_bytes)
+    for oid in graph_oids:
+        object_type, size = object_metadata[oid]
         if size > policy.max_file_bytes:
-            blockers.append("git_blob_too_large")
-            continue
+            blockers.append(
+                "git_blob_too_large" if object_type == "blob" else "git_object_too_large"
+            )
+            return None
         try:
-            blob_budget.reserve(size)
+            (blob_budget if object_type == "blob" else metadata_budget).reserve(size)
         except _BudgetExceeded:
-            blockers.append("git_blob_aggregate_too_large")
-            continue
-        blob_result = _run_and_record(
+            blockers.append(
+                "git_blob_aggregate_too_large"
+                if object_type == "blob"
+                else "git_object_aggregate_too_large"
+            )
+            return None
+        object_result = _run_and_record(
             runner,
-            ("git", "cat-file", "blob", oid),
+            ("git", "cat-file", object_type, oid),
             cwd=clone,
             evidence_hashes=evidence_hashes,
             exit_codes=exit_codes,
-            blocker_scope="git_blob_read",
+            blocker_scope=f"git_{object_type}_read",
             blockers=blockers,
         )
-        if blob_result is None or blob_result.exit_code != 0:
+        if object_result is None or object_result.exit_code != 0:
+            return None
+        if len(object_result.stdout) != size:
+            blockers.append(f"git_{object_type}_size_mismatch")
+            return None
+        objects[oid] = _GitObject(object_type, size, object_result.stdout)
+
+    commit_trees: set[str] = set()
+    for oid in commits:
+        header, separator, _message = objects[oid].data.partition(b"\n\n")
+        lines = header.splitlines()
+        if not separator or not lines:
+            blockers.append("git_commit_inventory_malformed")
+            return None
+        tree_match = re.fullmatch(rb"tree ([0-9a-f]{40}|[0-9a-f]{64})", lines[0])
+        if tree_match is None:
+            blockers.append("git_commit_inventory_malformed")
+            return None
+        tree_oid = tree_match.group(1).decode("ascii")
+        if object_metadata.get(tree_oid, (None, 0))[0] != "tree":
+            blockers.append("git_object_inventory_incomplete")
+            return None
+        commit_trees.add(tree_oid)
+        for line in lines[1:]:
+            if not line.startswith(b"parent "):
+                continue
+            parent_match = re.fullmatch(rb"parent ([0-9a-f]{40}|[0-9a-f]{64})", line)
+            if parent_match is None:
+                blockers.append("git_commit_inventory_malformed")
+                return None
+            parent_oid = parent_match.group(1).decode("ascii")
+            if object_metadata.get(parent_oid, (None, 0))[0] != "commit":
+                blockers.append("git_object_inventory_incomplete")
+                return None
+
+    tag_targets: dict[str, str] = {}
+    tag_payloads: dict[str, bytes] = {}
+    for oid, obj in objects.items():
+        if obj.object_type != "tag":
             continue
-        if len(blob_result.stdout) != size:
-            blockers.append("git_blob_size_mismatch")
+        header, separator, message = obj.data.partition(b"\n\n")
+        lines = header.splitlines()
+        if not separator or len(lines) < 3:
+            blockers.append("git_tag_inventory_malformed")
+            return None
+        target_match = re.fullmatch(rb"object ([0-9a-f]{40}|[0-9a-f]{64})", lines[0])
+        type_match = re.fullmatch(rb"type (blob|commit|tag|tree)", lines[1])
+        if target_match is None or type_match is None or not lines[2].startswith(b"tag "):
+            blockers.append("git_tag_inventory_malformed")
+            return None
+        target_oid = target_match.group(1).decode("ascii")
+        declared_type = type_match.group(1).decode("ascii")
+        if object_metadata.get(target_oid, (None, 0))[0] != declared_type:
+            blockers.append("git_object_inventory_incomplete")
+            return None
+        tag_targets[oid] = target_oid
+        tag_payloads[oid] = b"\n".join(lines[1:]) + b"\n\n" + message
+
+    root_trees = set(commit_trees)
+    for root in roots:
+        target = root
+        seen_tags: set[str] = set()
+        while objects[target].object_type == "tag":
+            if target in seen_tags or target not in tag_targets:
+                blockers.append("git_tag_inventory_malformed")
+                return None
+            seen_tags.add(target)
+            target = tag_targets[target]
+        if objects[target].object_type == "tree":
+            root_trees.add(target)
+
+    tree_entries: dict[str, tuple[tuple[str, str, str], ...]] = {}
+    edge_count = 0
+    for oid, obj in objects.items():
+        if obj.object_type != "tree":
             continue
-        for path in oid_paths[oid]:
-            findings.extend(_scan_bytes(blob_result.stdout, path, policy))
-    return findings, len(reachable_oids), len(blobs)
+        tree_result = _run_and_record(
+            runner,
+            ("git", "ls-tree", "-z", oid),
+            cwd=clone,
+            evidence_hashes=evidence_hashes,
+            exit_codes=exit_codes,
+            blocker_scope="git_tree_inventory",
+            blockers=blockers,
+        )
+        if tree_result is None or tree_result.exit_code != 0:
+            return None
+        parsed_entries: list[tuple[str, str, str]] = []
+        seen_names: set[str] = set()
+        try:
+            for record in (value for value in tree_result.stdout.split(b"\0") if value):
+                edge_count += 1
+                if edge_count > policy.max_git_tree_entries:
+                    blockers.append("git_tree_entry_limit")
+                    return None
+                raw_metadata, tab, raw_name = record.partition(b"\t")
+                metadata = raw_metadata.decode("ascii", errors="strict").split()
+                name = raw_name.decode("utf-8", errors="strict")
+                if (
+                    tab != b"\t"
+                    or len(metadata) != 3
+                    or not name
+                    or "/" in name
+                    or "\\" in name
+                    or name in {".", ".."}
+                    or name in seen_names
+                ):
+                    raise ValueError
+                mode, declared_type, target_oid = metadata
+                seen_names.add(name)
+                if mode == "120000" and declared_type == "blob":
+                    blockers.append("git_tree_symlink")
+                    continue
+                if mode == "160000" and declared_type == "commit":
+                    blockers.append("git_tree_gitlink")
+                    continue
+                safe_entry = (mode, declared_type) in {
+                    ("040000", "tree"),
+                    ("100644", "blob"),
+                    ("100755", "blob"),
+                }
+                if not safe_entry:
+                    blockers.append("git_tree_mode_unsafe")
+                    continue
+                if object_metadata.get(target_oid, (None, 0))[0] != declared_type:
+                    blockers.append("git_object_inventory_incomplete")
+                    return None
+                parsed_entries.append((name, declared_type, target_oid))
+        except (UnicodeError, ValueError):
+            blockers.append("git_tree_inventory_malformed")
+            return None
+        tree_entries[oid] = tuple(parsed_entries)
+
+    findings: list[SecretFinding] = []
+    oid_paths = {oid: set(paths) for oid, paths in graph_paths.items()}
+    visited_trees: set[str] = set()
+    visited_states: set[tuple[str, str]] = set()
+    path_count = 0
+
+    def walk_tree(tree_oid: str, prefix: str, active: frozenset[str]) -> bool:
+        nonlocal path_count
+        if tree_oid in active:
+            blockers.append("git_tree_inventory_malformed")
+            return False
+        state = (tree_oid, prefix)
+        if state in visited_states:
+            return True
+        visited_states.add(state)
+        visited_trees.add(tree_oid)
+        next_active = active | {tree_oid}
+        for name, object_type, target_oid in tree_entries.get(tree_oid, ()):
+            path_count += 1
+            if path_count > policy.max_git_tree_entries:
+                blockers.append("git_tree_entry_limit")
+                return False
+            path = f"{prefix}/{name}" if prefix else name
+            if _is_forbidden_path(PurePosixPath(path)):
+                findings.append(_path_finding("forbidden_path", path))
+            if object_type == "blob":
+                oid_paths[target_oid].add(path)
+            elif not walk_tree(target_oid, path, next_active):
+                return False
+        return True
+
+    for tree_oid in sorted(root_trees):
+        if not walk_tree(tree_oid, "", frozenset()):
+            return None
+    expected_trees = {
+        oid for oid, obj in objects.items() if obj.object_type == "tree"
+    }
+    if visited_trees != expected_trees:
+        blockers.append("git_object_inventory_incomplete")
+        return None
+
+    public_payloads: list[bytes] = []
+    blobs = tuple(oid for oid in graph_oids if objects[oid].object_type == "blob")
+    for oid in blobs:
+        data = objects[oid].data
+        public_payloads.append(data)
+        paths = oid_paths[oid] or {f"git/object/{oid}"}
+        for path in sorted(paths):
+            findings.extend(_scan_bytes(data, path, policy))
+    for oid, payload in sorted(tag_payloads.items()):
+        public_payloads.append(payload)
+        findings.extend(_scan_bytes(payload, f"git/tag/{oid}", policy))
+    return _GitReachableInventory(
+        findings=_deduplicate_findings(findings),
+        public_payloads=tuple(public_payloads),
+        object_count=len(objects),
+        blob_count=len(blobs),
+    )
 
 
 def _run_history_scanners(
@@ -1895,52 +2124,408 @@ def _is_archive_name(name: str) -> bool:
     return name.endswith((".whl", ".zip", ".tar", ".tar.gz", ".tgz"))
 
 
+def _archive_like_name(name: str) -> bool:
+    return name.casefold().endswith(
+        (
+            ".7z",
+            ".bz2",
+            ".gz",
+            ".lz4",
+            ".lzma",
+            ".rar",
+            ".tar",
+            ".tar.bz2",
+            ".tar.gz",
+            ".tar.xz",
+            ".tgz",
+            ".txz",
+            ".whl",
+            ".xz",
+            ".zip",
+            ".zst",
+        )
+    )
+
+
+def _expected_archive_formats(name: str) -> tuple[str, ...]:
+    lowered = name.casefold()
+    if lowered.endswith((".tar.gz", ".tgz")):
+        return "gzip", "tar"
+    if lowered.endswith((".tar.bz2", ".tbz2")):
+        return "bz2", "tar"
+    if lowered.endswith((".tar.xz", ".txz")):
+        return "xz", "tar"
+    if lowered.endswith((".whl", ".zip")):
+        return ("zip",)
+    if lowered.endswith(".tar"):
+        return ("tar",)
+    if lowered.endswith(".gz"):
+        return ("gzip",)
+    if lowered.endswith(".bz2"):
+        return ("bz2",)
+    if lowered.endswith(".xz"):
+        return ("xz",)
+    return ()
+
+
 @dataclass(frozen=True, repr=False)
 class _ArtifactSnapshot:
     name: str
     data: bytes = field(repr=False)
 
 
+def _detect_archive_format(data: bytes) -> str | None:
+    if data.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
+        return "zip"
+    if data.startswith(b"\x1f\x8b"):
+        return "gzip"
+    if data.startswith(b"BZh"):
+        return "bz2"
+    if data.startswith(b"\xfd7zXZ\x00"):
+        return "xz"
+    if _tar_header_is_valid(data):
+        return "tar"
+    if data.startswith(
+        (
+            b"7z\xbc\xaf'\x1c",
+            b"Rar!\x1a\x07",
+            b"\x04\x22\x4d\x18",
+            b"\x1f\x9d",
+            b"\x28\xb5\x2f\xfd",
+        )
+    ):
+        return "opaque"
+    return None
+
+
+def _tar_header_is_valid(data: bytes) -> bool:
+    if len(data) < 1024:
+        return False
+    if data[:1024] == b"\0" * 1024:
+        return len(data) % 512 == 0 and not any(data)
+    return _tar_checksum_is_valid(data[:512])
+
+
+def _tar_checksum_is_valid(header: bytes) -> bool:
+    if len(header) != 512:
+        return False
+    raw_checksum = header[148:156].strip(b" \0")
+    try:
+        expected = int(raw_checksum, 8)
+    except ValueError:
+        return False
+    unsigned = sum(header[:148]) + (8 * ord(" ")) + sum(header[156:])
+    signed = (
+        sum(value if value < 128 else value - 256 for value in header[:148])
+        + (8 * ord(" "))
+        + sum(value if value < 128 else value - 256 for value in header[156:])
+    )
+    return expected in {unsigned, signed}
+
+
+def _parse_tar_number(field: bytes) -> int:
+    if not field:
+        raise ValueError("empty_tar_number")
+    if field[0] in {0x80, 0xFF}:
+        value = int.from_bytes(field[1:], "big")
+        if field[0] == 0xFF:
+            value -= 256 ** (len(field) - 1)
+        return value
+    try:
+        return int(field.decode("ascii", errors="strict").strip(" \0") or "0", 8)
+    except (UnicodeError, ValueError) as error:
+        raise ValueError("invalid_tar_number") from error
+
+
+@dataclass(frozen=True)
+class _RawTarEntry:
+    offset: int
+    type_flag: bytes
+    size: int
+
+
+def _parse_tar_layout(data: bytes) -> tuple[tuple[_RawTarEntry, ...], bool]:
+    entries: list[_RawTarEntry] = []
+    offset = 0
+    zero_block = b"\0" * 512
+    while offset + 512 <= len(data):
+        header = data[offset : offset + 512]
+        if header == zero_block:
+            if data[offset + 512 : offset + 1024] != zero_block:
+                raise ValueError("tar_eof_incomplete")
+            trailing = data[offset + 1024 :]
+            unparsed = len(trailing) % 512 != 0 or any(trailing)
+            return tuple(entries), unparsed
+        if not _tar_checksum_is_valid(header):
+            raise ValueError("tar_checksum_invalid")
+        size = _parse_tar_number(header[124:136])
+        if size < 0:
+            raise ValueError("tar_size_invalid")
+        data_end = offset + 512 + size
+        padded_end = offset + 512 + (((size + 511) // 512) * 512)
+        if data_end > len(data) or padded_end > len(data):
+            raise ValueError("tar_entry_truncated")
+        entries.append(
+            _RawTarEntry(
+                offset=offset,
+                type_flag=header[156:157],
+                size=size,
+            )
+        )
+        offset = padded_end
+    raise ValueError("tar_eof_missing")
+
+
+def _artifact_scope(kind: ArtifactKind | None) -> str:
+    return kind.value if kind is not None else "sidecar"
+
+
 def _scan_archive(
     artifact: _ArtifactSnapshot,
-    kind: ArtifactKind,
+    kind: ArtifactKind | None,
     policy: SecretScanPolicy,
     archive_budget: _ByteBudget,
 ) -> tuple[list[SecretFinding], list[str]]:
+    return _scan_archive_at_depth(
+        artifact,
+        kind,
+        policy,
+        archive_budget,
+        depth=0,
+        expected_formats=_expected_archive_formats(artifact.name),
+    )
+
+
+def _scan_archive_at_depth(
+    artifact: _ArtifactSnapshot,
+    kind: ArtifactKind | None,
+    policy: SecretScanPolicy,
+    archive_budget: _ByteBudget,
+    *,
+    depth: int,
+    expected_formats: tuple[str, ...] | None = None,
+) -> tuple[list[SecretFinding], list[str]]:
+    scope = _artifact_scope(kind)
+    if depth > 8:
+        return [], [f"artifact_archive_depth:{scope}"]
+    if expected_formats is None:
+        expected_formats = _expected_archive_formats(artifact.name)
+    archive_format = _detect_archive_format(artifact.data)
+    if expected_formats and archive_format != expected_formats[0]:
+        return list(
+            _scan_bytes(artifact.data, f"{artifact.name}!metadata", policy)
+        ), [f"artifact_read_failed:{scope}"]
+    if archive_format == "opaque":
+        return list(
+            _scan_bytes(artifact.data, f"{artifact.name}!opaque", policy)
+        ), [f"artifact_opaque_member:{scope}"]
     try:
-        if zipfile.is_zipfile(io.BytesIO(artifact.data)):
-            return _scan_zip(artifact, kind, policy, archive_budget)
-        with tarfile.open(fileobj=io.BytesIO(artifact.data), mode="r:*"):
-            pass
-        return _scan_tar(artifact, kind, policy, archive_budget)
-    except (OSError, tarfile.TarError, zipfile.BadZipFile):
-        pass
-    return [], [f"artifact_read_failed:{kind.value}"]
+        if archive_format == "zip":
+            return _scan_zip(
+                artifact,
+                kind,
+                policy,
+                archive_budget,
+                depth=depth,
+            )
+        if archive_format == "tar":
+            return _scan_tar(
+                artifact,
+                kind,
+                policy,
+                archive_budget,
+                depth=depth,
+            )
+        if archive_format in {"gzip", "bz2", "xz"}:
+            remaining = archive_budget.limit - archive_budget.used
+            if remaining <= 0:
+                return [], [f"artifact_uncompressed_limit:{scope}"]
+            expanded, trailing, metadata = _decompress_bounded(
+                artifact.data,
+                archive_format,
+                remaining,
+            )
+            findings = list(
+                _scan_bytes(
+                    metadata,
+                    f"{artifact.name}!metadata",
+                    policy,
+                )
+            )
+            findings.extend(
+                _scan_bytes(
+                    trailing,
+                    f"{artifact.name}!trailing",
+                    policy,
+                )
+            )
+            blockers = [f"artifact_unparsed_data:{scope}"] if trailing else []
+            inner_format = _detect_archive_format(expanded)
+            remaining_expected = expected_formats[1:] if expected_formats else ()
+            if remaining_expected and inner_format != remaining_expected[0]:
+                blockers.append(f"artifact_read_failed:{scope}")
+                findings.extend(
+                    _scan_bytes(expanded, f"{artifact.name}!compressed", policy)
+                )
+                return findings, blockers
+            if inner_format is not None:
+                if inner_format == "opaque":
+                    blockers.append(f"artifact_opaque_member:{scope}")
+                    findings.extend(
+                        _scan_bytes(expanded, f"{artifact.name}!compressed", policy)
+                    )
+                    return findings, blockers
+                nested_findings, nested_blockers = _scan_archive_at_depth(
+                    _ArtifactSnapshot(name=artifact.name, data=expanded),
+                    kind,
+                    policy,
+                    archive_budget,
+                    depth=depth + 1,
+                    expected_formats=remaining_expected,
+                )
+                findings.extend(nested_findings)
+                blockers.extend(nested_blockers)
+                return findings, blockers
+            if len(expanded) > policy.max_archive_member_bytes:
+                blockers.append(f"artifact_member_too_large:{scope}")
+                return findings, blockers
+            archive_budget.reserve(len(expanded))
+            findings.extend(
+                _scan_bytes(expanded, f"{artifact.name}!compressed", policy)
+            )
+            return findings, blockers
+    except _BudgetExceeded:
+        return [], [f"artifact_uncompressed_limit:{scope}"]
+    except (
+        EOFError,
+        OSError,
+        RuntimeError,
+        tarfile.TarError,
+        zipfile.BadZipFile,
+        lzma.LZMAError,
+    ):
+        return [], [f"artifact_read_failed:{scope}"]
+    return [], [f"artifact_read_failed:{scope}"]
+
+
+def _decompress_bounded(
+    data: bytes,
+    compression: str,
+    limit: int,
+) -> tuple[bytes, bytes, bytes]:
+    magic = {
+        "gzip": b"\x1f\x8b",
+        "bz2": b"BZh",
+        "xz": b"\xfd7zXZ\x00",
+    }[compression]
+    pending = data
+    output: list[bytes] = []
+    metadata: list[bytes] = []
+    total = 0
+    while pending.startswith(magic):
+        remaining = limit - total
+        if remaining < 0:
+            raise _BudgetExceeded
+        if compression == "gzip":
+            header_end = _gzip_header_end(pending)
+            decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            chunk = decompressor.decompress(pending, remaining + 1)
+            eof = decompressor.eof
+            unused = decompressor.unused_data
+        elif compression == "bz2":
+            bz2_decompressor = bz2.BZ2Decompressor()
+            chunk = bz2_decompressor.decompress(pending, max_length=remaining + 1)
+            eof = bz2_decompressor.eof
+            unused = bz2_decompressor.unused_data
+        else:
+            xz_decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_AUTO)
+            chunk = xz_decompressor.decompress(pending, max_length=remaining + 1)
+            eof = xz_decompressor.eof
+            unused = xz_decompressor.unused_data
+        total += len(chunk)
+        if total > limit:
+            raise _BudgetExceeded
+        if not eof:
+            if total >= limit:
+                raise _BudgetExceeded
+            raise EOFError
+        if compression == "gzip":
+            member_end = len(pending) - len(unused)
+            if member_end < header_end + 8:
+                raise EOFError
+            metadata.extend((pending[:header_end], pending[member_end - 8 : member_end]))
+        output.append(chunk)
+        pending = unused
+        if compression in {"gzip", "xz"} and pending.startswith(b"\0"):
+            padding_length = len(pending) - len(pending.lstrip(b"\0"))
+            if compression == "gzip" or padding_length % 4 == 0:
+                metadata.append(pending[:padding_length])
+                pending = pending[padding_length:]
+    return b"".join(output), pending, b"".join(metadata)
+
+
+def _gzip_header_end(data: bytes) -> int:
+    if (
+        len(data) < 10
+        or data[:3] != b"\x1f\x8b\x08"
+        or data[3] & 0xE0
+    ):
+        raise EOFError
+    flags = data[3]
+    cursor = 10
+    if flags & 0x04:
+        if cursor + 2 > len(data):
+            raise EOFError
+        extra_length = struct.unpack("<H", data[cursor : cursor + 2])[0]
+        cursor += 2 + extra_length
+        if cursor > len(data):
+            raise EOFError
+    for flag in (0x08, 0x10):
+        if not flags & flag:
+            continue
+        terminator = data.find(b"\0", cursor)
+        if terminator < 0:
+            raise EOFError
+        cursor = terminator + 1
+    if flags & 0x02:
+        cursor += 2
+    if cursor > len(data):
+        raise EOFError
+    return cursor
 
 
 def _scan_zip(
     artifact: _ArtifactSnapshot,
-    kind: ArtifactKind,
+    kind: ArtifactKind | None,
     policy: SecretScanPolicy,
     archive_budget: _ByteBudget,
+    *,
+    depth: int = 0,
 ) -> tuple[list[SecretFinding], list[str]]:
+    scope = _artifact_scope(kind)
     findings: list[SecretFinding] = []
     blockers: list[str] = []
     try:
         with zipfile.ZipFile(io.BytesIO(artifact.data)) as archive:
             entries = archive.infolist()
             if len(entries) > policy.max_archive_entries:
-                return [], [f"artifact_entry_limit:{kind.value}"]
+                return [], [f"artifact_entry_limit:{scope}"]
+            metadata, unparsed = _zip_metadata_corpus(artifact.data, archive, entries)
+            findings.extend(
+                _scan_bytes(metadata, f"{artifact.name}!metadata", policy)
+            )
+            if unparsed:
+                blockers.append(f"artifact_unparsed_data:{scope}")
             canonical_names: set[str] = set()
             for entry in entries:
                 logical_path = f"{artifact.name}!{entry.filename}"
                 canonical = _canonical_archive_member(entry.filename)
                 if canonical is None or not _zip_entry_is_safe_type(entry):
                     findings.append(_path_finding("archive_unsafe", logical_path))
-                    blockers.append(f"artifact_unsafe_member:{kind.value}")
+                    blockers.append(f"artifact_unsafe_member:{scope}")
                     continue
                 if canonical in canonical_names:
-                    blockers.append(f"artifact_duplicate_member:{kind.value}")
+                    blockers.append(f"artifact_duplicate_member:{scope}")
                 canonical_names.add(canonical)
             if blockers:
                 return findings, blockers
@@ -1949,12 +2534,12 @@ def _scan_zip(
                 if canonical is None or not _zip_entry_is_safe_type(entry) or entry.is_dir():
                     continue
                 if entry.file_size > policy.max_archive_member_bytes:
-                    blockers.append(f"artifact_member_too_large:{kind.value}")
+                    blockers.append(f"artifact_member_too_large:{scope}")
                     continue
                 try:
                     archive_budget.reserve(entry.file_size)
                 except _BudgetExceeded:
-                    blockers.append(f"artifact_uncompressed_limit:{kind.value}")
+                    blockers.append(f"artifact_uncompressed_limit:{scope}")
             if blockers:
                 return findings, blockers
             for entry in entries:
@@ -1970,53 +2555,159 @@ def _scan_zip(
                 with archive.open(entry, "r") as stream:
                     data = _read_stream_exact(stream, entry.file_size)
                 findings.extend(_scan_bytes(data, logical_path, policy))
+                nested_format = _detect_archive_format(data)
+                if nested_format is not None:
+                    nested_findings, nested_blockers = _scan_archive_at_depth(
+                        _ArtifactSnapshot(name=logical_path, data=data),
+                        kind,
+                        policy,
+                        archive_budget,
+                        depth=depth + 1,
+                    )
+                    findings.extend(nested_findings)
+                    blockers.extend(nested_blockers)
     except (OSError, RuntimeError, EOFError, zipfile.BadZipFile):
-        blockers.append(f"artifact_read_failed:{kind.value}")
+        blockers.append(f"artifact_read_failed:{scope}")
     return findings, blockers
+
+
+def _zip_metadata_corpus(
+    data: bytes,
+    archive: zipfile.ZipFile,
+    entries: list[zipfile.ZipInfo],
+) -> tuple[bytes, bool]:
+    start_dir = archive.start_dir
+    if not isinstance(start_dir, int) or start_dir < 0 or start_dir > len(data):
+        raise zipfile.BadZipFile
+    layouts: list[tuple[int, int, int, bool]] = []
+    for entry in sorted(entries, key=lambda item: item.header_offset):
+        offset = entry.header_offset
+        if (
+            offset < 0
+            or offset + 30 > len(data)
+            or data[offset : offset + 4] != b"PK\x03\x04"
+        ):
+            raise zipfile.BadZipFile
+        name_length, extra_length = struct.unpack("<HH", data[offset + 26 : offset + 30])
+        payload_start = offset + 30 + name_length + extra_length
+        payload_end = payload_start + entry.compress_size
+        if payload_start > payload_end or payload_end > start_dir:
+            raise zipfile.BadZipFile
+        layouts.append((offset, payload_start, payload_end, bool(entry.flag_bits & 0x08)))
+    eocd_offset, eocd_end = _zip_eocd_bounds(data)
+    unparsed = bool(
+        (layouts and layouts[0][0] != 0)
+        or (not layouts and (start_dir != 0 or eocd_offset != 0))
+    )
+    for index, (_offset, _payload_start, payload_end, has_descriptor) in enumerate(layouts):
+        next_offset = layouts[index + 1][0] if index + 1 < len(layouts) else start_dir
+        if payload_end > next_offset:
+            raise zipfile.BadZipFile
+        gap = data[payload_end:next_offset]
+        if not gap:
+            continue
+        descriptor_length = len(gap)
+        descriptor_valid = has_descriptor and descriptor_length in {12, 16, 20, 24}
+        if descriptor_valid and descriptor_length in {16, 24}:
+            descriptor_valid = gap.startswith(b"PK\x07\x08")
+        if not descriptor_valid:
+            unparsed = True
+    if eocd_end < len(data):
+        unparsed = True
+    intervals = sorted((start, end) for _offset, start, end, _flag in layouts)
+    metadata_chunks: list[bytes] = []
+    cursor = 0
+    for start, end in intervals:
+        if start < cursor:
+            raise zipfile.BadZipFile
+        metadata_chunks.append(data[cursor:start])
+        cursor = end
+    metadata_chunks.append(data[cursor:])
+    return b"".join(metadata_chunks), unparsed
+
+
+def _zip_eocd_bounds(data: bytes) -> tuple[int, int]:
+    search_start = max(0, len(data) - (65535 + 22 + 65535))
+    offset = data.rfind(b"PK\x05\x06", search_start)
+    while offset >= search_start:
+        if offset + 22 <= len(data):
+            comment_length = struct.unpack("<H", data[offset + 20 : offset + 22])[0]
+            end = offset + 22 + comment_length
+            if end <= len(data):
+                return offset, end
+        offset = data.rfind(b"PK\x05\x06", search_start, offset)
+    raise zipfile.BadZipFile
 
 
 def _scan_tar(
     artifact: _ArtifactSnapshot,
-    kind: ArtifactKind,
+    kind: ArtifactKind | None,
     policy: SecretScanPolicy,
     archive_budget: _ByteBudget,
+    *,
+    depth: int = 0,
 ) -> tuple[list[SecretFinding], list[str]]:
-    findings: list[SecretFinding] = []
+    scope = _artifact_scope(kind)
+    findings: list[SecretFinding] = list(
+        _scan_bytes(artifact.data, f"{artifact.name}!metadata", policy)
+    )
     blockers: list[str] = []
     try:
-        with tarfile.open(fileobj=io.BytesIO(artifact.data), mode="r:*") as archive:
+        raw_entries, unparsed = _parse_tar_layout(artifact.data)
+    except ValueError:
+        return findings, [f"artifact_read_failed:{scope}"]
+    if len(raw_entries) > policy.max_archive_entries:
+        return findings, [f"artifact_entry_limit:{scope}"]
+    if unparsed:
+        blockers.append(f"artifact_unparsed_data:{scope}")
+    if any(
+        entry.type_flag not in {tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE}
+        for entry in raw_entries
+    ):
+        blockers.append(f"artifact_unsafe_member:{scope}")
+        return findings, blockers
+    try:
+        with tarfile.open(fileobj=io.BytesIO(artifact.data), mode="r:") as archive:
             entries = archive.getmembers()
-            if len(entries) > policy.max_archive_entries:
-                return [], [f"artifact_entry_limit:{kind.value}"]
+            if len(entries) != len(raw_entries):
+                return findings, [f"artifact_read_failed:{scope}"]
+            if any(
+                entry.offset != raw.offset
+                or entry.offset_data != raw.offset + 512
+                or entry.type != raw.type_flag
+                or entry.size != raw.size
+                for entry, raw in zip(entries, raw_entries, strict=True)
+            ):
+                return findings, [f"artifact_read_failed:{scope}"]
             canonical_names: set[str] = set()
             for entry in entries:
                 logical_path = f"{artifact.name}!{entry.name}"
                 canonical = _canonical_archive_member(entry.name)
-                if canonical is None or not (entry.isfile() or entry.isdir()):
+                if canonical is None or not _tar_entry_is_safe_type(entry):
                     findings.append(_path_finding("archive_unsafe", logical_path))
-                    blockers.append(f"artifact_unsafe_member:{kind.value}")
+                    blockers.append(f"artifact_unsafe_member:{scope}")
                     continue
                 if canonical in canonical_names:
-                    blockers.append(f"artifact_duplicate_member:{kind.value}")
+                    blockers.append(f"artifact_duplicate_member:{scope}")
                 canonical_names.add(canonical)
             if blockers:
                 return findings, blockers
             for entry in entries:
                 canonical = _canonical_archive_member(entry.name)
-                if canonical is None or not (entry.isfile() or entry.isdir()) or not entry.isfile():
+                if canonical is None or not _tar_entry_is_safe_type(entry) or entry.isdir():
                     continue
                 if entry.size > policy.max_archive_member_bytes:
-                    blockers.append(f"artifact_member_too_large:{kind.value}")
+                    blockers.append(f"artifact_member_too_large:{scope}")
                     continue
                 try:
                     archive_budget.reserve(entry.size)
                 except _BudgetExceeded:
-                    blockers.append(f"artifact_uncompressed_limit:{kind.value}")
+                    blockers.append(f"artifact_uncompressed_limit:{scope}")
             if blockers:
                 return findings, blockers
             for entry in entries:
                 canonical = _canonical_archive_member(entry.name)
-                if canonical is None or not (entry.isfile() or entry.isdir()):
+                if canonical is None or not _tar_entry_is_safe_type(entry):
                     continue
                 if not entry.isfile():
                     continue
@@ -2025,13 +2716,24 @@ def _scan_tar(
                     findings.append(_path_finding("forbidden_path", logical_path))
                 stream = archive.extractfile(entry)
                 if stream is None:
-                    blockers.append(f"artifact_read_failed:{kind.value}")
+                    blockers.append(f"artifact_read_failed:{scope}")
                     continue
                 with stream:
                     data = _read_stream_exact(stream, entry.size)
                 findings.extend(_scan_bytes(data, logical_path, policy))
+                nested_format = _detect_archive_format(data)
+                if nested_format is not None:
+                    nested_findings, nested_blockers = _scan_archive_at_depth(
+                        _ArtifactSnapshot(name=logical_path, data=data),
+                        kind,
+                        policy,
+                        archive_budget,
+                        depth=depth + 1,
+                    )
+                    findings.extend(nested_findings)
+                    blockers.extend(nested_blockers)
     except (OSError, EOFError, tarfile.TarError):
-        blockers.append(f"artifact_read_failed:{kind.value}")
+        blockers.append(f"artifact_read_failed:{scope}")
     return findings, blockers
 
 
@@ -2075,11 +2777,22 @@ def _zip_entry_is_symlink(entry: zipfile.ZipInfo) -> bool:
 
 def _zip_entry_is_safe_type(entry: zipfile.ZipInfo) -> bool:
     if entry.create_system != 3:
-        return True
+        return False
     member_type = (entry.external_attr >> 16) & 0o170000
     if entry.is_dir():
-        return member_type in {0, stat.S_IFDIR}
-    return member_type in {0, stat.S_IFREG}
+        return member_type == stat.S_IFDIR
+    return member_type == stat.S_IFREG
+
+
+def _tar_entry_is_safe_type(entry: tarfile.TarInfo) -> bool:
+    if entry.type not in {tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE}:
+        return False
+    if entry.type == tarfile.DIRTYPE:
+        return entry.isdir()
+    sparse = getattr(entry, "sparse", None)
+    return entry.isfile() and not sparse and not any(
+        key.startswith("GNU.sparse.") for key in entry.pax_headers
+    )
 
 
 def _is_forbidden_path(path: PurePosixPath) -> bool:
