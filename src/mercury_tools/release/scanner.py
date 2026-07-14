@@ -2174,6 +2174,34 @@ class _ArtifactSnapshot:
     data: bytes = field(repr=False)
 
 
+_ZIP_PREFIX_ARCHIVE_SIGNATURES = (
+    b"PK\x03\x04",
+    b"PK\x01\x02",
+    b"PK\x05\x06",
+    b"PK\x07\x08",
+    b"PK\x06\x06",
+    b"PK\x06\x07",
+)
+_ZIP_PREFIX_COMPRESSION_SIGNATURES = (
+    b"\x1f\x8b",
+    b"BZh",
+    b"\xfd7zXZ\x00",
+)
+_ZIP_PREFIX_OPAQUE_SIGNATURES = (
+    b"7z\xbc\xaf'\x1c",
+    b"Rar!\x1a\x07",
+    b"\x04\x22\x4d\x18",
+    b"\x1f\x9d",
+    b"\x28\xb5\x2f\xfd",
+)
+_ZIP_PREFIX_TAR_SIGNATURES = (b"ustar\x00", b"ustar ")
+_TAR_CHECKSUM_FIELD_PATTERNS = (
+    re.compile(rb"[ 0-7]{6}\x00 "),
+    re.compile(rb"[ 0-7]{6} \x00"),
+    re.compile(rb"[ 0-7]{7}\x00"),
+)
+
+
 def _detect_archive_format(data: bytes) -> str | None:
     zip_magic = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
     if data.startswith(zip_magic) or _has_bounded_zip_structure(data):
@@ -2657,25 +2685,24 @@ def _zip_metadata_corpus(
 
 
 def _zip_prefix_contains_archive(prefix: bytes) -> bool:
-    if not prefix:
-        return False
-    if prefix.startswith(
-        (
-            b"PK\x03\x04",
-            b"PK\x05\x06",
-            b"PK\x07\x08",
-            b"\x1f\x8b",
-            b"BZh",
-            b"\xfd7zXZ\x00",
-            b"7z\xbc\xaf'\x1c",
-            b"Rar!\x1a\x07",
-            b"\x04\x22\x4d\x18",
-            b"\x1f\x9d",
-            b"\x28\xb5\x2f\xfd",
-        )
-    ):
+    candidates = (
+        *_ZIP_PREFIX_ARCHIVE_SIGNATURES,
+        *_ZIP_PREFIX_COMPRESSION_SIGNATURES,
+        *_ZIP_PREFIX_OPAQUE_SIGNATURES,
+        *_ZIP_PREFIX_TAR_SIGNATURES,
+    )
+    if any(candidate in prefix for candidate in candidates):
         return True
-    return _tar_header_is_valid(prefix) or _has_bounded_zip_structure(prefix)
+    for pattern in _TAR_CHECKSUM_FIELD_PATTERNS:
+        for match in pattern.finditer(prefix):
+            header_offset = match.start() - 148
+            if (
+                header_offset >= 0
+                and header_offset + 512 <= len(prefix)
+                and _tar_checksum_is_valid(prefix[header_offset : header_offset + 512])
+            ):
+                return True
+    return False
 
 
 def _zip_eocd_bounds(data: bytes) -> tuple[int, int]:

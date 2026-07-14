@@ -170,6 +170,14 @@ def _complete_inspection(surface: str, *chunks: bytes) -> HostedInspection:
         HostedReceipt(
             name=name,
             chunks=material if index == 0 else (),
+            object_boundaries=(
+                tuple(
+                    hosted_module.HostedObjectBoundary(1, len(chunk))
+                    for chunk in (material if index == 0 else ())
+                )
+                if name in hosted_module._ARCHIVE_CAPABLE_RECEIPTS
+                else None
+            ),
             complete=True,
             page_count=1,
             record_count=len(material) if index == 0 else 0,
@@ -255,6 +263,9 @@ def test_zero_records_pass_only_when_every_expected_receipt_proves_complete_empt
             HostedReceipt(
                 name=name,
                 chunks=(),
+                object_boundaries=(
+                    () if name in hosted_module._ARCHIVE_CAPABLE_RECEIPTS else None
+                ),
                 complete=True,
                 page_count=1,
                 record_count=0,
@@ -311,6 +322,7 @@ def test_each_hosted_receipt_reconciles_completion_status_exit_and_budgets(
         for field in (
             "name",
             "chunks",
+            "object_boundaries",
             "complete",
             "page_count",
             "record_count",
@@ -551,6 +563,9 @@ def test_hosted_archive_receipts_preflight_aliases_and_uncompressed_budget(
             HostedReceipt(
                 name="github_release_assets_download",
                 chunks=(buffer.getvalue(),),
+                object_boundaries=(
+                    hosted_module.HostedObjectBoundary(1, len(buffer.getvalue())),
+                ),
                 complete=True,
                 page_count=1,
                 record_count=1,

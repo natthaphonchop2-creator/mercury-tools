@@ -104,11 +104,36 @@ _PARENT_COUNT_RECEIPTS = frozenset(
         "supabase_storage_download",
     }
 )
+_ARCHIVE_CAPABLE_RECEIPTS = frozenset(
+    {
+        "github_release_assets_download",
+        "github_actions_logs_download",
+        "github_actions_artifacts_download",
+        "github_actions_caches_content",
+        "github_package_versions_content",
+        "github_pages_download",
+        "github_wiki_download",
+        "marketplace_snapshot_download",
+        "supabase_storage_download",
+    }
+)
+_PAGE_BOUND_ARCHIVE_RECEIPTS = frozenset({"marketplace_snapshot_download"})
+_REQUEST_BOUND_ARCHIVE_RECEIPTS = _ARCHIVE_CAPABLE_RECEIPTS.difference(
+    {"github_wiki_download", *_PAGE_BOUND_ARCHIVE_RECEIPTS}
+)
 _VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 _RECEIPT_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 _PACKAGE_TYPES = ("container", "docker", "maven", "npm", "nuget", "rubygems")
 _MCP_PROTOCOL_VERSION = "2025-11-25"
 _SUPPORTED_MCP_PROTOCOL_VERSIONS = frozenset({_MCP_PROTOCOL_VERSION})
+
+
+@dataclass(frozen=True, repr=False)
+class HostedObjectBoundary:
+    """Consume the next transport chunks as one complete downloaded object."""
+
+    chunk_count: int
+    byte_count: int
 
 
 @dataclass(frozen=True, repr=False)
@@ -123,6 +148,31 @@ class HostedReceipt:
     exit_codes: tuple[int, ...] = ()
     status_codes: tuple[int, ...] = ()
     findings: tuple[SecretFinding, ...] = field(default=(), repr=False)
+    object_boundaries: tuple[HostedObjectBoundary, ...] | None = None
+
+
+def _object_boundaries_for_chunks(
+    name: str,
+    chunks: Iterable[bytes],
+) -> tuple[HostedObjectBoundary, ...] | None:
+    if name not in _ARCHIVE_CAPABLE_RECEIPTS:
+        return None
+    return tuple(HostedObjectBoundary(1, len(chunk)) for chunk in chunks)
+
+
+def _merged_object_boundaries(
+    name: str,
+    receipts: tuple[HostedReceipt, ...],
+) -> tuple[HostedObjectBoundary, ...] | None:
+    if name not in _ARCHIVE_CAPABLE_RECEIPTS:
+        return None
+    if any(receipt.object_boundaries is None for receipt in receipts):
+        return None
+    return tuple(
+        boundary
+        for receipt in receipts
+        for boundary in receipt.object_boundaries or ()
+    )
 
 
 @dataclass(frozen=True, repr=False)
@@ -327,6 +377,68 @@ def _scan_hosted_archive(
     if _detect_archive_format(data) is None:
         return [], []
     return _scan_complete_hosted_archive(data, surface, policy, budget)
+
+
+def _scan_hosted_archive_objects(
+    chunks: tuple[bytes, ...],
+    boundaries: tuple[HostedObjectBoundary, ...] | None,
+    surface: str,
+    policy: SecretScanPolicy,
+    budget: _HostedArchiveBudget,
+    *,
+    expected_object_count: int | None,
+) -> tuple[list[SecretFinding], list[str]]:
+    boundary_code = f"hosted_archive_boundary_invalid:{surface}"
+    if (
+        not isinstance(boundaries, tuple)
+        or len(boundaries) > policy.max_hosted_records
+        or (
+            expected_object_count is not None
+            and len(boundaries) != expected_object_count
+        )
+    ):
+        return [], [boundary_code]
+    spans: list[tuple[int, int, int]] = []
+    cursor = 0
+    for boundary in boundaries:
+        if (
+            not isinstance(boundary, HostedObjectBoundary)
+            or isinstance(boundary.chunk_count, bool)
+            or not isinstance(boundary.chunk_count, int)
+            or boundary.chunk_count <= 0
+            or isinstance(boundary.byte_count, bool)
+            or not isinstance(boundary.byte_count, int)
+            or boundary.byte_count < 0
+            or boundary.chunk_count > policy.max_hosted_records
+        ):
+            return [], [boundary_code]
+        end = cursor + boundary.chunk_count
+        if end > len(chunks):
+            return [], [boundary_code]
+        actual_bytes = sum(len(chunk) for chunk in chunks[cursor:end])
+        if actual_bytes != boundary.byte_count:
+            return [], [boundary_code]
+        spans.append((cursor, end, boundary.byte_count))
+        cursor = end
+    if cursor != len(chunks):
+        return [], [boundary_code]
+
+    findings: list[SecretFinding] = []
+    blockers: list[str] = []
+    for start, end, byte_count in spans:
+        if byte_count > policy.max_archive_bytes:
+            blockers.append(_hosted_archive_code("too_large", surface))
+            continue
+        data = b"".join(chunks[start:end])
+        archive_findings, archive_blockers = _scan_hosted_archive(
+            data,
+            surface,
+            policy,
+            budget,
+        )
+        findings.extend(archive_findings)
+        blockers.extend(archive_blockers)
+    return findings, blockers
 
 
 def _page_records(payload: object, record_key: str | None) -> list[object] | None:
@@ -614,6 +726,7 @@ class GhApiHostedClient:
         if not material:
             return HostedReceipt(
                 name=name,
+                object_boundaries=_object_boundaries_for_chunks(name, ()),
                 complete=False,
                 page_count=1,
                 request_count=0,
@@ -623,6 +736,7 @@ class GhApiHostedClient:
         return HostedReceipt(
             name=name,
             chunks=tuple(chunk for receipt in material for chunk in receipt.chunks),
+            object_boundaries=_merged_object_boundaries(name, material),
             complete=(
                 all(receipt.complete for receipt in material)
                 and (
@@ -654,6 +768,7 @@ class GhApiHostedClient:
     ) -> HostedReceipt:
         return HostedReceipt(
             name=name,
+            object_boundaries=_object_boundaries_for_chunks(name, ()),
             complete=proof.complete and parent_record_count == 0,
             page_count=max(1, proof.page_count),
             record_count=0,
@@ -668,6 +783,7 @@ class GhApiHostedClient:
             return self._derived_empty(name, proof)
         return HostedReceipt(
             name=name,
+            object_boundaries=_object_boundaries_for_chunks(name, ()),
             complete=False,
             page_count=1,
             record_count=proof.record_count,
@@ -712,10 +828,21 @@ class GhApiHostedClient:
                 result = CommandResult(exit_code=127, stdout=b"", stderr=b"")
             result_chunks = _command_chunks(result)
             used_bytes += sum(len(chunk) for chunk in result_chunks)
+            object_boundaries = (
+                (
+                    HostedObjectBoundary(
+                        chunk_count=len(result_chunks),
+                        byte_count=sum(len(chunk) for chunk in result_chunks),
+                    ),
+                )
+                if result_chunks
+                else ()
+            )
             receipts.append(
                 HostedReceipt(
                     name=name,
                     chunks=result_chunks,
+                    object_boundaries=object_boundaries,
                     complete=result.exit_code == 0,
                     page_count=1,
                     record_count=1,
@@ -1096,6 +1223,10 @@ class GhApiHostedClient:
         download = HostedReceipt(
             name="github_wiki_download",
             chunks=tuple(chunks),
+            object_boundaries=_object_boundaries_for_chunks(
+                "github_wiki_download",
+                chunks,
+            ),
             complete=complete,
             page_count=1,
             record_count=1,
@@ -1108,6 +1239,7 @@ class GhApiHostedClient:
             download = HostedReceipt(
                 name=download.name,
                 chunks=download.chunks,
+                object_boundaries=download.object_boundaries,
                 complete=False,
                 page_count=download.page_count,
                 record_count=download.record_count,
@@ -1425,6 +1557,7 @@ def _http_receipt(
     return HostedReceipt(
         name=name,
         chunks=tuple(chunks),
+        object_boundaries=_object_boundaries_for_chunks(name, chunks),
         complete=complete,
         page_count=max(1, len(statuses)),
         record_count=record_count,
@@ -1465,6 +1598,7 @@ def _merge_receipts(
     if not material:
         return HostedReceipt(
             name=name,
+            object_boundaries=_object_boundaries_for_chunks(name, ()),
             complete=False,
             request_count=0,
             parent_record_count=parent_record_count,
@@ -1473,6 +1607,7 @@ def _merge_receipts(
     return HostedReceipt(
         name=name,
         chunks=tuple(chunk for receipt in material for chunk in receipt.chunks),
+        object_boundaries=_merged_object_boundaries(name, material),
         complete=(
             all(receipt.complete for receipt in material)
             and (
@@ -1492,6 +1627,7 @@ def _merge_receipts(
 def _derived_http_empty(name: str, proof: HostedReceipt) -> HostedReceipt:
     return HostedReceipt(
         name=name,
+        object_boundaries=_object_boundaries_for_chunks(name, ()),
         complete=proof.complete and proof.record_count == 0,
         page_count=proof.page_count,
         record_count=0,
@@ -2189,6 +2325,22 @@ def scan_hosted_surface(
             blockers.append(f"hosted_receipt_malformed:{surface}")
         else:
             findings.extend(receipt.findings)
+        receipt_shape_valid = (
+            valid_page_count
+            and valid_record_count
+            and valid_request_count
+            and valid_parent_count
+            and isinstance(receipt.complete, bool)
+            and valid_exit_codes
+            and valid_status_codes
+            and valid_findings
+        )
+        if (
+            receipt_shape_valid
+            and receipt.name in _ARCHIVE_CAPABLE_RECEIPTS
+            and receipt.object_boundaries is None
+        ):
+            blockers.append(f"hosted_archive_boundary_invalid:{surface}")
         if (
             valid_exit_codes
             and valid_status_codes
@@ -2230,8 +2382,37 @@ def scan_hosted_surface(
             if valid_parent_count and receipt.parent_record_count is not None
             else b"none"
         )
+        evidence_hash.update(b"\0object-boundaries\0")
+        if receipt.object_boundaries is None:
+            evidence_hash.update(b"none")
+        elif isinstance(receipt.object_boundaries, tuple):
+            evidence_hash.update(len(receipt.object_boundaries).to_bytes(8, "big"))
+            boundaries_for_evidence = (
+                receipt.object_boundaries
+                if len(receipt.object_boundaries) <= policy.max_hosted_records
+                else ()
+            )
+            if not boundaries_for_evidence and receipt.object_boundaries:
+                evidence_hash.update(b"invalid")
+            for boundary in boundaries_for_evidence:
+                if not isinstance(boundary, HostedObjectBoundary):
+                    evidence_hash.update(b"invalid")
+                    continue
+                for value in (boundary.chunk_count, boundary.byte_count):
+                    if (
+                        isinstance(value, int)
+                        and not isinstance(value, bool)
+                        and 0 <= value < 2**64
+                    ):
+                        evidence_hash.update(value.to_bytes(8, "big"))
+                    else:
+                        evidence_hash.update(b"invalid")
+                    evidence_hash.update(b"\0")
+        else:
+            evidence_hash.update(b"invalid")
         receipt_bytes = 0
         chunk_count = 0
+        material_chunks: list[bytes] = []
         tail = b""
         stream_ok = True
         try:
@@ -2240,20 +2421,13 @@ def scan_hosted_surface(
                     stream_ok = False
                     break
                 chunk_count += 1
+                material_chunks.append(chunk)
                 receipt_bytes += len(chunk)
                 total_bytes += len(chunk)
                 evidence_hash.update(len(chunk).to_bytes(8, "big"))
                 evidence_hash.update(chunk)
                 window = tail + chunk
                 findings.extend(_scan_bytes(window, f"hosted/{surface}", policy))
-                archive_findings, archive_blockers = _scan_hosted_archive(
-                    chunk,
-                    surface,
-                    policy,
-                    archive_budget,
-                )
-                findings.extend(archive_findings)
-                blockers.extend(archive_blockers)
                 tail = window[-1024:]
         except Exception:
             stream_ok = False
@@ -2266,6 +2440,27 @@ def scan_hosted_surface(
             blockers.append(f"hosted_byte_limit:{surface}")
         if total_bytes > policy.max_hosted_total_bytes:
             blockers.append(f"hosted_total_byte_limit:{surface}")
+        if (
+            receipt_shape_valid
+            and receipt.name in _ARCHIVE_CAPABLE_RECEIPTS
+            and receipt.object_boundaries is not None
+        ):
+            archive_findings, archive_blockers = _scan_hosted_archive_objects(
+                tuple(material_chunks),
+                receipt.object_boundaries,
+                surface,
+                policy,
+                archive_budget,
+                expected_object_count=(
+                    page_count
+                    if receipt.name in _PAGE_BOUND_ARCHIVE_RECEIPTS
+                    else receipt.request_count
+                    if receipt.name in _REQUEST_BOUND_ARCHIVE_RECEIPTS
+                    else None
+                ),
+            )
+            findings.extend(archive_findings)
+            blockers.extend(archive_blockers)
         evidence_hashes.append(evidence_hash.hexdigest())
 
     return HostedSurfaceScanResult(

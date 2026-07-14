@@ -10,6 +10,7 @@ from mercury_tools.release import scanner as scanner_module
 from mercury_tools.release.hosted import (
     HOSTED_SCANNER_VERSION,
     HostedInspection,
+    HostedObjectBoundary,
     HostedReceipt,
     scan_hosted_surface,
 )
@@ -78,6 +79,7 @@ class _HostedClient:
                 HostedReceipt(
                     name="marketplace_snapshot_download",
                     chunks=(self._payload,),
+                    object_boundaries=(HostedObjectBoundary(1, len(self._payload)),),
                     complete=True,
                     page_count=1,
                     record_count=1,

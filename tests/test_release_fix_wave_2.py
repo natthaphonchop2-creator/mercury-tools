@@ -224,6 +224,9 @@ def test_child_receipts_cannot_omit_parent_count_reconciliation() -> None:
         receipts=tuple(
             HostedReceipt(
                 name=name,
+                object_boundaries=(
+                    () if name in hosted_module._ARCHIVE_CAPABLE_RECEIPTS else None
+                ),
                 complete=True,
                 page_count=1,
                 record_count=0,
