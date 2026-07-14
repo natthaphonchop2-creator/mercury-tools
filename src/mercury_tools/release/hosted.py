@@ -27,10 +27,13 @@ from mercury_tools.release.scanner import (
     CommandResult,
     CommandRunner,
     SubprocessCommandRunner,
+    _archive_candidate_crosses_boundary,
     _ArtifactSnapshot,
     _BudgetExceeded,
     _deduplicate_findings,
     _detect_archive_format,
+    _GitReachableInventory,
+    _is_archive_candidate,
     _parse_local_refs,
     _scan_archive_at_depth,
     _scan_bytes,
@@ -126,6 +129,41 @@ _RECEIPT_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 _PACKAGE_TYPES = ("container", "docker", "maven", "npm", "nuget", "rubygems")
 _MCP_PROTOCOL_VERSION = "2025-11-25"
 _SUPPORTED_MCP_PROTOCOL_VERSIONS = frozenset({_MCP_PROTOCOL_VERSION})
+_OBJECT_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_OBJECT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_./:-]{0,255}$")
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_WIKI_OBJECT_TYPES = frozenset(
+    {
+        "wiki_command_output",
+        "wiki_mirror_inventory",
+        "wiki_reachable_blob",
+        "wiki_reachable_tag",
+    }
+)
+_WIKI_COMMAND_OBJECT_IDS = frozenset(
+    {
+        "wiki/command/clone",
+        "wiki/command/refs-initial",
+        "wiki/command/head-initial",
+        "wiki/command/refs-final",
+        "wiki/command/head-final",
+    }
+)
+_WIKI_INVENTORY_OBJECT_ID = "wiki/mirror-inventory/v1"
+_WIKI_INVENTORY_KEYS = frozenset(
+    {
+        "schema_version",
+        "remote_ref_count",
+        "remote_ref_digest",
+        "reachable_object_count",
+        "reachable_blob_count",
+        "payload_object_count",
+        "payload_objects",
+    }
+)
+_WIKI_PAYLOAD_KEYS = frozenset(
+    {"object_type", "object_id", "byte_count", "content_sha256"}
+)
 
 
 @dataclass(frozen=True, repr=False)
@@ -134,6 +172,9 @@ class HostedObjectBoundary:
 
     chunk_count: int
     byte_count: int
+    object_type: str | None = None
+    object_id: str | None = None
+    content_sha256: str | None = None
 
 
 @dataclass(frozen=True, repr=False)
@@ -149,6 +190,53 @@ class HostedReceipt:
     status_codes: tuple[int, ...] = ()
     findings: tuple[SecretFinding, ...] = field(default=(), repr=False)
     object_boundaries: tuple[HostedObjectBoundary, ...] | None = None
+    expected_object_count: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.name not in _ARCHIVE_CAPABLE_RECEIPTS:
+            return
+        if self.expected_object_count is not None:
+            return
+        expected: int | None = None
+        if self.name in _PAGE_BOUND_ARCHIVE_RECEIPTS and (
+            isinstance(self.page_count, int)
+            and not isinstance(self.page_count, bool)
+            and self.page_count >= 1
+        ):
+            expected = self.page_count
+        elif self.name in _REQUEST_BOUND_ARCHIVE_RECEIPTS and (
+            isinstance(self.request_count, int)
+            and not isinstance(self.request_count, bool)
+            and self.request_count >= 0
+        ):
+            expected = self.request_count
+        elif (
+            self.name == "github_wiki_download"
+            and self.complete is True
+            and self.object_boundaries == ()
+            and self.record_count == 0
+            and self.request_count == 0
+            and self.parent_record_count == 0
+        ):
+            expected = 0
+        if expected is not None:
+            object.__setattr__(self, "expected_object_count", expected)
+
+
+def _logical_object_boundary(
+    chunks: tuple[bytes, ...],
+    *,
+    object_type: str,
+    object_id: str,
+) -> HostedObjectBoundary:
+    data = b"".join(chunks)
+    return HostedObjectBoundary(
+        chunk_count=len(chunks),
+        byte_count=len(data),
+        object_type=object_type,
+        object_id=object_id,
+        content_sha256=hashlib.sha256(data).hexdigest(),
+    )
 
 
 def _object_boundaries_for_chunks(
@@ -157,7 +245,14 @@ def _object_boundaries_for_chunks(
 ) -> tuple[HostedObjectBoundary, ...] | None:
     if name not in _ARCHIVE_CAPABLE_RECEIPTS:
         return None
-    return tuple(HostedObjectBoundary(1, len(chunk)) for chunk in chunks)
+    return tuple(
+        _logical_object_boundary(
+            (chunk,),
+            object_type="hosted_transport_object",
+            object_id=f"{name}/{index}",
+        )
+        for index, chunk in enumerate(chunks)
+    )
 
 
 def _merged_object_boundaries(
@@ -168,11 +263,25 @@ def _merged_object_boundaries(
         return None
     if any(receipt.object_boundaries is None for receipt in receipts):
         return None
-    return tuple(
-        boundary
-        for receipt in receipts
-        for boundary in receipt.object_boundaries or ()
-    )
+    merged: list[HostedObjectBoundary] = []
+    for receipt_index, receipt in enumerate(receipts):
+        for boundary_index, boundary in enumerate(receipt.object_boundaries or ()):
+            if not isinstance(boundary, HostedObjectBoundary):
+                return None
+            if all(
+                isinstance(value, str)
+                for value in (
+                    boundary.object_type,
+                    boundary.object_id,
+                    boundary.content_sha256,
+                )
+            ):
+                boundary = replace(
+                    boundary,
+                    object_id=f"{name}/{receipt_index}/{boundary_index}",
+                )
+            merged.append(boundary)
+    return tuple(merged)
 
 
 @dataclass(frozen=True, repr=False)
@@ -374,9 +483,127 @@ def _scan_hosted_archive(
     policy: SecretScanPolicy,
     budget: _HostedArchiveBudget,
 ) -> tuple[list[SecretFinding], list[str]]:
-    if _detect_archive_format(data) is None:
+    candidate = _is_archive_candidate(data)
+    archive_format = _detect_archive_format(data)
+    if candidate and archive_format is None:
+        return [], [_hosted_archive_code("read_failed", surface)]
+    if archive_format is None:
         return [], []
     return _scan_complete_hosted_archive(data, surface, policy, budget)
+
+
+def _boundary_metadata_is_valid(
+    boundary: HostedObjectBoundary,
+    data: bytes,
+    *,
+    required: bool,
+) -> bool:
+    metadata = (
+        boundary.object_type,
+        boundary.object_id,
+        boundary.content_sha256,
+    )
+    if not required and all(value is None for value in metadata):
+        return True
+    return bool(
+        isinstance(boundary.object_type, str)
+        and _OBJECT_TYPE_PATTERN.fullmatch(boundary.object_type)
+        and isinstance(boundary.object_id, str)
+        and _OBJECT_ID_PATTERN.fullmatch(boundary.object_id)
+        and isinstance(boundary.content_sha256, str)
+        and _SHA256_PATTERN.fullmatch(boundary.content_sha256)
+        and hashlib.sha256(data).hexdigest() == boundary.content_sha256
+    )
+
+
+def _wiki_boundary_identity_is_valid(boundary: HostedObjectBoundary) -> bool:
+    if boundary.object_type not in _WIKI_OBJECT_TYPES:
+        return False
+    if boundary.object_type == "wiki_command_output":
+        return boundary.object_id in _WIKI_COMMAND_OBJECT_IDS
+    if boundary.object_type == "wiki_mirror_inventory":
+        return boundary.object_id == _WIKI_INVENTORY_OBJECT_ID
+    if boundary.object_type == "wiki_reachable_blob":
+        return bool(
+            isinstance(boundary.object_id, str)
+            and re.fullmatch(
+                r"git/blob/(?:[0-9a-f]{40}|[0-9a-f]{64})",
+                boundary.object_id,
+            )
+        )
+    return bool(
+        isinstance(boundary.object_id, str)
+        and re.fullmatch(
+            r"git/tag/(?:[0-9a-f]{40}|[0-9a-f]{64})",
+            boundary.object_id,
+        )
+    )
+
+
+def _valid_nonnegative_count(value: object, *, positive: bool = False) -> bool:
+    return bool(
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and (value > 0 if positive else value >= 0)
+    )
+
+
+def _wiki_inventory_reconciles(
+    objects: tuple[tuple[HostedObjectBoundary, bytes], ...],
+) -> bool:
+    inventory_objects = tuple(
+        data
+        for boundary, data in objects
+        if boundary.object_type == "wiki_mirror_inventory"
+    )
+    if len(inventory_objects) != 1:
+        return False
+    try:
+        manifest = json.loads(inventory_objects[0])
+    except (UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(manifest, dict) or frozenset(manifest) != _WIKI_INVENTORY_KEYS:
+        return False
+    payload_objects = manifest.get("payload_objects")
+    if (
+        manifest.get("schema_version") != 1
+        or not _valid_nonnegative_count(manifest.get("remote_ref_count"), positive=True)
+        or not isinstance(manifest.get("remote_ref_digest"), str)
+        or _SHA256_PATTERN.fullmatch(manifest["remote_ref_digest"]) is None
+        or not _valid_nonnegative_count(
+            manifest.get("reachable_object_count"), positive=True
+        )
+        or not _valid_nonnegative_count(manifest.get("reachable_blob_count"))
+        or not _valid_nonnegative_count(manifest.get("payload_object_count"))
+        or not isinstance(payload_objects, list)
+        or manifest["payload_object_count"] != len(payload_objects)
+    ):
+        return False
+    actual_payloads = [
+        {
+            "object_type": boundary.object_type,
+            "object_id": boundary.object_id,
+            "byte_count": boundary.byte_count,
+            "content_sha256": boundary.content_sha256,
+        }
+        for boundary, _data in objects
+        if boundary.object_type in {"wiki_reachable_blob", "wiki_reachable_tag"}
+    ]
+    if payload_objects != actual_payloads:
+        return False
+    if any(
+        not isinstance(item, dict) or frozenset(item) != _WIKI_PAYLOAD_KEYS
+        for item in payload_objects
+    ):
+        return False
+    blob_count = sum(
+        item.get("object_type") == "wiki_reachable_blob"
+        for item in payload_objects
+    )
+    return bool(
+        manifest["reachable_blob_count"] == blob_count
+        and manifest["reachable_object_count"] >= len(payload_objects)
+    )
 
 
 def _scan_hosted_archive_objects(
@@ -386,16 +613,20 @@ def _scan_hosted_archive_objects(
     policy: SecretScanPolicy,
     budget: _HostedArchiveBudget,
     *,
-    expected_object_count: int | None,
+    expected_object_count: int,
+    receipt_name: str | None = None,
 ) -> tuple[list[SecretFinding], list[str]]:
     boundary_code = f"hosted_archive_boundary_invalid:{surface}"
     if (
         not isinstance(boundaries, tuple)
         or len(boundaries) > policy.max_hosted_records
-        or (
-            expected_object_count is not None
-            and len(boundaries) != expected_object_count
-        )
+        or isinstance(expected_object_count, bool)
+        or not isinstance(expected_object_count, int)
+        or expected_object_count < 0
+        or expected_object_count > policy.max_hosted_records
+        or len(boundaries) != expected_object_count
+        or (expected_object_count == 0 and bool(chunks))
+        or (expected_object_count > 0 and not chunks)
     ):
         return [], [boundary_code]
     spans: list[tuple[int, int, int]] = []
@@ -423,13 +654,57 @@ def _scan_hosted_archive_objects(
     if cursor != len(chunks):
         return [], [boundary_code]
 
+    objects: list[tuple[HostedObjectBoundary, bytes]] = []
+    identities: set[str] = set()
+    strict_identities = receipt_name == "github_wiki_download"
+    for boundary, (start, end, _byte_count) in zip(
+        boundaries,
+        spans,
+        strict=True,
+    ):
+        data = b"".join(chunks[start:end])
+        if not _boundary_metadata_is_valid(
+            boundary,
+            data,
+            required=strict_identities,
+        ):
+            return [], [boundary_code]
+        if boundary.object_id is not None:
+            if boundary.object_id in identities:
+                return [], [boundary_code]
+            identities.add(boundary.object_id)
+        if strict_identities and not _wiki_boundary_identity_is_valid(boundary):
+            return [], [boundary_code]
+        objects.append((boundary, data))
+
+    material = tuple(objects)
+    if (
+        strict_identities
+        and expected_object_count > 0
+        and (
+            not _wiki_inventory_reconciles(material)
+            or any(
+                _archive_candidate_crosses_boundary(left, right)
+                for (_left_boundary, left), (_right_boundary, right) in zip(
+                    material,
+                    material[1:],
+                    strict=False,
+                )
+            )
+        )
+    ):
+        return [], [boundary_code]
+
     findings: list[SecretFinding] = []
     blockers: list[str] = []
-    for start, end, byte_count in spans:
+    for (_boundary, data), (_start, _end, byte_count) in zip(
+        material,
+        spans,
+        strict=True,
+    ):
         if byte_count > policy.max_archive_bytes:
             blockers.append(_hosted_archive_code("too_large", surface))
             continue
-        data = b"".join(chunks[start:end])
         archive_findings, archive_blockers = _scan_hosted_archive(
             data,
             surface,
@@ -591,6 +866,44 @@ def _parse_head_oid(output: bytes) -> str:
     if match is None:
         raise ValueError("malformed_git_head")
     return match.group(1).decode("ascii")
+
+
+def _wiki_inventory_manifest(
+    inventory: _GitReachableInventory,
+    remote_refs: Mapping[str, str],
+) -> bytes:
+    payload_objects: list[dict[str, object]] = []
+    for item in inventory.public_objects:
+        if item.object_type not in {"blob", "tag"}:
+            raise ValueError("wiki_payload_object_type_invalid")
+        data = item.data
+        payload_objects.append(
+            {
+                "object_type": f"wiki_reachable_{item.object_type}",
+                "object_id": f"git/{item.object_type}/{item.object_id}",
+                "byte_count": len(data),
+                "content_sha256": hashlib.sha256(data).hexdigest(),
+            }
+        )
+    ref_payload = json.dumps(
+        sorted(remote_refs.items()),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "remote_ref_count": len(remote_refs),
+            "remote_ref_digest": hashlib.sha256(ref_payload).hexdigest(),
+            "reachable_object_count": inventory.object_count,
+            "reachable_blob_count": inventory.blob_count,
+            "payload_object_count": len(payload_objects),
+            "payload_objects": payload_objects,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
 
 
 class GhApiHostedClient:
@@ -830,9 +1143,10 @@ class GhApiHostedClient:
             used_bytes += sum(len(chunk) for chunk in result_chunks)
             object_boundaries = (
                 (
-                    HostedObjectBoundary(
-                        chunk_count=len(result_chunks),
-                        byte_count=sum(len(chunk) for chunk in result_chunks),
+                    _logical_object_boundary(
+                        result_chunks,
+                        object_type="hosted_command_output",
+                        object_id=f"{name}/{len(receipts)}",
                     ),
                 )
                 if result_chunks
@@ -1119,13 +1433,32 @@ class GhApiHostedClient:
                 parent_record_count=1,
             )
         chunks: list[bytes] = []
+        object_boundaries: list[HostedObjectBoundary] = []
         exit_codes: list[int] = []
         inventory_findings: tuple[SecretFinding, ...] = ()
         complete = True
 
+        def append_logical_object(
+            object_chunks: tuple[bytes, ...],
+            *,
+            object_type: str,
+            object_id: str,
+        ) -> None:
+            if not object_chunks:
+                return
+            chunks.extend(object_chunks)
+            object_boundaries.append(
+                _logical_object_boundary(
+                    object_chunks,
+                    object_type=object_type,
+                    object_id=object_id,
+                )
+            )
+
         def run_command(
             argv: tuple[str, ...],
             *,
+            identity: str,
             cwd: Path | None = None,
         ) -> CommandResult:
             remaining = policy.max_hosted_receipt_bytes - sum(map(len, chunks))
@@ -1140,14 +1473,20 @@ class GhApiHostedClient:
                 )
             except Exception:
                 result = CommandResult(127, b"", b"")
-            chunks.extend(_command_chunks(result))
+            command_chunks = _command_chunks(result) or (b"",)
+            append_logical_object(
+                command_chunks,
+                object_type="wiki_command_output",
+                object_id=f"wiki/command/{identity}",
+            )
             exit_codes.append(result.exit_code)
             return result
 
         with tempfile.TemporaryDirectory(prefix="mercury-wiki-scan-") as temporary:
             clone = Path(temporary) / "wiki.git"
             clone_result = run_command(
-                ("git", "clone", "--mirror", wiki_url, str(clone))
+                ("git", "clone", "--mirror", wiki_url, str(clone)),
+                identity="clone",
             )
             complete = clone_result.exit_code == 0
             local_refs: dict[str, str] = {}
@@ -1158,10 +1497,12 @@ class GhApiHostedClient:
                         "for-each-ref",
                         "--format=%(refname)%09%(objectname)%09%(*objectname)",
                     ),
+                    identity="refs-initial",
                     cwd=clone,
                 )
                 head_result = run_command(
                     ("git", "rev-parse", "--verify", "HEAD"),
+                    identity="head-initial",
                     cwd=clone,
                 )
                 try:
@@ -1194,16 +1535,19 @@ class GhApiHostedClient:
                 exit_codes.extend(inventory_exit_codes)
                 complete = inventory is not None and not inventory_blockers
             if complete and inventory is not None:
+                inventory_findings = inventory.findings
                 final_refs_result = run_command(
                     (
                         "git",
                         "for-each-ref",
                         "--format=%(refname)%09%(objectname)%09%(*objectname)",
                     ),
+                    identity="refs-final",
                     cwd=clone,
                 )
                 final_head_result = run_command(
                     ("git", "rev-parse", "--verify", "HEAD"),
+                    identity="head-final",
                     cwd=clone,
                 )
                 try:
@@ -1218,15 +1562,28 @@ class GhApiHostedClient:
                     and final_head_result.exit_code == 0
                     and final_map == remote_refs
                 )
-                chunks.extend(inventory.public_payloads)
-                inventory_findings = inventory.findings
+                if complete:
+                    try:
+                        manifest = _wiki_inventory_manifest(inventory, remote_refs)
+                    except (TypeError, ValueError):
+                        complete = False
+                    else:
+                        append_logical_object(
+                            (manifest,),
+                            object_type="wiki_mirror_inventory",
+                            object_id=_WIKI_INVENTORY_OBJECT_ID,
+                        )
+                        for item in inventory.public_objects:
+                            append_logical_object(
+                                (item.data,),
+                                object_type=f"wiki_reachable_{item.object_type}",
+                                object_id=f"git/{item.object_type}/{item.object_id}",
+                            )
         download = HostedReceipt(
             name="github_wiki_download",
             chunks=tuple(chunks),
-            object_boundaries=_object_boundaries_for_chunks(
-                "github_wiki_download",
-                chunks,
-            ),
+            object_boundaries=tuple(object_boundaries),
+            expected_object_count=len(object_boundaries),
             complete=complete,
             page_count=1,
             record_count=1,
@@ -1236,18 +1593,7 @@ class GhApiHostedClient:
             findings=inventory_findings,
         )
         if sum(len(chunk) for chunk in download.chunks) > policy.max_hosted_receipt_bytes:
-            download = HostedReceipt(
-                name=download.name,
-                chunks=download.chunks,
-                object_boundaries=download.object_boundaries,
-                complete=False,
-                page_count=download.page_count,
-                record_count=download.record_count,
-                request_count=download.request_count,
-                parent_record_count=download.parent_record_count,
-                exit_codes=download.exit_codes,
-                findings=download.findings,
-            )
+            download = replace(download, complete=False)
         return query, download
 
     def inspect(self, surface: str, policy: SecretScanPolicy) -> HostedInspection:
@@ -2325,6 +2671,46 @@ def scan_hosted_surface(
             blockers.append(f"hosted_receipt_malformed:{surface}")
         else:
             findings.extend(receipt.findings)
+        archive_capable = receipt.name in _ARCHIVE_CAPABLE_RECEIPTS
+        valid_expected_object_count = not archive_capable or (
+            isinstance(receipt.expected_object_count, int)
+            and not isinstance(receipt.expected_object_count, bool)
+            and 0 <= receipt.expected_object_count <= policy.max_hosted_records
+        )
+        archive_count_reconciled = valid_expected_object_count
+        if archive_capable and valid_expected_object_count:
+            declared_object_count = receipt.expected_object_count
+            assert isinstance(declared_object_count, int)
+            if receipt.name in _PAGE_BOUND_ARCHIVE_RECEIPTS:
+                archive_count_reconciled = (
+                    valid_page_count and declared_object_count == receipt.page_count
+                )
+            elif receipt.name in _REQUEST_BOUND_ARCHIVE_RECEIPTS:
+                archive_count_reconciled = (
+                    valid_request_count
+                    and declared_object_count == receipt.request_count
+                )
+            if declared_object_count == 0:
+                archive_count_reconciled = bool(
+                    archive_count_reconciled
+                    and receipt.complete is True
+                    and valid_record_count
+                    and receipt.record_count == 0
+                    and valid_request_count
+                    and receipt.request_count == 0
+                    and valid_parent_count
+                    and receipt.parent_record_count in {None, 0}
+                )
+        if (
+            archive_capable
+            and valid_page_count
+            and valid_record_count
+            and valid_request_count
+            and valid_parent_count
+            and isinstance(receipt.complete, bool)
+            and (not valid_expected_object_count or not archive_count_reconciled)
+        ):
+            blockers.append(f"hosted_archive_boundary_invalid:{surface}")
         receipt_shape_valid = (
             valid_page_count
             and valid_record_count
@@ -2334,6 +2720,8 @@ def scan_hosted_surface(
             and valid_exit_codes
             and valid_status_codes
             and valid_findings
+            and valid_expected_object_count
+            and archive_count_reconciled
         )
         if (
             receipt_shape_valid
@@ -2382,6 +2770,14 @@ def scan_hosted_surface(
             if valid_parent_count and receipt.parent_record_count is not None
             else b"none"
         )
+        evidence_hash.update(b"\0expected-object-count\0")
+        if archive_capable and valid_expected_object_count:
+            assert isinstance(receipt.expected_object_count, int)
+            evidence_hash.update(receipt.expected_object_count.to_bytes(8, "big"))
+        elif archive_capable:
+            evidence_hash.update(b"invalid")
+        else:
+            evidence_hash.update(b"none")
         evidence_hash.update(b"\0object-boundaries\0")
         if receipt.object_boundaries is None:
             evidence_hash.update(b"none")
@@ -2405,6 +2801,27 @@ def scan_hosted_surface(
                         and 0 <= value < 2**64
                     ):
                         evidence_hash.update(value.to_bytes(8, "big"))
+                    else:
+                        evidence_hash.update(b"invalid")
+                    evidence_hash.update(b"\0")
+                for value in (
+                    boundary.object_type,
+                    boundary.object_id,
+                    boundary.content_sha256,
+                ):
+                    if value is None:
+                        evidence_hash.update(b"none")
+                    elif isinstance(value, str):
+                        try:
+                            encoded = value.encode("ascii")
+                        except UnicodeError:
+                            evidence_hash.update(b"invalid")
+                        else:
+                            if len(encoded) <= 512:
+                                evidence_hash.update(len(encoded).to_bytes(2, "big"))
+                                evidence_hash.update(encoded)
+                            else:
+                                evidence_hash.update(b"invalid")
                     else:
                         evidence_hash.update(b"invalid")
                     evidence_hash.update(b"\0")
@@ -2442,8 +2859,10 @@ def scan_hosted_surface(
             blockers.append(f"hosted_total_byte_limit:{surface}")
         if (
             receipt_shape_valid
-            and receipt.name in _ARCHIVE_CAPABLE_RECEIPTS
+            and archive_capable
             and receipt.object_boundaries is not None
+            and isinstance(receipt.expected_object_count, int)
+            and not isinstance(receipt.expected_object_count, bool)
         ):
             archive_findings, archive_blockers = _scan_hosted_archive_objects(
                 tuple(material_chunks),
@@ -2451,13 +2870,8 @@ def scan_hosted_surface(
                 surface,
                 policy,
                 archive_budget,
-                expected_object_count=(
-                    page_count
-                    if receipt.name in _PAGE_BOUND_ARCHIVE_RECEIPTS
-                    else receipt.request_count
-                    if receipt.name in _REQUEST_BOUND_ARCHIVE_RECEIPTS
-                    else None
-                ),
+                expected_object_count=receipt.expected_object_count,
+                receipt_name=receipt.name,
             )
             findings.extend(archive_findings)
             blockers.extend(archive_blockers)

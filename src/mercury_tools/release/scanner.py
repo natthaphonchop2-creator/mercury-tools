@@ -1597,11 +1597,22 @@ def _valid_ref_namespace(
 
 
 @dataclass(frozen=True, repr=False)
+class _GitPublicObject:
+    object_type: str
+    object_id: str
+    data: bytes = field(repr=False)
+
+
+@dataclass(frozen=True, repr=False)
 class _GitReachableInventory:
     findings: tuple[SecretFinding, ...]
-    public_payloads: tuple[bytes, ...] = field(repr=False)
+    public_objects: tuple[_GitPublicObject, ...] = field(repr=False)
     object_count: int
     blob_count: int
+
+    @property
+    def public_payloads(self) -> tuple[bytes, ...]:
+        return tuple(item.data for item in self.public_objects)
 
 
 @dataclass(frozen=True, repr=False)
@@ -1935,20 +1946,20 @@ def _scan_reachable_blobs(
         blockers.append("git_object_inventory_incomplete")
         return None
 
-    public_payloads: list[bytes] = []
+    public_objects: list[_GitPublicObject] = []
     blobs = tuple(oid for oid in graph_oids if objects[oid].object_type == "blob")
     for oid in blobs:
         data = objects[oid].data
-        public_payloads.append(data)
+        public_objects.append(_GitPublicObject("blob", oid, data))
         paths = oid_paths[oid] or {f"git/object/{oid}"}
         for path in sorted(paths):
             findings.extend(_scan_bytes(data, path, policy))
     for oid, payload in sorted(tag_payloads.items()):
-        public_payloads.append(payload)
+        public_objects.append(_GitPublicObject("tag", oid, payload))
         findings.extend(_scan_bytes(payload, f"git/tag/{oid}", policy))
     return _GitReachableInventory(
         findings=_deduplicate_findings(findings),
-        public_payloads=tuple(public_payloads),
+        public_objects=tuple(public_objects),
         object_count=len(objects),
         blob_count=len(blobs),
     )
@@ -2174,27 +2185,34 @@ class _ArtifactSnapshot:
     data: bytes = field(repr=False)
 
 
-_ZIP_PREFIX_ARCHIVE_SIGNATURES = (
+_ZIP_RECORD_SIGNATURES = (
     b"PK\x03\x04",
     b"PK\x01\x02",
     b"PK\x05\x06",
     b"PK\x07\x08",
     b"PK\x06\x06",
     b"PK\x06\x07",
+    b"PK\x05\x05",
+    b"PK\x08\x06",
 )
-_ZIP_PREFIX_COMPRESSION_SIGNATURES = (
-    b"\x1f\x8b",
-    b"BZh",
-    b"\xfd7zXZ\x00",
+_SUPPORTED_COMPRESSION_SIGNATURES = (
+    (b"\x1f\x8b", "gzip"),
+    (b"BZh", "bz2"),
+    (b"\xfd7zXZ\x00", "xz"),
 )
-_ZIP_PREFIX_OPAQUE_SIGNATURES = (
+_KNOWN_OPAQUE_ARCHIVE_SIGNATURES = (
     b"7z\xbc\xaf'\x1c",
     b"Rar!\x1a\x07",
     b"\x04\x22\x4d\x18",
     b"\x1f\x9d",
     b"\x28\xb5\x2f\xfd",
 )
-_ZIP_PREFIX_TAR_SIGNATURES = (b"ustar\x00", b"ustar ")
+_TAR_MAGIC_SIGNATURES = (b"ustar\x00", b"ustar ")
+_ARCHIVE_OFFSET_ZERO_SIGNATURES = (
+    *((signature, "zip") for signature in _ZIP_RECORD_SIGNATURES),
+    *_SUPPORTED_COMPRESSION_SIGNATURES,
+    *((signature, "opaque") for signature in _KNOWN_OPAQUE_ARCHIVE_SIGNATURES),
+)
 _TAR_CHECKSUM_FIELD_PATTERNS = (
     re.compile(rb"[ 0-7]{6}\x00 "),
     re.compile(rb"[ 0-7]{6} \x00"),
@@ -2202,28 +2220,83 @@ _TAR_CHECKSUM_FIELD_PATTERNS = (
 )
 
 
-def _detect_archive_format(data: bytes) -> str | None:
-    zip_magic = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
-    if data.startswith(zip_magic) or _has_bounded_zip_structure(data):
-        return "zip"
-    if data.startswith(b"\x1f\x8b"):
-        return "gzip"
-    if data.startswith(b"BZh"):
-        return "bz2"
-    if data.startswith(b"\xfd7zXZ\x00"):
-        return "xz"
-    if _tar_header_is_valid(data):
+def _archive_candidate_format_at(data: bytes, offset: int) -> str | None:
+    if offset < 0 or offset > len(data):
+        return None
+    for signature, archive_format in _ARCHIVE_OFFSET_ZERO_SIGNATURES:
+        if data.startswith(signature, offset):
+            return archive_format
+    magic_start = offset + 257
+    if any(data.startswith(magic, magic_start) for magic in _TAR_MAGIC_SIGNATURES):
         return "tar"
-    if data.startswith(
-        (
-            b"7z\xbc\xaf'\x1c",
-            b"Rar!\x1a\x07",
-            b"\x04\x22\x4d\x18",
-            b"\x1f\x9d",
-            b"\x28\xb5\x2f\xfd",
-        )
+    if offset + 512 <= len(data) and _tar_checksum_is_valid(
+        data[offset : offset + 512]
     ):
-        return "opaque"
+        return "tar"
+    if (
+        offset == 0
+        and len(data) >= 1024
+        and len(data) % 512 == 0
+        and not any(data)
+    ):
+        return "tar"
+    return None
+
+
+def _archive_candidate_ranges(data: bytes) -> tuple[tuple[int, int], ...]:
+    ranges: set[tuple[int, int]] = set()
+    for signature, _archive_format in _ARCHIVE_OFFSET_ZERO_SIGNATURES:
+        offset = data.find(signature)
+        while offset >= 0:
+            ranges.add((offset, offset + len(signature)))
+            offset = data.find(signature, offset + 1)
+    for magic in _TAR_MAGIC_SIGNATURES:
+        magic_offset = data.find(magic)
+        while magic_offset >= 0:
+            header_offset = magic_offset - 257
+            if header_offset >= 0:
+                ranges.add((header_offset, magic_offset + len(magic)))
+            magic_offset = data.find(magic, magic_offset + 1)
+    for pattern in _TAR_CHECKSUM_FIELD_PATTERNS:
+        for match in pattern.finditer(data):
+            header_offset = match.start() - 148
+            if (
+                header_offset >= 0
+                and header_offset + 512 <= len(data)
+                and _tar_checksum_is_valid(data[header_offset : header_offset + 512])
+            ):
+                ranges.add((header_offset, header_offset + 512))
+    if len(data) >= 1024 and len(data) % 512 == 0 and not any(data):
+        ranges.add((0, 1024))
+    return tuple(sorted(ranges))
+
+
+def _is_archive_candidate(data: bytes, *, search: bool = False) -> bool:
+    if not isinstance(data, bytes):
+        return False
+    if not search:
+        return _archive_candidate_format_at(data, 0) is not None
+    return bool(_archive_candidate_ranges(data))
+
+
+def _archive_candidate_crosses_boundary(left: bytes, right: bytes) -> bool:
+    if not left or not right:
+        return False
+    left_tail = left[-1024:]
+    right_head = right[:1024]
+    split = len(left_tail)
+    return any(
+        start < split < end
+        for start, end in _archive_candidate_ranges(left_tail + right_head)
+    )
+
+
+def _detect_archive_format(data: bytes) -> str | None:
+    candidate_format = _archive_candidate_format_at(data, 0)
+    if candidate_format is not None:
+        return candidate_format
+    if _has_bounded_zip_structure(data):
+        return "zip"
     if _has_prefixed_zip_local_header(data):
         return "opaque"
     return None
@@ -2256,10 +2329,8 @@ def _has_prefixed_zip_local_header(data: bytes) -> bool:
 
 
 def _tar_header_is_valid(data: bytes) -> bool:
-    if len(data) < 1024:
+    if len(data) < 512:
         return False
-    if data[:1024] == b"\0" * 1024:
-        return len(data) % 512 == 0 and not any(data)
     return _tar_checksum_is_valid(data[:512])
 
 
@@ -2685,24 +2756,7 @@ def _zip_metadata_corpus(
 
 
 def _zip_prefix_contains_archive(prefix: bytes) -> bool:
-    candidates = (
-        *_ZIP_PREFIX_ARCHIVE_SIGNATURES,
-        *_ZIP_PREFIX_COMPRESSION_SIGNATURES,
-        *_ZIP_PREFIX_OPAQUE_SIGNATURES,
-        *_ZIP_PREFIX_TAR_SIGNATURES,
-    )
-    if any(candidate in prefix for candidate in candidates):
-        return True
-    for pattern in _TAR_CHECKSUM_FIELD_PATTERNS:
-        for match in pattern.finditer(prefix):
-            header_offset = match.start() - 148
-            if (
-                header_offset >= 0
-                and header_offset + 512 <= len(prefix)
-                and _tar_checksum_is_valid(prefix[header_offset : header_offset + 512])
-            ):
-                return True
-    return False
+    return _is_archive_candidate(prefix, search=True)
 
 
 def _zip_eocd_bounds(data: bytes) -> tuple[int, int]:
