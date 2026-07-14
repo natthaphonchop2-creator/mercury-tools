@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import time
 from pathlib import Path
@@ -186,6 +187,69 @@ def cmd_catalog_validate(args: argparse.Namespace) -> int:
         return 1
     _print_json(report.public_dict())
     return 0
+
+
+def cmd_release_scan_secrets(args: argparse.Namespace) -> int:
+    from pydantic import ValidationError
+
+    from mercury_tools.release.models import SecretScanPolicy, SecretScanRequest
+    from mercury_tools.release.scanner import (
+        ReleaseGateError,
+        build_blocked_report,
+        load_known_secret_digests,
+        load_public_surface_manifest,
+        load_secret_scan_allowlist,
+        scan_public_release,
+    )
+
+    try:
+        manifest = load_public_surface_manifest(Path(args.manifest))
+        allowlist = load_secret_scan_allowlist(Path(args.allowlist))
+        fingerprints = load_known_secret_digests(
+            paths=tuple(Path(path) for path in args.known_fingerprint_file),
+            interactive=bool(args.known_fingerprint_stdin),
+            repo_root=Path(args.repo_root),
+        )
+        request = SecretScanRequest(
+            repo=args.repo,
+            artifacts=Path(args.artifacts),
+            all_history=bool(args.all_history),
+            hosted=bool(args.hosted),
+            manifest=manifest,
+            allowlist=allowlist,
+            policy=SecretScanPolicy(
+                scanner_versions=manifest.scanner_versions,
+                known_secret_digests=fingerprints,
+            ),
+        )
+    except ReleaseGateError as exc:
+        report = build_blocked_report(str(exc))
+    except ValidationError:
+        report = build_blocked_report("scan_request_malformed")
+    else:
+        try:
+            report = scan_public_release(request)
+        except Exception:
+            report = build_blocked_report("release_scan_failed")
+
+    payload = report.public_dict()
+    if args.output:
+        output = Path(args.output)
+        temporary = output.with_name(f".{output.name}.tmp")
+        try:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(output)
+        except OSError:
+            with contextlib.suppress(OSError):
+                temporary.unlink(missing_ok=True)
+            report = build_blocked_report("report_write_failed")
+            payload = report.public_dict()
+    _print_json(payload)
+    return 0 if report.passed else 1
 
 
 def cmd_mcp_serve(args: argparse.Namespace) -> int:
@@ -694,6 +758,27 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--all", action="store_true")
     validate.add_argument("--repo-root", default=".")
     validate.set_defaults(func=cmd_catalog_validate)
+
+    release = sub.add_parser("release")
+    release_sub = release.add_subparsers(dest="release_command", required=True)
+    scan_secrets = release_sub.add_parser("scan-secrets")
+    scan_secrets.add_argument("--all-history", action="store_true")
+    scan_secrets.add_argument("--hosted", action="store_true")
+    scan_secrets.add_argument("--artifacts", required=True)
+    scan_secrets.add_argument("--repo", required=True)
+    scan_secrets.add_argument("--output")
+    scan_secrets.add_argument(
+        "--manifest",
+        default="docs/release/public-surface-manifest.json",
+    )
+    scan_secrets.add_argument(
+        "--allowlist",
+        default="docs/release/secret-scan-allowlist.json",
+    )
+    scan_secrets.add_argument("--known-fingerprint-stdin", action="store_true")
+    scan_secrets.add_argument("--known-fingerprint-file", action="append", default=[])
+    scan_secrets.add_argument("--repo-root", default=".")
+    scan_secrets.set_defaults(func=cmd_release_scan_secrets)
 
     ingest = sub.add_parser("ingest")
     ingest_sub = ingest.add_subparsers(dest="ingest_command", required=True)
