@@ -328,6 +328,54 @@ def test_cross_mcp_catalog_rows_are_public_metadata_only() -> None:
         assert row["required_connectors"] == []
 
 
+def _cross_mcp_values_tuples(migration: str) -> tuple[str, ...]:
+    match = re.search(
+        r"\bvalues\b(?P<rows>.*?)\bon\s+conflict\b",
+        migration,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert match is not None
+    rows = match.group("rows")
+    tuples: list[str] = []
+    depth = 0
+    quote_open = False
+    start = 0
+
+    for index, character in enumerate(rows):
+        if character == "'":
+            if quote_open and index + 1 < len(rows) and rows[index + 1] == "'":
+                continue
+            quote_open = not quote_open
+        elif not quote_open and character == "(":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif not quote_open and character == ")":
+            depth -= 1
+            assert depth >= 0
+            if depth == 0:
+                tuples.append(rows[start : index + 1])
+
+    assert depth == 0
+    assert not quote_open
+    return tuple(tuples)
+
+
+def _assert_cross_mcp_source_rows(migration: str) -> tuple[str, ...]:
+    tuples = _cross_mcp_values_tuples(migration)
+    skill_ids = []
+    for row in tuples:
+        skill_id = re.match(r"\s*\(\s*'(?P<skill_id>[^']+)'\s*,", row, flags=re.DOTALL)
+        assert skill_id is not None
+        skill_ids.append(skill_id.group("skill_id"))
+
+    assert len(tuples) == len(CROSS_MCP_SKILLS)
+    assert len(skill_ids) == len(CROSS_MCP_SKILLS)
+    assert len(set(skill_ids)) == len(skill_ids)
+    assert set(skill_ids) == set(CROSS_MCP_SKILLS)
+    return tuples
+
+
 def test_cross_mcp_catalog_migration_matches_exact_public_seed_metadata() -> None:
     migration = (
         ROOT
@@ -339,6 +387,14 @@ def test_cross_mcp_catalog_migration_matches_exact_public_seed_metadata() -> Non
         flags=re.IGNORECASE | re.DOTALL,
     )
     assert header is not None
+    tuples = _assert_cross_mcp_source_rows(migration)
+    duplicated_first_tuple = migration.replace(
+        tuples[0],
+        f"{tuples[0]},\n{tuples[0]}",
+        1,
+    )
+    with pytest.raises(AssertionError):
+        _assert_cross_mcp_source_rows(duplicated_first_tuple)
     columns = tuple(
         column.strip().casefold() for column in header.group("columns").split(",")
     )

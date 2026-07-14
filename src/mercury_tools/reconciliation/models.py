@@ -10,11 +10,10 @@ from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from mercury_tools.orchestration.models import validate_cross_mcp_data
+from mercury_tools.orchestration.models import validate_accounting_text, validate_cross_mcp_data
 from mercury_tools.qualification.models import StrictSafeModel
 
 MONEY_QUANTUM = Decimal("0.01")
-_ACCOUNTING_TOKEN = re.compile(r"^[\w][\w./:#()+,%&'-]*$")
 
 
 def _normalized_money(value: Any, *, code: str) -> Decimal:
@@ -59,21 +58,36 @@ def _normalized_text_tuple(value: Any, *, code: str) -> tuple[str, ...]:
     return tuple(_normalized_text(item, code=code) for item in value)
 
 
-def _normalized_accounting_token(value: Any, *, code: str) -> str:
-    cleaned = _normalized_text(value, code=code)
-    validate_cross_mcp_data(cleaned)
+def _normalized_accounting_text(
+    value: Any,
+    *,
+    code: str,
+    max_length: int = 512,
+) -> str:
+    if not isinstance(value, str):
+        raise ValueError(code)
+    validate_cross_mcp_data(value)
+    cleaned = _clean_text(value)
+    if not cleaned:
+        raise ValueError(code)
+    return validate_accounting_text(cleaned, code=code, max_length=max_length)
+
+
+def _normalized_accounting_text_tuple(
+    value: Any,
+    *,
+    code: str,
+    max_length: int = 512,
+) -> tuple[str, ...]:
     if (
-        not _ACCOUNTING_TOKEN.fullmatch(cleaned)
-        or ".." in cleaned
-        or "//" in cleaned
+        isinstance(value, (str, bytes, bytearray, Mapping))
+        or not isinstance(value, Sequence)
     ):
         raise ValueError(code)
-    return cleaned
-
-
-def _normalized_accounting_token_tuple(value: Any, *, code: str) -> tuple[str, ...]:
-    values = _normalized_text_tuple(value, code=code)
-    return tuple(_normalized_accounting_token(item, code=code) for item in values)
+    return tuple(
+        _normalized_accounting_text(item, code=code, max_length=max_length)
+        for item in value
+    )
 
 
 class CanonicalTransaction(StrictSafeModel):
@@ -100,7 +114,7 @@ class CanonicalTransaction(StrictSafeModel):
     @field_validator("transaction_id", "source", "document_state", mode="before")
     @classmethod
     def normalize_required_text(cls, value: Any) -> str:
-        return _normalized_accounting_token(value, code="transaction_text_invalid")
+        return _normalized_accounting_text(value, code="transaction_text_invalid")
 
     @field_validator("source", "document_state")
     @classmethod
@@ -114,13 +128,13 @@ class CanonicalTransaction(StrictSafeModel):
             return None
         if isinstance(value, str) and not value.strip():
             return None
-        cleaned = _normalized_accounting_token(value, code="transaction_text_invalid")
+        cleaned = _normalized_accounting_text(value, code="transaction_text_invalid")
         return cleaned or None
 
     @field_validator("evidence_refs", mode="before")
     @classmethod
     def normalize_evidence_refs(cls, value: Any) -> tuple[str, ...]:
-        return _normalized_accounting_token_tuple(
+        return _normalized_accounting_text_tuple(
             value,
             code="transaction_evidence_refs_invalid",
         )
@@ -180,9 +194,10 @@ class PairEvidence(StrictSafeModel):
     @field_validator("left_transaction_id", "right_transaction_id", mode="before")
     @classmethod
     def validate_transaction_ids(cls, value: Any) -> str:
-        return _normalized_accounting_token(
+        return _normalized_accounting_text(
             value,
             code="reconciliation_evidence_text_invalid",
+            max_length=256,
         )
 
     @field_validator("matched_fields", mode="before")
@@ -196,7 +211,7 @@ class PairEvidence(StrictSafeModel):
     @field_validator("evidence_refs", mode="before")
     @classmethod
     def validate_evidence_refs(cls, value: Any) -> tuple[str, ...]:
-        return _normalized_accounting_token_tuple(
+        return _normalized_accounting_text_tuple(
             value,
             code="reconciliation_evidence_text_invalid",
         )
@@ -238,15 +253,25 @@ class DuplicateEvidence(StrictSafeModel):
     @field_validator("canonical_transaction_id", mode="before")
     @classmethod
     def validate_canonical_id(cls, value: Any) -> str:
-        return _normalized_accounting_token(
+        return _normalized_accounting_text(
             value,
             code="reconciliation_evidence_text_invalid",
+            max_length=256,
         )
 
-    @field_validator("transaction_ids", "evidence_refs", mode="before")
+    @field_validator("transaction_ids", mode="before")
     @classmethod
-    def validate_text_tuples(cls, value: Any) -> tuple[str, ...]:
-        return _normalized_accounting_token_tuple(
+    def validate_transaction_ids(cls, value: Any) -> tuple[str, ...]:
+        return _normalized_accounting_text_tuple(
+            value,
+            code="reconciliation_evidence_text_invalid",
+            max_length=256,
+        )
+
+    @field_validator("evidence_refs", mode="before")
+    @classmethod
+    def validate_evidence_refs(cls, value: Any) -> tuple[str, ...]:
+        return _normalized_accounting_text_tuple(
             value,
             code="reconciliation_evidence_text_invalid",
         )
@@ -280,15 +305,16 @@ class UnmatchedEvidence(StrictSafeModel):
     @field_validator("transaction_id", mode="before")
     @classmethod
     def validate_transaction_id(cls, value: Any) -> str:
-        return _normalized_accounting_token(
+        return _normalized_accounting_text(
             value,
             code="reconciliation_evidence_text_invalid",
+            max_length=256,
         )
 
     @field_validator("evidence_refs", mode="before")
     @classmethod
     def validate_evidence_refs(cls, value: Any) -> tuple[str, ...]:
-        return _normalized_accounting_token_tuple(
+        return _normalized_accounting_text_tuple(
             value,
             code="reconciliation_evidence_text_invalid",
         )

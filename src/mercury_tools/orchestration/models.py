@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import math
 import re
 import secrets
+import unicodedata
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal, Self
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 
@@ -20,19 +23,47 @@ from mercury_tools.qualification.models import StrictSafeModel
 _MAX_DATA_DEPTH = 8
 _MAX_DATA_ITEMS = 512
 _MAX_DATA_STRING_LENGTH = 2_048
-_URL_LIKE = re.compile(
+_MAX_ACCOUNTING_TEXT_LENGTH = 512
+_ACCOUNTING_TEXT_PUNCTUATION = frozenset(" ./:-#()+,%&'_")
+_DISALLOWED_TEXT_CATEGORIES = frozenset({"Cc", "Cf", "Cn", "Co", "Cs", "Zl", "Zp"})
+_HOST_PORT = re.compile(
+    r"^(?:\[[0-9a-f:.]+\]|[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?):\d{1,5}(?:[/?#].*)?$",
+    re.IGNORECASE,
+)
+_DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE)
+_CREDENTIAL_LIKE = re.compile(
     r"(?ix)(?:"
-    r"\b[a-z][a-z0-9+.-]*://"
-    r"|\b(?:data|file|ftp|gs|https?|javascript|mailto|s3|sftp|ssh):"
-    r"|\bwww\."
-    r"|(?<!:)//"
-    r"|(?<![\w@])(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+"
-    r"[a-z]{2,63}(?::\d{1,5})?(?:[/#?][^\s]*)?"
+    r"\b(?:api[ _-]?key|access[ _-]?token|authorization|client[ _-]?secret|"
+    r"password|passwd|private[ _-]?key|refresh[ _-]?token)\b\s*(?:[:=]|\b)"
+    r"|\bbearer\s+[a-z0-9._~+/=-]{6,}\b"
+    r"|\b(?:sk|pk|rk)_[a-z0-9_-]{8,}\b"
+    r"|\bAKIA[0-9A-Z]{16}\b"
     r")"
+)
+_DISALLOWED_URI_SCHEMES = frozenset(
+    {
+        "data",
+        "file",
+        "ftp",
+        "ftps",
+        "gs",
+        "http",
+        "https",
+        "javascript",
+        "mailto",
+        "s3",
+        "sftp",
+        "ssh",
+        "tel",
+        "ws",
+        "wss",
+    }
 )
 _INSTRUCTION_LIKE = re.compile(
     r"(?i)(?:ignore\s+(?:all\s+|any\s+)?(?:previous|prior|above)\s+instructions?"
-    r"|\bsystem\s+prompt\b|\byou\s+must\b|<\s*(?:system|assistant|tool)[^>]*>)"
+    r"|\bsystem\s+prompt\b|\byou\s+must\b|<\s*(?:system|assistant|tool)[^>]*>"
+    r"|\b(?:call|delete|execute|invoke|open|post|run|send|share|upload|write)\s+"
+    r"(?:(?:this|the|a|an)\s+)?(?:command|email|file|message|report|request|tool)\b)"
 )
 _EXECUTABLE_LIKE = re.compile(
     r"(?ix)(?:"
@@ -125,7 +156,6 @@ _SIDE_EFFECT_IDENTIFIER = re.compile(
 )
 _ISSUANCE_IDENTIFIER = re.compile(r"^apr_[0-9a-f]{32}$")
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
-_ACCOUNTING_SCALAR_TEXT = re.compile(r"^[\w][\w./:#()+,%&'-]{0,511}$")
 _SAFE_PURPOSE_TEXT = re.compile(r"^[\w\s.,()&+%'-]+$")
 _PURPOSE_PREFIXES = frozenset(
     {
@@ -329,12 +359,108 @@ def _validate_controlled_values(
         raise ValueError(code)
 
 
-def _is_accounting_scalar_text(value: str) -> bool:
+def _has_disallowed_text_character(value: str) -> bool:
+    return any(
+        unicodedata.category(character) in _DISALLOWED_TEXT_CATEGORIES
+        or (unicodedata.category(character) == "Zs" and character != " ")
+        for character in value
+    )
+
+
+def _is_ip_host(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host.rstrip("."))
+    except ValueError:
+        return False
+    return True
+
+
+def _is_dns_host(host: str) -> bool:
+    normalized = host.rstrip(".")
+    if "." not in normalized:
+        return False
+    try:
+        ascii_host = normalized.encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    labels = ascii_host.split(".")
+    return all(_DNS_LABEL.fullmatch(label) for label in labels)
+
+
+def _is_file_path(value: str) -> bool:
+    return (
+        value.startswith(("/", "\\", "./", ".\\", "../", "..\\", "~/", "~\\"))
+        or bool(re.match(r"^[a-z]:[\\/]", value, flags=re.IGNORECASE))
+        or "\\" in value
+    )
+
+
+def _is_endpoint_token(value: str) -> bool:
+    if value.startswith("//") or _is_file_path(value):
+        return True
+
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return True
+    if parsed.scheme:
+        scheme = parsed.scheme.casefold()
+        if scheme in _DISALLOWED_URI_SCHEMES or value[len(parsed.scheme) + 1 :].startswith("//"):
+            return True
+
+    authority = re.split(r"[/?#]", value, maxsplit=1)[0]
+    if _is_ip_host(authority):
+        return True
+    try:
+        host = urlsplit(f"//{value}").hostname
+    except ValueError:
+        return value.startswith("[")
+    if host is not None and (
+        host.casefold() == "localhost" or _is_ip_host(host) or _is_dns_host(host)
+    ):
+        return True
+    return bool(_HOST_PORT.fullmatch(value) and any(marker in value for marker in "/?#"))
+
+
+def _is_endpoint_like(value: str) -> bool:
+    token_boundary = "\"'(){}<>,;!?`"
+    return any(
+        _is_endpoint_token(token.strip(token_boundary))
+        for token in re.findall(r"\S+", value)
+        if token.strip(token_boundary)
+    )
+
+
+def _is_bounded_accounting_text(value: str, *, max_length: int) -> bool:
     return bool(
-        _ACCOUNTING_SCALAR_TEXT.fullmatch(value)
+        value
+        and len(value) <= max_length
+        and value == value.strip()
         and ".." not in value
         and "//" not in value
+        and all(
+            character == " "
+            or character in _ACCOUNTING_TEXT_PUNCTUATION
+            or unicodedata.category(character)[0] in {"L", "M", "N"}
+            for character in value
+        )
     )
+
+
+def validate_accounting_text(
+    value: Any,
+    *,
+    code: str,
+    max_length: int = _MAX_ACCOUNTING_TEXT_LENGTH,
+) -> str:
+    """Validate bounded accounting labels without permitting executable endpoint text."""
+
+    if not isinstance(value, str):
+        raise ValueError(code)
+    validate_cross_mcp_data(value)
+    if not _is_bounded_accounting_text(value, max_length=max_length):
+        raise ValueError(code)
+    return value
 
 
 def _validate_capability(value: str, *, code: str) -> None:
@@ -413,14 +539,18 @@ def validate_cross_mcp_data(value: Any) -> None:
         if isinstance(item, str):
             if len(item) > _MAX_DATA_STRING_LENGTH:
                 raise ValueError("cross_mcp_data_too_large")
-            if _URL_LIKE.search(item):
-                raise ValueError("cross_mcp_url_forbidden")
+            if _CREDENTIAL_LIKE.search(item):
+                raise ValueError("cross_mcp_credential_forbidden")
             if _INSTRUCTION_LIKE.search(item):
                 raise ValueError("cross_mcp_instruction_forbidden")
             if _EXECUTABLE_LIKE.search(item):
                 raise ValueError("cross_mcp_executable_forbidden")
+            if _has_disallowed_text_character(item):
+                raise ValueError("cross_mcp_control_character_forbidden")
             if _TOOL_NAMES.search(item) or _EXTERNAL_MCP_TOOL.search(item):
                 raise ValueError("cross_mcp_tool_name_forbidden")
+            if _is_endpoint_like(item):
+                raise ValueError("cross_mcp_url_forbidden")
             return
         if item is None or isinstance(item, (bool, int, Decimal, date, datetime)):
             return
@@ -756,7 +886,6 @@ class ApprovalBinding(StrictSafeModel):
         ttl_seconds: int,
         purpose: str | None = None,
         now: datetime | None = None,
-        issuance_id: str | None = None,
     ) -> Self:
         if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool) or ttl_seconds <= 0:
             raise ValueError("approval_ttl_invalid")
@@ -777,9 +906,7 @@ class ApprovalBinding(StrictSafeModel):
             raise ValueError("approval_payload_invalid")
         payload_copy = dict(payload)
         approval_purpose = side_effect if purpose is None else purpose
-        approval_issuance_id = (
-            f"apr_{secrets.token_hex(16)}" if issuance_id is None else issuance_id
-        )
+        approval_issuance_id = _new_issuance_id()
         _validate_approval_payload(field_tuple, payload_copy)
         validate_cross_mcp_data(payload_copy)
         digest = _authorization_digest(
@@ -927,8 +1054,10 @@ def _validate_approval_payload(
                 raise ValueError("cross_mcp_non_finite_number")
             continue
         if isinstance(value, str):
-            validate_cross_mcp_data(value)
-            if not _is_accounting_scalar_text(value):
-                raise ValueError("approval_payload_value_invalid")
+            validate_accounting_text(value, code="approval_payload_value_invalid")
             continue
         raise ValueError("approval_payload_value_invalid")
+
+
+def _new_issuance_id() -> str:
+    return f"apr_{secrets.token_hex(16)}"
