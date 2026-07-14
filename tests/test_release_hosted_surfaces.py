@@ -66,14 +66,16 @@ class FakeCommandRunner:
         *,
         cwd: Path | None = None,
         input_bytes: bytes | None = None,
+        max_output_bytes: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> CommandResult:
-        del cwd, input_bytes
+        del cwd, input_bytes, max_output_bytes, timeout_seconds
         self.calls.append(argv)
         executable = Path(argv[0]).name
         if executable in self.responses and argv[1:] in {("version",), ("--version",)}:
             return self.responses[executable]
         for key, response in self.responses.items():
-            if key in argv:
+            if any(key in argument for argument in argv):
                 return response
         raise AssertionError("unexpected_command")
 
@@ -158,6 +160,10 @@ def _complete_inspection(surface: str, *chunks: bytes) -> HostedInspection:
             complete=True,
             page_count=1,
             record_count=len(material) if index == 0 else 0,
+            request_count=0 if name in hosted_module._PARENT_COUNT_RECEIPTS else 1,
+            parent_record_count=(
+                0 if name in hosted_module._PARENT_COUNT_RECEIPTS else None
+            ),
             exit_codes=(0,),
         )
         for index, name in enumerate(expected)
@@ -178,6 +184,13 @@ def _hosted_clients() -> dict[str, FakeHostedClient]:
 def _policy(**updates: object) -> SecretScanPolicy:
     policy = SecretScanPolicy(scanner_versions=PINNED_SCANNER_VERSIONS)
     return policy.model_copy(update=updates)
+
+
+def _public_tool_records() -> list[dict[str, object]]:
+    return [
+        dict(record)
+        for record in hosted_module._compiled_public_mcp_inventory().values()
+    ]
 
 
 def test_inaccessible_hosted_surface_blocks_release(tmp_path: Path) -> None:
@@ -224,6 +237,12 @@ def test_zero_records_pass_only_when_every_expected_receipt_proves_complete_empt
                 complete=True,
                 page_count=1,
                 record_count=0,
+                request_count=(
+                    0 if name in hosted_module._PARENT_COUNT_RECEIPTS else 1
+                ),
+                parent_record_count=(
+                    0 if name in hosted_module._PARENT_COUNT_RECEIPTS else None
+                ),
                 status_codes=(200,),
             )
             for name in HOSTED_RECEIPT_INVENTORY[surface]
@@ -408,12 +427,12 @@ def test_gh_adapter_uses_compiled_release_asset_inventory_and_downloads_content(
         {
             releases_route: CommandResult(
                 exit_code=0,
-                stdout=json.dumps([[{"id": 11}]]).encode(),
+                stdout=json.dumps([{"id": 11}]).encode(),
                 stderr=b"",
             ),
             assets_route: CommandResult(
                 exit_code=0,
-                stdout=json.dumps([[{"id": 22}]]).encode(),
+                stdout=json.dumps([{"id": 22}]).encode(),
                 stderr=b"",
             ),
             download_route: CommandResult(
@@ -435,7 +454,7 @@ def test_gh_adapter_uses_compiled_release_asset_inventory_and_downloads_content(
     assert tuple(receipt.name for receipt in inspection.receipts) == HOSTED_RECEIPT_INVENTORY[
         "github_releases_and_assets"
     ]
-    assert any("--paginate" in call and "--slurp" in call for call in runner.calls)
+    assert all("--paginate" not in call and "--slurp" not in call for call in runner.calls)
     assert any(download_route in call for call in runner.calls)
     assert any(finding.rule == "provider_token" for finding in result.findings)
     assert raw_value not in result.model_dump_json()
@@ -496,14 +515,16 @@ def test_hosted_archive_receipts_preflight_aliases_and_uncompressed_budget(
                 name="github_releases_query",
                 complete=True,
                 page_count=1,
-                record_count=0,
+                record_count=1,
                 exit_codes=(0,),
             ),
             HostedReceipt(
                 name="github_release_assets_query",
                 complete=True,
                 page_count=1,
-                record_count=0,
+                record_count=1,
+                request_count=1,
+                parent_record_count=1,
                 exit_codes=(0,),
             ),
             HostedReceipt(
@@ -512,6 +533,8 @@ def test_hosted_archive_receipts_preflight_aliases_and_uncompressed_budget(
                 complete=True,
                 page_count=1,
                 record_count=1,
+                request_count=1,
+                parent_record_count=1,
                 exit_codes=(0,),
             ),
         ),
@@ -554,25 +577,25 @@ def test_gh_adapter_proves_fixed_pr_actions_packages_pages_wiki_empty_receipts()
     repo = "example/mercury-tools"
     responses = {
         f"repos/{repo}/git/matching-refs/pull/?per_page=100": CommandResult(
-            0, b"[[]]", b""
+            0, b"[]", b""
         ),
         f"repos/{repo}/actions/runs?per_page=100": CommandResult(
-            0, b'[{"workflow_runs":[]}]', b""
+            0, b'{"total_count":0,"workflow_runs":[]}', b""
         ),
         f"repos/{repo}/actions/artifacts?per_page=100": CommandResult(
-            0, b'[{"artifacts":[]}]', b""
+            0, b'{"total_count":0,"artifacts":[]}', b""
         ),
         f"repos/{repo}/actions/caches?per_page=100": CommandResult(
-            0, b'[{"actions_caches":[]}]', b""
+            0, b'{"total_count":0,"actions_caches":[]}', b""
         ),
         f"repos/{repo}": CommandResult(
-            0, b'[{"has_pages":false,"has_wiki":false}]', b""
+            0, b'{"has_pages":false,"has_wiki":false}', b""
         ),
     }
     responses.update(
         {
-            f"users/example/packages?package_type={package_type}&per_page=100": CommandResult(
-                0, b"[[]]", b""
+                f"users/example/packages?package_type={package_type}&per_page=100": CommandResult(
+                    0, b"[]", b""
             )
             for package_type in ("container", "docker", "maven", "npm", "nuget", "rubygems")
         }
@@ -673,11 +696,15 @@ def test_supabase_adapter_queries_knowledge_lists_storage_and_downloads_every_ob
     token = "supabase-operator-token"
     transport = FakeHttpTransport(
         {
-            "/rest/v1/knowledge": HostedHttpResponse(200, b"[]", {}),
+            "/rest/v1/knowledge": HostedHttpResponse(
+                200,
+                b"[]",
+                {"Content-Range": "*/0"},
+            ),
             "/storage/v1/object/list/public": HostedHttpResponse(
                 200,
                 b'[{"name":"safe.txt"}]',
-                {},
+                {"Content-Range": "0-0/1"},
             ),
             "/storage/v1/object/authenticated/public/safe.txt": HostedHttpResponse(
                 200,
@@ -708,13 +735,18 @@ def test_supabase_storage_paginates_to_a_proven_short_final_page_before_download
     def handler(call: dict[str, object]) -> HostedHttpResponse:
         url = str(call["url"])
         if "/rest/v1/knowledge" in url:
-            return HostedHttpResponse(200, b"[]", {})
+            return HostedHttpResponse(200, b"[]", {"Content-Range": "*/0"})
         if "/storage/v1/object/list/public" in url:
             body = call["json_body"]
             assert isinstance(body, dict)
             offset = body["offset"]
             page = objects[offset : offset + body["limit"]]
-            return HostedHttpResponse(200, json.dumps(page).encode(), {})
+            end = offset + len(page) - 1
+            return HostedHttpResponse(
+                200,
+                json.dumps(page).encode(),
+                {"Content-Range": f"{offset}-{end}/{len(objects)}"},
+            )
         if "/storage/v1/object/authenticated/public/" in url:
             return HostedHttpResponse(200, b"safe", {})
         raise AssertionError("unexpected_http_request")
@@ -772,19 +804,29 @@ def test_supabase_adapter_rejects_a_server_page_over_the_requested_record_budget
 
 
 def test_marketplace_and_public_mcp_adapters_scan_fixed_http_receipts() -> None:
-    tools = [{"name": f"tool_{index}"} for index in range(19)]
+    tools = _public_tool_records()
     marketplace_transport = FakeHttpTransport(
         {"snapshot": HostedHttpResponse(200, b'[{"name":"mercury-finance"}]', {})}
     )
-    mcp_transport = FakeHttpTransport(
-        {
-            "mcp": HostedHttpResponse(
-                200,
-                json.dumps({"jsonrpc": "2.0", "result": {"tools": tools}}).encode(),
-                {},
-            )
-        }
-    )
+    def mcp_handler(call: dict[str, object]) -> HostedHttpResponse:
+        body = call["json_body"]
+        assert isinstance(body, dict)
+        if body["method"] == "notifications/initialized":
+            return HostedHttpResponse(202, b"", {})
+        result = (
+            {"protocolVersion": "2025-11-25"}
+            if body["method"] == "initialize"
+            else {"tools": tools}
+        )
+        return HostedHttpResponse(
+            200,
+            json.dumps(
+                {"jsonrpc": "2.0", "id": body["id"], "result": result}
+            ).encode(),
+            {},
+        )
+
+    mcp_transport = CallbackHttpTransport(mcp_handler)
     marketplace = MarketplaceHostedClient(
         snapshot_url="https://marketplace.example/snapshot",
         transport=marketplace_transport,
@@ -804,21 +846,27 @@ def test_marketplace_and_public_mcp_adapters_scan_fixed_http_receipts() -> None:
     assert "mcp-operator-token" not in mcp_result.model_dump_json()
 
 
-def test_public_mcp_adapter_follows_tools_cursor_until_all_19_tools_are_scanned() -> None:
-    first_tools = [{"name": f"tool_{index}"} for index in range(10)]
-    second_tools = [{"name": f"tool_{index}"} for index in range(10, 19)]
+def test_public_mcp_adapter_follows_tools_cursor_until_all_20_tools_are_scanned() -> None:
+    tools = _public_tool_records()
+    first_tools = tools[:10]
+    second_tools = tools[10:]
 
     def handler(call: dict[str, object]) -> HostedHttpResponse:
         body = call["json_body"]
         assert isinstance(body, dict)
         method = body["method"]
         parameters = body["params"]
-        if method == "tools/list" and parameters == {}:
-            payload = {"result": {"tools": first_tools, "nextCursor": "next-page"}}
+        if method == "notifications/initialized":
+            return HostedHttpResponse(202, b"", {})
+        if method == "initialize":
+            result = {"protocolVersion": "2025-11-25"}
+        elif method == "tools/list" and parameters == {}:
+            result = {"tools": first_tools, "nextCursor": "next-page"}
         elif method == "tools/list" and parameters == {"cursor": "next-page"}:
-            payload = {"result": {"tools": second_tools}}
+            result = {"tools": second_tools}
         else:
-            payload = {"result": {}}
+            result = {}
+        payload = {"jsonrpc": "2.0", "id": body["id"], "result": result}
         return HostedHttpResponse(200, json.dumps(payload).encode(), {})
 
     transport = CallbackHttpTransport(handler)
@@ -841,16 +889,22 @@ def test_public_mcp_adapter_follows_tools_cursor_until_all_19_tools_are_scanned(
 
 
 def test_public_mcp_adapter_rejects_a_tools_page_over_the_record_budget() -> None:
-    tools = [{"name": f"tool_{index}"} for index in range(19)]
-    transport = FakeHttpTransport(
-        {
-            "mcp": HostedHttpResponse(
-                200,
-                json.dumps({"result": {"tools": tools}}).encode(),
-                {},
-            )
-        }
-    )
+    tools = _public_tool_records()
+
+    def handler(call: dict[str, object]) -> HostedHttpResponse:
+        body = call["json_body"]
+        assert isinstance(body, dict)
+        if body["method"] == "notifications/initialized":
+            return HostedHttpResponse(202, b"", {})
+        result = (
+            {"protocolVersion": "2025-11-25"}
+            if body["method"] == "initialize"
+            else {"tools": tools}
+        )
+        payload = {"jsonrpc": "2.0", "id": body["id"], "result": result}
+        return HostedHttpResponse(200, json.dumps(payload).encode(), {})
+
+    transport = CallbackHttpTransport(handler)
     client = PublicMcpHostedClient(
         endpoint="https://public.example/mcp",
         token=None,
@@ -867,17 +921,28 @@ def test_public_mcp_adapter_rejects_a_tools_page_over_the_record_budget() -> Non
 
 
 def test_public_mcp_adapter_handles_sse_session_handshake_without_persisting_session() -> None:
-    tools = [{"name": f"tool_{index}"} for index in range(19)]
+    tools = _public_tool_records()
     session_id = "private-session-id"
 
     def handler(call: dict[str, object]) -> HostedHttpResponse:
+        if call["method"] == "DELETE":
+            headers = call["headers"]
+            assert isinstance(headers, dict)
+            assert headers["Mcp-Session-Id"] == session_id
+            return HostedHttpResponse(204, b"", {})
         body = call["json_body"]
         assert isinstance(body, dict)
         method = body["method"]
         headers = call["headers"]
         assert isinstance(headers, dict)
         if method == "initialize":
-            payload = json.dumps({"result": {"protocolVersion": "2025-11-25"}})
+            payload = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {"protocolVersion": "2025-11-25"},
+                }
+            )
             return HostedHttpResponse(
                 200,
                 f"event: message\ndata: {payload}\n\n".encode(),
@@ -889,7 +954,13 @@ def test_public_mcp_adapter_handles_sse_session_handshake_without_persisting_ses
         if method == "tools/list":
             return HostedHttpResponse(
                 200,
-                json.dumps({"result": {"tools": tools}}).encode(),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "result": {"tools": tools},
+                    }
+                ).encode(),
                 {},
             )
         raise AssertionError("unexpected_mcp_method")
@@ -905,10 +976,14 @@ def test_public_mcp_adapter_handles_sse_session_handshake_without_persisting_ses
 
     assert result.blockers == ()
     assert session_id not in result.model_dump_json()
-    assert [call["json_body"]["method"] for call in transport.calls] == [  # type: ignore[index]
+    assert [
+        call["json_body"].get("method") if isinstance(call["json_body"], dict) else None
+        for call in transport.calls
+    ] == [
         "initialize",
         "notifications/initialized",
         "tools/list",
+        None,
     ]
 
 

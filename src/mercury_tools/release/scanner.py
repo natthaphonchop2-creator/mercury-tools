@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import json
 import math
 import os
 import re
 import secrets
+import selectors
 import shutil
+import signal
 import stat
 import subprocess
 import tarfile
 import tempfile
+import time
 import unicodedata
 import zipfile
 from collections import Counter
@@ -101,6 +105,8 @@ class CommandRunner(Protocol):
         *,
         cwd: Path | None = None,
         input_bytes: bytes | None = None,
+        max_output_bytes: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> CommandResult: ...
 
 
@@ -110,9 +116,11 @@ class SubprocessCommandRunner:
         *,
         environment: Mapping[str, str] | None = None,
         max_output_bytes: int = 256 * 1024 * 1024,
+        timeout_seconds: float = 300.0,
     ) -> None:
         self._environment = dict(environment or {})
         self._max_output_bytes = max_output_bytes
+        self._timeout_seconds = timeout_seconds
 
     def run(
         self,
@@ -120,29 +128,121 @@ class SubprocessCommandRunner:
         *,
         cwd: Path | None = None,
         input_bytes: bytes | None = None,
+        max_output_bytes: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> CommandResult:
+        output_limit = self._max_output_bytes if max_output_bytes is None else max_output_bytes
+        command_timeout = self._timeout_seconds if timeout_seconds is None else timeout_seconds
+        if output_limit <= 0 or command_timeout <= 0:
+            return CommandResult(exit_code=127, stdout=b"", stderr=b"")
+        process: subprocess.Popen[bytes] | None = None
+        selector = selectors.DefaultSelector()
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 argv,
                 cwd=cwd,
-                input=input_bytes,
-                capture_output=True,
-                check=False,
-                timeout=300,
+                stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 env={**os.environ, **self._environment},
+                start_new_session=True,
             )
-        except (OSError, subprocess.SubprocessError):
+            assert process.stdout is not None
+            assert process.stderr is not None
+            stdout = bytearray()
+            stderr = bytearray()
+            total_output = 0
+            for stream, label in ((process.stdout, "stdout"), (process.stderr, "stderr")):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, label)
+
+            pending_input = memoryview(input_bytes or b"")
+            input_offset = 0
+            if process.stdin is not None:
+                os.set_blocking(process.stdin.fileno(), False)
+                if pending_input:
+                    selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+                else:
+                    process.stdin.close()
+
+            deadline = time.monotonic() + command_timeout
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _kill_process(process)
+                    return CommandResult(exit_code=124, stdout=b"", stderr=b"")
+                events = selector.select(min(remaining, 0.1))
+                for key, _mask in events:
+                    stream = key.fileobj
+                    if key.data == "stdin":
+                        try:
+                            written = os.write(
+                                stream.fileno(),  # type: ignore[union-attr]
+                                pending_input[input_offset : input_offset + 64 * 1024],
+                            )
+                        except BlockingIOError:
+                            continue
+                        except BrokenPipeError:
+                            selector.unregister(stream)
+                            stream.close()  # type: ignore[union-attr]
+                            continue
+                        input_offset += written
+                        if input_offset >= len(pending_input):
+                            with contextlib.suppress(Exception):
+                                selector.unregister(stream)
+                            stream.close()  # type: ignore[union-attr]
+                        continue
+                    try:
+                        chunk = os.read(stream.fileno(), 64 * 1024)  # type: ignore[union-attr]
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(stream)
+                        stream.close()  # type: ignore[union-attr]
+                        continue
+                    destination = stdout if key.data == "stdout" else stderr
+                    total_output += len(chunk)
+                    if (
+                        len(destination) + len(chunk) > output_limit
+                        or total_output > output_limit
+                    ):
+                        _kill_process(process)
+                        return CommandResult(exit_code=125, stdout=b"", stderr=b"")
+                    destination.extend(chunk)
+
+            remaining = max(0.001, deadline - time.monotonic())
+            try:
+                exit_code = process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                _kill_process(process)
+                return CommandResult(exit_code=124, stdout=b"", stderr=b"")
+            return CommandResult(
+                exit_code=exit_code,
+                stdout=bytes(stdout),
+                stderr=bytes(stderr),
+            )
+        except (OSError, subprocess.SubprocessError, ValueError):
+            if process is not None:
+                _kill_process(process)
             return CommandResult(exit_code=127, stdout=b"", stderr=b"")
-        if (
-            len(completed.stdout) > self._max_output_bytes
-            or len(completed.stderr) > self._max_output_bytes
-        ):
-            return CommandResult(exit_code=125, stdout=b"", stderr=b"")
-        return CommandResult(
-            exit_code=completed.returncode,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-        )
+        finally:
+            selector.close()
+            if process is not None:
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    if stream is not None:
+                        with contextlib.suppress(OSError):
+                            stream.close()
+
+
+def _kill_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (AttributeError, OSError):
+            with contextlib.suppress(OSError):
+                process.kill()
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        process.wait(timeout=1)
 
 
 def require_scanner(name: str) -> Path:
@@ -758,6 +858,10 @@ class _BudgetExceeded(RuntimeError):
     pass
 
 
+class _TraversalError(RuntimeError):
+    pass
+
+
 @dataclass
 class _ByteBudget:
     limit: int
@@ -770,17 +874,95 @@ class _ByteBudget:
 
 
 def _walk_paths(root: Path, *, skip_git: bool = False):
-    for directory, directory_names, file_names in os.walk(
-        root,
-        topdown=True,
-        followlinks=False,
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(root, flags)
+    except OSError as error:
+        raise _TraversalError from error
+    try:
+        opened = os.fstat(descriptor)
+        _verify_directory_identity(root, opened)
+        yield from _walk_directory(
+            descriptor,
+            root,
+            skip_git=skip_git,
+            flags=flags,
+        )
+        _verify_directory_identity(root, opened)
+    except (OSError, ValueError) as error:
+        raise _TraversalError from error
+    finally:
+        os.close(descriptor)
+
+
+def _walk_directory(
+    descriptor: int,
+    directory: Path,
+    *,
+    skip_git: bool,
+    flags: int,
+):
+    before = os.fstat(descriptor)
+    if not stat.S_ISDIR(before.st_mode):
+        raise OSError("directory_changed")
+    _verify_directory_identity(directory, before)
+    with os.scandir(descriptor) as iterator:
+        entries = sorted(iterator, key=lambda entry: entry.name)
+    after_enumeration = os.fstat(descriptor)
+    if _stat_identity(after_enumeration) != _stat_identity(before):
+        raise OSError("directory_changed")
+    _verify_directory_identity(directory, before)
+
+    for entry in entries:
+        if skip_git and entry.name == ".git":
+            continue
+        if not entry.name or "/" in entry.name or entry.name in {".", ".."}:
+            raise OSError("directory_entry_invalid")
+        child = directory / entry.name
+        metadata = entry.stat(follow_symlinks=False)
+        current = child.lstat()
+        if _stat_identity(current) != _stat_identity(metadata):
+            raise OSError("directory_entry_changed")
+        yield child
+        if not stat.S_ISDIR(metadata.st_mode):
+            continue
+        child_descriptor = os.open(entry.name, flags, dir_fd=descriptor)
+        try:
+            opened = os.fstat(child_descriptor)
+            if _stat_identity(opened) != _stat_identity(metadata):
+                raise OSError("directory_changed")
+            _verify_directory_identity(child, opened)
+            yield from _walk_directory(
+                child_descriptor,
+                child,
+                skip_git=skip_git,
+                flags=flags,
+            )
+            _verify_directory_identity(child, opened)
+        finally:
+            os.close(child_descriptor)
+
+    after_walk = os.fstat(descriptor)
+    if _stat_identity(after_walk) != _stat_identity(before):
+        raise OSError("directory_changed")
+    _verify_directory_identity(directory, before)
+
+
+def _stat_identity(metadata: os.stat_result) -> tuple[int, int, int]:
+    return metadata.st_dev, metadata.st_ino, metadata.st_mode
+
+
+def _verify_directory_identity(path: Path, expected: os.stat_result) -> None:
+    current = path.lstat()
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or _stat_identity(current) != _stat_identity(expected)
     ):
-        directory_names.sort()
-        file_names.sort()
-        if skip_git:
-            directory_names[:] = [name for name in directory_names if name != ".git"]
-        for name in (*directory_names, *file_names):
-            yield Path(directory) / name
+        raise OSError("directory_changed")
 
 
 def _read_regular_file(
@@ -796,7 +978,7 @@ def _read_regular_file(
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISREG(opened.st_mode)
-            or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+            or _stat_identity(opened) != _stat_identity(metadata)
             or opened.st_size != metadata.st_size
         ):
             raise OSError("file_changed")
@@ -810,9 +992,26 @@ def _read_regular_file(
             remaining -= len(chunk)
         if os.read(descriptor, 1):
             raise _BudgetExceeded
+        closed_over = os.fstat(descriptor)
+        if (
+            _stat_identity(closed_over) != _stat_identity(opened)
+            or closed_over.st_size != opened.st_size
+        ):
+            raise OSError("file_changed")
+        _verify_regular_file_identity(path, metadata)
         return b"".join(chunks)
     finally:
         os.close(descriptor)
+
+
+def _verify_regular_file_identity(path: Path, expected: os.stat_result) -> None:
+    current = path.lstat()
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or _stat_identity(current) != _stat_identity(expected)
+        or current.st_size != expected.st_size
+    ):
+        raise OSError("file_changed")
 
 
 def scan_filesystem(root: Path, _policy: SecretScanPolicy) -> FilesystemScanResult:
@@ -828,7 +1027,15 @@ def scan_filesystem(root: Path, _policy: SecretScanPolicy) -> FilesystemScanResu
         return FilesystemScanResult(blockers=("filesystem_unavailable",))
     entry_count = 0
     byte_budget = _ByteBudget(_policy.max_filesystem_bytes)
-    for path in _walk_paths(root, skip_git=True):
+    paths = _walk_paths(root, skip_git=True)
+    while True:
+        try:
+            path = next(paths)
+        except StopIteration:
+            break
+        except _TraversalError:
+            blockers.append("filesystem_traversal_failed")
+            break
         entry_count += 1
         if entry_count > _policy.max_filesystem_entries:
             blockers.append("filesystem_entry_limit")
@@ -864,6 +1071,7 @@ def scan_filesystem(root: Path, _policy: SecretScanPolicy) -> FilesystemScanResu
             blockers.append("filesystem_read_failed")
             continue
         findings.extend(_scan_bytes(data, relative_name, _policy))
+    paths.close()
     return FilesystemScanResult(
         findings=_deduplicate_findings(findings),
         blockers=tuple(sorted(set(blockers))),
@@ -897,7 +1105,15 @@ def scan_artifacts(root: Path, policy: SecretScanPolicy) -> ArtifactScanResult:
     entry_count = 0
     artifact_bytes = _ByteBudget(policy.max_artifact_total_bytes)
     archive_bytes = _ByteBudget(policy.max_archive_uncompressed_bytes)
-    for path in _walk_paths(root):
+    paths = _walk_paths(root)
+    while True:
+        try:
+            path = next(paths)
+        except StopIteration:
+            break
+        except _TraversalError:
+            blockers.append("artifact_traversal_failed")
+            break
         entry_count += 1
         if entry_count > policy.max_artifact_entries:
             blockers.append("artifact_entry_limit")
@@ -943,24 +1159,28 @@ def scan_artifacts(root: Path, policy: SecretScanPolicy) -> ArtifactScanResult:
             blockers.append(f"artifact_too_large:{kind.value}")
             continue
         try:
-            evidence_hashes.append(
-                _hash_file(
-                    path,
-                    max_bytes=policy.max_archive_bytes,
-                    expected_metadata=metadata,
-                )
+            data = _read_regular_file(
+                path,
+                metadata,
+                max_bytes=policy.max_archive_bytes,
             )
+            evidence_hashes.append(hashlib.sha256(data).hexdigest())
         except (_BudgetExceeded, OSError):
             blockers.append(f"artifact_read_failed:{kind.value}")
             continue
         archive_findings, archive_blockers = _scan_archive(
-            path,
+            _ArtifactSnapshot(name=path.name, data=data),
             kind,
             policy,
             archive_bytes,
         )
         findings.extend(archive_findings)
         blockers.extend(archive_blockers)
+        try:
+            _verify_regular_file_identity(path, metadata)
+        except OSError:
+            blockers.append(f"artifact_read_failed:{kind.value}")
+    paths.close()
 
     kinds = tuple(kind for kind in ArtifactKind if kind in discovered.values())
     for kind in ArtifactKind:
@@ -1056,7 +1276,7 @@ def scan_git_repository(
                 object_count,
                 blob_count,
             )
-        checkout_ref, local_refs = ref_sets
+        checkout_ref, _local_refs = ref_sets
         checkout_result = _run_and_record(
             runner,
             ("git", "checkout", "--force", "--detach", checkout_ref),
@@ -1102,9 +1322,6 @@ def scan_git_repository(
         findings.extend(scanner_findings)
         blockers.extend(scanner_blockers)
 
-        if "refs/remotes/origin/HEAD" in local_refs:
-            local_refs.remove("refs/remotes/origin/HEAD")
-
     return _git_result(
         findings,
         blockers,
@@ -1122,16 +1339,16 @@ def _inventory_refs(
     evidence_hashes: list[str],
     exit_codes: list[int],
     blockers: list[str],
-) -> tuple[str, set[str]] | None:
+) -> tuple[str, dict[str, str]] | None:
     commands = {
         "heads": ("git", "ls-remote", "--heads", "origin"),
-        "tags": ("git", "ls-remote", "--tags", "--refs", "origin"),
+        "tags": ("git", "ls-remote", "--tags", "origin"),
         "pull_requests": ("git", "ls-remote", "origin", "refs/pull/*/head"),
         "default": ("git", "ls-remote", "--symref", "origin", "HEAD"),
         "local": (
             "git",
             "for-each-ref",
-            "--format=%(refname)",
+            "--format=%(refname)%09%(objectname)%09%(*objectname)",
             "refs/remotes/origin",
             "refs/tags",
             "refs/remotes/pull",
@@ -1163,13 +1380,15 @@ def _inventory_refs(
         remote_heads = _parse_ls_remote(outputs["heads"])
         remote_tags = _parse_ls_remote(outputs["tags"])
         remote_pulls = _parse_ls_remote(outputs["pull_requests"])
-        remote_default = _parse_remote_default(outputs["default"])
-        local_refs = {
-            line.decode("utf-8", errors="strict")
-            for line in outputs["local"].splitlines()
-            if line
-        }
-        local_default = outputs["local_default"].decode("utf-8", errors="strict").strip()
+        remote_default, remote_default_oid = _parse_remote_default(outputs["default"])
+        local_refs = _parse_local_refs(outputs["local"])
+        local_default_lines = outputs["local_default"].decode(
+            "utf-8",
+            errors="strict",
+        ).splitlines()
+        if len(local_default_lines) != 1:
+            raise ReleaseGateError("git_default_branch_unverifiable")
+        local_default = local_default_lines[0]
     except ReleaseGateError as exc:
         blockers.append(
             "git_default_branch_unverifiable"
@@ -1182,20 +1401,52 @@ def _inventory_refs(
         return None
     if not remote_heads:
         blockers.append("git_refs_incomplete:heads")
-    expected = {
+    if not _valid_ref_namespace(remote_heads, r"refs/heads/.+", allow_peeled=False):
+        blockers.append("git_ref_inventory_malformed")
+        return None
+    if not _valid_ref_namespace(remote_tags, r"refs/tags/.+", allow_peeled=True):
+        blockers.append("git_ref_inventory_malformed")
+        return None
+    if not _valid_ref_namespace(
+        remote_pulls,
+        r"refs/pull/[1-9][0-9]*/head",
+        allow_peeled=False,
+    ):
+        blockers.append("git_ref_inventory_malformed")
+        return None
+    expected: dict[str, dict[str, str]] = {
         "heads": {
-            f"refs/remotes/origin/{ref.removeprefix('refs/heads/')}"
-            for ref in remote_heads
+            f"refs/remotes/origin/{ref.removeprefix('refs/heads/')}": oid
+            for ref, oid in remote_heads.items()
         },
-        "tags": remote_tags,
+        "tags": dict(remote_tags),
         "pull_requests": {
-            f"refs/remotes/pull/{ref.removeprefix('refs/pull/')}"
-            for ref in remote_pulls
+            f"refs/remotes/pull/{ref.removeprefix('refs/pull/')}": oid
+            for ref, oid in remote_pulls.items()
+        },
+    }
+    local_scopes = {
+        "heads": {
+            ref: oid
+            for ref, oid in local_refs.items()
+            if ref.startswith("refs/remotes/origin/")
+            and ref != "refs/remotes/origin/HEAD"
+        },
+        "tags": {
+            ref: oid for ref, oid in local_refs.items() if ref.startswith("refs/tags/")
+        },
+        "pull_requests": {
+            ref: oid
+            for ref, oid in local_refs.items()
+            if ref.startswith("refs/remotes/pull/")
         },
     }
     for scope, expected_refs in expected.items():
-        if not expected_refs.issubset(local_refs):
+        actual_refs = local_scopes[scope]
+        if set(actual_refs) != set(expected_refs):
             blockers.append(f"git_refs_incomplete:{scope}")
+        elif actual_refs != expected_refs:
+            blockers.append(f"git_ref_object_mismatch:{scope}")
     expected_default = (
         f"refs/remotes/origin/{remote_default.removeprefix('refs/heads/')}"
     )
@@ -1203,24 +1454,38 @@ def _inventory_refs(
         remote_default not in remote_heads
         or expected_default not in local_refs
         or local_default != expected_default
+        or remote_default_oid != remote_heads.get(remote_default)
+        or remote_default_oid != local_refs.get(expected_default)
     ):
         blockers.append("git_default_branch_unverifiable")
+    if blockers:
+        return None
     return expected_default, local_refs
 
 
-def _parse_ls_remote(output: bytes) -> set[str]:
-    refs: set[str] = set()
+def _parse_ls_remote(output: bytes) -> dict[str, str]:
+    refs: dict[str, str] = {}
     for line in output.splitlines():
         parts = line.split(b"\t", 1)
-        if len(parts) != 2:
+        if (
+            len(parts) != 2
+            or re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", parts[0]) is None
+        ):
             raise ReleaseGateError("git_ref_inventory_malformed")
-        refs.add(parts[1].decode("utf-8", errors="strict"))
+        ref = parts[1].decode("utf-8", errors="strict")
+        if (
+            not ref.startswith("refs/")
+            or any(character in ref for character in "\r\n\0")
+            or ref in refs
+        ):
+            raise ReleaseGateError("git_ref_inventory_malformed")
+        refs[ref] = parts[0].decode("ascii")
     return refs
 
 
-def _parse_remote_default(output: bytes) -> str:
+def _parse_remote_default(output: bytes) -> tuple[str, str]:
     symbolic: list[str] = []
-    head_oids = 0
+    head_oids: list[str] = []
     for line in output.splitlines():
         if line.startswith(b"ref: "):
             prefix, separator, suffix = line.partition(b"\t")
@@ -1237,12 +1502,59 @@ def _parse_remote_default(output: bytes) -> str:
             and parts[1] == b"HEAD"
             and re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", parts[0])
         ):
-            head_oids += 1
+            head_oids.append(parts[0].decode("ascii"))
             continue
         raise ReleaseGateError("git_default_branch_unverifiable")
-    if len(symbolic) != 1 or head_oids != 1:
+    if len(symbolic) != 1 or len(head_oids) != 1:
         raise ReleaseGateError("git_default_branch_unverifiable")
-    return symbolic[0]
+    return symbolic[0], head_oids[0]
+
+
+def _parse_local_refs(output: bytes) -> dict[str, str]:
+    refs: dict[str, str] = {}
+    for line in output.splitlines():
+        parts = line.split(b"\t")
+        if len(parts) != 3:
+            raise ReleaseGateError("git_ref_inventory_malformed")
+        ref = parts[0].decode("utf-8", errors="strict")
+        oid = parts[1].decode("ascii", errors="strict")
+        peeled = parts[2].decode("ascii", errors="strict")
+        if (
+            not ref.startswith("refs/")
+            or any(character in ref for character in "\r\n\0")
+            or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid) is None
+            or ref in refs
+        ):
+            raise ReleaseGateError("git_ref_inventory_malformed")
+        refs[ref] = oid
+        if peeled:
+            peeled_ref = f"{ref}^{{}}"
+            if (
+                not ref.startswith("refs/tags/")
+                or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", peeled) is None
+                or peeled_ref in refs
+            ):
+                raise ReleaseGateError("git_ref_inventory_malformed")
+            refs[peeled_ref] = peeled
+    return refs
+
+
+def _valid_ref_namespace(
+    refs: Mapping[str, str],
+    pattern: str,
+    *,
+    allow_peeled: bool,
+) -> bool:
+    direct_refs = {ref for ref in refs if not ref.endswith("^{}")}
+    for ref in refs:
+        candidate = ref.removesuffix("^{}")
+        if re.fullmatch(pattern, candidate) is None:
+            return False
+        if ref.endswith("^{}") and (
+            not allow_peeled or candidate not in direct_refs
+        ):
+            return False
+    return True
 
 
 def _scan_reachable_blobs(
@@ -1583,24 +1895,31 @@ def _is_archive_name(name: str) -> bool:
     return name.endswith((".whl", ".zip", ".tar", ".tar.gz", ".tgz"))
 
 
+@dataclass(frozen=True, repr=False)
+class _ArtifactSnapshot:
+    name: str
+    data: bytes = field(repr=False)
+
+
 def _scan_archive(
-    path: Path,
+    artifact: _ArtifactSnapshot,
     kind: ArtifactKind,
     policy: SecretScanPolicy,
     archive_budget: _ByteBudget,
 ) -> tuple[list[SecretFinding], list[str]]:
     try:
-        if zipfile.is_zipfile(path):
-            return _scan_zip(path, kind, policy, archive_budget)
-        if tarfile.is_tarfile(path):
-            return _scan_tar(path, kind, policy, archive_budget)
+        if zipfile.is_zipfile(io.BytesIO(artifact.data)):
+            return _scan_zip(artifact, kind, policy, archive_budget)
+        with tarfile.open(fileobj=io.BytesIO(artifact.data), mode="r:*"):
+            pass
+        return _scan_tar(artifact, kind, policy, archive_budget)
     except (OSError, tarfile.TarError, zipfile.BadZipFile):
         pass
     return [], [f"artifact_read_failed:{kind.value}"]
 
 
 def _scan_zip(
-    path: Path,
+    artifact: _ArtifactSnapshot,
     kind: ArtifactKind,
     policy: SecretScanPolicy,
     archive_budget: _ByteBudget,
@@ -1608,16 +1927,17 @@ def _scan_zip(
     findings: list[SecretFinding] = []
     blockers: list[str] = []
     try:
-        with zipfile.ZipFile(path) as archive:
+        with zipfile.ZipFile(io.BytesIO(artifact.data)) as archive:
             entries = archive.infolist()
             if len(entries) > policy.max_archive_entries:
                 return [], [f"artifact_entry_limit:{kind.value}"]
             canonical_names: set[str] = set()
             for entry in entries:
-                logical_path = f"{path.name}!{entry.filename}"
+                logical_path = f"{artifact.name}!{entry.filename}"
                 canonical = _canonical_archive_member(entry.filename)
-                if canonical is None or _zip_entry_is_symlink(entry):
+                if canonical is None or not _zip_entry_is_safe_type(entry):
                     findings.append(_path_finding("archive_unsafe", logical_path))
+                    blockers.append(f"artifact_unsafe_member:{kind.value}")
                     continue
                 if canonical in canonical_names:
                     blockers.append(f"artifact_duplicate_member:{kind.value}")
@@ -1626,7 +1946,7 @@ def _scan_zip(
                 return findings, blockers
             for entry in entries:
                 canonical = _canonical_archive_member(entry.filename)
-                if canonical is None or _zip_entry_is_symlink(entry) or entry.is_dir():
+                if canonical is None or not _zip_entry_is_safe_type(entry) or entry.is_dir():
                     continue
                 if entry.file_size > policy.max_archive_member_bytes:
                     blockers.append(f"artifact_member_too_large:{kind.value}")
@@ -1639,11 +1959,11 @@ def _scan_zip(
                 return findings, blockers
             for entry in entries:
                 canonical = _canonical_archive_member(entry.filename)
-                if canonical is None or _zip_entry_is_symlink(entry):
+                if canonical is None or not _zip_entry_is_safe_type(entry):
                     continue
                 if entry.is_dir():
                     continue
-                logical_path = f"{path.name}!{entry.filename}"
+                logical_path = f"{artifact.name}!{entry.filename}"
                 member_path = PurePosixPath(canonical)
                 if _is_forbidden_path(member_path):
                     findings.append(_path_finding("forbidden_path", logical_path))
@@ -1656,7 +1976,7 @@ def _scan_zip(
 
 
 def _scan_tar(
-    path: Path,
+    artifact: _ArtifactSnapshot,
     kind: ArtifactKind,
     policy: SecretScanPolicy,
     archive_budget: _ByteBudget,
@@ -1664,16 +1984,17 @@ def _scan_tar(
     findings: list[SecretFinding] = []
     blockers: list[str] = []
     try:
-        with tarfile.open(path, "r:*") as archive:
+        with tarfile.open(fileobj=io.BytesIO(artifact.data), mode="r:*") as archive:
             entries = archive.getmembers()
             if len(entries) > policy.max_archive_entries:
                 return [], [f"artifact_entry_limit:{kind.value}"]
             canonical_names: set[str] = set()
             for entry in entries:
-                logical_path = f"{path.name}!{entry.name}"
+                logical_path = f"{artifact.name}!{entry.name}"
                 canonical = _canonical_archive_member(entry.name)
-                if canonical is None or entry.issym() or entry.islnk():
+                if canonical is None or not (entry.isfile() or entry.isdir()):
                     findings.append(_path_finding("archive_unsafe", logical_path))
+                    blockers.append(f"artifact_unsafe_member:{kind.value}")
                     continue
                 if canonical in canonical_names:
                     blockers.append(f"artifact_duplicate_member:{kind.value}")
@@ -1682,7 +2003,7 @@ def _scan_tar(
                 return findings, blockers
             for entry in entries:
                 canonical = _canonical_archive_member(entry.name)
-                if canonical is None or entry.issym() or entry.islnk() or not entry.isfile():
+                if canonical is None or not (entry.isfile() or entry.isdir()) or not entry.isfile():
                     continue
                 if entry.size > policy.max_archive_member_bytes:
                     blockers.append(f"artifact_member_too_large:{kind.value}")
@@ -1695,11 +2016,11 @@ def _scan_tar(
                 return findings, blockers
             for entry in entries:
                 canonical = _canonical_archive_member(entry.name)
-                if canonical is None or entry.issym() or entry.islnk():
+                if canonical is None or not (entry.isfile() or entry.isdir()):
                     continue
                 if not entry.isfile():
                     continue
-                logical_path = f"{path.name}!{entry.name}"
+                logical_path = f"{artifact.name}!{entry.name}"
                 if _is_forbidden_path(PurePosixPath(canonical)):
                     findings.append(_path_finding("forbidden_path", logical_path))
                 stream = archive.extractfile(entry)
@@ -1750,6 +2071,15 @@ def _unsafe_archive_member(name: str) -> bool:
 
 def _zip_entry_is_symlink(entry: zipfile.ZipInfo) -> bool:
     return (entry.external_attr >> 16) & 0o170000 == 0o120000
+
+
+def _zip_entry_is_safe_type(entry: zipfile.ZipInfo) -> bool:
+    if entry.create_system != 3:
+        return True
+    member_type = (entry.external_attr >> 16) & 0o170000
+    if entry.is_dir():
+        return member_type in {0, stat.S_IFDIR}
+    return member_type in {0, stat.S_IFREG}
 
 
 def _is_forbidden_path(path: PurePosixPath) -> bool:

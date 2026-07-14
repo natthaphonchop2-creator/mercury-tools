@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bz2
+import functools
 import gzip
 import hashlib
 import io
@@ -12,8 +13,8 @@ import re
 import tarfile
 import tempfile
 import zipfile
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Protocol
@@ -37,7 +38,7 @@ from mercury_tools.release.scanner import (
     _path_finding,
     _read_stream_exact,
     _scan_bytes,
-    _zip_entry_is_symlink,
+    _zip_entry_is_safe_type,
 )
 
 HOSTED_SCANNER_VERSION = BUILTIN_SCANNER_VERSION
@@ -65,10 +66,12 @@ HOSTED_RECEIPT_INVENTORY = MappingProxyType(
             "github_actions_artifacts_query",
             "github_actions_artifacts_download",
             "github_actions_caches_query",
+            "github_actions_caches_content",
         ),
         "github_packages_pages_wiki": (
             "github_packages_query",
             "github_package_versions_query",
+            "github_package_versions_content",
             "github_pages_query",
             "github_pages_download",
             "github_wiki_query",
@@ -91,6 +94,20 @@ HOSTED_RECEIPT_INVENTORY = MappingProxyType(
         ),
     }
 )
+_PARENT_COUNT_RECEIPTS = frozenset(
+    {
+        "github_release_assets_query",
+        "github_release_assets_download",
+        "github_actions_logs_download",
+        "github_actions_artifacts_download",
+        "github_actions_caches_content",
+        "github_package_versions_query",
+        "github_package_versions_content",
+        "github_pages_download",
+        "github_wiki_download",
+        "supabase_storage_download",
+    }
+)
 _VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 _RECEIPT_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 _PACKAGE_TYPES = ("container", "docker", "maven", "npm", "nuget", "rubygems")
@@ -103,6 +120,8 @@ class HostedReceipt:
     complete: bool = False
     page_count: int = 0
     record_count: int = 0
+    request_count: int = 1
+    parent_record_count: int | None = None
     exit_codes: tuple[int, ...] = ()
     status_codes: tuple[int, ...] = ()
 
@@ -234,7 +253,7 @@ def _scan_hosted_zip(
             member_bytes = 0
             for entry in entries:
                 canonical = _canonical_archive_member(entry.filename)
-                if canonical is None or _zip_entry_is_symlink(entry):
+                if canonical is None or not _zip_entry_is_safe_type(entry):
                     blockers.append(_hosted_archive_code("unsafe", surface))
                     continue
                 if canonical in canonical_names:
@@ -398,6 +417,103 @@ def _page_records(payload: object, record_key: str | None) -> list[object] | Non
     return list(records) if isinstance(records, list) else None
 
 
+def _github_page_route(route: str, *, page: int, per_page: int) -> str:
+    parsed = urlsplit(route)
+    query = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key not in {"page", "per_page"}
+    ]
+    query.extend((("per_page", str(per_page)), ("page", str(page))))
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment)
+    )
+
+
+def _valid_id_records(records: list[object]) -> bool:
+    identifiers: list[int] = []
+    for record in records:
+        if not isinstance(record, dict):
+            return False
+        identifier = record.get("id")
+        if isinstance(identifier, bool) or not isinstance(identifier, int) or identifier <= 0:
+            return False
+        identifiers.append(identifier)
+    return len(identifiers) == len(set(identifiers))
+
+
+def _valid_pull_ref_records(records: list[object]) -> bool:
+    refs: list[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            return False
+        ref = record.get("ref")
+        target = record.get("object")
+        if (
+            not isinstance(ref, str)
+            or re.fullmatch(r"refs/pull/[1-9][0-9]*/head", ref) is None
+            or not isinstance(target, dict)
+            or not isinstance(target.get("sha"), str)
+            or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", target["sha"]) is None
+        ):
+            return False
+        refs.append(ref)
+    return len(refs) == len(set(refs))
+
+
+def _valid_package_records(records: list[object], expected_type: str) -> bool:
+    names: list[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            return False
+        name = record.get("name")
+        if (
+            not isinstance(name, str)
+            or not name
+            or len(name) > 255
+            or any(character in name for character in "\r\n\0")
+            or record.get("package_type") != expected_type
+        ):
+            return False
+        names.append(name)
+    return len(names) == len(set(names))
+
+
+def _valid_repository_metadata(records: list[object]) -> bool:
+    return (
+        len(records) == 1
+        and isinstance(records[0], dict)
+        and isinstance(records[0].get("has_pages"), bool)
+        and isinstance(records[0].get("has_wiki"), bool)
+    )
+
+
+def _valid_pages_records(records: list[object]) -> bool:
+    return (
+        len(records) == 1
+        and isinstance(records[0], dict)
+        and isinstance(records[0].get("html_url"), str)
+        and bool(records[0]["html_url"])
+    )
+
+
+def _valid_git_ref_map(output: bytes) -> bool:
+    refs: set[bytes] = set()
+    if not output:
+        return False
+    for line in output.splitlines():
+        parts = line.split(b"\t", 1)
+        if (
+            len(parts) != 2
+            or re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", parts[0]) is None
+            or not parts[1].startswith((b"HEAD", b"refs/"))
+            or parts[1] in refs
+        ):
+            return False
+        refs.add(parts[1])
+    return True
+
+
 class GhApiHostedClient:
     """Inspect the compiled GitHub route plan with authenticated ``gh api`` calls."""
 
@@ -421,62 +537,136 @@ class GhApiHostedClient:
         policy: SecretScanPolicy,
         *,
         record_key: str | None = None,
+        validator: Callable[[list[object]], bool] | None = None,
+        exact_total_key: str | None = None,
     ) -> tuple[HostedReceipt, list[object]]:
-        try:
-            result = self._command_runner.run(
-                (
-                    str(self._executable),
-                    "api",
-                    "--paginate",
-                    "--slurp",
-                    route,
-                )
-            )
-        except Exception:
-            result = CommandResult(exit_code=127, stdout=b"", stderr=b"")
+        page_size = min(100, policy.max_hosted_page_records, policy.max_hosted_records)
         records: list[object] = []
-        complete = result.exit_code == 0
-        page_count = 0
-        try:
-            pages = json.loads(result.stdout)
-            if not isinstance(pages, list) or not pages:
-                raise ValueError
-            page_count = len(pages)
-            for page in pages:
-                page_records = _page_records(page, record_key)
-                if page_records is None:
+        chunks: list[bytes] = []
+        exit_codes: list[int] = []
+        complete = True
+        page = 1
+        proven_total: int | None = None
+        while True:
+            if page > policy.max_hosted_pages:
+                complete = False
+                break
+            used_bytes = sum(len(chunk) for chunk in chunks)
+            remaining_bytes = policy.max_hosted_receipt_bytes - used_bytes
+            if remaining_bytes <= 0:
+                complete = False
+                break
+            page_route = _github_page_route(
+                route,
+                page=page,
+                per_page=page_size,
+            )
+            try:
+                result = self._command_runner.run(
+                    (str(self._executable), "api", page_route),
+                    max_output_bytes=remaining_bytes,
+                    timeout_seconds=300.0,
+                )
+            except Exception:
+                result = CommandResult(exit_code=127, stdout=b"", stderr=b"")
+            exit_codes.append(result.exit_code)
+            chunks.extend(_command_chunks(result))
+            if result.exit_code != 0:
+                complete = False
+                break
+            try:
+                payload = json.loads(result.stdout)
+                page_records = _page_records(payload, record_key)
+                if page_records is None or len(page_records) > page_size:
                     raise ValueError
-                if len(page_records) > policy.max_hosted_page_records:
-                    raise ValueError
-                records.extend(page_records)
-        except (UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+                if exact_total_key is not None:
+                    if not isinstance(payload, dict):
+                        raise ValueError
+                    total = payload.get(exact_total_key)
+                    if (
+                        isinstance(total, bool)
+                        or not isinstance(total, int)
+                        or total < 0
+                        or total > policy.max_hosted_records
+                    ):
+                        raise ValueError
+                    if proven_total is None:
+                        proven_total = total
+                    elif total != proven_total:
+                        raise ValueError
+            except (UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+                complete = False
+                break
+            records.extend(page_records)
+            if len(records) > policy.max_hosted_records:
+                complete = False
+                break
+            if validator is not None and not validator(records):
+                complete = False
+                break
+            if exact_total_key is not None:
+                assert proven_total is not None
+                if len(records) == proven_total:
+                    break
+                if len(records) > proven_total or len(page_records) < page_size:
+                    complete = False
+                    break
+                page += 1
+                continue
+            if len(page_records) < page_size:
+                break
+            page += 1
+        if exact_total_key is not None and (
+            proven_total is None or len(records) != proven_total
+        ):
             complete = False
-            page_count = max(1, page_count)
-            records = []
-        if page_count > policy.max_hosted_pages or len(records) > policy.max_hosted_records:
+        if sum(len(chunk) for chunk in chunks) > policy.max_hosted_receipt_bytes:
             complete = False
+        receipt = HostedReceipt(
+            name=name,
+            chunks=tuple(chunks),
+            complete=complete,
+            page_count=max(1, len(exit_codes)),
+            record_count=len(records),
+            request_count=1,
+            exit_codes=tuple(exit_codes),
+        )
         return (
-            HostedReceipt(
-                name=name,
-                chunks=_command_chunks(result),
-                complete=complete,
-                page_count=max(1, page_count),
-                record_count=len(records),
-                exit_codes=(result.exit_code,),
-            ),
-            records,
+            receipt,
+            records if complete else [],
         )
 
-    def _merge(self, name: str, receipts: Iterable[HostedReceipt]) -> HostedReceipt:
+    def _merge(
+        self,
+        name: str,
+        receipts: Iterable[HostedReceipt],
+        *,
+        parent_record_count: int | None = None,
+    ) -> HostedReceipt:
         material = tuple(receipts)
         if not material:
-            return HostedReceipt(name=name)
+            return HostedReceipt(
+                name=name,
+                complete=False,
+                page_count=1,
+                request_count=0,
+                parent_record_count=parent_record_count,
+            )
+        request_count = sum(receipt.request_count for receipt in material)
         return HostedReceipt(
             name=name,
             chunks=tuple(chunk for receipt in material for chunk in receipt.chunks),
-            complete=all(receipt.complete for receipt in material),
+            complete=(
+                all(receipt.complete for receipt in material)
+                and (
+                    parent_record_count is None
+                    or request_count == parent_record_count
+                )
+            ),
             page_count=sum(receipt.page_count for receipt in material),
             record_count=sum(receipt.record_count for receipt in material),
+            request_count=request_count,
+            parent_record_count=parent_record_count,
             exit_codes=tuple(
                 code for receipt in material for code in receipt.exit_codes
             ),
@@ -485,14 +675,35 @@ class GhApiHostedClient:
             ),
         )
 
-    def _derived_empty(self, name: str, proof: HostedReceipt) -> HostedReceipt:
+    def _derived_empty(
+        self,
+        name: str,
+        proof: HostedReceipt,
+        *,
+        parent_record_count: int = 0,
+    ) -> HostedReceipt:
         return HostedReceipt(
             name=name,
-            complete=proof.complete,
+            complete=proof.complete and parent_record_count == 0,
             page_count=max(1, proof.page_count),
             record_count=0,
+            request_count=0,
+            parent_record_count=parent_record_count,
             exit_codes=proof.exit_codes,
             status_codes=proof.status_codes,
+        )
+
+    def _unavailable_content(self, name: str, proof: HostedReceipt) -> HostedReceipt:
+        if proof.record_count == 0:
+            return self._derived_empty(name, proof)
+        return HostedReceipt(
+            name=name,
+            complete=False,
+            page_count=1,
+            record_count=proof.record_count,
+            request_count=0,
+            parent_record_count=proof.record_count,
+            exit_codes=proof.exit_codes,
         )
 
     def _download(
@@ -500,12 +711,21 @@ class GhApiHostedClient:
         name: str,
         routes: Iterable[str],
         proof: HostedReceipt,
+        policy: SecretScanPolicy,
     ) -> HostedReceipt:
         route_list = tuple(routes)
         if not route_list:
-            return self._derived_empty(name, proof)
+            return self._derived_empty(
+                name,
+                proof,
+                parent_record_count=proof.record_count,
+            )
         receipts: list[HostedReceipt] = []
+        used_bytes = 0
         for route in route_list:
+            remaining_bytes = policy.max_hosted_receipt_bytes - used_bytes
+            if remaining_bytes <= 0:
+                break
             try:
                 result = self._command_runner.run(
                     (
@@ -514,27 +734,46 @@ class GhApiHostedClient:
                         route,
                         "-H",
                         "Accept: application/octet-stream",
-                    )
+                    ),
+                    max_output_bytes=remaining_bytes,
+                    timeout_seconds=300.0,
                 )
             except Exception:
                 result = CommandResult(exit_code=127, stdout=b"", stderr=b"")
+            result_chunks = _command_chunks(result)
+            used_bytes += sum(len(chunk) for chunk in result_chunks)
             receipts.append(
                 HostedReceipt(
                     name=name,
-                    chunks=_command_chunks(result),
+                    chunks=result_chunks,
                     complete=result.exit_code == 0,
                     page_count=1,
                     record_count=1,
+                    request_count=1,
                     exit_codes=(result.exit_code,),
                 )
             )
-        return self._merge(name, receipts)
+        merged = self._merge(
+            name,
+            receipts,
+            parent_record_count=proof.record_count,
+        )
+        return replace(
+            merged,
+            complete=(
+                merged.complete
+                and proof.complete
+                and len(route_list) == len(set(route_list)) == proof.record_count
+                and used_bytes <= policy.max_hosted_receipt_bytes
+            ),
+        )
 
     def _inspect_pull_refs(self, policy: SecretScanPolicy) -> HostedInspection:
         receipt, _records = self._query(
             "github_pr_refs_query",
             f"repos/{self._repo}/git/matching-refs/pull/?per_page=100",
             policy,
+            validator=_valid_pull_ref_records,
         )
         return HostedInspection((receipt,), HOSTED_SCANNER_VERSION)
 
@@ -543,12 +782,9 @@ class GhApiHostedClient:
             "github_releases_query",
             f"repos/{self._repo}/releases?per_page=100",
             policy,
+            validator=_valid_id_records,
         )
-        release_ids = [
-            record.get("id")
-            for record in release_records
-            if isinstance(record, dict) and isinstance(record.get("id"), int)
-        ]
+        release_ids = [record["id"] for record in release_records]  # type: ignore[index]
         asset_queries: list[HostedReceipt] = []
         asset_records: list[object] = []
         for release_id in release_ids:
@@ -556,19 +792,27 @@ class GhApiHostedClient:
                 "github_release_assets_query",
                 f"repos/{self._repo}/releases/{release_id}/assets?per_page=100",
                 policy,
+                validator=_valid_id_records,
             )
             asset_queries.append(receipt)
             asset_records.extend(records)
         assets = (
-            self._merge("github_release_assets_query", asset_queries)
+            self._merge(
+                "github_release_assets_query",
+                asset_queries,
+                parent_record_count=releases.record_count,
+            )
             if asset_queries
-            else self._derived_empty("github_release_assets_query", releases)
+            else self._derived_empty(
+                "github_release_assets_query",
+                releases,
+                parent_record_count=releases.record_count,
+            )
         )
-        asset_ids = [
-            record.get("id")
-            for record in asset_records
-            if isinstance(record, dict) and isinstance(record.get("id"), int)
-        ]
+        if len({record["id"] for record in asset_records}) != len(asset_records):  # type: ignore[index]
+            assets = replace(assets, complete=False)
+            asset_records = []
+        asset_ids = [record["id"] for record in asset_records]  # type: ignore[index]
         downloads = self._download(
             "github_release_assets_download",
             (
@@ -576,6 +820,7 @@ class GhApiHostedClient:
                 for asset_id in asset_ids
             ),
             assets,
+            policy,
         )
         return HostedInspection((releases, assets, downloads), HOSTED_SCANNER_VERSION)
 
@@ -585,28 +830,25 @@ class GhApiHostedClient:
             f"repos/{self._repo}/actions/runs?per_page=100",
             policy,
             record_key="workflow_runs",
+            validator=_valid_id_records,
+            exact_total_key="total_count",
         )
-        run_ids = [
-            record.get("id")
-            for record in run_records
-            if isinstance(record, dict) and isinstance(record.get("id"), int)
-        ]
+        run_ids = [record["id"] for record in run_records]  # type: ignore[index]
         logs = self._download(
             "github_actions_logs_download",
             (f"repos/{self._repo}/actions/runs/{run_id}/logs" for run_id in run_ids),
             runs,
+            policy,
         )
         artifacts, artifact_records = self._query(
             "github_actions_artifacts_query",
             f"repos/{self._repo}/actions/artifacts?per_page=100",
             policy,
             record_key="artifacts",
+            validator=_valid_id_records,
+            exact_total_key="total_count",
         )
-        artifact_ids = [
-            record.get("id")
-            for record in artifact_records
-            if isinstance(record, dict) and isinstance(record.get("id"), int)
-        ]
+        artifact_ids = [record["id"] for record in artifact_records]  # type: ignore[index]
         artifact_downloads = self._download(
             "github_actions_artifacts_download",
             (
@@ -614,15 +856,22 @@ class GhApiHostedClient:
                 for artifact_id in artifact_ids
             ),
             artifacts,
+            policy,
         )
         caches, _cache_records = self._query(
             "github_actions_caches_query",
             f"repos/{self._repo}/actions/caches?per_page=100",
             policy,
             record_key="actions_caches",
+            validator=_valid_id_records,
+            exact_total_key="total_count",
+        )
+        cache_content = self._unavailable_content(
+            "github_actions_caches_content",
+            caches,
         )
         return HostedInspection(
-            (runs, logs, artifacts, artifact_downloads, caches),
+            (runs, logs, artifacts, artifact_downloads, caches, cache_content),
             HOSTED_SCANNER_VERSION,
         )
 
@@ -635,34 +884,59 @@ class GhApiHostedClient:
                 "github_packages_query",
                 f"users/{owner}/packages?package_type={package_type}&per_page=100",
                 policy,
+                validator=lambda records, expected=package_type: _valid_package_records(
+                    records,
+                    expected,
+                ),
             )
             package_queries.append(receipt)
             package_records.extend(records)
         packages = self._merge("github_packages_query", package_queries)
+        package_keys = [
+            (record["package_type"], record["name"])  # type: ignore[index]
+            for record in package_records
+        ]
+        if len(package_keys) != len(set(package_keys)):
+            packages = replace(packages, complete=False)
+            package_records = []
         version_queries: list[HostedReceipt] = []
+        version_records: list[object] = []
         for record in package_records:
-            if not isinstance(record, dict):
-                continue
-            package_name = record.get("name")
-            package_type = record.get("package_type")
-            if not isinstance(package_name, str) or package_type not in _PACKAGE_TYPES:
-                continue
-            receipt, _records = self._query(
+            package_name = record["name"]  # type: ignore[index]
+            package_type = record["package_type"]  # type: ignore[index]
+            receipt, records = self._query(
                 "github_package_versions_query",
                 f"users/{owner}/packages/{package_type}/{quote(package_name, safe='')}/versions"
                 "?per_page=100",
                 policy,
+                validator=_valid_id_records,
             )
             version_queries.append(receipt)
+            version_records.extend(records)
         versions = (
-            self._merge("github_package_versions_query", version_queries)
+            self._merge(
+                "github_package_versions_query",
+                version_queries,
+                parent_record_count=packages.record_count,
+            )
             if version_queries
-            else self._derived_empty("github_package_versions_query", packages)
+            else self._derived_empty(
+                "github_package_versions_query",
+                packages,
+                parent_record_count=packages.record_count,
+            )
+        )
+        if len({record["id"] for record in version_records}) != len(version_records):  # type: ignore[index]
+            versions = replace(versions, complete=False)
+        version_content = self._unavailable_content(
+            "github_package_versions_content",
+            versions,
         )
         metadata, metadata_records = self._query(
             "github_pages_query",
             f"repos/{self._repo}",
             policy,
+            validator=_valid_repository_metadata,
         )
         repository = metadata_records[0] if metadata_records else {}
         has_pages = isinstance(repository, dict) and repository.get("has_pages") is True
@@ -672,33 +946,20 @@ class GhApiHostedClient:
                 "github_pages_query",
                 f"repos/{self._repo}/pages",
                 policy,
+                validator=_valid_pages_records,
             )
-            page_url = next(
-                (
-                    record.get("html_url")
-                    for record in page_records
-                    if isinstance(record, dict) and isinstance(record.get("html_url"), str)
-                ),
-                None,
+            if len(page_records) != 1:
+                pages = replace(pages, complete=False)
+            pages = replace(
+                pages,
+                chunks=(*metadata.chunks, *pages.chunks),
+                complete=metadata.complete and pages.complete,
+                page_count=metadata.page_count + pages.page_count,
+                record_count=len(page_records),
+                request_count=metadata.request_count + pages.request_count,
+                exit_codes=(*metadata.exit_codes, *pages.exit_codes),
             )
-            if page_url and self._http_transport is not None:
-                page_download = _single_http_receipt(
-                    "github_pages_download",
-                    self._http_transport,
-                    "GET",
-                    page_url,
-                    headers={},
-                    policy=policy,
-                    expect_json=False,
-                )
-            else:
-                page_download = HostedReceipt(
-                    name="github_pages_download",
-                    complete=False,
-                    page_count=1,
-                    record_count=0,
-                    exit_codes=(127,),
-                )
+            page_download = self._unavailable_content("github_pages_download", pages)
         else:
             pages = HostedReceipt(
                 name="github_pages_query",
@@ -706,6 +967,7 @@ class GhApiHostedClient:
                 complete=metadata.complete,
                 page_count=metadata.page_count,
                 record_count=0,
+                request_count=metadata.request_count,
                 exit_codes=metadata.exit_codes,
             )
             page_download = self._derived_empty("github_pages_download", pages)
@@ -715,7 +977,15 @@ class GhApiHostedClient:
             wiki_query = self._derived_empty("github_wiki_query", metadata)
             wiki_download = self._derived_empty("github_wiki_download", wiki_query)
         return HostedInspection(
-            (packages, versions, pages, page_download, wiki_query, wiki_download),
+            (
+                packages,
+                versions,
+                version_content,
+                pages,
+                page_download,
+                wiki_query,
+                wiki_download,
+            ),
             HOSTED_SCANNER_VERSION,
         )
 
@@ -725,25 +995,38 @@ class GhApiHostedClient:
     ) -> tuple[HostedReceipt, HostedReceipt]:
         wiki_url = f"https://github.com/{self._repo}.wiki.git"
         try:
-            query_result = self._command_runner.run(("git", "ls-remote", wiki_url))
+            query_result = self._command_runner.run(
+                ("git", "ls-remote", wiki_url),
+                max_output_bytes=policy.max_hosted_receipt_bytes,
+                timeout_seconds=300.0,
+            )
         except Exception:
             query_result = CommandResult(127, b"", b"")
+        refs_valid = _valid_git_ref_map(query_result.stdout)
         query = HostedReceipt(
             name="github_wiki_query",
             chunks=_command_chunks(query_result),
-            complete=query_result.exit_code == 0,
+            complete=query_result.exit_code == 0 and refs_valid,
             page_count=1,
-            record_count=len(query_result.stdout.splitlines()),
+            record_count=1,
+            request_count=1,
             exit_codes=(query_result.exit_code,),
         )
-        if query_result.exit_code != 0 or not query_result.stdout:
-            return query, self._derived_empty("github_wiki_download", query)
+        if not query.complete:
+            return query, self._derived_empty(
+                "github_wiki_download",
+                query,
+                parent_record_count=1,
+            )
         with tempfile.TemporaryDirectory(prefix="mercury-wiki-scan-") as temporary:
             clone = Path(temporary) / "wiki.git"
             try:
                 clone_result = self._command_runner.run(
-                    ("git", "clone", "--mirror", wiki_url, str(clone))
+                    ("git", "clone", "--mirror", wiki_url, str(clone)),
+                    max_output_bytes=policy.max_hosted_receipt_bytes,
+                    timeout_seconds=300.0,
                 )
+                used_bytes = sum(len(chunk) for chunk in _command_chunks(clone_result))
                 content_result = self._command_runner.run(
                     (
                         "git",
@@ -756,6 +1039,11 @@ class GhApiHostedClient:
                         "-p",
                     ),
                     cwd=clone,
+                    max_output_bytes=max(
+                        1,
+                        policy.max_hosted_receipt_bytes - used_bytes,
+                    ),
+                    timeout_seconds=300.0,
                 )
             except Exception:
                 clone_result = CommandResult(127, b"", b"")
@@ -766,6 +1054,8 @@ class GhApiHostedClient:
             complete=clone_result.exit_code == 0 and content_result.exit_code == 0,
             page_count=2,
             record_count=1,
+            request_count=1,
+            parent_record_count=1,
             exit_codes=(clone_result.exit_code, content_result.exit_code),
         )
         if sum(len(chunk) for chunk in download.chunks) > policy.max_hosted_receipt_bytes:
@@ -775,6 +1065,8 @@ class GhApiHostedClient:
                 complete=False,
                 page_count=download.page_count,
                 record_count=download.record_count,
+                request_count=download.request_count,
+                parent_record_count=download.parent_record_count,
                 exit_codes=download.exit_codes,
             )
         return query, download
@@ -796,6 +1088,26 @@ def _header_value(headers: Mapping[str, str], name: str) -> str | None:
     return next((value for key, value in headers.items() if key.casefold() == target), None)
 
 
+def _content_range_total(value: str | None, *, offset: int, count: int) -> int | None:
+    if value == "*/0":
+        return 0 if offset == 0 and count == 0 else None
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"([0-9]+)-([0-9]+)/([0-9]+)", value)
+    if match is None:
+        return None
+    start, end, total = (int(part) for part in match.groups())
+    if (
+        total <= 0
+        or start != offset
+        or end < start
+        or end >= total
+        or end - start + 1 != count
+    ):
+        return None
+    return total
+
+
 def _valid_session_id(value: str | None) -> str | None:
     if (
         not isinstance(value, str)
@@ -814,30 +1126,105 @@ def _decode_mcp_json(body: bytes) -> dict[str, object]:
         payload = None
     if isinstance(payload, dict):
         return payload
-
-    event_data: list[str] = []
     try:
-        lines = body.decode("utf-8").splitlines()
+        stream = body.decode("utf-8")
     except UnicodeError as error:
         raise ValueError("invalid_mcp_response") from error
-    for line in (*lines, ""):
-        if line == "":
-            if not event_data:
-                continue
-            candidate = "\n".join(event_data)
-            event_data.clear()
-            if candidate == "[DONE]":
-                continue
-            try:
-                payload = json.loads(candidate)
-            except (ValueError, TypeError, json.JSONDecodeError):
-                continue
-            if isinstance(payload, dict):
-                return payload
+    stream = stream.replace("\r\n", "\n")
+    if "\r" in stream or not stream.endswith("\n\n"):
+        raise ValueError("invalid_mcp_response")
+    events = stream[:-2].split("\n\n")
+    if len(events) != 1 or not events[0]:
+        raise ValueError("invalid_mcp_response")
+    event_type: str | None = None
+    event_data: list[str] = []
+    for line in events[0].split("\n"):
+        if line.startswith("event:"):
+            if event_type is not None:
+                raise ValueError("invalid_mcp_response")
+            event_type = line[6:].lstrip(" ")
             continue
         if line.startswith("data:"):
             event_data.append(line[5:].lstrip(" "))
-    raise ValueError("invalid_mcp_response")
+            continue
+        raise ValueError("invalid_mcp_response")
+    if event_type not in {None, "message"} or not event_data:
+        raise ValueError("invalid_mcp_response")
+    try:
+        payload = json.loads("\n".join(event_data))
+    except (ValueError, TypeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid_mcp_response") from error
+    if not isinstance(payload, dict):
+        raise ValueError("invalid_mcp_response")
+    return payload
+
+
+def _mcp_result(body: bytes, *, request_id: int) -> dict[str, object]:
+    payload = _decode_mcp_json(body)
+    response_id = payload.get("id")
+    if (
+        payload.get("jsonrpc") != "2.0"
+        or isinstance(response_id, bool)
+        or response_id != request_id
+        or "error" in payload
+        or not isinstance(payload.get("result"), dict)
+    ):
+        raise ValueError("invalid_mcp_response")
+    return payload["result"]  # type: ignore[return-value]
+
+
+@functools.lru_cache(maxsize=1)
+def _compiled_public_mcp_inventory() -> Mapping[str, dict[str, object]]:
+    from mcp.types import Tool as McpTool
+
+    from mercury_tools.mcp.server import mcp as public_mcp
+
+    inventory: dict[str, dict[str, object]] = {}
+    for tool in public_mcp._tool_manager.list_tools():
+        record = {
+            "name": tool.name,
+            "title": tool.title,
+            "description": tool.description,
+            "inputSchema": tool.parameters,
+            "outputSchema": tool.output_schema,
+            "annotations": tool.annotations,
+            "icons": tool.icons,
+            "_meta": tool.meta,
+        }
+        normalized = McpTool.model_validate(record).model_dump(
+            by_alias=True,
+            exclude_none=True,
+        )
+        name = normalized.get("name")
+        if not isinstance(name, str) or name in inventory:
+            raise ValueError("public_mcp_inventory_invalid")
+        inventory[name] = normalized
+    if not inventory:
+        raise ValueError("public_mcp_inventory_invalid")
+    return MappingProxyType(inventory)
+
+
+def _normalize_mcp_tool(record: object) -> tuple[str, dict[str, object]]:
+    from mcp.types import Tool as McpTool
+
+    if not isinstance(record, dict):
+        raise ValueError("invalid_mcp_tool")
+    normalized = McpTool.model_validate(record).model_dump(
+        by_alias=True,
+        exclude_none=True,
+    )
+    name = normalized.get("name")
+    if not isinstance(name, str) or normalized != record:
+        raise ValueError("invalid_mcp_tool")
+    return name, normalized
+
+
+def _mcp_session_header_matches(
+    headers: Mapping[str, str],
+    session_id: str | None,
+) -> bool:
+    value = _header_value(headers, "mcp-session-id")
+    return value is None or (session_id is not None and value == session_id)
 
 
 def _next_link(headers: Mapping[str, str], current_url: str) -> str | None:
@@ -916,13 +1303,19 @@ def _http_receipt(
         if current_url in seen or len(statuses) >= policy.max_hosted_pages:
             complete = False
             break
+        remaining_bytes = policy.max_hosted_receipt_bytes - sum(
+            len(chunk) for chunk in chunks
+        )
+        if remaining_bytes <= 0:
+            complete = False
+            break
         seen.add(current_url)
         response = transport.request(
             method,
             current_url,
             headers=headers,
             json_body=json_body,
-            max_bytes=policy.max_hosted_receipt_bytes + 1,
+            max_bytes=remaining_bytes + 1,
         )
         statuses.append(response.status_code)
         if not isinstance(response.body, bytes):
@@ -993,16 +1386,35 @@ def _single_http_receipt(
     )
 
 
-def _merge_receipts(name: str, receipts: Iterable[HostedReceipt]) -> HostedReceipt:
+def _merge_receipts(
+    name: str,
+    receipts: Iterable[HostedReceipt],
+    *,
+    parent_record_count: int | None = None,
+) -> HostedReceipt:
     material = tuple(receipts)
     if not material:
-        return HostedReceipt(name=name)
+        return HostedReceipt(
+            name=name,
+            complete=False,
+            request_count=0,
+            parent_record_count=parent_record_count,
+        )
+    request_count = sum(receipt.request_count for receipt in material)
     return HostedReceipt(
         name=name,
         chunks=tuple(chunk for receipt in material for chunk in receipt.chunks),
-        complete=all(receipt.complete for receipt in material),
+        complete=(
+            all(receipt.complete for receipt in material)
+            and (
+                parent_record_count is None
+                or request_count == parent_record_count
+            )
+        ),
         page_count=sum(receipt.page_count for receipt in material),
         record_count=sum(receipt.record_count for receipt in material),
+        request_count=request_count,
+        parent_record_count=parent_record_count,
         exit_codes=tuple(code for receipt in material for code in receipt.exit_codes),
         status_codes=tuple(code for receipt in material for code in receipt.status_codes),
     )
@@ -1011,9 +1423,11 @@ def _merge_receipts(name: str, receipts: Iterable[HostedReceipt]) -> HostedRecei
 def _derived_http_empty(name: str, proof: HostedReceipt) -> HostedReceipt:
     return HostedReceipt(
         name=name,
-        complete=proof.complete,
+        complete=proof.complete and proof.record_count == 0,
         page_count=proof.page_count,
         record_count=0,
+        request_count=0,
+        parent_record_count=proof.record_count,
         exit_codes=proof.exit_codes,
         status_codes=proof.status_codes,
     )
@@ -1035,6 +1449,37 @@ class MarketplaceHostedClient:
             headers={},
             policy=policy,
         )
+        names: list[str] = []
+        records_valid = True
+        try:
+            for chunk in receipt.chunks:
+                payload = json.loads(chunk)
+                records = (
+                    payload
+                    if isinstance(payload, list)
+                    else payload.get("items")
+                    if isinstance(payload, dict)
+                    else None
+                )
+                if not isinstance(records, list):
+                    raise ValueError
+                for record in records:
+                    if not isinstance(record, dict):
+                        raise ValueError
+                    name = record.get("name")
+                    if (
+                        not isinstance(name, str)
+                        or not name
+                        or len(name) > 255
+                        or any(character in name for character in "\r\n\0")
+                    ):
+                        raise ValueError
+                    names.append(name)
+        except (UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+            records_valid = False
+        if len(names) != len(set(names)):
+            records_valid = False
+        receipt = replace(receipt, complete=receipt.complete and records_valid)
         return HostedInspection((receipt,), HOSTED_SCANNER_VERSION)
 
 
@@ -1102,24 +1547,32 @@ class SupabaseHostedClient:
         records: list[object] = []
         offset = 0
         complete = True
+        proven_total: int | None = None
         while True:
             if len(statuses) >= policy.max_hosted_pages:
                 complete = False
                 break
             page_headers = dict(headers)
             json_body: object | None = None
+            page_headers["Range"] = f"{offset}-{offset + page_size - 1}"
+            page_headers["Prefer"] = "count=exact"
             if method == "GET":
-                page_headers["Range"] = f"{offset}-{offset + page_size - 1}"
-                page_headers["Prefer"] = "count=exact"
+                pass
             else:
                 json_body = {"limit": page_size, "offset": offset}
+            remaining_bytes = policy.max_hosted_receipt_bytes - sum(
+                len(chunk) for chunk in chunks
+            )
+            if remaining_bytes <= 0:
+                complete = False
+                break
             try:
                 response = self._transport.request(
                     method,
                     url,
                     headers=page_headers,
                     json_body=json_body,
-                    max_bytes=policy.max_hosted_receipt_bytes + 1,
+                    max_bytes=remaining_bytes + 1,
                 )
                 statuses.append(response.status_code)
                 chunks.append(response.body)
@@ -1132,10 +1585,26 @@ class SupabaseHostedClient:
             if not 200 <= response.status_code < 300:
                 complete = False
                 break
-            records.extend(page)
             if len(page) > page_size:
                 complete = False
                 break
+            page_total = _content_range_total(
+                _header_value(response.headers, "content-range"),
+                offset=offset,
+                count=len(page),
+            )
+            if page_total is None:
+                complete = False
+                break
+            if proven_total is None:
+                proven_total = page_total
+            elif page_total != proven_total:
+                complete = False
+                break
+            if proven_total > policy.max_hosted_records:
+                complete = False
+                break
+            records.extend(page)
             if (
                 len(records) > policy.max_hosted_records
                 or sum(len(chunk) for chunk in chunks) > policy.max_hosted_receipt_bytes
@@ -1143,13 +1612,13 @@ class SupabaseHostedClient:
                 complete = False
                 break
             offset += len(page)
-            if len(page) < page_size:
+            if offset == proven_total:
                 break
-            content_range = _header_value(response.headers, "content-range")
-            if content_range and "/" in content_range:
-                total_raw = content_range.rsplit("/", 1)[1]
-                if total_raw.isdigit() and offset >= int(total_raw):
-                    break
+            if offset > proven_total or not page or len(page) < page_size:
+                complete = False
+                break
+        if proven_total is None or len(records) != proven_total:
+            complete = False
         return (
             HostedReceipt(
                 name=name,
@@ -1157,6 +1626,7 @@ class SupabaseHostedClient:
                 complete=complete,
                 page_count=max(1, len(statuses)),
                 record_count=len(records),
+                request_count=1,
                 status_codes=tuple(statuses),
             ),
             records,
@@ -1182,6 +1652,7 @@ class SupabaseHostedClient:
         knowledge = _merge_receipts("supabase_knowledge_query", knowledge_receipts)
         storage_queries: list[HostedReceipt] = []
         storage_objects: list[tuple[str, str]] = []
+        storage_records_valid = True
         for bucket in self._storage_buckets:
             receipt, records = self._paginated_list(
                 "supabase_storage_query",
@@ -1191,37 +1662,60 @@ class SupabaseHostedClient:
                 policy=policy,
             )
             storage_queries.append(receipt)
-            names = [
-                record["name"]
-                for record in records
-                if isinstance(record, dict) and isinstance(record.get("name"), str)
-            ]
-            if len(names) != len(records):
+            names: list[str] = []
+            for record in records:
+                name = record.get("name") if isinstance(record, dict) else None
+                candidate = PurePosixPath(name) if isinstance(name, str) else None
+                if (
+                    not isinstance(name, str)
+                    or not name
+                    or len(name) > 1024
+                    or any(character in name for character in "\r\n\0")
+                    or candidate is None
+                    or candidate.is_absolute()
+                    or any(part in {"", ".", ".."} for part in candidate.parts)
+                ):
+                    storage_records_valid = False
+                    break
+                names.append(name)
+            if len(names) != len(records) or len(names) != len(set(names)):
+                storage_records_valid = False
                 storage_queries[-1] = HostedReceipt(
                     name=receipt.name,
                     chunks=receipt.chunks,
                     complete=False,
                     page_count=receipt.page_count,
                     record_count=receipt.record_count,
+                    request_count=receipt.request_count,
                     status_codes=receipt.status_codes,
                 )
-            storage_objects.extend((bucket, name) for name in names)
+            if storage_records_valid:
+                storage_objects.extend((bucket, name) for name in names)
         storage = _merge_receipts("supabase_storage_query", storage_queries)
-        downloads = [
-            _single_http_receipt(
-                "supabase_storage_download",
-                self._transport,
-                "GET",
-                f"{self._base_url}/storage/v1/object/authenticated/"
-                f"{quote(bucket, safe='')}/{quote(name, safe='/')}",
-                headers=headers,
-                policy=policy,
-                expect_json=False,
-            )
-            for bucket, name in storage_objects
-        ]
+        if not storage_records_valid or len(storage_objects) != len(set(storage_objects)):
+            storage = replace(storage, complete=False)
+            storage_objects = []
+        downloads = []
+        if storage.complete:
+            downloads = [
+                _single_http_receipt(
+                    "supabase_storage_download",
+                    self._transport,
+                    "GET",
+                    f"{self._base_url}/storage/v1/object/authenticated/"
+                    f"{quote(bucket, safe='')}/{quote(name, safe='/')}",
+                    headers=headers,
+                    policy=policy,
+                    expect_json=False,
+                )
+                for bucket, name in storage_objects
+            ]
         download = (
-            _merge_receipts("supabase_storage_download", downloads)
+            _merge_receipts(
+                "supabase_storage_download",
+                downloads,
+                parent_record_count=storage.record_count,
+            )
             if downloads
             else _derived_http_empty("supabase_storage_download", storage)
         )
@@ -1252,7 +1746,7 @@ class PublicMcpHostedClient:
 
         initialize_chunks: list[bytes] = []
         initialize_statuses: list[int] = []
-        initialize_complete = True
+        initialize_complete = False
         session_id: str | None = None
         try:
             response = self._transport.request(
@@ -1276,14 +1770,15 @@ class PublicMcpHostedClient:
             )
             initialize_chunks.append(response.body)
             initialize_statuses.append(response.status_code)
-            payload = _decode_mcp_json(response.body)
-            if not isinstance(payload.get("result"), dict):
-                raise ValueError
             raw_session_id = _header_value(response.headers, "mcp-session-id")
             if raw_session_id is not None:
                 session_id = _valid_session_id(raw_session_id)
                 if session_id is None:
                     raise ValueError
+            result = _mcp_result(response.body, request_id=1)
+            if not isinstance(result.get("protocolVersion"), str):
+                raise ValueError
+            initialize_complete = 200 <= response.status_code < 300
         except Exception:
             initialize_complete = False
         if any(not 200 <= status < 300 for status in initialize_statuses):
@@ -1296,6 +1791,7 @@ class PublicMcpHostedClient:
             complete=initialize_complete,
             page_count=max(1, len(initialize_statuses)),
             record_count=1 if initialize_complete else 0,
+            request_count=1,
             status_codes=tuple(initialize_statuses),
         )
 
@@ -1320,31 +1816,40 @@ class PublicMcpHostedClient:
                 )
                 initialized_chunks.append(response.body)
                 initialized_statuses.append(response.status_code)
-                if not 200 <= response.status_code < 300:
+                if (
+                    not 200 <= response.status_code < 300
+                    or response.body
+                    or not _mcp_session_header_matches(response.headers, session_id)
+                ):
                     initialized_complete = False
             except Exception:
                 initialized_complete = False
-        if sum(len(chunk) for chunk in initialized_chunks) > policy.max_hosted_receipt_bytes:
-            initialized_complete = False
-        initialized_receipt = HostedReceipt(
-            name="public_mcp_response_stream",
-            chunks=tuple(initialized_chunks),
-            complete=initialized_complete,
-            page_count=max(1, len(initialized_statuses)),
-            record_count=0,
-            status_codes=tuple(initialized_statuses),
-        )
 
         tools_chunks: list[bytes] = []
         tools_statuses: list[int] = []
-        tool_count = 0
+        tools_by_name: dict[str, dict[str, object]] = {}
         tools_complete = initialize_complete and initialized_complete
         cursor: str | None = None
         seen_cursors: set[str] = set()
+        try:
+            expected_inventory = dict(_compiled_public_mcp_inventory())
+        except Exception:
+            expected_inventory = {}
+            tools_complete = False
         while tools_complete:
+            if len(tools_statuses) >= policy.max_hosted_pages:
+                tools_complete = False
+                break
             parameters: dict[str, str] = {}
             if cursor is not None:
                 parameters["cursor"] = cursor
+            request_id = len(tools_statuses) + 2
+            remaining_bytes = policy.max_hosted_receipt_bytes - sum(
+                len(chunk) for chunk in tools_chunks
+            )
+            if remaining_bytes <= 0:
+                tools_complete = False
+                break
             try:
                 response = self._transport.request(
                     "POST",
@@ -1352,24 +1857,32 @@ class PublicMcpHostedClient:
                     headers=request_headers,
                     json_body={
                         "jsonrpc": "2.0",
-                        "id": len(tools_statuses) + 2,
+                        "id": request_id,
                         "method": "tools/list",
                         "params": parameters,
                     },
-                    max_bytes=policy.max_hosted_receipt_bytes + 1,
+                    max_bytes=remaining_bytes + 1,
                 )
                 tools_chunks.append(response.body)
                 tools_statuses.append(response.status_code)
-                payload = _decode_mcp_json(response.body)
-                result = payload.get("result")
-                if not isinstance(result, dict):
+                if (
+                    not 200 <= response.status_code < 300
+                    or not _mcp_session_header_matches(response.headers, session_id)
+                ):
                     raise ValueError
+                result = _mcp_result(response.body, request_id=request_id)
                 records = result.get("tools")
                 if not isinstance(records, list):
                     raise ValueError
                 if len(records) > policy.max_hosted_page_records:
-                    tools_complete = False
-                tool_count += len(records)
+                    raise ValueError
+                for record in records:
+                    name, normalized = _normalize_mcp_tool(record)
+                    if name in tools_by_name:
+                        raise ValueError
+                    tools_by_name[name] = normalized
+                if len(tools_by_name) > policy.max_hosted_records:
+                    raise ValueError
                 next_cursor = result.get("nextCursor")
                 if next_cursor is None:
                     break
@@ -1379,29 +1892,61 @@ class PublicMcpHostedClient:
                     or len(next_cursor) > 1024
                     or any(character in next_cursor for character in "\r\n\0")
                     or next_cursor in seen_cursors
-                    or len(tools_statuses) >= policy.max_hosted_pages
                 ):
-                    tools_complete = False
-                    break
+                    raise ValueError
                 seen_cursors.add(next_cursor)
                 cursor = next_cursor
             except Exception:
                 tools_complete = False
                 break
-        if any(not 200 <= status < 300 for status in tools_statuses):
-            tools_complete = False
         if (
             sum(len(chunk) for chunk in tools_chunks) > policy.max_hosted_receipt_bytes
-            or tool_count > policy.max_hosted_records
-            or tool_count != 19
+            or tools_by_name != expected_inventory
         ):
             tools_complete = False
+
+        if session_id is not None:
+            try:
+                remaining_bytes = policy.max_hosted_receipt_bytes - sum(
+                    len(chunk) for chunk in initialized_chunks
+                )
+                if remaining_bytes <= 0:
+                    raise ValueError
+                response = self._transport.request(
+                    "DELETE",
+                    self._endpoint,
+                    headers=request_headers,
+                    max_bytes=remaining_bytes + 1,
+                )
+                initialized_chunks.append(response.body)
+                initialized_statuses.append(response.status_code)
+                if (
+                    not 200 <= response.status_code < 300
+                    or response.body
+                    or not _mcp_session_header_matches(response.headers, session_id)
+                ):
+                    initialized_complete = False
+            except Exception:
+                initialized_complete = False
+        if sum(len(chunk) for chunk in initialized_chunks) > policy.max_hosted_receipt_bytes:
+            initialized_complete = False
+
+        initialized_receipt = HostedReceipt(
+            name="public_mcp_response_stream",
+            chunks=tuple(initialized_chunks),
+            complete=initialized_complete,
+            page_count=max(1, len(initialized_statuses)),
+            record_count=0,
+            request_count=len(initialized_statuses),
+            status_codes=tuple(initialized_statuses),
+        )
         tools_receipt = HostedReceipt(
             name="public_mcp_tools_list",
             chunks=tuple(tools_chunks),
             complete=tools_complete,
             page_count=max(1, len(tools_statuses)),
-            record_count=tool_count,
+            record_count=len(tools_by_name),
+            request_count=len(tools_statuses),
             status_codes=tuple(tools_statuses),
         )
         return HostedInspection(
@@ -1537,6 +2082,26 @@ def scan_hosted_surface(
         )
         if not valid_record_count:
             blockers.append(f"hosted_receipt_malformed:{surface}")
+        valid_request_count = (
+            not isinstance(receipt.request_count, bool)
+            and isinstance(receipt.request_count, int)
+            and receipt.request_count >= 0
+        )
+        valid_parent_count = receipt.parent_record_count is None or (
+            not isinstance(receipt.parent_record_count, bool)
+            and isinstance(receipt.parent_record_count, int)
+            and receipt.parent_record_count >= 0
+        )
+        if not valid_request_count or not valid_parent_count:
+            blockers.append(f"hosted_receipt_malformed:{surface}")
+        elif (
+            receipt.name in _PARENT_COUNT_RECEIPTS
+            and receipt.parent_record_count is None
+        ) or (
+            receipt.parent_record_count is not None
+            and receipt.request_count != receipt.parent_record_count
+        ):
+            blockers.append(f"hosted_receipt_reconciliation_failed:{surface}")
         if not isinstance(receipt.complete, bool):
             blockers.append(f"hosted_receipt_malformed:{surface}")
         valid_exit_codes = isinstance(receipt.exit_codes, tuple) and all(
@@ -1580,6 +2145,16 @@ def scan_hosted_surface(
         evidence_hash.update(str(page_count).encode("ascii"))
         evidence_hash.update(b"\0")
         evidence_hash.update(str(record_count).encode("ascii"))
+        evidence_hash.update(b"\0")
+        evidence_hash.update(
+            str(receipt.request_count if valid_request_count else 0).encode("ascii")
+        )
+        evidence_hash.update(b"\0")
+        evidence_hash.update(
+            str(receipt.parent_record_count).encode("ascii")
+            if valid_parent_count and receipt.parent_record_count is not None
+            else b"none"
+        )
         receipt_bytes = 0
         chunk_count = 0
         tail = b""
