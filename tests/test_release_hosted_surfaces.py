@@ -1,17 +1,31 @@
 from __future__ import annotations
 
+import io
 import json
 import shutil
+import zipfile
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from mercury_tools.release import hosted as hosted_module
 from mercury_tools.release import scanner as scanner_module
 from mercury_tools.release.hosted import (
     HOSTED_PUBLIC_SURFACES,
+    HOSTED_RECEIPT_INVENTORY,
     HOSTED_SCANNER_VERSION,
     GhApiHostedClient,
+    HostedAdapterConfig,
+    HostedHttpResponse,
     HostedInspection,
+    HostedReceipt,
+    MarketplaceHostedClient,
+    PublicMcpHostedClient,
+    RenderHostedClient,
+    SupabaseHostedClient,
+    build_hosted_clients,
     scan_hosted_surface,
 )
 from mercury_tools.release.models import (
@@ -26,7 +40,7 @@ from mercury_tools.release.models import (
     SecretScanPolicy,
     SecretScanRequest,
 )
-from mercury_tools.release.scanner import CommandResult, scan_public_release
+from mercury_tools.release.scanner import CommandResult, build_blocked_report, scan_public_release
 
 
 class FakeHostedClient:
@@ -34,7 +48,7 @@ class FakeHostedClient:
         self.inspection = inspection
         self.calls: list[str] = []
 
-    def inspect(self, surface: str) -> HostedInspection:
+    def inspect(self, surface: str, _policy: SecretScanPolicy) -> HostedInspection:
         self.calls.append(surface)
         if isinstance(self.inspection, Exception):
             raise self.inspection
@@ -42,8 +56,8 @@ class FakeHostedClient:
 
 
 class FakeCommandRunner:
-    def __init__(self, responses: dict[str, CommandResult]) -> None:
-        self.responses = responses
+    def __init__(self, responses: Mapping[str, CommandResult]) -> None:
+        self.responses = dict(responses)
         self.calls: list[tuple[str, ...]] = []
 
     def run(
@@ -58,7 +72,64 @@ class FakeCommandRunner:
         executable = Path(argv[0]).name
         if executable in self.responses and argv[1:] in {("version",), ("--version",)}:
             return self.responses[executable]
-        return self.responses[argv[-1]]
+        for key, response in self.responses.items():
+            if key in argv:
+                return response
+        raise AssertionError("unexpected_command")
+
+
+class FakeHttpTransport:
+    def __init__(self, responses: Mapping[str, HostedHttpResponse]) -> None:
+        self.responses = dict(responses)
+        self.calls: list[dict[str, object]] = []
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        json_body: object | None = None,
+        max_bytes: int,
+    ) -> HostedHttpResponse:
+        self.calls.append(
+            {
+                "method": method,
+                "url": url,
+                "headers": dict(headers),
+                "json_body": json_body,
+                "max_bytes": max_bytes,
+            }
+        )
+        for suffix, response in self.responses.items():
+            if suffix in url:
+                return response
+        raise AssertionError("unexpected_http_request")
+
+
+class CallbackHttpTransport:
+    def __init__(self, handler: Any) -> None:
+        self.handler = handler
+        self.calls: list[dict[str, object]] = []
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        json_body: object | None = None,
+        max_bytes: int,
+    ) -> HostedHttpResponse:
+        call = {
+            "method": method,
+            "url": url,
+            "headers": dict(headers),
+            "json_body": json_body,
+            "max_bytes": max_bytes,
+        }
+        self.calls.append(call)
+        return self.handler(call)
 
 
 def _request(tmp_path: Path, **updates: object) -> SecretScanRequest:
@@ -77,21 +148,36 @@ def _request(tmp_path: Path, **updates: object) -> SecretScanRequest:
     return request.model_copy(update=updates)
 
 
-def _complete_inspection(*chunks: bytes) -> HostedInspection:
+def _complete_inspection(surface: str, *chunks: bytes) -> HostedInspection:
+    expected = HOSTED_RECEIPT_INVENTORY[surface]
+    material = chunks or (b"safe hosted fixture",)
+    receipts = tuple(
+        HostedReceipt(
+            name=name,
+            chunks=material if index == 0 else (),
+            complete=True,
+            page_count=1,
+            record_count=len(material) if index == 0 else 0,
+            exit_codes=(0,),
+        )
+        for index, name in enumerate(expected)
+    )
     return HostedInspection(
-        accessible=True,
-        complete=True,
-        chunks=chunks or (b"safe hosted fixture",),
+        receipts=receipts,
         scanner_version=HOSTED_SCANNER_VERSION,
-        exit_codes=(0,),
     )
 
 
 def _hosted_clients() -> dict[str, FakeHostedClient]:
     return {
-        surface: FakeHostedClient(_complete_inspection())
+        surface: FakeHostedClient(_complete_inspection(surface))
         for surface in HOSTED_PUBLIC_SURFACES
     }
+
+
+def _policy(**updates: object) -> SecretScanPolicy:
+    policy = SecretScanPolicy(scanner_versions=PINNED_SCANNER_VERSIONS)
+    return policy.model_copy(update=updates)
 
 
 def test_inaccessible_hosted_surface_blocks_release(tmp_path: Path) -> None:
@@ -106,153 +192,753 @@ def test_inaccessible_hosted_surface_blocks_release(tmp_path: Path) -> None:
     assert "hosted_surface_inaccessible:render_logs" in report.blockers
 
 
-def test_hosted_stream_detects_secret_without_returning_raw_payload() -> None:
+def test_hosted_receipt_stream_detects_secret_without_returning_raw_payload() -> None:
     raw_value = "xox" + "b-" + "A1b2C3d4-E5f6G7h8-I9j0K1l2"
-    client = FakeHostedClient(_complete_inspection(raw_value.encode()))
-    policy = SecretScanPolicy(scanner_versions=PINNED_SCANNER_VERSIONS)
+    surface = "public_mcp_responses"
+    client = FakeHostedClient(_complete_inspection(surface, raw_value.encode()))
 
-    result = scan_hosted_surface("public_mcp_responses", client, policy)
+    result = scan_hosted_surface(surface, client, _policy())
     serialized = result.model_dump_json()
 
     assert any(finding.rule == "provider_token" for finding in result.findings)
     assert raw_value not in serialized
-    assert result.evidence_hashes
+    assert len(result.evidence_hashes) == len(HOSTED_RECEIPT_INVENTORY[surface])
+
+
+def test_caller_complete_flag_without_fixed_receipts_is_not_evidence() -> None:
+    surface = "render_build_and_runtime_logs"
+    inspection = HostedInspection(receipts=(), scanner_version=HOSTED_SCANNER_VERSION)
+
+    result = scan_hosted_surface(surface, FakeHostedClient(inspection), _policy())
+
+    assert result.blockers == (f"hosted_receipt_inventory_invalid:{surface}",)
+
+
+def test_zero_records_pass_only_when_every_expected_receipt_proves_complete_empty() -> None:
+    surface = "supabase_knowledge_and_storage"
+    inspection = HostedInspection(
+        receipts=tuple(
+            HostedReceipt(
+                name=name,
+                chunks=(),
+                complete=True,
+                page_count=1,
+                record_count=0,
+                status_codes=(200,),
+            )
+            for name in HOSTED_RECEIPT_INVENTORY[surface]
+        ),
+        scanner_version=HOSTED_SCANNER_VERSION,
+    )
+
+    complete = scan_hosted_surface(surface, FakeHostedClient(inspection), _policy())
+    missing = scan_hosted_surface(
+        surface,
+        FakeHostedClient(
+            HostedInspection(
+                receipts=inspection.receipts[:-1],
+                scanner_version=HOSTED_SCANNER_VERSION,
+            )
+        ),
+        _policy(),
+    )
+
+    assert complete.blockers == ()
+    assert f"hosted_receipt_inventory_invalid:{surface}" in missing.blockers
 
 
 @pytest.mark.parametrize(
-    ("inspection", "blocker"),
+    ("receipt_updates", "policy_updates", "blocker"),
     [
-        (
-            HostedInspection(
-                accessible=False,
-                complete=False,
-                chunks=(),
-                scanner_version=HOSTED_SCANNER_VERSION,
-                exit_codes=(),
-            ),
-            "hosted_surface_inaccessible:render_build_and_runtime_logs",
-        ),
-        (
-            HostedInspection(
-                accessible=True,
-                complete=False,
-                chunks=(b"partial",),
-                scanner_version=HOSTED_SCANNER_VERSION,
-                exit_codes=(0,),
-            ),
-            "hosted_surface_incomplete:render_build_and_runtime_logs",
-        ),
-        (
-            HostedInspection(
-                accessible=True,
-                complete=True,
-                chunks=(b"safe",),
-                scanner_version="9.9.9",
-                exit_codes=(0,),
-            ),
-            "hosted_scanner_version_unpinned:render_build_and_runtime_logs",
-        ),
-        (
-            HostedInspection(
-                accessible=True,
-                complete=True,
-                chunks=(b"safe",),
-                scanner_version=HOSTED_SCANNER_VERSION,
-                exit_codes=(1,),
-            ),
-            "hosted_command_failed:render_build_and_runtime_logs",
-        ),
+        ({"complete": False}, {}, "hosted_receipt_incomplete"),
+        ({"exit_codes": (7,)}, {}, "hosted_command_failed"),
+        ({"exit_codes": (), "status_codes": (503,)}, {}, "hosted_status_failed"),
+        ({"page_count": 3}, {"max_hosted_pages": 2}, "hosted_page_limit"),
+        ({"record_count": 3}, {"max_hosted_records": 2}, "hosted_record_limit"),
+        ({"chunks": (b"12345",)}, {"max_hosted_receipt_bytes": 4}, "hosted_byte_limit"),
     ],
 )
-def test_hosted_unavailable_incomplete_unpinned_or_failed_is_blocking(
-    inspection: HostedInspection,
+def test_each_hosted_receipt_reconciles_completion_status_exit_and_budgets(
+    receipt_updates: dict[str, object],
+    policy_updates: dict[str, object],
     blocker: str,
 ) -> None:
+    surface = "marketplace_snapshot"
+    inspection = _complete_inspection(surface)
+    receipt = inspection.receipts[0]
+    values = {
+        field: getattr(receipt, field)
+        for field in (
+            "name",
+            "chunks",
+            "complete",
+            "page_count",
+            "record_count",
+            "exit_codes",
+            "status_codes",
+        )
+    }
+    values.update(receipt_updates)
+    malformed = HostedInspection(
+        receipts=(HostedReceipt(**values),),
+        scanner_version=HOSTED_SCANNER_VERSION,
+    )
+
+    result = scan_hosted_surface(surface, FakeHostedClient(malformed), _policy(**policy_updates))
+
+    assert f"{blocker}:{surface}" in result.blockers
+
+
+def test_hosted_record_budget_is_cumulative_across_expected_receipts() -> None:
+    surface = "render_build_and_runtime_logs"
+    inspection = HostedInspection(
+        receipts=tuple(
+            HostedReceipt(
+                name=name,
+                chunks=(b"[]",),
+                complete=True,
+                page_count=1,
+                record_count=2,
+                status_codes=(200,),
+            )
+            for name in HOSTED_RECEIPT_INVENTORY[surface]
+        ),
+        scanner_version=HOSTED_SCANNER_VERSION,
+    )
+
     result = scan_hosted_surface(
-        "render_build_and_runtime_logs",
+        surface,
         FakeHostedClient(inspection),
-        SecretScanPolicy(scanner_versions=PINNED_SCANNER_VERSIONS),
+        _policy(max_hosted_records=3),
     )
 
-    assert blocker in result.blockers
+    assert f"hosted_total_record_limit:{surface}" in result.blockers
 
 
-def test_hosted_client_exception_is_constant_code_only() -> None:
+def test_malformed_hosted_receipt_numbers_fail_closed_without_raising() -> None:
+    surface = "marketplace_snapshot"
+    inspection = HostedInspection(
+        receipts=(
+            HostedReceipt(
+                name=HOSTED_RECEIPT_INVENTORY[surface][0],
+                chunks=(b"[]",),
+                complete=True,
+                page_count="one",  # type: ignore[arg-type]
+                record_count=0,
+                status_codes=(200,),
+            ),
+        ),
+        scanner_version=HOSTED_SCANNER_VERSION,
+    )
+
+    result = scan_hosted_surface(surface, FakeHostedClient(inspection), _policy())
+
+    assert result.blockers == (f"hosted_receipt_malformed:{surface}",)
+
+
+def test_hosted_client_exception_and_malformed_result_use_constant_codes() -> None:
+    surface = "public_mcp_responses"
     raw_message = "provider payload must not survive"
-    client = FakeHostedClient(RuntimeError(raw_message))
 
-    result = scan_hosted_surface(
-        "supabase_knowledge_and_storage",
-        client,
-        SecretScanPolicy(scanner_versions=PINNED_SCANNER_VERSIONS),
-    )
+    failed = scan_hosted_surface(surface, FakeHostedClient(RuntimeError(raw_message)), _policy())
 
-    assert result.blockers == ("hosted_inspection_failed:supabase_knowledge_and_storage",)
-    assert raw_message not in result.model_dump_json()
-
-
-def test_malformed_hosted_inspection_is_a_constant_blocker() -> None:
     class MalformedClient:
-        def inspect(self, _surface: str) -> object:
+        def inspect(self, _surface: str, _policy: SecretScanPolicy) -> object:
             return object()
 
-    result = scan_hosted_surface(
-        "public_mcp_responses",
-        MalformedClient(),  # type: ignore[arg-type]
-        SecretScanPolicy(scanner_versions=PINNED_SCANNER_VERSIONS),
+    malformed = scan_hosted_surface(surface, MalformedClient(), _policy())  # type: ignore[arg-type]
+
+    assert failed.blockers == (f"hosted_inspection_failed:{surface}",)
+    assert malformed.blockers == (f"hosted_inspection_malformed:{surface}",)
+    assert raw_message not in failed.model_dump_json()
+
+
+def test_http_transport_never_buffers_past_the_caller_byte_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Response:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def iter_bytes(self, chunk_size: int | None = None):
+            assert chunk_size == 64 * 1024
+            yield b"a" * 16
+
+    class Client:
+        def __enter__(self) -> Client:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def stream(self, *_args: object, **_kwargs: object) -> Response:
+            return Response()
+
+    monkeypatch.setattr(hosted_module.httpx, "Client", lambda **_kwargs: Client())
+
+    response = hosted_module.HttpxHostedTransport().request(
+        "GET",
+        "https://hosted.example/data",
+        headers={},
+        max_bytes=5,
     )
 
-    assert result.blockers == ("hosted_inspection_malformed:public_mcp_responses",)
+    assert response.body == b"a" * 5
 
 
-def test_nonbyte_hosted_chunk_blocks_raw_evidence_handling() -> None:
-    inspection = HostedInspection(
-        accessible=True,
-        complete=True,
-        chunks=("raw text",),  # type: ignore[arg-type]
-        scanner_version=HOSTED_SCANNER_VERSION,
-        exit_codes=(0,),
-    )
-
-    result = scan_hosted_surface(
-        "public_mcp_responses",
-        FakeHostedClient(inspection),
-        SecretScanPolicy(scanner_versions=PINNED_SCANNER_VERSIONS),
-    )
-
-    assert result.blockers == ("raw_evidence_handling_failed:public_mcp_responses",)
-
-
-def test_gh_api_adapter_uses_injected_commands_and_never_returns_raw() -> None:
+def test_gh_adapter_uses_compiled_release_asset_inventory_and_downloads_content() -> None:
     raw_value = "gh" + "p_" + "E1f2G3h4I5j6K7l8M9n0P1q2R3s4"
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(
+        archive_buffer,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+    ) as archive:
+        archive.writestr("release/config.txt", raw_value)
+    releases_route = "repos/example/mercury-tools/releases?per_page=100"
+    assets_route = "repos/example/mercury-tools/releases/11/assets?per_page=100"
+    download_route = "repos/example/mercury-tools/releases/assets/22"
     runner = FakeCommandRunner(
         {
-            "releases": CommandResult(exit_code=0, stdout=raw_value.encode(), stderr=b""),
-            "assets": CommandResult(exit_code=0, stdout=b"safe", stderr=b""),
+            releases_route: CommandResult(
+                exit_code=0,
+                stdout=json.dumps([[{"id": 11}]]).encode(),
+                stderr=b"",
+            ),
+            assets_route: CommandResult(
+                exit_code=0,
+                stdout=json.dumps([[{"id": 22}]]).encode(),
+                stderr=b"",
+            ),
+            download_route: CommandResult(
+                exit_code=0,
+                stdout=archive_buffer.getvalue(),
+                stderr=b"",
+            ),
         }
     )
     client = GhApiHostedClient(
         executable=Path("/mock/gh"),
         command_runner=runner,
-        routes={"github_releases_and_assets": ("releases", "assets")},
+        repo="example/mercury-tools",
     )
 
-    inspection = client.inspect("github_releases_and_assets")
-    result = scan_hosted_surface(
-        "github_releases_and_assets",
-        client,
-        SecretScanPolicy(scanner_versions=PINNED_SCANNER_VERSIONS),
-    )
+    inspection = client.inspect("github_releases_and_assets", _policy())
+    result = scan_hosted_surface("github_releases_and_assets", client, _policy())
 
-    assert inspection.complete is True
-    assert runner.calls == [
-        ("/mock/gh", "api", "--paginate", "releases"),
-        ("/mock/gh", "api", "--paginate", "assets"),
-        ("/mock/gh", "api", "--paginate", "releases"),
-        ("/mock/gh", "api", "--paginate", "assets"),
+    assert tuple(receipt.name for receipt in inspection.receipts) == HOSTED_RECEIPT_INVENTORY[
+        "github_releases_and_assets"
     ]
-    assert raw_value not in result.model_dump_json()
+    assert any("--paginate" in call and "--slurp" in call for call in runner.calls)
+    assert any(download_route in call for call in runner.calls)
     assert any(finding.rule == "provider_token" for finding in result.findings)
+    assert raw_value not in result.model_dump_json()
+
+
+def test_gh_adapter_rejects_a_page_over_the_record_budget() -> None:
+    route = "repos/example/mercury-tools/git/matching-refs/pull/?per_page=100"
+    runner = FakeCommandRunner(
+        {route: CommandResult(0, b'[[{"ref":"one"},{"ref":"two"}]]', b"")}
+    )
+    client = GhApiHostedClient(
+        executable=Path("/mock/gh"),
+        command_runner=runner,
+        repo="example/mercury-tools",
+    )
+
+    result = scan_hosted_surface(
+        "github_pull_request_refs",
+        client,
+        _policy(max_hosted_page_records=1, max_hosted_records=10),
+    )
+
+    assert "hosted_receipt_incomplete:github_pull_request_refs" in result.blockers
+
+
+@pytest.mark.parametrize(
+    ("duplicate", "policy_updates", "blocker"),
+    [
+        (
+            True,
+            {},
+            "hosted_archive_duplicate_member:github_releases_and_assets",
+        ),
+        (
+            False,
+            {"max_archive_member_bytes": 8, "max_archive_uncompressed_bytes": 10},
+            "hosted_archive_uncompressed_limit:github_releases_and_assets",
+        ),
+    ],
+)
+def test_hosted_archive_receipts_preflight_aliases_and_uncompressed_budget(
+    duplicate: bool,
+    policy_updates: dict[str, object],
+    blocker: str,
+) -> None:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        if duplicate:
+            archive.writestr("same/path.txt", b"safe")
+            archive.writestr("same//path.txt", b"safe alias")
+        else:
+            archive.writestr("one.txt", b"a" * 6)
+            archive.writestr("two.txt", b"b" * 6)
+    surface = "github_releases_and_assets"
+    inspection = HostedInspection(
+        receipts=(
+            HostedReceipt(
+                name="github_releases_query",
+                complete=True,
+                page_count=1,
+                record_count=0,
+                exit_codes=(0,),
+            ),
+            HostedReceipt(
+                name="github_release_assets_query",
+                complete=True,
+                page_count=1,
+                record_count=0,
+                exit_codes=(0,),
+            ),
+            HostedReceipt(
+                name="github_release_assets_download",
+                chunks=(buffer.getvalue(),),
+                complete=True,
+                page_count=1,
+                record_count=1,
+                exit_codes=(0,),
+            ),
+        ),
+        scanner_version=HOSTED_SCANNER_VERSION,
+    )
+
+    result = scan_hosted_surface(
+        surface,
+        FakeHostedClient(inspection),
+        _policy(**policy_updates),
+    )
+
+    assert blocker in result.blockers
+
+
+def test_gh_wiki_download_reads_every_historical_diff() -> None:
+    historical_value = "gh" + "p_" + "W1x2Y3z4A5b6C7d8E9f0G1h2I3j4"
+    runner = FakeCommandRunner(
+        {
+            "ls-remote": CommandResult(0, b"a" * 40 + b"\trefs/heads/main\n", b""),
+            "clone": CommandResult(0, b"", b""),
+            "log": CommandResult(0, historical_value.encode(), b""),
+        }
+    )
+    client = GhApiHostedClient(
+        executable=Path("/mock/gh"),
+        command_runner=runner,
+        repo="example/mercury-tools",
+    )
+
+    query, download = client._wiki_receipts(_policy())
+
+    assert query.complete is True
+    assert download.complete is True
+    assert any(call[:3] == ("git", "log", "--all") for call in runner.calls)
+    assert historical_value.encode() in tuple(download.chunks)
+
+
+def test_gh_adapter_proves_fixed_pr_actions_packages_pages_wiki_empty_receipts() -> None:
+    repo = "example/mercury-tools"
+    responses = {
+        f"repos/{repo}/git/matching-refs/pull/?per_page=100": CommandResult(
+            0, b"[[]]", b""
+        ),
+        f"repos/{repo}/actions/runs?per_page=100": CommandResult(
+            0, b'[{"workflow_runs":[]}]', b""
+        ),
+        f"repos/{repo}/actions/artifacts?per_page=100": CommandResult(
+            0, b'[{"artifacts":[]}]', b""
+        ),
+        f"repos/{repo}/actions/caches?per_page=100": CommandResult(
+            0, b'[{"actions_caches":[]}]', b""
+        ),
+        f"repos/{repo}": CommandResult(
+            0, b'[{"has_pages":false,"has_wiki":false}]', b""
+        ),
+    }
+    responses.update(
+        {
+            f"users/example/packages?package_type={package_type}&per_page=100": CommandResult(
+                0, b"[[]]", b""
+            )
+            for package_type in ("container", "docker", "maven", "npm", "nuget", "rubygems")
+        }
+    )
+    runner = FakeCommandRunner(responses)
+    client = GhApiHostedClient(
+        executable=Path("/mock/gh"),
+        command_runner=runner,
+        repo=repo,
+    )
+
+    for surface in (
+        "github_pull_request_refs",
+        "github_actions_logs_artifacts_caches",
+        "github_packages_pages_wiki",
+    ):
+        inspection = client.inspect(surface, _policy())
+        result = scan_hosted_surface(surface, client, _policy())
+        assert tuple(receipt.name for receipt in inspection.receipts) == (
+            HOSTED_RECEIPT_INVENTORY[surface]
+        )
+        assert result.blockers == ()
+
+
+def test_render_adapter_proves_build_and_runtime_pagination_without_leaking_token() -> None:
+    token = "render-operator-token"
+    transport = FakeHttpTransport(
+        {
+            "type=build": HostedHttpResponse(200, b'{"logs":[]}', {}),
+            "type=runtime": HostedHttpResponse(200, b'{"logs":[]}', {}),
+        }
+    )
+    client = RenderHostedClient(
+        api_url="https://api.render.example",
+        service_id="srv-safe",
+        token=token,
+        transport=transport,
+    )
+
+    result = scan_hosted_surface("render_build_and_runtime_logs", client, _policy())
+
+    assert result.blockers == ()
+    assert len(transport.calls) == 2
+    assert all(call["headers"] == {"Authorization": f"Bearer {token}"} for call in transport.calls)
+    assert token not in result.model_dump_json()
+
+
+def test_render_adapter_follows_provider_cursor_to_completion() -> None:
+    def handler(call: dict[str, object]) -> HostedHttpResponse:
+        url = str(call["url"])
+        if "type=runtime" in url:
+            payload = {"logs": []}
+        elif "cursor=next-page" in url:
+            payload = {"logs": [{"message": "second"}]}
+        else:
+            payload = {"logs": [{"message": "first"}], "nextCursor": "next-page"}
+        return HostedHttpResponse(200, json.dumps(payload).encode(), {})
+
+    transport = CallbackHttpTransport(handler)
+    client = RenderHostedClient(
+        api_url="https://api.render.example",
+        service_id="srv-safe",
+        token="operator-token",
+        transport=transport,
+    )
+
+    result = scan_hosted_surface("render_build_and_runtime_logs", client, _policy())
+
+    assert result.blockers == ()
+    build_calls = [call for call in transport.calls if "type=build" in str(call["url"])]
+    assert len(build_calls) == 2
+
+
+def test_render_adapter_rejects_a_page_over_the_record_budget() -> None:
+    transport = FakeHttpTransport(
+        {
+            "type=build": HostedHttpResponse(200, b'{"logs":[{},{}]}', {}),
+            "type=runtime": HostedHttpResponse(200, b'{"logs":[]}', {}),
+        }
+    )
+    client = RenderHostedClient(
+        api_url="https://api.render.example",
+        service_id="srv-safe",
+        token="operator-token",
+        transport=transport,
+    )
+
+    result = scan_hosted_surface(
+        "render_build_and_runtime_logs",
+        client,
+        _policy(max_hosted_page_records=1, max_hosted_records=10),
+    )
+
+    assert "hosted_receipt_incomplete:render_build_and_runtime_logs" in result.blockers
+
+
+def test_supabase_adapter_queries_knowledge_lists_storage_and_downloads_every_object() -> None:
+    token = "supabase-operator-token"
+    transport = FakeHttpTransport(
+        {
+            "/rest/v1/knowledge": HostedHttpResponse(200, b"[]", {}),
+            "/storage/v1/object/list/public": HostedHttpResponse(
+                200,
+                b'[{"name":"safe.txt"}]',
+                {},
+            ),
+            "/storage/v1/object/authenticated/public/safe.txt": HostedHttpResponse(
+                200,
+                b"safe storage content",
+                {},
+            ),
+        }
+    )
+    client = SupabaseHostedClient(
+        base_url="https://project.supabase.example",
+        service_key=token,
+        knowledge_tables=("knowledge",),
+        storage_buckets=("public",),
+        transport=transport,
+    )
+
+    result = scan_hosted_surface("supabase_knowledge_and_storage", client, _policy())
+
+    assert result.blockers == ()
+    assert len(transport.calls) == 3
+    assert all(call["headers"]["apikey"] == token for call in transport.calls)  # type: ignore[index]
+    assert token not in result.model_dump_json()
+
+
+def test_supabase_storage_paginates_to_a_proven_short_final_page_before_downloads() -> None:
+    objects = [{"name": "one.txt"}, {"name": "two.txt"}, {"name": "three.txt"}]
+
+    def handler(call: dict[str, object]) -> HostedHttpResponse:
+        url = str(call["url"])
+        if "/rest/v1/knowledge" in url:
+            return HostedHttpResponse(200, b"[]", {})
+        if "/storage/v1/object/list/public" in url:
+            body = call["json_body"]
+            assert isinstance(body, dict)
+            offset = body["offset"]
+            page = objects[offset : offset + body["limit"]]
+            return HostedHttpResponse(200, json.dumps(page).encode(), {})
+        if "/storage/v1/object/authenticated/public/" in url:
+            return HostedHttpResponse(200, b"safe", {})
+        raise AssertionError("unexpected_http_request")
+
+    transport = CallbackHttpTransport(handler)
+    client = SupabaseHostedClient(
+        base_url="https://project.supabase.example",
+        service_key="operator-token",
+        knowledge_tables=("knowledge",),
+        storage_buckets=("public",),
+        transport=transport,
+    )
+
+    result = scan_hosted_surface(
+        "supabase_knowledge_and_storage",
+        client,
+        _policy(max_hosted_page_records=2, max_hosted_records=10),
+    )
+
+    assert result.blockers == ()
+    list_calls = [
+        call for call in transport.calls if "/storage/v1/object/list/public" in str(call["url"])
+    ]
+    assert [call["json_body"]["offset"] for call in list_calls] == [0, 2]  # type: ignore[index]
+    download_calls = [
+        call
+        for call in transport.calls
+        if "/storage/v1/object/authenticated/public/" in str(call["url"])
+    ]
+    assert len(download_calls) == 3
+
+
+def test_supabase_adapter_rejects_a_server_page_over_the_requested_record_budget() -> None:
+    transport = FakeHttpTransport(
+        {
+            "/rest/v1/knowledge": HostedHttpResponse(200, b"[{},{}]", {}),
+            "/storage/v1/object/list/public": HostedHttpResponse(200, b"[]", {}),
+        }
+    )
+    client = SupabaseHostedClient(
+        base_url="https://project.supabase.example",
+        service_key="operator-token",
+        knowledge_tables=("knowledge",),
+        storage_buckets=("public",),
+        transport=transport,
+    )
+
+    result = scan_hosted_surface(
+        "supabase_knowledge_and_storage",
+        client,
+        _policy(max_hosted_page_records=1, max_hosted_records=10),
+    )
+
+    assert "hosted_receipt_incomplete:supabase_knowledge_and_storage" in result.blockers
+
+
+def test_marketplace_and_public_mcp_adapters_scan_fixed_http_receipts() -> None:
+    tools = [{"name": f"tool_{index}"} for index in range(19)]
+    marketplace_transport = FakeHttpTransport(
+        {"snapshot": HostedHttpResponse(200, b'[{"name":"mercury-finance"}]', {})}
+    )
+    mcp_transport = FakeHttpTransport(
+        {
+            "mcp": HostedHttpResponse(
+                200,
+                json.dumps({"jsonrpc": "2.0", "result": {"tools": tools}}).encode(),
+                {},
+            )
+        }
+    )
+    marketplace = MarketplaceHostedClient(
+        snapshot_url="https://marketplace.example/snapshot",
+        transport=marketplace_transport,
+    )
+    mcp = PublicMcpHostedClient(
+        endpoint="https://public.example/mcp",
+        token="mcp-operator-token",
+        transport=mcp_transport,
+    )
+
+    marketplace_result = scan_hosted_surface("marketplace_snapshot", marketplace, _policy())
+    mcp_result = scan_hosted_surface("public_mcp_responses", mcp, _policy())
+
+    assert marketplace_result.blockers == ()
+    assert mcp_result.blockers == ()
+    assert len(mcp_transport.calls) == len(HOSTED_RECEIPT_INVENTORY["public_mcp_responses"])
+    assert "mcp-operator-token" not in mcp_result.model_dump_json()
+
+
+def test_public_mcp_adapter_follows_tools_cursor_until_all_19_tools_are_scanned() -> None:
+    first_tools = [{"name": f"tool_{index}"} for index in range(10)]
+    second_tools = [{"name": f"tool_{index}"} for index in range(10, 19)]
+
+    def handler(call: dict[str, object]) -> HostedHttpResponse:
+        body = call["json_body"]
+        assert isinstance(body, dict)
+        method = body["method"]
+        parameters = body["params"]
+        if method == "tools/list" and parameters == {}:
+            payload = {"result": {"tools": first_tools, "nextCursor": "next-page"}}
+        elif method == "tools/list" and parameters == {"cursor": "next-page"}:
+            payload = {"result": {"tools": second_tools}}
+        else:
+            payload = {"result": {}}
+        return HostedHttpResponse(200, json.dumps(payload).encode(), {})
+
+    transport = CallbackHttpTransport(handler)
+    client = PublicMcpHostedClient(
+        endpoint="https://public.example/mcp",
+        token=None,
+        transport=transport,
+    )
+
+    result = scan_hosted_surface("public_mcp_responses", client, _policy())
+
+    assert result.blockers == ()
+    tool_calls = [
+        call
+        for call in transport.calls
+        if isinstance(call["json_body"], dict)
+        and call["json_body"]["method"] == "tools/list"  # type: ignore[index]
+    ]
+    assert len(tool_calls) == 2
+
+
+def test_public_mcp_adapter_rejects_a_tools_page_over_the_record_budget() -> None:
+    tools = [{"name": f"tool_{index}"} for index in range(19)]
+    transport = FakeHttpTransport(
+        {
+            "mcp": HostedHttpResponse(
+                200,
+                json.dumps({"result": {"tools": tools}}).encode(),
+                {},
+            )
+        }
+    )
+    client = PublicMcpHostedClient(
+        endpoint="https://public.example/mcp",
+        token=None,
+        transport=transport,
+    )
+
+    result = scan_hosted_surface(
+        "public_mcp_responses",
+        client,
+        _policy(max_hosted_page_records=10, max_hosted_records=20),
+    )
+
+    assert "hosted_receipt_incomplete:public_mcp_responses" in result.blockers
+
+
+def test_public_mcp_adapter_handles_sse_session_handshake_without_persisting_session() -> None:
+    tools = [{"name": f"tool_{index}"} for index in range(19)]
+    session_id = "private-session-id"
+
+    def handler(call: dict[str, object]) -> HostedHttpResponse:
+        body = call["json_body"]
+        assert isinstance(body, dict)
+        method = body["method"]
+        headers = call["headers"]
+        assert isinstance(headers, dict)
+        if method == "initialize":
+            payload = json.dumps({"result": {"protocolVersion": "2025-11-25"}})
+            return HostedHttpResponse(
+                200,
+                f"event: message\ndata: {payload}\n\n".encode(),
+                {"mcp-session-id": session_id},
+            )
+        assert headers["Mcp-Session-Id"] == session_id
+        if method == "notifications/initialized":
+            return HostedHttpResponse(202, b"", {})
+        if method == "tools/list":
+            return HostedHttpResponse(
+                200,
+                json.dumps({"result": {"tools": tools}}).encode(),
+                {},
+            )
+        raise AssertionError("unexpected_mcp_method")
+
+    transport = CallbackHttpTransport(handler)
+    client = PublicMcpHostedClient(
+        endpoint="https://public.example/mcp",
+        token="operator-token",
+        transport=transport,
+    )
+
+    result = scan_hosted_surface("public_mcp_responses", client, _policy())
+
+    assert result.blockers == ()
+    assert session_id not in result.model_dump_json()
+    assert [call["json_body"]["method"] for call in transport.calls] == [  # type: ignore[index]
+        "initialize",
+        "notifications/initialized",
+        "tools/list",
+    ]
+
+
+def test_adapter_factory_instantiates_every_hosted_surface_from_secret_safe_config() -> None:
+    token = "operator-token-that-must-not-render"
+    config = HostedAdapterConfig(
+        repo="example/mercury-tools",
+        gh_executable=Path("/mock/gh"),
+        github_token=token,
+        marketplace_url="https://marketplace.example/snapshot",
+        render_api_url="https://api.render.example",
+        render_service_id="srv-safe",
+        render_token=token,
+        supabase_url="https://project.supabase.example",
+        supabase_key=token,
+        supabase_knowledge_tables=("knowledge",),
+        supabase_storage_buckets=("public",),
+        public_mcp_url="https://public.example/mcp",
+        public_mcp_token=token,
+    )
+
+    clients = build_hosted_clients(
+        config,
+        command_runner=FakeCommandRunner({}),
+        http_transport=FakeHttpTransport({}),
+    )
+
+    assert set(clients) == set(HOSTED_PUBLIC_SURFACES)
+    assert token not in repr(config)
+    assert token not in repr(clients)
 
 
 def test_all_ten_surfaces_are_required_for_a_passing_report(
@@ -343,3 +1029,94 @@ def test_missing_required_hosted_client_blocks_full_report(
     assert report.passed is False
     assert "hosted_client_missing:public_mcp_responses" in report.blockers
     assert "/mock" not in serialized
+
+
+def test_cli_wires_concrete_hosted_clients_from_env_names_without_token_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from mercury_tools import cli
+
+    root = Path(__file__).resolve().parents[1]
+    raw_token = "operator-token-not-for-output"
+    captured: dict[str, Any] = {}
+
+    def fake_build(config: HostedAdapterConfig, **_kwargs: object) -> dict[str, object]:
+        captured["config"] = config
+        return {surface: object() for surface in HOSTED_PUBLIC_SURFACES}
+
+    def fake_scan(
+        _request: SecretScanRequest,
+        *,
+        hosted_clients: Mapping[str, object],
+        **_kwargs: object,
+    ) -> object:
+        captured["clients"] = hosted_clients
+        return build_blocked_report("test_blocker")
+
+    monkeypatch.setattr(hosted_module, "build_hosted_clients", fake_build)
+    monkeypatch.setattr(scanner_module, "scan_public_release", fake_scan)
+    monkeypatch.setenv("TASK13_GITHUB_TOKEN", raw_token)
+    monkeypatch.setenv("TASK13_RENDER_TOKEN", raw_token)
+    monkeypatch.setenv("TASK13_SUPABASE_KEY", raw_token)
+    monkeypatch.setenv("TASK13_MCP_TOKEN", raw_token)
+    monkeypatch.setattr(shutil, "which", lambda _name: "/mock/gh")
+
+    exit_code = cli.main(
+        [
+            "release",
+            "scan-secrets",
+            "--all-history",
+            "--hosted",
+            "--artifacts",
+            str(tmp_path / "dist"),
+            "--repo",
+            "example/mercury-tools",
+            "--manifest",
+            str(root / "docs/release/public-surface-manifest.json"),
+            "--allowlist",
+            str(root / "docs/release/secret-scan-allowlist.json"),
+            "--github-token-env",
+            "TASK13_GITHUB_TOKEN",
+            "--marketplace-snapshot-url",
+            "https://marketplace.example/snapshot",
+            "--render-api-url",
+            "https://api.render.example",
+            "--render-service-id",
+            "srv-safe",
+            "--render-token-env",
+            "TASK13_RENDER_TOKEN",
+            "--supabase-url",
+            "https://project.supabase.example",
+            "--supabase-key-env",
+            "TASK13_SUPABASE_KEY",
+            "--supabase-knowledge-table",
+            "knowledge",
+            "--supabase-storage-bucket",
+            "public",
+            "--public-mcp-url",
+            "https://public.example/mcp",
+            "--public-mcp-token-env",
+            "TASK13_MCP_TOKEN",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert set(captured["clients"]) == set(HOSTED_PUBLIC_SURFACES)
+    assert raw_token not in json.dumps(payload, sort_keys=True)
+    assert raw_token not in repr(captured["config"])
+
+
+def test_missing_scanners_never_invoke_injected_hosted_clients(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    clients = _hosted_clients()
+
+    report = scan_public_release(_request(tmp_path), hosted_clients=clients)
+
+    assert report.passed is False
+    assert all(client.calls == [] for client in clients.values())

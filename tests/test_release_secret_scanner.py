@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import io
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tarfile
+import textwrap
 import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,9 +27,12 @@ from mercury_tools.release.models import (
     GateStatus,
     HostedSurface,
     PublicSurfaceManifest,
+    ScannerVersionAttestation,
     SecretScanAllowlist,
     SecretScanPolicy,
+    SecretScanReport,
     SecretScanRequest,
+    SurfaceAttestation,
 )
 from mercury_tools.release.scanner import (
     CommandResult,
@@ -174,6 +180,141 @@ def _make_remote(tmp_path: Path, *, historical_value: str | None = None) -> Path
     return remote
 
 
+def _publish_remote(source: Path, remote: Path) -> Path:
+    _git("clone", "--bare", str(source), str(remote))
+    head = _git("rev-parse", "HEAD", cwd=source)
+    _git("--git-dir", str(remote), "update-ref", "refs/pull/1/head", head)
+    return remote
+
+
+def _make_historical_alias_remote(tmp_path: Path) -> Path:
+    source = tmp_path / "alias-source"
+    remote = tmp_path / "alias-remote.git"
+    source.mkdir()
+    _git("init", "-b", "main", cwd=source)
+    (source / ".env").write_text("safe fixture\n", encoding="utf-8")
+    _git("add", ".env", cwd=source)
+    _git("commit", "-m", "historical forbidden alias", cwd=source)
+    _git("mv", ".env", "safe.txt", cwd=source)
+    _git("commit", "-m", "rename alias", cwd=source)
+    return _publish_remote(source, remote)
+
+
+def _make_multibranch_remote(tmp_path: Path) -> Path:
+    source = tmp_path / "branch-source"
+    remote = tmp_path / "branch-remote.git"
+    source.mkdir()
+    _git("init", "-b", "main", cwd=source)
+    (source / "README.md").write_text("main checkout\n", encoding="utf-8")
+    _git("add", "README.md", cwd=source)
+    _git("commit", "-m", "main", cwd=source)
+    _git("branch", "aaa", cwd=source)
+    return _publish_remote(source, remote)
+
+
+def _make_symlink_remote(tmp_path: Path) -> Path:
+    source = tmp_path / "symlink-source"
+    remote = tmp_path / "symlink-remote.git"
+    source.mkdir()
+    _git("init", "-b", "main", cwd=source)
+    (source / "README.md").write_text("safe\n", encoding="utf-8")
+    (source / "linked").symlink_to("README.md")
+    _git("add", "README.md", "linked", cwd=source)
+    _git("commit", "-m", "symlink", cwd=source)
+    (source / "linked").unlink()
+    _git("add", "-u", cwd=source)
+    _git("commit", "-m", "remove symlink", cwd=source)
+    return _publish_remote(source, remote)
+
+
+def _make_gitlink_remote(tmp_path: Path) -> Path:
+    source = tmp_path / "gitlink-source"
+    remote = tmp_path / "gitlink-remote.git"
+    source.mkdir()
+    _git("init", "-b", "main", cwd=source)
+    (source / "README.md").write_text("safe\n", encoding="utf-8")
+    _git("add", "README.md", cwd=source)
+    _git("commit", "-m", "initial", cwd=source)
+    commit = _git("rev-parse", "HEAD", cwd=source)
+    _git("update-index", "--add", "--cacheinfo", f"160000,{commit},vendor", cwd=source)
+    _git("commit", "-m", "gitlink", cwd=source)
+    _git("rm", "--cached", "vendor", cwd=source)
+    _git("commit", "-m", "remove gitlink", cwd=source)
+    return _publish_remote(source, remote)
+
+
+def _write_fake_scanner(path: Path, *, exit_code: int) -> None:
+    if path.name == "gitleaks":
+        finding = json.dumps(
+            [{"File": "README.md", "RuleID": "generic", "Secret": "redacted"}]
+        )
+        scan_output = f"print({finding!r})"
+    else:
+        finding = json.dumps(
+            {"SourceMetadata": {"Data": {"Git": {"file": "README.md"}}}, "Raw": "redacted"}
+        )
+        scan_output = f"print({finding!r})"
+    path.write_text(
+        textwrap.dedent(
+            f"""\
+            #!{sys.executable}
+            import pathlib
+            import sys
+
+            pathlib.Path(__file__).with_suffix('.args').write_text(
+                '\\n'.join(sys.argv[1:]), encoding='utf-8'
+            )
+            if sys.argv[1:] in (['version'], ['--version']):
+                print('{path.name} {PINNED_SCANNER_VERSIONS[path.name]}')
+                raise SystemExit(0)
+            {scan_output}
+            print('partial scan detail that must not survive', file=sys.stderr)
+            raise SystemExit({exit_code})
+            """
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o700)
+
+
+def _valid_pass_report() -> SecretScanReport:
+    timestamp = datetime(2026, 7, 14, tzinfo=UTC)
+    scanners = tuple(
+        ScannerVersionAttestation(
+            scanner=name,
+            version=version,
+            status=GateStatus.PASSED,
+            evidence_sha256=hashlib.sha256(name.encode()).hexdigest(),
+            exit_code=0,
+        )
+        for name, version in PINNED_SCANNER_VERSIONS.items()
+    )
+    surfaces = tuple(
+        SurfaceAttestation(
+            surface=surface,
+            status=GateStatus.PASSED,
+            scanner_versions=(
+                tuple(sorted((*PINNED_SCANNER_VERSIONS.values(), "1.0.0")))
+                if surface in {"git_all_refs", "github_pull_request_refs"}
+                else ("1.0.0",)
+            ),
+            started_at=timestamp,
+            completed_at=timestamp,
+            finding_count=0,
+            evidence_hashes=(hashlib.sha256(surface.encode()).hexdigest(),),
+            exit_codes=(0,),
+        )
+        for surface in REQUIRED_PUBLIC_SURFACES
+    )
+    return SecretScanReport(
+        status=GateStatus.PASSED,
+        started_at=timestamp,
+        completed_at=timestamp,
+        scanner_versions=scanners,
+        surfaces=surfaces,
+    )
+
+
 @pytest.fixture
 def scan_request(tmp_path: Path) -> SecretScanRequest:
     return SecretScanRequest(
@@ -260,6 +401,7 @@ def test_tracked_manifest_and_allowlist_are_secret_free_strict_defaults() -> Non
         {"gitleaks": PINNED_SCANNER_VERSIONS["gitleaks"]},
         {**PINNED_SCANNER_VERSIONS, "other": "1.2.3"},
         {**PINNED_SCANNER_VERSIONS, "gitleaks": "latest"},
+        {"gitleaks": "9.9.9", "trufflehog": "1.2.3"},
     ],
 )
 def test_policy_rejects_missing_extra_or_unpinned_scanners(
@@ -447,6 +589,62 @@ def test_high_entropy_credential_assignment_is_detected(
     assert "high_entropy" in rules
 
 
+def test_long_high_entropy_hex_is_detected_but_declared_sha256_is_exempt(
+    tmp_path: Path,
+    scan_request: SecretScanRequest,
+) -> None:
+    credential = "0123456789abcdef" * 8
+    digest = "fedcba9876543210" * 4
+    (tmp_path / "opaque.txt").write_text(credential, encoding="utf-8")
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"artifact": {"sha256": digest}}, indent=2),
+        encoding="utf-8",
+    )
+
+    result = scan_filesystem(tmp_path, scan_request.policy)
+
+    high_entropy = [finding for finding in result.findings if finding.rule == "high_entropy"]
+    assert len(high_entropy) == 1
+    assert credential not in result.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("updates", "blocker"),
+    [
+        ({"max_filesystem_entries": 1}, "filesystem_entry_limit"),
+        ({"max_filesystem_bytes": 7}, "filesystem_aggregate_too_large"),
+    ],
+)
+def test_filesystem_walk_has_entry_and_aggregate_byte_budgets(
+    tmp_path: Path,
+    scan_request: SecretScanRequest,
+    updates: dict[str, int],
+    blocker: str,
+) -> None:
+    (tmp_path / "one.txt").write_text("1234", encoding="utf-8")
+    (tmp_path / "two.txt").write_text("5678", encoding="utf-8")
+    policy = scan_request.policy.model_copy(update=updates)
+
+    result = scan_filesystem(tmp_path, policy)
+
+    assert blocker in result.blockers
+
+
+def test_filesystem_root_symlink_is_rejected(
+    tmp_path: Path,
+    scan_request: SecretScanRequest,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "safe.txt").write_text("safe", encoding="utf-8")
+    linked = tmp_path / "linked"
+    linked.symlink_to(target, target_is_directory=True)
+
+    result = scan_filesystem(linked, scan_request.policy)
+
+    assert result.blockers == ("filesystem_symlink",)
+
+
 def test_known_credential_fingerprint_matches_tokenized_content(tmp_path: Path) -> None:
     candidate = "known" + "-credential-" + "A1b2C3d4E5f6G7h8"
     fingerprint = hashlib.sha256(candidate.encode()).hexdigest()
@@ -604,6 +802,145 @@ def test_provider_token_inside_archive_is_detected_in_memory(
     assert candidate.decode() not in result.model_dump_json()
 
 
+def test_high_entropy_hex_inside_artifact_is_detected(
+    tmp_path: Path,
+    scan_request: SecretScanRequest,
+) -> None:
+    artifacts = tmp_path / "dist"
+    _write_complete_artifact_set(artifacts)
+    credential = ("0123456789abcdef" * 8).encode()
+    _write_zip(artifacts / "mercury-finance-plugin.zip", "plugin/opaque.txt", credential)
+
+    result = scan_artifacts(artifacts, scan_request.policy)
+
+    assert any(finding.rule == "high_entropy" for finding in result.findings)
+    assert credential.decode() not in result.model_dump_json()
+
+
+@pytest.mark.parametrize("archive_format", ["zip", "tar"])
+def test_archive_rejects_duplicate_canonical_member_aliases_before_scanning(
+    tmp_path: Path,
+    scan_request: SecretScanRequest,
+    archive_format: str,
+) -> None:
+    artifacts = tmp_path / "dist"
+    _write_complete_artifact_set(artifacts)
+    target = artifacts / "mercury-tools-source.zip"
+    if archive_format == "zip":
+        with zipfile.ZipFile(target, "w") as archive:
+            archive.writestr("same/path.txt", b"safe")
+            archive.writestr("same//path.txt", b"safe alias")
+    else:
+        target.unlink()
+        target = artifacts / "mercury-tools-source.tar.gz"
+        with tarfile.open(target, "w:gz") as archive:
+            for name, data in (
+                ("same/path.txt", b"safe"),
+                ("same//path.txt", b"safe alias"),
+            ):
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+
+    result = scan_artifacts(artifacts, scan_request.policy)
+
+    assert "artifact_duplicate_member:source" in result.blockers
+
+
+def test_archive_rejects_unicode_normalization_member_aliases(
+    tmp_path: Path,
+    scan_request: SecretScanRequest,
+) -> None:
+    artifacts = tmp_path / "dist"
+    _write_complete_artifact_set(artifacts)
+    with zipfile.ZipFile(artifacts / "mercury-tools-source.zip", "w") as archive:
+        archive.writestr("caf\u00e9.txt", b"safe")
+        archive.writestr("cafe\u0301.txt", b"safe alias")
+
+    result = scan_artifacts(artifacts, scan_request.policy)
+
+    assert "artifact_duplicate_member:source" in result.blockers
+
+
+def test_archive_cumulative_uncompressed_budget_blocks_before_member_reads(
+    tmp_path: Path,
+    scan_request: SecretScanRequest,
+) -> None:
+    artifacts = tmp_path / "dist"
+    _write_complete_artifact_set(artifacts)
+    with zipfile.ZipFile(artifacts / "mercury-tools-source.zip", "w") as archive:
+        archive.writestr("one.txt", b"a" * 6)
+        archive.writestr("two.txt", b"b" * 6)
+    policy = scan_request.policy.model_copy(
+        update={"max_archive_member_bytes": 8, "max_archive_uncompressed_bytes": 10}
+    )
+
+    result = scan_artifacts(artifacts, policy)
+
+    assert "artifact_uncompressed_limit:source" in result.blockers
+
+
+def test_oversized_artifact_metadata_is_checked_before_hashing(
+    tmp_path: Path,
+    scan_request: SecretScanRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = tmp_path / "dist"
+    _write_complete_artifact_set(artifacts)
+    oversized = artifacts / "mercury-tools-source.zip"
+    policy = scan_request.policy.model_copy(update={"max_archive_bytes": 1})
+    hashed: list[Path] = []
+    original_hash = scanner_module._hash_file
+
+    def record_hash(path: Path, *args: object, **kwargs: object) -> str:
+        hashed.append(path)
+        return original_hash(path, *args, **kwargs)
+
+    monkeypatch.setattr(scanner_module, "_hash_file", record_hash)
+
+    result = scan_artifacts(artifacts, policy)
+
+    assert "artifact_too_large:source" in result.blockers
+    assert oversized not in hashed
+
+
+@pytest.mark.parametrize(
+    ("updates", "blocker"),
+    [
+        ({"max_artifact_entries": 1}, "artifact_entry_limit"),
+        ({"max_artifact_total_bytes": 10}, "artifact_aggregate_too_large"),
+    ],
+)
+def test_artifact_walk_has_entry_and_aggregate_byte_budgets(
+    tmp_path: Path,
+    scan_request: SecretScanRequest,
+    updates: dict[str, int],
+    blocker: str,
+) -> None:
+    artifacts = tmp_path / "dist"
+    _write_complete_artifact_set(artifacts)
+    policy = scan_request.policy.model_copy(update=updates)
+
+    result = scan_artifacts(artifacts, policy)
+
+    assert blocker in result.blockers
+
+
+def test_artifact_root_symlink_is_rejected(
+    tmp_path: Path,
+    scan_request: SecretScanRequest,
+) -> None:
+    target = tmp_path / "dist"
+    _write_complete_artifact_set(target)
+    linked = tmp_path / "linked-dist"
+    linked.symlink_to(target, target_is_directory=True)
+
+    result = scan_artifacts(linked, scan_request.policy)
+
+    assert "artifact_symlink" in result.blockers
+    assert result.kinds == ()
+
+
 def test_fresh_clone_fetches_all_ref_classes_and_scans_reachable_history(
     tmp_path: Path,
     scan_request: SecretScanRequest,
@@ -631,7 +968,11 @@ def test_fresh_clone_fetches_all_ref_classes_and_scans_reachable_history(
     assert "+refs/heads/*:refs/remotes/origin/*" in fetch
     assert "+refs/tags/*:refs/tags/*" in fetch
     assert "+refs/pull/*/head:refs/remotes/pull/*/head" in fetch
-    assert any(call[1:4] == ("rev-list", "--objects", "--all") for call in runner.calls)
+    assert any(
+        len(call) >= 4 and call[1] == "rev-list" and call[-1] == "--all"
+        for call in runner.calls
+    )
+    assert any(call[1:3] == ("ls-tree", "-rzt") for call in runner.calls)
     assert any(
         Path(call[0]).name == "gitleaks" and "--log-opts=--all" in call
         for call in runner.calls
@@ -683,6 +1024,147 @@ def test_malformed_remote_ref_inventory_is_a_secret_safe_blocker(
     assert "raw detail" not in result.model_dump_json()
 
 
+def test_git_tree_inventory_detects_every_historical_path_alias(
+    tmp_path: Path,
+    scan_request: SecretScanRequest,
+) -> None:
+    remote = _make_historical_alias_remote(tmp_path)
+
+    result = scan_git_repository(
+        str(remote),
+        scan_request.policy,
+        scanner_binaries={
+            "gitleaks": Path("/mock/gitleaks"),
+            "trufflehog": Path("/mock/trufflehog"),
+        },
+        command_runner=GitScannerRunner(),
+    )
+
+    assert any(finding.rule == "forbidden_path" for finding in result.findings)
+
+
+def test_git_checkout_uses_verified_remote_default_branch(
+    tmp_path: Path,
+    scan_request: SecretScanRequest,
+) -> None:
+    remote = _make_multibranch_remote(tmp_path)
+    runner = GitScannerRunner()
+
+    result = scan_git_repository(
+        str(remote),
+        scan_request.policy,
+        scanner_binaries={
+            "gitleaks": Path("/mock/gitleaks"),
+            "trufflehog": Path("/mock/trufflehog"),
+        },
+        command_runner=runner,
+    )
+
+    assert result.blockers == ()
+    checkout = next(call for call in runner.calls if call[1:3] == ("checkout", "--force"))
+    assert checkout[-1] == "refs/remotes/origin/main"
+    assert any(call[1:4] == ("ls-remote", "--symref", "origin") for call in runner.calls)
+
+
+def test_missing_symbolic_remote_default_branch_blocks(
+    tmp_path: Path,
+    scan_request: SecretScanRequest,
+) -> None:
+    remote = _make_remote(tmp_path)
+
+    class MissingDefaultRunner(GitScannerRunner):
+        def run(
+            self,
+            argv: tuple[str, ...],
+            *,
+            cwd: Path | None = None,
+            input_bytes: bytes | None = None,
+        ) -> CommandResult:
+            if argv[1:] == ("ls-remote", "--symref", "origin", "HEAD"):
+                return CommandResult(exit_code=0, stdout=b"a" * 40 + b"\tHEAD\n", stderr=b"")
+            return super().run(argv, cwd=cwd, input_bytes=input_bytes)
+
+    result = scan_git_repository(
+        str(remote),
+        scan_request.policy,
+        scanner_binaries={
+            "gitleaks": Path("/mock/gitleaks"),
+            "trufflehog": Path("/mock/trufflehog"),
+        },
+        command_runner=MissingDefaultRunner(),
+    )
+
+    assert "git_default_branch_unverifiable" in result.blockers
+
+
+def test_git_tree_inventory_rejects_historical_symlink_mode(
+    tmp_path: Path,
+    scan_request: SecretScanRequest,
+) -> None:
+    remote = _make_symlink_remote(tmp_path)
+
+    result = scan_git_repository(
+        str(remote),
+        scan_request.policy,
+        scanner_binaries={
+            "gitleaks": Path("/mock/gitleaks"),
+            "trufflehog": Path("/mock/trufflehog"),
+        },
+        command_runner=GitScannerRunner(),
+    )
+
+    assert "git_tree_symlink" in result.blockers
+
+
+def test_git_tree_inventory_rejects_historical_gitlink_mode(
+    tmp_path: Path,
+    scan_request: SecretScanRequest,
+) -> None:
+    remote = _make_gitlink_remote(tmp_path)
+
+    result = scan_git_repository(
+        str(remote),
+        scan_request.policy,
+        scanner_binaries={
+            "gitleaks": Path("/mock/gitleaks"),
+            "trufflehog": Path("/mock/trufflehog"),
+        },
+        command_runner=GitScannerRunner(),
+    )
+
+    assert "git_tree_gitlink" in result.blockers
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit", "blocker"),
+    [
+        ("max_git_commits", 1, "git_commit_limit"),
+        ("max_git_tree_entries", 1, "git_tree_entry_limit"),
+    ],
+)
+def test_git_commit_and_tree_enumeration_are_bounded(
+    tmp_path: Path,
+    scan_request: SecretScanRequest,
+    limit_name: str,
+    limit: int,
+    blocker: str,
+) -> None:
+    remote = _make_remote(tmp_path, historical_value="safe fixture")
+    policy = scan_request.policy.model_copy(update={limit_name: limit})
+
+    result = scan_git_repository(
+        str(remote),
+        policy,
+        scanner_binaries={
+            "gitleaks": Path("/mock/gitleaks"),
+            "trufflehog": Path("/mock/trufflehog"),
+        },
+        command_runner=GitScannerRunner(),
+    )
+
+    assert blocker in result.blockers
+
+
 def test_external_scanner_findings_are_opaque_and_both_scanners_run(
     tmp_path: Path,
     scan_request: SecretScanRequest,
@@ -696,7 +1178,7 @@ def test_external_scanner_findings_are_opaque_and_both_scanners_run(
         {"SourceMetadata": {"Data": {"Git": {"file": "README.md"}}}, "Raw": raw_value}
     ).encode()
     runner = GitScannerRunner(
-        gitleaks=CommandResult(exit_code=1, stdout=gitleaks_output, stderr=b""),
+        gitleaks=CommandResult(exit_code=0, stdout=gitleaks_output, stderr=b""),
         trufflehog=CommandResult(exit_code=0, stdout=trufflehog_output + b"\n", stderr=b""),
     )
 
@@ -715,6 +1197,58 @@ def test_external_scanner_findings_are_opaque_and_both_scanners_run(
     assert raw_value not in serialized
     assert any(Path(call[0]).name == "gitleaks" for call in runner.calls)
     assert any(Path(call[0]).name == "trufflehog" for call in runner.calls)
+
+
+@pytest.mark.parametrize("failed_scanner", ["gitleaks", "trufflehog"])
+def test_real_subprocess_nonzero_scanner_exit_is_unsuppressible_after_allowlist(
+    tmp_path: Path,
+    failed_scanner: str,
+) -> None:
+    binaries = {name: tmp_path / name for name in PINNED_SCANNER_VERSIONS}
+    for name, path in binaries.items():
+        _write_fake_scanner(path, exit_code=9 if name == failed_scanner else 0)
+    evidence_hashes: list[str] = []
+    exit_codes: list[int] = []
+
+    findings, blockers = scanner_module._run_history_scanners(
+        SubprocessCommandRunner(),
+        tmp_path,
+        binaries,
+        evidence_hashes=evidence_hashes,
+        exit_codes=exit_codes,
+    )
+
+    assert f"scanner_command_failed:{failed_scanner}:history" in blockers
+    assert 9 in exit_codes
+    allowlist = SecretScanAllowlist(
+        entries=tuple(
+            AllowlistEntry(
+                classification=AllowlistClassification.NON_SECRET_FIXTURE,
+                file=finding.relative_path,
+                rule=finding.rule,
+                digest=finding.evidence_sha256,
+                reviewer_role="security_reviewer",
+                expires_at=datetime(2026, 7, 15, tzinfo=UTC),
+            )
+            for finding in findings
+        )
+    )
+    attestation = scanner_module._surface_attestation(
+        "git_all_refs",
+        findings=tuple(findings),
+        blockers=tuple(blockers),
+        evidence_hashes=tuple(evidence_hashes),
+        exit_codes=tuple(exit_codes),
+        scanner_versions=tuple(PINNED_SCANNER_VERSIONS.values()),
+        allowlist=allowlist,
+        at=datetime(2026, 7, 14, tzinfo=UTC),
+    )
+
+    assert attestation.finding_count == 0
+    assert attestation.status is GateStatus.BLOCKED
+    assert "partial scan detail" not in attestation.model_dump_json()
+    gitleaks_args = binaries["gitleaks"].with_suffix(".args").read_text(encoding="utf-8")
+    assert "--exit-code=0" in gitleaks_args
 
 
 def test_external_scanner_command_failure_blocks_without_stderr_echo(
@@ -1044,6 +1578,229 @@ def test_report_cannot_claim_passed_while_any_surface_is_blocked() -> None:
 
     with pytest.raises(ValidationError, match="passing_report_has_blocked_surface"):
         blocked.model_copy(update={"status": GateStatus.PASSED, "blockers": ()})
+
+
+def test_report_requires_exactly_one_attestation_for_each_compiled_scanner() -> None:
+    report = _valid_pass_report()
+
+    with pytest.raises(ValidationError, match="report_scanner_corpus_invalid"):
+        report.model_copy(update={"scanner_versions": report.scanner_versions[:1]})
+    with pytest.raises(ValidationError, match="report_scanner_corpus_invalid"):
+        report.model_copy(
+            update={"scanner_versions": (*report.scanner_versions, report.scanner_versions[0])}
+        )
+
+
+def test_report_rejects_unpinned_or_nonzero_passing_scanner_attestation() -> None:
+    report = _valid_pass_report()
+
+    with pytest.raises(ValidationError, match="scanner_attestation_inconsistent"):
+        report.model_copy(
+            update={
+                "scanner_versions": (
+                    report.scanner_versions[0].model_copy(update={"version": "9.9.9"}),
+                    report.scanner_versions[1],
+                )
+            }
+        )
+    with pytest.raises(ValidationError, match="scanner_attestation_inconsistent"):
+        report.model_copy(
+            update={
+                "scanner_versions": (
+                    report.scanner_versions[0].model_copy(update={"exit_code": 9}),
+                    report.scanner_versions[1],
+                )
+            }
+        )
+
+
+def test_surface_attestation_reconciles_status_counts_codes_and_exit_codes() -> None:
+    report = _valid_pass_report()
+    surface = report.surfaces[0]
+
+    with pytest.raises(ValidationError, match="surface_finding_evidence_inconsistent"):
+        surface.model_copy(update={"finding_count": 1})
+    with pytest.raises(ValidationError, match="surface_exit_codes_inconsistent"):
+        surface.model_copy(update={"exit_codes": (3,)})
+    with pytest.raises(ValidationError, match="surface_scanner_versions_invalid"):
+        surface.model_copy(update={"scanner_versions": ("9.9.9",)})
+
+
+def test_report_reconciles_top_level_blocker_and_finding_codes() -> None:
+    report = _valid_pass_report()
+    blocked_surface = report.surfaces[0].model_copy(
+        update={
+            "status": GateStatus.BLOCKED,
+            "blocker_codes": ("command_failed:git_checkout",),
+        }
+    )
+    finding_surface = report.surfaces[1].model_copy(
+        update={
+            "status": GateStatus.BLOCKED,
+            "finding_count": 1,
+            "finding_codes": ("finding:provider_token",),
+        }
+    )
+
+    with pytest.raises(ValidationError, match="report_blockers_inconsistent"):
+        report.model_copy(
+            update={
+                "status": GateStatus.BLOCKED,
+                "surfaces": (blocked_surface, *report.surfaces[1:]),
+            }
+        )
+    with pytest.raises(ValidationError, match="report_findings_inconsistent"):
+        report.model_copy(
+            update={
+                "status": GateStatus.BLOCKED,
+                "surfaces": (
+                    report.surfaces[0],
+                    finding_surface,
+                    *report.surfaces[2:],
+                ),
+            }
+        )
+
+
+def test_blocked_report_cannot_hide_all_failure_evidence() -> None:
+    report = _valid_pass_report()
+
+    with pytest.raises(ValidationError, match="report_status_inconsistent"):
+        report.model_copy(update={"status": GateStatus.BLOCKED})
+
+
+def test_report_writer_uses_unique_exclusive_temp_files_under_concurrency(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "secret-scan.json"
+    payloads = [{"writer": index} for index in range(12)]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        list(
+            executor.map(
+                lambda payload: scanner_module.write_secret_scan_report(output, payload),
+                payloads,
+            )
+        )
+
+    assert json.loads(output.read_text(encoding="utf-8")) in payloads
+    assert not list(tmp_path.glob(".secret-scan.json.tmp-*"))
+
+
+def test_report_writer_rejects_an_oversized_payload_before_creating_output(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "secret-scan.json"
+
+    with pytest.raises(OSError, match="report_too_large"):
+        scanner_module.write_secret_scan_report(
+            output,
+            {"payload": "too large"},
+            max_bytes=4,
+        )
+
+    assert not os.path.lexists(output)
+
+
+def test_report_writer_supports_a_verified_symlinked_parent_directory(
+    tmp_path: Path,
+) -> None:
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    output = linked_parent / "secret-scan.json"
+
+    scanner_module.write_secret_scan_report(output, {"passed": False})
+
+    assert json.loads(output.read_text(encoding="utf-8")) == {"passed": False}
+    assert not list(real_parent.glob(".secret-scan.json.tmp-*"))
+
+
+def test_cli_report_output_symlink_is_replaced_without_touching_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from mercury_tools import cli
+
+    root = Path(__file__).resolve().parents[1]
+    target = tmp_path / "target.json"
+    target.write_text("target sentinel", encoding="utf-8")
+    output = tmp_path / "secret-scan.json"
+    output.symlink_to(target)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+
+    exit_code = cli.main(
+        [
+            "release",
+            "scan-secrets",
+            "--all-history",
+            "--hosted",
+            "--artifacts",
+            str(tmp_path / "dist"),
+            "--repo",
+            "example/mercury-tools",
+            "--manifest",
+            str(root / "docs/release/public-surface-manifest.json"),
+            "--allowlist",
+            str(root / "docs/release/secret-scan-allowlist.json"),
+            "--output",
+            str(output),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert target.read_text(encoding="utf-8") == "target sentinel"
+    assert output.is_file() and not output.is_symlink()
+    assert json.loads(output.read_text(encoding="utf-8")) == payload
+
+
+def test_cli_invalidates_stale_report_before_scan_and_removes_output_on_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from mercury_tools import cli
+
+    root = Path(__file__).resolve().parents[1]
+    output = tmp_path / "secret-scan.json"
+    output.write_text('{"passed": true}', encoding="utf-8")
+
+    def fake_scan(*_args: object, **_kwargs: object) -> SecretScanReport:
+        assert not os.path.lexists(output)
+        return _valid_pass_report()
+
+    def fail_replace(*_args: object, **_kwargs: object) -> None:
+        raise OSError("redacted failure")
+
+    monkeypatch.setattr(scanner_module, "scan_public_release", fake_scan)
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    exit_code = cli.main(
+        [
+            "release",
+            "scan-secrets",
+            "--all-history",
+            "--hosted",
+            "--artifacts",
+            str(tmp_path / "dist"),
+            "--repo",
+            "example/mercury-tools",
+            "--manifest",
+            str(root / "docs/release/public-surface-manifest.json"),
+            "--allowlist",
+            str(root / "docs/release/secret-scan-allowlist.json"),
+            "--output",
+            str(output),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert payload["blockers"] == ["report_write_failed"]
+    assert not os.path.lexists(output)
 
 
 def test_request_rejects_repository_url_with_embedded_credentials(

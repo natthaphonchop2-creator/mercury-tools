@@ -34,11 +34,26 @@ PINNED_SCANNER_VERSIONS = MappingProxyType(
         "trufflehog": "3.88.32",
     }
 )
+BUILTIN_SCANNER_VERSION = "1.0.0"
+_HISTORY_SURFACE_SCANNER_VERSIONS = tuple(
+    sorted((*PINNED_SCANNER_VERSIONS.values(), BUILTIN_SCANNER_VERSION))
+)
+EXPECTED_SURFACE_SCANNER_VERSIONS = MappingProxyType(
+    {
+        surface: (
+            _HISTORY_SURFACE_SCANNER_VERSIONS
+            if surface in {"git_all_refs", "github_pull_request_refs"}
+            else (BUILTIN_SCANNER_VERSION,)
+        )
+        for surface in REQUIRED_PUBLIC_SURFACES
+    }
+)
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 _SAFE_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(?::[a-z0-9_.-]+){0,2}$")
 _SAFE_SURFACE_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+_UNAVAILABLE_CODE_MARKERS = ("unavailable", "inaccessible", "client_missing", "missing", "disabled")
 
 
 class StrictReleaseModel(BaseModel):
@@ -66,9 +81,7 @@ class StrictReleaseModel(BaseModel):
 
 def _validate_scanner_pins(value: Mapping[str, str]) -> FrozenDict:
     pins = dict(value)
-    if set(pins) != set(PINNED_SCANNER_VERSIONS):
-        raise ValueError("scanner_pins_invalid")
-    if any(not _VERSION_PATTERN.fullmatch(version) for version in pins.values()):
+    if pins != dict(PINNED_SCANNER_VERSIONS):
         raise ValueError("scanner_pins_invalid")
     return FrozenDict({name: pins[name] for name in PINNED_SCANNER_VERSIONS})
 
@@ -154,8 +167,22 @@ class SecretScanPolicy(StrictReleaseModel):
     scanner_versions: dict[str, str]
     known_secret_digests: tuple[str, ...] = ()
     max_file_bytes: int = Field(default=16 * 1024 * 1024, gt=0)
+    max_filesystem_entries: int = Field(default=100_000, gt=0)
+    max_filesystem_bytes: int = Field(default=1024 * 1024 * 1024, gt=0)
+    max_artifact_entries: int = Field(default=100_000, gt=0)
+    max_artifact_total_bytes: int = Field(default=1024 * 1024 * 1024, gt=0)
     max_archive_bytes: int = Field(default=256 * 1024 * 1024, gt=0)
     max_archive_entries: int = Field(default=100_000, gt=0)
+    max_archive_member_bytes: int = Field(default=16 * 1024 * 1024, gt=0)
+    max_archive_uncompressed_bytes: int = Field(default=1024 * 1024 * 1024, gt=0)
+    max_git_commits: int = Field(default=100_000, gt=0)
+    max_git_tree_entries: int = Field(default=1_000_000, gt=0)
+    max_git_blob_bytes: int = Field(default=1024 * 1024 * 1024, gt=0)
+    max_hosted_pages: int = Field(default=1_000, gt=0)
+    max_hosted_page_records: int = Field(default=1_000, gt=0)
+    max_hosted_records: int = Field(default=1_000_000, gt=0)
+    max_hosted_receipt_bytes: int = Field(default=256 * 1024 * 1024, gt=0)
+    max_hosted_total_bytes: int = Field(default=1024 * 1024 * 1024, gt=0)
 
     @model_validator(mode="after")
     def validate_policy(self) -> SecretScanPolicy:
@@ -294,6 +321,7 @@ class ScannerVersionAttestation(StrictReleaseModel):
     status: GateStatus
     evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     exit_code: int
+    blocker_codes: tuple[str, ...] = ()
 
     @field_validator("version")
     @classmethod
@@ -301,6 +329,38 @@ class ScannerVersionAttestation(StrictReleaseModel):
         if value is not None and not _VERSION_PATTERN.fullmatch(value):
             raise ValueError("scanner_version_invalid")
         return value
+
+    @model_validator(mode="after")
+    def validate_consistency(self) -> ScannerVersionAttestation:
+        if any(not _SAFE_CODE_PATTERN.fullmatch(code) for code in self.blocker_codes):
+            raise ValueError("report_code_invalid")
+        if len(self.blocker_codes) != len(set(self.blocker_codes)):
+            raise ValueError("scanner_attestation_inconsistent")
+        expected = PINNED_SCANNER_VERSIONS.get(self.scanner)
+        if self.status is GateStatus.PASSED and (
+            expected is None
+            or self.version != expected
+            or self.exit_code != 0
+            or self.blocker_codes
+        ):
+            raise ValueError("scanner_attestation_inconsistent")
+        if self.status is not GateStatus.PASSED and not self.blocker_codes:
+            raise ValueError("scanner_attestation_inconsistent")
+        if self.exit_code != 0 and not self.blocker_codes:
+            raise ValueError("scanner_attestation_inconsistent")
+        if self.status is not GateStatus.PASSED:
+            expected_status = (
+                GateStatus.UNAVAILABLE
+                if any(
+                    marker in code
+                    for code in self.blocker_codes
+                    for marker in _UNAVAILABLE_CODE_MARKERS
+                )
+                else GateStatus.BLOCKED
+            )
+            if self.status is not expected_status:
+                raise ValueError("scanner_attestation_inconsistent")
+        return self
 
 
 class SurfaceAttestation(StrictReleaseModel):
@@ -328,6 +388,47 @@ class SurfaceAttestation(StrictReleaseModel):
             raise ValueError("report_code_invalid")
         if self.completed_at < self.started_at:
             raise ValueError("attestation_time_invalid")
+        if len(self.scanner_versions) != len(set(self.scanner_versions)):
+            raise ValueError("surface_scanner_versions_invalid")
+        expected_versions = EXPECTED_SURFACE_SCANNER_VERSIONS.get(self.surface)
+        allowed_versions = set(PINNED_SCANNER_VERSIONS.values()) | {
+            BUILTIN_SCANNER_VERSION
+        }
+        if any(version not in allowed_versions for version in self.scanner_versions):
+            raise ValueError("surface_scanner_versions_invalid")
+        if len(self.blocker_codes) != len(set(self.blocker_codes)) or len(
+            self.finding_codes
+        ) != len(set(self.finding_codes)):
+            raise ValueError("surface_codes_duplicate")
+        if (self.finding_count == 0) != (not self.finding_codes):
+            raise ValueError("surface_finding_evidence_inconsistent")
+        if any(exit_code != 0 for exit_code in self.exit_codes) and not self.blocker_codes:
+            raise ValueError("surface_exit_codes_inconsistent")
+        if self.blocker_codes:
+            expected_status = (
+                GateStatus.UNAVAILABLE
+                if any(
+                    marker in code
+                    for code in self.blocker_codes
+                    for marker in _UNAVAILABLE_CODE_MARKERS
+                )
+                else GateStatus.BLOCKED
+            )
+        elif self.finding_codes:
+            expected_status = GateStatus.BLOCKED
+        else:
+            expected_status = GateStatus.PASSED
+        if self.status is not expected_status:
+            raise ValueError("surface_status_inconsistent")
+        if self.status is GateStatus.PASSED and (
+            self.blocker_codes
+            or self.finding_codes
+            or self.finding_count
+            or any(exit_code != 0 for exit_code in self.exit_codes)
+            or expected_versions is None
+            or self.scanner_versions != expected_versions
+        ):
+            raise ValueError("surface_pass_inconsistent")
         return self
 
 
@@ -345,6 +446,9 @@ class SecretScanReport(StrictReleaseModel):
         surface_names = tuple(surface.surface for surface in self.surfaces)
         if surface_names != REQUIRED_PUBLIC_SURFACES:
             raise ValueError("report_surface_corpus_invalid")
+        scanner_names = tuple(scanner.scanner for scanner in self.scanner_versions)
+        if scanner_names != tuple(PINNED_SCANNER_VERSIONS):
+            raise ValueError("report_scanner_corpus_invalid")
         if any(not _SAFE_CODE_PATTERN.fullmatch(code) for code in self.blockers):
             raise ValueError("report_code_invalid")
         if any(not _SAFE_CODE_PATTERN.fullmatch(code) for code in self.finding_codes):
@@ -361,6 +465,52 @@ class SecretScanReport(StrictReleaseModel):
             scanner.status is not GateStatus.PASSED for scanner in self.scanner_versions
         ):
             raise ValueError("passing_report_has_blocked_scanner")
+        expected_blockers = tuple(
+            sorted(
+                {
+                    code
+                    for scanner in self.scanner_versions
+                    for code in scanner.blocker_codes
+                }
+                | {
+                    code
+                    for surface in self.surfaces
+                    for code in surface.blocker_codes
+                }
+            )
+        )
+        if self.blockers != expected_blockers:
+            raise ValueError("report_blockers_inconsistent")
+        expected_findings = tuple(
+            sorted(
+                {
+                    code
+                    for surface in self.surfaces
+                    for code in surface.finding_codes
+                }
+            )
+        )
+        if self.finding_codes != expected_findings:
+            raise ValueError("report_findings_inconsistent")
+        expected_status = (
+            GateStatus.PASSED
+            if not expected_blockers
+            and not expected_findings
+            and all(
+                scanner.status is GateStatus.PASSED
+                for scanner in self.scanner_versions
+            )
+            and all(surface.status is GateStatus.PASSED for surface in self.surfaces)
+            else GateStatus.BLOCKED
+        )
+        if self.status is not expected_status:
+            raise ValueError("report_status_inconsistent")
+        if any(
+            surface.started_at < self.started_at
+            or surface.completed_at > self.completed_at
+            for surface in self.surfaces
+        ):
+            raise ValueError("report_time_inconsistent")
         return self
 
     @property

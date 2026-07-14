@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
+import os
 import re
+import secrets
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
+import unicodedata
 import zipfile
 from collections import Counter
 from collections.abc import Mapping
@@ -21,6 +26,7 @@ from typing import Protocol, TextIO
 from pydantic import ValidationError
 
 from mercury_tools.release.models import (
+    PINNED_SCANNER_VERSIONS,
     REQUIRED_PUBLIC_SURFACES,
     ArtifactKind,
     ArtifactScanResult,
@@ -99,6 +105,15 @@ class CommandRunner(Protocol):
 
 
 class SubprocessCommandRunner:
+    def __init__(
+        self,
+        *,
+        environment: Mapping[str, str] | None = None,
+        max_output_bytes: int = 256 * 1024 * 1024,
+    ) -> None:
+        self._environment = dict(environment or {})
+        self._max_output_bytes = max_output_bytes
+
     def run(
         self,
         argv: tuple[str, ...],
@@ -114,9 +129,15 @@ class SubprocessCommandRunner:
                 capture_output=True,
                 check=False,
                 timeout=300,
+                env={**os.environ, **self._environment},
             )
         except (OSError, subprocess.SubprocessError):
             return CommandResult(exit_code=127, stdout=b"", stderr=b"")
+        if (
+            len(completed.stdout) > self._max_output_bytes
+            or len(completed.stderr) > self._max_output_bytes
+        ):
+            return CommandResult(exit_code=125, stdout=b"", stderr=b"")
         return CommandResult(
             exit_code=completed.returncode,
             stdout=completed.stdout,
@@ -164,6 +185,115 @@ def _strict_json_loads(value: str) -> object:
         return result
 
     return json.loads(value, object_pairs_hook=unique_object)
+
+
+MAX_DURABLE_REPORT_BYTES = 1024 * 1024
+
+
+def _open_directory(path: Path) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise OSError("report_parent_invalid")
+    return descriptor
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = _open_directory(path)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _report_destination(path: Path) -> Path:
+    if path.name in {"", ".", ".."}:
+        raise OSError("report_output_invalid")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parent = path.parent.resolve(strict=True)
+    descriptor = _open_directory(parent)
+    os.close(descriptor)
+    return parent / path.name
+
+
+def invalidate_report_output(path: Path) -> None:
+    destination = _report_destination(path)
+    try:
+        metadata = destination.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(metadata.st_mode):
+        raise OSError("report_output_invalid")
+    os.unlink(destination)
+    _fsync_directory(destination.parent)
+
+
+def write_secret_scan_report(
+    path: Path,
+    payload: Mapping[str, object],
+    *,
+    max_bytes: int = MAX_DURABLE_REPORT_BYTES,
+) -> None:
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > max_bytes:
+        raise OSError("report_too_large")
+
+    destination = _report_destination(path)
+    temporary: Path | None = None
+    descriptor: int | None = None
+    created_identity: tuple[int, int] | None = None
+    try:
+        for _attempt in range(128):
+            candidate = destination.with_name(
+                f".{destination.name}.tmp-{secrets.token_hex(16)}"
+            )
+            try:
+                descriptor = os.open(
+                    candidate,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+            except FileExistsError:
+                continue
+            temporary = candidate
+            break
+        if descriptor is None or temporary is None:
+            raise OSError("report_temp_unavailable")
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("report_temp_invalid")
+        created_identity = (metadata.st_dev, metadata.st_ino)
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor = None
+            written = stream.write(encoded)
+            if written != len(encoded):
+                raise OSError("report_write_incomplete")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+        temporary = None
+        _fsync_directory(destination.parent)
+    except Exception:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                temporary.unlink(missing_ok=True)
+        if created_identity is not None:
+            try:
+                current = destination.lstat()
+                if (current.st_dev, current.st_ino) == created_identity:
+                    os.unlink(destination)
+                    _fsync_directory(destination.parent)
+            except OSError:
+                pass
+        raise
 
 
 def load_known_secret_digests(
@@ -248,14 +378,42 @@ def _reject_tracked_fingerprint_source(path: Path) -> None:
         raise ReleaseGateError("fingerprint_source_unverifiable")
 
 
+def _constant_evidence_hash(*parts: str) -> str:
+    return hashlib.sha256("\0".join(parts).encode("ascii")).hexdigest()
+
+
+def _blocked_scanner_attestations(
+    blockers: tuple[str, ...],
+) -> tuple[ScannerVersionAttestation, ...]:
+    unavailable_markers = ("unavailable", "inaccessible", "client_missing", "missing", "disabled")
+    status = (
+        GateStatus.UNAVAILABLE
+        if any(marker in code for code in blockers for marker in unavailable_markers)
+        else GateStatus.BLOCKED
+    )
+    return tuple(
+        ScannerVersionAttestation(
+            scanner=name,
+            version=None,
+            status=status,
+            evidence_sha256=_constant_evidence_hash("scanner", name, "unavailable"),
+            exit_code=127,
+            blocker_codes=blockers,
+        )
+        for name in PINNED_SCANNER_VERSIONS
+    )
+
+
 def build_blocked_report(blocker: str, *, at: datetime | None = None) -> SecretScanReport:
     timestamp = at or datetime.now(UTC)
+    blockers = (blocker,)
     return SecretScanReport(
         status=GateStatus.BLOCKED,
         started_at=timestamp,
         completed_at=timestamp,
-        surfaces=_blocked_surfaces(timestamp, "scan_prerequisite_failed"),
-        blockers=(blocker,),
+        scanner_versions=_blocked_scanner_attestations(blockers),
+        surfaces=_blocked_surfaces(timestamp, blockers),
+        blockers=blockers,
     )
 
 
@@ -293,40 +451,80 @@ def _scanner_versions(
 ]:
     binaries: dict[str, Path] = {}
     blockers: list[str] = []
+    attestations: list[ScannerVersionAttestation] = []
     for scanner_name in request.policy.scanner_versions:
         try:
             binaries[scanner_name] = require_scanner(scanner_name)
         except ReleaseGateError as exc:
-            blockers.append(str(exc))
-    if blockers:
-        return (), tuple(blockers), binaries
-
-    attestations: list[ScannerVersionAttestation] = []
+            blocker = str(exc)
+            blockers.append(blocker)
+            attestations.append(
+                ScannerVersionAttestation(
+                    scanner=scanner_name,
+                    version=None,
+                    status=GateStatus.UNAVAILABLE,
+                    evidence_sha256=_constant_evidence_hash(
+                        "scanner", scanner_name, "missing"
+                    ),
+                    exit_code=127,
+                    blocker_codes=(blocker,),
+                )
+            )
     for scanner_name, expected_version in request.policy.scanner_versions.items():
+        if scanner_name not in binaries:
+            continue
+        scanner_blockers: list[str] = []
         try:
             result = command_runner.run(
                 (str(binaries[scanner_name]), *_SCANNER_VERSION_COMMANDS[scanner_name])
             )
         except Exception:
-            blockers.append(f"scanner_command_failed:{scanner_name}:version")
+            blocker = f"scanner_command_failed:{scanner_name}:version"
+            blockers.append(blocker)
+            attestations.append(
+                ScannerVersionAttestation(
+                    scanner=scanner_name,
+                    version=None,
+                    status=GateStatus.BLOCKED,
+                    evidence_sha256=_constant_evidence_hash(
+                        "scanner", scanner_name, "command_failed"
+                    ),
+                    exit_code=127,
+                    blocker_codes=(blocker,),
+                )
+            )
             continue
         try:
             evidence_sha256 = _raw_evidence_hash(result, scanner_name)
         except ReleaseGateError as exc:
-            blockers.append(str(exc))
+            blocker = str(exc)
+            blockers.append(blocker)
+            attestations.append(
+                ScannerVersionAttestation(
+                    scanner=scanner_name,
+                    version=None,
+                    status=GateStatus.BLOCKED,
+                    evidence_sha256=_constant_evidence_hash(
+                        "scanner", scanner_name, "evidence_failed"
+                    ),
+                    exit_code=result.exit_code,
+                    blocker_codes=(blocker,),
+                )
+            )
             continue
         matches = _VERSION_IN_OUTPUT.findall(result.stdout + b"\n" + result.stderr)
         version = matches[0].decode("ascii") if len(matches) == 1 else None
         status = GateStatus.PASSED
         if result.exit_code != 0:
-            blockers.append(f"scanner_command_failed:{scanner_name}")
+            scanner_blockers.append(f"scanner_command_failed:{scanner_name}")
             status = GateStatus.BLOCKED
         elif version is None:
-            blockers.append(f"scanner_version_unverifiable:{scanner_name}")
+            scanner_blockers.append(f"scanner_version_unverifiable:{scanner_name}")
             status = GateStatus.BLOCKED
         elif version != expected_version:
-            blockers.append(f"scanner_version_unpinned:{scanner_name}")
+            scanner_blockers.append(f"scanner_version_unpinned:{scanner_name}")
             status = GateStatus.BLOCKED
+        blockers.extend(scanner_blockers)
         attestations.append(
             ScannerVersionAttestation(
                 scanner=scanner_name,
@@ -334,20 +532,38 @@ def _scanner_versions(
                 status=status,
                 evidence_sha256=evidence_sha256,
                 exit_code=result.exit_code,
+                blocker_codes=tuple(scanner_blockers),
             )
         )
-    return tuple(attestations), tuple(blockers), binaries
+    ordered = {
+        attestation.scanner: attestation
+        for attestation in attestations
+    }
+    return (
+        tuple(ordered[name] for name in request.policy.scanner_versions),
+        tuple(sorted(set(blockers))),
+        binaries,
+    )
 
 
-def _blocked_surfaces(at: datetime, blocker_code: str) -> tuple[SurfaceAttestation, ...]:
+def _blocked_surfaces(
+    at: datetime,
+    blocker_codes: tuple[str, ...],
+) -> tuple[SurfaceAttestation, ...]:
+    unavailable_markers = ("unavailable", "inaccessible", "client_missing", "missing", "disabled")
+    status = (
+        GateStatus.UNAVAILABLE
+        if any(marker in code for code in blocker_codes for marker in unavailable_markers)
+        else GateStatus.BLOCKED
+    )
     return tuple(
         SurfaceAttestation(
             surface=surface,
-            status=GateStatus.BLOCKED,
+            status=status,
             started_at=at,
             completed_at=at,
             finding_count=0,
-            blocker_codes=(blocker_code,),
+            blocker_codes=blocker_codes,
         )
         for surface in REQUIRED_PUBLIC_SURFACES
     )
@@ -388,7 +604,7 @@ def scan_public_release(
             started_at=started_at,
             completed_at=completed_at,
             scanner_versions=scanner_versions,
-            surfaces=_blocked_surfaces(completed_at, "scan_prerequisite_failed"),
+            surfaces=_blocked_surfaces(completed_at, tuple(blockers)),
             blockers=tuple(blockers),
         )
 
@@ -436,8 +652,16 @@ def scan_public_release(
         allowlist=request.allowlist,
         at=completed_at,
     )
-    pull_attestation = git_attestation.model_copy(
-        update={"surface": "github_pull_request_refs"}
+    pull_result = hosted_results["github_pull_request_refs"]
+    pull_attestation = _surface_attestation(
+        "github_pull_request_refs",
+        findings=(*git_result.findings, *pull_result.findings),
+        blockers=(*git_result.blockers, *pull_result.blockers),
+        evidence_hashes=(*git_result.evidence_hashes, *pull_result.evidence_hashes),
+        exit_codes=(*git_result.exit_codes, *pull_result.exit_codes),
+        scanner_versions=(*verified_versions, HOSTED_SCANNER_VERSION),
+        allowlist=request.allowlist,
+        at=completed_at,
     )
     artifact_attestation = _surface_attestation(
         "wheel_sdist_plugin_source_archives",
@@ -455,6 +679,8 @@ def scan_public_release(
         "wheel_sdist_plugin_source_archives": artifact_attestation,
     }
     for surface, result in hosted_results.items():
+        if surface == "github_pull_request_refs":
+            continue
         attestation_map[surface] = _surface_attestation(
             surface,
             findings=result.findings,
@@ -528,28 +754,112 @@ def _surface_attestation(
     )
 
 
+class _BudgetExceeded(RuntimeError):
+    pass
+
+
+@dataclass
+class _ByteBudget:
+    limit: int
+    used: int = 0
+
+    def reserve(self, size: int) -> None:
+        if size < 0 or size > self.limit - self.used:
+            raise _BudgetExceeded
+        self.used += size
+
+
+def _walk_paths(root: Path, *, skip_git: bool = False):
+    for directory, directory_names, file_names in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+    ):
+        directory_names.sort()
+        file_names.sort()
+        if skip_git:
+            directory_names[:] = [name for name in directory_names if name != ".git"]
+        for name in (*directory_names, *file_names):
+            yield Path(directory) / name
+
+
+def _read_regular_file(
+    path: Path,
+    metadata: os.stat_result,
+    *,
+    max_bytes: int,
+) -> bytes:
+    if metadata.st_size > max_bytes:
+        raise _BudgetExceeded
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+            or opened.st_size != metadata.st_size
+        ):
+            raise OSError("file_changed")
+        chunks: list[bytes] = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise OSError("file_truncated")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise _BudgetExceeded
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
 def scan_filesystem(root: Path, _policy: SecretScanPolicy) -> FilesystemScanResult:
     findings: list[SecretFinding] = []
     blockers: list[str] = []
-    if not root.is_dir():
+    try:
+        root_metadata = root.lstat()
+    except OSError:
         return FilesystemScanResult(blockers=("filesystem_unavailable",))
-    for path in sorted(root.rglob("*")):
+    if stat.S_ISLNK(root_metadata.st_mode):
+        return FilesystemScanResult(blockers=("filesystem_symlink",))
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        return FilesystemScanResult(blockers=("filesystem_unavailable",))
+    entry_count = 0
+    byte_budget = _ByteBudget(_policy.max_filesystem_bytes)
+    for path in _walk_paths(root, skip_git=True):
+        entry_count += 1
+        if entry_count > _policy.max_filesystem_entries:
+            blockers.append("filesystem_entry_limit")
+            break
         relative = path.relative_to(root)
-        if ".git" in relative.parts:
-            continue
         relative_name = relative.as_posix()
         if _is_forbidden_path(PurePosixPath(relative_name)):
             findings.append(_path_finding("forbidden_path", relative_name))
-        if path.is_symlink():
+        try:
+            metadata = path.lstat()
+        except OSError:
+            blockers.append("filesystem_read_failed")
+            continue
+        if stat.S_ISLNK(metadata.st_mode):
             blockers.append("filesystem_symlink")
             continue
-        if not path.is_file():
+        if not stat.S_ISREG(metadata.st_mode):
             continue
         try:
-            if path.stat().st_size > _policy.max_file_bytes:
+            if metadata.st_size > _policy.max_file_bytes:
                 blockers.append("filesystem_file_too_large")
                 continue
-            data = path.read_bytes()
+            byte_budget.reserve(metadata.st_size)
+            data = _read_regular_file(
+                path,
+                metadata,
+                max_bytes=_policy.max_file_bytes,
+            )
+        except _BudgetExceeded:
+            blockers.append("filesystem_aggregate_too_large")
+            continue
         except OSError:
             blockers.append("filesystem_read_failed")
             continue
@@ -561,50 +871,94 @@ def scan_filesystem(root: Path, _policy: SecretScanPolicy) -> FilesystemScanResu
 
 
 def scan_artifacts(root: Path, policy: SecretScanPolicy) -> ArtifactScanResult:
-    if not root.is_dir():
+    missing_kinds = tuple(
+        f"artifact_kind_missing:{kind.value}" for kind in ArtifactKind
+    )
+    try:
+        root_metadata = root.lstat()
+    except OSError:
         return ArtifactScanResult(
             blockers=(
                 "artifact_surface_unavailable",
-                *(f"artifact_kind_missing:{kind.value}" for kind in ArtifactKind),
+                *missing_kinds,
             )
+        )
+    if stat.S_ISLNK(root_metadata.st_mode):
+        return ArtifactScanResult(blockers=("artifact_symlink", *missing_kinds))
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        return ArtifactScanResult(
+            blockers=("artifact_surface_unavailable", *missing_kinds)
         )
 
     discovered: dict[Path, ArtifactKind] = {}
     findings: list[SecretFinding] = []
     blockers: list[str] = []
     evidence_hashes: list[str] = []
-    for path in sorted(root.rglob("*")):
+    entry_count = 0
+    artifact_bytes = _ByteBudget(policy.max_artifact_total_bytes)
+    archive_bytes = _ByteBudget(policy.max_archive_uncompressed_bytes)
+    for path in _walk_paths(root):
+        entry_count += 1
+        if entry_count > policy.max_artifact_entries:
+            blockers.append("artifact_entry_limit")
+            break
         relative_name = path.relative_to(root).as_posix()
         if _is_forbidden_path(PurePosixPath(relative_name)):
             findings.append(_path_finding("forbidden_path", relative_name))
-        if path.is_symlink():
+        try:
+            metadata = path.lstat()
+        except OSError:
+            blockers.append("artifact_read_failed")
+            continue
+        if stat.S_ISLNK(metadata.st_mode):
             blockers.append("artifact_symlink")
             continue
-        if not path.is_file():
+        if not stat.S_ISREG(metadata.st_mode):
             continue
         kind = _artifact_kind(path)
+        try:
+            artifact_bytes.reserve(metadata.st_size)
+        except _BudgetExceeded:
+            blockers.append("artifact_aggregate_too_large")
+            if kind is not None:
+                discovered[path] = kind
+            continue
         if kind is None:
             try:
-                sidecar_size = path.stat().st_size
-                evidence_hashes.append(_hash_file(path))
-                if sidecar_size > policy.max_file_bytes:
+                if metadata.st_size > policy.max_file_bytes:
                     blockers.append("artifact_sidecar_too_large")
                     continue
-                findings.extend(_scan_bytes(path.read_bytes(), relative_name, policy))
-            except OSError:
+                data = _read_regular_file(
+                    path,
+                    metadata,
+                    max_bytes=policy.max_file_bytes,
+                )
+                evidence_hashes.append(hashlib.sha256(data).hexdigest())
+                findings.extend(_scan_bytes(data, relative_name, policy))
+            except (_BudgetExceeded, OSError):
                 blockers.append("artifact_sidecar_read_failed")
             continue
         discovered[path] = kind
-        try:
-            artifact_size = path.stat().st_size
-            evidence_hashes.append(_hash_file(path))
-        except OSError:
-            blockers.append(f"artifact_read_failed:{kind.value}")
-            continue
-        if artifact_size > policy.max_archive_bytes:
+        if metadata.st_size > policy.max_archive_bytes:
             blockers.append(f"artifact_too_large:{kind.value}")
             continue
-        archive_findings, archive_blockers = _scan_archive(path, kind, policy)
+        try:
+            evidence_hashes.append(
+                _hash_file(
+                    path,
+                    max_bytes=policy.max_archive_bytes,
+                    expected_metadata=metadata,
+                )
+            )
+        except (_BudgetExceeded, OSError):
+            blockers.append(f"artifact_read_failed:{kind.value}")
+            continue
+        archive_findings, archive_blockers = _scan_archive(
+            path,
+            kind,
+            policy,
+            archive_bytes,
+        )
         findings.extend(archive_findings)
         blockers.extend(archive_blockers)
 
@@ -702,12 +1056,7 @@ def scan_git_repository(
                 object_count,
                 blob_count,
             )
-        remote_heads, local_refs = ref_sets
-
-        checkout_ref = sorted(
-            f"refs/remotes/origin/{ref.removeprefix('refs/heads/')}"
-            for ref in remote_heads
-        )[0]
+        checkout_ref, local_refs = ref_sets
         checkout_result = _run_and_record(
             runner,
             ("git", "checkout", "--force", "--detach", checkout_ref),
@@ -773,11 +1122,12 @@ def _inventory_refs(
     evidence_hashes: list[str],
     exit_codes: list[int],
     blockers: list[str],
-) -> tuple[set[str], set[str]] | None:
+) -> tuple[str, set[str]] | None:
     commands = {
         "heads": ("git", "ls-remote", "--heads", "origin"),
         "tags": ("git", "ls-remote", "--tags", "--refs", "origin"),
         "pull_requests": ("git", "ls-remote", "origin", "refs/pull/*/head"),
+        "default": ("git", "ls-remote", "--symref", "origin", "HEAD"),
         "local": (
             "git",
             "for-each-ref",
@@ -785,6 +1135,11 @@ def _inventory_refs(
             "refs/remotes/origin",
             "refs/tags",
             "refs/remotes/pull",
+        ),
+        "local_default": (
+            "git",
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
         ),
     }
     outputs: dict[str, bytes] = {}
@@ -799,6 +1154,8 @@ def _inventory_refs(
             blockers=blockers,
         )
         if result is None or result.exit_code != 0:
+            if scope in {"default", "local_default"}:
+                blockers.append("git_default_branch_unverifiable")
             return None
         outputs[scope] = result.stdout
 
@@ -806,12 +1163,21 @@ def _inventory_refs(
         remote_heads = _parse_ls_remote(outputs["heads"])
         remote_tags = _parse_ls_remote(outputs["tags"])
         remote_pulls = _parse_ls_remote(outputs["pull_requests"])
+        remote_default = _parse_remote_default(outputs["default"])
         local_refs = {
             line.decode("utf-8", errors="strict")
             for line in outputs["local"].splitlines()
             if line
         }
-    except (ReleaseGateError, UnicodeError):
+        local_default = outputs["local_default"].decode("utf-8", errors="strict").strip()
+    except ReleaseGateError as exc:
+        blockers.append(
+            "git_default_branch_unverifiable"
+            if str(exc) == "git_default_branch_unverifiable"
+            else "git_ref_inventory_malformed"
+        )
+        return None
+    except UnicodeError:
         blockers.append("git_ref_inventory_malformed")
         return None
     if not remote_heads:
@@ -830,7 +1196,16 @@ def _inventory_refs(
     for scope, expected_refs in expected.items():
         if not expected_refs.issubset(local_refs):
             blockers.append(f"git_refs_incomplete:{scope}")
-    return remote_heads, local_refs
+    expected_default = (
+        f"refs/remotes/origin/{remote_default.removeprefix('refs/heads/')}"
+    )
+    if (
+        remote_default not in remote_heads
+        or expected_default not in local_refs
+        or local_default != expected_default
+    ):
+        blockers.append("git_default_branch_unverifiable")
+    return expected_default, local_refs
 
 
 def _parse_ls_remote(output: bytes) -> set[str]:
@@ -843,6 +1218,33 @@ def _parse_ls_remote(output: bytes) -> set[str]:
     return refs
 
 
+def _parse_remote_default(output: bytes) -> str:
+    symbolic: list[str] = []
+    head_oids = 0
+    for line in output.splitlines():
+        if line.startswith(b"ref: "):
+            prefix, separator, suffix = line.partition(b"\t")
+            if separator != b"\t" or suffix != b"HEAD":
+                raise ReleaseGateError("git_default_branch_unverifiable")
+            target = prefix.removeprefix(b"ref: ").decode("utf-8", errors="strict")
+            if not target.startswith("refs/heads/"):
+                raise ReleaseGateError("git_default_branch_unverifiable")
+            symbolic.append(target)
+            continue
+        parts = line.split(b"\t", 1)
+        if (
+            len(parts) == 2
+            and parts[1] == b"HEAD"
+            and re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", parts[0])
+        ):
+            head_oids += 1
+            continue
+        raise ReleaseGateError("git_default_branch_unverifiable")
+    if len(symbolic) != 1 or head_oids != 1:
+        raise ReleaseGateError("git_default_branch_unverifiable")
+    return symbolic[0]
+
+
 def _scan_reachable_blobs(
     runner: CommandRunner,
     clone: Path,
@@ -852,34 +1254,110 @@ def _scan_reachable_blobs(
     exit_codes: list[int],
     blockers: list[str],
 ) -> tuple[list[SecretFinding], int, int] | None:
-    rev_list = _run_and_record(
+    commit_result = _run_and_record(
         runner,
-        ("git", "rev-list", "--objects", "--all"),
+        (
+            "git",
+            "rev-list",
+            f"--max-count={policy.max_git_commits + 1}",
+            "--all",
+        ),
         cwd=clone,
         evidence_hashes=evidence_hashes,
         exit_codes=exit_codes,
-        blocker_scope="git_object_inventory",
+        blocker_scope="git_commit_inventory",
         blockers=blockers,
     )
-    if rev_list is None or rev_list.exit_code != 0:
+    if commit_result is None or commit_result.exit_code != 0:
+        return None
+    try:
+        commits = tuple(
+            line.decode("ascii", errors="strict")
+            for line in commit_result.stdout.splitlines()
+            if line
+        )
+    except UnicodeError:
+        blockers.append("git_commit_inventory_malformed")
+        return None
+    if not commits or any(
+        not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)
+        for commit in commits
+    ):
+        blockers.append("git_commit_inventory_malformed")
+        return None
+    if len(commits) > policy.max_git_commits:
+        blockers.append("git_commit_limit")
         return None
 
+    findings: list[SecretFinding] = []
     oid_paths: dict[str, set[str]] = {}
-    for line in rev_list.stdout.splitlines():
-        oid_raw, _, path_raw = line.partition(b" ")
-        oid = oid_raw.decode("ascii", errors="strict")
-        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
-            blockers.append("git_object_inventory_malformed")
+    reachable_oids = set(commits)
+    tree_entry_count = 0
+    for commit in commits:
+        tree_result = _run_and_record(
+            runner,
+            ("git", "ls-tree", "-rzt", "--full-tree", commit),
+            cwd=clone,
+            evidence_hashes=evidence_hashes,
+            exit_codes=exit_codes,
+            blocker_scope="git_tree_inventory",
+            blockers=blockers,
+        )
+        if tree_result is None or tree_result.exit_code != 0:
             return None
-        path = path_raw.decode("utf-8", errors="strict") if path_raw else "git-object"
-        oid_paths.setdefault(oid, set()).add(path)
+        try:
+            records = [record for record in tree_result.stdout.split(b"\0") if record]
+            for record in records:
+                tree_entry_count += 1
+                if tree_entry_count > policy.max_git_tree_entries:
+                    blockers.append("git_tree_entry_limit")
+                    return None
+                metadata_raw, separator, path_raw = record.partition(b"\t")
+                metadata = metadata_raw.decode("ascii", errors="strict").split()
+                path = path_raw.decode("utf-8", errors="strict")
+                if separator != b"\t" or len(metadata) != 3:
+                    raise ValueError
+                mode, object_type, oid = metadata
+                candidate_path = PurePosixPath(path)
+                if (
+                    not path
+                    or candidate_path.is_absolute()
+                    or "\\" in path
+                    or ".." in candidate_path.parts
+                    or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid)
+                ):
+                    raise ValueError
+                reachable_oids.add(oid)
+                if _is_forbidden_path(candidate_path):
+                    findings.append(_path_finding("forbidden_path", path))
+                if mode == "120000" and object_type == "blob":
+                    blockers.append("git_tree_symlink")
+                    continue
+                if mode == "160000" and object_type == "commit":
+                    blockers.append("git_tree_gitlink")
+                    continue
+                if object_type == "tree" and mode == "040000":
+                    continue
+                if object_type != "blob" or mode not in {"100644", "100755"}:
+                    blockers.append("git_tree_mode_unsafe")
+                    continue
+                oid_paths.setdefault(oid, set()).add(path)
+        except (UnicodeError, ValueError):
+            blockers.append("git_tree_inventory_malformed")
+            return None
 
-    oids = tuple(sorted(oid_paths))
+    blobs = tuple(sorted(oid_paths))
+    if not blobs:
+        return findings, len(reachable_oids), 0
     type_result = _run_and_record(
         runner,
-        ("git", "cat-file", "--batch-check=%(objectname) %(objecttype)"),
+        (
+            "git",
+            "cat-file",
+            "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+        ),
         cwd=clone,
-        input_bytes=("\n".join(oids) + "\n").encode("ascii"),
+        input_bytes=("\n".join(blobs) + "\n").encode("ascii"),
         evidence_hashes=evidence_hashes,
         exit_codes=exit_codes,
         blocker_scope="git_object_type_inventory",
@@ -887,20 +1365,35 @@ def _scan_reachable_blobs(
     )
     if type_result is None or type_result.exit_code != 0:
         return None
-    object_types: dict[str, str] = {}
-    for line in type_result.stdout.splitlines():
-        parts = line.decode("ascii", errors="strict").split()
-        if len(parts) != 2:
-            blockers.append("git_object_inventory_malformed")
-            return None
-        object_types[parts[0]] = parts[1]
-    if set(object_types) != set(oids):
+    blob_sizes: dict[str, int] = {}
+    try:
+        for line in type_result.stdout.splitlines():
+            parts = line.decode("ascii", errors="strict").split()
+            if (
+                len(parts) != 3
+                or parts[1] != "blob"
+                or not parts[2].isdigit()
+            ):
+                raise ValueError
+            blob_sizes[parts[0]] = int(parts[2])
+    except (UnicodeError, ValueError):
+        blockers.append("git_object_inventory_malformed")
+        return None
+    if set(blob_sizes) != set(blobs):
         blockers.append("git_object_inventory_incomplete")
         return None
 
-    findings: list[SecretFinding] = []
-    blobs = [oid for oid in oids if object_types[oid] == "blob"]
+    blob_budget = _ByteBudget(policy.max_git_blob_bytes)
     for oid in blobs:
+        size = blob_sizes[oid]
+        if size > policy.max_file_bytes:
+            blockers.append("git_blob_too_large")
+            continue
+        try:
+            blob_budget.reserve(size)
+        except _BudgetExceeded:
+            blockers.append("git_blob_aggregate_too_large")
+            continue
         blob_result = _run_and_record(
             runner,
             ("git", "cat-file", "blob", oid),
@@ -912,14 +1405,12 @@ def _scan_reachable_blobs(
         )
         if blob_result is None or blob_result.exit_code != 0:
             continue
-        if len(blob_result.stdout) > policy.max_file_bytes:
-            blockers.append("git_blob_too_large")
+        if len(blob_result.stdout) != size:
+            blockers.append("git_blob_size_mismatch")
             continue
         for path in oid_paths[oid]:
-            if _is_forbidden_path(PurePosixPath(path)):
-                findings.append(_path_finding("forbidden_path", path))
             findings.extend(_scan_bytes(blob_result.stdout, path, policy))
-    return findings, len(object_types), len(blobs)
+    return findings, len(reachable_oids), len(blobs)
 
 
 def _run_history_scanners(
@@ -942,6 +1433,7 @@ def _run_history_scanners(
             "json",
             "--report-path",
             "-",
+            "--exit-code=0",
             "--log-opts=--all",
             str(clone),
         ),
@@ -967,9 +1459,9 @@ def _run_history_scanners(
         exit_codes.append(result.exit_code)
         if scanner_name == "gitleaks":
             parsed, parse_blocker = _parse_gitleaks_findings(result.stdout)
-            if result.exit_code not in {0, 1}:
+            if result.exit_code != 0:
                 blockers.append("scanner_command_failed:gitleaks:history")
-            elif result.exit_code == 1 and not parsed:
+            if result.exit_code != 0 and not result.stdout:
                 parse_blocker = True
         else:
             parsed, parse_blocker = _parse_trufflehog_findings(result.stdout)
@@ -1095,12 +1587,13 @@ def _scan_archive(
     path: Path,
     kind: ArtifactKind,
     policy: SecretScanPolicy,
+    archive_budget: _ByteBudget,
 ) -> tuple[list[SecretFinding], list[str]]:
     try:
         if zipfile.is_zipfile(path):
-            return _scan_zip(path, kind, policy)
+            return _scan_zip(path, kind, policy, archive_budget)
         if tarfile.is_tarfile(path):
-            return _scan_tar(path, kind, policy)
+            return _scan_tar(path, kind, policy, archive_budget)
     except (OSError, tarfile.TarError, zipfile.BadZipFile):
         pass
     return [], [f"artifact_read_failed:{kind.value}"]
@@ -1110,6 +1603,7 @@ def _scan_zip(
     path: Path,
     kind: ArtifactKind,
     policy: SecretScanPolicy,
+    archive_budget: _ByteBudget,
 ) -> tuple[list[SecretFinding], list[str]]:
     findings: list[SecretFinding] = []
     blockers: list[str] = []
@@ -1118,22 +1612,45 @@ def _scan_zip(
             entries = archive.infolist()
             if len(entries) > policy.max_archive_entries:
                 return [], [f"artifact_entry_limit:{kind.value}"]
+            canonical_names: set[str] = set()
             for entry in entries:
                 logical_path = f"{path.name}!{entry.filename}"
-                if _unsafe_archive_member(entry.filename) or _zip_entry_is_symlink(entry):
+                canonical = _canonical_archive_member(entry.filename)
+                if canonical is None or _zip_entry_is_symlink(entry):
                     findings.append(_path_finding("archive_unsafe", logical_path))
+                    continue
+                if canonical in canonical_names:
+                    blockers.append(f"artifact_duplicate_member:{kind.value}")
+                canonical_names.add(canonical)
+            if blockers:
+                return findings, blockers
+            for entry in entries:
+                canonical = _canonical_archive_member(entry.filename)
+                if canonical is None or _zip_entry_is_symlink(entry) or entry.is_dir():
+                    continue
+                if entry.file_size > policy.max_archive_member_bytes:
+                    blockers.append(f"artifact_member_too_large:{kind.value}")
+                    continue
+                try:
+                    archive_budget.reserve(entry.file_size)
+                except _BudgetExceeded:
+                    blockers.append(f"artifact_uncompressed_limit:{kind.value}")
+            if blockers:
+                return findings, blockers
+            for entry in entries:
+                canonical = _canonical_archive_member(entry.filename)
+                if canonical is None or _zip_entry_is_symlink(entry):
                     continue
                 if entry.is_dir():
                     continue
-                member_path = PurePosixPath(entry.filename)
+                logical_path = f"{path.name}!{entry.filename}"
+                member_path = PurePosixPath(canonical)
                 if _is_forbidden_path(member_path):
                     findings.append(_path_finding("forbidden_path", logical_path))
-                if entry.file_size > policy.max_file_bytes:
-                    blockers.append(f"artifact_member_too_large:{kind.value}")
-                    continue
-                data = archive.read(entry)
+                with archive.open(entry, "r") as stream:
+                    data = _read_stream_exact(stream, entry.file_size)
                 findings.extend(_scan_bytes(data, logical_path, policy))
-    except (OSError, RuntimeError, zipfile.BadZipFile):
+    except (OSError, RuntimeError, EOFError, zipfile.BadZipFile):
         blockers.append(f"artifact_read_failed:{kind.value}")
     return findings, blockers
 
@@ -1142,6 +1659,7 @@ def _scan_tar(
     path: Path,
     kind: ArtifactKind,
     policy: SecretScanPolicy,
+    archive_budget: _ByteBudget,
 ) -> tuple[list[SecretFinding], list[str]]:
     findings: list[SecretFinding] = []
     blockers: list[str] = []
@@ -1150,26 +1668,74 @@ def _scan_tar(
             entries = archive.getmembers()
             if len(entries) > policy.max_archive_entries:
                 return [], [f"artifact_entry_limit:{kind.value}"]
+            canonical_names: set[str] = set()
             for entry in entries:
                 logical_path = f"{path.name}!{entry.name}"
-                if _unsafe_archive_member(entry.name) or entry.issym() or entry.islnk():
+                canonical = _canonical_archive_member(entry.name)
+                if canonical is None or entry.issym() or entry.islnk():
                     findings.append(_path_finding("archive_unsafe", logical_path))
+                    continue
+                if canonical in canonical_names:
+                    blockers.append(f"artifact_duplicate_member:{kind.value}")
+                canonical_names.add(canonical)
+            if blockers:
+                return findings, blockers
+            for entry in entries:
+                canonical = _canonical_archive_member(entry.name)
+                if canonical is None or entry.issym() or entry.islnk() or not entry.isfile():
+                    continue
+                if entry.size > policy.max_archive_member_bytes:
+                    blockers.append(f"artifact_member_too_large:{kind.value}")
+                    continue
+                try:
+                    archive_budget.reserve(entry.size)
+                except _BudgetExceeded:
+                    blockers.append(f"artifact_uncompressed_limit:{kind.value}")
+            if blockers:
+                return findings, blockers
+            for entry in entries:
+                canonical = _canonical_archive_member(entry.name)
+                if canonical is None or entry.issym() or entry.islnk():
                     continue
                 if not entry.isfile():
                     continue
-                if _is_forbidden_path(PurePosixPath(entry.name)):
+                logical_path = f"{path.name}!{entry.name}"
+                if _is_forbidden_path(PurePosixPath(canonical)):
                     findings.append(_path_finding("forbidden_path", logical_path))
-                if entry.size > policy.max_file_bytes:
-                    blockers.append(f"artifact_member_too_large:{kind.value}")
-                    continue
                 stream = archive.extractfile(entry)
                 if stream is None:
                     blockers.append(f"artifact_read_failed:{kind.value}")
                     continue
-                findings.extend(_scan_bytes(stream.read(), logical_path, policy))
-    except (OSError, tarfile.TarError):
+                with stream:
+                    data = _read_stream_exact(stream, entry.size)
+                findings.extend(_scan_bytes(data, logical_path, policy))
+    except (OSError, EOFError, tarfile.TarError):
         blockers.append(f"artifact_read_failed:{kind.value}")
     return findings, blockers
+
+
+def _read_stream_exact(stream, expected_size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = expected_size
+    while remaining:
+        chunk = stream.read(min(1024 * 1024, remaining))
+        if not isinstance(chunk, bytes) or not chunk:
+            raise EOFError
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if stream.read(1):
+        raise EOFError
+    return b"".join(chunks)
+
+
+def _canonical_archive_member(name: str) -> str | None:
+    normalized = unicodedata.normalize("NFC", name)
+    if _unsafe_archive_member(normalized):
+        return None
+    canonical = PurePosixPath(normalized).as_posix().rstrip("/").casefold()
+    if not canonical or canonical == ".":
+        return None
+    return canonical
 
 
 def _unsafe_archive_member(name: str) -> bool:
@@ -1214,7 +1780,12 @@ def _scan_bytes(
             findings.append(_content_finding("high_entropy", candidate, relative_path))
     for match in _HIGH_ENTROPY_CANDIDATE.finditer(data):
         candidate = match.group(0)
-        if _is_high_entropy(candidate):
+        if _is_high_entropy(candidate) and not _is_declared_digest_context(
+            data,
+            match.start(),
+            match.end(),
+            candidate,
+        ):
             findings.append(_content_finding("high_entropy", candidate, relative_path))
     fingerprints = set(policy.known_secret_digests)
     if fingerprints:
@@ -1226,28 +1797,57 @@ def _scan_bytes(
 
 
 def _is_high_entropy(candidate: bytes) -> bool:
-    if (
-        len(candidate) < 32
-        or re.fullmatch(rb"[0-9a-fA-F]+", candidate)
-        or re.fullmatch(
-            rb"(?:md5|sha1|sha224|sha256|sha384|sha512)=[A-Za-z0-9_-]+",
-            candidate,
-            flags=re.IGNORECASE,
-        )
+    if len(candidate) < 32 or re.fullmatch(
+        rb"(?:md5|sha1|sha224|sha256|sha384|sha512)=[A-Za-z0-9_-]+",
+        candidate,
+        flags=re.IGNORECASE,
     ):
-        return False
-    character_classes = sum(
-        bool(re.search(pattern, candidate))
-        for pattern in (rb"[a-z]", rb"[A-Z]", rb"[0-9]", rb"[+/=_-]")
-    )
-    if character_classes < 3:
         return False
     counts = Counter(candidate)
     entropy = -sum(
         (count / len(candidate)) * math.log2(count / len(candidate))
         for count in counts.values()
     )
+    if re.fullmatch(rb"[0-9a-fA-F]+", candidate):
+        return len(candidate) >= 40 and len(counts) >= 8 and entropy >= 3.5
+    character_classes = sum(
+        bool(re.search(pattern, candidate))
+        for pattern in (rb"[a-z]", rb"[A-Z]", rb"[0-9]", rb"[+/=_-]")
+    )
+    if character_classes < 3:
+        return False
     return entropy >= 4.0
+
+
+def _is_declared_digest_context(
+    data: bytes,
+    start: int,
+    end: int,
+    candidate: bytes,
+) -> bool:
+    if not re.fullmatch(rb"[0-9a-fA-F]+", candidate) or len(candidate) not in {
+        32,
+        40,
+        56,
+        64,
+        96,
+        128,
+    }:
+        return False
+    line_start = data.rfind(b"\n", 0, start) + 1
+    line_end = data.find(b"\n", end)
+    if line_end == -1:
+        line_end = len(data)
+    line = data[line_start:line_end]
+    pattern = re.compile(
+        rb"(?i)(?:^|[,{])\s*[\"']?"
+        rb"(?:md5|sha1|sha224|sha256|sha384|sha512|evidence_sha256|digest)"
+        rb"[\"']?\s*[:=]\s*[\"']?"
+        rb"(?:(?:md5|sha1|sha224|sha256|sha384|sha512)[:=])?"
+        + re.escape(candidate)
+        + rb"[\"']?(?=\s*(?:[,}]|$))"
+    )
+    return pattern.search(line) is not None
 
 
 def _known_fingerprint_candidates(data: bytes) -> set[bytes]:
@@ -1280,11 +1880,38 @@ def _known_fingerprint_candidates(data: bytes) -> set[bytes]:
     return candidates
 
 
-def _hash_file(path: Path) -> str:
+def _hash_file(
+    path: Path,
+    *,
+    max_bytes: int | None = None,
+    expected_metadata: os.stat_result | None = None,
+) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
+    total = 0
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("artifact_not_regular")
+        if expected_metadata is not None and (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+        ) != (
+            expected_metadata.st_dev,
+            expected_metadata.st_ino,
+            expected_metadata.st_size,
+        ):
+            raise OSError("artifact_changed")
+        if max_bytes is not None and metadata.st_size > max_bytes:
+            raise _BudgetExceeded
+        while chunk := os.read(descriptor, 1024 * 1024):
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise _BudgetExceeded
             digest.update(chunk)
+    finally:
+        os.close(descriptor)
     return digest.hexdigest()
 
 

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import json
+import os
+import re
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -196,11 +198,22 @@ def cmd_release_scan_secrets(args: argparse.Namespace) -> int:
     from mercury_tools.release.scanner import (
         ReleaseGateError,
         build_blocked_report,
+        invalidate_report_output,
         load_known_secret_digests,
         load_public_surface_manifest,
         load_secret_scan_allowlist,
         scan_public_release,
+        write_secret_scan_report,
     )
+
+    output = Path(args.output) if args.output else None
+    if output is not None:
+        try:
+            invalidate_report_output(output)
+        except OSError:
+            report = build_blocked_report("report_write_failed")
+            _print_json(report.public_dict())
+            return 1
 
     try:
         manifest = load_public_surface_manifest(Path(args.manifest))
@@ -228,24 +241,72 @@ def cmd_release_scan_secrets(args: argparse.Namespace) -> int:
         report = build_blocked_report("scan_request_malformed")
     else:
         try:
-            report = scan_public_release(request)
+            from mercury_tools.release.hosted import (
+                HostedAdapterConfig,
+                build_hosted_clients,
+            )
+
+            def secret_from_env(name: str) -> str | None:
+                if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name):
+                    return None
+                return os.environ.get(name, "").strip() or None
+
+            def configured_tuple(values: list[str], environment_name: str) -> tuple[str, ...]:
+                configured = values or [
+                    item.strip()
+                    for item in os.environ.get(environment_name, "").split(",")
+                    if item.strip()
+                ]
+                return tuple(dict.fromkeys(configured))
+
+            gh_path = shutil.which(args.gh_executable)
+            config = HostedAdapterConfig(
+                repo=request.repo,
+                gh_executable=Path(gh_path) if gh_path else None,
+                github_token=secret_from_env(args.github_token_env),
+                marketplace_url=(
+                    args.marketplace_snapshot_url
+                    or os.environ.get("MERCURY_MARKETPLACE_SNAPSHOT_URL")
+                    or None
+                ),
+                render_api_url=(
+                    args.render_api_url
+                    or os.environ.get("MERCURY_RENDER_API_URL")
+                    or None
+                ),
+                render_service_id=(
+                    args.render_service_id
+                    or os.environ.get("MERCURY_RENDER_SERVICE_ID")
+                    or None
+                ),
+                render_token=secret_from_env(args.render_token_env),
+                supabase_url=(args.supabase_url or os.environ.get("SUPABASE_URL") or None),
+                supabase_key=secret_from_env(args.supabase_key_env),
+                supabase_knowledge_tables=configured_tuple(
+                    args.supabase_knowledge_table,
+                    "MERCURY_RELEASE_KNOWLEDGE_TABLES",
+                ),
+                supabase_storage_buckets=configured_tuple(
+                    args.supabase_storage_bucket,
+                    "MERCURY_RELEASE_STORAGE_BUCKETS",
+                ),
+                public_mcp_url=(
+                    args.public_mcp_url
+                    or os.environ.get("MERCURY_PUBLIC_MCP_URL")
+                    or None
+                ),
+                public_mcp_token=secret_from_env(args.public_mcp_token_env),
+            )
+            hosted_clients = build_hosted_clients(config) if request.hosted else {}
+            report = scan_public_release(request, hosted_clients=hosted_clients)
         except Exception:
             report = build_blocked_report("release_scan_failed")
 
     payload = report.public_dict()
-    if args.output:
-        output = Path(args.output)
-        temporary = output.with_name(f".{output.name}.tmp")
+    if output is not None:
         try:
-            output.parent.mkdir(parents=True, exist_ok=True)
-            temporary.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-            temporary.replace(output)
+            write_secret_scan_report(output, payload)
         except OSError:
-            with contextlib.suppress(OSError):
-                temporary.unlink(missing_ok=True)
             report = build_blocked_report("report_write_failed")
             payload = report.public_dict()
     _print_json(payload)
@@ -778,6 +839,21 @@ def build_parser() -> argparse.ArgumentParser:
     scan_secrets.add_argument("--known-fingerprint-stdin", action="store_true")
     scan_secrets.add_argument("--known-fingerprint-file", action="append", default=[])
     scan_secrets.add_argument("--repo-root", default=".")
+    scan_secrets.add_argument("--gh-executable", default="gh")
+    scan_secrets.add_argument("--github-token-env", default="GH_TOKEN")
+    scan_secrets.add_argument("--marketplace-snapshot-url")
+    scan_secrets.add_argument("--render-api-url")
+    scan_secrets.add_argument("--render-service-id")
+    scan_secrets.add_argument("--render-token-env", default="RENDER_API_KEY")
+    scan_secrets.add_argument("--supabase-url")
+    scan_secrets.add_argument("--supabase-key-env", default="SUPABASE_SERVICE_ROLE_KEY")
+    scan_secrets.add_argument("--supabase-knowledge-table", action="append", default=[])
+    scan_secrets.add_argument("--supabase-storage-bucket", action="append", default=[])
+    scan_secrets.add_argument("--public-mcp-url")
+    scan_secrets.add_argument(
+        "--public-mcp-token-env",
+        default="MERCURY_PUBLIC_MCP_TOKEN",
+    )
     scan_secrets.set_defaults(func=cmd_release_scan_secrets)
 
     ingest = sub.add_parser("ingest")
