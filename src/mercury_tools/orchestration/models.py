@@ -10,7 +10,7 @@ import math
 import re
 import secrets
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal, Self
@@ -23,9 +23,15 @@ _MAX_ACCOUNTING_TEXT_LENGTH = 512
 _DISALLOWED_TEXT_CATEGORIES = frozenset({"Cc", "Cf", "Cn", "Co", "Cs", "Zl", "Zp"})
 _DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE)
 _REFERENCE_TOKEN_SEPARATORS = frozenset("-/.#")
+_LABELED_IDENTIFIER_SEPARATORS = frozenset("-#")
 _IDENTIFIER_SEPARATORS = frozenset("-")
 _ENDPOINT_ATOM_BOUNDARY = re.compile(r"[\s(){}\[\]<>\"'`,;]+")
 _AMOUNT_TEXT = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,6})?$")
+_IPV4_DECIMAL_COMPONENT = re.compile(r"^(?:0|[1-9][0-9]*)$")
+_IPV4_OCTAL_COMPONENT = re.compile(r"^0[0-7]+$")
+_IPV4_HEX_COMPONENT = re.compile(r"^0[xX][0-9A-Fa-f]+$")
+_ACCOUNTING_DATE_DMY = re.compile(r"^([0-9]{2})([./])([0-9]{2})\2([0-9]{4})$")
+_ACCOUNTING_DATE_ISO = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 _FORBIDDEN_HANDOFF_FIELDS = frozenset(
     {
         "approval",
@@ -257,12 +263,29 @@ _BLOCKED_ACTIONS = frozenset(
         "store_credentials",
     }
 )
-_ACCOUNTING_REFERENCE_PREFIXES = (
+_ACCOUNTING_COMPACT_REFERENCE_PREFIXES = (
+    "purchase-order",
+    "bank-payment",
+    "bank-transfer",
+    "credit-note",
+    "debit-note",
+    "sales-order",
+    "ใบกำกับภาษี",
+    "ใบแจ้งหนี้",
+    "invoice",
+    "payment",
+    "receipt",
+    "transfer",
+    "ใบเสร็จ",
+    "เลขที่",
+    "order",
+    "inv",
+)
+_ACCOUNTING_IDENTIFIER_LABELS = (
     "bank payment",
     "bank transfer",
     "credit note",
     "debit note",
-    "document date",
     "invoice",
     "order",
     "payment",
@@ -270,12 +293,22 @@ _ACCOUNTING_REFERENCE_PREFIXES = (
     "receipt",
     "sales order",
     "transfer",
-    "vat",
-    "วันที่เอกสาร",
     "ใบกำกับภาษี",
     "ใบแจ้งหนี้",
     "ใบเสร็จ",
+    "เลขที่",
+)
+_ACCOUNTING_DATE_LABELS = (
+    "document date",
+    "วันที่เอกสาร",
     "เอกสารวันที่",
+)
+_ACCOUNTING_DECIMAL_LABELS = ("vat",)
+_LEGACY_IPV4_COMPONENT_LIMITS = (
+    (0xFFFFFFFF,),
+    (0xFF, 0xFFFFFF),
+    (0xFF, 0xFF, 0xFFFF),
+    (0xFF, 0xFF, 0xFF, 0xFF),
 )
 _COUNTERPARTY_PREFIXES = frozenset(
     {
@@ -435,31 +468,25 @@ def _is_ip_host(host: str) -> bool:
 
 
 def _parse_ipv4_component(value: str) -> int | None:
-    try:
-        if value.casefold().startswith("0x"):
-            return int(value[2:], 16)
-        if len(value) > 1 and value.startswith("0"):
-            return int(value, 8)
+    if _IPV4_HEX_COMPONENT.fullmatch(value):
+        return int(value[2:], 16)
+    if _IPV4_OCTAL_COMPONENT.fullmatch(value):
+        return int(value, 8)
+    if _IPV4_DECIMAL_COMPONENT.fullmatch(value):
         return int(value, 10)
-    except ValueError:
-        return None
+    return None
 
 
-def _is_legacy_ipv4_host(host: str, *, has_route: bool) -> bool:
+def _is_legacy_ipv4_host(host: str) -> bool:
     parts = host.split(".")
-    if len(parts) == 4:
-        values = tuple(_parse_ipv4_component(part) for part in parts)
-        return all(value is not None and value <= 255 for value in values)
-    if len(parts) != 1:
+    if not 1 <= len(parts) <= len(_LEGACY_IPV4_COMPONENT_LIMITS):
         return False
-
-    normalized = host.casefold()
-    value = _parse_ipv4_component(normalized)
-    if value is None or value > 0xFFFFFFFF:
-        return False
-    if normalized.startswith("0x") or (len(normalized) > 1 and normalized.startswith("0")):
-        return True
-    return normalized.isdecimal() and (has_route or value >= 1 << 24)
+    limits = _LEGACY_IPV4_COMPONENT_LIMITS[len(parts) - 1]
+    values = tuple(_parse_ipv4_component(part) for part in parts)
+    return all(
+        value is not None and value <= limit
+        for value, limit in zip(values, limits, strict=True)
+    )
 
 
 def _is_dns_host(host: str) -> bool:
@@ -498,7 +525,6 @@ def _is_endpoint_atom(value: str) -> bool:
         return True
 
     route_match = re.search(r"[/?#\\]", candidate)
-    has_route = route_match is not None
     authority = candidate if route_match is None else candidate[: route_match.start()]
     if not authority:
         return False
@@ -518,7 +544,7 @@ def _is_endpoint_atom(value: str) -> bool:
         return True
     if host.casefold() == "localhost":
         return True
-    if _is_legacy_ipv4_host(host, has_route=has_route):
+    if _is_legacy_ipv4_host(host):
         return True
     return _is_dns_host(host)
 
@@ -562,10 +588,95 @@ def _has_cased_upper(value: str) -> bool:
     return any(character.isupper() and not character.islower() for character in value)
 
 
-def _is_reference_token(value: str) -> bool:
+def _is_compact_reference_suffix(value: str) -> bool:
     if not _is_segmented_unicode_token(value, separators=_REFERENCE_TOKEN_SEPARATORS):
         return False
-    return any(character.isdecimal() for character in value) or _has_cased_upper(value)
+    components = re.split(r"[-/.#]", value)
+    return all(any(character.isdecimal() for character in component) for component in components)
+
+
+def _is_compact_accounting_reference(value: str) -> bool:
+    folded = value.casefold()
+    for prefix in _ACCOUNTING_COMPACT_REFERENCE_PREFIXES:
+        prefix_length = len(prefix)
+        if (
+            folded.startswith(prefix)
+            and len(value) > prefix_length
+            and value[prefix_length] in _REFERENCE_TOKEN_SEPARATORS
+            and _is_compact_reference_suffix(value[prefix_length + 1 :])
+        ):
+            return True
+    return False
+
+
+def _is_labeled_identifier_suffix(value: str) -> bool:
+    if value.isdecimal() or _is_compact_accounting_reference(value):
+        return True
+    if not _is_segmented_unicode_token(
+        value,
+        separators=_LABELED_IDENTIFIER_SEPARATORS,
+    ):
+        return False
+    return any(character.isdecimal() for character in value) and any(
+        unicodedata.category(character).startswith("L") for character in value
+    )
+
+
+def _is_accounting_date_suffix(value: str) -> bool:
+    if _ACCOUNTING_DATE_ISO.fullmatch(value):
+        try:
+            date.fromisoformat(value)
+        except ValueError:
+            return False
+        return True
+    match = _ACCOUNTING_DATE_DMY.fullmatch(value)
+    if match is None:
+        return False
+    day, _, month, year = match.groups()
+    try:
+        date(int(year), int(month), int(day))
+    except ValueError:
+        return False
+    return True
+
+
+def _is_accounting_decimal_suffix(value: str) -> bool:
+    return _AMOUNT_TEXT.fullmatch(value) is not None
+
+
+def _has_labeled_suffix(
+    value: str,
+    *,
+    labels: tuple[str, ...],
+    suffix_validator: Callable[[str], bool],
+) -> bool:
+    folded = value.casefold()
+    for label in labels:
+        marker = f"{label} "
+        if folded.startswith(marker):
+            suffix = value[len(marker) :]
+            return " " not in suffix and suffix_validator(suffix)
+    return False
+
+
+def _is_labeled_accounting_reference(value: str) -> bool:
+    return (
+        _has_labeled_suffix(
+            value,
+            labels=_ACCOUNTING_IDENTIFIER_LABELS,
+            suffix_validator=_is_labeled_identifier_suffix,
+        )
+        or _has_labeled_suffix(
+            value,
+            labels=_ACCOUNTING_DATE_LABELS,
+            suffix_validator=_is_accounting_date_suffix,
+        )
+        or _has_labeled_suffix(
+            value,
+            labels=_ACCOUNTING_DECIMAL_LABELS,
+            suffix_validator=_is_accounting_decimal_suffix,
+        )
+    )
 
 
 def validate_accounting_reference(
@@ -574,22 +685,17 @@ def validate_accounting_reference(
     code: str,
     max_length: int = _MAX_ACCOUNTING_TEXT_LENGTH,
 ) -> str:
-    """Parse one compact or reviewed labelled accounting reference."""
+    """Parse one explicit compact or labelled accounting reference."""
 
     reference = _require_plain_text(value, code=code, max_length=max_length)
+    if _is_compact_accounting_reference(reference) or _is_labeled_accounting_reference(
+        reference
+    ):
+        return reference
+    if reference.isascii() and reference.isdecimal():
+        raise ValueError(code)
     if _is_endpoint_like(reference):
         raise ValueError("cross_mcp_url_forbidden")
-    if " " not in reference:
-        if _is_reference_token(reference):
-            return reference
-        raise ValueError(code)
-
-    tokens = reference.split(" ")
-    folded_tokens = tuple(token.casefold() for token in tokens)
-    for prefix in _ACCOUNTING_REFERENCE_PREFIXES:
-        prefix_tokens = tuple(prefix.split(" "))
-        if folded_tokens[:-1] == prefix_tokens and _is_reference_token(tokens[-1]):
-            return reference
     raise ValueError(code)
 
 

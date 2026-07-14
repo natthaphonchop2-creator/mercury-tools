@@ -23,6 +23,59 @@ VALID_HANDOFF = {
     "blocked_actions": ["send_email", "share_file", "delete_record"],
 }
 
+LEGACY_IPV4_COMPONENT_LIMITS = (
+    (0xFFFFFFFF,),
+    (0xFF, 0xFFFFFF),
+    (0xFF, 0xFF, 0xFFFF),
+    (0xFF, 0xFF, 0xFF, 0xFF),
+)
+ACCOUNTING_COMPACT_REFERENCE_PREFIXES = (
+    "BANK-PAYMENT",
+    "BANK-TRANSFER",
+    "CREDIT-NOTE",
+    "DEBIT-NOTE",
+    "INV",
+    "INVOICE",
+    "ORDER",
+    "PAYMENT",
+    "PURCHASE-ORDER",
+    "RECEIPT",
+    "SALES-ORDER",
+    "TRANSFER",
+    "ใบกำกับภาษี",
+    "ใบแจ้งหนี้",
+    "ใบเสร็จ",
+    "เลขที่",
+)
+ACCOUNTING_IDENTIFIER_LABELS = (
+    "BANK PAYMENT",
+    "BANK TRANSFER",
+    "CREDIT NOTE",
+    "DEBIT NOTE",
+    "Invoice",
+    "ORDER",
+    "PAYMENT",
+    "PURCHASE ORDER",
+    "RECEIPT",
+    "SALES ORDER",
+    "TRANSFER",
+    "ใบกำกับภาษี",
+    "ใบแจ้งหนี้",
+    "ใบเสร็จ",
+    "เลขที่",
+)
+ACCOUNTING_DATE_LABELS = ("DOCUMENT DATE", "วันที่เอกสาร", "เอกสารวันที่")
+
+
+def _format_legacy_ipv4_component(value: int, radix: str) -> str:
+    if radix == "decimal":
+        return str(value)
+    if radix == "octal":
+        return f"0{value:o}"
+    if radix == "hex":
+        return f"0x{value:x}"
+    raise AssertionError(radix)
+
 
 def _verification_context(
     approval: ApprovalBinding,
@@ -577,6 +630,232 @@ def test_approval_reference_accepts_reviewed_positive_accounting_corpus(
     assert approval.payload == {"reference": reference}
 
 
+@pytest.mark.parametrize("prefix", ACCOUNTING_COMPACT_REFERENCE_PREFIXES)
+@pytest.mark.parametrize("suffix", ("20260001", "A2026"))
+def test_approval_reference_accepts_each_reviewed_compact_prefix(
+    prefix: str,
+    suffix: str,
+) -> None:
+    reference = f"{prefix}-{suffix}"
+
+    approval = ApprovalBinding.issue(
+        action_version="av_123",
+        destination="google-sheets",
+        side_effect="sheet.write",
+        allowed_fields=("reference",),
+        payload={"reference": reference},
+        ttl_seconds=300,
+    )
+
+    assert approval.payload == {"reference": reference}
+
+
+@pytest.mark.parametrize("label", ACCOUNTING_IDENTIFIER_LABELS)
+@pytest.mark.parametrize("suffix", ("20260001", "A2026"))
+def test_approval_reference_accepts_each_reviewed_identifier_label(
+    label: str,
+    suffix: str,
+) -> None:
+    reference = f"{label} {suffix}"
+
+    approval = ApprovalBinding.issue(
+        action_version="av_123",
+        destination="google-sheets",
+        side_effect="sheet.write",
+        allowed_fields=("reference",),
+        payload={"reference": reference},
+        ttl_seconds=300,
+    )
+
+    assert approval.payload == {"reference": reference}
+
+
+@pytest.mark.parametrize("label", ACCOUNTING_DATE_LABELS)
+def test_approval_reference_accepts_each_reviewed_date_label(label: str) -> None:
+    reference = f"{label} 14.07.2026"
+
+    approval = ApprovalBinding.issue(
+        action_version="av_123",
+        destination="google-sheets",
+        side_effect="sheet.write",
+        allowed_fields=("reference",),
+        payload={"reference": reference},
+        ttl_seconds=300,
+    )
+
+    assert approval.payload == {"reference": reference}
+
+
+def test_approval_reference_accepts_reviewed_decimal_label() -> None:
+    reference = "VAT 7.00"
+
+    approval = ApprovalBinding.issue(
+        action_version="av_123",
+        destination="google-sheets",
+        side_effect="sheet.write",
+        allowed_fields=("reference",),
+        payload={"reference": reference},
+        ttl_seconds=300,
+    )
+
+    assert approval.payload == {"reference": reference}
+
+
+@pytest.mark.parametrize("radix", ("decimal", "octal", "hex"))
+@pytest.mark.parametrize("limits", LEGACY_IPV4_COMPONENT_LIMITS)
+def test_legacy_ipv4_recognizes_each_component_radix_range_and_adjacent_invalid(
+    radix: str,
+    limits: tuple[int, ...],
+) -> None:
+    minimum_host = ".".join(
+        _format_legacy_ipv4_component(0, radix) for _ in limits
+    )
+    valid_host = ".".join(
+        _format_legacy_ipv4_component(limit, radix) for limit in limits
+    )
+
+    assert orchestration_models._is_legacy_ipv4_host(minimum_host)
+    assert orchestration_models._is_legacy_ipv4_host(valid_host)
+    for index, limit in enumerate(limits):
+        invalid_components = [
+            _format_legacy_ipv4_component(item, radix) for item in limits
+        ]
+        invalid_components[index] = _format_legacy_ipv4_component(limit + 1, radix)
+        invalid_host = ".".join(invalid_components)
+        assert not orchestration_models._is_legacy_ipv4_host(invalid_host)
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "0x7f.01",
+        "0177.0x0.1",
+        "0x7f.00.0x0.01",
+    ],
+)
+def test_legacy_ipv4_recognizes_mixed_radix_components(host: str) -> None:
+    assert orchestration_models._is_legacy_ipv4_host(host)
+
+
+@pytest.mark.parametrize("radix", ("decimal", "octal", "hex"))
+@pytest.mark.parametrize("limits", LEGACY_IPV4_COMPONENT_LIMITS)
+def test_approval_reference_rejects_legacy_ipv4_ranges_and_adjacent_mutations(
+    radix: str,
+    limits: tuple[int, ...],
+) -> None:
+    valid_host = ".".join(
+        _format_legacy_ipv4_component(limit, radix) for limit in limits
+    )
+    valid_candidates = (
+        f"{valid_host}/upload",
+        f"{valid_host}:8080/upload",
+        f"user@{valid_host}/upload",
+    )
+    for value in valid_candidates:
+        with pytest.raises(ValueError, match="cross_mcp_url_forbidden") as exc_info:
+            ApprovalBinding.issue(
+                action_version="av_123",
+                destination="google-sheets",
+                side_effect="sheet.write",
+                allowed_fields=("reference",),
+                payload={"reference": value},
+                ttl_seconds=300,
+            )
+        assert value not in str(exc_info.value)
+
+    invalid_candidates = []
+    for index, limit in enumerate(limits):
+        invalid_components = [
+            _format_legacy_ipv4_component(item, radix) for item in limits
+        ]
+        invalid_components[index] = _format_legacy_ipv4_component(limit + 1, radix)
+        invalid_candidates.append(f"{'.'.join(invalid_components)}/upload")
+
+    for value in invalid_candidates:
+        with pytest.raises(ValueError) as exc_info:
+            ApprovalBinding.issue(
+                action_version="av_123",
+                destination="google-sheets",
+                side_effect="sheet.write",
+                allowed_fields=("reference",),
+                payload={"reference": value},
+                ttl_seconds=300,
+            )
+        assert value not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "127.1",
+        "127.0.1",
+        "127.1/upload",
+        "127.0.1/upload",
+        "0x7f.1/upload",
+        "0177.1/upload",
+        "127.65535/upload",
+        "127.1:8080/upload",
+        "user@127.1/upload",
+        "Receipt(127.1/upload)",
+    ],
+)
+def test_approval_reference_rejects_review_four_legacy_ipv4_embeddings(
+    value: str,
+) -> None:
+    with pytest.raises(ValueError, match="cross_mcp_url_forbidden") as exc_info:
+        ApprovalBinding.issue(
+            action_version="av_123",
+            destination="google-sheets",
+            side_effect="sheet.write",
+            allowed_fields=("reference",),
+            payload={"reference": value},
+            ttl_seconds=300,
+        )
+
+    assert value not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "A2026",
+        "VAT A2026",
+        "DOCUMENT DATE A2026",
+        "Invoice 7.00",
+        "Invoice 14.07.2026",
+    ],
+)
+def test_approval_reference_rejects_unlabelled_or_wrong_suffix_grammar(value: str) -> None:
+    with pytest.raises(ValueError) as exc_info:
+        ApprovalBinding.issue(
+            action_version="av_123",
+            destination="google-sheets",
+            side_effect="sheet.write",
+            allowed_fields=("reference",),
+            payload={"reference": value},
+            ttl_seconds=300,
+        )
+
+    assert value not in str(exc_info.value)
+
+
+def test_approval_reference_fails_closed_for_ambiguous_bare_numeric_reference() -> None:
+    value = "20260001"
+
+    with pytest.raises(ValueError, match="approval_payload_value_invalid") as exc_info:
+        ApprovalBinding.issue(
+            action_version="av_123",
+            destination="google-sheets",
+            side_effect="sheet.write",
+            allowed_fields=("reference",),
+            payload={"reference": value},
+            ttl_seconds=300,
+        )
+
+    assert "cross_mcp_url_forbidden" not in str(exc_info.value)
+    assert value not in str(exc_info.value)
+
+
 def test_approval_payload_dispatches_every_allowed_field_to_its_exact_schema() -> None:
     payload = {
         "transaction_id": "erp-001",
@@ -701,6 +980,18 @@ def test_approval_reference_rejects_endpoint_mutations_independent_of_context(
 @pytest.mark.parametrize(
     "value",
     [
+        "ส่งอีเมลนี้๑",
+        "ลบไฟล์นี้1",
+        "PleaseEmailThisReport1",
+        "FORWARD-FILE-1",
+        "mcp-gmail-send-email-v1",
+        "gmail-send-email-1",
+        "connector-status-v1",
+        "python3",
+        "php8",
+        "nc6",
+        "token-abcdefgh123",
+        "secret-abcdefgh123",
         "Please email this report",
         "Please email report 123",
         "Forward this file",
