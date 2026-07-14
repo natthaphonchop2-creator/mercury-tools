@@ -6,6 +6,7 @@ import math
 import re
 import uuid
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Any, Literal
 from urllib.parse import unquote, urlsplit
 
@@ -15,6 +16,12 @@ from mercury_tools.catalog.identity import sanitize_document, validate_action_id
 from mercury_tools.catalog.schema_contract import (
     is_canonical_schema_name,
     validate_required_schema_contract,
+)
+from mercury_tools.qualification.models import (
+    EvidenceLevel,
+    ExecutionEligibility,
+    SemanticContract,
+    ValidationStatus,
 )
 from mercury_tools.rag.models import project_approved_validation_metadata
 from mercury_tools.safety.redaction import (
@@ -32,6 +39,10 @@ _PUBLIC_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 _CATALOG_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _ACTION_ID_RE = re.compile(r"^act_[0-9a-f]{24}$")
 _ACTION_VERSION_ID_RE = re.compile(r"^av_[0-9a-f]{64}$")
+_OPAQUE_EVIDENCE_ID_RE = re.compile(
+    r"^ev_[0-9A-HJKMNP-TV-Z]{26}$",
+    re.IGNORECASE,
+)
 _VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$")
 _WIKI_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,199}$")
 _CHUNK_FRAGMENT_RE = re.compile(r"^chunk-[0-9]+$")
@@ -137,6 +148,7 @@ _AUTH_IDENTIFIER_RE = re.compile(
 _MAX_SCHEMA_DEPTH = 20
 _MAX_SCHEMA_NODES = 8_192
 _MAX_RULE_STRING_BYTES = 2_048
+_BLOCKING_CONDITION_RE = re.compile(r"^[a-z][a-z0-9_]{1,127}$")
 
 
 def sanitize_public_text(value: str, *, redact_paths: bool = True) -> str:
@@ -856,6 +868,110 @@ class PublicValidationMetadata(StrictPublicModel):
         return self
 
 
+class PublicEvidenceRequest(StrictPublicModel):
+    connector_id: str
+    action_id: str
+    version_id: str
+    environment: Literal["sandbox", "test", "uat", "production"]
+
+    @model_validator(mode="after")
+    def validate_exact_scope(self) -> PublicEvidenceRequest:
+        if (
+            not is_canonical_catalog_identity(self.connector_id)
+            or _ACTION_ID_RE.fullmatch(self.action_id) is None
+            or _ACTION_VERSION_ID_RE.fullmatch(self.version_id) is None
+        ):
+            raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
+        return self
+
+    @property
+    def scope_key(self) -> tuple[str, str, str, str]:
+        return (
+            self.connector_id,
+            self.action_id,
+            self.version_id,
+            self.environment,
+        )
+
+
+class PublicValidationEvidence(StrictPublicModel):
+    action_id: str
+    version_id: str
+    connector_id: str
+    environment: Literal["sandbox", "test", "uat", "production"]
+    validation_status: ValidationStatus
+    evidence_level: EvidenceLevel
+    execution_eligibility: ExecutionEligibility
+    summary_th: str
+    summary_en: str
+    limitations: tuple[str, ...]
+    prerequisites: tuple[str, ...]
+    recommended_next_step: str
+    semantic_contract: SemanticContract
+    opaque_evidence_id: str
+    evidence_sha256: str
+    evaluated_at: datetime
+    expires_at: datetime | None
+
+    @model_validator(mode="after")
+    def validate_evidence(self) -> PublicValidationEvidence:
+        if (
+            _ACTION_ID_RE.fullmatch(self.action_id) is None
+            or _ACTION_VERSION_ID_RE.fullmatch(self.version_id) is None
+            or not is_canonical_catalog_identity(self.connector_id)
+            or _OPAQUE_EVIDENCE_ID_RE.fullmatch(self.opaque_evidence_id) is None
+            or _SHA256_RE.fullmatch(self.evidence_sha256) is None
+            or self.evaluated_at.tzinfo is None
+            or self.evaluated_at.utcoffset() is None
+            or (
+                self.expires_at is not None
+                and (
+                    self.expires_at.tzinfo is None
+                    or self.expires_at.utcoffset() is None
+                    or self.expires_at <= self.evaluated_at
+                )
+            )
+        ):
+            raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
+        return self
+
+
+class PublicEvidenceSelection(StrictPublicModel):
+    selected: PublicValidationEvidence | None
+    blocking_conditions: tuple[str, ...]
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> PublicEvidenceSelection:
+        if (
+            (self.selected is None) == (not self.blocking_conditions)
+            or len(set(self.blocking_conditions)) != len(self.blocking_conditions)
+            or any(
+                _BLOCKING_CONDITION_RE.fullmatch(condition) is None
+                for condition in self.blocking_conditions
+            )
+        ):
+            raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
+        return self
+
+
+class PublicValidationResolveRequest(StrictPublicModel):
+    requests: tuple[PublicEvidenceRequest, ...] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_unique_requests(self) -> PublicValidationResolveRequest:
+        scopes = tuple(request.scope_key for request in self.requests)
+        if len(set(scopes)) != len(scopes):
+            raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
+        return self
+
+
+class PublicEvidenceSelectionsEnvelope(StrictPublicModel):
+    selections: tuple[PublicEvidenceSelection, ...] = Field(
+        min_length=1,
+        max_length=100,
+    )
+
+
 class PublicSearchResult(StrictPublicModel):
     chunk_id: str
     document_id: str
@@ -956,6 +1072,10 @@ def _validate_public_value(value: Any) -> None:
         return
     if isinstance(value, float):
         if not math.isfinite(value):
+            raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
+        return
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
         return
     if isinstance(value, str):

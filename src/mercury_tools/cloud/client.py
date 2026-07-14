@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import quote, urlparse
@@ -24,9 +25,13 @@ from mercury_tools.cloud.models import (
     PUBLIC_RESPONSE_VALIDATION_ERROR,
     PublicConnectorsEnvelope,
     PublicDocument,
+    PublicEvidenceRequest,
+    PublicEvidenceSelection,
+    PublicEvidenceSelectionsEnvelope,
     PublicSearchEnvelope,
     PublicSkillDetail,
     PublicSkillsEnvelope,
+    PublicValidationResolveRequest,
     is_canonical_document_identifier,
     is_canonical_skill_id,
     validate_document_identity,
@@ -41,6 +46,8 @@ from mercury_tools.config import load_settings
 _SELECTOR_RE = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 _ACTION_ID_RE = re.compile(r"^act_[0-9a-f]{24}$")
 _ETAG_RE = re.compile(r'^(?:W/)?"[A-Za-z0-9._:-]{1,128}"$')
+
+
 @dataclass(frozen=True)
 class CatalogFetchResult:
     actions: tuple[CatalogAction, ...]
@@ -152,6 +159,59 @@ class CloudBrainClient:
             raise ValueError("cloud_catalog_invalid")
         _validate_public_catalog_action(action)
         return action
+
+    async def resolve_validations(
+        self,
+        requests: Sequence[Any],
+    ) -> tuple[PublicEvidenceSelection, ...]:
+        batch = _validation_request_batch(requests)
+        try:
+            response = await self.client.post(
+                "/api/cloud/v1/catalog/validation/resolve",
+                json=batch.model_dump(mode="json"),
+            )
+        except httpx.TransportError:
+            return _unavailable_selections(len(batch.requests))
+        if response.status_code >= 500:
+            return _unavailable_selections(len(batch.requests))
+        response.raise_for_status()
+        envelope = _validate_public_response(
+            response,
+            PublicEvidenceSelectionsEnvelope,
+        )
+        if len(envelope.selections) != len(batch.requests):
+            raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
+        for request, selection in zip(
+            batch.requests,
+            envelope.selections,
+            strict=True,
+        ):
+            if selection.selected is not None and request.scope_key != (
+                selection.selected.connector_id,
+                selection.selected.action_id,
+                selection.selected.version_id,
+                selection.selected.environment,
+            ):
+                raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
+        return envelope.selections
+
+    async def resolve_validation(
+        self,
+        *,
+        connector_id: str,
+        action_id: str,
+        version_id: str,
+        environment: str,
+    ) -> PublicEvidenceSelection:
+        request = PublicEvidenceRequest.model_validate(
+            {
+                "connector_id": connector_id,
+                "action_id": action_id,
+                "version_id": version_id,
+                "environment": environment,
+            }
+        )
+        return (await self.resolve_validations((request,)))[0]
 
     async def list_connectors(self) -> tuple[dict[str, Any], ...]:
         response = await self.client.get("/api/cloud/v1/connectors")
@@ -293,6 +353,38 @@ def _validate_public_catalog_action(action: CatalogAction) -> None:
 
 def _validate_public_response(response: httpx.Response, model_type: Any) -> Any:
     try:
-        return model_type.model_validate(response.json())
+        return model_type.model_validate_json(response.content)
     except (KeyError, OverflowError, RecursionError, TypeError, ValueError):
         raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR) from None
+
+
+def _validation_request_batch(
+    requests: Sequence[Any],
+) -> PublicValidationResolveRequest:
+    if isinstance(requests, str | bytes | bytearray):
+        raise ValueError("cloud_validation_request_invalid")
+    try:
+        values = tuple(requests)
+        public_requests = tuple(
+            PublicEvidenceRequest.model_validate(request.model_dump(mode="python"))
+            if hasattr(request, "model_dump")
+            else PublicEvidenceRequest.model_validate(request)
+            for request in values
+        )
+        return PublicValidationResolveRequest.model_validate(
+            {"requests": public_requests}
+        )
+    except (TypeError, ValueError):
+        raise ValueError("cloud_validation_request_invalid") from None
+
+
+def _unavailable_selections(count: int) -> tuple[PublicEvidenceSelection, ...]:
+    return tuple(
+        PublicEvidenceSelection.model_validate(
+            {
+                "selected": None,
+                "blocking_conditions": ("validation_unavailable",),
+            }
+        )
+        for _ in range(count)
+    )

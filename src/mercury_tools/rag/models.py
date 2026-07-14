@@ -72,6 +72,29 @@ _VALIDATION_ONLY_METADATA_FIELDS = frozenset(VALIDATION_METADATA_FIELDS) - froze
     GENERAL_PUBLIC_METADATA_FIELDS
 )
 _VALIDATION_URI_PREFIX = "mercury://wiki/validation/"
+DOCUMENTED_SEARCH_FILTER_FIELDS = frozenset(
+    {
+        "jurisdiction",
+        "connector",
+        "doc_type",
+        "review_status",
+        "effective_date",
+        "action_id",
+        "version_id",
+        "environment",
+        "capability",
+        "accounting_use",
+    }
+)
+VALIDATION_CONTEXT_FILTER_FIELDS = frozenset(
+    {
+        "action_id",
+        "version_id",
+        "environment",
+        "capability",
+        "accounting_use",
+    }
+)
 
 
 @dataclass(frozen=True)

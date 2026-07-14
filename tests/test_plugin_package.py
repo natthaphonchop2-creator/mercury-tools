@@ -9,12 +9,35 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from mcp.shared.memory import create_connected_server_and_client_session
 
 from mercury_tools.db.product import SKILL_CATALOG_SEED
+from mercury_tools.mcp.local_server import local_mcp
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = ROOT / "plugins/mercury-finance"
 SKILLS_ROOT = PLUGIN_ROOT / "skills"
+EXPECTED_LOCAL_TOOLS = {
+    "search_knowledge",
+    "retrieve_context_pack",
+    "get_document",
+    "connector_status",
+    "run_accounting_skill",
+    "run_mercury_flow",
+    "list_workspace_flows",
+    "save_workspace_flow",
+    "run_workspace_flow",
+    "search_erp_actions",
+    "get_erp_action_schema",
+    "run_erp_read",
+    "preview_erp_write",
+    "confirm_erp_write",
+    "execute_erp_write",
+    "get_erp_request_status",
+    "import_erp_spec",
+    "list_connector_drivers",
+    "credential_status",
+}
 
 SETUP_SKILLS = (
     "connector-setup-guide-th",
@@ -354,6 +377,36 @@ def test_plugin_registers_one_pinned_local_stdio_server() -> None:
     assert "url" not in server
     assert "env" not in server
     assert "bearer_token_env_var" not in server
+
+
+@pytest.mark.asyncio
+async def test_plugin_stdio_target_keeps_exact_task_11_tool_contract() -> None:
+    async with create_connected_server_and_client_session(local_mcp) as session:
+        tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+
+    assert len(tools) == 19
+    assert set(tools) == EXPECTED_LOCAL_TOOLS
+    for tool_name in ("search_erp_actions", "get_erp_action_schema"):
+        schema = tools[tool_name].inputSchema
+        assert "environment" in schema["properties"]
+        assert "environment" not in schema.get("required", [])
+
+    context_schema = tools["retrieve_context_pack"].inputSchema
+    task_11_fields = {
+        "action_id",
+        "version_id",
+        "environment",
+        "capability",
+        "accounting_use",
+    }
+    assert task_11_fields.issubset(context_schema["properties"])
+    assert task_11_fields.isdisjoint(context_schema.get("required", []))
+    assert set(tools["run_accounting_skill"].inputSchema["properties"]) == {
+        "skill_id",
+        "inputs",
+        "evidence_mode",
+        "repo_root",
+    }
 
 
 def test_plugin_declares_read_and_write_without_embedded_secrets() -> None:

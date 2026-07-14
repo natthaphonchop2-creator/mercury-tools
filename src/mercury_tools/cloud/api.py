@@ -9,7 +9,7 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Any
 
 import httpx
@@ -26,10 +26,15 @@ from mercury_tools.catalog.models import (
 from mercury_tools.cloud.models import (
     PublicConnectorsEnvelope,
     PublicDocument,
+    PublicEvidenceRequest,
+    PublicEvidenceSelection,
+    PublicEvidenceSelectionsEnvelope,
     PublicSearchEnvelope,
     PublicSkill,
     PublicSkillDetail,
     PublicSkillsEnvelope,
+    PublicValidationEvidence,
+    PublicValidationResolveRequest,
     is_canonical_document_identifier,
     is_canonical_public_wiki_uri,
     is_canonical_skill_id,
@@ -41,7 +46,13 @@ from mercury_tools.config import Settings, load_settings
 from mercury_tools.db.catalog import SupabaseCatalogStore
 from mercury_tools.db.product import SKILL_CATALOG_SEED
 from mercury_tools.db.supabase import SupabaseRagStore
+from mercury_tools.db.validation import ResolveResult, SupabaseValidationStore
 from mercury_tools.mercury_runtime import skill_markdown
+from mercury_tools.qualification.selection import (
+    EvidenceRequest,
+    EvidenceSelection,
+    select_evidence,
+)
 from mercury_tools.rag.models import (
     SearchFilters,
     SearchResult,
@@ -99,6 +110,7 @@ class CloudDependencies:
     settings: Settings | None = None
     catalog_store: Any | None = None
     rag_store: Any | None = None
+    validation_store: Any | None = None
     skills: Sequence[Mapping[str, Any]] | None = None
     skill_loader: Callable[[str], str | None] = skill_markdown
 
@@ -111,6 +123,13 @@ class CloudDependencies:
         if self.rag_store is None:
             self.rag_store = SupabaseRagStore(self.settings or load_settings())
         return self.rag_store
+
+    def _validation_store(self) -> Any:
+        if self.validation_store is None:
+            self.validation_store = SupabaseValidationStore(
+                self.settings or load_settings()
+            )
+        return self.validation_store
 
     def _skills(self) -> Sequence[Mapping[str, Any]]:
         return _CANONICAL_SKILLS
@@ -163,6 +182,38 @@ class CloudDependencies:
         except _ORDINARY_DEPENDENCY_ERRORS:
             return _service_unavailable()
         return JSONResponse({"action": payload})
+
+    async def resolve_validation(self, request: Request) -> Response:
+        try:
+            batch = PublicValidationResolveRequest.model_validate_json(
+                await request.body()
+            )
+            evidence_requests = tuple(
+                EvidenceRequest.model_validate(item.model_dump(mode="python"))
+                for item in batch.requests
+            )
+        except (TypeError, ValueError, UnicodeDecodeError):
+            return _bad_request()
+
+        try:
+            resolved_at = datetime.now(UTC)
+            resolved = await run_in_threadpool(
+                self._validation_store().resolve,
+                evidence_requests,
+                resolved_at,
+            )
+            validated = ResolveResult.model_validate(resolved)
+            selections = _ordered_public_evidence_selections(
+                batch,
+                validated,
+                now=resolved_at,
+            )
+            envelope = PublicEvidenceSelectionsEnvelope.model_validate(
+                {"selections": selections}
+            )
+        except _ORDINARY_DEPENDENCY_ERRORS:
+            return _service_unavailable()
+        return JSONResponse(envelope.model_dump(mode="json"))
 
     async def list_connectors(self, request: Request) -> Response:
         try:
@@ -344,6 +395,11 @@ def cloud_routes(dependencies: CloudDependencies) -> list[Route]:
             dependencies.get_action,
             methods=["GET"],
         ),
+        Route(
+            "/api/cloud/v1/catalog/validation/resolve",
+            dependencies.resolve_validation,
+            methods=["POST"],
+        ),
         Route("/api/cloud/v1/connectors", dependencies.list_connectors, methods=["GET"]),
         Route("/api/cloud/v1/skills", dependencies.list_skills, methods=["GET"]),
         Route(
@@ -362,6 +418,65 @@ def cloud_routes(dependencies: CloudDependencies) -> list[Route]:
             methods=["GET"],
         ),
     ]
+
+
+def _ordered_public_evidence_selections(
+    batch: PublicValidationResolveRequest,
+    resolved: ResolveResult,
+    *,
+    now: datetime,
+) -> tuple[PublicEvidenceSelection, ...]:
+    by_scope: dict[tuple[str, str, str, str], EvidenceSelection] = {}
+    for entry in resolved.entries:
+        scope = entry.request.scope_key
+        if scope in by_scope:
+            raise ValueError("cloud_validation_response_invalid")
+        selected_again = select_evidence(
+            entry.selection.records,
+            request=entry.request,
+            now=now,
+        )
+        if selected_again != entry.selection:
+            raise ValueError("cloud_validation_response_invalid")
+        by_scope[scope] = entry.selection
+
+    expected = {request.scope_key for request in batch.requests}
+    if set(by_scope) != expected:
+        raise ValueError("cloud_validation_response_invalid")
+
+    return tuple(
+        _public_evidence_selection(request, by_scope[request.scope_key])
+        for request in batch.requests
+    )
+
+
+def _public_evidence_selection(
+    request: PublicEvidenceRequest,
+    selection: EvidenceSelection,
+) -> PublicEvidenceSelection:
+    selected = selection.selected
+    if selected is None:
+        blockers = selection.blocking_conditions or ("validation_unavailable",)
+        return PublicEvidenceSelection.model_validate(
+            {"selected": None, "blocking_conditions": blockers}
+        )
+    if not selected.approved_public or request.scope_key != (
+        selected.connector_id,
+        selected.action_id,
+        selected.version_id,
+        selected.environment,
+    ):
+        raise ValueError("cloud_validation_response_invalid")
+
+    evidence = PublicValidationEvidence.model_validate(
+        {
+            field: getattr(selected, field)
+            for field in PublicValidationEvidence.model_fields
+        }
+    )
+    return PublicEvidenceSelection.model_validate(
+        {"selected": evidence, "blocking_conditions": ()}
+    )
 
 
 def sanitize_search_query(value: str) -> str:
