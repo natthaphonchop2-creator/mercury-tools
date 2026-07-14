@@ -30,6 +30,7 @@ from mercury_tools.qualification.flowaccount import (
     create_flowaccount_qualification_runner,
 )
 from mercury_tools.qualification.models import QualificationRunState
+from mercury_tools.qualification.peak import load_peak_contract_report
 from mercury_tools.rag.embeddings import create_embedding_provider
 from mercury_tools.rag.ingest import ingest_wiki
 from mercury_tools.rag.models import SearchFilters, public_search_result_payload
@@ -161,6 +162,30 @@ def cmd_catalog_qualify(args: argparse.Namespace) -> int:
         )
     _print_json(report.public_dict())
     return 0 if report.run_state is QualificationRunState.COMPLETED else 1
+
+
+def cmd_catalog_validate(args: argparse.Namespace) -> int:
+    if (args.connector, args.all) != ("peak", True):
+        _print_json(
+            {
+                "status": "error",
+                "error": "qualification_scope_not_supported",
+            }
+        )
+        return 2
+
+    try:
+        report = load_peak_contract_report(Path(args.repo_root))
+    except Exception:
+        _print_json(
+            {
+                "status": "error",
+                "error": "catalog_validation_failed",
+            }
+        )
+        return 1
+    _print_json(report.public_dict())
+    return 0
 
 
 def cmd_mcp_serve(args: argparse.Namespace) -> int:
@@ -663,6 +688,12 @@ def build_parser() -> argparse.ArgumentParser:
     qualify.add_argument("--dry-run", action="store_true")
     qualify.add_argument("--repo-root", default=".")
     qualify.set_defaults(func=cmd_catalog_qualify)
+
+    validate = catalog_sub.add_parser("validate")
+    validate.add_argument("--connector", required=True)
+    validate.add_argument("--all", action="store_true")
+    validate.add_argument("--repo-root", default=".")
+    validate.set_defaults(func=cmd_catalog_validate)
 
     ingest = sub.add_parser("ingest")
     ingest_sub = ingest.add_subparsers(dest="ingest_command", required=True)

@@ -100,6 +100,85 @@ def test_catalog_qualify_parser_exposes_exact_supported_command() -> None:
     assert callable(args.func)
 
 
+def test_catalog_validate_parser_exposes_exact_peak_contract_command() -> None:
+    from mercury_tools.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "catalog",
+            "validate",
+            "--connector",
+            "peak",
+            "--all",
+            "--repo-root",
+            ".",
+        ]
+    )
+
+    assert args.catalog_command == "validate"
+    assert args.connector == "peak"
+    assert args.all is True
+    assert args.repo_root == "."
+    assert not hasattr(args, "environment")
+    assert callable(args.func)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        argparse.Namespace(connector="flowaccount", all=True, repo_root="."),
+        argparse.Namespace(connector="peak", all=False, repo_root="."),
+    ],
+)
+def test_catalog_validate_unsupported_scope_is_constant_json_exit_two(
+    args: argparse.Namespace,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from mercury_tools import cli
+
+    monkeypatch.setattr(
+        cli,
+        "load_peak_contract_report",
+        lambda _root: (_ for _ in ()).throw(AssertionError("peak_validator_called")),
+        raising=False,
+    )
+
+    assert cli.cmd_catalog_validate(args) == 2
+
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "qualification_scope_not_supported",
+        "status": "error",
+    }
+
+
+def test_catalog_validate_peak_is_contract_only_and_prints_completed_report(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from mercury_tools import cli
+
+    root = Path(__file__).resolve().parents[1]
+
+    def forbid_credentials_or_network(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("credential_or_network_call")
+
+    monkeypatch.setattr(cli, "load_settings", forbid_credentials_or_network)
+    monkeypatch.setattr(cli, "read_token", forbid_credentials_or_network)
+    args = argparse.Namespace(connector="peak", all=True, repo_root=str(root))
+
+    assert cli.cmd_catalog_validate(args) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["connector_id"] == "peak"
+    assert payload["environment"] == "production"
+    assert payload["run_state"] == QualificationRunState.COMPLETED.value
+    assert payload["total"] == 64
+    assert payload["counts"] == {ValidationStatus.BLOCKED_MISSING_CREDENTIALS.value: 64}
+    assert payload["http_attempts"] == 0
+    assert payload["mutation_attempts"] == 0
+
+
 @pytest.mark.parametrize(
     "args",
     [
