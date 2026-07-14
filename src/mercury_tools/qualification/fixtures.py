@@ -85,7 +85,10 @@ class CleanupReport(StrictSafeModel):
             or set(self.failed_handles) & set(self.outcome_unknown_handles)
         ):
             raise ValueError("cleanup_report_handle_invalid")
-        if self.publication_allowed != (self.run_state is QualificationRunState.COMPLETED):
+        if (
+            self.publication_allowed
+            and self.run_state is not QualificationRunState.COMPLETED
+        ):
             raise ValueError("cleanup_report_state_invalid")
         return self
 

@@ -8,7 +8,7 @@ import os
 import re
 import secrets
 import stat
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -71,7 +71,7 @@ class _StoredFixture(FixtureReference):
         return self
 
 
-class _PersistedRun(StrictSafeModel):
+class _RunRecord(StrictSafeModel):
     run_id: str = Field(pattern=r"^run_[0-9A-HJKMNP-TV-Z]{26}$")
     state: QualificationRunState
     publication_allowed: bool
@@ -81,12 +81,10 @@ class _PersistedRun(StrictSafeModel):
     fixtures: tuple[_StoredFixture, ...] = ()
 
     @model_validator(mode="after")
-    def validate_run_state(self) -> _PersistedRun:
+    def validate_run_state(self) -> _RunRecord:
         _require_utc_timestamp(self.created_at)
         _require_utc_timestamp(self.updated_at)
         if self.updated_at < self.created_at:
-            raise ValueError("qualification_state_invalid")
-        if self.publication_allowed:
             raise ValueError("qualification_state_invalid")
         handles = tuple(fixture.handle for fixture in self.fixtures)
         if handles != tuple(sorted(handles)) or len(handles) != len(set(handles)):
@@ -105,6 +103,37 @@ class _PersistedRun(StrictSafeModel):
             raise ValueError("qualification_state_invalid")
         if self.state is QualificationRunState.COMPLETED and any(
             fixture.cleanup_status is not CleanupStatus.CLEANED for fixture in self.fixtures
+        ):
+            raise ValueError("qualification_state_invalid")
+        return self
+
+
+class _PersistedRun(_RunRecord):
+    @model_validator(mode="after")
+    def validate_publication_disabled(self) -> _PersistedRun:
+        if self.publication_allowed:
+            raise ValueError("qualification_state_invalid")
+        return self
+
+
+class _LegacyCompletedRun(_RunRecord):
+    @model_validator(mode="before")
+    @classmethod
+    def require_canonical_publication_flag(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping) or value.get("publication_allowed") is not True:
+            raise ValueError("qualification_state_invalid")
+        return value
+
+    @model_validator(mode="after")
+    def validate_legacy_completion(self) -> _LegacyCompletedRun:
+        if (
+            self.state is not QualificationRunState.COMPLETED
+            or not self.publication_allowed
+            or self.quarantine_reason is not None
+            or any(
+                fixture.cleanup_status is not CleanupStatus.CLEANED
+                for fixture in self.fixtures
+            )
         ):
             raise ValueError("qualification_state_invalid")
         return self
@@ -135,7 +164,7 @@ class QualificationRunStore:
         run_fd = _open_run_directory(self._root, self._run_id)
         try:
             self._run_directory_identity = _directory_identity(run_fd)
-            existing = _read_state(run_fd)
+            existing, migrate_legacy = _read_state(run_fd)
             recovered = existing is not None
             if existing is None:
                 now = self._timestamp()
@@ -155,6 +184,8 @@ class QualificationRunStore:
             else:
                 if existing.run_id != self._run_id:
                     raise ValueError("qualification_state_invalid")
+                if migrate_legacy:
+                    _write_state(self._root, self._run_id, run_fd, existing)
                 _validate_run_directory_binding(self._root, self._run_id, run_fd)
                 self._record = existing
                 self._validate_runtime_binding()
@@ -571,11 +602,11 @@ def _validate_expected_run_directory_binding(
                 os.close(lexical_fd)
 
 
-def _read_state(run_fd: int) -> _PersistedRun | None:
+def _read_state(run_fd: int) -> tuple[_PersistedRun | None, bool]:
     try:
         state = os.stat(_STATE_NAME, dir_fd=run_fd, follow_symlinks=False)
     except FileNotFoundError:
-        return None
+        return None, False
     except OSError:
         raise ValueError("qualification_state_path_unsafe") from None
     if stat.S_ISLNK(state.st_mode) or not stat.S_ISREG(state.st_mode):
@@ -600,7 +631,14 @@ def _read_state(run_fd: int) -> _PersistedRun | None:
         payload = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_object)
         if not isinstance(payload, dict):
             raise ValueError
-        return _PersistedRun.model_validate(payload)
+        try:
+            return _PersistedRun.model_validate(payload), False
+        except ValueError:
+            legacy = _LegacyCompletedRun.model_validate(payload)
+            normalized = _PersistedRun.model_validate(
+                {**legacy.model_dump(mode="python"), "publication_allowed": False}
+            )
+            return normalized, True
     except ValueError as exc:
         if str(exc) == "qualification_state_path_unsafe":
             raise

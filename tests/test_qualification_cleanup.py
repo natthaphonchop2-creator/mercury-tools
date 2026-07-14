@@ -15,6 +15,7 @@ from mercury_tools.qualification import run_store as run_store_module
 from mercury_tools.qualification.fixtures import (
     CleanupCoordinator,
     CleanupOutcome,
+    CleanupReport,
     FixtureRegistry,
 )
 from mercury_tools.qualification.models import QualificationRunState
@@ -97,6 +98,23 @@ def _state_payload(root: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _write_state_payload(root: Path, payload: dict[str, object]) -> None:
+    path = root / ".mercury" / "validation" / RUN_ID / "state.json"
+    path.write_text(
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _legacy_completed_payload(root: Path) -> dict[str, object]:
+    store = QualificationRunStore(root, RUN_ID)
+    asyncio.run(CleanupCoordinator(_registry(), RecordingCleanupAdapter(), store).cleanup())
+    payload = _state_payload(root)
+    payload["publication_allowed"] = True
+    _write_state_payload(root, payload)
+    return payload
+
+
 def test_cleanup_runs_once_in_reverse_dependency_order_and_persists_opaque_state(
     tmp_path: Path,
 ) -> None:
@@ -170,6 +188,177 @@ def test_cleanup_runs_once_in_reverse_dependency_order_and_persists_opaque_state
     assert reopened.state is QualificationRunState.COMPLETED
     assert reopened.publication_allowed is False
     assert _state_payload(tmp_path)["publication_allowed"] is False
+
+
+def test_reopened_completed_store_returns_non_publishable_cleanup_report_without_dispatch(
+    tmp_path: Path,
+) -> None:
+    initial_store = QualificationRunStore(tmp_path, RUN_ID)
+    asyncio.run(
+        CleanupCoordinator(_registry(), RecordingCleanupAdapter(), initial_store).cleanup()
+    )
+    reopened = QualificationRunStore(tmp_path, RUN_ID)
+    recovery_adapter = RecordingCleanupAdapter()
+
+    report = asyncio.run(CleanupCoordinator(_registry(), recovery_adapter, reopened).cleanup())
+
+    assert recovery_adapter.calls == []
+    assert report.attempted_handles == ()
+    assert report.run_state is QualificationRunState.COMPLETED
+    assert report.publication_allowed is False
+    assert reopened.publication_allowed is False
+
+
+@pytest.mark.parametrize(
+    "run_state",
+    [QualificationRunState.FAILED, QualificationRunState.QUARANTINED],
+)
+def test_cleanup_report_rejects_publication_for_non_completed_state(
+    run_state: QualificationRunState,
+) -> None:
+    with pytest.raises(ValueError, match="cleanup_report_state_invalid"):
+        CleanupReport(run_state=run_state, publication_allowed=True)
+
+
+def test_reopen_atomically_migrates_valid_legacy_completed_publication_state(
+    tmp_path: Path,
+) -> None:
+    legacy = _legacy_completed_payload(tmp_path)
+
+    reopened = QualificationRunStore(tmp_path, RUN_ID)
+
+    expected = {**legacy, "publication_allowed": False}
+    assert _state_payload(tmp_path) == expected
+    assert reopened.state is QualificationRunState.COMPLETED
+    assert reopened.publication_allowed is False
+    reopened.complete()
+    assert reopened.publication_allowed is False
+    run_dir = tmp_path / ".mercury" / "validation" / RUN_ID
+    assert not tuple(run_dir.glob(".state-*.tmp"))
+
+
+@pytest.mark.parametrize(
+    "invalid_kind",
+    [
+        "failed",
+        "quarantined",
+        "pending_cleanup",
+        "quarantine_reason",
+        "non_boolean_publication",
+    ],
+)
+def test_legacy_publication_migration_rejects_non_completed_or_malformed_state(
+    tmp_path: Path,
+    invalid_kind: str,
+) -> None:
+    legacy = _legacy_completed_payload(tmp_path)
+    if invalid_kind == "failed":
+        legacy["state"] = QualificationRunState.FAILED.value
+    elif invalid_kind == "quarantined":
+        legacy["state"] = QualificationRunState.QUARANTINED.value
+        legacy["quarantine_reason"] = "cleanup_failed"
+    elif invalid_kind == "pending_cleanup":
+        fixtures = legacy["fixtures"]
+        assert isinstance(fixtures, list)
+        fixture = fixtures[0]
+        assert isinstance(fixture, dict)
+        fixture["cleanup_status"] = CleanupStatus.PENDING.value
+        fixture["cleanup_updated_at"] = None
+    elif invalid_kind == "quarantine_reason":
+        legacy["quarantine_reason"] = "cleanup_failed"
+    else:
+        legacy["publication_allowed"] = 1
+    _write_state_payload(tmp_path, legacy)
+    state_path = tmp_path / ".mercury" / "validation" / RUN_ID / "state.json"
+    before = state_path.read_bytes()
+
+    with pytest.raises(ValueError, match="^qualification_state_invalid$"):
+        QualificationRunStore(tmp_path, RUN_ID)
+
+    assert state_path.read_bytes() == before
+    assert _state_payload(tmp_path) == legacy
+    assert not tuple(state_path.parent.glob(".state-*.tmp"))
+
+
+def test_legacy_publication_migration_rename_failure_keeps_original_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy = _legacy_completed_payload(tmp_path)
+    state_path = tmp_path / ".mercury" / "validation" / RUN_ID / "state.json"
+    before = state_path.read_bytes()
+
+    def fail_rename(*args, **kwargs):
+        raise OSError("simulated legacy migration rename failure")
+
+    monkeypatch.setattr(run_store_module.os, "rename", fail_rename)
+    monkeypatch.setattr(
+        run_store_module.os,
+        "supports_dir_fd",
+        run_store_module.os.supports_dir_fd | {fail_rename},
+    )
+
+    with pytest.raises(ValueError, match="^qualification_state_write_failed$"):
+        QualificationRunStore(tmp_path, RUN_ID)
+
+    assert state_path.read_bytes() == before
+    assert _state_payload(tmp_path) == legacy
+    assert not tuple(state_path.parent.glob(".state-*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="dir_fd checks require POSIX")
+@pytest.mark.parametrize(
+    ("failure_phase", "expected_error"),
+    [
+        ("post_rename_binding", "qualification_state_path_unsafe"),
+        ("directory_fsync", "qualification_state_write_failed"),
+    ],
+)
+def test_legacy_publication_migration_post_rename_failure_stays_non_publishable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_phase: str,
+    expected_error: str,
+) -> None:
+    _legacy_completed_payload(tmp_path)
+    real_validate = run_store_module._validate_run_directory_binding
+    real_fsync = run_store_module.os.fsync
+    binding_checks = 0
+
+    def fail_after_rename_binding(root: Path, run_id: str, run_fd: int) -> None:
+        nonlocal binding_checks
+        real_validate(root, run_id, run_fd)
+        binding_checks += 1
+        if binding_checks >= 2:
+            raise ValueError("qualification_state_path_unsafe")
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError(errno.EIO, "simulated legacy migration directory fsync failure")
+        real_fsync(descriptor)
+
+    with monkeypatch.context() as faults:
+        if failure_phase == "post_rename_binding":
+            faults.setattr(
+                run_store_module,
+                "_validate_run_directory_binding",
+                fail_after_rename_binding,
+            )
+        else:
+            faults.setattr(run_store_module.os, "fsync", fail_directory_fsync)
+
+        with pytest.raises(ValueError, match=f"^{expected_error}$"):
+            QualificationRunStore(tmp_path, RUN_ID)
+
+        migrated = _state_payload(tmp_path)
+        assert migrated["state"] == QualificationRunState.COMPLETED.value
+        assert migrated["publication_allowed"] is False
+
+    reopened = QualificationRunStore(tmp_path, RUN_ID)
+    assert reopened.state is QualificationRunState.COMPLETED
+    assert reopened.publication_allowed is False
+    state_path = tmp_path / ".mercury" / "validation" / RUN_ID / "state.json"
+    assert not tuple(state_path.parent.glob(".state-*.tmp"))
 
 
 def test_registry_public_references_and_cleanup_report_never_expose_provider_ids(
