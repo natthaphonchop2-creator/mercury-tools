@@ -121,19 +121,66 @@ def _wiki_declaration(
     *,
     object_format: str = "sha1",
 ) -> tuple[HostedReceipt, HostedReceipt]:
-    payload_boundaries: list[HostedObjectBoundary] = []
-    for object_type, data in payloads:
-        oid = _git_oid(object_type, data, object_format)
-        payload_boundaries.append(
-            _typed_boundary(
-                data,
-                object_type=f"wiki_reachable_{object_type}",
-                object_id=f"git/{object_type}/{oid}",
-            )
+    blob_payloads = tuple(data for object_type, data in payloads if object_type == "blob")
+    tag_payloads = tuple(data for object_type, data in payloads if object_type == "tag")
+    if (
+        not blob_payloads
+        or len(blob_payloads) + len(tag_payloads) != len(payloads)
+    ):
+        raise ValueError("wiki_fixture_requires_reachable_blob_or_tag_payloads")
+    blob_objects = tuple(
+        ("blob", data, _git_oid("blob", data, object_format))
+        for data in blob_payloads
+    )
+    oid_size = 20 if object_format == "sha1" else 32
+    tree = b"".join(
+        b"100644 blob-"
+        + f"{index:06d}".encode("ascii")
+        + b".bin\0"
+        + bytes.fromhex(oid)
+        for index, (_object_type, _data, oid) in enumerate(blob_objects)
+    )
+    assert all(len(bytes.fromhex(oid)) == oid_size for _, _, oid in blob_objects)
+    tree_oid = _git_oid("tree", tree, object_format)
+    commit = (
+        f"tree {tree_oid}\n"
+        "author Release Test <release@example.invalid> 0 +0000\n"
+        "committer Release Test <release@example.invalid> 0 +0000\n"
+        "\n"
+        "safe wiki commit\n"
+    ).encode("ascii")
+    commit_oid = _git_oid("commit", commit, object_format)
+    tag_objects = tuple(
+        ("tag", data, _git_oid("tag", data, object_format)) for data in tag_payloads
+    )
+    public_objects = (
+        *blob_objects,
+        *tag_objects,
+        ("commit", commit, commit_oid),
+        ("tree", tree, tree_oid),
+    )
+    payload_boundaries = tuple(
+        _typed_boundary(
+            data,
+            object_type=f"wiki_reachable_{object_type}",
+            object_id=f"git/{object_type}/{oid}",
         )
+        for object_type, data, oid in public_objects
+    )
 
-    head_oid = payload_boundaries[0].object_id.rsplit("/", 1)[-1]
-    local_refs = f"refs/heads/main\t{head_oid}\t\n".encode("ascii")
+    tag_ref_records: list[tuple[str, str, str]] = []
+    for index, (_object_type, data, tag_oid) in enumerate(tag_objects):
+        target_line = data.partition(b"\n")[0]
+        target_oid = target_line.removeprefix(b"object ").decode("ascii")
+        tag_ref_records.append((f"refs/tags/proof-{index}", tag_oid, target_oid))
+    local_refs = (
+        f"refs/heads/main\t{commit_oid}\t\n"
+        + "".join(
+            f"{ref}\t{tag_oid}\t{target_oid}\n"
+            for ref, tag_oid, target_oid in tag_ref_records
+        )
+    ).encode("ascii")
+    head_oid = commit_oid
     head = f"{head_oid}\n".encode("ascii")
     command_data = (
         b"safe clone output",
@@ -151,6 +198,9 @@ def _wiki_declaration(
         for object_id, data in zip(_WIKI_COMMAND_IDS, command_data, strict=True)
     )
     remote_refs = {"HEAD": head_oid, "refs/heads/main": head_oid}
+    for ref, tag_oid, target_oid in tag_ref_records:
+        remote_refs[ref] = tag_oid
+        remote_refs[f"{ref}^{{}}"] = target_oid
     remote_ref_payload = json.dumps(
         sorted(remote_refs.items()),
         ensure_ascii=True,
@@ -169,6 +219,14 @@ def _wiki_declaration(
             ),
             "reachable_tag_count": sum(
                 boundary.object_type == "wiki_reachable_tag"
+                for boundary in payload_boundaries
+            ),
+            "reachable_commit_count": sum(
+                boundary.object_type == "wiki_reachable_commit"
+                for boundary in payload_boundaries
+            ),
+            "reachable_tree_count": sum(
+                boundary.object_type == "wiki_reachable_tree"
                 for boundary in payload_boundaries
             ),
             "command_object_count": len(command_boundaries),
@@ -190,7 +248,7 @@ def _wiki_declaration(
         object_id="wiki/mirror-inventory/v1",
     )
     boundaries = (*command_boundaries, inventory_boundary, *payload_boundaries)
-    chunks = (*command_data, manifest, *(data for _object_type, data in payloads))
+    chunks = (*command_data, manifest, *(data for _object_type, data, _oid in public_objects))
     query_data = b"".join(
         f"{oid}\t{ref}\n".encode("ascii") for ref, oid in remote_refs.items()
     )
@@ -687,7 +745,12 @@ def test_wiki_object_identity_must_match_canonical_git_framing(
             "tagger Release Test <release@example.invalid> 0 +0000\n\n"
             "safe annotated tag\n"
         ).encode("ascii")
-    query, download = _wiki_declaration(((object_type, data),))
+    payloads = (
+        (("blob", data),)
+        if object_type == "blob"
+        else (("blob", blob), ("tag", data))
+    )
+    query, download = _wiki_declaration(payloads)
     boundaries = list(download.object_boundaries or ())
     payload_index = next(
         index
@@ -700,12 +763,17 @@ def test_wiki_object_identity_must_match_canonical_git_framing(
         object_id=f"git/{object_type}/{forged_oid}",
     )
     download = replace(download, object_boundaries=tuple(boundaries))
-    download = _replace_wiki_manifest(
-        download,
-        lambda manifest: manifest["payload_objects"][0].__setitem__(
-            "object_id", f"git/{object_type}/{forged_oid}"
-        ),
-    )
+    def forge_manifest_identity(manifest: dict[str, object]) -> None:
+        entries = manifest["payload_objects"]
+        assert isinstance(entries, list)
+        entry = next(
+            item
+            for item in entries
+            if item["object_type"] == f"wiki_reachable_{object_type}"
+        )
+        entry["object_id"] = f"git/{object_type}/{forged_oid}"
+
+    download = _replace_wiki_manifest(download, forge_manifest_identity)
 
     result = _scan_wiki(query, download)
 

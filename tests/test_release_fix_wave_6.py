@@ -35,6 +35,25 @@ _STRICT_WIKI_BLOB_OID = hashlib.sha1(  # noqa: S324 - Git SHA-1 object identity.
     f"blob {len(_STRICT_WIKI_BLOB)}\0".encode("ascii") + _STRICT_WIKI_BLOB,
     usedforsecurity=False,
 ).hexdigest()
+_STRICT_WIKI_TREE = (
+    b"100644 Home.md\0" + bytes.fromhex(_STRICT_WIKI_BLOB_OID)
+)
+_STRICT_WIKI_TREE_OID = hashlib.sha1(  # noqa: S324 - Git SHA-1 object identity.
+    f"tree {len(_STRICT_WIKI_TREE)}\0".encode("ascii") + _STRICT_WIKI_TREE,
+    usedforsecurity=False,
+).hexdigest()
+_STRICT_WIKI_COMMIT = (
+    f"tree {_STRICT_WIKI_TREE_OID}\n"
+    "author Release Test <release-test@example.invalid> 1700000000 +0000\n"
+    "committer Release Test <release-test@example.invalid> 1700000000 +0000\n"
+    "\n"
+    "safe wiki commit\n"
+).encode("ascii")
+_STRICT_WIKI_COMMIT_OID = hashlib.sha1(  # noqa: S324 - Git SHA-1 object identity.
+    f"commit {len(_STRICT_WIKI_COMMIT)}\0".encode("ascii")
+    + _STRICT_WIKI_COMMIT,
+    usedforsecurity=False,
+).hexdigest()
 
 
 def _policy(**updates: object) -> SecretScanPolicy:
@@ -215,8 +234,8 @@ def _empty_archive_receipt(name: str) -> HostedReceipt:
 
 def _default_wiki_query(*, present: bool = True) -> HostedReceipt:
     remote_refs = (
-        f"{_STRICT_WIKI_BLOB_OID}\tHEAD\n"
-        f"{_STRICT_WIKI_BLOB_OID}\trefs/heads/main\n"
+        f"{_STRICT_WIKI_COMMIT_OID}\tHEAD\n"
+        f"{_STRICT_WIKI_COMMIT_OID}\trefs/heads/main\n"
     ).encode("ascii")
     return HostedReceipt(
         name="github_wiki_query",
@@ -336,8 +355,8 @@ def _inventory_manifest(
 ) -> bytes:
     commands = command_entries or []
     remote_refs = {
-        "HEAD": _STRICT_WIKI_BLOB_OID,
-        "refs/heads/main": _STRICT_WIKI_BLOB_OID,
+        "HEAD": _STRICT_WIKI_COMMIT_OID,
+        "refs/heads/main": _STRICT_WIKI_COMMIT_OID,
     }
     ref_payload = json.dumps(
         sorted(remote_refs.items()),
@@ -356,6 +375,14 @@ def _inventory_manifest(
                 entry.get("object_type") == "wiki_reachable_tag"
                 for entry in payload_entries
             ),
+            "reachable_commit_count": sum(
+                entry.get("object_type") == "wiki_reachable_commit"
+                for entry in payload_entries
+            ),
+            "reachable_tree_count": sum(
+                entry.get("object_type") == "wiki_reachable_tree"
+                for entry in payload_entries
+            ),
             "command_object_count": len(commands),
             "command_objects": commands,
             "payload_object_count": len(payload_entries),
@@ -371,8 +398,12 @@ def _strict_wiki_declaration() -> tuple[
 ]:
     blob = _STRICT_WIKI_BLOB
     blob_oid = _STRICT_WIKI_BLOB_OID
-    local_refs = f"refs/heads/main\t{blob_oid}\t\n".encode("ascii")
-    head = f"{blob_oid}\n".encode("ascii")
+    commit = _STRICT_WIKI_COMMIT
+    commit_oid = _STRICT_WIKI_COMMIT_OID
+    tree = _STRICT_WIKI_TREE
+    tree_oid = _STRICT_WIKI_TREE_OID
+    local_refs = f"refs/heads/main\t{commit_oid}\t\n".encode("ascii")
+    head = f"{commit_oid}\n".encode("ascii")
     command_chunks = (
         b"safe clone command output",
         local_refs,
@@ -398,9 +429,21 @@ def _strict_wiki_declaration() -> tuple[
         "byte_count": len(blob),
         "content_sha256": hashlib.sha256(blob).hexdigest(),
     }
+    commit_entry = {
+        "object_type": "wiki_reachable_commit",
+        "object_id": f"git/commit/{commit_oid}",
+        "byte_count": len(commit),
+        "content_sha256": hashlib.sha256(commit).hexdigest(),
+    }
+    tree_entry = {
+        "object_type": "wiki_reachable_tree",
+        "object_id": f"git/tree/{tree_oid}",
+        "byte_count": len(tree),
+        "content_sha256": hashlib.sha256(tree).hexdigest(),
+    }
     inventory = _inventory_manifest(
-        [blob_entry],
-        reachable_object_count=1,
+        [blob_entry, commit_entry, tree_entry],
+        reachable_object_count=3,
         reachable_blob_count=1,
         command_entries=[
             {
@@ -412,7 +455,7 @@ def _strict_wiki_declaration() -> tuple[
             for boundary in command_boundaries
         ],
     )
-    chunks = (*command_chunks, inventory, blob)
+    chunks = (*command_chunks, inventory, blob, commit, tree)
     boundaries = (
         *command_boundaries,
         _typed_boundary(
@@ -424,6 +467,16 @@ def _strict_wiki_declaration() -> tuple[
             (blob,),
             object_type="wiki_reachable_blob",
             object_id=f"git/blob/{blob_oid}",
+        ),
+        _typed_boundary(
+            (commit,),
+            object_type="wiki_reachable_commit",
+            object_id=f"git/commit/{commit_oid}",
+        ),
+        _typed_boundary(
+            (tree,),
+            object_type="wiki_reachable_tree",
+            object_id=f"git/tree/{tree_oid}",
         ),
     )
     return chunks, boundaries

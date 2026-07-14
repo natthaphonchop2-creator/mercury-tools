@@ -1596,11 +1596,29 @@ def _valid_ref_namespace(
     return True
 
 
+_GIT_PUBLIC_OBJECT_TYPE_ORDER = ("blob", "tag", "commit", "tree")
+_GIT_PUBLIC_OBJECT_TYPE_INDEX = {
+    object_type: index
+    for index, object_type in enumerate(_GIT_PUBLIC_OBJECT_TYPE_ORDER)
+}
+_GIT_TREE_MODES = {
+    "40000": "tree",
+    "100644": "blob",
+    "100755": "blob",
+    "120000": "blob",
+    "160000": "commit",
+}
+
+
 @dataclass(frozen=True, repr=False)
 class _GitPublicObject:
     object_type: str
     object_id: str
     data: bytes = field(repr=False)
+    validated_high_entropy_spans: frozenset[tuple[int, int]] = field(
+        default=frozenset(),
+        repr=False,
+    )
 
 
 @dataclass(frozen=True, repr=False)
@@ -1609,6 +1627,9 @@ class _GitReachableInventory:
     public_objects: tuple[_GitPublicObject, ...] = field(repr=False)
     object_count: int
     blob_count: int
+    tag_count: int
+    commit_count: int
+    tree_count: int
 
     @property
     def public_payloads(self) -> tuple[bytes, ...]:
@@ -1620,6 +1641,401 @@ class _GitObject:
     object_type: str
     size: int
     data: bytes = field(repr=False)
+
+
+@dataclass(frozen=True, repr=False)
+class _GitTreeEntry:
+    mode: str
+    object_type: str
+    object_id: str
+    name: bytes = field(repr=False)
+    object_id_span: tuple[int, int] = field(repr=False)
+
+
+@dataclass(frozen=True, repr=False)
+class _CanonicalGitObject:
+    public_object: _GitPublicObject = field(repr=False)
+    references: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+    tree_entries: tuple[_GitTreeEntry, ...] = field(default=(), repr=False)
+
+
+@dataclass(frozen=True, repr=False)
+class _CanonicalGitCorpus:
+    objects: tuple[_CanonicalGitObject, ...] = field(repr=False)
+    tree_entry_count: int
+
+    @property
+    def public_objects(self) -> tuple[_GitPublicObject, ...]:
+        return tuple(item.public_object for item in self.objects)
+
+    @property
+    def by_oid(self) -> dict[str, _CanonicalGitObject]:
+        return {item.public_object.object_id: item for item in self.objects}
+
+
+@dataclass(frozen=True, repr=False)
+class _GitHeaderRecord:
+    key: bytes = field(repr=False)
+    value: bytes = field(repr=False)
+    value_span: tuple[int, int]
+    continued: bool = False
+
+
+def _git_object_format_for_oids(oids: Iterable[str]) -> str | None:
+    lengths = {len(oid) for oid in oids}
+    if lengths == {40}:
+        return "sha1"
+    if lengths == {64}:
+        return "sha256"
+    return None
+
+
+def _canonical_git_object_oid(
+    data: bytes,
+    object_type: str,
+    object_format: str,
+) -> str:
+    if object_type not in _GIT_PUBLIC_OBJECT_TYPE_INDEX:
+        raise ValueError("git_object_type_invalid")
+    framed = f"{object_type} {len(data)}\0".encode("ascii") + data
+    if object_format == "sha1":
+        return hashlib.sha1(  # noqa: S324 - canonical Git SHA-1 identity.
+            framed,
+            usedforsecurity=False,
+        ).hexdigest()
+    if object_format == "sha256":
+        return hashlib.sha256(framed).hexdigest()
+    raise ValueError("git_object_format_invalid")
+
+
+def _parse_git_headers(data: bytes, malformed_code: str) -> tuple[_GitHeaderRecord, ...]:
+    separator = data.find(b"\n\n")
+    if separator <= 0:
+        raise ReleaseGateError(malformed_code)
+    header = data[:separator]
+    if b"\0" in header or b"\r" in header:
+        raise ReleaseGateError(malformed_code)
+    records: list[_GitHeaderRecord] = []
+    cursor = 0
+    while cursor < len(header):
+        line_end = header.find(b"\n", cursor)
+        if line_end < 0:
+            line_end = len(header)
+        line = header[cursor:line_end]
+        if not line:
+            raise ReleaseGateError(malformed_code)
+        if line.startswith(b" "):
+            if not records:
+                raise ReleaseGateError(malformed_code)
+            previous = records[-1]
+            records[-1] = _GitHeaderRecord(
+                previous.key,
+                previous.value,
+                previous.value_span,
+                continued=True,
+            )
+        else:
+            key, space, value = line.partition(b" ")
+            if (
+                space != b" "
+                or not value
+                or re.fullmatch(rb"[a-z][a-z0-9-]*", key) is None
+            ):
+                raise ReleaseGateError(malformed_code)
+            value_start = cursor + len(key) + 1
+            records.append(
+                _GitHeaderRecord(
+                    key,
+                    value,
+                    (value_start, line_end),
+                )
+            )
+        cursor = line_end + 1
+    return tuple(records)
+
+
+def _validated_git_oid_header(
+    record: _GitHeaderRecord,
+    *,
+    oid_length: int,
+    malformed_code: str,
+) -> tuple[str, tuple[int, int]]:
+    if record.continued or re.fullmatch(rb"[0-9a-f]+", record.value) is None:
+        raise ReleaseGateError(malformed_code)
+    if len(record.value) != oid_length:
+        raise ReleaseGateError(malformed_code)
+    return record.value.decode("ascii"), record.value_span
+
+
+def _parse_canonical_git_commit(
+    data: bytes,
+    object_format: str,
+) -> tuple[tuple[tuple[str, str], ...], frozenset[tuple[int, int]]]:
+    records = _parse_git_headers(data, "git_commit_inventory_malformed")
+    oid_length = 40 if object_format == "sha1" else 64 if object_format == "sha256" else 0
+    if oid_length == 0 or not records or records[0].key != b"tree":
+        raise ReleaseGateError("git_commit_inventory_malformed")
+    tree_oid, tree_span = _validated_git_oid_header(
+        records[0],
+        oid_length=oid_length,
+        malformed_code="git_commit_inventory_malformed",
+    )
+    references: list[tuple[str, str]] = [(tree_oid, "tree")]
+    spans = {tree_span}
+    cursor = 1
+    parent_oids: set[str] = set()
+    while cursor < len(records) and records[cursor].key == b"parent":
+        parent_oid, parent_span = _validated_git_oid_header(
+            records[cursor],
+            oid_length=oid_length,
+            malformed_code="git_commit_inventory_malformed",
+        )
+        if parent_oid in parent_oids:
+            raise ReleaseGateError("git_commit_inventory_malformed")
+        parent_oids.add(parent_oid)
+        references.append((parent_oid, "commit"))
+        spans.add(parent_span)
+        cursor += 1
+    if (
+        cursor + 1 >= len(records)
+        or records[cursor].key != b"author"
+        or records[cursor].continued
+        or records[cursor + 1].key != b"committer"
+        or records[cursor + 1].continued
+    ):
+        raise ReleaseGateError("git_commit_inventory_malformed")
+    cursor += 2
+    if any(
+        record.key in {b"tree", b"parent", b"author", b"committer"}
+        for record in records[cursor:]
+    ):
+        raise ReleaseGateError("git_commit_inventory_malformed")
+    return tuple(references), frozenset(spans)
+
+
+def _parse_canonical_git_tag(
+    data: bytes,
+    object_format: str,
+) -> tuple[tuple[tuple[str, str], ...], frozenset[tuple[int, int]]]:
+    records = _parse_git_headers(data, "git_tag_inventory_malformed")
+    oid_length = 40 if object_format == "sha1" else 64 if object_format == "sha256" else 0
+    if (
+        oid_length == 0
+        or len(records) < 4
+        or tuple(record.key for record in records[:4])
+        != (b"object", b"type", b"tag", b"tagger")
+        or any(record.continued for record in records[:4])
+        or records[1].value not in {b"blob", b"commit", b"tag", b"tree"}
+        or any(
+            record.key in {b"object", b"type", b"tag", b"tagger"}
+            for record in records[4:]
+        )
+    ):
+        raise ReleaseGateError("git_tag_inventory_malformed")
+    target_oid, target_span = _validated_git_oid_header(
+        records[0],
+        oid_length=oid_length,
+        malformed_code="git_tag_inventory_malformed",
+    )
+    return (
+        ((target_oid, records[1].value.decode("ascii")),),
+        frozenset({target_span}),
+    )
+
+
+def _parse_canonical_git_tree(
+    data: bytes,
+    object_format: str,
+) -> tuple[_GitTreeEntry, ...]:
+    oid_size = 20 if object_format == "sha1" else 32 if object_format == "sha256" else 0
+    if oid_size == 0:
+        raise ReleaseGateError("git_tree_inventory_malformed")
+    entries: list[_GitTreeEntry] = []
+    names: set[bytes] = set()
+    previous_sort_key: bytes | None = None
+    cursor = 0
+    while cursor < len(data):
+        mode_end = data.find(b" ", cursor)
+        if mode_end < 0:
+            raise ReleaseGateError("git_tree_inventory_malformed")
+        mode_bytes = data[cursor:mode_end]
+        try:
+            mode = mode_bytes.decode("ascii", errors="strict")
+        except UnicodeError as exc:
+            raise ReleaseGateError("git_tree_inventory_malformed") from exc
+        name_end = data.find(b"\0", mode_end + 1)
+        oid_start = name_end + 1
+        oid_end = oid_start + oid_size
+        if (
+            name_end < 0
+            or oid_end > len(data)
+            or mode not in _GIT_TREE_MODES
+        ):
+            raise ReleaseGateError("git_tree_inventory_malformed")
+        name = data[mode_end + 1 : name_end]
+        if (
+            not name
+            or name in {b".", b".."}
+            or b"/" in name
+            or b"\\" in name
+            or name in names
+        ):
+            raise ReleaseGateError("git_tree_inventory_malformed")
+        if mode == "120000":
+            raise ReleaseGateError("git_tree_symlink")
+        if mode == "160000":
+            raise ReleaseGateError("git_tree_gitlink")
+        object_type = _GIT_TREE_MODES[mode]
+        object_id = data[oid_start:oid_end].hex()
+        if set(data[oid_start:oid_end]) == {0}:
+            raise ReleaseGateError("git_tree_inventory_malformed")
+        sort_key = name + (b"/" if object_type == "tree" else b"\0")
+        if previous_sort_key is not None and sort_key <= previous_sort_key:
+            raise ReleaseGateError("git_tree_inventory_malformed")
+        previous_sort_key = sort_key
+        names.add(name)
+        entries.append(
+            _GitTreeEntry(
+                mode,
+                object_type,
+                object_id,
+                name,
+                (oid_start, oid_end),
+            )
+        )
+        cursor = oid_end
+    return tuple(entries)
+
+
+def _validate_canonical_git_object_corpus(
+    public_objects: Iterable[_GitPublicObject],
+    *,
+    object_format: str,
+    root_oids: Iterable[str],
+    max_objects: int,
+    max_commits: int,
+    max_tree_entries: int,
+    require_canonical_order: bool = False,
+) -> _CanonicalGitCorpus:
+    supplied = tuple(public_objects)
+    if not supplied or len(supplied) > max_objects:
+        raise ReleaseGateError("git_object_inventory_incomplete")
+    canonical_order = tuple(
+        sorted(
+            supplied,
+            key=lambda item: _GIT_PUBLIC_OBJECT_TYPE_INDEX.get(
+                item.object_type,
+                len(_GIT_PUBLIC_OBJECT_TYPE_INDEX),
+            ),
+        )
+    )
+    if require_canonical_order and supplied != canonical_order:
+        raise ReleaseGateError("git_object_inventory_malformed")
+    if len({item.object_id for item in supplied}) != len(supplied):
+        raise ReleaseGateError("git_object_inventory_malformed")
+    oid_format = _git_object_format_for_oids(item.object_id for item in supplied)
+    roots = tuple(dict.fromkeys(root_oids))
+    if (
+        oid_format != object_format
+        or not roots
+        or _git_object_format_for_oids(roots) != object_format
+    ):
+        raise ReleaseGateError("git_object_inventory_malformed")
+
+    parsed: list[_CanonicalGitObject] = []
+    commit_count = 0
+    tree_entry_count = 0
+    for supplied_object in canonical_order:
+        if supplied_object.object_type not in _GIT_PUBLIC_OBJECT_TYPE_INDEX:
+            raise ReleaseGateError("git_object_inventory_malformed")
+        try:
+            canonical_oid = _canonical_git_object_oid(
+                supplied_object.data,
+                supplied_object.object_type,
+                object_format,
+            )
+        except ValueError as exc:
+            raise ReleaseGateError("git_object_inventory_malformed") from exc
+        if canonical_oid != supplied_object.object_id:
+            raise ReleaseGateError("git_object_identity_mismatch")
+        references: tuple[tuple[str, str], ...] = ()
+        tree_entries: tuple[_GitTreeEntry, ...] = ()
+        allowed_spans: frozenset[tuple[int, int]] = frozenset()
+        if supplied_object.object_type == "commit":
+            commit_count += 1
+            if commit_count > max_commits:
+                raise ReleaseGateError("git_commit_limit")
+            references, allowed_spans = _parse_canonical_git_commit(
+                supplied_object.data,
+                object_format,
+            )
+        elif supplied_object.object_type == "tag":
+            references, allowed_spans = _parse_canonical_git_tag(
+                supplied_object.data,
+                object_format,
+            )
+        elif supplied_object.object_type == "tree":
+            tree_entries = _parse_canonical_git_tree(
+                supplied_object.data,
+                object_format,
+            )
+            allowed_spans = frozenset(
+                entry.object_id_span for entry in tree_entries
+            )
+            tree_entry_count += len(tree_entries)
+            if tree_entry_count > max_tree_entries:
+                raise ReleaseGateError("git_tree_entry_limit")
+            references = tuple(
+                (entry.object_id, entry.object_type) for entry in tree_entries
+            )
+        parsed.append(
+            _CanonicalGitObject(
+                _GitPublicObject(
+                    supplied_object.object_type,
+                    supplied_object.object_id,
+                    supplied_object.data,
+                    allowed_spans,
+                ),
+                references,
+                tree_entries,
+            )
+        )
+
+    by_oid = {item.public_object.object_id: item for item in parsed}
+    for item in parsed:
+        for target_oid, expected_type in item.references:
+            target = by_oid.get(target_oid)
+            if target is None or target.public_object.object_type != expected_type:
+                raise ReleaseGateError("git_object_inventory_incomplete")
+
+    states: dict[str, int] = {}
+    for root_oid in roots:
+        stack: list[tuple[str, bool]] = [(root_oid, False)]
+        while stack:
+            oid, expanded = stack.pop()
+            state = states.get(oid, 0)
+            if expanded:
+                states[oid] = 2
+                continue
+            if state == 2:
+                continue
+            if state == 1:
+                raise ReleaseGateError("git_object_inventory_malformed")
+            item = by_oid.get(oid)
+            if item is None:
+                raise ReleaseGateError("git_object_inventory_incomplete")
+            states[oid] = 1
+            stack.append((oid, True))
+            for target_oid, _target_type in reversed(item.references):
+                target_state = states.get(target_oid, 0)
+                if target_state == 1:
+                    raise ReleaseGateError("git_object_inventory_malformed")
+                if target_state != 2:
+                    stack.append((target_oid, False))
+    visited = {oid for oid, state in states.items() if state == 2}
+    if visited != set(by_oid):
+        raise ReleaseGateError("git_object_inventory_incomplete")
+    return _CanonicalGitCorpus(tuple(parsed), tree_entry_count)
 
 
 def _scan_reachable_blobs(
@@ -1658,7 +2074,7 @@ def _scan_reachable_blobs(
     if graph_result is None or graph_result.exit_code != 0:
         return None
 
-    graph_paths: dict[str, set[str]] = {}
+    graph_paths: dict[str, set[bytes]] = {}
     graph_oids: list[str] = []
     try:
         last_oid: str | None = None
@@ -1668,16 +2084,13 @@ def _scan_reachable_blobs(
             if raw_record.startswith(b"path="):
                 if last_oid is None or graph_paths[last_oid]:
                     raise ValueError
-                path = raw_record.removeprefix(b"path=").decode(
-                    "utf-8",
-                    errors="strict",
-                )
-                candidate = PurePosixPath(path)
+                path = raw_record.removeprefix(b"path=")
+                parts = path.split(b"/")
                 if (
                     not path
-                    or candidate.is_absolute()
-                    or "\\" in path
-                    or ".." in candidate.parts
+                    or path.startswith(b"/")
+                    or b"\\" in path
+                    or any(part in {b"", b".", b".."} for part in parts)
                 ):
                     raise ValueError
                 graph_paths[last_oid].add(path)
@@ -1699,6 +2112,10 @@ def _scan_reachable_blobs(
         return None
     if len(graph_oids) > policy.max_git_commits + policy.max_git_tree_entries:
         blockers.append("git_object_limit")
+        return None
+    object_format = _git_object_format_for_oids(graph_oids)
+    if object_format is None or _git_object_format_for_oids(roots) != object_format:
+        blockers.append("git_object_inventory_malformed")
         return None
 
     type_result = _run_and_record(
@@ -1737,13 +2154,6 @@ def _scan_reachable_blobs(
         blockers.append("git_object_inventory_incomplete")
         return None
 
-    commits = tuple(
-        oid for oid in graph_oids if object_metadata[oid][0] == "commit"
-    )
-    if len(commits) > policy.max_git_commits:
-        blockers.append("git_commit_limit")
-        return None
-
     objects: dict[str, _GitObject] = {}
     blob_budget = _ByteBudget(policy.max_git_blob_bytes)
     metadata_budget = _ByteBudget(policy.max_git_blob_bytes)
@@ -1779,75 +2189,32 @@ def _scan_reachable_blobs(
             return None
         objects[oid] = _GitObject(object_type, size, object_result.stdout)
 
-    commit_trees: set[str] = set()
-    for oid in commits:
-        header, separator, _message = objects[oid].data.partition(b"\n\n")
-        lines = header.splitlines()
-        if not separator or not lines:
-            blockers.append("git_commit_inventory_malformed")
-            return None
-        tree_match = re.fullmatch(rb"tree ([0-9a-f]{40}|[0-9a-f]{64})", lines[0])
-        if tree_match is None:
-            blockers.append("git_commit_inventory_malformed")
-            return None
-        tree_oid = tree_match.group(1).decode("ascii")
-        if object_metadata.get(tree_oid, (None, 0))[0] != "tree":
-            blockers.append("git_object_inventory_incomplete")
-            return None
-        commit_trees.add(tree_oid)
-        for line in lines[1:]:
-            if not line.startswith(b"parent "):
-                continue
-            parent_match = re.fullmatch(rb"parent ([0-9a-f]{40}|[0-9a-f]{64})", line)
-            if parent_match is None:
-                blockers.append("git_commit_inventory_malformed")
-                return None
-            parent_oid = parent_match.group(1).decode("ascii")
-            if object_metadata.get(parent_oid, (None, 0))[0] != "commit":
-                blockers.append("git_object_inventory_incomplete")
-                return None
+    supplied_objects = tuple(
+        _GitPublicObject(
+            objects[oid].object_type,
+            oid,
+            objects[oid].data,
+        )
+        for oid in graph_oids
+    )
+    try:
+        corpus = _validate_canonical_git_object_corpus(
+            supplied_objects,
+            object_format=object_format,
+            root_oids=roots,
+            max_objects=policy.max_git_commits + policy.max_git_tree_entries,
+            max_commits=policy.max_git_commits,
+            max_tree_entries=policy.max_git_tree_entries,
+        )
+    except ReleaseGateError as exc:
+        blockers.append(str(exc))
+        return None
 
-    tag_targets: dict[str, str] = {}
-    tag_payloads: dict[str, bytes] = {}
-    for oid, obj in objects.items():
-        if obj.object_type != "tag":
+    corpus_by_oid = corpus.by_oid
+    for item in corpus.objects:
+        if item.public_object.object_type != "tree":
             continue
-        header, separator, message = obj.data.partition(b"\n\n")
-        lines = header.splitlines()
-        if not separator or len(lines) < 3:
-            blockers.append("git_tag_inventory_malformed")
-            return None
-        target_match = re.fullmatch(rb"object ([0-9a-f]{40}|[0-9a-f]{64})", lines[0])
-        type_match = re.fullmatch(rb"type (blob|commit|tag|tree)", lines[1])
-        if target_match is None or type_match is None or not lines[2].startswith(b"tag "):
-            blockers.append("git_tag_inventory_malformed")
-            return None
-        target_oid = target_match.group(1).decode("ascii")
-        declared_type = type_match.group(1).decode("ascii")
-        if object_metadata.get(target_oid, (None, 0))[0] != declared_type:
-            blockers.append("git_object_inventory_incomplete")
-            return None
-        tag_targets[oid] = target_oid
-        tag_payloads[oid] = b"\n".join(lines[1:]) + b"\n\n" + message
-
-    root_trees = set(commit_trees)
-    for root in roots:
-        target = root
-        seen_tags: set[str] = set()
-        while objects[target].object_type == "tag":
-            if target in seen_tags or target not in tag_targets:
-                blockers.append("git_tag_inventory_malformed")
-                return None
-            seen_tags.add(target)
-            target = tag_targets[target]
-        if objects[target].object_type == "tree":
-            root_trees.add(target)
-
-    tree_entries: dict[str, tuple[tuple[str, str, str], ...]] = {}
-    edge_count = 0
-    for oid, obj in objects.items():
-        if obj.object_type != "tree":
-            continue
+        oid = item.public_object.object_id
         tree_result = _run_and_record(
             runner,
             ("git", "ls-tree", "-z", oid),
@@ -1859,109 +2226,198 @@ def _scan_reachable_blobs(
         )
         if tree_result is None or tree_result.exit_code != 0:
             return None
-        parsed_entries: list[tuple[str, str, str]] = []
-        seen_names: set[str] = set()
         try:
-            for record in (value for value in tree_result.stdout.split(b"\0") if value):
-                edge_count += 1
-                if edge_count > policy.max_git_tree_entries:
-                    blockers.append("git_tree_entry_limit")
-                    return None
+            if tree_result.stdout and not tree_result.stdout.endswith(b"\0"):
+                raise ValueError
+            records = (
+                tree_result.stdout[:-1].split(b"\0")
+                if tree_result.stdout
+                else []
+            )
+            parsed_entries: list[tuple[str, str, str, bytes]] = []
+            for record in records:
                 raw_metadata, tab, raw_name = record.partition(b"\t")
                 metadata = raw_metadata.decode("ascii", errors="strict").split()
-                name = raw_name.decode("utf-8", errors="strict")
                 if (
                     tab != b"\t"
                     or len(metadata) != 3
-                    or not name
-                    or "/" in name
-                    or "\\" in name
-                    or name in {".", ".."}
-                    or name in seen_names
+                    or not raw_name
+                    or re.fullmatch(r"[0-7]{6}", metadata[0]) is None
+                    or metadata[1] not in _GIT_PUBLIC_OBJECT_TYPE_INDEX
+                    or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", metadata[2])
+                    is None
                 ):
                     raise ValueError
                 mode, declared_type, target_oid = metadata
-                seen_names.add(name)
-                if mode == "120000" and declared_type == "blob":
-                    blockers.append("git_tree_symlink")
-                    continue
-                if mode == "160000" and declared_type == "commit":
-                    blockers.append("git_tree_gitlink")
-                    continue
-                safe_entry = (mode, declared_type) in {
-                    ("040000", "tree"),
-                    ("100644", "blob"),
-                    ("100755", "blob"),
-                }
-                if not safe_entry:
-                    blockers.append("git_tree_mode_unsafe")
-                    continue
-                if object_metadata.get(target_oid, (None, 0))[0] != declared_type:
-                    blockers.append("git_object_inventory_incomplete")
-                    return None
-                parsed_entries.append((name, declared_type, target_oid))
+                parsed_entries.append((mode, declared_type, target_oid, raw_name))
         except (UnicodeError, ValueError):
             blockers.append("git_tree_inventory_malformed")
             return None
-        tree_entries[oid] = tuple(parsed_entries)
+        expected_entries = tuple(
+            (
+                entry.mode.zfill(6),
+                entry.object_type,
+                entry.object_id,
+                entry.name,
+            )
+            for entry in item.tree_entries
+        )
+        if tuple(parsed_entries) != expected_entries:
+            blockers.append("git_tree_inventory_malformed")
+            return None
 
     findings: list[SecretFinding] = []
-    oid_paths = {oid: set(paths) for oid, paths in graph_paths.items()}
+    oid_paths: dict[str, set[bytes]] = {oid: set() for oid in graph_oids}
+    tree_paths: set[tuple[str, bytes]] = set()
     visited_trees: set[str] = set()
-    visited_states: set[tuple[str, str]] = set()
+    visited_states: set[tuple[str, bytes]] = set()
     path_count = 0
 
-    def walk_tree(tree_oid: str, prefix: str, active: frozenset[str]) -> bool:
-        nonlocal path_count
-        if tree_oid in active:
-            blockers.append("git_tree_inventory_malformed")
-            return False
-        state = (tree_oid, prefix)
-        if state in visited_states:
+    def display_path(path: bytes) -> str:
+        try:
+            return path.decode("utf-8", errors="strict")
+        except UnicodeError:
+            return f"git/path/{hashlib.sha256(path).hexdigest()}"
+
+    def forbidden_git_path(path: bytes) -> bool:
+        lowered_parts = tuple(part.lower() for part in path.split(b"/"))
+        if any(
+            part == b".mercury" or part == b".env" or part.startswith(b".env.")
+            for part in lowered_parts
+        ):
             return True
-        visited_states.add(state)
-        visited_trees.add(tree_oid)
-        next_active = active | {tree_oid}
-        for name, object_type, target_oid in tree_entries.get(tree_oid, ()):
-            path_count += 1
-            if path_count > policy.max_git_tree_entries:
-                blockers.append("git_tree_entry_limit")
+        filename = lowered_parts[-1] if lowered_parts else b""
+        stem = filename.split(b".", 1)[0].replace(b"_", b"-")
+        return stem.decode("ascii", errors="ignore") in _FORBIDDEN_FILE_STEMS
+
+    def walk_tree(tree_oid: str, prefix: bytes) -> bool:
+        nonlocal path_count
+        stack: list[tuple[str, bytes, frozenset[str]]] = [
+            (tree_oid, prefix, frozenset())
+        ]
+        while stack:
+            current_oid, current_prefix, active = stack.pop()
+            if current_oid in active:
+                blockers.append("git_tree_inventory_malformed")
                 return False
-            path = f"{prefix}/{name}" if prefix else name
-            if _is_forbidden_path(PurePosixPath(path)):
-                findings.append(_path_finding("forbidden_path", path))
-            if object_type == "blob":
-                oid_paths[target_oid].add(path)
-            elif not walk_tree(target_oid, path, next_active):
+            state = (current_oid, current_prefix)
+            if state in visited_states:
+                continue
+            visited_states.add(state)
+            visited_trees.add(current_oid)
+            tree = corpus_by_oid.get(current_oid)
+            if tree is None or tree.public_object.object_type != "tree":
+                blockers.append("git_object_inventory_incomplete")
                 return False
+            next_active = active | {current_oid}
+            children: list[tuple[str, bytes, frozenset[str]]] = []
+            for entry in tree.tree_entries:
+                path_count += 1
+                if path_count > policy.max_git_tree_entries:
+                    blockers.append("git_tree_entry_limit")
+                    return False
+                path = (
+                    current_prefix
+                    + (b"/" if current_prefix else b"")
+                    + entry.name
+                )
+                if len(path) > policy.max_file_bytes:
+                    blockers.append("git_tree_path_too_large")
+                    return False
+                tree_paths.add((current_oid, path))
+                oid_paths[entry.object_id].add(path)
+                if forbidden_git_path(path):
+                    findings.append(
+                        _path_finding("forbidden_path", display_path(path))
+                    )
+                if entry.object_type == "tree":
+                    children.append((entry.object_id, path, next_active))
+            stack.extend(reversed(children))
         return True
 
+    root_trees = {
+        item.references[0][0]
+        for item in corpus.objects
+        if item.public_object.object_type == "commit"
+    }
+    for root in roots:
+        target = corpus_by_oid[root]
+        while target.public_object.object_type == "tag":
+            target = corpus_by_oid[target.references[0][0]]
+        if target.public_object.object_type == "tree":
+            root_trees.add(target.public_object.object_id)
     for tree_oid in sorted(root_trees):
-        if not walk_tree(tree_oid, "", frozenset()):
+        if not walk_tree(tree_oid, b""):
             return None
     expected_trees = {
-        oid for oid, obj in objects.items() if obj.object_type == "tree"
+        item.public_object.object_id
+        for item in corpus.objects
+        if item.public_object.object_type == "tree"
     }
     if visited_trees != expected_trees:
         blockers.append("git_object_inventory_incomplete")
         return None
 
-    public_objects: list[_GitPublicObject] = []
-    blobs = tuple(oid for oid in graph_oids if objects[oid].object_type == "blob")
-    for oid in blobs:
-        data = objects[oid].data
-        public_objects.append(_GitPublicObject("blob", oid, data))
-        paths = oid_paths[oid] or {f"git/object/{oid}"}
-        for path in sorted(paths):
-            findings.extend(_scan_bytes(data, path, policy))
-    for oid, payload in sorted(tag_payloads.items()):
-        public_objects.append(_GitPublicObject("tag", oid, objects[oid].data))
-        findings.extend(_scan_bytes(payload, f"git/tag/{oid}", policy))
+    for oid, paths in graph_paths.items():
+        oid_paths[oid].update(paths)
+    for item in corpus.objects:
+        public_object = item.public_object
+        object_path = f"git/{public_object.object_type}/{public_object.object_id}"
+        if public_object.object_type == "blob":
+            paths = oid_paths[public_object.object_id]
+            if paths:
+                for path in sorted(paths):
+                    findings.extend(
+                        _scan_bytes(public_object.data, display_path(path), policy)
+                    )
+            else:
+                findings.extend(_scan_bytes(public_object.data, object_path, policy))
+        else:
+            findings.extend(
+                _scan_bytes(
+                    public_object.data,
+                    object_path,
+                    policy,
+                    validated_high_entropy_spans=(
+                        public_object.validated_high_entropy_spans
+                    ),
+                )
+            )
+        if public_object.object_type == "tree":
+            for entry in item.tree_entries:
+                prefix = f"{entry.mode} {entry.object_type} ".encode("ascii")
+                metadata = (
+                    prefix
+                    + entry.object_id.encode("ascii")
+                    + b"\t"
+                    + entry.name
+                )
+                findings.extend(
+                    _scan_bytes(
+                        metadata,
+                        object_path,
+                        policy,
+                        validated_high_entropy_spans=frozenset(
+                            {(len(prefix), len(prefix) + len(entry.object_id))}
+                        ),
+                    )
+                )
+    for tree_oid, path in sorted(tree_paths):
+        findings.extend(
+            _scan_bytes(path, f"git/tree-path/{tree_oid}", policy)
+        )
+
+    counts = Counter(
+        item.public_object.object_type for item in corpus.objects
+    )
     return _GitReachableInventory(
         findings=_deduplicate_findings(findings),
-        public_objects=tuple(public_objects),
-        object_count=len(objects),
-        blob_count=len(blobs),
+        public_objects=corpus.public_objects,
+        object_count=len(corpus.objects),
+        blob_count=counts["blob"],
+        tag_count=counts["tag"],
+        commit_count=counts["commit"],
+        tree_count=counts["tree"],
     )
 
 
@@ -3036,12 +3492,6 @@ def _scan_bytes(
         if (
             _is_high_entropy(candidate)
             and (match.start(), match.end()) not in validated_high_entropy_spans
-            and not _is_declared_digest_context(
-                data,
-                match.start(),
-                match.end(),
-                candidate,
-            )
         ):
             findings.append(_content_finding("high_entropy", candidate, relative_path))
     fingerprints = set(policy.known_secret_digests)
@@ -3074,37 +3524,6 @@ def _is_high_entropy(candidate: bytes) -> bool:
     if character_classes < 3:
         return False
     return entropy >= 4.0
-
-
-def _is_declared_digest_context(
-    data: bytes,
-    start: int,
-    end: int,
-    candidate: bytes,
-) -> bool:
-    if not re.fullmatch(rb"[0-9a-fA-F]+", candidate) or len(candidate) not in {
-        32,
-        40,
-        56,
-        64,
-        96,
-        128,
-    }:
-        return False
-    line_start = data.rfind(b"\n", 0, start) + 1
-    line_end = data.find(b"\n", end)
-    if line_end == -1:
-        line_end = len(data)
-    line = data[line_start:line_end]
-    pattern = re.compile(
-        rb"(?i)(?:^|[,{])\s*[\"']?"
-        rb"(?:md5|sha1|sha224|sha256|sha384|sha512|evidence_sha256|digest)"
-        rb"[\"']?\s*[:=]\s*[\"']?"
-        rb"(?:(?:md5|sha1|sha224|sha256|sha384|sha512)[:=])?"
-        + re.escape(candidate)
-        + rb"[\"']?(?=\s*(?:[,}]|$))"
-    )
-    return pattern.search(line) is not None
 
 
 def _known_fingerprint_candidates(data: bytes) -> set[bytes]:

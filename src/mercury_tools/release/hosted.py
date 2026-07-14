@@ -24,20 +24,26 @@ from mercury_tools.release.models import (
     SecretScanPolicy,
 )
 from mercury_tools.release.scanner import (
+    _GIT_PUBLIC_OBJECT_TYPE_INDEX,
     CommandResult,
     CommandRunner,
+    ReleaseGateError,
     SubprocessCommandRunner,
     _archive_candidate_crosses_object_boundaries,
     _ArtifactSnapshot,
     _BudgetExceeded,
+    _canonical_git_object_oid,
     _deduplicate_findings,
     _detect_archive_format,
+    _git_object_format_for_oids,
+    _GitPublicObject,
     _GitReachableInventory,
     _is_archive_candidate,
     _parse_local_refs,
     _scan_archive_at_depth,
     _scan_bytes,
     _scan_reachable_blobs,
+    _validate_canonical_git_object_corpus,
 )
 
 HOSTED_SCANNER_VERSION = BUILTIN_SCANNER_VERSION
@@ -158,6 +164,8 @@ _WIKI_OBJECT_TYPES = frozenset(
         "wiki_mirror_inventory",
         "wiki_reachable_blob",
         "wiki_reachable_tag",
+        "wiki_reachable_commit",
+        "wiki_reachable_tree",
     }
 )
 _WIKI_COMMAND_OBJECT_ORDER = (
@@ -178,6 +186,8 @@ _WIKI_INVENTORY_KEYS = frozenset(
         "reachable_object_count",
         "reachable_blob_count",
         "reachable_tag_count",
+        "reachable_commit_count",
+        "reachable_tree_count",
         "command_object_count",
         "command_objects",
         "payload_object_count",
@@ -546,18 +556,12 @@ def _wiki_boundary_identity_is_valid(boundary: HostedObjectBoundary) -> bool:
         return boundary.object_id in _WIKI_COMMAND_OBJECT_IDS
     if boundary.object_type == "wiki_mirror_inventory":
         return boundary.object_id == _WIKI_INVENTORY_OBJECT_ID
-    if boundary.object_type == "wiki_reachable_blob":
-        return bool(
-            isinstance(boundary.object_id, str)
-            and re.fullmatch(
-                r"git/blob/(?:[0-9a-f]{40}|[0-9a-f]{64})",
-                boundary.object_id,
-            )
-        )
+    object_type = boundary.object_type.removeprefix("wiki_reachable_")
     return bool(
-        isinstance(boundary.object_id, str)
+        object_type in _GIT_PUBLIC_OBJECT_TYPE_INDEX
+        and isinstance(boundary.object_id, str)
         and re.fullmatch(
-            r"git/tag/(?:[0-9a-f]{40}|[0-9a-f]{64})",
+            rf"git/{object_type}/(?:[0-9a-f]{{40}}|[0-9a-f]{{64}})",
             boundary.object_id,
         )
     )
@@ -569,51 +573,6 @@ def _valid_nonnegative_count(value: object, *, positive: bool = False) -> bool:
         and not isinstance(value, bool)
         and (value > 0 if positive else value >= 0)
     )
-
-
-def _canonical_git_object_oid(
-    data: bytes,
-    object_type: str,
-    object_format: str,
-) -> str:
-    if object_type not in {"blob", "tag"}:
-        raise ValueError("wiki_git_object_type_invalid")
-    framed = f"{object_type} {len(data)}\0".encode("ascii") + data
-    if object_format == "sha1":
-        return hashlib.sha1(  # noqa: S324 - canonical Git SHA-1 object identity.
-            framed,
-            usedforsecurity=False,
-        ).hexdigest()
-    if object_format == "sha256":
-        return hashlib.sha256(framed).hexdigest()
-    raise ValueError("wiki_git_object_format_invalid")
-
-
-def _git_object_format_for_oids(oids: Iterable[str]) -> str | None:
-    lengths = {len(oid) for oid in oids}
-    if lengths == {40}:
-        return "sha1"
-    if lengths == {64}:
-        return "sha256"
-    return None
-
-
-def _validated_tag_target(data: bytes, object_format: str) -> bytes | None:
-    header, separator, _message = data.partition(b"\n\n")
-    lines = header.splitlines()
-    oid_size = 40 if object_format == "sha1" else 64
-    if not separator or len(lines) < 4:
-        return None
-    object_match = re.fullmatch(rb"object ([0-9a-f]+)", lines[0])
-    if (
-        object_match is None
-        or len(object_match.group(1)) != oid_size
-        or re.fullmatch(rb"type (?:blob|commit|tag|tree)", lines[1]) is None
-        or re.fullmatch(rb"tag [^\x00\r\n]+", lines[2]) is None
-        or not lines[3].startswith(b"tagger ")
-    ):
-        return None
-    return object_match.group(1)
 
 
 def _wiki_manifest_entry(boundary: HostedObjectBoundary) -> dict[str, object]:
@@ -631,24 +590,116 @@ class _ValidatedWikiInventory:
     object_high_entropy_spans: frozenset[tuple[int, int]]
 
 
-def _exact_value_spans(
-    data: bytes,
-    values: Iterable[bytes],
-) -> frozenset[tuple[int, int]]:
+def _remote_ref_oid_spans(data: bytes) -> frozenset[tuple[int, int]] | None:
     spans: set[tuple[int, int]] = set()
-    for value in values:
-        if not value:
-            continue
-        offset = data.find(value)
-        while offset >= 0:
-            spans.add((offset, offset + len(value)))
-            offset = data.find(value, offset + 1)
+    cursor = 0
+    lines = data.split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()
+    if not lines or any(not line for line in lines):
+        return None
+    for line in lines:
+        oid, tab, _ref = line.partition(b"\t")
+        if tab != b"\t" or re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", oid) is None:
+            return None
+        spans.add((cursor, cursor + len(oid)))
+        cursor += len(line) + 1
+    if cursor - (1 if not data.endswith(b"\n") else 0) != len(data):
+        return None
     return frozenset(spans)
+
+
+def _local_ref_oid_spans(data: bytes) -> frozenset[tuple[int, int]] | None:
+    spans: set[tuple[int, int]] = set()
+    cursor = 0
+    lines = data.split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()
+    if not lines or any(not line for line in lines):
+        return None
+    for line in lines:
+        parts = line.split(b"\t")
+        if (
+            len(parts) != 3
+            or re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", parts[1]) is None
+            or (
+                parts[2]
+                and re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", parts[2])
+                is None
+            )
+        ):
+            return None
+        first_oid_start = cursor + len(parts[0]) + 1
+        spans.add((first_oid_start, first_oid_start + len(parts[1])))
+        if parts[2]:
+            peeled_start = first_oid_start + len(parts[1]) + 1
+            spans.add((peeled_start, peeled_start + len(parts[2])))
+        cursor += len(line) + 1
+    if cursor - (1 if not data.endswith(b"\n") else 0) != len(data):
+        return None
+    return frozenset(spans)
+
+
+def _head_oid_spans(data: bytes) -> frozenset[tuple[int, int]] | None:
+    match = re.fullmatch(rb"([0-9a-f]{40}|[0-9a-f]{64})\n?", data)
+    if match is None:
+        return None
+    return frozenset({match.span(1)})
+
+
+def _canonical_json_with_string_spans(
+    value: object,
+    allowed_paths: frozenset[tuple[str | int, ...]],
+) -> tuple[bytes, frozenset[tuple[int, int]]]:
+    output = bytearray()
+    spans: set[tuple[int, int]] = set()
+
+    def emit(item: object, path: tuple[str | int, ...]) -> None:
+        if isinstance(item, dict):
+            if any(not isinstance(key, str) for key in item):
+                raise ValueError("wiki_manifest_json_invalid")
+            output.extend(b"{")
+            for index, key in enumerate(sorted(item)):
+                if index:
+                    output.extend(b",")
+                output.extend(
+                    json.dumps(key, ensure_ascii=True, separators=(",", ":")).encode(
+                        "ascii"
+                    )
+                )
+                output.extend(b":")
+                emit(item[key], (*path, key))
+            output.extend(b"}")
+            return
+        if isinstance(item, list):
+            output.extend(b"[")
+            for index, child in enumerate(item):
+                if index:
+                    output.extend(b",")
+                emit(child, (*path, index))
+            output.extend(b"]")
+            return
+        encoded = json.dumps(
+            item,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        start = len(output)
+        output.extend(encoded)
+        if isinstance(item, str) and path in allowed_paths:
+            raw = item.encode("ascii", errors="strict")
+            if encoded != b'"' + raw + b'"':
+                raise ValueError("wiki_manifest_json_invalid")
+            spans.add((start + 1, start + 1 + len(raw)))
+
+    emit(value, ())
+    return bytes(output), frozenset(spans)
 
 
 def _wiki_inventory_reconciles(
     objects: tuple[tuple[HostedObjectBoundary, bytes], ...],
     remote_ref_data: bytes,
+    policy: SecretScanPolicy,
 ) -> _ValidatedWikiInventory | None:
     command_objects = tuple(
         (boundary, data)
@@ -663,7 +714,8 @@ def _wiki_inventory_reconciles(
     payload_objects_with_data = tuple(
         (boundary, data)
         for boundary, data in objects
-        if boundary.object_type in {"wiki_reachable_blob", "wiki_reachable_tag"}
+        if isinstance(boundary.object_type, str)
+        and boundary.object_type.startswith("wiki_reachable_")
     )
     if (
         tuple(boundary.object_id for boundary, _data in command_objects)
@@ -689,6 +741,19 @@ def _wiki_inventory_reconciles(
             "HEAD": _parse_head_oid(commands["wiki/command/head-final"]),
             **_parse_local_refs(commands["wiki/command/refs-final"]),
         }
+        query_spans = _remote_ref_oid_spans(remote_ref_data)
+        initial_ref_spans = _local_ref_oid_spans(
+            commands["wiki/command/refs-initial"]
+        )
+        initial_head_spans = _head_oid_spans(
+            commands["wiki/command/head-initial"]
+        )
+        final_ref_spans = _local_ref_oid_spans(
+            commands["wiki/command/refs-final"]
+        )
+        final_head_spans = _head_oid_spans(
+            commands["wiki/command/head-final"]
+        )
     except (
         KeyError,
         RuntimeError,
@@ -706,6 +771,11 @@ def _wiki_inventory_reconciles(
         or manifest.get("object_format") != object_format
         or initial_map != remote_refs
         or final_map != remote_refs
+        or query_spans is None
+        or initial_ref_spans is None
+        or initial_head_spans is None
+        or final_ref_spans is None
+        or final_head_spans is None
     ):
         return None
     command_manifest = manifest.get("command_objects")
@@ -726,6 +796,8 @@ def _wiki_inventory_reconciles(
         )
         or not _valid_nonnegative_count(manifest.get("reachable_blob_count"))
         or not _valid_nonnegative_count(manifest.get("reachable_tag_count"))
+        or not _valid_nonnegative_count(manifest.get("reachable_commit_count"))
+        or not _valid_nonnegative_count(manifest.get("reachable_tree_count"))
         or manifest.get("command_object_count") != len(command_objects)
         or not isinstance(command_manifest, list)
         or not _valid_nonnegative_count(manifest.get("payload_object_count"))
@@ -747,7 +819,7 @@ def _wiki_inventory_reconciles(
         for item in (*command_manifest, *payload_objects)
     ):
         return None
-    tag_targets: dict[str, bytes] = {}
+    public_objects: list[_GitPublicObject] = []
     for boundary, data in payload_objects_with_data:
         assert isinstance(boundary.object_type, str)
         assert isinstance(boundary.object_id, str)
@@ -757,64 +829,121 @@ def _wiki_inventory_reconciles(
             return None
         object_oid = boundary.object_id.removeprefix(identity_prefix)
         if (
-            _git_object_format_for_oids((object_oid,)) != object_format
+            object_type not in _GIT_PUBLIC_OBJECT_TYPE_INDEX
+            or _git_object_format_for_oids((object_oid,)) != object_format
             or _canonical_git_object_oid(data, object_type, object_format) != object_oid
         ):
             return None
-        if object_type == "tag":
-            tag_target = _validated_tag_target(data, object_format)
-            if tag_target is None:
+        public_objects.append(_GitPublicObject(object_type, object_oid, data))
+    expected_public_order = tuple(
+        sorted(
+            public_objects,
+            key=lambda item: _GIT_PUBLIC_OBJECT_TYPE_INDEX[item.object_type],
+        )
+    )
+    if tuple(public_objects) != expected_public_order:
+        return None
+    try:
+        corpus = _validate_canonical_git_object_corpus(
+            public_objects,
+            object_format=object_format,
+            root_oids=remote_refs.values(),
+            max_objects=policy.max_hosted_records,
+            max_commits=policy.max_git_commits,
+            max_tree_entries=policy.max_git_tree_entries,
+            require_canonical_order=True,
+        )
+    except ReleaseGateError:
+        return None
+    corpus_by_oid = corpus.by_oid
+    for ref, object_oid in remote_refs.items():
+        if ref.endswith("^{}"):
+            continue
+        direct = corpus_by_oid.get(object_oid)
+        if direct is None:
+            return None
+        if (
+            ref == "HEAD" or ref.startswith("refs/heads/")
+        ) and direct.public_object.object_type != "commit":
+            return None
+        peeled_ref = f"{ref}^{{}}"
+        if direct.public_object.object_type != "tag":
+            if peeled_ref in remote_refs:
                 return None
-            tag_targets[boundary.object_id] = tag_target
-    blob_count = sum(
-        item.get("object_type") == "wiki_reachable_blob"
-        for item in payload_objects
-    )
-    tag_count = sum(
-        item.get("object_type") == "wiki_reachable_tag" for item in payload_objects
-    )
+            continue
+        target = direct
+        seen_tags: set[str] = set()
+        while target.public_object.object_type == "tag":
+            if target.public_object.object_id in seen_tags or not target.references:
+                return None
+            seen_tags.add(target.public_object.object_id)
+            next_target = corpus_by_oid.get(target.references[0][0])
+            if next_target is None:
+                return None
+            target = next_target
+        if remote_refs.get(peeled_ref) != target.public_object.object_id:
+            return None
+    counts = {
+        object_type: sum(
+            item.public_object.object_type == object_type
+            for item in corpus.objects
+        )
+        for object_type in _GIT_PUBLIC_OBJECT_TYPE_INDEX
+    }
     if (
-        manifest["reachable_blob_count"] != blob_count
-        or manifest["reachable_tag_count"] != tag_count
-        or manifest["payload_object_count"] != blob_count + tag_count
-        or manifest["reachable_object_count"] < len(payload_objects)
+        manifest["reachable_blob_count"] != counts["blob"]
+        or manifest["reachable_tag_count"] != counts["tag"]
+        or manifest["reachable_commit_count"] != counts["commit"]
+        or manifest["reachable_tree_count"] != counts["tree"]
+        or manifest["payload_object_count"] != len(corpus.objects)
+        or manifest["reachable_object_count"] != len(corpus.objects)
+        or len(corpus.objects) != sum(counts.values())
     ):
         return None
+    allowed_manifest_paths: set[tuple[str | int, ...]] = {
+        ("remote_ref_digest",)
+    }
+    for key, entries in (
+        ("command_objects", actual_commands),
+        ("payload_objects", actual_payloads),
+    ):
+        for index, _entry in enumerate(entries):
+            allowed_manifest_paths.add((key, index, "content_sha256"))
+            allowed_manifest_paths.add((key, index, "object_id"))
+    try:
+        canonical_manifest, manifest_spans = _canonical_json_with_string_spans(
+            manifest,
+            frozenset(allowed_manifest_paths),
+        )
+    except (UnicodeError, ValueError, TypeError):
+        return None
+    if canonical_manifest != inventory_objects[0][1]:
+        return None
 
-    remote_oid_values = frozenset(
-        oid.encode("ascii") for oid in remote_refs.values()
-    )
-    query_spans = _exact_value_spans(remote_ref_data, remote_oid_values)
-    manifest_values = {
-        manifest["remote_ref_digest"].encode("ascii"),
-        *(
-            entry["content_sha256"].encode("ascii")
-            for entry in (*actual_commands, *actual_payloads)
-            if isinstance(entry["content_sha256"], str)
-        ),
-        *(
-            entry["object_id"].encode("ascii")
-            for entry in (*actual_commands, *actual_payloads)
-            if isinstance(entry["object_id"], str)
-        ),
+    command_spans = {
+        "wiki/command/refs-initial": initial_ref_spans,
+        "wiki/command/head-initial": initial_head_spans,
+        "wiki/command/refs-final": final_ref_spans,
+        "wiki/command/head-final": final_head_spans,
     }
     object_spans: set[tuple[int, int]] = set()
     object_offset = 0
     for boundary, data in objects:
         local_spans: frozenset[tuple[int, int]] = frozenset()
-        if (
-            boundary.object_type == "wiki_command_output"
-            and boundary.object_id != "wiki/command/clone"
-        ):
-            local_spans = _exact_value_spans(data, remote_oid_values)
+        if boundary.object_type == "wiki_command_output":
+            local_spans = command_spans.get(boundary.object_id, frozenset())
         elif boundary.object_type == "wiki_mirror_inventory":
-            local_spans = _exact_value_spans(data, manifest_values)
-        elif boundary.object_type == "wiki_reachable_tag":
+            local_spans = manifest_spans
+        elif isinstance(boundary.object_type, str) and boundary.object_type.startswith(
+            "wiki_reachable_"
+        ):
             assert isinstance(boundary.object_id, str)
-            target = tag_targets[boundary.object_id]
-            target_start = len(b"object ")
-            local_spans = frozenset(
-                {(target_start, target_start + len(target))}
+            object_oid = boundary.object_id.rsplit("/", 1)[-1]
+            canonical_object = corpus_by_oid.get(object_oid)
+            if canonical_object is None:
+                return None
+            local_spans = (
+                canonical_object.public_object.validated_high_entropy_spans
             )
         object_spans.update(
             (object_offset + start, object_offset + end)
@@ -841,9 +970,12 @@ def _scan_bounded_hosted_chunks(
         window_start = stream_offset - len(tail)
         window_end = stream_offset + len(chunk)
         window_spans = frozenset(
-            (start - window_start, end - window_start)
+            (
+                max(start, window_start) - window_start,
+                min(end, window_end) - window_start,
+            )
             for start, end in validated_high_entropy_spans
-            if window_start <= start and end <= window_end
+            if start < window_end and end > window_start
         )
         findings.extend(
             _scan_bytes(
@@ -955,6 +1087,7 @@ def _scan_hosted_archive_objects(
             validation = _wiki_inventory_reconciles(
                 material,
                 b"".join(wiki_query_chunks),
+                policy,
             )
             if validation is None:
                 return reject_boundary()
@@ -1170,9 +1303,28 @@ def _wiki_inventory_manifest(
     object_format = _git_object_format_for_oids(remote_refs.values())
     if object_format is None:
         raise ValueError("wiki_object_format_invalid")
+    expected_order = tuple(
+        sorted(
+            inventory.public_objects,
+            key=lambda item: _GIT_PUBLIC_OBJECT_TYPE_INDEX.get(
+                item.object_type,
+                len(_GIT_PUBLIC_OBJECT_TYPE_INDEX),
+            ),
+        )
+    )
+    if (
+        inventory.public_objects != expected_order
+        or inventory.object_count != len(inventory.public_objects)
+        or inventory.object_count
+        != inventory.blob_count
+        + inventory.tag_count
+        + inventory.commit_count
+        + inventory.tree_count
+    ):
+        raise ValueError("wiki_payload_object_inventory_invalid")
     payload_objects: list[dict[str, object]] = []
     for item in inventory.public_objects:
-        if item.object_type not in {"blob", "tag"}:
+        if item.object_type not in _GIT_PUBLIC_OBJECT_TYPE_INDEX:
             raise ValueError("wiki_payload_object_type_invalid")
         data = item.data
         if (
@@ -1201,9 +1353,9 @@ def _wiki_inventory_manifest(
             "remote_ref_digest": hashlib.sha256(ref_payload).hexdigest(),
             "reachable_object_count": inventory.object_count,
             "reachable_blob_count": inventory.blob_count,
-            "reachable_tag_count": sum(
-                item.object_type == "tag" for item in inventory.public_objects
-            ),
+            "reachable_tag_count": inventory.tag_count,
+            "reachable_commit_count": inventory.commit_count,
+            "reachable_tree_count": inventory.tree_count,
             "command_object_count": len(command_boundaries),
             "command_objects": [
                 _wiki_manifest_entry(boundary) for boundary in command_boundaries

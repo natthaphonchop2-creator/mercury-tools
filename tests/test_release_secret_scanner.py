@@ -602,7 +602,7 @@ def test_high_entropy_credential_assignment_is_detected(
     assert "high_entropy" in rules
 
 
-def test_long_high_entropy_hex_is_detected_but_declared_sha256_is_exempt(
+def test_long_high_entropy_hex_and_untrusted_sha256_field_are_detected(
     tmp_path: Path,
     scan_request: SecretScanRequest,
 ) -> None:
@@ -617,8 +617,9 @@ def test_long_high_entropy_hex_is_detected_but_declared_sha256_is_exempt(
     result = scan_filesystem(tmp_path, scan_request.policy)
 
     high_entropy = [finding for finding in result.findings if finding.rule == "high_entropy"]
-    assert len(high_entropy) == 1
+    assert len(high_entropy) == 2
     assert credential not in result.model_dump_json()
+    assert digest not in result.model_dump_json()
 
 
 @pytest.mark.parametrize(
