@@ -3,6 +3,7 @@ import importlib
 import json
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tomllib
@@ -57,6 +58,16 @@ CROSS_MCP_SKILLS = (
     "bank-settlement-reconciliation-th",
     "marketplace-settlement-review-th",
     "month-end-evidence-gathering-th",
+)
+SKILL_CATALOG_PUBLIC_FIELDS = (
+    "skill_id",
+    "title",
+    "category",
+    "summary",
+    "status",
+    "version",
+    "required_connectors",
+    "tags",
 )
 EXPECTED_DESCRIPTIONS = {
     "accounts-receivable-reconciliation-th": (
@@ -275,6 +286,9 @@ def test_cross_mcp_skills_use_the_exact_nine_step_hard_stop_sequence() -> None:
         "9. For any Sheets, Gmail, or Drive change",
         "separate destination-bound approval",
         "let the host invoke that external MCP",
+        "trusted issuance identity and authorization digest",
+        "atomically consume the unique issuance ID",
+        "reject any replay before invoking",
     )
 
     for skill_name in CROSS_MCP_SKILLS:
@@ -288,10 +302,13 @@ def test_cross_mcp_skills_use_the_exact_nine_step_hard_stop_sequence() -> None:
 
 
 def test_cross_mcp_catalog_rows_are_public_metadata_only() -> None:
+    cross_mcp_seed = [
+        row for row in SKILL_CATALOG_SEED if "cross-mcp" in row.get("tags", ())
+    ]
+    assert {row["skill_id"] for row in cross_mcp_seed} == set(CROSS_MCP_SKILLS)
     rows = {
         row["skill_id"]: row
-        for row in SKILL_CATALOG_SEED
-        if row["skill_id"] in CROSS_MCP_SKILLS
+        for row in cross_mcp_seed
     }
 
     assert set(rows) == set(CROSS_MCP_SKILLS)
@@ -311,24 +328,67 @@ def test_cross_mcp_catalog_rows_are_public_metadata_only() -> None:
         assert row["required_connectors"] == []
 
 
-def test_cross_mcp_catalog_migration_contains_only_public_metadata() -> None:
-    text = (
+def test_cross_mcp_catalog_migration_matches_exact_public_seed_metadata() -> None:
+    migration = (
         ROOT
         / "supabase/migrations/20260713102000_add_reconciliation_skill_catalog.sql"
     ).read_text(encoding="utf-8")
-    lowered = text.lower()
+    header = re.match(
+        r"\s*insert\s+into\s+public\.mercury_skill_catalog\s*\((?P<columns>[^)]*)\)\s*values\b",
+        migration,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert header is not None
+    columns = tuple(
+        column.strip().casefold() for column in header.group("columns").split(",")
+    )
+    assert columns == SKILL_CATALOG_PUBLIC_FIELDS
 
-    for skill_name in CROSS_MCP_SKILLS:
-        assert f"'{skill_name}'" in text
-    for forbidden in (
-        "workflow_payload",
-        "approval_record",
-        "tenant_id",
-        "credential",
-        "client_secret",
-        "access_token",
-    ):
-        assert forbidden not in lowered
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute("attach database ':memory:' as public")
+    connection.create_function("now", 0, lambda: "2026-07-14T00:00:00+00:00")
+    connection.execute(
+        """
+        create table public.mercury_skill_catalog (
+          skill_id text primary key,
+          title text not null,
+          category text not null,
+          summary text not null,
+          status text not null,
+          version text not null,
+          required_connectors text not null,
+          tags text not null,
+          updated_at text
+        )
+        """
+    )
+    connection.executescript(migration.replace("::jsonb", ""))
+    stored = connection.execute(
+        f"select {', '.join(SKILL_CATALOG_PUBLIC_FIELDS)} "
+        "from public.mercury_skill_catalog order by skill_id"
+    ).fetchall()
+    connection.close()
+
+    actual = []
+    for stored_row in stored:
+        row = dict(stored_row)
+        row["required_connectors"] = json.loads(row["required_connectors"])
+        row["tags"] = json.loads(row["tags"])
+        actual.append(row)
+    cross_mcp_seed = [
+        row for row in SKILL_CATALOG_SEED if "cross-mcp" in row.get("tags", ())
+    ]
+    assert {row["skill_id"] for row in cross_mcp_seed} == set(CROSS_MCP_SKILLS)
+    expected = sorted(
+        (
+            {field: row[field] for field in SKILL_CATALOG_PUBLIC_FIELDS}
+            for row in cross_mcp_seed
+        ),
+        key=lambda row: row["skill_id"],
+    )
+
+    assert actual == expected
 
 
 def test_journal_skill_branches_every_mutation_on_returned_risk_contract() -> None:

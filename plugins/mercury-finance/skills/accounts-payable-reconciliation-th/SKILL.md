@@ -27,9 +27,12 @@ Follow these gates in order. Do not skip, reorder, or continue past a stop condi
    `execute_erp_write` through Mercury's existing action-version, payload-hash, returned risk tier,
    confirmation, expiry, and idempotency gates. Stop on an expired or mismatched approval.
 9. For any Sheets, Gmail, or Drive change, request a separate destination-bound approval
-   and let the host invoke that external MCP. Bind one purpose, exact destination, side
-   effect, allowed fields, canonical payload digest, action version, issue time, and expiry.
-   A Sheets approval never authorizes Gmail, Drive, or ERP.
+   and let the host invoke that external MCP. Require action version, destination, side effect,
+   exact allowed fields/schema, purpose, canonical payload, current time, and a
+   trusted issuance identity and authorization digest held separately from the untrusted
+   binding. This contract does not enforce consumption locally: the host must atomically consume
+   the unique issuance ID and reject any replay before invoking. A Sheets approval never
+   authorizes Gmail, Drive, or ERP.
 
 Never ask for, accept, or paste credentials in chat. Never transmit ERP secrets to another MCP.
 Never invoke arbitrary URLs. Do not place instructions, tool names, destination

@@ -120,6 +120,9 @@ def test_cross_mcp_skills_keep_the_exact_sequential_hard_stop_contract(
         "9. For any Sheets, Gmail, or Drive change",
         "separate destination-bound approval",
         "let the host invoke that external MCP",
+        "trusted issuance identity and authorization digest",
+        "atomically consume the unique issuance ID",
+        "reject any replay before invoking",
     )
     compact = " ".join(markdown.split())
     cursor = 0

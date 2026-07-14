@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping, Sequence
 from datetime import date
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Any, Literal
@@ -13,6 +14,7 @@ from mercury_tools.orchestration.models import validate_cross_mcp_data
 from mercury_tools.qualification.models import StrictSafeModel
 
 MONEY_QUANTUM = Decimal("0.01")
+_ACCOUNTING_TOKEN = re.compile(r"^[\w][\w./:#()+,%&'-]*$")
 
 
 def _normalized_money(value: Any, *, code: str) -> Decimal:
@@ -31,6 +33,47 @@ def _normalized_money(value: Any, *, code: str) -> Decimal:
 def _clean_text(value: str, *, casefold: bool = False) -> str:
     cleaned = re.sub(r"\s+", " ", value.strip())
     return cleaned.casefold() if casefold else cleaned
+
+
+def _normalized_text(
+    value: Any,
+    *,
+    code: str,
+    casefold: bool = False,
+    allow_empty: bool = False,
+) -> str:
+    if not isinstance(value, str):
+        raise ValueError(code)
+    cleaned = _clean_text(value, casefold=casefold)
+    if not cleaned and not allow_empty:
+        raise ValueError(code)
+    return cleaned
+
+
+def _normalized_text_tuple(value: Any, *, code: str) -> tuple[str, ...]:
+    if (
+        isinstance(value, (str, bytes, bytearray, Mapping))
+        or not isinstance(value, Sequence)
+    ):
+        raise ValueError(code)
+    return tuple(_normalized_text(item, code=code) for item in value)
+
+
+def _normalized_accounting_token(value: Any, *, code: str) -> str:
+    cleaned = _normalized_text(value, code=code)
+    validate_cross_mcp_data(cleaned)
+    if (
+        not _ACCOUNTING_TOKEN.fullmatch(cleaned)
+        or ".." in cleaned
+        or "//" in cleaned
+    ):
+        raise ValueError(code)
+    return cleaned
+
+
+def _normalized_accounting_token_tuple(value: Any, *, code: str) -> tuple[str, ...]:
+    values = _normalized_text_tuple(value, code=code)
+    return tuple(_normalized_accounting_token(item, code=code) for item in values)
 
 
 class CanonicalTransaction(StrictSafeModel):
@@ -52,14 +95,12 @@ class CanonicalTransaction(StrictSafeModel):
     @field_validator("currency", mode="before")
     @classmethod
     def normalize_currency(cls, value: Any) -> str:
-        return str(value).strip().upper()
+        return _normalized_text(value, code="transaction_text_invalid").upper()
 
     @field_validator("transaction_id", "source", "document_state", mode="before")
     @classmethod
     def normalize_required_text(cls, value: Any) -> str:
-        if value is None:
-            raise ValueError("transaction_required_text_invalid")
-        return _clean_text(str(value), casefold=False)
+        return _normalized_accounting_token(value, code="transaction_text_invalid")
 
     @field_validator("source", "document_state")
     @classmethod
@@ -71,15 +112,18 @@ class CanonicalTransaction(StrictSafeModel):
     def normalize_optional_text(cls, value: Any) -> str | None:
         if value is None:
             return None
-        cleaned = _clean_text(str(value))
+        if isinstance(value, str) and not value.strip():
+            return None
+        cleaned = _normalized_accounting_token(value, code="transaction_text_invalid")
         return cleaned or None
 
     @field_validator("evidence_refs", mode="before")
     @classmethod
     def normalize_evidence_refs(cls, value: Any) -> tuple[str, ...]:
-        if isinstance(value, str):
-            raise ValueError("transaction_evidence_refs_invalid")
-        return tuple(_clean_text(str(item)) for item in value)
+        return _normalized_accounting_token_tuple(
+            value,
+            code="transaction_evidence_refs_invalid",
+        )
 
     @model_validator(mode="after")
     def validate_canonical_data(self) -> CanonicalTransaction:
@@ -133,8 +177,46 @@ class PairEvidence(StrictSafeModel):
     candidate_count: int = Field(ge=1)
     tie_breaker: Literal["none", "stable_transaction_id"] = "none"
 
+    @field_validator("left_transaction_id", "right_transaction_id", mode="before")
+    @classmethod
+    def validate_transaction_ids(cls, value: Any) -> str:
+        return _normalized_accounting_token(
+            value,
+            code="reconciliation_evidence_text_invalid",
+        )
+
+    @field_validator("matched_fields", mode="before")
+    @classmethod
+    def validate_matched_fields(cls, value: Any) -> tuple[str, ...]:
+        return _normalized_text_tuple(
+            value,
+            code="reconciliation_evidence_text_invalid",
+        )
+
+    @field_validator("evidence_refs", mode="before")
+    @classmethod
+    def validate_evidence_refs(cls, value: Any) -> tuple[str, ...]:
+        return _normalized_accounting_token_tuple(
+            value,
+            code="reconciliation_evidence_text_invalid",
+        )
+
     @model_validator(mode="after")
     def validate_evidence_data(self) -> PairEvidence:
+        allowed_match_fields = {
+            "amount",
+            "counterparty_key",
+            "currency",
+            "document_state",
+            "reference",
+            "transaction_date",
+        }
+        if not self.matched_fields or any(
+            field not in allowed_match_fields for field in self.matched_fields
+        ):
+            raise ValueError("reconciliation_matched_fields_invalid")
+        if len(set(self.evidence_refs)) != len(self.evidence_refs):
+            raise ValueError("reconciliation_evidence_refs_invalid")
         validate_cross_mcp_data(
             (
                 self.left_transaction_id,
@@ -153,8 +235,30 @@ class DuplicateEvidence(StrictSafeModel):
     evidence_refs: tuple[str, ...] = Field(min_length=1)
     reason: Literal["exact_canonical_duplicate"] = "exact_canonical_duplicate"
 
+    @field_validator("canonical_transaction_id", mode="before")
+    @classmethod
+    def validate_canonical_id(cls, value: Any) -> str:
+        return _normalized_accounting_token(
+            value,
+            code="reconciliation_evidence_text_invalid",
+        )
+
+    @field_validator("transaction_ids", "evidence_refs", mode="before")
+    @classmethod
+    def validate_text_tuples(cls, value: Any) -> tuple[str, ...]:
+        return _normalized_accounting_token_tuple(
+            value,
+            code="reconciliation_evidence_text_invalid",
+        )
+
     @model_validator(mode="after")
     def validate_evidence_data(self) -> DuplicateEvidence:
+        if len(set(self.transaction_ids)) != len(self.transaction_ids):
+            raise ValueError("reconciliation_duplicate_ids_invalid")
+        if self.canonical_transaction_id not in self.transaction_ids:
+            raise ValueError("reconciliation_duplicate_ids_invalid")
+        if len(set(self.evidence_refs)) != len(self.evidence_refs):
+            raise ValueError("reconciliation_evidence_refs_invalid")
         validate_cross_mcp_data(
             (
                 self.canonical_transaction_id,
@@ -169,10 +273,30 @@ class UnmatchedEvidence(StrictSafeModel):
     side: Literal["left", "right"]
     transaction_id: str
     evidence_refs: tuple[str, ...] = Field(min_length=1)
-    reason: Literal["no_eligible_candidate"] = "no_eligible_candidate"
+    reason: Literal["candidate_contention", "no_eligible_candidate"] = (
+        "no_eligible_candidate"
+    )
+
+    @field_validator("transaction_id", mode="before")
+    @classmethod
+    def validate_transaction_id(cls, value: Any) -> str:
+        return _normalized_accounting_token(
+            value,
+            code="reconciliation_evidence_text_invalid",
+        )
+
+    @field_validator("evidence_refs", mode="before")
+    @classmethod
+    def validate_evidence_refs(cls, value: Any) -> tuple[str, ...]:
+        return _normalized_accounting_token_tuple(
+            value,
+            code="reconciliation_evidence_text_invalid",
+        )
 
     @model_validator(mode="after")
     def validate_evidence_data(self) -> UnmatchedEvidence:
+        if len(set(self.evidence_refs)) != len(self.evidence_refs):
+            raise ValueError("reconciliation_evidence_refs_invalid")
         validate_cross_mcp_data((self.transaction_id, self.evidence_refs))
         return self
 
