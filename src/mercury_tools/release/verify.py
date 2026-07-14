@@ -4,37 +4,37 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import stat
 import sys
 import tarfile
 import tempfile
 import zipfile
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from mercury_tools.release.artifacts import (
     MANIFEST_FILE_NAME,
     ReleaseArtifact,
     ReleaseArtifactManifest,
-    ScannerGate,
-    _require_output_absent,
+    ReleaseCandidate,
+    _build_artifact_set,
+    _ensure_candidate_unchanged,
+    _prepare_output_destination,
+    _publish_owned_directory,
     _strict_json_loads,
     _write_candidate_tree,
     _zip_datetime,
     is_excluded_public_path,
     load_release_artifact_manifest,
     load_release_candidate,
-    require_clean_worktree,
+    materialize_release_candidate,
     require_task13_scanner_gate,
     source_tree_digest,
+    validate_canonical_archive_member_names,
 )
-from mercury_tools.release.models import SecretScanPolicy
 from mercury_tools.release.scanner import (
     ReleaseGateError,
     SubprocessCommandRunner,
-    load_public_surface_manifest,
-    scan_filesystem,
 )
 
 EXPECTED_LOCAL_MCP_TOOL_NAMES = frozenset(
@@ -61,7 +61,8 @@ EXPECTED_LOCAL_MCP_TOOL_NAMES = frozenset(
     }
 )
 _MCP_TOOL_LIST_PROGRAM = (
-    "import asyncio, json\n"
+    "import asyncio, json, sys\n"
+    "sys.path.insert(0, sys.argv[1])\n"
     "from mercury_tools.mcp.local_server import local_mcp\n"
     "tools = asyncio.run(local_mcp.list_tools())\n"
     "print(json.dumps(sorted(tool.name for tool in tools)))\n"
@@ -107,8 +108,9 @@ def verify_release_tree(root: Path, *, version: str):
     """Verify source-tree contracts independent of artifact publication state."""
 
     candidate = load_release_candidate(root, version=version, require_clean=False)
-    _require_immutable_plugin_ref(candidate.root, version)
-    _require_exact_local_mcp_tools(candidate.root)
+    with materialize_release_candidate(candidate) as snapshot:
+        _require_immutable_plugin_ref(snapshot, version)
+        _require_exact_local_mcp_tools(snapshot)
     return candidate
 
 
@@ -117,33 +119,44 @@ def verify_release(
     root: Path,
     version: str,
     artifacts: Path,
-    scanner_gate: ScannerGate | None = None,
 ) -> ReleaseVerification:
     """Verify a clean release candidate and its exact deterministic artifact set."""
 
-    candidate = load_release_candidate(root, version=version, require_clean=False)
-    require_clean_worktree(candidate.root)
-    _require_immutable_plugin_ref(candidate.root, version)
-    _require_exact_local_mcp_tools(candidate.root)
-    manifest = load_release_artifact_manifest(artifacts / MANIFEST_FILE_NAME)
-    _require_manifest_binding(
-        manifest,
-        candidate.version,
-        candidate.commit_sha,
-        candidate.build_epoch,
-    )
-    _require_exact_artifact_set(artifacts, manifest)
-    for artifact in manifest.artifacts:
-        path = artifacts / artifact.file_name
-        _require_artifact_digest(path, artifact)
-        _require_normalized_archive(path, artifact.build_epoch)
-    require_task13_scanner_gate(candidate.root, artifacts, scanner_gate=scanner_gate)
-    return ReleaseVerification(
-        passed=True,
-        version=candidate.version,
-        commit_sha=candidate.commit_sha,
-        artifact_manifest_sha256=_sha256_file(artifacts / MANIFEST_FILE_NAME),
-    )
+    candidate = load_release_candidate(root, version=version, require_clean=True)
+    try:
+        with materialize_release_candidate(candidate) as snapshot:
+            _require_immutable_plugin_ref(snapshot, version)
+            _require_exact_local_mcp_tools(snapshot)
+            with tempfile.TemporaryDirectory(prefix=".mercury-release-verify-") as temporary:
+                expected_artifacts = Path(temporary) / "expected-artifacts"
+                expected_artifacts.mkdir()
+                expected_manifest = _build_artifact_set(
+                    candidate,
+                    snapshot,
+                    expected_artifacts,
+                )
+                _require_artifacts_match_expected(
+                    artifacts,
+                    expected_artifacts,
+                    expected_manifest,
+                )
+                require_task13_scanner_gate(candidate, snapshot, expected_artifacts)
+                _require_artifacts_match_expected(
+                    artifacts,
+                    expected_artifacts,
+                    expected_manifest,
+                )
+                _ensure_candidate_unchanged(candidate)
+                return ReleaseVerification(
+                    passed=True,
+                    version=candidate.version,
+                    commit_sha=candidate.commit_sha,
+                    artifact_manifest_sha256=_sha256_file(artifacts / MANIFEST_FILE_NAME),
+                )
+    except ReleaseGateError:
+        raise
+    except (OSError, tarfile.TarError, zipfile.BadZipFile, ValueError) as exc:
+        raise ReleaseGateError("artifact_candidate_mismatch") from exc
 
 
 def build_public_staging(
@@ -152,41 +165,51 @@ def build_public_staging(
     version: str,
     output: Path,
     artifacts: Path | None = None,
-    scanner_gate: ScannerGate | None = None,
 ) -> PublicStaging:
     """Create a one-commit, history-free staging repository from ``git archive`` only."""
 
+    destination = _prepare_output_destination(output)
     candidate = load_release_candidate(root, version=version, require_clean=True)
-    output = output.expanduser()
-    _require_output_absent(output)
-    try:
-        output.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise ReleaseGateError("release_output_invalid") from exc
-
     candidate_digest = source_tree_digest(candidate.entries)
     try:
-        with tempfile.TemporaryDirectory(
-            prefix=".mercury-public-staging-",
-            dir=output.parent,
-        ) as temporary:
-            temporary_root = Path(temporary)
-            stage = temporary_root / "stage"
-            stage.mkdir()
-            _write_candidate_tree(candidate.entries, stage)
-            _initialize_history_free_repository(stage, candidate.build_epoch)
-            _require_single_new_commit(stage, candidate.commit_sha)
-            staged_candidate = load_release_candidate(stage, version=version, require_clean=True)
-            staged_digest = source_tree_digest(staged_candidate.entries)
-            if staged_digest != candidate_digest:
-                raise ReleaseGateError("staging_tree_digest_mismatch")
-            _require_staging_scanner_gate(
-                candidate.root,
-                stage,
-                artifacts=artifacts,
-                scanner_gate=scanner_gate,
-            )
-            os.replace(stage, output)
+        with materialize_release_candidate(candidate) as snapshot:
+            _require_immutable_plugin_ref(snapshot, version)
+            _require_exact_local_mcp_tools(snapshot)
+            with tempfile.TemporaryDirectory(prefix=".mercury-public-staging-") as temporary:
+                temporary_root = Path(temporary)
+                stage = temporary_root / "stage"
+                expected_artifacts = temporary_root / "expected-artifacts"
+                stage.mkdir()
+                expected_artifacts.mkdir()
+                expected_manifest = _build_artifact_set(
+                    candidate,
+                    snapshot,
+                    expected_artifacts,
+                )
+                if artifacts is not None:
+                    _require_artifacts_match_expected(
+                        artifacts,
+                        expected_artifacts,
+                        expected_manifest,
+                    )
+                _write_candidate_tree(candidate.entries, stage)
+                _require_staging_scanner_gate(
+                    candidate,
+                    snapshot,
+                    expected_artifacts,
+                )
+                _initialize_history_free_repository(stage, candidate.build_epoch)
+                _require_single_new_commit(stage, candidate.commit_sha)
+                staged_candidate = load_release_candidate(
+                    stage,
+                    version=version,
+                    require_clean=True,
+                )
+                staged_digest = source_tree_digest(staged_candidate.entries)
+                if staged_digest != candidate_digest:
+                    raise ReleaseGateError("staging_tree_digest_mismatch")
+                _ensure_candidate_unchanged(candidate)
+                _publish_owned_directory(stage, destination)
     except ReleaseGateError:
         raise
     except OSError as exc:
@@ -239,16 +262,14 @@ def _require_exact_local_mcp_tools(root: Path) -> None:
     source_root = root / "src"
     if not source_root.is_dir():
         raise ReleaseGateError("local_mcp_contract_invalid")
-    inherited_path = os.environ.get("PYTHONPATH", "")
-    python_path = str(source_root)
-    if inherited_path:
-        python_path = f"{python_path}{os.pathsep}{inherited_path}"
     runner = SubprocessCommandRunner(
-        environment={"PYTHONPATH": python_path},
         max_output_bytes=_MAX_COMMAND_OUTPUT,
         timeout_seconds=30.0,
     )
-    result = runner.run((sys.executable, "-c", _MCP_TOOL_LIST_PROGRAM), cwd=root)
+    result = runner.run(
+        (sys.executable, "-I", "-c", _MCP_TOOL_LIST_PROGRAM, str(source_root)),
+        cwd=root,
+    )
     if result.exit_code != 0:
         raise ReleaseGateError("local_mcp_contract_invalid")
     try:
@@ -257,32 +278,34 @@ def _require_exact_local_mcp_tools(root: Path) -> None:
         raise ReleaseGateError("local_mcp_contract_invalid") from exc
     if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
         raise ReleaseGateError("local_mcp_contract_invalid")
-    if (
-        set(names) != EXPECTED_LOCAL_MCP_TOOL_NAMES
-        or len(names) != len(EXPECTED_LOCAL_MCP_TOOL_NAMES)
+    if set(names) != EXPECTED_LOCAL_MCP_TOOL_NAMES or len(names) != len(
+        EXPECTED_LOCAL_MCP_TOOL_NAMES
     ):
         raise ReleaseGateError("local_mcp_contract_invalid")
 
 
-def _require_manifest_binding(
-    manifest: ReleaseArtifactManifest,
-    version: str,
-    commit_sha: str,
-    build_epoch: int,
+def _require_artifacts_match_expected(
+    artifacts: Path,
+    expected_artifacts: Path,
+    expected_manifest: ReleaseArtifactManifest,
 ) -> None:
-    if (
-        manifest.version != version
-        or manifest.commit_sha != commit_sha
-        or manifest.build_epoch != build_epoch
-    ):
-        raise ReleaseGateError("artifact_binding_mismatch")
-    for artifact in manifest.artifacts:
-        if (
-            artifact.version != version
-            or artifact.commit_sha != commit_sha
-            or artifact.build_epoch != build_epoch
-        ):
-            raise ReleaseGateError("artifact_binding_mismatch")
+    _require_exact_artifact_set(artifacts, expected_manifest)
+    for artifact in expected_manifest.artifacts:
+        _require_normalized_archive(
+            artifacts / artifact.file_name,
+            expected_manifest.build_epoch,
+        )
+    submitted_manifest = load_release_artifact_manifest(artifacts / MANIFEST_FILE_NAME)
+    if submitted_manifest.as_dict() != expected_manifest.as_dict():
+        raise ReleaseGateError("artifact_candidate_mismatch")
+    _require_files_equal(
+        artifacts / MANIFEST_FILE_NAME,
+        expected_artifacts / MANIFEST_FILE_NAME,
+    )
+    for artifact in expected_manifest.artifacts:
+        submitted = artifacts / artifact.file_name
+        _require_artifact_digest(submitted, artifact)
+        _require_files_equal(submitted, expected_artifacts / artifact.file_name)
 
 
 def _require_exact_artifact_set(artifacts: Path, manifest: ReleaseArtifactManifest) -> None:
@@ -313,10 +336,9 @@ def _require_exact_artifact_set(artifacts: Path, manifest: ReleaseArtifactManife
 
 def _artifact_name_matches(artifact: ReleaseArtifact) -> bool:
     if artifact.kind == "wheel":
-        return (
-            artifact.file_name.startswith(f"mercury_tools-{artifact.version}-")
-            and artifact.file_name.endswith(".whl")
-        )
+        return artifact.file_name.startswith(
+            f"mercury_tools-{artifact.version}-"
+        ) and artifact.file_name.endswith(".whl")
     if artifact.kind == "sdist":
         return artifact.file_name == f"mercury_tools-{artifact.version}.tar.gz"
     if artifact.kind == "plugin":
@@ -333,6 +355,22 @@ def _require_artifact_digest(path: Path, artifact: ReleaseArtifact) -> None:
         raise ReleaseGateError("artifact_digest_mismatch")
 
 
+def _require_files_equal(submitted: Path, expected: Path) -> None:
+    try:
+        with submitted.open("rb") as submitted_stream, expected.open("rb") as expected_stream:
+            while True:
+                submitted_chunk = submitted_stream.read(1024 * 1024)
+                expected_chunk = expected_stream.read(1024 * 1024)
+                if submitted_chunk != expected_chunk:
+                    raise ReleaseGateError("artifact_candidate_mismatch")
+                if not submitted_chunk:
+                    return
+    except ReleaseGateError:
+        raise
+    except OSError as exc:
+        raise ReleaseGateError("artifact_candidate_mismatch") from exc
+
+
 def _require_normalized_archive(path: Path, epoch: int) -> None:
     if path.suffix in {".whl", ".zip"}:
         _require_normalized_zip(path, epoch)
@@ -345,18 +383,18 @@ def _require_normalized_zip(path: Path, epoch: int) -> None:
         with zipfile.ZipFile(path) as archive:
             entries = archive.infolist()
             names = [entry.filename for entry in entries]
-            if names != sorted(names) or len(names) != len({name.casefold() for name in names}):
+            try:
+                validate_canonical_archive_member_names(names)
+            except ReleaseGateError as exc:
+                raise ReleaseGateError("artifact_archive_metadata_invalid") from exc
+            if names != sorted(names) or any(entry.is_dir() for entry in entries):
                 raise ReleaseGateError("artifact_archive_metadata_invalid")
             if archive.comment:
                 raise ReleaseGateError("artifact_archive_metadata_invalid")
             for entry in entries:
-                if not _safe_member_name(entry.filename) or is_excluded_public_path(entry.filename):
+                if is_excluded_public_path(entry.filename):
                     raise ReleaseGateError("artifact_archive_metadata_invalid")
-                expected_mode = (
-                    stat.S_IFDIR | 0o755
-                    if entry.is_dir()
-                    else stat.S_IFREG | 0o644
-                )
+                expected_mode = stat.S_IFREG | 0o644
                 if (
                     entry.create_system != 3
                     or entry.compress_type != zipfile.ZIP_DEFLATED
@@ -387,14 +425,16 @@ def _require_normalized_tar_gz(path: Path, epoch: int) -> None:
         with tarfile.open(path, mode="r:gz") as archive:
             entries = archive.getmembers()
             names = [entry.name for entry in entries]
-            if names != sorted(names) or len(names) != len({name.casefold() for name in names}):
+            try:
+                validate_canonical_archive_member_names(names)
+            except ReleaseGateError as exc:
+                raise ReleaseGateError("artifact_archive_metadata_invalid") from exc
+            if names != sorted(names) or any(entry.isdir() for entry in entries):
                 raise ReleaseGateError("artifact_archive_metadata_invalid")
             for entry in entries:
-                if not _safe_member_name(entry.name) or is_excluded_public_path(entry.name):
+                if is_excluded_public_path(entry.name):
                     raise ReleaseGateError("artifact_archive_metadata_invalid")
-                if entry.isdir():
-                    expected_mode = 0o755
-                elif entry.isfile():
+                if entry.isfile():
                     expected_mode = 0o644
                 else:
                     raise ReleaseGateError("artifact_archive_metadata_invalid")
@@ -416,30 +456,11 @@ def _require_normalized_tar_gz(path: Path, epoch: int) -> None:
 
 
 def _require_staging_scanner_gate(
-    root: Path,
-    stage: Path,
-    *,
-    artifacts: Path | None,
-    scanner_gate: ScannerGate | None,
+    candidate: ReleaseCandidate,
+    snapshot: Path,
+    expected_artifacts: Path,
 ) -> None:
-    if scanner_gate is not None:
-        require_task13_scanner_gate(root, stage, scanner_gate=scanner_gate)
-        return
-    if artifacts is None:
-        raise ReleaseGateError("release_scanner_context_unavailable")
-    require_task13_scanner_gate(root, artifacts, scanner_gate=None)
-    try:
-        manifest = load_public_surface_manifest(root / "docs/release/public-surface-manifest.json")
-        result = scan_filesystem(
-            stage,
-            SecretScanPolicy(scanner_versions=manifest.scanner_versions),
-        )
-    except ReleaseGateError:
-        raise
-    except Exception as exc:
-        raise ReleaseGateError("release_scanner_gate_unavailable") from exc
-    if result.blockers or result.findings:
-        raise ReleaseGateError("release_scanner_gate_blocked")
+    require_task13_scanner_gate(candidate, snapshot, expected_artifacts)
 
 
 def _initialize_history_free_repository(stage: Path, epoch: int) -> None:
@@ -490,8 +511,3 @@ def _sha256_file(path: Path) -> str:
     except OSError as exc:
         raise ReleaseGateError("artifact_digest_mismatch") from exc
     return digest.hexdigest()
-
-
-def _safe_member_name(name: str) -> bool:
-    path = PurePosixPath(name)
-    return bool(name) and not path.is_absolute() and "\\" not in name and ".." not in path.parts

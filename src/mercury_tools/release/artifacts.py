@@ -13,15 +13,24 @@ import stat
 import tarfile
 import tempfile
 import tomllib
+import unicodedata
 import zipfile
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 
-from mercury_tools.release.models import SecretScanPolicy, SecretScanRequest
+from mercury_tools.release.models import (
+    PINNED_SCANNER_VERSIONS,
+    REQUIRED_PUBLIC_SURFACES,
+    GateStatus,
+    SecretScanPolicy,
+    SecretScanReport,
+    SecretScanRequest,
+)
 from mercury_tools.release.scanner import (
     ReleaseGateError,
     SubprocessCommandRunner,
@@ -62,13 +71,6 @@ _EXCLUDED_STATE_FILES = frozenset(
         "validation-traffic.json",
     }
 )
-
-
-@dataclass(frozen=True)
-class ReleaseScannerAttestation:
-    """A narrow adapter for an explicit successful Task 13 gate result."""
-
-    passed: bool
 
 
 @dataclass(frozen=True)
@@ -124,13 +126,20 @@ class CandidateEntry:
 @dataclass(frozen=True)
 class ReleaseCandidate:
     root: Path
+    head_ref: str
+    origin_url: str | None
+    repository_name: str | None
     version: str
     commit_sha: str
     build_epoch: int
     entries: tuple[CandidateEntry, ...]
 
 
-ScannerGate = Callable[[Path, Path], object]
+@dataclass(frozen=True)
+class _OutputDestination:
+    path: Path
+    parent_device: int
+    parent_inode: int
 
 
 def build_release_artifacts(
@@ -138,39 +147,23 @@ def build_release_artifacts(
     *,
     version: str,
     output: Path,
-    scanner_gate: ScannerGate | None = None,
 ) -> ReleaseArtifactManifest:
     """Build exactly four reproducible artifacts from the clean candidate commit."""
 
+    destination = _prepare_output_destination(output)
     candidate = load_release_candidate(root, version=version, require_clean=True)
-    output = output.expanduser()
-    _require_output_absent(output)
     try:
-        output.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise ReleaseGateError("release_output_invalid") from exc
-
-    try:
-        with tempfile.TemporaryDirectory(
-            prefix=".mercury-release-",
-            dir=output.parent,
-        ) as temporary:
+        with (
+            materialize_release_candidate(candidate) as snapshot,
+            tempfile.TemporaryDirectory(prefix=".mercury-release-") as temporary,
+        ):
             temporary_root = Path(temporary)
-            source_root = temporary_root / "source"
             staged_artifacts = temporary_root / "artifacts"
-            source_root.mkdir()
             staged_artifacts.mkdir()
-            _write_candidate_tree(candidate.entries, source_root)
-            _build_distributions(candidate, source_root, staged_artifacts)
-            _build_plugin_archive(candidate, staged_artifacts)
-            _build_source_archive(candidate, staged_artifacts)
-            manifest = _write_manifest(candidate, staged_artifacts)
-            require_task13_scanner_gate(
-                candidate.root,
-                staged_artifacts,
-                scanner_gate=scanner_gate,
-            )
-            os.replace(staged_artifacts, output)
+            manifest = _build_artifact_set(candidate, snapshot, staged_artifacts)
+            require_task13_scanner_gate(candidate, snapshot, staged_artifacts)
+            _ensure_candidate_unchanged(candidate)
+            _publish_owned_directory(staged_artifacts, destination)
             return manifest
     except ReleaseGateError:
         raise
@@ -187,21 +180,42 @@ def load_release_candidate(
     """Read the reviewed Git commit without importing worktree-only content."""
 
     root = _resolve_root(root)
-    _require_version_matches(root, version)
-    if require_clean:
-        require_clean_worktree(root)
     commit_sha = git_head(root)
+    head_ref = _git_head_ref(root)
+    _require_git_commit_object(root, commit_sha)
+    origin_url = _origin_url(root)
     build_epoch = git_commit_epoch(root, commit_sha)
     entries = _candidate_entries(root, commit_sha)
     if not entries:
         raise ReleaseGateError("release_candidate_empty")
-    return ReleaseCandidate(
+    _require_version_matches_entries(entries, version)
+    candidate = ReleaseCandidate(
         root=root,
+        head_ref=head_ref,
+        origin_url=origin_url,
+        repository_name=(
+            _repository_name_from_origin_url(origin_url) if origin_url is not None else None
+        ),
         version=version,
         commit_sha=commit_sha,
         build_epoch=build_epoch,
         entries=entries,
     )
+    if require_clean:
+        require_clean_worktree(root)
+        _ensure_candidate_unchanged(candidate)
+    return candidate
+
+
+@contextmanager
+def materialize_release_candidate(candidate: ReleaseCandidate) -> Iterator[Path]:
+    """Materialize the captured candidate once in an owned temporary snapshot."""
+
+    with tempfile.TemporaryDirectory(prefix=".mercury-candidate-") as temporary:
+        snapshot = Path(temporary) / "candidate"
+        snapshot.mkdir()
+        _write_candidate_tree(candidate.entries, snapshot)
+        yield snapshot
 
 
 def require_clean_worktree(root: Path) -> None:
@@ -226,6 +240,28 @@ def git_head(root: Path) -> str:
     if result.exit_code != 0 or not _COMMIT_PATTERN.fullmatch(value):
         raise ReleaseGateError("release_candidate_invalid")
     return value
+
+
+def _git_head_ref(root: Path) -> str:
+    result = _run_command(
+        ("git", "rev-parse", "--symbolic-full-name", "HEAD"),
+        cwd=root,
+        timeout_seconds=_GIT_TIMEOUT_SECONDS,
+    )
+    value = result.stdout.decode("utf-8", errors="ignore").strip()
+    if result.exit_code != 0 or not value or "\n" in value or "\0" in value:
+        raise ReleaseGateError("release_candidate_invalid")
+    return value
+
+
+def _require_git_commit_object(root: Path, commit_sha: str) -> None:
+    result = _run_command(
+        ("git", "cat-file", "-e", f"{commit_sha}^{{commit}}"),
+        cwd=root,
+        timeout_seconds=_GIT_TIMEOUT_SECONDS,
+    )
+    if result.exit_code != 0:
+        raise ReleaseGateError("release_candidate_invalid")
 
 
 def git_commit_epoch(root: Path, commit_sha: str) -> int:
@@ -313,29 +349,45 @@ def load_release_artifact_manifest(path: Path) -> ReleaseArtifactManifest:
 
 
 def require_task13_scanner_gate(
-    root: Path,
+    candidate: ReleaseCandidate,
+    snapshot: Path,
     target: Path,
-    *,
-    scanner_gate: ScannerGate | None,
 ) -> None:
     try:
-        result = (
-            scanner_gate(root, target)
-            if scanner_gate is not None
-            else _run_task13_artifact_gate(root, target)
-        )
-        passed = result.passed
+        report = _run_task13_artifact_gate(candidate, snapshot, target)
     except ReleaseGateError:
         raise
     except Exception as exc:
         raise ReleaseGateError("release_scanner_gate_unavailable") from exc
-    if passed is not True:
+    _require_complete_task13_report(report)
+
+
+def _require_complete_task13_report(report: object) -> None:
+    if type(report) is not SecretScanReport:
+        raise ReleaseGateError("release_scanner_gate_unavailable")
+    try:
+        validated = SecretScanReport.model_validate(report.model_dump())
+    except Exception as exc:
+        raise ReleaseGateError("release_scanner_gate_unavailable") from exc
+    expected_scanners = tuple(
+        (name, version, GateStatus.PASSED, 0) for name, version in PINNED_SCANNER_VERSIONS.items()
+    )
+    actual_scanners = tuple(
+        (scanner.scanner, scanner.version, scanner.status, scanner.exit_code)
+        for scanner in validated.scanner_versions
+    )
+    if (
+        validated.status is not GateStatus.PASSED
+        or actual_scanners != expected_scanners
+        or tuple(surface.surface for surface in validated.surfaces) != REQUIRED_PUBLIC_SURFACES
+        or any(surface.status is not GateStatus.PASSED for surface in validated.surfaces)
+    ):
         raise ReleaseGateError("release_scanner_gate_blocked")
 
 
 def source_tree_digest(entries: Iterable[CandidateEntry]) -> str:
     digest = hashlib.sha256()
-    for entry in sorted(entries, key=lambda item: item.name):
+    for entry in _ordered_entries(entries):
         digest.update(f"{entry.mode:o} {entry.name}\0".encode())
         digest.update(hashlib.sha256(entry.data).digest())
     return digest.hexdigest()
@@ -361,14 +413,15 @@ def _resolve_root(root: Path) -> Path:
     return resolved
 
 
-def _require_version_matches(root: Path, version: str) -> None:
+def _require_version_matches_entries(entries: Iterable[CandidateEntry], version: str) -> None:
     if not _VERSION_PATTERN.fullmatch(version):
         raise ReleaseGateError("release_version_invalid")
     try:
-        payload = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        pyproject = next(entry for entry in entries if entry.name == "pyproject.toml")
+        payload = tomllib.loads(pyproject.data.decode("utf-8"))
         project = payload["project"]
         package_version = project["version"] if isinstance(project, dict) else None
-    except (OSError, UnicodeError, tomllib.TOMLDecodeError, KeyError, TypeError) as exc:
+    except (StopIteration, UnicodeError, tomllib.TOMLDecodeError, KeyError, TypeError) as exc:
         raise ReleaseGateError("release_version_unavailable") from exc
     if package_version != version:
         raise ReleaseGateError("release_version_mismatch")
@@ -384,17 +437,12 @@ def _candidate_entries(root: Path, commit_sha: str) -> tuple[CandidateEntry, ...
         raise ReleaseGateError("release_git_archive_failed")
     try:
         with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:") as archive:
+            members = tuple(member for member in archive.getmembers() if not member.isdir())
+            if any(not member.isfile() for member in members):
+                raise ReleaseGateError("release_archive_member_invalid")
+            validate_canonical_archive_member_names(member.name for member in members)
             entries: list[CandidateEntry] = []
-            seen: set[str] = set()
-            for member in archive.getmembers():
-                if member.isdir():
-                    continue
-                if not member.isfile() or not _safe_archive_name(member.name):
-                    raise ReleaseGateError("release_archive_member_invalid")
-                canonical_name = member.name.casefold()
-                if canonical_name in seen:
-                    raise ReleaseGateError("release_archive_member_invalid")
-                seen.add(canonical_name)
+            for member in members:
                 if is_excluded_public_path(member.name):
                     continue
                 source = archive.extractfile(member)
@@ -418,13 +466,43 @@ def _candidate_entries(root: Path, commit_sha: str) -> tuple[CandidateEntry, ...
 
 
 def _write_candidate_tree(entries: Iterable[CandidateEntry], destination: Path) -> None:
-    for entry in sorted(entries, key=lambda item: item.name):
-        if not _safe_archive_name(entry.name):
-            raise ReleaseGateError("release_archive_member_invalid")
-        path = destination / entry.name
+    try:
+        destination = destination.resolve(strict=True)
+        metadata = destination.lstat()
+    except OSError as exc:
+        raise ReleaseGateError("release_archive_member_invalid") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ReleaseGateError("release_archive_member_invalid")
+    for entry in _ordered_entries(entries):
+        path = destination.joinpath(*entry.name.split("/"))
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(entry.data)
-        os.chmod(path, entry.mode)
+        try:
+            resolved_parent = path.parent.resolve(strict=True)
+            resolved_parent.relative_to(destination)
+            path.lstat()
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            raise ReleaseGateError("release_archive_member_invalid") from exc
+        else:
+            raise ReleaseGateError("release_archive_member_invalid")
+        try:
+            with path.open("xb") as stream:
+                stream.write(entry.data)
+            os.chmod(path, entry.mode)
+        except OSError as exc:
+            raise ReleaseGateError("release_archive_member_invalid") from exc
+
+
+def _build_artifact_set(
+    candidate: ReleaseCandidate,
+    source_root: Path,
+    output: Path,
+) -> ReleaseArtifactManifest:
+    _build_distributions(candidate, source_root, output)
+    _build_plugin_archive(candidate, output)
+    _build_source_archive(candidate, output)
+    return _write_manifest(candidate, output)
 
 
 def _build_distributions(
@@ -435,7 +513,12 @@ def _build_distributions(
     raw_output = staged_artifacts / "raw"
     raw_output.mkdir()
     runner = SubprocessCommandRunner(
-        environment={"PYTHONHASHSEED": "0", "SOURCE_DATE_EPOCH": str(candidate.build_epoch)},
+        environment={
+            "PYTHONHASHSEED": "0",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONPATH": "",
+            "SOURCE_DATE_EPOCH": str(candidate.build_epoch),
+        },
         max_output_bytes=_MAX_COMMAND_OUTPUT,
         timeout_seconds=_BUILD_TIMEOUT_SECONDS,
     )
@@ -504,8 +587,6 @@ def _normalize_zip_archive(source: Path, destination: Path, epoch: int) -> None:
             for member in archive.infolist():
                 if member.is_dir():
                     continue
-                if not _safe_archive_name(member.filename):
-                    raise ReleaseGateError("release_archive_member_invalid")
                 entries.append(
                     CandidateEntry(
                         name=member.filename,
@@ -517,6 +598,7 @@ def _normalize_zip_archive(source: Path, destination: Path, epoch: int) -> None:
         raise
     except (OSError, zipfile.BadZipFile) as exc:
         raise ReleaseGateError("release_build_output_invalid") from exc
+    validate_canonical_archive_member_names(entry.name for entry in entries)
     _write_zip_archive(entries, destination, epoch)
 
 
@@ -527,7 +609,7 @@ def _normalize_tar_gz_archive(source: Path, destination: Path, epoch: int) -> No
             for member in archive.getmembers():
                 if member.isdir():
                     continue
-                if not member.isfile() or not _safe_archive_name(member.name):
+                if not member.isfile():
                     raise ReleaseGateError("release_archive_member_invalid")
                 stream = archive.extractfile(member)
                 if stream is None:
@@ -543,6 +625,7 @@ def _normalize_tar_gz_archive(source: Path, destination: Path, epoch: int) -> No
         raise
     except (OSError, tarfile.TarError) as exc:
         raise ReleaseGateError("release_build_output_invalid") from exc
+    validate_canonical_archive_member_names(entry.name for entry in entries)
     _write_tar_gz_archive(entries, destination, epoch)
 
 
@@ -566,17 +649,21 @@ def _write_zip_archive(entries: Iterable[CandidateEntry], destination: Path, epo
 
 def _write_tar_gz_archive(entries: Iterable[CandidateEntry], destination: Path, epoch: int) -> None:
     ordered = _ordered_entries(entries)
-    with destination.open("wb") as raw, gzip.GzipFile(
-        filename="",
-        mode="wb",
-        fileobj=raw,
-        mtime=epoch,
-        compresslevel=9,
-    ) as compressed, tarfile.open(
-        fileobj=compressed,
-        mode="w",
-        format=tarfile.GNU_FORMAT,
-    ) as archive:
+    with (
+        destination.open("wb") as raw,
+        gzip.GzipFile(
+            filename="",
+            mode="wb",
+            fileobj=raw,
+            mtime=epoch,
+            compresslevel=9,
+        ) as compressed,
+        tarfile.open(
+            fileobj=compressed,
+            mode="w",
+            format=tarfile.GNU_FORMAT,
+        ) as archive,
+    ):
         for entry in ordered:
             metadata = tarfile.TarInfo(entry.name)
             metadata.size = len(entry.data)
@@ -622,27 +709,36 @@ def _write_manifest(candidate: ReleaseCandidate, output: Path) -> ReleaseArtifac
         artifacts=tuple(sorted(artifacts, key=lambda artifact: artifact.file_name)),
     )
     try:
-        encoded = json.dumps(
-            manifest.as_dict(),
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8") + b"\n"
+        encoded = (
+            json.dumps(
+                manifest.as_dict(),
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            + b"\n"
+        )
         (output / MANIFEST_FILE_NAME).write_bytes(encoded)
     except OSError as exc:
         raise ReleaseGateError("release_manifest_write_failed") from exc
     return manifest
 
 
-def _run_task13_artifact_gate(root: Path, artifacts: Path) -> ReleaseScannerAttestation:
-    repo = _repository_name_from_origin(root)
+def _run_task13_artifact_gate(
+    candidate: ReleaseCandidate,
+    snapshot: Path,
+    artifacts: Path,
+) -> SecretScanReport:
+    repo = candidate.repository_name
+    if repo is None:
+        raise ReleaseGateError("release_scanner_context_unavailable")
     try:
         from mercury_tools.release.hosted import HostedAdapterConfig, build_hosted_clients
 
         manifest = load_public_surface_manifest(
-            root / "docs/release/public-surface-manifest.json"
+            snapshot / "docs/release/public-surface-manifest.json"
         )
-        allowlist = load_secret_scan_allowlist(root / "docs/release/secret-scan-allowlist.json")
+        allowlist = load_secret_scan_allowlist(snapshot / "docs/release/secret-scan-allowlist.json")
         request = SecretScanRequest(
             repo=repo,
             artifacts=artifacts,
@@ -664,12 +760,8 @@ def _run_task13_artifact_gate(root: Path, artifacts: Path) -> ReleaseScannerAtte
                 render_token=_environment_secret("RENDER_API_KEY"),
                 supabase_url=os.environ.get("SUPABASE_URL") or None,
                 supabase_key=_environment_secret("SUPABASE_SERVICE_ROLE_KEY"),
-                supabase_knowledge_tables=_environment_values(
-                    "MERCURY_RELEASE_KNOWLEDGE_TABLES"
-                ),
-                supabase_storage_buckets=_environment_values(
-                    "MERCURY_RELEASE_STORAGE_BUCKETS"
-                ),
+                supabase_knowledge_tables=_environment_values("MERCURY_RELEASE_KNOWLEDGE_TABLES"),
+                supabase_storage_buckets=_environment_values("MERCURY_RELEASE_STORAGE_BUCKETS"),
                 public_mcp_url=os.environ.get("MERCURY_PUBLIC_MCP_URL") or None,
                 public_mcp_token=_environment_secret("MERCURY_PUBLIC_MCP_TOKEN"),
             )
@@ -679,7 +771,7 @@ def _run_task13_artifact_gate(root: Path, artifacts: Path) -> ReleaseScannerAtte
         raise
     except Exception as exc:
         raise ReleaseGateError("release_scanner_gate_unavailable") from exc
-    return ReleaseScannerAttestation(passed=report.passed)
+    return report
 
 
 def _environment_secret(name: str) -> str | None:
@@ -692,7 +784,7 @@ def _environment_values(name: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(item for item in values if item))
 
 
-def _repository_name_from_origin(root: Path) -> str:
+def _origin_url(root: Path) -> str | None:
     result = _run_command(
         ("git", "remote", "get-url", "origin"),
         cwd=root,
@@ -700,7 +792,11 @@ def _repository_name_from_origin(root: Path) -> str:
     )
     value = result.stdout.decode("utf-8", errors="ignore").strip()
     if result.exit_code != 0:
-        raise ReleaseGateError("release_scanner_context_unavailable")
+        return None
+    return value or None
+
+
+def _repository_name_from_origin_url(value: str) -> str:
     ssh_match = re.fullmatch(
         r"git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(?:\.git)?",
         value,
@@ -716,6 +812,22 @@ def _repository_name_from_origin(root: Path) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", path):
         raise ReleaseGateError("release_scanner_context_unavailable")
     return path
+
+
+def _ensure_candidate_unchanged(candidate: ReleaseCandidate) -> None:
+    try:
+        require_clean_worktree(candidate.root)
+        if git_head(candidate.root) != candidate.commit_sha:
+            raise ReleaseGateError("release_candidate_changed")
+        if _git_head_ref(candidate.root) != candidate.head_ref:
+            raise ReleaseGateError("release_candidate_changed")
+        _require_git_commit_object(candidate.root, candidate.commit_sha)
+        if _origin_url(candidate.root) != candidate.origin_url:
+            raise ReleaseGateError("release_candidate_changed")
+    except ReleaseGateError as exc:
+        if str(exc) == "release_candidate_changed":
+            raise
+        raise ReleaseGateError("release_candidate_changed") from exc
 
 
 def _run_command(
@@ -741,28 +853,79 @@ def _require_output_absent(output: Path) -> None:
     raise ReleaseGateError("release_output_invalid")
 
 
+def _prepare_output_destination(output: Path) -> _OutputDestination:
+    requested = output.expanduser()
+    if requested.name in {"", ".", ".."}:
+        raise ReleaseGateError("release_output_invalid")
+    try:
+        requested.parent.mkdir(parents=True, exist_ok=True)
+        parent = requested.parent.resolve(strict=True)
+        metadata = parent.lstat()
+    except OSError as exc:
+        raise ReleaseGateError("release_output_invalid") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ReleaseGateError("release_output_invalid")
+    destination = parent / requested.name
+    _require_output_absent(destination)
+    return _OutputDestination(
+        path=destination,
+        parent_device=metadata.st_dev,
+        parent_inode=metadata.st_ino,
+    )
+
+
+def _publish_owned_directory(source: Path, destination: _OutputDestination) -> None:
+    try:
+        parent_metadata = destination.path.parent.lstat()
+        source_metadata = source.lstat()
+    except OSError as exc:
+        raise ReleaseGateError("release_output_invalid") from exc
+    if (
+        stat.S_ISLNK(parent_metadata.st_mode)
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_dev != destination.parent_device
+        or parent_metadata.st_ino != destination.parent_inode
+        or stat.S_ISLNK(source_metadata.st_mode)
+        or not stat.S_ISDIR(source_metadata.st_mode)
+    ):
+        raise ReleaseGateError("release_output_invalid")
+    _require_output_absent(destination.path)
+    try:
+        os.replace(source, destination.path)
+    except OSError as exc:
+        raise ReleaseGateError("release_output_invalid") from exc
+
+
 def _ordered_entries(entries: Iterable[CandidateEntry]) -> tuple[CandidateEntry, ...]:
     ordered = tuple(sorted(entries, key=lambda entry: entry.name))
-    names = [entry.name for entry in ordered]
-    canonical_names = [name.casefold() for name in names]
-    if (
-        len(names) != len(set(canonical_names))
-        or any(not _safe_archive_name(name) for name in names)
-    ):
-        raise ReleaseGateError("release_archive_member_invalid")
+    validate_canonical_archive_member_names(entry.name for entry in ordered)
     return ordered
 
 
-def _safe_archive_name(name: str) -> bool:
-    path = PurePosixPath(name)
-    return (
-        bool(name)
-        and name == path.as_posix()
-        and path.as_posix() != "."
-        and not path.is_absolute()
-        and "\\" not in name
-        and ".." not in path.parts
-    )
+def validate_canonical_archive_member_names(names: Iterable[str]) -> tuple[str, ...]:
+    canonical_names: list[str] = []
+    collision_keys: set[str] = set()
+    for name in names:
+        if not isinstance(name, str) or not name or "\0" in name or "\\" in name:
+            raise ReleaseGateError("release_archive_member_invalid")
+        normalized = unicodedata.normalize("NFC", name)
+        path = PurePosixPath(name)
+        parts = name.split("/")
+        canonical = "/".join(parts)
+        if (
+            normalized != name
+            or path.is_absolute()
+            or path.as_posix() != name
+            or any(part in {"", ".", ".."} for part in parts)
+            or canonical != name
+        ):
+            raise ReleaseGateError("release_archive_member_invalid")
+        collision_key = normalized.casefold()
+        if collision_key in collision_keys:
+            raise ReleaseGateError("release_archive_member_invalid")
+        collision_keys.add(collision_key)
+        canonical_names.append(canonical)
+    return tuple(canonical_names)
 
 
 def _zip_datetime(epoch: int) -> tuple[int, int, int, int, int, int]:

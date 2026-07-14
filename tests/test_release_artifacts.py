@@ -1,20 +1,33 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
 import subprocess
 import tarfile
 import zipfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from mercury_tools.release import artifacts as release_artifacts
 from mercury_tools.release.artifacts import (
-    ReleaseScannerAttestation,
+    ReleaseCandidate,
     build_release_artifacts,
+    validate_canonical_archive_member_names,
 )
-from mercury_tools.release.scanner import ReleaseGateError
+from mercury_tools.release.models import (
+    EXPECTED_SURFACE_SCANNER_VERSIONS,
+    PINNED_SCANNER_VERSIONS,
+    REQUIRED_PUBLIC_SURFACES,
+    GateStatus,
+    ScannerVersionAttestation,
+    SecretScanReport,
+    SurfaceAttestation,
+)
+from mercury_tools.release.scanner import ReleaseGateError, build_blocked_report
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = "0.2.1"
@@ -98,12 +111,65 @@ def make_release_tree(tmp_path: Path) -> Path:
     return root
 
 
-def passing_scanner(_root: Path, _target: Path) -> ReleaseScannerAttestation:
-    return ReleaseScannerAttestation(passed=True)
+def passing_task13_report() -> SecretScanReport:
+    timestamp = datetime(2026, 7, 14, tzinfo=UTC)
+    scanners = tuple(
+        ScannerVersionAttestation(
+            scanner=name,
+            version=version,
+            status=GateStatus.PASSED,
+            evidence_sha256=hashlib.sha256(name.encode()).hexdigest(),
+            exit_code=0,
+        )
+        for name, version in PINNED_SCANNER_VERSIONS.items()
+    )
+    surfaces = tuple(
+        SurfaceAttestation(
+            surface=surface,
+            status=GateStatus.PASSED,
+            scanner_versions=EXPECTED_SURFACE_SCANNER_VERSIONS[surface],
+            started_at=timestamp,
+            completed_at=timestamp,
+            finding_count=0,
+            evidence_hashes=(hashlib.sha256(surface.encode()).hexdigest(),),
+            exit_codes=(0,),
+        )
+        for surface in REQUIRED_PUBLIC_SURFACES
+    )
+    return SecretScanReport(
+        status=GateStatus.PASSED,
+        started_at=timestamp,
+        completed_at=timestamp,
+        scanner_versions=scanners,
+        surfaces=surfaces,
+    )
 
 
-def blocked_scanner(_root: Path, _target: Path) -> ReleaseScannerAttestation:
-    return ReleaseScannerAttestation(passed=False)
+def install_task13_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    report: object | None = None,
+) -> list[tuple[object, Path, Path]]:
+    calls: list[tuple[object, Path, Path]] = []
+
+    def run(candidate: object, snapshot: Path, target: Path) -> object:
+        calls.append((candidate, snapshot, target))
+        return passing_task13_report() if report is None else report
+
+    monkeypatch.setattr(release_artifacts, "_run_task13_artifact_gate", run)
+    return calls
+
+
+def incomplete_task13_report() -> SecretScanReport:
+    timestamp = datetime(2026, 7, 14, tzinfo=UTC)
+    return SecretScanReport.model_construct(
+        status=GateStatus.PASSED,
+        started_at=timestamp,
+        completed_at=timestamp,
+        scanner_versions=(),
+        surfaces=(),
+        blockers=(),
+        finding_codes=(),
+    )
 
 
 def _archive_names(path: Path) -> list[str]:
@@ -114,22 +180,43 @@ def _archive_names(path: Path) -> list[str]:
         return [item.name for item in archive.getmembers()]
 
 
-def test_release_artifacts_are_reproducible_and_bound_to_candidate(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "names",
+    (
+        ("a/./b", "a/b"),
+        ("/absolute",),
+        ("a\\b",),
+        ("a//b",),
+        ("a/../b",),
+        ("README.md", "readme.md"),
+        ("caf\u00e9.txt", "cafe\u0301.txt"),
+    ),
+)
+def test_canonical_archive_member_validator_rejects_noncanonical_paths(
+    names: tuple[str, ...],
+) -> None:
+    with pytest.raises(ReleaseGateError, match="^release_archive_member_invalid$"):
+        validate_canonical_archive_member_names(names)
+
+
+def test_release_artifacts_are_reproducible_and_bound_to_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     root = make_release_tree(tmp_path)
     first_output = tmp_path / "first"
     second_output = tmp_path / "second"
+    calls = install_task13_runner(monkeypatch)
 
     first = build_release_artifacts(
         root,
         version=VERSION,
         output=first_output,
-        scanner_gate=passing_scanner,
     )
     second = build_release_artifacts(
         root,
         version=VERSION,
         output=second_output,
-        scanner_gate=passing_scanner,
     )
 
     assert first.version == VERSION
@@ -145,6 +232,8 @@ def test_release_artifacts_are_reproducible_and_bound_to_candidate(tmp_path: Pat
         "SHA256SUMS.json",
     }
     assert _run(["git", "status", "--porcelain"], cwd=root) == ""
+    assert len(calls) == 2
+    assert all(snapshot != root for _candidate, snapshot, _target in calls)
 
     for artifact in first.artifacts:
         path = first_output / artifact.file_name
@@ -168,20 +257,60 @@ def test_current_v020_source_fails_closed_for_v021_request(tmp_path: Path) -> No
             ROOT,
             version=VERSION,
             output=tmp_path / "dist",
-            scanner_gate=passing_scanner,
         )
 
 
-def test_artifact_builder_does_not_publish_when_scanner_gate_blocks(tmp_path: Path) -> None:
+def test_artifact_builder_does_not_publish_when_task13_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     root = make_release_tree(tmp_path)
     output = tmp_path / "blocked"
+    install_task13_runner(monkeypatch, build_blocked_report("scanner_missing"))
 
     with pytest.raises(ReleaseGateError, match="^release_scanner_gate_blocked$"):
         build_release_artifacts(
             root,
             version=VERSION,
             output=output,
-            scanner_gate=blocked_scanner,
         )
+
+    assert not output.exists()
+
+
+def test_artifact_builder_rejects_incomplete_task13_report_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_release_tree(tmp_path)
+    output = tmp_path / "incomplete"
+    install_task13_runner(monkeypatch, incomplete_task13_report())
+
+    with pytest.raises(ReleaseGateError, match="^release_scanner_gate_unavailable$"):
+        build_release_artifacts(root, version=VERSION, output=output)
+
+    assert not output.exists()
+
+
+def test_artifact_builder_rechecks_candidate_identity_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_release_tree(tmp_path)
+    output = tmp_path / "mutated"
+
+    def mutate_candidate(
+        candidate: ReleaseCandidate,
+        _snapshot: Path,
+        _target: Path,
+    ) -> SecretScanReport:
+        readme = candidate.root / "README.md"
+        readme.write_text(readme.read_text(encoding="utf-8") + "changed\n", encoding="utf-8")
+        return passing_task13_report()
+
+    monkeypatch.setattr(release_artifacts, "_run_task13_artifact_gate", mutate_candidate)
+
+    with pytest.raises(ReleaseGateError, match="^release_candidate_changed$"):
+        build_release_artifacts(root, version=VERSION, output=output)
 
     assert not output.exists()
