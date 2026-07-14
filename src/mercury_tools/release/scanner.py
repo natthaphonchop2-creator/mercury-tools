@@ -2175,7 +2175,8 @@ class _ArtifactSnapshot:
 
 
 def _detect_archive_format(data: bytes) -> str | None:
-    if data.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
+    zip_magic = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+    if data.startswith(zip_magic) or _has_bounded_zip_structure(data):
         return "zip"
     if data.startswith(b"\x1f\x8b"):
         return "gzip"
@@ -2195,7 +2196,35 @@ def _detect_archive_format(data: bytes) -> str | None:
         )
     ):
         return "opaque"
+    if _has_prefixed_zip_local_header(data):
+        return "opaque"
     return None
+
+
+def _has_bounded_zip_structure(data: bytes) -> bool:
+    if len(data) < 22 or b"PK\x05\x06" not in data:
+        return False
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            entries = archive.infolist()
+            _zip_metadata_corpus(data, archive, entries)
+    except (OSError, RuntimeError, EOFError, struct.error, zipfile.BadZipFile):
+        return False
+    return True
+
+
+def _has_prefixed_zip_local_header(data: bytes) -> bool:
+    offset = data.find(b"PK\x03\x04", 1)
+    while offset >= 0:
+        if offset + 30 <= len(data):
+            name_length, extra_length = struct.unpack(
+                "<HH",
+                data[offset + 26 : offset + 30],
+            )
+            if offset + 30 + name_length + extra_length <= len(data):
+                return True
+        offset = data.find(b"PK\x03\x04", offset + 4)
+    return False
 
 
 def _tar_header_is_valid(data: bytes) -> bool:
@@ -2595,9 +2624,10 @@ def _zip_metadata_corpus(
             raise zipfile.BadZipFile
         layouts.append((offset, payload_start, payload_end, bool(entry.flag_bits & 0x08)))
     eocd_offset, eocd_end = _zip_eocd_bounds(data)
+    prefix = data[: layouts[0][0]] if layouts else data[:start_dir]
     unparsed = bool(
-        (layouts and layouts[0][0] != 0)
-        or (not layouts and (start_dir != 0 or eocd_offset != 0))
+        (not layouts and (start_dir != 0 or eocd_offset != 0))
+        or _zip_prefix_contains_archive(prefix)
     )
     for index, (_offset, _payload_start, payload_end, has_descriptor) in enumerate(layouts):
         next_offset = layouts[index + 1][0] if index + 1 < len(layouts) else start_dir
@@ -2624,6 +2654,28 @@ def _zip_metadata_corpus(
         cursor = end
     metadata_chunks.append(data[cursor:])
     return b"".join(metadata_chunks), unparsed
+
+
+def _zip_prefix_contains_archive(prefix: bytes) -> bool:
+    if not prefix:
+        return False
+    if prefix.startswith(
+        (
+            b"PK\x03\x04",
+            b"PK\x05\x06",
+            b"PK\x07\x08",
+            b"\x1f\x8b",
+            b"BZh",
+            b"\xfd7zXZ\x00",
+            b"7z\xbc\xaf'\x1c",
+            b"Rar!\x1a\x07",
+            b"\x04\x22\x4d\x18",
+            b"\x1f\x9d",
+            b"\x28\xb5\x2f\xfd",
+        )
+    ):
+        return True
+    return _tar_header_is_valid(prefix) or _has_bounded_zip_structure(prefix)
 
 
 def _zip_eocd_bounds(data: bytes) -> tuple[int, int]:

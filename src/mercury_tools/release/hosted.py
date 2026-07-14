@@ -2,17 +2,11 @@
 
 from __future__ import annotations
 
-import bz2
 import functools
-import gzip
 import hashlib
-import io
 import json
-import lzma
 import re
-import tarfile
 import tempfile
-import zipfile
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
@@ -33,16 +27,14 @@ from mercury_tools.release.scanner import (
     CommandResult,
     CommandRunner,
     SubprocessCommandRunner,
-    _canonical_archive_member,
+    _ArtifactSnapshot,
+    _BudgetExceeded,
     _deduplicate_findings,
-    _is_forbidden_path,
+    _detect_archive_format,
     _parse_local_refs,
-    _path_finding,
-    _read_stream_exact,
+    _scan_archive_at_depth,
     _scan_bytes,
     _scan_reachable_blobs,
-    _tar_entry_is_safe_type,
-    _zip_entry_is_safe_type,
 )
 
 HOSTED_SCANNER_VERSION = BUILTIN_SCANNER_VERSION
@@ -151,11 +143,10 @@ class _HostedArchiveBudget:
     limit: int
     used: int = 0
 
-    def reserve(self, size: int) -> bool:
+    def reserve(self, size: int) -> None:
         if size < 0 or size > self.limit - self.used:
-            return False
+            raise _BudgetExceeded
         self.used += size
-        return True
 
 
 @dataclass(frozen=True, repr=False)
@@ -243,53 +234,67 @@ def _hosted_archive_code(reason: str, surface: str) -> str:
     return f"hosted_archive_{reason}:{surface}"
 
 
+_HOSTED_ARCHIVE_REASON_MAP = MappingProxyType(
+    {
+        "artifact_archive_depth": "depth",
+        "artifact_duplicate_member": "duplicate_member",
+        "artifact_entry_limit": "entry_limit",
+        "artifact_member_too_large": "member_too_large",
+        "artifact_opaque_member": "opaque_member",
+        "artifact_read_failed": "read_failed",
+        "artifact_uncompressed_limit": "uncompressed_limit",
+        "artifact_unparsed_data": "unparsed_data",
+        "artifact_unsafe_member": "unsafe",
+    }
+)
+
+
+def _map_hosted_archive_blockers(
+    blockers: list[str],
+    surface: str,
+) -> list[str]:
+    mapped: list[str] = []
+    for blocker in blockers:
+        local_reason = blocker.partition(":")[0]
+        reason = _HOSTED_ARCHIVE_REASON_MAP.get(local_reason, "read_failed")
+        mapped.append(_hosted_archive_code(reason, surface))
+    return mapped
+
+
+def _scan_complete_hosted_archive(
+    data: bytes,
+    surface: str,
+    policy: SecretScanPolicy,
+    budget: _HostedArchiveBudget,
+    *,
+    expected_formats: tuple[str, ...] | None = None,
+) -> tuple[list[SecretFinding], list[str]]:
+    if len(data) > policy.max_archive_bytes:
+        return [], [_hosted_archive_code("too_large", surface)]
+    findings, blockers = _scan_archive_at_depth(
+        _ArtifactSnapshot(name=f"hosted/{surface}", data=data),
+        None,
+        policy,
+        budget,
+        depth=0,
+        expected_formats=expected_formats,
+    )
+    return findings, _map_hosted_archive_blockers(blockers, surface)
+
+
 def _scan_hosted_zip(
     data: bytes,
     surface: str,
     policy: SecretScanPolicy,
     budget: _HostedArchiveBudget,
 ) -> tuple[list[SecretFinding], list[str]]:
-    findings: list[SecretFinding] = []
-    blockers: list[str] = []
-    try:
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            entries = archive.infolist()
-            if len(entries) > policy.max_archive_entries:
-                return [], [_hosted_archive_code("entry_limit", surface)]
-            canonical_names: set[str] = set()
-            member_bytes = 0
-            for entry in entries:
-                canonical = _canonical_archive_member(entry.filename)
-                if canonical is None or not _zip_entry_is_safe_type(entry):
-                    blockers.append(_hosted_archive_code("unsafe", surface))
-                    continue
-                if canonical in canonical_names:
-                    blockers.append(_hosted_archive_code("duplicate_member", surface))
-                canonical_names.add(canonical)
-                if entry.is_dir():
-                    continue
-                if entry.file_size > policy.max_archive_member_bytes:
-                    blockers.append(_hosted_archive_code("member_too_large", surface))
-                member_bytes += entry.file_size
-            if blockers:
-                return findings, blockers
-            if not budget.reserve(member_bytes):
-                return findings, [_hosted_archive_code("uncompressed_limit", surface)]
-            for entry in entries:
-                if entry.is_dir():
-                    continue
-                canonical = _canonical_archive_member(entry.filename)
-                if canonical is None:
-                    return findings, [_hosted_archive_code("unsafe", surface)]
-                logical_path = f"hosted/{surface}!{entry.filename}"
-                if _is_forbidden_path(PurePosixPath(canonical)):
-                    findings.append(_path_finding("forbidden_path", logical_path))
-                with archive.open(entry, "r") as stream:
-                    member = _read_stream_exact(stream, entry.file_size)
-                findings.extend(_scan_bytes(member, logical_path, policy))
-    except (OSError, RuntimeError, EOFError, zipfile.BadZipFile):
-        blockers.append(_hosted_archive_code("read_failed", surface))
-    return findings, blockers
+    return _scan_complete_hosted_archive(
+        data,
+        surface,
+        policy,
+        budget,
+        expected_formats=("zip",),
+    )
 
 
 def _scan_hosted_tar(
@@ -298,66 +303,19 @@ def _scan_hosted_tar(
     policy: SecretScanPolicy,
     budget: _HostedArchiveBudget,
 ) -> tuple[list[SecretFinding], list[str]]:
-    findings: list[SecretFinding] = []
-    blockers: list[str] = []
-    try:
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
-            entries: list[tarfile.TarInfo] = []
-            for entry in archive:
-                entries.append(entry)
-                if len(entries) > policy.max_archive_entries:
-                    return [], [_hosted_archive_code("entry_limit", surface)]
-            canonical_names: set[str] = set()
-            member_bytes = 0
-            for entry in entries:
-                canonical = _canonical_archive_member(entry.name)
-                if (
-                    canonical is None
-                    or not _tar_entry_is_safe_type(entry)
-                ):
-                    blockers.append(_hosted_archive_code("unsafe", surface))
-                    continue
-                if canonical in canonical_names:
-                    blockers.append(_hosted_archive_code("duplicate_member", surface))
-                canonical_names.add(canonical)
-                if entry.isdir():
-                    continue
-                if entry.size > policy.max_archive_member_bytes:
-                    blockers.append(_hosted_archive_code("member_too_large", surface))
-                member_bytes += entry.size
-            if blockers:
-                return findings, blockers
-            if not budget.reserve(member_bytes):
-                return findings, [_hosted_archive_code("uncompressed_limit", surface)]
-            for entry in entries:
-                if not entry.isfile():
-                    continue
-                canonical = _canonical_archive_member(entry.name)
-                if canonical is None:
-                    return findings, [_hosted_archive_code("unsafe", surface)]
-                logical_path = f"hosted/{surface}!{entry.name}"
-                if _is_forbidden_path(PurePosixPath(canonical)):
-                    findings.append(_path_finding("forbidden_path", logical_path))
-                stream = archive.extractfile(entry)
-                if stream is None:
-                    return findings, [_hosted_archive_code("read_failed", surface)]
-                with stream:
-                    member = _read_stream_exact(stream, entry.size)
-                findings.extend(_scan_bytes(member, logical_path, policy))
-    except (OSError, EOFError, tarfile.TarError):
-        blockers.append(_hosted_archive_code("read_failed", surface))
-    return findings, blockers
-
-
-def _read_compressed(data: bytes, compression: str, max_bytes: int) -> bytes:
-    if compression == "gzip":
-        with gzip.GzipFile(fileobj=io.BytesIO(data), mode="rb") as stream:
-            return stream.read(max_bytes)
-    if compression == "bz2":
-        with bz2.BZ2File(io.BytesIO(data), mode="rb") as stream:
-            return stream.read(max_bytes)
-    with lzma.LZMAFile(io.BytesIO(data), mode="rb") as stream:
-        return stream.read(max_bytes)
+    archive_format = _detect_archive_format(data)
+    expected_formats = {
+        "gzip": ("gzip", "tar"),
+        "bz2": ("bz2", "tar"),
+        "xz": ("xz", "tar"),
+    }.get(archive_format, ("tar",))
+    return _scan_complete_hosted_archive(
+        data,
+        surface,
+        policy,
+        budget,
+        expected_formats=expected_formats,
+    )
 
 
 def _scan_hosted_archive(
@@ -366,47 +324,9 @@ def _scan_hosted_archive(
     policy: SecretScanPolicy,
     budget: _HostedArchiveBudget,
 ) -> tuple[list[SecretFinding], list[str]]:
-    zip_candidate = data.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"))
-    tar_candidate = len(data) >= 262 and data[257:262] == b"ustar"
-    compression: str | None
-    if data.startswith(b"\x1f\x8b"):
-        compression = "gzip"
-    elif data.startswith(b"BZh"):
-        compression = "bz2"
-    elif data.startswith(b"\xfd7zXZ\x00"):
-        compression = "lzma"
-    else:
-        compression = None
-    if not zip_candidate and not tar_candidate and compression is None:
+    if _detect_archive_format(data) is None:
         return [], []
-    if len(data) > policy.max_archive_bytes:
-        return [], [_hosted_archive_code("too_large", surface)]
-    if zip_candidate:
-        return _scan_hosted_zip(data, surface, policy, budget)
-    if compression is not None:
-        remaining = budget.limit - budget.used
-        if remaining <= 0:
-            return [], [_hosted_archive_code("uncompressed_limit", surface)]
-        try:
-            expanded = _read_compressed(data, compression, remaining + 1)
-        except (OSError, EOFError, gzip.BadGzipFile, lzma.LZMAError):
-            return [], [_hosted_archive_code("read_failed", surface)]
-        if len(expanded) > remaining:
-            return [], [_hosted_archive_code("uncompressed_limit", surface)]
-        if len(expanded) >= 262 and expanded[257:262] == b"ustar":
-            return _scan_hosted_tar(expanded, surface, policy, budget)
-        if len(expanded) > policy.max_archive_member_bytes:
-            return [], [_hosted_archive_code("member_too_large", surface)]
-        if not budget.reserve(len(expanded)):
-            return [], [_hosted_archive_code("uncompressed_limit", surface)]
-        return (
-            list(_scan_bytes(expanded, f"hosted/{surface}!compressed", policy)),
-            [],
-        )
-    try:
-        return _scan_hosted_tar(data, surface, policy, budget)
-    except Exception:
-        return [], [_hosted_archive_code("read_failed", surface)]
+    return _scan_complete_hosted_archive(data, surface, policy, budget)
 
 
 def _page_records(payload: object, record_key: str | None) -> list[object] | None:
