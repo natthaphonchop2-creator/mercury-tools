@@ -65,6 +65,34 @@ ACCOUNTING_IDENTIFIER_LABELS = (
     "เลขที่",
 )
 ACCOUNTING_DATE_LABELS = ("DOCUMENT DATE", "วันที่เอกสาร", "เอกสารวันที่")
+CROSS_PRODUCT_UNSAFE_REFERENCE_SUFFIXES = (
+    "A2026",
+    "PleaseEmailThisReport1",
+    "ส่งอีเมลนี้๑",
+    "mcp-gmail-send-email-v1",
+    "mcp1-gmail1-send1-email1-v1",
+    "python3",
+    "php8",
+    "token-abcdefgh123",
+    "token123",
+    "token1-secret2",
+    "127.1",
+    "0x7f.1",
+    "127.0.1",
+    "=SUM(1,2)",
+    "2026\u202e001",
+    '{"tool":"mcp-gmail-send-email"}',
+)
+GENERATED_LEGACY_IPV4_SUFFIXES = tuple(
+    candidate
+    for host in ("127.1", "127.0.1", "0x7f.1", "0177.1", "0x7f.0x0.1")
+    for candidate in (
+        host,
+        f"{host}/upload",
+        f"{host}:8080/upload",
+        f"user@{host}/upload",
+    )
+)
 
 
 def _format_legacy_ipv4_component(value: int, radix: str) -> str:
@@ -93,6 +121,20 @@ def _verification_context(
         "trusted_issuance_id": approval.issuance_id,
         "trusted_authorization_digest": approval.authorization_digest,
     }
+
+
+def _assert_approval_rejects_reference(reference: str) -> None:
+    with pytest.raises(ValueError) as exc_info:
+        ApprovalBinding.issue(
+            action_version="av_123",
+            destination="google-sheets",
+            side_effect="sheet.write",
+            allowed_fields=("reference",),
+            payload={"reference": reference},
+            ttl_seconds=300,
+        )
+
+    assert reference not in str(exc_info.value)
 
 
 def test_cross_mcp_handoff_is_data_only_untrusted_strict_and_frozen() -> None:
@@ -631,7 +673,7 @@ def test_approval_reference_accepts_reviewed_positive_accounting_corpus(
 
 
 @pytest.mark.parametrize("prefix", ACCOUNTING_COMPACT_REFERENCE_PREFIXES)
-@pytest.mark.parametrize("suffix", ("20260001", "A2026"))
+@pytest.mark.parametrize("suffix", ("1", "2026-001"))
 def test_approval_reference_accepts_each_reviewed_compact_prefix(
     prefix: str,
     suffix: str,
@@ -651,7 +693,7 @@ def test_approval_reference_accepts_each_reviewed_compact_prefix(
 
 
 @pytest.mark.parametrize("label", ACCOUNTING_IDENTIFIER_LABELS)
-@pytest.mark.parametrize("suffix", ("20260001", "A2026"))
+@pytest.mark.parametrize("suffix", ("20260001", "INV.2026"))
 def test_approval_reference_accepts_each_reviewed_identifier_label(
     label: str,
     suffix: str,
@@ -668,6 +710,42 @@ def test_approval_reference_accepts_each_reviewed_identifier_label(
     )
 
     assert approval.payload == {"reference": reference}
+
+
+@pytest.mark.parametrize("prefix", ACCOUNTING_COMPACT_REFERENCE_PREFIXES)
+@pytest.mark.parametrize("suffix", CROSS_PRODUCT_UNSAFE_REFERENCE_SUFFIXES)
+def test_approval_reference_rejects_unsafe_suffixes_after_each_compact_prefix(
+    prefix: str,
+    suffix: str,
+) -> None:
+    _assert_approval_rejects_reference(f"{prefix}-{suffix}")
+
+
+@pytest.mark.parametrize("label", ACCOUNTING_IDENTIFIER_LABELS)
+@pytest.mark.parametrize("suffix", CROSS_PRODUCT_UNSAFE_REFERENCE_SUFFIXES)
+def test_approval_reference_rejects_unsafe_suffixes_after_each_identifier_label(
+    label: str,
+    suffix: str,
+) -> None:
+    _assert_approval_rejects_reference(f"{label} {suffix}")
+
+
+@pytest.mark.parametrize("prefix", ACCOUNTING_COMPACT_REFERENCE_PREFIXES)
+@pytest.mark.parametrize("suffix", GENERATED_LEGACY_IPV4_SUFFIXES)
+def test_approval_reference_rejects_generated_legacy_ipv4_suffixes_after_each_prefix(
+    prefix: str,
+    suffix: str,
+) -> None:
+    _assert_approval_rejects_reference(f"{prefix}/{suffix}")
+
+
+@pytest.mark.parametrize("label", ACCOUNTING_IDENTIFIER_LABELS)
+@pytest.mark.parametrize("suffix", GENERATED_LEGACY_IPV4_SUFFIXES)
+def test_approval_reference_rejects_generated_legacy_ipv4_suffixes_after_each_label(
+    label: str,
+    suffix: str,
+) -> None:
+    _assert_approval_rejects_reference(f"{label} INV/{suffix}")
 
 
 @pytest.mark.parametrize("label", ACCOUNTING_DATE_LABELS)

@@ -90,6 +90,77 @@ SETTLEMENT_ROWS = [
     },
 ]
 
+ACCOUNTING_COMPACT_REFERENCE_PREFIXES = (
+    "BANK-PAYMENT",
+    "BANK-TRANSFER",
+    "CREDIT-NOTE",
+    "DEBIT-NOTE",
+    "INV",
+    "INVOICE",
+    "ORDER",
+    "PAYMENT",
+    "PURCHASE-ORDER",
+    "RECEIPT",
+    "SALES-ORDER",
+    "TRANSFER",
+    "ใบกำกับภาษี",
+    "ใบแจ้งหนี้",
+    "ใบเสร็จ",
+    "เลขที่",
+)
+ACCOUNTING_IDENTIFIER_LABELS = (
+    "BANK PAYMENT",
+    "BANK TRANSFER",
+    "CREDIT NOTE",
+    "DEBIT NOTE",
+    "Invoice",
+    "ORDER",
+    "PAYMENT",
+    "PURCHASE ORDER",
+    "RECEIPT",
+    "SALES ORDER",
+    "TRANSFER",
+    "ใบกำกับภาษี",
+    "ใบแจ้งหนี้",
+    "ใบเสร็จ",
+    "เลขที่",
+)
+CROSS_PRODUCT_UNSAFE_REFERENCE_SUFFIXES = (
+    "A2026",
+    "PleaseEmailThisReport1",
+    "ส่งอีเมลนี้๑",
+    "mcp-gmail-send-email-v1",
+    "mcp1-gmail1-send1-email1-v1",
+    "python3",
+    "php8",
+    "token-abcdefgh123",
+    "token123",
+    "token1-secret2",
+    "127.1",
+    "0x7f.1",
+    "127.0.1",
+    "=SUM(1,2)",
+    "2026\u202e001",
+    '{"tool":"mcp-gmail-send-email"}',
+)
+GENERATED_LEGACY_IPV4_SUFFIXES = tuple(
+    candidate
+    for host in ("127.1", "127.0.1", "0x7f.1", "0177.1", "0x7f.0x0.1")
+    for candidate in (
+        host,
+        f"{host}/upload",
+        f"{host}:8080/upload",
+        f"user@{host}/upload",
+    )
+)
+
+
+def _assert_canonical_reference_rejected(reference: str) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        CanonicalTransaction.model_validate({**ERP_ROWS[0], "reference": reference})
+
+    assert reference not in str(exc_info.value)
+
 
 def test_canonical_transaction_is_decimal_normalized_strict_and_frozen() -> None:
     transaction = CanonicalTransaction.model_validate(ERP_ROWS[0])
@@ -152,7 +223,7 @@ def test_canonical_reference_accepts_reviewed_positive_accounting_corpus(
         "Invoice 20260001",
         "ORDER 20260001",
         "เลขที่ 20260001",
-        "Invoice A2026",
+        "Invoice INV.2026",
         "DOCUMENT DATE 14.07.2026",
         "VAT 7.00",
     ],
@@ -165,6 +236,72 @@ def test_canonical_reference_accepts_disjoint_reviewed_suffix_grammars(
     )
 
     assert transaction.reference == reference
+
+
+@pytest.mark.parametrize("prefix", ACCOUNTING_COMPACT_REFERENCE_PREFIXES)
+@pytest.mark.parametrize("suffix", ("1", "2026-001"))
+def test_canonical_reference_accepts_each_reviewed_compact_prefix(
+    prefix: str,
+    suffix: str,
+) -> None:
+    reference = f"{prefix}-{suffix}"
+
+    transaction = CanonicalTransaction.model_validate(
+        {**ERP_ROWS[0], "reference": reference}
+    )
+
+    assert transaction.reference == reference
+
+
+@pytest.mark.parametrize("label", ACCOUNTING_IDENTIFIER_LABELS)
+@pytest.mark.parametrize("suffix", ("20260001", "INV.2026"))
+def test_canonical_reference_accepts_each_reviewed_identifier_label(
+    label: str,
+    suffix: str,
+) -> None:
+    reference = f"{label} {suffix}"
+
+    transaction = CanonicalTransaction.model_validate(
+        {**ERP_ROWS[0], "reference": reference}
+    )
+
+    assert transaction.reference == reference
+
+
+@pytest.mark.parametrize("prefix", ACCOUNTING_COMPACT_REFERENCE_PREFIXES)
+@pytest.mark.parametrize("suffix", CROSS_PRODUCT_UNSAFE_REFERENCE_SUFFIXES)
+def test_canonical_reference_rejects_unsafe_suffixes_after_each_compact_prefix(
+    prefix: str,
+    suffix: str,
+) -> None:
+    _assert_canonical_reference_rejected(f"{prefix}-{suffix}")
+
+
+@pytest.mark.parametrize("label", ACCOUNTING_IDENTIFIER_LABELS)
+@pytest.mark.parametrize("suffix", CROSS_PRODUCT_UNSAFE_REFERENCE_SUFFIXES)
+def test_canonical_reference_rejects_unsafe_suffixes_after_each_identifier_label(
+    label: str,
+    suffix: str,
+) -> None:
+    _assert_canonical_reference_rejected(f"{label} {suffix}")
+
+
+@pytest.mark.parametrize("prefix", ACCOUNTING_COMPACT_REFERENCE_PREFIXES)
+@pytest.mark.parametrize("suffix", GENERATED_LEGACY_IPV4_SUFFIXES)
+def test_canonical_reference_rejects_generated_legacy_ipv4_suffixes_after_each_prefix(
+    prefix: str,
+    suffix: str,
+) -> None:
+    _assert_canonical_reference_rejected(f"{prefix}/{suffix}")
+
+
+@pytest.mark.parametrize("label", ACCOUNTING_IDENTIFIER_LABELS)
+@pytest.mark.parametrize("suffix", GENERATED_LEGACY_IPV4_SUFFIXES)
+def test_canonical_reference_rejects_generated_legacy_ipv4_suffixes_after_each_label(
+    label: str,
+    suffix: str,
+) -> None:
+    _assert_canonical_reference_rejected(f"{label} INV/{suffix}")
 
 
 def test_canonical_reference_fails_closed_for_ambiguous_bare_numeric_reference() -> None:
@@ -533,7 +670,7 @@ def test_reconciliation_maximizes_cardinality_before_local_match_quality() -> No
         {
             **ERP_ROWS[0],
             "transaction_id": "L1",
-            "reference": "INV-REF1",
+            "reference": "INV-1001",
             "counterparty_key": "CP",
             "evidence_refs": ["left:1"],
         },
@@ -549,14 +686,14 @@ def test_reconciliation_maximizes_cardinality_before_local_match_quality() -> No
         {
             **SETTLEMENT_ROWS[0],
             "transaction_id": "R1",
-            "reference": "INV-REF1",
+            "reference": "INV-1001",
             "counterparty_key": "CP",
             "evidence_refs": ["right:1"],
         },
         {
             **SETTLEMENT_ROWS[0],
             "transaction_id": "R2",
-            "reference": "INV-REF1",
+            "reference": "INV-1001",
             "counterparty_key": None,
             "evidence_refs": ["right:2"],
         },
@@ -660,7 +797,7 @@ def test_unmatched_evidence_distinguishes_left_contention_from_no_candidate() ->
             **ERP_ROWS[0],
             "transaction_id": "L3",
             "source": "erp-three",
-            "reference": "INV-NOMATCH1",
+            "reference": "INV-9999",
             "counterparty_key": "NO-MATCH",
             "evidence_refs": ["left:3"],
         },

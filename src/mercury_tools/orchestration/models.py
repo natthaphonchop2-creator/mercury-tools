@@ -23,7 +23,6 @@ _MAX_ACCOUNTING_TEXT_LENGTH = 512
 _DISALLOWED_TEXT_CATEGORIES = frozenset({"Cc", "Cf", "Cn", "Co", "Cs", "Zl", "Zp"})
 _DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE)
 _REFERENCE_TOKEN_SEPARATORS = frozenset("-/.#")
-_LABELED_IDENTIFIER_SEPARATORS = frozenset("-#")
 _IDENTIFIER_SEPARATORS = frozenset("-")
 _ENDPOINT_ATOM_BOUNDARY = re.compile(r"[\s(){}\[\]<>\"'`,;]+")
 _AMOUNT_TEXT = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,6})?$")
@@ -589,10 +588,7 @@ def _has_cased_upper(value: str) -> bool:
 
 
 def _is_compact_reference_suffix(value: str) -> bool:
-    if not _is_segmented_unicode_token(value, separators=_REFERENCE_TOKEN_SEPARATORS):
-        return False
-    components = re.split(r"[-/.#]", value)
-    return all(any(character.isdecimal() for character in component) for component in components)
+    return all(component.isdecimal() for component in value.split("-"))
 
 
 def _is_compact_accounting_reference(value: str) -> bool:
@@ -610,16 +606,7 @@ def _is_compact_accounting_reference(value: str) -> bool:
 
 
 def _is_labeled_identifier_suffix(value: str) -> bool:
-    if value.isdecimal() or _is_compact_accounting_reference(value):
-        return True
-    if not _is_segmented_unicode_token(
-        value,
-        separators=_LABELED_IDENTIFIER_SEPARATORS,
-    ):
-        return False
-    return any(character.isdecimal() for character in value) and any(
-        unicodedata.category(character).startswith("L") for character in value
-    )
+    return value.isdecimal() or _is_compact_accounting_reference(value)
 
 
 def _is_accounting_date_suffix(value: str) -> bool:
