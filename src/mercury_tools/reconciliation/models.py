@@ -10,7 +10,14 @@ from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from mercury_tools.orchestration.models import validate_accounting_text, validate_cross_mcp_data
+from mercury_tools.orchestration.models import (
+    validate_accounting_reference,
+    validate_accounting_source,
+    validate_counterparty_key,
+    validate_document_state,
+    validate_evidence_locator,
+    validate_record_identifier,
+)
 from mercury_tools.qualification.models import StrictSafeModel
 
 MONEY_QUANTUM = Decimal("0.01")
@@ -30,7 +37,7 @@ def _normalized_money(value: Any, *, code: str) -> Decimal:
 
 
 def _clean_text(value: str, *, casefold: bool = False) -> str:
-    cleaned = re.sub(r"\s+", " ", value.strip())
+    cleaned = re.sub(r" +", " ", value.strip(" "))
     return cleaned.casefold() if casefold else cleaned
 
 
@@ -58,36 +65,52 @@ def _normalized_text_tuple(value: Any, *, code: str) -> tuple[str, ...]:
     return tuple(_normalized_text(item, code=code) for item in value)
 
 
-def _normalized_accounting_text(
-    value: Any,
-    *,
-    code: str,
-    max_length: int = 512,
-) -> str:
+def _normalized_record_identifier(value: Any, *, code: str) -> str:
     if not isinstance(value, str):
         raise ValueError(code)
-    validate_cross_mcp_data(value)
     cleaned = _clean_text(value)
     if not cleaned:
         raise ValueError(code)
-    return validate_accounting_text(cleaned, code=code, max_length=max_length)
+    return validate_record_identifier(cleaned, code=code)
 
 
-def _normalized_accounting_text_tuple(
-    value: Any,
-    *,
-    code: str,
-    max_length: int = 512,
-) -> tuple[str, ...]:
+def _normalized_reference(value: Any, *, code: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(code)
+    return validate_accounting_reference(_clean_text(value), code=code)
+
+
+def _normalized_counterparty_key(value: Any, *, code: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(code)
+    return validate_counterparty_key(_clean_text(value), code=code)
+
+
+def _normalized_source(value: Any, *, code: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(code)
+    return validate_accounting_source(_clean_text(value), code=code)
+
+
+def _normalized_document_state(value: Any, *, code: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(code)
+    return validate_document_state(_clean_text(value), code=code)
+
+
+def _normalized_evidence_locator(value: Any, *, code: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(code)
+    return validate_evidence_locator(_clean_text(value), code=code)
+
+
+def _normalized_evidence_locators(value: Any, *, code: str) -> tuple[str, ...]:
     if (
         isinstance(value, (str, bytes, bytearray, Mapping))
         or not isinstance(value, Sequence)
     ):
         raise ValueError(code)
-    return tuple(
-        _normalized_accounting_text(item, code=code, max_length=max_length)
-        for item in value
-    )
+    return tuple(_normalized_evidence_locator(item, code=code) for item in value)
 
 
 class CanonicalTransaction(StrictSafeModel):
@@ -111,30 +134,48 @@ class CanonicalTransaction(StrictSafeModel):
     def normalize_currency(cls, value: Any) -> str:
         return _normalized_text(value, code="transaction_text_invalid").upper()
 
-    @field_validator("transaction_id", "source", "document_state", mode="before")
+    @field_validator("transaction_id", mode="before")
     @classmethod
-    def normalize_required_text(cls, value: Any) -> str:
-        return _normalized_accounting_text(value, code="transaction_text_invalid")
+    def normalize_transaction_id(cls, value: Any) -> str:
+        return _normalized_record_identifier(value, code="transaction_text_invalid")
 
-    @field_validator("source", "document_state")
+    @field_validator("source", mode="before")
     @classmethod
-    def casefold_matching_text(cls, value: str) -> str:
-        return value.casefold()
+    def normalize_source(cls, value: Any) -> str:
+        return _normalized_source(value, code="transaction_source_invalid")
 
-    @field_validator("reference", "counterparty_key", mode="before")
+    @field_validator("document_state", mode="before")
     @classmethod
-    def normalize_optional_text(cls, value: Any) -> str | None:
+    def normalize_document_state(cls, value: Any) -> str:
+        return _normalized_document_state(value, code="transaction_document_state_invalid")
+
+    @field_validator("reference", mode="before")
+    @classmethod
+    def normalize_optional_reference(cls, value: Any) -> str | None:
         if value is None:
             return None
-        if isinstance(value, str) and not value.strip():
+        if isinstance(value, str) and not value.strip(" "):
             return None
-        cleaned = _normalized_accounting_text(value, code="transaction_text_invalid")
+        cleaned = _normalized_reference(value, code="transaction_reference_invalid")
+        return cleaned or None
+
+    @field_validator("counterparty_key", mode="before")
+    @classmethod
+    def normalize_optional_counterparty_key(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip(" "):
+            return None
+        cleaned = _normalized_counterparty_key(
+            value,
+            code="transaction_counterparty_key_invalid",
+        )
         return cleaned or None
 
     @field_validator("evidence_refs", mode="before")
     @classmethod
     def normalize_evidence_refs(cls, value: Any) -> tuple[str, ...]:
-        return _normalized_accounting_text_tuple(
+        return _normalized_evidence_locators(
             value,
             code="transaction_evidence_refs_invalid",
         )
@@ -145,19 +186,6 @@ class CanonicalTransaction(StrictSafeModel):
             raise ValueError("transaction_evidence_refs_invalid")
         if len(set(self.evidence_refs)) != len(self.evidence_refs):
             raise ValueError("transaction_evidence_refs_invalid")
-        validate_cross_mcp_data(
-            {
-                "transaction_id": self.transaction_id,
-                "source": self.source,
-                "amount": self.amount,
-                "currency": self.currency,
-                "transaction_date": self.transaction_date,
-                "reference": self.reference,
-                "counterparty_key": self.counterparty_key,
-                "document_state": self.document_state,
-                "evidence_refs": self.evidence_refs,
-            }
-        )
         return self
 
 
@@ -194,10 +222,9 @@ class PairEvidence(StrictSafeModel):
     @field_validator("left_transaction_id", "right_transaction_id", mode="before")
     @classmethod
     def validate_transaction_ids(cls, value: Any) -> str:
-        return _normalized_accounting_text(
+        return _normalized_record_identifier(
             value,
             code="reconciliation_evidence_text_invalid",
-            max_length=256,
         )
 
     @field_validator("matched_fields", mode="before")
@@ -211,7 +238,7 @@ class PairEvidence(StrictSafeModel):
     @field_validator("evidence_refs", mode="before")
     @classmethod
     def validate_evidence_refs(cls, value: Any) -> tuple[str, ...]:
-        return _normalized_accounting_text_tuple(
+        return _normalized_evidence_locators(
             value,
             code="reconciliation_evidence_text_invalid",
         )
@@ -232,14 +259,6 @@ class PairEvidence(StrictSafeModel):
             raise ValueError("reconciliation_matched_fields_invalid")
         if len(set(self.evidence_refs)) != len(self.evidence_refs):
             raise ValueError("reconciliation_evidence_refs_invalid")
-        validate_cross_mcp_data(
-            (
-                self.left_transaction_id,
-                self.right_transaction_id,
-                self.matched_fields,
-                self.evidence_refs,
-            )
-        )
         return self
 
 
@@ -253,25 +272,31 @@ class DuplicateEvidence(StrictSafeModel):
     @field_validator("canonical_transaction_id", mode="before")
     @classmethod
     def validate_canonical_id(cls, value: Any) -> str:
-        return _normalized_accounting_text(
+        return _normalized_record_identifier(
             value,
             code="reconciliation_evidence_text_invalid",
-            max_length=256,
         )
 
     @field_validator("transaction_ids", mode="before")
     @classmethod
     def validate_transaction_ids(cls, value: Any) -> tuple[str, ...]:
-        return _normalized_accounting_text_tuple(
-            value,
-            code="reconciliation_evidence_text_invalid",
-            max_length=256,
+        if (
+            isinstance(value, (str, bytes, bytearray, Mapping))
+            or not isinstance(value, Sequence)
+        ):
+            raise ValueError("reconciliation_evidence_text_invalid")
+        return tuple(
+            _normalized_record_identifier(
+                item,
+                code="reconciliation_evidence_text_invalid",
+            )
+            for item in value
         )
 
     @field_validator("evidence_refs", mode="before")
     @classmethod
     def validate_evidence_refs(cls, value: Any) -> tuple[str, ...]:
-        return _normalized_accounting_text_tuple(
+        return _normalized_evidence_locators(
             value,
             code="reconciliation_evidence_text_invalid",
         )
@@ -284,13 +309,6 @@ class DuplicateEvidence(StrictSafeModel):
             raise ValueError("reconciliation_duplicate_ids_invalid")
         if len(set(self.evidence_refs)) != len(self.evidence_refs):
             raise ValueError("reconciliation_evidence_refs_invalid")
-        validate_cross_mcp_data(
-            (
-                self.canonical_transaction_id,
-                self.transaction_ids,
-                self.evidence_refs,
-            )
-        )
         return self
 
 
@@ -305,16 +323,15 @@ class UnmatchedEvidence(StrictSafeModel):
     @field_validator("transaction_id", mode="before")
     @classmethod
     def validate_transaction_id(cls, value: Any) -> str:
-        return _normalized_accounting_text(
+        return _normalized_record_identifier(
             value,
             code="reconciliation_evidence_text_invalid",
-            max_length=256,
         )
 
     @field_validator("evidence_refs", mode="before")
     @classmethod
     def validate_evidence_refs(cls, value: Any) -> tuple[str, ...]:
-        return _normalized_accounting_text_tuple(
+        return _normalized_evidence_locators(
             value,
             code="reconciliation_evidence_text_invalid",
         )
@@ -323,7 +340,6 @@ class UnmatchedEvidence(StrictSafeModel):
     def validate_evidence_data(self) -> UnmatchedEvidence:
         if len(set(self.evidence_refs)) != len(self.evidence_refs):
             raise ValueError("reconciliation_evidence_refs_invalid")
-        validate_cross_mcp_data((self.transaction_id, self.evidence_refs))
         return self
 
 
