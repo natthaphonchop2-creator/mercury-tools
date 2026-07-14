@@ -831,7 +831,17 @@ def test_batch_resolve_migration_is_bounded_set_based_and_service_role_only() ->
     sql = BATCH_RESOLVE_MIGRATION.read_text(encoding="utf-8").lower()
 
     assert "function public.resolve_erp_action_validation_batch" in sql
+    null_guard = sql.index("p_requests is null")
+    type_guard = sql.index("jsonb_typeof(p_requests) is distinct from 'array'")
+    first_array_operation = min(
+        sql.index("jsonb_array_length(p_requests)"),
+        sql.index("jsonb_array_elements(p_requests)"),
+    )
+    assert null_guard < first_array_operation
+    assert type_guard < first_array_operation
     assert "jsonb_array_length(p_requests) between 1 and 100" in sql
+    assert "request_item->>'action_id' !~ '^act_[0-9a-f]{24}$'" in sql
+    assert "request_item->>'version_id' !~ '^av_[0-9a-f]{64}$'" in sql
     assert "jsonb_array_elements(p_requests) with ordinality" in sql
     assert "left join lateral" in sql
     assert "knowledge.connector_id = parsed.connector_id" in sql

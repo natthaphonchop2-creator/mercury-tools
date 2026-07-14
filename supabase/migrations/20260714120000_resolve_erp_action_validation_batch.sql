@@ -27,7 +27,9 @@ begin
       message = 'validation_batch_invalid';
   end if;
 
-  if jsonb_typeof(p_requests) <> 'array' then
+  if p_requests is null
+    or jsonb_typeof(p_requests) is distinct from 'array'
+  then
     raise exception using
       errcode = '22023',
       message = 'validation_batch_invalid';
@@ -64,8 +66,8 @@ begin
       or jsonb_typeof(request_item->'version_id') <> 'string'
       or jsonb_typeof(request_item->'environment') <> 'string'
       or request_item->>'connector_id' !~ '^[A-Za-z0-9._:-]{1,200}$'
-      or request_item->>'action_id' !~ '^[A-Za-z0-9._:-]{1,200}$'
-      or request_item->>'version_id' !~ '^[A-Za-z0-9._:-]{1,200}$'
+      or request_item->>'action_id' !~ '^act_[0-9a-f]{24}$'
+      or request_item->>'version_id' !~ '^av_[0-9a-f]{64}$'
       or request_item->>'environment' not in (
         'sandbox',
         'test',

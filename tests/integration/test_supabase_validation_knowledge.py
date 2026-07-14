@@ -21,6 +21,7 @@ _OPT_IN = "MERCURY_SUPABASE_VALIDATION_TEST"
 _ISOLATED_OPT_IN = "MERCURY_SUPABASE_TEST_ISOLATED"
 _GUARD_MARKER_ENV = "MERCURY_SUPABASE_TEST_GUARD"
 _GUARD_RPC = "mercury_validation_test_guard_matches"
+_BATCH_RESOLVE_RPC = "resolve_erp_action_validation_batch"
 _UNAVAILABLE_REASON = (
     "requires a disposable local or explicitly isolated Supabase environment with "
     "the Task 3 migration applied"
@@ -617,6 +618,88 @@ def test_labelled_value_rpc_matrix_covers_complete_contract() -> None:
         assignment = f"{label}{separator}{candidate}"
         assert len(assignment) <= 512
         assert assignment in values
+
+
+def test_validation_batch_rpc_enforces_inputs_order_and_service_role() -> None:
+    environment = _test_environment()
+    now = "2026-07-14T09:00:00Z"
+
+    def request(index: int) -> dict[str, str]:
+        return {
+            "connector_id": "flowaccount",
+            "action_id": f"act_{index:024x}",
+            "version_id": f"av_{index:064x}",
+            "environment": "sandbox",
+        }
+
+    first = request(2)
+    second = request(1)
+    invalid_batches: tuple[object, ...] = (
+        None,
+        {},
+        "not-an-array",
+        [],
+        [first, first],
+        [{**first, "action_id": "action_000000000000000000000002"}],
+        [{**first, "action_id": "act_00000000000000000000000A"}],
+        [{**first, "version_id": "version_" + "2" * 64}],
+        [{**first, "version_id": "av_" + "G" * 64}],
+        [{**first, "environment": "local"}],
+        [{**first, "connector_id": "flowaccount,or=(id.gt.0)"}],
+        [{**first, "private_field": "must-not-be-accepted"}],
+        [request(index) for index in range(1, 102)],
+    )
+    rpc_url = f"{environment.rest_url}/rpc/{_BATCH_RESOLVE_RPC}"
+
+    with httpx.Client(timeout=30.0, follow_redirects=False) as client:
+        for batch in invalid_batches:
+            response = _guarded_request(
+                client,
+                environment,
+                "POST",
+                rpc_url,
+                headers=environment.service_headers,
+                json={"p_requests": batch, "p_now": now},
+            )
+            _assert_status(response, 400)
+            assert response.json().get("message") == "validation_batch_invalid"
+
+        for invalid_now in (None, "infinity"):
+            response = _guarded_request(
+                client,
+                environment,
+                "POST",
+                rpc_url,
+                headers=environment.service_headers,
+                json={"p_requests": [first], "p_now": invalid_now},
+            )
+            _assert_status(response, 400)
+            assert response.json().get("message") == "validation_batch_invalid"
+
+        response = _guarded_request(
+            client,
+            environment,
+            "POST",
+            rpc_url,
+            headers=environment.service_headers,
+            json={"p_requests": [first, second], "p_now": now},
+        )
+        _assert_status(response, 200)
+        assert response.json() == [
+            {"request_index": 0, **first, "records": []},
+            {"request_index": 1, **second, "records": []},
+        ]
+
+        for role_headers in (environment.anon_headers, environment.authenticated_headers):
+            response = _guarded_request(
+                client,
+                environment,
+                "POST",
+                rpc_url,
+                headers=role_headers,
+                json={"p_requests": [first], "p_now": now},
+            )
+            _assert_status(response, {401, 403})
 
 
 def test_long_label_assignment_matrix_passes_actual_sql_helpers() -> None:
