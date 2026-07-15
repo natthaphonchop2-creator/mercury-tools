@@ -347,6 +347,28 @@ def cmd_release_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_release_verify_test_skips(args: argparse.Namespace) -> int:
+    from mercury_tools.release.scanner import ReleaseGateError
+    from mercury_tools.release.verify import verify_required_release_test_skips
+
+    try:
+        verify_required_release_test_skips(
+            Path(args.junit),
+            known_device=not args.allow_capability_skip,
+        )
+    except ReleaseGateError as exc:
+        _print_json({"status": "error", "error": str(exc)})
+        return 1
+    _print_json(
+        {
+            "status": "ok",
+            "junit": str(Path(args.junit)),
+            "known_device": not args.allow_capability_skip,
+        }
+    )
+    return 0
+
+
 def cmd_release_build_public_staging(args: argparse.Namespace) -> int:
     from mercury_tools.release.scanner import ReleaseGateError
     from mercury_tools.release.verify import build_public_staging
@@ -919,6 +941,11 @@ def build_parser() -> argparse.ArgumentParser:
     release_verify.add_argument("--artifacts", required=True)
     release_verify.add_argument("--repo-root", default=".")
     release_verify.set_defaults(func=cmd_release_verify)
+
+    release_verify_test_skips = release_sub.add_parser("verify-test-skips")
+    release_verify_test_skips.add_argument("--junit", required=True)
+    release_verify_test_skips.add_argument("--allow-capability-skip", action="store_true")
+    release_verify_test_skips.set_defaults(func=cmd_release_verify_test_skips)
 
     build_public_staging = release_sub.add_parser("build-public-staging")
     build_public_staging.add_argument("--version", required=True)

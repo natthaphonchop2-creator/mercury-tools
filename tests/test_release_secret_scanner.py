@@ -997,6 +997,13 @@ def test_fresh_clone_fetches_all_ref_classes_and_scans_reachable_history(
     )
 
 
+def test_release_scan_requires_an_explicit_trusted_git_runner(
+    scan_request: SecretScanRequest,
+) -> None:
+    with pytest.raises(ReleaseGateError, match="^release_git_runner_required$"):
+        scan_public_release(scan_request, require_trusted_git_runner=True)
+
+
 def test_incomplete_pull_request_ref_inventory_blocks_repository_scan(
     tmp_path: Path,
     scan_request: SecretScanRequest,

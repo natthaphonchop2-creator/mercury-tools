@@ -14,6 +14,7 @@ import tarfile
 import tempfile
 import zipfile
 import zlib
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -35,7 +36,13 @@ from mercury_tools.release.models import (
     SurfaceAttestation,
 )
 from mercury_tools.release.scanner import ReleaseGateError, build_blocked_report
-from mercury_tools.release.verify import verify_release
+from mercury_tools.release.verify import (
+    RELEASE_CROSS_FILESYSTEM_CAPABILITY_SKIP_REASON,
+    RELEASE_CROSS_FILESYSTEM_KNOWN_LINUX_DEVICE,
+    RELEASE_REQUIRED_CROSS_FILESYSTEM_TEST_IDS,
+    RELEASE_TEST_SKIP_AUDIT_CONTRACT,
+    verify_release,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = "0.2.1"
@@ -53,19 +60,6 @@ _FIXTURE_PYTHON_VERSION = platform.python_version()
 _FIXTURE_STDLIB_VERSION = sysconfig.get_python_version()
 _FIXTURE_ZLIB_RUNTIME_VERSION = zlib.ZLIB_RUNTIME_VERSION
 _ZERO_SHA256 = "0" * 64
-_RELEASE_REQUIRED_CROSS_FILESYSTEM_TEST_IDS = frozenset(
-    {
-        "tests/test_release_artifacts.py::test_publish_copies_verified_tree_to_distinct_destination_device",
-        "tests/test_release_artifacts.py::test_release_artifacts_publish_to_distinct_destination_device",
-    }
-)
-_RELEASE_CROSS_FILESYSTEM_KNOWN_LINUX_DEVICE = "/dev/shm"
-_RELEASE_CROSS_FILESYSTEM_CAPABILITY_SKIP_REASON = "no_writable_second_device"
-RELEASE_TEST_SKIP_AUDIT_CONTRACT = {
-    "capability_skip_reason": _RELEASE_CROSS_FILESYSTEM_CAPABILITY_SKIP_REASON,
-    "known_linux_distinct_device": _RELEASE_CROSS_FILESYSTEM_KNOWN_LINUX_DEVICE,
-    "required_nodeids": tuple(sorted(_RELEASE_REQUIRED_CROSS_FILESYSTEM_TEST_IDS)),
-}
 
 
 def _run(argv: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> str:
@@ -513,6 +507,59 @@ def install_task13_runner(
     return calls
 
 
+def _replace_fixture_uv(root: Path, payload: str) -> None:
+    uv = root / "release-toolchain/uv"
+    original_sha256 = _sha256_bytes(uv.read_bytes())
+    uv.write_text(payload, encoding="utf-8")
+    uv.chmod(0o755)
+    replacement_sha256 = _sha256_bytes(uv.read_bytes())
+    pyproject = root / "pyproject.toml"
+    source = pyproject.read_text(encoding="utf-8")
+    assert source.count(original_sha256) == 2
+    pyproject.write_text(
+        source.replace(original_sha256, replacement_sha256),
+        encoding="utf-8",
+    )
+    _commit_release_tree(root, "replace fixture uv launcher")
+
+
+def _delegating_uv_script(shebang: str, original: str) -> str:
+    lines = original.splitlines()
+    assert lines[0].startswith("#!")
+    assert lines[1] == "from __future__ import annotations"
+    body = "\n".join(lines[2:])
+    marker = "MERCURY_FIXTURE_UV_DELEGATED"
+    return (
+        f"#!{shebang}\n"
+        "from __future__ import annotations\n"
+        "import os\n"
+        "import sys\n"
+        f"if os.environ.pop({marker!r}, None) != '1':\n"
+        "    environment = dict(os.environ)\n"
+        f"    environment[{marker!r}] = '1'\n"
+        f"    os.execve({_FIXTURE_INTERPRETER.as_posix()!r}, "
+        f"[{_FIXTURE_INTERPRETER.as_posix()!r}, *sys.argv], environment)\n"
+        f"{body}\n"
+    )
+
+
+def _write_release_gate_fake_scanners(directory: Path) -> None:
+    for scanner, version_flag in (("gitleaks", "version"), ("trufflehog", "--version")):
+        path = directory / scanner
+        version = PINNED_SCANNER_VERSIONS[scanner]
+        scan_output = "[]" if scanner == "gitleaks" else ""
+        path.write_text(
+            "#!/bin/sh\n"
+            f"if [ \"$1\" = \"{version_flag}\" ]; then\n"
+            f"  printf '%s\\n' '{scanner} {version}'\n"
+            "  exit 0\n"
+            "fi\n"
+            f"printf '%s' '{scan_output}'\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+
+
 def incomplete_task13_report() -> SecretScanReport:
     timestamp = datetime(2026, 7, 14, tzinfo=UTC)
     return SecretScanReport.model_construct(
@@ -819,6 +866,220 @@ def test_release_git_bootstrap_ignores_local_replace_refs(
     assert manifest.commit_sha == head
     assert manifest.build_epoch == expected_epoch
     assert (output / "SHA256SUMS.json").is_file()
+
+
+def test_release_task13_gate_uses_trusted_git_for_real_scanner_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_release_tree(tmp_path)
+    remote = tmp_path / "gate-remote.git"
+    _run(["git", "clone", "--bare", str(root), str(remote)], cwd=tmp_path)
+    foreign_parent = tmp_path / "foreign-parent"
+    foreign_parent.mkdir()
+    foreign = make_release_tree(foreign_parent)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "fake-git-ran"
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        f"#!/bin/sh\nprintf '%s' fake > '{marker}'\nexit 97\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    _write_release_gate_fake_scanners(fake_bin)
+    poison_config = tmp_path / "poison.gitconfig"
+    poison_config.write_text("[core]\nrepositoryformatversion = 0\n", encoding="utf-8")
+    poison_template = tmp_path / "poison-template"
+    poison_template.mkdir()
+
+    candidate = release_artifacts.load_release_candidate(
+        root,
+        version=VERSION,
+        require_clean=True,
+    )
+    gate_candidate = replace(
+        candidate,
+        origin_url=str(remote),
+        repository_name="example/mercury-tools",
+    )
+    with release_artifacts.materialize_release_candidate(candidate) as snapshot:
+        artifacts = tmp_path / "gate-artifacts"
+        artifacts.mkdir()
+        release_artifacts._build_artifact_set(candidate, snapshot, artifacts)
+        monkeypatch.setenv("PATH", f"{fake_bin}:/usr/bin:/bin")
+        monkeypatch.setenv("GIT_DIR", str(foreign / ".git"))
+        monkeypatch.setenv("GIT_WORK_TREE", str(foreign))
+        monkeypatch.setenv("GIT_INDEX_FILE", str(foreign / ".git" / "index"))
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(poison_config))
+        monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(poison_config))
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(poison_template))
+        monkeypatch.setenv("GIT_TEMPLATE_DIR", str(poison_template))
+        monkeypatch.setenv("GIT_REPLACE_REF_BASE", str(foreign / "replace"))
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+
+        report = release_artifacts._run_task13_artifact_gate(
+            gate_candidate,
+            snapshot,
+            artifacts,
+        )
+
+    git_surface = next(surface for surface in report.surfaces if surface.surface == "git_all_refs")
+    assert "command_failed:git_clone" not in report.blockers
+    assert not any(code.startswith("command_failed:git_") for code in git_surface.blocker_codes)
+    assert git_surface.exit_codes
+    assert not marker.exists()
+
+
+def test_task13_trusted_git_runner_rejects_unallowlisted_executables_and_argv(
+    tmp_path: Path,
+) -> None:
+    root = make_release_tree(tmp_path)
+    candidate = release_artifacts.load_release_candidate(
+        root,
+        version=VERSION,
+        require_clean=True,
+    )
+    runner = release_artifacts._ReleaseTask13GitRunner.for_candidate(
+        replace(
+            candidate,
+            origin_url="https://github.com/example/mercury-tools.git",
+            repository_name="example/mercury-tools",
+        )
+    )
+
+    with pytest.raises(ReleaseGateError, match="^release_repository_invalid$"):
+        runner.run(("/usr/bin/git", "status"))
+    with pytest.raises(ReleaseGateError, match="^release_repository_invalid$"):
+        runner.run(("git", "status"))
+
+
+def test_release_candidate_rejects_repointed_dot_git_to_foreign_same_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_release_tree(tmp_path)
+    foreign = tmp_path / "foreign"
+    _run(["git", "clone", str(root), str(foreign)], cwd=tmp_path)
+    _run(["git", "config", "user.name", "Release Fixture"], cwd=foreign)
+    _run(["git", "config", "user.email", "release-fixture@example.test"], cwd=foreign)
+    foreign_tree = _run(["git", "rev-parse", "HEAD^{tree}"], cwd=foreign)
+    replacement_commit = _run(
+        ["git", "commit-tree", foreign_tree, "-m", "foreign same-tree candidate"],
+        cwd=foreign,
+    )
+    _run(["git", "update-ref", "refs/heads/main", replacement_commit], cwd=foreign)
+    _run(["git", "reset", "--hard", replacement_commit], cwd=foreign)
+    assert _run(["git", "rev-parse", "HEAD^{tree}"], cwd=root) == foreign_tree
+    assert _run(["git", "rev-parse", "HEAD"], cwd=foreign) != _run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+    )
+    original_git = tmp_path / "original-dot-git"
+    (root / ".git").rename(original_git)
+    (root / ".git").write_text(f"gitdir: {foreign / '.git'}\n", encoding="utf-8")
+    output = tmp_path / "artifacts"
+    install_task13_runner(monkeypatch)
+
+    with pytest.raises(ReleaseGateError, match="^release_repository_invalid$"):
+        build_release_artifacts(root, version=VERSION, output=output)
+
+    assert not output.exists()
+
+
+def test_release_candidate_accepts_a_physically_bound_linked_worktree(tmp_path: Path) -> None:
+    root = make_release_tree(tmp_path)
+    linked = tmp_path / "linked-candidate"
+    _run(["git", "worktree", "add", "--detach", str(linked), "HEAD"], cwd=root)
+
+    candidate = release_artifacts.load_release_candidate(
+        linked,
+        version=VERSION,
+        require_clean=True,
+    )
+
+    assert (linked / ".git").is_file()
+    assert candidate.git_metadata.root == linked.resolve()
+    assert candidate.git_metadata.git_dir.parent == candidate.git_metadata.common_dir / "worktrees"
+
+
+def test_release_candidate_rejects_git_alternates_without_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_release_tree(tmp_path)
+    alternates = root / ".git" / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(parents=True, exist_ok=True)
+    alternates.write_text(str(tmp_path / "foreign-objects") + "\n", encoding="utf-8")
+    output = tmp_path / "artifacts"
+    install_task13_runner(monkeypatch)
+
+    with pytest.raises(ReleaseGateError, match="^release_repository_invalid$"):
+        build_release_artifacts(root, version=VERSION, output=output)
+
+    assert not output.exists()
+
+
+def test_release_candidate_rejects_submodule_gitdir_pointer(tmp_path: Path) -> None:
+    source_parent = tmp_path / "source-parent"
+    source_parent.mkdir()
+    source = make_release_tree(source_parent)
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    _run(["git", "init", "--initial-branch", "main"], cwd=parent)
+    _run(
+        ["git", "-c", "protocol.file.allow=always", "submodule", "add", str(source), "module"],
+        cwd=parent,
+    )
+
+    with pytest.raises(ReleaseGateError, match="^release_repository_invalid$"):
+        release_artifacts.load_release_candidate(
+            parent / "module",
+            version=VERSION,
+            require_clean=True,
+        )
+
+
+def test_release_runtime_rejects_hash_valid_env_shebang_uv_launcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_release_tree(tmp_path)
+    uv = root / "release-toolchain/uv"
+    _replace_fixture_uv(
+        root,
+        _delegating_uv_script(f"/usr/bin/env {_FIXTURE_INTERPRETER}", uv.read_text()),
+    )
+    output = tmp_path / "artifacts"
+    install_task13_runner(monkeypatch)
+
+    with pytest.raises(ReleaseGateError, match="^release_build_toolchain_invalid$"):
+        build_release_artifacts(root, version=VERSION, output=output)
+
+    assert not output.exists()
+
+
+def test_release_runtime_rejects_hash_valid_uv_launcher_with_different_interpreter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_release_tree(tmp_path)
+    foreign_interpreter = tmp_path / "foreign-python"
+    foreign_interpreter.symlink_to(_FIXTURE_INTERPRETER)
+    uv = root / "release-toolchain/uv"
+    _replace_fixture_uv(
+        root,
+        "#!" + str(foreign_interpreter) + "\n" + uv.read_text(encoding="utf-8").split("\n", 1)[1],
+    )
+    output = tmp_path / "artifacts"
+    install_task13_runner(monkeypatch)
+
+    with pytest.raises(ReleaseGateError, match="^release_build_toolchain_invalid$"):
+        build_release_artifacts(root, version=VERSION, output=output)
+
+    assert not output.exists()
 
 
 def test_current_v020_source_fails_closed_for_v021_request(tmp_path: Path) -> None:
@@ -1258,6 +1519,110 @@ def test_publish_cleans_staging_when_its_initial_open_fails(
     assert _private_staging_paths(parent) == []
 
 
+def test_preidentity_staging_open_failure_never_removes_external_competitor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "owned-source"
+    _write_owned_publish_tree(source)
+    parent = tmp_path / "output-parent"
+    parent.mkdir()
+    output = parent / "release"
+    external = tmp_path / "external-target"
+    external.mkdir()
+    (external / "keep.txt").write_text("external\n", encoding="utf-8")
+    original_open = release_artifacts._open_directory_at_no_follow
+    staging_path: list[Path] = []
+
+    def replace_staging_then_fail(parent_fd: int, name: str) -> int:
+        if name.startswith(release_artifacts._STAGING_NAME_PREFIX):
+            staging = parent / name
+            staging.rmdir()
+            external.rename(staging)
+            staging_path.append(staging)
+            raise OSError("staging open failure after replacement")
+        return original_open(parent_fd, name)
+
+    monkeypatch.setattr(
+        release_artifacts,
+        "_open_directory_at_no_follow",
+        replace_staging_then_fail,
+    )
+    destination = release_artifacts._prepare_output_destination(output)
+    before = _open_file_descriptor_count()
+    after: int | None = None
+
+    try:
+        with pytest.raises(ReleaseGateError, match="^release_output_invalid$"):
+            release_artifacts._publish_owned_directory(source, destination)
+        after = _open_file_descriptor_count()
+    finally:
+        _close_output_destination(destination)
+
+    assert len(staging_path) == 1
+    assert (staging_path[0] / "keep.txt").read_text(encoding="utf-8") == "external\n"
+    if before is not None and after is not None:
+        assert after <= before
+    assert not output.exists()
+
+
+def test_publish_never_stats_private_staging_before_no_follow_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "owned-source"
+    _write_owned_publish_tree(source)
+    parent = tmp_path / "output-parent"
+    parent.mkdir()
+    output = parent / "release"
+    original_stat = release_artifacts.os.stat
+    original_fstat = release_artifacts.os.fstat
+    original_open = release_artifacts._open_directory_at_no_follow
+    staging_fds: set[int] = set()
+    identity_ready = False
+    staging_stat_calls = 0
+
+    def record_staging_open(parent_fd: int, name: str) -> int:
+        fd = original_open(parent_fd, name)
+        if name.startswith(release_artifacts._STAGING_NAME_PREFIX):
+            staging_fds.add(fd)
+        return fd
+
+    def record_staging_fstat(fd: int):
+        nonlocal identity_ready
+        metadata = original_fstat(fd)
+        if fd in staging_fds:
+            identity_ready = True
+        return metadata
+
+    def fail_staging_path_stat(path: object, *args: object, **kwargs: object):
+        nonlocal staging_stat_calls
+        if (
+            isinstance(path, str)
+            and path.startswith(release_artifacts._STAGING_NAME_PREFIX)
+            and kwargs.get("dir_fd") is not None
+        ):
+            staging_stat_calls += 1
+            if not identity_ready:
+                raise OSError("staging pathname stat ran before no-follow identity")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(release_artifacts, "_open_directory_at_no_follow", record_staging_open)
+    monkeypatch.setattr(release_artifacts.os, "fstat", record_staging_fstat)
+    monkeypatch.setattr(release_artifacts.os, "stat", fail_staging_path_stat)
+    destination = release_artifacts._prepare_output_destination(output)
+
+    try:
+        release_artifacts._publish_owned_directory(source, destination)
+    finally:
+        _close_output_destination(destination)
+
+    assert identity_ready
+    assert staging_stat_calls >= 1
+    assert (output / "nested" / "child.txt").read_text(encoding="utf-8") == "child\n"
+    assert _private_staging_paths(parent) == []
+
+
 def test_publish_cleans_staging_when_its_initial_fstat_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1398,7 +1763,7 @@ def test_private_staging_cleanup_never_removes_a_competing_external_target(
 def _second_writable_filesystem(tmp_path: Path) -> Path:
     baseline_device = tmp_path.stat().st_dev
     candidates = (
-        Path(_RELEASE_CROSS_FILESYSTEM_KNOWN_LINUX_DEVICE),
+        Path(RELEASE_CROSS_FILESYSTEM_KNOWN_LINUX_DEVICE),
         Path("/Volumes"),
         Path("/private/var/tmp"),
         Path(os.environ.get("TMPDIR", "/tmp")),
@@ -1418,7 +1783,7 @@ def _second_writable_filesystem(tmp_path: Path) -> Path:
         if created.stat().st_dev != baseline_device:
             return created
         shutil.rmtree(created)
-    pytest.skip(_RELEASE_CROSS_FILESYSTEM_CAPABILITY_SKIP_REASON)
+    pytest.skip(RELEASE_CROSS_FILESYSTEM_CAPABILITY_SKIP_REASON)
 
 
 def test_publish_copies_verified_tree_to_distinct_destination_device(tmp_path: Path) -> None:
@@ -1470,10 +1835,10 @@ def test_cross_filesystem_release_coverage_is_required_and_not_integration_marke
         "tests/test_release_artifacts.py::"
         "test_release_artifacts_publish_to_distinct_destination_device",
     }
-    assert expected_test_ids == _RELEASE_REQUIRED_CROSS_FILESYSTEM_TEST_IDS
+    assert expected_test_ids == RELEASE_REQUIRED_CROSS_FILESYSTEM_TEST_IDS
     expected_skip_audit_contract = {
-        "capability_skip_reason": _RELEASE_CROSS_FILESYSTEM_CAPABILITY_SKIP_REASON,
-        "known_linux_distinct_device": _RELEASE_CROSS_FILESYSTEM_KNOWN_LINUX_DEVICE,
+        "capability_skip_reason": RELEASE_CROSS_FILESYSTEM_CAPABILITY_SKIP_REASON,
+        "known_linux_distinct_device": RELEASE_CROSS_FILESYSTEM_KNOWN_LINUX_DEVICE,
         "required_nodeids": tuple(sorted(expected_test_ids)),
     }
     assert expected_skip_audit_contract == RELEASE_TEST_SKIP_AUDIT_CONTRACT

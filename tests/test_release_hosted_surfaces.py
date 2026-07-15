@@ -41,7 +41,12 @@ from mercury_tools.release.models import (
     SecretScanPolicy,
     SecretScanRequest,
 )
-from mercury_tools.release.scanner import CommandResult, build_blocked_report, scan_public_release
+from mercury_tools.release.scanner import (
+    CommandResult,
+    ReleaseGateError,
+    build_blocked_report,
+    scan_public_release,
+)
 
 
 def _write_regular_zip_member(
@@ -1052,6 +1057,32 @@ def test_adapter_factory_instantiates_every_hosted_surface_from_secret_safe_conf
     assert set(clients) == set(HOSTED_PUBLIC_SURFACES)
     assert token not in repr(config)
     assert token not in repr(clients)
+
+
+def test_adapter_factory_requires_a_trusted_git_runner_in_release_mode() -> None:
+    with pytest.raises(ReleaseGateError, match="^release_git_runner_required$"):
+        build_hosted_clients(
+            HostedAdapterConfig(repo="example/mercury-tools"),
+            require_trusted_git_runner=True,
+        )
+
+
+def test_wiki_git_query_uses_the_dedicated_git_runner() -> None:
+    command_runner = FakeCommandRunner({})
+    git_runner = FakeCommandRunner({"git": CommandResult(127, b"", b"")})
+    client = GhApiHostedClient(
+        executable=Path("/mock/gh"),
+        command_runner=command_runner,
+        git_command_runner=git_runner,
+        repo="example/mercury-tools",
+    )
+
+    query, download = client._wiki_receipts(_policy())
+
+    assert query.complete is False
+    assert download.complete is False
+    assert command_runner.calls == []
+    assert git_runner.calls == [("git", "ls-remote", "https://github.com/example/mercury-tools.wiki.git")]
 
 
 def test_all_ten_surfaces_are_required_for_a_passing_report(

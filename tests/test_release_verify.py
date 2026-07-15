@@ -22,6 +22,7 @@ from test_release_artifacts import (
 
 from mercury_tools import cli
 from mercury_tools.release import artifacts as release_artifacts
+from mercury_tools.release import verify as release_verify
 from mercury_tools.release.artifacts import (
     _zip_datetime,
     build_release_artifacts,
@@ -319,3 +320,118 @@ def test_cli_release_verify_keeps_current_v020_tree_blocked(
 
     assert exit_code == 1
     assert payload == {"status": "error", "error": "release_version_mismatch"}
+
+
+def _write_junit(path: Path, cases: tuple[str, ...]) -> None:
+    path.write_text(
+        "<testsuites><testsuite>" + "".join(cases) + "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+
+
+def test_required_cross_filesystem_release_tests_pass_junit_audit(tmp_path: Path) -> None:
+    junit = tmp_path / "pytest.xml"
+    _write_junit(
+        junit,
+        (
+            '<testcase classname="tests.test_release_artifacts" '
+            'name="test_publish_copies_verified_tree_to_distinct_destination_device"/>',
+            '<testcase classname="tests.test_release_artifacts" '
+            'name="test_release_artifacts_publish_to_distinct_destination_device"/>',
+        ),
+    )
+
+    release_verify.verify_required_release_test_skips(junit)
+
+
+def test_cli_release_verify_test_skips_accepts_known_device_passing_junit(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    junit = tmp_path / "pytest.xml"
+    _write_junit(
+        junit,
+        (
+            '<testcase classname="tests.test_release_artifacts" '
+            'name="test_publish_copies_verified_tree_to_distinct_destination_device"/>',
+            '<testcase classname="tests.test_release_artifacts" '
+            'name="test_release_artifacts_publish_to_distinct_destination_device"/>',
+        ),
+    )
+
+    exit_code = cli.main(["release", "verify-test-skips", "--junit", str(junit)])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload == {"junit": str(junit), "known_device": True, "status": "ok"}
+
+
+def test_release_test_skip_audit_allows_only_the_capability_reason_without_known_device(
+    tmp_path: Path,
+) -> None:
+    junit = tmp_path / "pytest.xml"
+    _write_junit(
+        junit,
+        (
+            '<testcase classname="tests.test_release_artifacts" '
+            'name="test_publish_copies_verified_tree_to_distinct_destination_device">'
+            '<skipped message="no_writable_second_device"/></testcase>',
+            '<testcase classname="tests.test_release_artifacts" '
+            'name="test_release_artifacts_publish_to_distinct_destination_device">'
+            '<skipped message="no_writable_second_device"/></testcase>',
+        ),
+    )
+
+    release_verify.verify_required_release_test_skips(junit, known_device=False)
+
+
+@pytest.mark.parametrize(
+    ("cases", "error"),
+    (
+        (
+            (
+                '<testcase classname="tests.test_release_artifacts" '
+                'name="test_publish_copies_verified_tree_to_distinct_destination_device">'
+                '<skipped message="no_writable_second_device"/></testcase>',
+                '<testcase classname="tests.test_release_artifacts" '
+                'name="test_release_artifacts_publish_to_distinct_destination_device"/>',
+            ),
+            "release_test_skip_audit_failed",
+        ),
+        (
+            (
+                '<testcase classname="tests.test_release_artifacts" '
+                'name="test_publish_copies_verified_tree_to_distinct_destination_device"/>',
+            ),
+            "release_test_skip_audit_failed",
+        ),
+        (
+            (
+                '<testcase classname="tests.test_release_artifacts" '
+                'name="test_publish_copies_verified_tree_to_distinct_destination_device">'
+                '<failure message="copy failed"/></testcase>',
+                '<testcase classname="tests.test_release_artifacts" '
+                'name="test_release_artifacts_publish_to_distinct_destination_device"/>',
+            ),
+            "release_test_skip_audit_failed",
+        ),
+    ),
+)
+def test_required_cross_filesystem_release_tests_reject_nonpassing_junit_results(
+    tmp_path: Path,
+    cases: tuple[str, ...],
+    error: str,
+) -> None:
+    junit = tmp_path / "pytest.xml"
+    _write_junit(junit, cases)
+
+    with pytest.raises(ReleaseGateError, match=f"^{error}$"):
+        release_verify.verify_required_release_test_skips(junit)
+
+
+def test_required_cross_filesystem_release_tests_reject_malformed_junit(tmp_path: Path) -> None:
+    junit = tmp_path / "pytest.xml"
+    junit.write_text("<testsuite><testcase>", encoding="utf-8")
+
+    with pytest.raises(ReleaseGateError, match="^release_test_skip_audit_invalid$"):
+        release_verify.verify_required_release_test_skips(junit)

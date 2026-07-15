@@ -677,6 +677,8 @@ def scan_public_release(
     request: SecretScanRequest,
     *,
     command_runner: CommandRunner | None = None,
+    git_command_runner: CommandRunner | None = None,
+    require_trusted_git_runner: bool = False,
     hosted_clients: Mapping[str, object] | None = None,
 ) -> SecretScanReport:
     started_at = datetime.now(UTC)
@@ -695,6 +697,9 @@ def scan_public_release(
         blockers.append(str(exc))
 
     runner = command_runner or SubprocessCommandRunner()
+    if require_trusted_git_runner and git_command_runner is None:
+        raise ReleaseGateError("release_git_runner_required")
+    git_runner = git_command_runner or runner
     scanner_versions, scanner_blockers, scanner_binaries = _scanner_versions(
         request,
         runner,
@@ -717,6 +722,8 @@ def scan_public_release(
         request.policy,
         scanner_binaries=scanner_binaries,
         command_runner=runner,
+        git_command_runner=git_runner,
+        require_trusted_git_runner=require_trusted_git_runner,
     )
     artifact_result = scan_artifacts(request.artifacts, request.policy)
 
@@ -1237,8 +1244,13 @@ def scan_git_repository(
     *,
     scanner_binaries: Mapping[str, Path],
     command_runner: CommandRunner | None = None,
+    git_command_runner: CommandRunner | None = None,
+    require_trusted_git_runner: bool = False,
 ) -> GitRepositoryScanResult:
     runner = command_runner or SubprocessCommandRunner()
+    if require_trusted_git_runner and git_command_runner is None:
+        raise ReleaseGateError("release_git_runner_required")
+    git_runner = git_command_runner or runner
     blockers: list[str] = []
     findings: list[SecretFinding] = []
     evidence_hashes: list[str] = []
@@ -1252,7 +1264,7 @@ def scan_git_repository(
     with tempfile.TemporaryDirectory(prefix="mercury-release-scan-") as temporary:
         clone = Path(temporary) / "repository"
         clone_result = _run_and_record(
-            runner,
+            git_runner,
             ("git", "clone", "--no-checkout", "--origin", "origin", repo_url, str(clone)),
             evidence_hashes=evidence_hashes,
             exit_codes=exit_codes,
@@ -1270,7 +1282,7 @@ def scan_git_repository(
             )
 
         fetch_result = _run_and_record(
-            runner,
+            git_runner,
             (
                 "git",
                 "fetch",
@@ -1298,7 +1310,7 @@ def scan_git_repository(
             )
 
         ref_sets = _inventory_refs(
-            runner,
+            git_runner,
             clone,
             evidence_hashes=evidence_hashes,
             exit_codes=exit_codes,
@@ -1315,7 +1327,7 @@ def scan_git_repository(
             )
         checkout_ref, local_refs = ref_sets
         checkout_result = _run_and_record(
-            runner,
+            git_runner,
             ("git", "checkout", "--force", "--detach", checkout_ref),
             cwd=clone,
             evidence_hashes=evidence_hashes,
@@ -1334,7 +1346,7 @@ def scan_git_repository(
             )
 
         inventory = _scan_reachable_blobs(
-            runner,
+            git_runner,
             clone,
             policy,
             ref_oids=local_refs.values(),

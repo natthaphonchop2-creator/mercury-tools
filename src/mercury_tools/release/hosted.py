@@ -1377,11 +1377,13 @@ class GhApiHostedClient:
         *,
         executable: Path,
         command_runner: CommandRunner,
+        git_command_runner: CommandRunner | None = None,
         repo: str,
         http_transport: HostedHttpTransport | None = None,
     ) -> None:
         self._executable = executable
         self._command_runner = command_runner
+        self._git_command_runner = git_command_runner or command_runner
         self._repo = repo
         self._http_transport = http_transport
 
@@ -1872,7 +1874,7 @@ class GhApiHostedClient:
     ) -> tuple[HostedReceipt, HostedReceipt]:
         wiki_url = f"https://github.com/{self._repo}.wiki.git"
         try:
-            query_result = self._command_runner.run(
+            query_result = self._git_command_runner.run(
                 ("git", "ls-remote", wiki_url),
                 max_output_bytes=policy.max_hosted_receipt_bytes,
                 timeout_seconds=300.0,
@@ -1931,7 +1933,7 @@ class GhApiHostedClient:
             if remaining <= 0:
                 return CommandResult(127, b"", b"")
             try:
-                result = self._command_runner.run(
+                result = self._git_command_runner.run(
                     argv,
                     cwd=cwd,
                     max_output_bytes=remaining,
@@ -1990,7 +1992,7 @@ class GhApiHostedClient:
             inventory = None
             if complete:
                 inventory = _scan_reachable_blobs(
-                    self._command_runner,
+                    self._git_command_runner,
                     clone,
                     policy,
                     ref_oids=local_refs.values(),
@@ -2979,10 +2981,14 @@ def build_hosted_clients(
     config: HostedAdapterConfig,
     *,
     command_runner: CommandRunner | None = None,
+    git_command_runner: CommandRunner | None = None,
+    require_trusted_git_runner: bool = False,
     http_transport: HostedHttpTransport | None = None,
 ) -> dict[str, HostedSurfaceClient]:
     clients: dict[str, HostedSurfaceClient] = {}
     transport = http_transport or HttpxHostedTransport()
+    if require_trusted_git_runner and git_command_runner is None:
+        raise ReleaseGateError("release_git_runner_required")
     if config.gh_executable is not None and config.github_token:
         runner = command_runner or SubprocessCommandRunner(
             environment={"GH_TOKEN": config.github_token}
@@ -2990,6 +2996,7 @@ def build_hosted_clients(
         github = GhApiHostedClient(
             executable=config.gh_executable,
             command_runner=runner,
+            git_command_runner=git_command_runner or runner,
             repo=config.repo,
             http_transport=transport,
         )

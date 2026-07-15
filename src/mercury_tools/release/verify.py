@@ -9,6 +9,7 @@ import stat
 import sys
 import tarfile
 import tempfile
+import xml.etree.ElementTree as ElementTree
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,6 +72,20 @@ _MCP_TOOL_LIST_PROGRAM = (
     "print(json.dumps(sorted(tool.name for tool in tools)))\n"
 )
 _MAX_COMMAND_OUTPUT = 64 * 1024
+_MAX_JUNIT_BYTES = 16 * 1024 * 1024
+RELEASE_REQUIRED_CROSS_FILESYSTEM_TEST_IDS = frozenset(
+    {
+        "tests/test_release_artifacts.py::test_publish_copies_verified_tree_to_distinct_destination_device",
+        "tests/test_release_artifacts.py::test_release_artifacts_publish_to_distinct_destination_device",
+    }
+)
+RELEASE_CROSS_FILESYSTEM_KNOWN_LINUX_DEVICE = "/dev/shm"
+RELEASE_CROSS_FILESYSTEM_CAPABILITY_SKIP_REASON = "no_writable_second_device"
+RELEASE_TEST_SKIP_AUDIT_CONTRACT = {
+    "capability_skip_reason": RELEASE_CROSS_FILESYSTEM_CAPABILITY_SKIP_REASON,
+    "known_linux_distinct_device": RELEASE_CROSS_FILESYSTEM_KNOWN_LINUX_DEVICE,
+    "required_nodeids": tuple(sorted(RELEASE_REQUIRED_CROSS_FILESYSTEM_TEST_IDS)),
+}
 
 
 @dataclass(frozen=True)
@@ -105,6 +120,99 @@ class PublicStaging:
             "staged_tree_digest": self.staged_tree_digest,
             "version": self.version,
         }
+
+
+def verify_required_release_test_skips(
+    junit: Path,
+    *,
+    known_device: bool = True,
+) -> None:
+    """Require the cross-device release tests to pass on a known-device job."""
+
+    if not isinstance(known_device, bool):
+        raise ReleaseGateError("release_test_skip_audit_invalid")
+    root = _load_junit_root(junit)
+    results: dict[str, list[tuple[str, str | None]]] = {
+        nodeid: [] for nodeid in RELEASE_REQUIRED_CROSS_FILESYSTEM_TEST_IDS
+    }
+    for testcase in root.iter():
+        if _xml_local_name(testcase.tag) != "testcase":
+            continue
+        outcome = _junit_testcase_outcome(testcase)
+        for nodeid in _junit_testcase_nodeids(testcase):
+            if nodeid in results:
+                results[nodeid].append(outcome)
+    for nodeid in RELEASE_REQUIRED_CROSS_FILESYSTEM_TEST_IDS:
+        outcomes = results[nodeid]
+        if len(outcomes) != 1:
+            raise ReleaseGateError("release_test_skip_audit_failed")
+        state, reason = outcomes[0]
+        if state == "passed":
+            continue
+        if (
+            not known_device
+            and state == "skipped"
+            and reason == RELEASE_CROSS_FILESYSTEM_CAPABILITY_SKIP_REASON
+        ):
+            continue
+        raise ReleaseGateError("release_test_skip_audit_failed")
+
+
+def _load_junit_root(path: Path) -> ElementTree.Element:
+    try:
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise ReleaseGateError("release_test_skip_audit_invalid")
+        if metadata.st_size > _MAX_JUNIT_BYTES:
+            raise ReleaseGateError("release_test_skip_audit_invalid")
+        payload = path.read_bytes()
+        if b"<!" in payload:
+            raise ReleaseGateError("release_test_skip_audit_invalid")
+        root = ElementTree.fromstring(payload)
+    except ReleaseGateError:
+        raise
+    except (ElementTree.ParseError, OSError, ValueError) as exc:
+        raise ReleaseGateError("release_test_skip_audit_invalid") from exc
+    if _xml_local_name(root.tag) not in {"testsuite", "testsuites"}:
+        raise ReleaseGateError("release_test_skip_audit_invalid")
+    return root
+
+
+def _junit_testcase_nodeids(testcase: ElementTree.Element) -> tuple[str, ...]:
+    name = testcase.attrib.get("name")
+    if not name or "\0" in name:
+        return ()
+    candidates = {testcase.attrib.get("nodeid", "")}
+    file_name = testcase.attrib.get("file")
+    if file_name:
+        candidates.add(file_name.replace("\\", "/") + "::" + name)
+    classname = testcase.attrib.get("classname")
+    if classname:
+        normalized = classname.replace(".", "/")
+        if not normalized.endswith(".py"):
+            normalized += ".py"
+        candidates.add(f"{normalized}::{name}")
+    return tuple(candidate for candidate in candidates if candidate)
+
+
+def _junit_testcase_outcome(testcase: ElementTree.Element) -> tuple[str, str | None]:
+    children = tuple(testcase)
+    if any(_xml_local_name(child.tag) in {"failure", "error"} for child in children):
+        return "failed", None
+    skipped = next(
+        (child for child in children if _xml_local_name(child.tag) == "skipped"),
+        None,
+    )
+    if skipped is None:
+        return "passed", None
+    reason = skipped.attrib.get("message") or (skipped.text or "").strip()
+    return "skipped", reason
+
+
+def _xml_local_name(tag: object) -> str:
+    if not isinstance(tag, str):
+        return ""
+    return tag.rsplit("}", 1)[-1]
 
 
 def verify_release_tree(root: Path, *, version: str):

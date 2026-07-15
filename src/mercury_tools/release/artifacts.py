@@ -58,6 +58,7 @@ _BACKEND_MODULE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Z
 _MAX_COMMAND_OUTPUT = 256 * 1024 * 1024
 _BUILD_TIMEOUT_SECONDS = 600.0
 _GIT_TIMEOUT_SECONDS = 60.0
+_TASK13_GIT_TIMEOUT_SECONDS = 300.0
 _BUILD_TOOLCHAIN_SCHEMA_VERSION = 2
 _RELEASE_MANIFEST_SCHEMA_VERSION = 3
 _NORMALIZER_NAME = "mercury-release-normalizer"
@@ -238,10 +239,44 @@ class _BuildToolchainPolicy:
 
 
 @dataclass(frozen=True)
+class _ValidatedBuildLauncher:
+    path: Path
+    invocation: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _PathIdentity:
+    path: Path
+    device: int
+    inode: int
+    mode: int
+
+
+@dataclass(frozen=True)
 class _GitRepositoryMetadata:
     root: Path
     git_dir: Path
     common_dir: Path
+    root_identity: _PathIdentity
+    dot_git_identity: _PathIdentity
+    git_dir_identity: _PathIdentity
+    common_dir_identity: _PathIdentity
+    commondir_pointer_identity: _PathIdentity | None = None
+    gitdir_backlink_identity: _PathIdentity | None = None
+
+
+@dataclass(frozen=True)
+class _BareGitRepositoryMetadata:
+    root_identity: _PathIdentity
+    head_identity: _PathIdentity
+    config_identity: _PathIdentity
+
+
+@dataclass(frozen=True)
+class _Task13GitClone:
+    root: Path
+    origin_url: str
+    metadata: _GitRepositoryMetadata | _BareGitRepositoryMetadata
 
 
 @dataclass(frozen=True)
@@ -407,15 +442,15 @@ class _ReleaseGitRunner:
         if _read_git_repository_metadata(self.root) != self.metadata:
             raise ReleaseGateError("release_repository_invalid")
         top_level = _git_result_path(
-            self._run(("rev-parse", "--show-toplevel")),
+            self._run(("rev-parse", "--show-toplevel"), bind_repository=False),
             base=self.root,
         )
         git_dir = _git_result_path(
-            self._run(("rev-parse", "--git-dir")),
+            self._run(("rev-parse", "--git-dir"), bind_repository=False),
             base=self.root,
         )
         common_dir = _git_result_path(
-            self._run(("rev-parse", "--git-common-dir")),
+            self._run(("rev-parse", "--git-common-dir"), bind_repository=False),
             base=self.root,
         )
         if (
@@ -430,6 +465,7 @@ class _ReleaseGitRunner:
         arguments: tuple[str, ...],
         *,
         extra_environment: dict[str, str] | None = None,
+        bind_repository: bool = True,
     ) -> CommandResult:
         if not arguments or any(not argument or "\0" in argument for argument in arguments):
             raise ReleaseGateError("release_repository_invalid")
@@ -448,7 +484,7 @@ class _ReleaseGitRunner:
                 "-c",
                 f"core.hooksPath={workspace / 'hooks'}",
             ]
-            if self.metadata is not None:
+            if self.metadata is not None and bind_repository:
                 command.extend(
                     (
                         f"--git-dir={self.metadata.git_dir}",
@@ -515,36 +551,455 @@ def _release_git_environment(workspace: Path) -> dict[str, str]:
     }
 
 
-def _read_git_repository_metadata(root: Path) -> _GitRepositoryMetadata:
-    try:
-        dot_git = root / ".git"
-        dot_git_metadata = dot_git.lstat()
-        if stat.S_ISLNK(dot_git_metadata.st_mode):
+class _ReleaseTask13GitRunner:
+    """Allow only scanner Git reads through one scrubbed, identity-bound runner."""
+
+    _FETCH_REFS = (
+        "+refs/heads/*:refs/remotes/origin/*",
+        "+refs/tags/*:refs/tags/*",
+        "+refs/pull/*/head:refs/remotes/pull/*/head",
+    )
+    _REF_FORMAT = "--format=%(refname)%09%(objectname)%09%(*objectname)"
+    _OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+    def __init__(
+        self,
+        candidate: ReleaseCandidate,
+        *,
+        executable: Path,
+    ) -> None:
+        if candidate.origin_url is None or candidate.repository_name is None:
+            raise ReleaseGateError("release_scanner_context_unavailable")
+        self._candidate = candidate
+        self._executable = executable
+        self._wiki_url = f"https://github.com/{candidate.repository_name}.wiki.git"
+        self._clones: dict[Path, _Task13GitClone] = {}
+
+    @classmethod
+    def for_candidate(cls, candidate: ReleaseCandidate) -> _ReleaseTask13GitRunner:
+        _ReleaseGitRunner.for_repository(
+            candidate.root,
+            expected_metadata=candidate.git_metadata,
+        )
+        return cls(candidate, executable=_trusted_system_git_executable())
+
+    def run(
+        self,
+        argv: tuple[str, ...],
+        *,
+        cwd: Path | None = None,
+        input_bytes: bytes | None = None,
+        max_output_bytes: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> CommandResult:
+        self._validate_argv(argv)
+        output_limit, timeout = self._command_limits(max_output_bytes, timeout_seconds)
+        arguments = argv[1:]
+        if cwd is None:
+            return self._run_unbound_command(
+                arguments,
+                input_bytes=input_bytes,
+                max_output_bytes=output_limit,
+                timeout_seconds=timeout,
+            )
+        clone = self._registered_clone(cwd)
+        if not self._allowed_bound_command(clone, arguments, input_bytes):
             raise ReleaseGateError("release_repository_invalid")
-        if stat.S_ISDIR(dot_git_metadata.st_mode):
-            git_dir = _resolve_git_metadata_directory(dot_git, base=root)
-        elif stat.S_ISREG(dot_git_metadata.st_mode):
-            git_dir = _resolve_gitdir_pointer(dot_git, base=root)
-        else:
-            raise ReleaseGateError("release_repository_invalid")
-        common_file = git_dir / "commondir"
+        self._assert_clone_identity(clone)
         try:
-            common_metadata = common_file.lstat()
-        except FileNotFoundError:
-            common_dir = git_dir
-        else:
-            if not stat.S_ISREG(common_metadata.st_mode):
+            return self._run_trusted_command(
+                arguments,
+                cwd=clone.root,
+                metadata=clone.metadata,
+                input_bytes=input_bytes,
+                max_output_bytes=output_limit,
+                timeout_seconds=timeout,
+            )
+        finally:
+            self._assert_clone_identity(clone)
+
+    def _run_unbound_command(
+        self,
+        arguments: tuple[str, ...],
+        *,
+        input_bytes: bytes | None,
+        max_output_bytes: int,
+        timeout_seconds: float,
+    ) -> CommandResult:
+        normal_clone = (
+            len(arguments) == 6
+            and arguments[:4] == ("clone", "--no-checkout", "--origin", "origin")
+            and arguments[4] == self._candidate.origin_url
+        )
+        mirror_clone = (
+            len(arguments) == 4
+            and arguments[:2] == ("clone", "--mirror")
+            and arguments[2] == self._wiki_url
+        )
+        if normal_clone or mirror_clone:
+            if input_bytes is not None:
                 raise ReleaseGateError("release_repository_invalid")
-            common_dir = _resolve_gitdir_pointer(common_file, base=git_dir)
+            destination = self._clone_destination(arguments[-1])
+            result = self._run_trusted_command(
+                arguments,
+                cwd=None,
+                metadata=None,
+                input_bytes=None,
+                max_output_bytes=max_output_bytes,
+                timeout_seconds=timeout_seconds,
+            )
+            if result.exit_code == 0:
+                self._register_clone(
+                    destination,
+                    origin_url=arguments[-2],
+                    mirror=mirror_clone,
+                )
+            return result
+        if arguments == ("ls-remote", self._wiki_url) and input_bytes is None:
+            return self._run_trusted_command(
+                arguments,
+                cwd=None,
+                metadata=None,
+                input_bytes=None,
+                max_output_bytes=max_output_bytes,
+                timeout_seconds=timeout_seconds,
+            )
+        raise ReleaseGateError("release_repository_invalid")
+
+    def _registered_clone(self, cwd: Path) -> _Task13GitClone:
+        if not isinstance(cwd, Path):
+            raise ReleaseGateError("release_repository_invalid")
+        clone = self._clones.get(_resolve_root(cwd))
+        if clone is None:
+            raise ReleaseGateError("release_repository_invalid")
+        return clone
+
+    def _clone_destination(self, value: str) -> Path:
+        if not value or "\0" in value:
+            raise ReleaseGateError("release_repository_invalid")
+        destination = Path(value)
+        if not destination.is_absolute() or any(part in {".", ".."} for part in destination.parts):
+            raise ReleaseGateError("release_repository_invalid")
+        destination = _absolute_lexical_path(destination)
+        try:
+            destination.lstat()
+        except FileNotFoundError:
+            return destination
+        except OSError as exc:
+            raise ReleaseGateError("release_repository_invalid") from exc
+        raise ReleaseGateError("release_repository_invalid")
+
+    def _register_clone(self, root: Path, *, origin_url: str, mirror: bool) -> None:
+        try:
+            root = _resolve_root(root)
+            metadata: _GitRepositoryMetadata | _BareGitRepositoryMetadata
+            if mirror:
+                metadata = _read_bare_git_repository_metadata(root)
+            else:
+                metadata = _read_git_repository_metadata(root)
+            clone = _Task13GitClone(
+                root=root,
+                origin_url=origin_url,
+                metadata=metadata,
+            )
+            self._clones[root] = clone
+            self._assert_clone_identity(clone)
+        except ReleaseGateError:
+            self._clones.pop(root, None)
+            raise
+
+    def _assert_clone_identity(self, clone: _Task13GitClone) -> None:
+        if isinstance(clone.metadata, _GitRepositoryMetadata):
+            runner = _ReleaseGitRunner.for_repository(
+                clone.root,
+                expected_metadata=clone.metadata,
+            )
+            result = runner.run(("config", "--get", "remote.origin.url"))
+        else:
+            if _read_bare_git_repository_metadata(clone.root) != clone.metadata:
+                raise ReleaseGateError("release_repository_invalid")
+            result = self._run_trusted_command(
+                ("config", "--get", "remote.origin.url"),
+                cwd=clone.root,
+                metadata=clone.metadata,
+                input_bytes=None,
+                max_output_bytes=_MAX_COMMAND_OUTPUT,
+                timeout_seconds=_TASK13_GIT_TIMEOUT_SECONDS,
+            )
+        if _single_git_config_value(result) != clone.origin_url:
+            raise ReleaseGateError("release_repository_invalid")
+
+    def _allowed_bound_command(
+        self,
+        clone: _Task13GitClone,
+        arguments: tuple[str, ...],
+        input_bytes: bytes | None,
+    ) -> bool:
+        object_command = self._allowed_object_command(arguments, input_bytes)
+        if object_command:
+            return True
+        if input_bytes is not None:
+            return False
+        if isinstance(clone.metadata, _BareGitRepositoryMetadata):
+            return arguments in {
+                ("for-each-ref", self._REF_FORMAT),
+                ("rev-parse", "--verify", "HEAD"),
+            }
+        return arguments in {
+            (
+                "fetch",
+                "--force",
+                "--prune",
+                "origin",
+                *self._FETCH_REFS,
+            ),
+            ("ls-remote", "--heads", "origin"),
+            ("ls-remote", "--tags", "origin"),
+            ("ls-remote", "origin", "refs/pull/*/head"),
+            ("ls-remote", "--symref", "origin", "HEAD"),
+            (
+                "for-each-ref",
+                self._REF_FORMAT,
+                "refs/remotes/origin",
+                "refs/tags",
+                "refs/remotes/pull",
+            ),
+            ("symbolic-ref", "refs/remotes/origin/HEAD"),
+        } or (
+            len(arguments) == 4
+            and arguments[:3] == ("checkout", "--force", "--detach")
+            and _is_task13_remote_ref(arguments[3])
+        )
+
+    def _allowed_object_command(
+        self,
+        arguments: tuple[str, ...],
+        input_bytes: bytes | None,
+    ) -> bool:
+        if arguments == ("rev-list", "--objects", "-z", "--stdin"):
+            return self._valid_oid_input(input_bytes)
+        if arguments == ("cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"):
+            return self._valid_oid_input(input_bytes)
+        if input_bytes is not None:
+            return False
+        if (
+            len(arguments) == 3
+            and arguments[0] == "cat-file"
+            and arguments[1] in {"blob", "commit", "tag", "tree"}
+            and self._OID.fullmatch(arguments[2]) is not None
+        ):
+            return True
+        return (
+            len(arguments) == 3
+            and arguments[:2] == ("ls-tree", "-z")
+            and self._OID.fullmatch(arguments[2]) is not None
+        )
+
+    def _valid_oid_input(self, value: bytes | None) -> bool:
+        if not isinstance(value, bytes) or not value or not value.endswith(b"\n"):
+            return False
+        try:
+            values = value[:-1].decode("ascii", errors="strict").split("\n")
+        except UnicodeError:
+            return False
+        return bool(values) and all(self._OID.fullmatch(item) is not None for item in values)
+
+    def _validate_argv(self, argv: tuple[str, ...]) -> None:
+        if (
+            not isinstance(argv, tuple)
+            or not argv
+            or argv[0] != "git"
+            or any(
+                not isinstance(argument, str)
+                or not argument
+                or any(character in argument for character in "\0\r\n")
+                for argument in argv
+            )
+        ):
+            raise ReleaseGateError("release_repository_invalid")
+
+    def _command_limits(
+        self,
+        max_output_bytes: int | None,
+        timeout_seconds: float | None,
+    ) -> tuple[int, float]:
+        output_limit = _MAX_COMMAND_OUTPUT if max_output_bytes is None else max_output_bytes
+        timeout = _TASK13_GIT_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+        if (
+            not isinstance(output_limit, int)
+            or output_limit <= 0
+            or not isinstance(timeout, (int, float))
+            or timeout <= 0
+        ):
+            raise ReleaseGateError("release_repository_invalid")
+        return (
+            min(output_limit, _MAX_COMMAND_OUTPUT),
+            min(float(timeout), _TASK13_GIT_TIMEOUT_SECONDS),
+        )
+
+    def _run_trusted_command(
+        self,
+        arguments: tuple[str, ...],
+        *,
+        cwd: Path | None,
+        metadata: _GitRepositoryMetadata | _BareGitRepositoryMetadata | None,
+        input_bytes: bytes | None,
+        max_output_bytes: int,
+        timeout_seconds: float,
+    ) -> CommandResult:
+        with tempfile.TemporaryDirectory(prefix=".mercury-release-task13-git-") as temporary:
+            workspace = Path(temporary)
+            environment = _release_git_environment(workspace)
+            command: list[str] = [
+                str(self._executable),
+                "--no-replace-objects",
+                "--no-optional-locks",
+                "-c",
+                f"core.hooksPath={workspace / 'hooks'}",
+            ]
+            command_cwd = workspace if cwd is None else cwd
+            if isinstance(metadata, _GitRepositoryMetadata):
+                command.extend(
+                    (
+                        f"--git-dir={metadata.git_dir}",
+                        f"--work-tree={metadata.root}",
+                    )
+                )
+            elif isinstance(metadata, _BareGitRepositoryMetadata):
+                command.append(f"--git-dir={metadata.root_identity.path}")
+            command.extend(arguments)
+            return _run_exact_environment_command(
+                tuple(command),
+                cwd=command_cwd,
+                environment=environment,
+                timeout_seconds=timeout_seconds,
+                max_output_bytes=max_output_bytes,
+                input_bytes=input_bytes,
+            )
+
+
+def _is_task13_remote_ref(value: str) -> bool:
+    prefix = "refs/remotes/origin/"
+    if not value.startswith(prefix):
+        return False
+    suffix = value.removeprefix(prefix)
+    return (
+        bool(suffix)
+        and not suffix.startswith("/")
+        and not suffix.endswith(("/", "."))
+        and ".." not in suffix
+        and "@{" not in suffix
+        and not suffix.endswith(".lock")
+        and all(character > " " and character not in "~^:?*[\\" for character in suffix)
+    )
+
+
+def _read_bare_git_repository_metadata(root: Path) -> _BareGitRepositoryMetadata:
+    try:
+        root_identity = _require_git_directory_identity(root)
+        _require_git_metadata_path_absent(root_identity.path / "commondir")
+        _require_no_git_alternates((root_identity.path,))
+        return _BareGitRepositoryMetadata(
+            root_identity=root_identity,
+            head_identity=_require_git_regular_identity(root_identity.path / "HEAD"),
+            config_identity=_require_git_regular_identity(root_identity.path / "config"),
+        )
     except ReleaseGateError:
         raise
     except (OSError, UnicodeError) as exc:
         raise ReleaseGateError("release_repository_invalid") from exc
-    return _GitRepositoryMetadata(root=root, git_dir=git_dir, common_dir=common_dir)
+
+
+def _single_git_config_value(result: CommandResult) -> str:
+    try:
+        values = result.stdout.decode("utf-8", errors="strict").splitlines()
+    except UnicodeError as exc:
+        raise ReleaseGateError("release_repository_invalid") from exc
+    if result.exit_code != 0 or len(values) != 1 or not values[0] or "\0" in values[0]:
+        raise ReleaseGateError("release_repository_invalid")
+    return values[0]
+
+
+def _read_git_repository_metadata(root: Path) -> _GitRepositoryMetadata:
+    try:
+        root_identity = _require_git_directory_identity(root)
+        dot_git = root_identity.path / ".git"
+        dot_git_metadata = dot_git.lstat()
+        if stat.S_ISDIR(dot_git_metadata.st_mode):
+            dot_git_identity = _require_git_directory_identity(dot_git)
+            _require_git_metadata_path_absent(dot_git / "commondir")
+            _require_no_git_alternates((dot_git_identity.path,))
+            return _GitRepositoryMetadata(
+                root=root_identity.path,
+                git_dir=dot_git_identity.path,
+                common_dir=dot_git_identity.path,
+                root_identity=root_identity,
+                dot_git_identity=dot_git_identity,
+                git_dir_identity=dot_git_identity,
+                common_dir_identity=dot_git_identity,
+            )
+        if not stat.S_ISREG(dot_git_metadata.st_mode):
+            raise ReleaseGateError("release_repository_invalid")
+        dot_git_identity = _require_git_regular_identity(dot_git)
+        git_dir = _resolve_gitdir_pointer(dot_git_identity.path, base=root_identity.path)
+        git_dir_identity = _require_git_directory_identity(git_dir)
+        common_file = git_dir_identity.path / "commondir"
+        commondir_pointer_identity = _require_git_regular_identity(common_file)
+        common_dir = _resolve_gitdir_pointer(
+            commondir_pointer_identity.path,
+            base=git_dir_identity.path,
+        )
+        common_dir_identity = _require_git_directory_identity(common_dir)
+        worktrees = common_dir_identity.path / "worktrees"
+        worktrees_identity = _require_git_directory_identity(worktrees)
+        if git_dir_identity.path.parent != worktrees_identity.path:
+            raise ReleaseGateError("release_repository_invalid")
+        _require_git_metadata_path_absent(common_dir_identity.path / "commondir")
+        backlink = git_dir_identity.path / "gitdir"
+        backlink_identity = _require_git_regular_identity(backlink)
+        if (
+            _resolve_git_regular_pointer(backlink_identity.path, base=git_dir_identity.path)
+            != dot_git_identity.path
+        ):
+            raise ReleaseGateError("release_repository_invalid")
+        _require_no_git_alternates((git_dir_identity.path, common_dir_identity.path))
+    except ReleaseGateError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise ReleaseGateError("release_repository_invalid") from exc
+    return _GitRepositoryMetadata(
+        root=root_identity.path,
+        git_dir=git_dir_identity.path,
+        common_dir=common_dir_identity.path,
+        root_identity=root_identity,
+        dot_git_identity=dot_git_identity,
+        git_dir_identity=git_dir_identity,
+        common_dir_identity=common_dir_identity,
+        commondir_pointer_identity=commondir_pointer_identity,
+        gitdir_backlink_identity=backlink_identity,
+    )
 
 
 def _resolve_gitdir_pointer(pointer: Path, *, base: Path) -> Path:
+    return _resolve_git_metadata_directory(
+        _read_git_pointer_target(pointer, base=base, require_gitdir_prefix=pointer.name == ".git"),
+        base=base,
+    )
+
+
+def _resolve_git_regular_pointer(pointer: Path, *, base: Path) -> Path:
+    target = _read_git_pointer_target(pointer, base=base, require_gitdir_prefix=False)
+    return _require_git_regular_identity(target).path
+
+
+def _read_git_pointer_target(
+    pointer: Path,
+    *,
+    base: Path,
+    require_gitdir_prefix: bool,
+) -> Path:
     try:
+        _require_git_regular_identity(pointer)
         value = pointer.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise ReleaseGateError("release_repository_invalid") from exc
@@ -552,25 +1007,71 @@ def _resolve_gitdir_pointer(pointer: Path, *, base: Path) -> Path:
     if len(lines) != 1 or "\0" in lines[0]:
         raise ReleaseGateError("release_repository_invalid")
     line = lines[0]
-    if pointer.name == ".git":
+    if require_gitdir_prefix:
         if not line.startswith("gitdir: "):
             raise ReleaseGateError("release_repository_invalid")
         line = line.removeprefix("gitdir: ")
     if not line:
         raise ReleaseGateError("release_repository_invalid")
-    return _resolve_git_metadata_directory(Path(line), base=base)
+    candidate = Path(line)
+    return _absolute_lexical_path(candidate if candidate.is_absolute() else base / candidate)
 
 
 def _resolve_git_metadata_directory(path: Path, *, base: Path) -> Path:
     candidate = path if path.is_absolute() else base / path
     try:
-        resolved = candidate.resolve(strict=True)
-        metadata = resolved.lstat()
+        return _require_git_directory_identity(candidate).path
     except OSError as exc:
         raise ReleaseGateError("release_repository_invalid") from exc
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+
+
+def _absolute_lexical_path(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _require_git_directory_identity(path: Path) -> _PathIdentity:
+    return _require_git_path_identity(path, directory=True)
+
+
+def _require_git_regular_identity(path: Path) -> _PathIdentity:
+    return _require_git_path_identity(path, directory=False)
+
+
+def _require_git_path_identity(path: Path, *, directory: bool) -> _PathIdentity:
+    lexical = _absolute_lexical_path(path)
+    try:
+        metadata = lexical.lstat()
+        resolved = lexical.resolve(strict=True)
+    except OSError as exc:
+        raise ReleaseGateError("release_repository_invalid") from exc
+    if (
+        resolved != lexical
+        or stat.S_ISLNK(metadata.st_mode)
+        or (directory and not stat.S_ISDIR(metadata.st_mode))
+        or (not directory and not stat.S_ISREG(metadata.st_mode))
+    ):
         raise ReleaseGateError("release_repository_invalid")
-    return resolved
+    return _PathIdentity(
+        path=lexical,
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        mode=stat.S_IFMT(metadata.st_mode),
+    )
+
+
+def _require_git_metadata_path_absent(path: Path) -> None:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ReleaseGateError("release_repository_invalid") from exc
+    raise ReleaseGateError("release_repository_invalid")
+
+
+def _require_no_git_alternates(git_directories: Iterable[Path]) -> None:
+    for git_directory in git_directories:
+        _require_git_metadata_path_absent(git_directory / "objects" / "info" / "alternates")
 
 
 def _git_result_path(result: CommandResult, *, base: Path) -> Path:
@@ -1304,17 +1805,103 @@ def _runtime_policy_interpreter_path(value: object) -> Path:
     if not path.is_absolute():
         raise ReleaseGateError("release_build_toolchain_invalid")
     try:
+        metadata = path.lstat()
         resolved = path.resolve(strict=True)
-        metadata = resolved.lstat()
     except OSError as exc:
         raise ReleaseGateError("release_build_toolchain_invalid") from exc
     if (
         str(path) != str(resolved)
+        or stat.S_ISLNK(metadata.st_mode)
         or not stat.S_ISREG(metadata.st_mode)
         or not metadata.st_mode & 0o111
     ):
         raise ReleaseGateError("release_build_toolchain_invalid")
+    _require_native_current_platform_executable(resolved)
     return resolved
+
+
+def _require_native_current_platform_executable(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+        with path.open("rb") as stream:
+            header = stream.read(4096)
+    except OSError as exc:
+        raise ReleaseGateError("release_build_toolchain_invalid") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or not metadata.st_mode & 0o111
+        or not _matches_current_native_binary(header)
+    ):
+        raise ReleaseGateError("release_build_toolchain_invalid")
+
+
+def _matches_current_native_binary(header: bytes) -> bool:
+    system = platform.system()
+    architecture = platform.machine().casefold()
+    if system == "Darwin":
+        return _matches_mach_o_architecture(header, architecture)
+    if system == "Linux":
+        return _matches_elf_architecture(header, architecture)
+    return False
+
+
+def _matches_elf_architecture(header: bytes, architecture: str) -> bool:
+    expected = {
+        "i386": 3,
+        "i686": 3,
+        "x86_64": 62,
+        "amd64": 62,
+        "aarch64": 183,
+        "arm64": 183,
+        "armv7l": 40,
+    }.get(architecture)
+    if expected is None or len(header) < 20 or header[:4] != b"\x7fELF":
+        return False
+    byte_order = {1: "little", 2: "big"}.get(header[5])
+    if header[4] not in {1, 2} or byte_order is None:
+        return False
+    return int.from_bytes(header[18:20], byte_order) == expected
+
+
+def _matches_mach_o_architecture(header: bytes, architecture: str) -> bool:
+    expected = {
+        "i386": 7,
+        "x86_64": 0x01000007,
+        "amd64": 0x01000007,
+        "arm": 12,
+        "arm64": 0x0100000C,
+        "aarch64": 0x0100000C,
+    }.get(architecture)
+    if expected is None or len(header) < 8:
+        return False
+    magic = header[:4]
+    thin = {
+        b"\xfe\xed\xfa\xce": "big",
+        b"\xce\xfa\xed\xfe": "little",
+        b"\xfe\xed\xfa\xcf": "big",
+        b"\xcf\xfa\xed\xfe": "little",
+    }
+    byte_order = thin.get(magic)
+    if byte_order is not None:
+        return int.from_bytes(header[4:8], byte_order) == expected
+    fat = {
+        b"\xca\xfe\xba\xbe": ("big", 20),
+        b"\xbe\xba\xfe\xca": ("little", 20),
+        b"\xca\xfe\xba\xbf": ("big", 32),
+        b"\xbf\xba\xfe\xca": ("little", 32),
+    }
+    layout = fat.get(magic)
+    if layout is None:
+        return False
+    byte_order, record_size = layout
+    count = int.from_bytes(header[4:8], byte_order)
+    if count == 0 or count > 128 or len(header) < 8 + count * record_size:
+        return False
+    return any(
+        int.from_bytes(header[offset : offset + 4], byte_order) == expected
+        for offset in range(8, 8 + count * record_size, record_size)
+    )
 
 
 def _runtime_policy_label(value: object) -> str:
@@ -1614,9 +2201,11 @@ def _build_distributions(
         uv, constraints, wheelhouse = _verify_materialized_build_toolchain(candidate, source_root)
         environment = _isolated_build_environment(candidate, build_workspace)
         _require_exact_uv_version(uv, candidate, source_root, environment)
-        lock_result = _run_isolated_build_command(
+        lock_result = _run_verified_build_launcher(
+            candidate,
+            source_root,
+            uv,
             (
-                str(uv),
                 "lock",
                 "--check",
                 "--offline",
@@ -1628,14 +2217,15 @@ def _build_distributions(
                 "--color",
                 "never",
             ),
-            cwd=source_root,
-            environment=environment,
+            environment,
         )
         if lock_result.exit_code != 0:
             raise ReleaseGateError("release_build_toolchain_invalid")
-        result = _run_isolated_build_command(
+        result = _run_verified_build_launcher(
+            candidate,
+            source_root,
+            uv,
             (
-                str(uv),
                 "build",
                 "--wheel",
                 "--sdist",
@@ -1655,8 +2245,7 @@ def _build_distributions(
                 "--color",
                 "never",
             ),
-            cwd=source_root,
-            environment=environment,
+            environment,
         )
         if result.exit_code != 0:
             raise ReleaseGateError("release_build_failed")
@@ -1681,7 +2270,7 @@ def _build_distributions(
 def _verify_materialized_build_toolchain(
     candidate: ReleaseCandidate,
     source_root: Path,
-) -> tuple[Path, Path, Path]:
+) -> tuple[_ValidatedBuildLauncher, Path, Path]:
     policy = candidate.build_toolchain
     provenance = policy.provenance
     _require_runtime_provenance_current(provenance.runtime)
@@ -1703,14 +2292,63 @@ def _verify_materialized_build_toolchain(
         or _sha256_file(constraints) != policy.constraints_sha256
         or not uv.is_absolute()
         or not stat.S_ISREG(uv.lstat().st_mode)
-        or not uv.stat().st_mode & 0o111
+        or not uv.lstat().st_mode & 0o111
     ):
         raise ReleaseGateError("release_build_toolchain_invalid")
+    launcher = _validated_build_launcher(uv, provenance.runtime)
     for dependency in provenance.backend_requirements:
         path = _materialized_candidate_file(source_root, dependency.file_name)
         if path.parent != wheelhouse or _sha256_file(path) != dependency.sha256:
             raise ReleaseGateError("release_build_toolchain_invalid")
-    return uv, constraints, wheelhouse
+    return launcher, constraints, wheelhouse
+
+
+def _validated_build_launcher(
+    path: Path,
+    runtime: ReleaseRuntimeProvenance,
+) -> _ValidatedBuildLauncher:
+    shebang = _direct_launcher_shebang(path)
+    if shebang is None:
+        _require_native_current_platform_executable(path)
+        return _ValidatedBuildLauncher(path=path, invocation=(str(path),))
+    interpreter, interpreter_args = shebang
+    if str(interpreter) != runtime.interpreter_path:
+        raise ReleaseGateError("release_build_toolchain_invalid")
+    validated_interpreter = _runtime_policy_interpreter_path(str(interpreter))
+    if (
+        str(validated_interpreter) != runtime.interpreter_path
+        or _runtime_interpreter_sha256(validated_interpreter) != runtime.interpreter_sha256
+    ):
+        raise ReleaseGateError("release_build_toolchain_invalid")
+    return _ValidatedBuildLauncher(
+        path=path,
+        invocation=(str(validated_interpreter), *interpreter_args, str(path)),
+    )
+
+
+def _direct_launcher_shebang(path: Path) -> tuple[Path, tuple[str, ...]] | None:
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(4096)
+    except OSError as exc:
+        raise ReleaseGateError("release_build_toolchain_invalid") from exc
+    if not header.startswith(b"#!"):
+        return None
+    line, separator, _rest = header.partition(b"\n")
+    if not separator or line.endswith(b"\r"):
+        raise ReleaseGateError("release_build_toolchain_invalid")
+    try:
+        value = line[2:].decode("utf-8", errors="strict")
+    except UnicodeError as exc:
+        raise ReleaseGateError("release_build_toolchain_invalid") from exc
+    if not value or value[0].isspace() or any(character in value for character in "\0\r\n"):
+        raise ReleaseGateError("release_build_toolchain_invalid")
+    fields = value.split(maxsplit=1)
+    interpreter = Path(fields[0])
+    if not interpreter.is_absolute() or interpreter.name == "env":
+        raise ReleaseGateError("release_build_toolchain_invalid")
+    arguments = () if len(fields) == 1 else (fields[1],)
+    return interpreter, arguments
 
 
 def _materialized_candidate_file(source_root: Path, name: str) -> Path:
@@ -1759,20 +2397,49 @@ def _isolated_build_environment(
 
 
 def _require_exact_uv_version(
-    uv: Path,
+    uv: _ValidatedBuildLauncher,
     candidate: ReleaseCandidate,
     source_root: Path,
     environment: dict[str, str],
 ) -> None:
-    result = _run_isolated_build_command(
-        (str(uv), "--version"),
-        cwd=source_root,
-        environment=environment,
+    result = _run_verified_build_launcher(
+        candidate,
+        source_root,
+        uv,
+        ("--version",),
+        environment,
     )
     value = result.stdout.decode("utf-8", errors="ignore").strip()
     expected = f"uv {candidate.build_toolchain.provenance.uv_version}"
     if result.exit_code != 0 or not (value == expected or value.startswith(f"{expected} ")):
         raise ReleaseGateError("release_build_toolchain_invalid")
+
+
+def _run_verified_build_launcher(
+    candidate: ReleaseCandidate,
+    source_root: Path,
+    expected_launcher: _ValidatedBuildLauncher,
+    arguments: tuple[str, ...],
+    environment: dict[str, str],
+) -> CommandResult:
+    current_launcher, _constraints, _wheelhouse = _verify_materialized_build_toolchain(
+        candidate,
+        source_root,
+    )
+    if current_launcher != expected_launcher:
+        raise ReleaseGateError("release_build_toolchain_invalid")
+    result = _run_isolated_build_command(
+        (*current_launcher.invocation, *arguments),
+        cwd=source_root,
+        environment=environment,
+    )
+    verified_launcher, _constraints, _wheelhouse = _verify_materialized_build_toolchain(
+        candidate,
+        source_root,
+    )
+    if verified_launcher != expected_launcher:
+        raise ReleaseGateError("release_build_toolchain_invalid")
+    return result
 
 
 def _run_isolated_build_command(
@@ -1797,12 +2464,13 @@ def _run_exact_environment_command(
     environment: dict[str, str],
     timeout_seconds: float,
     max_output_bytes: int,
+    input_bytes: bytes | None = None,
 ) -> CommandResult:
     try:
         process = subprocess.Popen(
             argv,
             cwd=cwd,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=environment,
@@ -1821,6 +2489,14 @@ def _run_exact_environment_command(
         for stream, label in ((process.stdout, "stdout"), (process.stderr, "stderr")):
             os.set_blocking(stream.fileno(), False)
             selector.register(stream, selectors.EVENT_READ, label)
+        pending_input = memoryview(input_bytes or b"")
+        input_offset = 0
+        if process.stdin is not None:
+            os.set_blocking(process.stdin.fileno(), False)
+            if pending_input:
+                selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+            else:
+                process.stdin.close()
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1828,6 +2504,20 @@ def _run_exact_environment_command(
                 return CommandResult(exit_code=124, stdout=b"", stderr=b"")
             for key, _mask in selector.select(min(remaining, 0.1)):
                 stream = key.fileobj
+                if key.data == "stdin":
+                    try:
+                        written = os.write(
+                            stream.fileno(),
+                            pending_input[input_offset : input_offset + 64 * 1024],
+                        )
+                    except (BlockingIOError, BrokenPipeError):
+                        written = 0
+                    if written:
+                        input_offset += written
+                    if not written or input_offset >= len(pending_input):
+                        selector.unregister(stream)
+                        stream.close()
+                    continue
                 try:
                     chunk = os.read(stream.fileno(), 64 * 1024)
                 except BlockingIOError:
@@ -1856,7 +2546,9 @@ def _run_exact_environment_command(
         return CommandResult(exit_code=exit_code, stdout=bytes(output), stderr=bytes(error))
     finally:
         selector.close()
-        for stream in (process.stdout, process.stderr):
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is None:
+                continue
             with contextlib.suppress(OSError):
                 stream.close()
 
@@ -2186,12 +2878,14 @@ def _run_task13_artifact_gate(
     try:
         from mercury_tools.release.hosted import HostedAdapterConfig, build_hosted_clients
 
+        git_runner = _ReleaseTask13GitRunner.for_candidate(candidate)
         manifest = load_public_surface_manifest(
             snapshot / "docs/release/public-surface-manifest.json"
         )
         allowlist = load_secret_scan_allowlist(snapshot / "docs/release/secret-scan-allowlist.json")
         request = SecretScanRequest(
             repo=repo,
+            repo_url=candidate.origin_url,
             artifacts=artifacts,
             all_history=True,
             hosted=True,
@@ -2215,9 +2909,16 @@ def _run_task13_artifact_gate(
                 supabase_storage_buckets=_environment_values("MERCURY_RELEASE_STORAGE_BUCKETS"),
                 public_mcp_url=os.environ.get("MERCURY_PUBLIC_MCP_URL") or None,
                 public_mcp_token=_environment_secret("MERCURY_PUBLIC_MCP_TOKEN"),
-            )
+            ),
+            git_command_runner=git_runner,
+            require_trusted_git_runner=True,
         )
-        report = scan_public_release(request, hosted_clients=hosted_clients)
+        report = scan_public_release(
+            request,
+            git_command_runner=git_runner,
+            require_trusted_git_runner=True,
+            hosted_clients=hosted_clients,
+        )
     except ReleaseGateError:
         raise
     except Exception as exc:
@@ -2344,6 +3045,7 @@ def _publish_owned_directory(source: Path, destination: _OutputDestination) -> N
         _copy_verified_tree(source, staging_fd)
         os.fsync(staging_fd)
         os.fsync(parent_fd)
+        _require_current_private_staging(parent_fd, staging)
         # This pathname precheck is advisory only; the descriptor-relative rename below is final.
         _require_output_absent(destination.path)
         _rename_directory_exclusive(parent_fd, staging.name, destination.name)
@@ -2416,31 +3118,26 @@ def _create_private_staging(parent_fd: int) -> _PrivateStaging:
             os.mkdir(name, mode=0o700, dir_fd=parent_fd)
         except FileExistsError:
             continue
+        staging_fd: int | None = None
         identity: _PrivateStaging | None = None
         try:
-            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            staging_fd = _open_directory_at_no_follow(parent_fd, name)
+            metadata = os.fstat(staging_fd)
             if not stat.S_ISDIR(metadata.st_mode):
                 raise OSError(errno.ENOTDIR, "private staging is not a directory")
             identity = _PrivateStaging(
                 name=name,
                 device=metadata.st_dev,
                 inode=metadata.st_ino,
+                fd=staging_fd,
             )
-            with contextlib.ExitStack() as stack:
-                fd = _open_directory_at_no_follow(parent_fd, name)
-                stack.callback(_close_fd, fd)
-                opened = os.fstat(fd)
-                if not _same_staging(opened, identity):
-                    raise OSError(errno.ESTALE, "private staging identity changed")
-                stack.pop_all()
-            return _PrivateStaging(
-                name=identity.name,
-                device=identity.device,
-                inode=identity.inode,
-                fd=fd,
-            )
+            return identity
         except (OSError, ValueError):
-            if identity is not None:
+            if staging_fd is not None:
+                _close_fd(staging_fd)
+            if identity is None:
+                _safe_rmdir_unidentified_private_staging(parent_fd, name)
+            else:
                 _safe_remove_private_staging(parent_fd, identity)
             raise
     raise OSError(errno.EEXIST, "unable to reserve private staging directory")
@@ -2817,6 +3514,22 @@ def _safe_remove_private_staging(parent_fd: int, staging: _PrivateStaging) -> No
             os.rmdir(staging.name, dir_fd=parent_fd)
     except OSError:
         return
+
+
+def _safe_rmdir_unidentified_private_staging(parent_fd: int, name: str) -> None:
+    try:
+        os.rmdir(name, dir_fd=parent_fd)
+    except OSError:
+        return
+
+
+def _require_current_private_staging(parent_fd: int, staging: _PrivateStaging) -> None:
+    try:
+        metadata = os.stat(staging.name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise ReleaseGateError("release_output_invalid") from exc
+    if not _same_staging(metadata, staging):
+        raise ReleaseGateError("release_output_invalid")
 
 
 def _same_staging(metadata: os.stat_result, staging: _PrivateStaging) -> bool:
