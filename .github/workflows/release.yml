@@ -50,10 +50,18 @@ jobs:
           git fetch origin main
           test "$(git rev-parse HEAD)" = "$REVIEWED_MAIN_SHA"
           test "$(git rev-parse origin/main)" = "$REVIEWED_MAIN_SHA"
-          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG" \
-            || git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "public release tag already exists; immutable release cannot be recreated"
-            exit 1
+          TAG_OBJECT="$(git ls-remote origin "refs/tags/$RELEASE_TAG" \
+            | awk -v ref="refs/tags/$RELEASE_TAG" '$2 == ref {print $1; exit}')"
+          TAG_COMMIT="$(git ls-remote origin "refs/tags/$RELEASE_TAG^{}" \
+            | awk -v ref="refs/tags/$RELEASE_TAG^{}" '$2 == ref {print $1; exit}')"
+          if [[ -n "$TAG_OBJECT" || -n "$TAG_COMMIT" ]]; then
+            test -n "$TAG_OBJECT"
+            test "$TAG_COMMIT" = "$REVIEWED_MAIN_SHA"
+            git fetch --no-tags origin \
+              "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+            test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = "tag"
+            test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$REVIEWED_MAIN_SHA"
+            echo "existing annotated release tag is bound to reviewed main; publication may resume"
           fi
           test -z "$(git status --porcelain)"
 
@@ -574,8 +582,16 @@ jobs:
               release-toolchain/uv-linux-x86_64 run --frozen --no-dev python \
                 scripts/build_public_staging.py --version 0.2.1 \
                 --artifacts /release-output/artifacts \
-                --output /release-output/public-staging
+                --output /release-output/public-staging \
+                > /release-output/public-staging-identity.json
             '
+      - name: Retain staging identity for remote binding
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mercury-v0.2.1-public-staging-identity
+          path: ${{ runner.temp }}/release-evidence/private/public-staging-identity.json
+          if-no-files-found: error
+          retention-days: 1
 
   tagged-marketplace:
     needs: public-staging
@@ -593,6 +609,11 @@ jobs:
         with:
           version: 0.11.9
           enable-cache: true
+      - name: Download reviewed staging identity
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: mercury-v0.2.1-public-staging-identity
+          path: ${{ runner.temp }}/release-evidence/private
       - name: Install exact tagged marketplace plugin
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -605,8 +626,12 @@ jobs:
           test "$STAGING_REPO" != "natthaphonchop2-creator/mercury-tools"
           test "$STAGING_REF" != "v0.2.1"
           test -n "$(git ls-remote --refs "https://github.com/$STAGING_REPO.git" "refs/tags/$STAGING_REF" | awk 'NF == 2 {print $1; exit}')"
-          echo "history-free staging marketplace ref verified"
           uv sync --extra dev --frozen
+          uv run python scripts/verify_staging_snapshot.py \
+            --repo "$STAGING_REPO" \
+            --tag "$STAGING_REF" \
+            --identity "$RUNNER_TEMP/release-evidence/private/public-staging-identity.json"
+          echo "history-free staging marketplace ref is bound to the reviewed candidate tree"
           uv run python scripts/smoke_tagged_marketplace.py \
             --repo "$STAGING_REPO" \
             --tag "$STAGING_REF" \
@@ -674,17 +699,35 @@ jobs:
           git fetch origin main
           test "$(git rev-parse HEAD)" = "$REVIEWED_MAIN_SHA"
           test "$(git rev-parse origin/main)" = "$REVIEWED_MAIN_SHA"
-          if git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "public release tag already exists; immutable release cannot be recreated"
-            exit 1
+          TAG_OBJECT="$(git ls-remote origin "refs/tags/$RELEASE_TAG" \
+            | awk -v ref="refs/tags/$RELEASE_TAG" '$2 == ref {print $1; exit}')"
+          TAG_COMMIT="$(git ls-remote origin "refs/tags/$RELEASE_TAG^{}" \
+            | awk -v ref="refs/tags/$RELEASE_TAG^{}" '$2 == ref {print $1; exit}')"
+          if [[ -n "$TAG_OBJECT" || -n "$TAG_COMMIT" ]]; then
+            test -n "$TAG_OBJECT"
+            test "$TAG_COMMIT" = "$REVIEWED_MAIN_SHA"
+            git fetch --no-tags origin \
+              "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+            test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = "tag"
+            test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$REVIEWED_MAIN_SHA"
+          else
+            gh auth setup-git
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$RELEASE_TAG" "$REVIEWED_MAIN_SHA" \
+              --message "Mercury Finance $RELEASE_TAG"
+            git push origin "refs/tags/$RELEASE_TAG"
           fi
-          gh auth setup-git
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$RELEASE_TAG" "$REVIEWED_MAIN_SHA" \
-            --message "Mercury Finance $RELEASE_TAG"
-          git push origin "refs/tags/$RELEASE_TAG"
           test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$REVIEWED_MAIN_SHA"
-          gh release create "$RELEASE_TAG" "$ARTIFACT_ROOT"/* \
-            --verify-tag --title "Mercury Finance v0.2.1" \
-            --notes-file docs/RELEASE_V0.2.1.md
+          if RELEASE_STATE="$(gh release view "$RELEASE_TAG" \
+            --json tagName,isDraft,isPrerelease 2>/dev/null)"; then
+            echo "$RELEASE_STATE" | jq -e \
+              --arg tag "$RELEASE_TAG" \
+              '(.tagName == $tag) and (.isDraft == false) and (.isPrerelease == false)' \
+              >/dev/null
+            gh release upload "$RELEASE_TAG" "$ARTIFACT_ROOT"/* --clobber
+          else
+            gh release create "$RELEASE_TAG" "$ARTIFACT_ROOT"/* \
+              --verify-tag --title "Mercury Finance v0.2.1" \
+              --notes-file docs/RELEASE_V0.2.1.md
+          fi

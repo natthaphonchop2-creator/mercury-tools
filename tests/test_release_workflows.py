@@ -62,6 +62,7 @@ def test_ci_is_full_history_fail_closed_and_emits_exact_skip_junit() -> None:
     payload = _workflow("ci.yml")
     _assert_pinned_actions_and_no_bypasses(payload)
     test = payload["jobs"]["test"]
+    assert test["if"] == "github.event_name == 'push' && github.ref == 'refs/heads/main'"
     checkout = test["steps"][0]
     assert checkout["with"]["fetch-depth"] == "0"
     command = _run_text(test)
@@ -80,6 +81,14 @@ def test_ci_is_full_history_fail_closed_and_emits_exact_skip_junit() -> None:
     assert "uv build --wheel --sdist" in command
     assert "gitleaks dir" in command
     assert "trufflehog filesystem" in command
+
+    public = payload["jobs"]["public"]
+    assert public["if"] == "github.event_name == 'pull_request' || github.ref != 'refs/heads/main'"
+    assert "secrets." not in json.dumps(public)
+    public_command = _run_text(public)
+    assert "uv run pytest -q --ignore=tests/integration" in public_command
+    assert "gitleaks git" in public_command
+    assert "trufflehog git" in public_command
 
 
 def test_release_is_manual_sha_bound_and_publication_depends_on_every_gate() -> None:
@@ -169,6 +178,8 @@ def test_release_is_manual_sha_bound_and_publication_depends_on_every_gate() -> 
     assert '--launcher-ref "$STAGING_REF"' in marketplace
     assert "history-free staging" in marketplace
     assert "refs/tags/$STAGING_REF" in marketplace
+    assert "verify_staging_snapshot.py" in marketplace
+    assert "mercury-v0.2.1-public-staging-identity" in json.dumps(jobs["public-staging"])
     assert "refs/tags/v0.2.1" not in marketplace
     render = _run_text(jobs["render-release"])
     assert "scripts/verify_render_release.py" in render
@@ -178,6 +189,8 @@ def test_release_is_manual_sha_bound_and_publication_depends_on_every_gate() -> 
     assert "git push origin \"refs/tags/$RELEASE_TAG\"" in publish
     assert "--force" not in publish
     assert "gh release create" in publish
+    assert "gh release upload" in publish
+    assert "existing annotated release tag" in validate
     assert "--verify-tag" in publish
     assert publish.index("git tag -a") < publish.index("gh release create")
 
