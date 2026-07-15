@@ -407,7 +407,7 @@ def test_tracked_manifest_and_allowlist_are_secret_free_and_exactly_reviewed() -
         "scanner_versions": PINNED_SCANNER_VERSIONS,
     }
     reviewed = SecretScanAllowlist.model_validate(allowlist)
-    assert len(reviewed.entries) == 19
+    assert len(reviewed.entries) == 17
     assert {entry.rule.value for entry in reviewed.entries} == {"scanner_finding"}
     assert {entry.reviewer_role.value for entry in reviewed.entries} == {
         "security_reviewer"
@@ -1014,6 +1014,7 @@ def test_fresh_clone_fetches_all_ref_classes_and_scans_reachable_history(
         Path(call[0]).name == "trufflehog"
         and "--no-update" in call
         and "--no-verification" in call
+        and "--concurrency=1" in call
         for call in runner.calls
     )
 
@@ -1241,21 +1242,33 @@ def test_external_scanner_findings_are_opaque_and_both_scanners_run(
     assert any(Path(call[0]).name == "trufflehog" for call in runner.calls)
 
 
-def test_trufflehog_fingerprint_ignores_runtime_metadata_but_binds_location_and_raw() -> None:
+def test_trufflehog_fingerprint_ignores_commit_but_binds_location_and_raw() -> None:
     raw_value = "".join(("https://", "user:", "password", "@example.test"))
 
-    def finding(*, source_id: int, raw: str = raw_value, commit: str = "a" * 40):
+    def finding(
+        *,
+        source_id: int,
+        raw: str = raw_value,
+        commit: str = "a" * 40,
+        line: int = 12,
+        detector: str = "URI",
+        decoder: str = "PLAIN",
+        verified: bool = False,
+        raw_v2: str | None = None,
+        file: str = "tests/test_fixture.py",
+    ):
         item = {
             "SourceID": source_id,
-            "DetectorName": "URI",
-            "DecoderName": "PLAIN",
-            "Verified": False,
+            "DetectorName": detector,
+            "DecoderName": decoder,
+            "Verified": verified,
             "Raw": raw,
+            "RawV2": raw_v2,
             "SourceMetadata": {
                 "Data": {
                     "Git": {
-                        "file": "tests/test_fixture.py",
-                        "line": 12,
+                        "file": file,
+                        "line": line,
                         "commit": commit,
                         "repository": f"file:///tmp/runtime-{source_id}",
                         "timestamp": f"2026-07-{source_id:02d}T00:00:00Z",
@@ -1274,7 +1287,13 @@ def test_trufflehog_fingerprint_ignores_runtime_metadata_but_binds_location_and_
 
     assert first == second
     assert finding(source_id=1, raw=raw_value + "/changed") != first
-    assert finding(source_id=1, commit="b" * 40) != first
+    assert finding(source_id=1, line=13) != first
+    assert finding(source_id=1, detector="BasicAuth") != first
+    assert finding(source_id=1, decoder="BASE64") != first
+    assert finding(source_id=1, verified=True) != first
+    assert finding(source_id=1, raw_v2="decoded-source") != first
+    assert finding(source_id=1, file="tests/other_fixture.py") != first
+    assert finding(source_id=1, commit="b" * 40) == first
 
 
 def test_trufflehog_report_gate_allows_only_exact_reviewed_fingerprint() -> None:

@@ -63,6 +63,7 @@ def _assert_scanner_install_and_gates(command: str, job: dict[str, Any]) -> None
     assert trufflehog_invocations
     assert all("--no-update" in line for line in trufflehog_invocations)
     assert all("--no-verification" in line for line in trufflehog_invocations)
+    assert all("--concurrency=1" in line for line in trufflehog_invocations)
     assert all("--json" in line for line in trufflehog_invocations)
     assert command.count('>"$TRUFFLEHOG_REPORT" 2>/dev/null') == len(
         trufflehog_invocations

@@ -83,7 +83,7 @@ jobs:
           TRUFFLEHOG_REPORT="$SCAN_LOG/trufflehog-history.jsonl"
           trap 'rm -f "$TRUFFLEHOG_REPORT"' EXIT
           umask 077
-          if ! trufflehog git "file://$GITHUB_WORKSPACE" --no-update --no-verification --json \
+          if ! trufflehog git "file://$GITHUB_WORKSPACE" --concurrency=1 --no-update --no-verification --json \
             >"$TRUFFLEHOG_REPORT" 2>/dev/null; then
             echo "secret gate failed: trufflehog_history"
             exit 1
@@ -157,7 +157,7 @@ jobs:
           TRUFFLEHOG_REPORT="$SCAN_LOG/trufflehog-artifacts.jsonl"
           trap 'rm -f "$TRUFFLEHOG_REPORT"' EXIT
           umask 077
-          if ! trufflehog filesystem "$ARTIFACT_ROOT" --no-update --no-verification --fail --json \
+          if ! trufflehog filesystem "$ARTIFACT_ROOT" --concurrency=1 --no-update --no-verification --fail --json \
             >"$TRUFFLEHOG_REPORT" 2>/dev/null; then
             echo "secret gate failed: trufflehog_artifacts"
             exit 1
@@ -241,7 +241,7 @@ jobs:
           TRUFFLEHOG_REPORT="$SCAN_LOG/trufflehog-history.jsonl"
           trap 'rm -f "$TRUFFLEHOG_REPORT"' EXIT
           umask 077
-          if ! trufflehog git "file://$GITHUB_WORKSPACE" --no-update --no-verification --json \
+          if ! trufflehog git "file://$GITHUB_WORKSPACE" --concurrency=1 --no-update --no-verification --json \
             >"$TRUFFLEHOG_REPORT" 2>/dev/null; then
             echo "secret gate failed: trufflehog_history"
             exit 1
@@ -278,7 +278,7 @@ jobs:
           TRUFFLEHOG_REPORT="$SCAN_LOG/trufflehog-artifacts.jsonl"
           trap 'rm -f "$TRUFFLEHOG_REPORT"' EXIT
           umask 077
-          if ! trufflehog filesystem "$ARTIFACT_ROOT" --no-update --no-verification --fail --json \
+          if ! trufflehog filesystem "$ARTIFACT_ROOT" --concurrency=1 --no-update --no-verification --fail --json \
             >"$TRUFFLEHOG_REPORT" 2>/dev/null; then
             echo "secret gate failed: trufflehog_artifacts"
             exit 1
