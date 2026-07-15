@@ -13,7 +13,6 @@ from pathlib import Path
 
 import pytest
 from test_release_artifacts import (
-    ROOT,
     VERSION,
     _run,
     install_task13_runner,
