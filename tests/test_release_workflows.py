@@ -55,7 +55,87 @@ def _assert_scanner_install_and_gates(command: str, job: dict[str, Any]) -> None
     assert "trufflehog --version" in command
     assert "gitleaks git" in command
     assert "trufflehog git" in command
+    trufflehog_invocations = [
+        line.strip()
+        for line in command.splitlines()
+        if re.search(r"\btrufflehog (?:git|filesystem)\b", line)
+    ]
+    assert trufflehog_invocations
+    assert all("--no-update" in line for line in trufflehog_invocations)
+    assert all("--no-verification" in line for line in trufflehog_invocations)
+    assert all("--json" in line for line in trufflehog_invocations)
+    assert command.count('>"$TRUFFLEHOG_REPORT" 2>/dev/null') == len(
+        trufflehog_invocations
+    )
+    assert "trufflehog-history.log" not in command
+    assert "trufflehog-artifacts.log" not in command
+    assert "scripts/verify_trufflehog_report.py" in command
+    assert command.count("--config .gitleaks.toml") == (
+        command.count("gitleaks git") + command.count("gitleaks dir")
+    )
     assert ">\"$" in command or "> \"$" in command
+
+
+def test_gitleaks_fixture_allowlists_are_exact_and_fail_closed() -> None:
+    config = tomllib.loads((ROOT / ".gitleaks.toml").read_text(encoding="utf-8"))
+
+    assert set(config) == {"title", "extend", "rules"}
+    assert config["extend"] == {"useDefault": True}
+    rules = config["rules"]
+    assert [rule["id"] for rule in rules] == [
+        "generic-api-key",
+        "aws-access-token",
+        "jwt",
+    ]
+
+    expected_signatures = {
+        ("generic-api-key", r"^tests/test_release_secret_scanner\.py$"): (
+            r'^\s*credential\s*=\s*"[0-9a-f]{16}"\s*\*\s*8\s*$',
+        ),
+        ("generic-api-key", r"^tests/test_cloud_secret_removal\.py$"): (
+            r'^\s*\{"id":\s*"event-1",\s*"summary":\s*\{"api_key":\s*'
+            r'"live-api-key-123456789"\},\s*"metadata":\s*\{\}\}\s*$',
+        ),
+        ("generic-api-key", r"^tests/test_plugin_package\.py$"): (
+            r'^\s*\("api_key",\s*"sk-live-[0-9a-f]{24}"\),\s*$',
+            r'^\s*\("client_secret",\s*"v1\.[A-Za-z0-9]{20}"\),\s*$',
+        ),
+        ("generic-api-key", r"^tests/test_cloud_api\.py$"): (
+            r'^\s*for secret in \("inbound-secret",\s*"inbound-secret2",'
+            r'\s*"inbound-session"\):\s*$',
+        ),
+        ("aws-access-token", r"^tests/test_cloud_secret_removal\.py$"): (
+            r'^\s*"aws=AKIA[0-9]{10}ABCDEF",\s*$',
+            r'^\s*"AKIA[0-9]{10}ABCDEF",\s*$',
+        ),
+        ("jwt", r"^tests/test_cloud_secret_removal\.py$"): (
+            r'^\s*"jwt=eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIn0\.signaturevalue1234",\s*$',
+        ),
+    }
+    actual_signatures: dict[tuple[str, str], tuple[str, ...]] = {}
+    for rule in rules:
+        assert set(rule) == {"id", "allowlists"}
+        for allowlist in rule["allowlists"]:
+            assert set(allowlist) == {
+                "description",
+                "condition",
+                "regexTarget",
+                "paths",
+                "regexes",
+            }
+            assert allowlist["condition"] == "AND"
+            assert allowlist["regexTarget"] == "line"
+            assert len(allowlist["paths"]) == 1
+            assert all(".*" not in regex for regex in allowlist["regexes"])
+            assert all(
+                regex.startswith("^") and regex.endswith("$")
+                for regex in allowlist["regexes"]
+            )
+            signature = (rule["id"], allowlist["paths"][0])
+            assert signature not in actual_signatures
+            actual_signatures[signature] = tuple(allowlist["regexes"])
+
+    assert actual_signatures == expected_signatures
 
 
 def test_ci_is_full_history_fail_closed_and_emits_exact_skip_junit() -> None:

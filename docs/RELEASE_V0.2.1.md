@@ -44,6 +44,10 @@ Every release output is created under an owner-controlled mode-`0700` parent.
 The reproducible release platform is the immutable Linux/amd64 image recorded
 in `release-toolchain/platform.json`; unsupported local platforms fail closed.
 
+The reviewed scanner false positives are exact, expiring fingerprints documented
+in `docs/release/v0.2.1-secret-scan-review.md`; no whole path, commit, detector,
+or repository is excluded.
+
 ## Operator Constraints
 
 Do not recreate or move an existing tag. Do not publish assets until every

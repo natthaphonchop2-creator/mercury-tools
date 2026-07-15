@@ -129,16 +129,27 @@ jobs:
           set -euo pipefail
           SCAN_LOG="$RUNNER_TEMP/mercury-scanner-output"
           install -d -m 700 "$SCAN_LOG"
-          if ! gitleaks git --no-banner --redact --exit-code 1 \
+          if ! gitleaks git --config .gitleaks.toml --no-banner --redact --exit-code 1 \
             --log-opts="--all" . >"$SCAN_LOG/gitleaks-history.log" 2>&1; then
             echo "secret gate failed: gitleaks_history"
             exit 1
           fi
-          if ! trufflehog git "file://$GITHUB_WORKSPACE" --no-update --fail \
-            >"$SCAN_LOG/trufflehog-history.log" 2>&1; then
+          TRUFFLEHOG_REPORT="$SCAN_LOG/trufflehog-history.jsonl"
+          trap 'rm -f "$TRUFFLEHOG_REPORT"' EXIT
+          umask 077
+          if ! trufflehog git "file://$GITHUB_WORKSPACE" --no-update --no-verification --json \
+            >"$TRUFFLEHOG_REPORT" 2>/dev/null; then
             echo "secret gate failed: trufflehog_history"
             exit 1
           fi
+          if ! uv run python scripts/verify_trufflehog_report.py \
+            --report "$TRUFFLEHOG_REPORT" \
+            --allowlist docs/release/secret-scan-allowlist.json >/dev/null; then
+            echo "secret gate failed: trufflehog_history"
+            exit 1
+          fi
+          rm -f "$TRUFFLEHOG_REPORT"
+          trap - EXIT
       - name: Configure required repository-local sandbox credential
         run: |
           set -euo pipefail

@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tomllib
 from pathlib import Path
 
@@ -228,6 +229,23 @@ def test_v021_versions_and_launcher_are_consistent() -> None:
     assert mcp["mcpServers"]["mercury-finance"]["args"][1] == (
         "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.1"
     )
+
+
+def test_sdist_excludes_internal_test_fixtures(tmp_path: Path) -> None:
+    result = subprocess.run(
+        ["uv", "build", "--sdist", "--out-dir", str(tmp_path)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    archives = list(tmp_path.glob("mercury_tools-*.tar.gz"))
+    assert len(archives) == 1
+
+    with tarfile.open(archives[0], mode="r:gz") as archive:
+        assert not any("/tests/" in member.name for member in archive.getmembers())
 
 
 def test_skill_frontmatter_descriptions_are_trigger_only() -> None:

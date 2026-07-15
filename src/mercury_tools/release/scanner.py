@@ -2463,6 +2463,7 @@ def _run_history_scanners(
             f"file://{clone}",
             "--json",
             "--no-update",
+            "--no-verification",
         ),
     }
     for scanner_name, command in commands.items():
@@ -2502,7 +2503,10 @@ def _parse_gitleaks_findings(output: bytes) -> tuple[list[SecretFinding], bool]:
     if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
         return [], True
     findings = [
-        _scanner_finding(item, _safe_scanner_file(item.get("File"), "scanner/gitleaks"))
+        _gitleaks_scanner_finding(
+            item,
+            _safe_scanner_file(item.get("File"), "scanner/gitleaks"),
+        )
         for item in payload
     ]
     return findings, False
@@ -2522,9 +2526,28 @@ def _parse_trufflehog_findings(output: bytes) -> tuple[list[SecretFinding], bool
         git_data = item.get("SourceMetadata", {}).get("Data", {}).get("Git", {})
         file_value = git_data.get("file") if isinstance(git_data, dict) else None
         findings.append(
-            _scanner_finding(item, _safe_scanner_file(file_value, "scanner/trufflehog"))
+            _trufflehog_scanner_finding(
+                item,
+                _safe_scanner_file(file_value, "scanner/trufflehog"),
+            )
         )
     return findings, False
+
+
+def verify_trufflehog_report(
+    output: bytes,
+    allowlist: SecretScanAllowlist,
+    *,
+    at: datetime,
+) -> int:
+    """Fail unless every TruffleHog finding has an exact reviewed fingerprint."""
+    findings, malformed = _parse_trufflehog_findings(output)
+    if malformed:
+        raise ReleaseGateError("raw_evidence_handling_failed:trufflehog")
+    unresolved = apply_allowlist(tuple(findings), allowlist, at=at)
+    if unresolved:
+        raise ReleaseGateError("scanner_findings_unresolved:trufflehog")
+    return len(findings)
 
 
 def _safe_scanner_file(value: object, fallback: str) -> str:
@@ -2534,6 +2557,58 @@ def _safe_scanner_file(value: object, fallback: str) -> str:
     if candidate.is_absolute() or ".." in candidate.parts or "\\" in value:
         return fallback
     return candidate.as_posix()
+
+
+def _gitleaks_scanner_finding(
+    item: dict[str, object],
+    relative_path: str,
+) -> SecretFinding:
+    canonical = {
+        "scanner": "gitleaks",
+        "rule_id": _scanner_scalar(item.get("RuleID")),
+        "commit": _scanner_scalar(item.get("Commit")),
+        "start_line": _scanner_integer(item.get("StartLine")),
+        "secret_sha256": _scanner_value_digest(item.get("Secret")),
+    }
+    return _scanner_finding(canonical, relative_path)
+
+
+def _trufflehog_scanner_finding(
+    item: dict[str, object],
+    relative_path: str,
+) -> SecretFinding:
+    source_metadata = item.get("SourceMetadata")
+    data = source_metadata.get("Data") if isinstance(source_metadata, dict) else None
+    git_data = data.get("Git") if isinstance(data, dict) else None
+    canonical = {
+        "scanner": "trufflehog",
+        "detector": _scanner_scalar(item.get("DetectorName")),
+        "decoder": _scanner_scalar(item.get("DecoderName")),
+        "verified": item.get("Verified") if isinstance(item.get("Verified"), bool) else None,
+        "commit": _scanner_scalar(git_data.get("commit")) if isinstance(git_data, dict) else None,
+        "line": _scanner_integer(git_data.get("line")) if isinstance(git_data, dict) else None,
+        "raw_sha256": _scanner_value_digest(item.get("Raw")),
+        "raw_v2_sha256": _scanner_value_digest(item.get("RawV2")),
+    }
+    return _scanner_finding(canonical, relative_path)
+
+
+def _scanner_scalar(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _scanner_integer(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _scanner_value_digest(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        encoded = value.encode("utf-8")
+    else:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _scanner_finding(item: dict[str, object], relative_path: str) -> SecretFinding:

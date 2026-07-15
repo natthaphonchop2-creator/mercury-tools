@@ -48,6 +48,7 @@ from mercury_tools.release.scanner import (
     scan_git_repository,
     scan_public_release,
     validate_allowlist,
+    verify_trufflehog_report,
 )
 
 
@@ -390,7 +391,7 @@ def test_manifest_requires_exact_declared_corpus(required: tuple[str, ...]) -> N
         )
 
 
-def test_tracked_manifest_and_allowlist_are_secret_free_strict_defaults() -> None:
+def test_tracked_manifest_and_allowlist_are_secret_free_and_exactly_reviewed() -> None:
     root = Path(__file__).resolve().parents[1]
 
     manifest = json.loads(
@@ -405,7 +406,25 @@ def test_tracked_manifest_and_allowlist_are_secret_free_strict_defaults() -> Non
         "required": list(REQUIRED_PUBLIC_SURFACES),
         "scanner_versions": PINNED_SCANNER_VERSIONS,
     }
-    assert allowlist == {"schema_version": 1, "entries": []}
+    reviewed = SecretScanAllowlist.model_validate(allowlist)
+    assert len(reviewed.entries) == 19
+    assert {entry.rule.value for entry in reviewed.entries} == {"scanner_finding"}
+    assert {entry.reviewer_role.value for entry in reviewed.entries} == {
+        "security_reviewer"
+    }
+    assert {entry.expires_at for entry in reviewed.entries} == {
+        datetime(2026, 8, 15, tzinfo=UTC)
+    }
+    assert sum(
+        entry.classification == AllowlistClassification.DOCUMENTATION_PLACEHOLDER
+        for entry in reviewed.entries
+    ) == 1
+    assert all(
+        entry.file.startswith("tests/")
+        or entry.file
+        == "docs/superpowers/plans/2026-07-13-mercury-v0.2.1-public-endpoint-validation.md"
+        for entry in reviewed.entries
+    )
 
 
 @pytest.mark.parametrize(
@@ -992,7 +1011,9 @@ def test_fresh_clone_fetches_all_ref_classes_and_scans_reachable_history(
         for call in runner.calls
     )
     assert any(
-        Path(call[0]).name == "trufflehog" and "--no-update" in call
+        Path(call[0]).name == "trufflehog"
+        and "--no-update" in call
+        and "--no-verification" in call
         for call in runner.calls
     )
 
@@ -1218,6 +1239,87 @@ def test_external_scanner_findings_are_opaque_and_both_scanners_run(
     assert raw_value not in serialized
     assert any(Path(call[0]).name == "gitleaks" for call in runner.calls)
     assert any(Path(call[0]).name == "trufflehog" for call in runner.calls)
+
+
+def test_trufflehog_fingerprint_ignores_runtime_metadata_but_binds_location_and_raw() -> None:
+    raw_value = "".join(("https://", "user:", "password", "@example.test"))
+
+    def finding(*, source_id: int, raw: str = raw_value, commit: str = "a" * 40):
+        item = {
+            "SourceID": source_id,
+            "DetectorName": "URI",
+            "DecoderName": "PLAIN",
+            "Verified": False,
+            "Raw": raw,
+            "SourceMetadata": {
+                "Data": {
+                    "Git": {
+                        "file": "tests/test_fixture.py",
+                        "line": 12,
+                        "commit": commit,
+                        "repository": f"file:///tmp/runtime-{source_id}",
+                        "timestamp": f"2026-07-{source_id:02d}T00:00:00Z",
+                    }
+                }
+            },
+        }
+        parsed, malformed = scanner_module._parse_trufflehog_findings(
+            json.dumps(item).encode() + b"\n"
+        )
+        assert malformed is False
+        return parsed[0]
+
+    first = finding(source_id=1)
+    second = finding(source_id=2)
+
+    assert first == second
+    assert finding(source_id=1, raw=raw_value + "/changed") != first
+    assert finding(source_id=1, commit="b" * 40) != first
+
+
+def test_trufflehog_report_gate_allows_only_exact_reviewed_fingerprint() -> None:
+    raw_value = "".join(("https://", "user:", "password", "@example.test"))
+    item = {
+        "DetectorName": "URI",
+        "DecoderName": "PLAIN",
+        "Verified": False,
+        "Raw": raw_value,
+        "SourceMetadata": {
+            "Data": {
+                "Git": {
+                    "file": "tests/test_fixture.py",
+                    "line": 12,
+                    "commit": "a" * 40,
+                }
+            }
+        },
+    }
+    output = json.dumps(item).encode() + b"\n"
+    findings, malformed = scanner_module._parse_trufflehog_findings(output)
+    assert malformed is False
+    entry = AllowlistEntry(
+        classification=AllowlistClassification.NON_SECRET_FIXTURE,
+        file="tests/test_fixture.py",
+        rule="scanner_finding",
+        digest=findings[0].evidence_sha256,
+        reviewer_role="security_reviewer",
+        expires_at=datetime(2026, 8, 15, tzinfo=UTC),
+    )
+    allowlist = SecretScanAllowlist(entries=(entry,))
+
+    assert verify_trufflehog_report(
+        output,
+        allowlist,
+        at=datetime(2026, 7, 15, tzinfo=UTC),
+    ) == 1
+
+    item["Raw"] = raw_value.replace("password", "different")
+    with pytest.raises(ReleaseGateError, match="^scanner_findings_unresolved:trufflehog$"):
+        verify_trufflehog_report(
+            json.dumps(item).encode() + b"\n",
+            allowlist,
+            at=datetime(2026, 7, 15, tzinfo=UTC),
+        )
 
 
 @pytest.mark.parametrize("failed_scanner", ["gitleaks", "trufflehog"])
