@@ -81,8 +81,11 @@ _MAX_GIT_METADATA_ENTRIES = 250_000
 _MAX_GIT_METADATA_DEPTH = 64
 _MAX_GIT_METADATA_PATH_BYTES = 16 * 1024 * 1024
 _MAX_GIT_METADATA_TEXT_BYTES = 1024 * 1024
+_MAX_GIT_CONFIG_VALUE_BYTES = 16 * 1024
 _STORED_DEFLATE_BLOCK_BYTES = 65_535
 _STAGING_NAME_PREFIX = ".mercury-release-publish-"
+_STAGING_PAYLOAD_PREFIX = ".mercury-release-payload-"
+_PRIVATE_STAGING_MODE = 0o700
 _RENAME_NOREPLACE = 1
 _RENAME_EXCL = 0x00000004
 _LINUX_RENAMEAT2_SYSCALLS = {
@@ -117,6 +120,26 @@ _EXCLUDED_STATE_FILES = frozenset(
         "raw-provider-response.json",
         "validation-raw-traffic.json",
         "validation-traffic.json",
+    }
+)
+_GIT_CONFIG_KEY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
+_GIT_CONFIG_BRANCH_KEY_PATTERN = re.compile(
+    r"^branch\.([a-z0-9][a-z0-9._/-]*)\.(merge|rebase|remote)$"
+)
+_GIT_SAFE_CORE_BOOLEAN_CONFIG_KEYS = frozenset(
+    {
+        "core.filemode",
+        "core.fscache",
+        "core.ignorecase",
+        "core.ignorestat",
+        "core.logallrefupdates",
+        "core.precomposeunicode",
+        "core.protecthfs",
+        "core.protectntfs",
+        "core.sparsecheckout",
+        "core.sparsecheckoutcone",
+        "core.symlinks",
+        "core.trustctime",
     }
 )
 
@@ -570,6 +593,7 @@ class _ReleaseGitRunner:
                     environment.update(extra_environment)
                 command: list[str] = [
                     str(self._executable),
+                    "--no-pager",
                     "--no-replace-objects",
                     "--no-optional-locks",
                     "-c",
@@ -973,6 +997,7 @@ class _ReleaseTask13GitRunner:
             environment = _release_git_environment(workspace)
             command: list[str] = [
                 str(self._executable),
+                "--no-pager",
                 "--no-replace-objects",
                 "--no-optional-locks",
                 "-c",
@@ -1210,7 +1235,13 @@ def _build_bare_git_metadata_manifest(root: Path) -> _GitMetadataManifest:
     builder = _GitMetadataManifestBuilder(entries=[], names=set())
     _record_required_git_metadata_path(builder, "bare/git-dir", root, directory=True)
     _record_required_git_metadata_path(builder, "bare/git-dir/HEAD", root / "HEAD", directory=False)
-    _record_common_git_metadata(builder, prefix="bare/git-dir", git_dir=root)
+    _record_common_git_metadata(
+        builder,
+        prefix="bare/git-dir",
+        git_dir=root,
+        bare=True,
+        record_worktree_config=False,
+    )
     _validate_git_head_symbolic_ref(root / "HEAD", ref_roots=(root,))
     return builder.build()
 
@@ -1230,7 +1261,13 @@ def _build_normal_git_metadata_manifest(git_dir: Path) -> _GitMetadataManifest:
         git_dir / "index",
         directory=False,
     )
-    _record_common_git_metadata(builder, prefix="normal/git-dir", git_dir=git_dir)
+    _record_common_git_metadata(
+        builder,
+        prefix="normal/git-dir",
+        git_dir=git_dir,
+        bare=False,
+        record_worktree_config=True,
+    )
     _validate_git_head_symbolic_ref(git_dir / "HEAD", ref_roots=(git_dir,))
     return builder.build()
 
@@ -1286,7 +1323,7 @@ def _build_linked_git_metadata_manifest(
         git_dir / "config.worktree",
         directory=False,
     )
-    _require_optional_git_config_without_includes(git_dir / "config.worktree")
+    _require_optional_git_config_policy(git_dir / "config.worktree", bare=False)
     _record_optional_git_metadata_tree(
         builder,
         "linked/git-dir/refs",
@@ -1298,7 +1335,13 @@ def _build_linked_git_metadata_manifest(
         git_dir / "packed-refs",
         directory=False,
     )
-    _record_common_git_metadata(builder, prefix="linked/common-dir", git_dir=common_dir)
+    _record_common_git_metadata(
+        builder,
+        prefix="linked/common-dir",
+        git_dir=common_dir,
+        bare=False,
+        record_worktree_config=True,
+    )
     _validate_git_head_symbolic_ref(
         git_dir / "HEAD",
         ref_roots=(git_dir, common_dir),
@@ -1311,6 +1354,8 @@ def _record_common_git_metadata(
     *,
     prefix: str,
     git_dir: Path,
+    bare: bool,
+    record_worktree_config: bool,
 ) -> None:
     _record_required_git_metadata_path(
         builder,
@@ -1318,7 +1363,15 @@ def _record_common_git_metadata(
         git_dir / "config",
         directory=False,
     )
-    _require_git_config_without_includes(git_dir / "config")
+    _require_git_config_policy(git_dir / "config", bare=bare)
+    if record_worktree_config:
+        _record_optional_git_metadata_path(
+            builder,
+            f"{prefix}/config.worktree",
+            git_dir / "config.worktree",
+            directory=False,
+        )
+        _require_optional_git_config_policy(git_dir / "config.worktree", bare=bare)
     _record_required_git_metadata_tree(builder, f"{prefix}/refs", git_dir / "refs")
     _record_optional_git_metadata_path(
         builder,
@@ -1337,6 +1390,25 @@ def _record_common_git_metadata(
         builder,
         f"{prefix}/info/grafts",
         git_dir / "info" / "grafts",
+        directory=False,
+    )
+    _record_optional_git_metadata_tree(builder, f"{prefix}/info", git_dir / "info")
+    _record_optional_git_metadata_path(
+        builder,
+        f"{prefix}/git-input/info-exclude",
+        git_dir / "info" / "exclude",
+        directory=False,
+    )
+    _record_optional_git_metadata_path(
+        builder,
+        f"{prefix}/git-input/info-attributes",
+        git_dir / "info" / "attributes",
+        directory=False,
+    )
+    _record_optional_git_metadata_path(
+        builder,
+        f"{prefix}/git-input/info-sparse-checkout",
+        git_dir / "info" / "sparse-checkout",
         directory=False,
     )
     _record_absent_git_metadata_path(
@@ -1617,28 +1689,167 @@ def _read_git_metadata_text(path: Path) -> str:
             _close_fd(fd)
 
 
-def _require_optional_git_config_without_includes(path: Path) -> None:
+def _require_optional_git_config_policy(path: Path, *, bare: bool) -> None:
     try:
-        os.stat(path, follow_symlinks=False)
+        metadata = os.stat(path, follow_symlinks=False)
     except FileNotFoundError:
         return
-    _require_git_config_without_includes(path)
+    except OSError as exc:
+        raise ReleaseGateError("release_repository_invalid") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ReleaseGateError("release_repository_invalid")
+    _require_git_config_policy(path, bare=bare)
 
 
-def _require_git_config_without_includes(path: Path) -> None:
-    for raw_line in _read_git_metadata_text(path).splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith(("#", ";")):
-            continue
-        if line.startswith("["):
-            closing = line.find("]")
-            if closing < 2:
-                raise ReleaseGateError("release_repository_invalid")
-            section = line[1:closing].strip().split(None, 1)[0].casefold()
-            if section in {"include", "includeif"}:
-                raise ReleaseGateError("release_repository_invalid")
-        elif line.casefold().startswith("include."):
+def _require_git_config_policy(path: Path, *, bare: bool) -> None:
+    for key, value in _read_git_config_entries(path):
+        if not _is_allowed_git_config_entry(key, value, bare=bare):
             raise ReleaseGateError("release_repository_invalid")
+
+
+def _read_git_config_entries(path: Path) -> tuple[tuple[str, str], ...]:
+    path = _absolute_lexical_path(path)
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise ReleaseGateError("release_repository_invalid") from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ReleaseGateError("release_repository_invalid")
+    try:
+        with tempfile.TemporaryDirectory(prefix=".mercury-release-config-") as temporary:
+            workspace = Path(temporary)
+            result = _run_exact_environment_command(
+                (
+                    str(_trusted_system_git_executable()),
+                    "--no-pager",
+                    "config",
+                    "list",
+                    f"--file={path}",
+                    "--null",
+                    "--no-includes",
+                ),
+                cwd=workspace,
+                environment=_release_git_environment(workspace),
+                timeout_seconds=_GIT_TIMEOUT_SECONDS,
+                max_output_bytes=_MAX_GIT_METADATA_TEXT_BYTES,
+            )
+    except OSError as exc:
+        raise ReleaseGateError("release_repository_invalid") from exc
+    try:
+        after = path.lstat()
+    except OSError as exc:
+        raise ReleaseGateError("release_repository_invalid") from exc
+    if not _same_git_metadata_stat(before, after) or result.exit_code != 0:
+        raise ReleaseGateError("release_repository_invalid")
+    return _parse_git_config_entries(result.stdout)
+
+
+def _parse_git_config_entries(payload: bytes) -> tuple[tuple[str, str], ...]:
+    if not payload:
+        return ()
+    if not payload.endswith(b"\0"):
+        raise ReleaseGateError("release_repository_invalid")
+    entries: list[tuple[str, str]] = []
+    for record in payload[:-1].split(b"\0"):
+        raw_key, separator, raw_value = record.partition(b"\n")
+        if not raw_key or not separator or len(raw_value) > _MAX_GIT_CONFIG_VALUE_BYTES:
+            raise ReleaseGateError("release_repository_invalid")
+        try:
+            key = raw_key.decode("ascii")
+            value = raw_value.decode("utf-8")
+        except UnicodeError as exc:
+            raise ReleaseGateError("release_repository_invalid") from exc
+        if (
+            key != key.casefold()
+            or _GIT_CONFIG_KEY_PATTERN.fullmatch(key) is None
+            or "\0" in value
+            or "\r" in value
+            or "\n" in value
+        ):
+            raise ReleaseGateError("release_repository_invalid")
+        entries.append((key, value))
+    return tuple(entries)
+
+
+def _is_allowed_git_config_entry(key: str, value: str, *, bare: bool) -> bool:
+    value_folded = value.casefold()
+    if key == "core.repositoryformatversion":
+        return value in {"0", "1"}
+    if key == "core.bare":
+        return _git_config_boolean(value) is bare
+    if key in _GIT_SAFE_CORE_BOOLEAN_CONFIG_KEYS:
+        return _git_config_boolean(value) is not None
+    if key == "core.untrackedcache":
+        return _git_config_boolean(value) is not None or value_folded == "keep"
+    if key == "core.checkstat":
+        return value_folded in {"default", "minimal"}
+    if key == "core.autocrlf":
+        return value_folded in {"false", "input", "true"}
+    if key == "core.eol":
+        return value_folded in {"crlf", "lf", "native"}
+    if key == "core.safecrlf":
+        return _git_config_boolean(value) is not None or value_folded == "warn"
+    if key == "extensions.objectformat":
+        return value_folded in {"sha1", "sha256"}
+    if key in {"extensions.preciousobjects", "extensions.worktreeconfig"}:
+        return _git_config_boolean(value) is not None
+    if key == "remote.origin.url":
+        return _is_safe_git_config_value(value)
+    if key == "remote.origin.fetch":
+        return _is_safe_git_refspec(value)
+    if key in {"remote.origin.mirror", "remote.origin.prune", "remote.origin.prunetags"}:
+        return _git_config_boolean(value) is not None
+    if key == "remote.origin.tagopt":
+        return value in {"--no-tags", "--tags"}
+    if key in {"user.email", "user.name"}:
+        return _is_safe_git_config_value(value)
+    branch = _GIT_CONFIG_BRANCH_KEY_PATTERN.fullmatch(key)
+    if branch is None:
+        return False
+    branch_key = branch.group(2)
+    if branch_key == "remote":
+        return re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value) is not None
+    if branch_key == "merge":
+        return _is_safe_git_ref_name(value)
+    return value_folded in {"false", "true", "interactive", "merges"}
+
+
+def _git_config_boolean(value: str) -> bool | None:
+    value = value.casefold()
+    if value in {"1", "on", "true", "yes"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _is_safe_git_config_value(value: str) -> bool:
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeError:
+        return False
+    return bool(value) and len(encoded) <= _MAX_GIT_CONFIG_VALUE_BYTES and all(
+        character.isprintable() for character in value
+    )
+
+
+def _is_safe_git_refspec(value: str) -> bool:
+    if not _is_safe_git_config_value(value):
+        return False
+    source, separator, destination = value.removeprefix("+").partition(":")
+    return (
+        bool(separator)
+        and source.startswith("refs/")
+        and (not destination or destination.startswith("refs/"))
+    )
+
+
+def _is_safe_git_ref_name(value: str) -> bool:
+    try:
+        _require_safe_git_ref_name(value)
+    except ReleaseGateError:
+        return False
+    return True
 
 
 def _validate_git_head_symbolic_ref(head: Path, *, ref_roots: tuple[Path, ...]) -> None:
@@ -3767,32 +3978,52 @@ def _prepare_output_destination(output: Path) -> _OutputDestination:
 
 
 def _publish_owned_directory(source: Path, destination: _OutputDestination) -> None:
+    private_parent: _PrivateStaging | None = None
     staging: _PrivateStaging | None = None
+    parent_fd: int | None = None
+    private_parent_fd: int | None = None
     try:
         parent_fd = _require_destination_parent_fd(destination)
+        _require_private_publication_namespace(parent_fd)
         _require_child_absent(parent_fd, destination.name)
-        staging = _create_private_staging(parent_fd)
+        private_parent = _create_private_staging(parent_fd, prefix=_STAGING_NAME_PREFIX)
+        private_parent_fd = private_parent.require_fd()
+        # Copy only into a child of the descriptor-bound private parent.
+        staging = _create_private_staging(private_parent_fd, prefix=_STAGING_PAYLOAD_PREFIX)
         staging_fd = staging.require_fd()
         _copy_verified_tree(source, staging_fd)
         os.fsync(staging_fd)
+        os.fsync(private_parent_fd)
         os.fsync(parent_fd)
-        _require_current_private_staging(parent_fd, staging)
+        _require_current_private_staging(private_parent_fd, staging)
+        _require_current_private_staging(parent_fd, private_parent)
         # This pathname precheck is advisory only; the descriptor-relative rename below is final.
         _require_output_absent(destination.path)
-        _rename_directory_exclusive(parent_fd, staging.name, destination.name)
+        _rename_directory_exclusive(
+            private_parent_fd,
+            staging.name,
+            parent_fd,
+            destination.name,
+        )
+        os.fsync(private_parent_fd)
         os.fsync(parent_fd)
     except ReleaseGateError:
-        if staging is not None:
-            _safe_remove_private_staging(parent_fd, staging)
+        if staging is not None and private_parent_fd is not None:
+            _safe_remove_private_staging(private_parent_fd, staging)
         raise
     except OSError as exc:
-        if staging is not None:
-            _safe_remove_private_staging(parent_fd, staging)
+        if staging is not None and private_parent_fd is not None:
+            _safe_remove_private_staging(private_parent_fd, staging)
         raise ReleaseGateError("release_output_invalid") from exc
     finally:
+        if private_parent is not None and parent_fd is not None:
+            _safe_remove_private_staging(parent_fd, private_parent)
         if staging is not None and staging.fd is not None:
             with contextlib.suppress(OSError):
                 os.close(staging.fd)
+        if private_parent is not None and private_parent.fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(private_parent.fd)
 
 
 def _directory_open_flags() -> int:
@@ -3842,11 +4073,21 @@ def _require_child_absent(parent_fd: int, name: str) -> None:
     raise ReleaseGateError("release_output_invalid")
 
 
-def _create_private_staging(parent_fd: int) -> _PrivateStaging:
+def _require_private_publication_namespace(parent_fd: int) -> None:
+    try:
+        metadata = os.fstat(parent_fd)
+    except OSError as exc:
+        raise ReleaseGateError("release_output_invalid") from exc
+    mode = stat.S_IMODE(metadata.st_mode)
+    if not stat.S_ISDIR(metadata.st_mode) or mode & 0o022:
+        raise ReleaseGateError("release_output_invalid")
+
+
+def _create_private_staging(parent_fd: int, *, prefix: str) -> _PrivateStaging:
     for _attempt in range(128):
-        name = f"{_STAGING_NAME_PREFIX}{secrets.token_hex(16)}"
+        name = f"{prefix}{secrets.token_hex(16)}"
         try:
-            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+            os.mkdir(name, mode=_PRIVATE_STAGING_MODE, dir_fd=parent_fd)
         except FileExistsError:
             continue
         staging_fd: int | None = None
@@ -3854,22 +4095,40 @@ def _create_private_staging(parent_fd: int) -> _PrivateStaging:
         try:
             staging_fd = _open_directory_at_no_follow(parent_fd, name)
             metadata = os.fstat(staging_fd)
-            if not stat.S_ISDIR(metadata.st_mode):
-                raise OSError(errno.ENOTDIR, "private staging is not a directory")
+            _require_creator_owned_private_staging(metadata)
             identity = _PrivateStaging(
                 name=name,
                 device=metadata.st_dev,
                 inode=metadata.st_ino,
                 fd=staging_fd,
             )
+            _require_empty_private_staging(staging_fd)
             return identity
-        except (OSError, ValueError):
+        except (OSError, ValueError, ReleaseGateError):
             if staging_fd is not None:
                 _close_fd(staging_fd)
             if identity is not None:
                 _safe_remove_private_staging(parent_fd, identity)
             raise
     raise OSError(errno.EEXIST, "unable to reserve private staging directory")
+
+
+def _require_creator_owned_private_staging(metadata: os.stat_result) -> None:
+    try:
+        owner = os.geteuid()
+    except AttributeError as exc:
+        raise OSError(errno.ENOSYS, "effective uid is unavailable") from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != owner
+        or stat.S_IMODE(metadata.st_mode) != _PRIVATE_STAGING_MODE
+    ):
+        raise OSError(errno.EPERM, "private staging ownership changed")
+
+
+def _require_empty_private_staging(staging_fd: int) -> None:
+    if _bounded_sorted_directory_names(staging_fd, _PublicationBounds()):
+        raise OSError(errno.ENOTEMPTY, "private staging is not empty")
 
 
 def _copy_verified_tree(source: Path, destination_fd: int) -> None:
@@ -4170,7 +4429,12 @@ def _same_regular_file(left: os.stat_result, right: os.stat_result) -> bool:
     )
 
 
-def _rename_directory_exclusive(parent_fd: int, source_name: str, destination_name: str) -> None:
+def _rename_directory_exclusive(
+    source_parent_fd: int,
+    source_name: str,
+    destination_parent_fd: int,
+    destination_name: str,
+) -> None:
     source = os.fsencode(source_name)
     destination = os.fsencode(destination_name)
     libc = ctypes.CDLL(None, use_errno=True)
@@ -4187,7 +4451,13 @@ def _rename_directory_exclusive(parent_fd: int, source_name: str, destination_na
             ctypes.c_uint,
         ]
         rename.restype = ctypes.c_int
-        result = rename(parent_fd, source, parent_fd, destination, _RENAME_EXCL)
+        result = rename(
+            source_parent_fd,
+            source,
+            destination_parent_fd,
+            destination,
+            _RENAME_EXCL,
+        )
     elif sys.platform.startswith("linux"):
         rename = getattr(libc, "renameat2", None)
         if rename is not None:
@@ -4199,7 +4469,13 @@ def _rename_directory_exclusive(parent_fd: int, source_name: str, destination_na
                 ctypes.c_uint,
             ]
             rename.restype = ctypes.c_int
-            result = rename(parent_fd, source, parent_fd, destination, _RENAME_NOREPLACE)
+            result = rename(
+                source_parent_fd,
+                source,
+                destination_parent_fd,
+                destination,
+                _RENAME_NOREPLACE,
+            )
         else:
             syscall_number = _LINUX_RENAMEAT2_SYSCALLS.get(os.uname().machine)
             syscall = getattr(libc, "syscall", None)
@@ -4208,9 +4484,9 @@ def _rename_directory_exclusive(parent_fd: int, source_name: str, destination_na
             syscall.restype = ctypes.c_long
             result = syscall(
                 ctypes.c_long(syscall_number),
-                ctypes.c_int(parent_fd),
+                ctypes.c_int(source_parent_fd),
                 ctypes.c_char_p(source),
-                ctypes.c_int(parent_fd),
+                ctypes.c_int(destination_parent_fd),
                 ctypes.c_char_p(destination),
                 ctypes.c_uint(_RENAME_NOREPLACE),
             )

@@ -1197,6 +1197,145 @@ def test_release_candidate_rejects_local_git_config_include(tmp_path: Path) -> N
         )
 
 
+@pytest.mark.parametrize(
+    "config_fragment",
+    (
+        "[core]\n\texcludesFile = {external}\n",
+        "[core]\n\tattributesFile = {external}\n",
+        "[core]\n\tfsmonitor = {external}\n",
+        "[include]\n\tpath = {external}\n",
+        "[includeIf \"gitdir:/tmp/mercury/**\"]\n\tpath = {external}\n",
+        "[remote \"origin\"]\n\tuploadpack = {external}\n",
+    ),
+    ids=(
+        "external_exclude",
+        "external_attributes",
+        "external_helper",
+        "include",
+        "include_if",
+        "remote_helper",
+    ),
+)
+def test_release_git_runner_rejects_preexisting_unbound_config_inputs(
+    tmp_path: Path,
+    config_fragment: str,
+) -> None:
+    root = make_release_tree(tmp_path)
+    external = tmp_path / "external-config-target"
+    external.write_text("local-secret.txt\n", encoding="utf-8")
+    config = root / ".git" / "config"
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        + "\n"
+        + config_fragment.format(external=external),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReleaseGateError, match="^release_repository_invalid$"):
+        release_artifacts._ReleaseGitRunner.for_repository(root)
+
+
+@pytest.mark.parametrize("linked", (False, True), ids=("normal", "linked"))
+def test_release_git_runner_rejects_config_indirection_added_after_construction(
+    tmp_path: Path,
+    linked: bool,
+) -> None:
+    root = make_release_tree(tmp_path)
+    candidate = root
+    if linked:
+        candidate = tmp_path / "linked-candidate"
+        _run(["git", "worktree", "add", "--detach", str(candidate), "HEAD"], cwd=root)
+    secret = candidate / "local-secret.txt"
+    secret.write_text("local\n", encoding="utf-8")
+    external = tmp_path / "external-exclude"
+    external.write_text(f"{secret.name}\n", encoding="utf-8")
+    runner = release_artifacts._ReleaseGitRunner.for_repository(candidate)
+    config = root / ".git" / "config"
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        + f"\n[core]\n\texcludesFile = {external}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReleaseGateError, match="^release_repository_invalid$"):
+        runner.run(("status", "--porcelain=v1", "--untracked-files=all"))
+
+
+def test_release_git_runner_rechecks_normal_info_exclude_after_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_release_tree(tmp_path)
+    secret = root / "local-secret.txt"
+    secret.write_text("local\n", encoding="utf-8")
+    exclude = root / ".git" / "info" / "exclude"
+    original_exclude = exclude.read_text(encoding="utf-8")
+    exclude.write_text(original_exclude + f"\n{secret.name}\n", encoding="utf-8")
+    runner = release_artifacts._ReleaseGitRunner.for_repository(root)
+
+    assert runner.run(("status", "--porcelain=v1", "--untracked-files=all")).stdout == b""
+
+    original_run = release_artifacts._run_exact_environment_command
+    mutated = False
+
+    def mutate_exclude_after_status(*args: object, **kwargs: object):
+        nonlocal mutated
+        result = original_run(*args, **kwargs)
+        if not mutated:
+            mutated = True
+            exclude.write_text(original_exclude, encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(
+        release_artifacts,
+        "_run_exact_environment_command",
+        mutate_exclude_after_status,
+    )
+
+    with pytest.raises(ReleaseGateError, match="^release_repository_invalid$"):
+        runner.run(("status", "--porcelain=v1", "--untracked-files=all"))
+
+    assert mutated
+
+
+def test_linked_release_git_runner_rejects_info_exclude_mutation_before_status(
+    tmp_path: Path,
+) -> None:
+    root = make_release_tree(tmp_path)
+    linked = tmp_path / "linked-candidate"
+    _run(["git", "worktree", "add", "--detach", str(linked), "HEAD"], cwd=root)
+    secret = linked / "linked-secret.txt"
+    secret.write_text("local\n", encoding="utf-8")
+    exclude = root / ".git" / "info" / "exclude"
+    original_exclude = exclude.read_text(encoding="utf-8")
+    exclude.write_text(original_exclude + f"\n{secret.name}\n", encoding="utf-8")
+    runner = release_artifacts._ReleaseGitRunner.for_repository(linked)
+
+    assert runner.run(("status", "--porcelain=v1", "--untracked-files=all")).stdout == b""
+    exclude.write_text(original_exclude, encoding="utf-8")
+
+    with pytest.raises(ReleaseGateError, match="^release_repository_invalid$"):
+        runner.run(("status", "--porcelain=v1", "--untracked-files=all"))
+
+
+def test_linked_release_git_runner_rejects_external_worktree_config(
+    tmp_path: Path,
+) -> None:
+    root = make_release_tree(tmp_path)
+    linked = tmp_path / "linked-candidate"
+    _run(["git", "worktree", "add", "--detach", str(linked), "HEAD"], cwd=root)
+    external = tmp_path / "external-exclude"
+    external.write_text("linked-secret.txt\n", encoding="utf-8")
+    _run(["git", "config", "extensions.worktreeConfig", "true"], cwd=root)
+    _run(
+        ["git", "config", "--worktree", "core.excludesFile", str(external)],
+        cwd=linked,
+    )
+
+    with pytest.raises(ReleaseGateError, match="^release_repository_invalid$"):
+        release_artifacts._ReleaseGitRunner.for_repository(linked)
+
+
 def test_release_candidate_rejects_submodule_gitdir_pointer(tmp_path: Path) -> None:
     source_parent = tmp_path / "source-parent"
     source_parent.mkdir()
@@ -1755,6 +1894,79 @@ def test_preidentity_staging_open_failure_never_removes_external_competitor(
     assert not output.exists()
 
 
+@pytest.mark.parametrize(
+    "foreign_contents",
+    (None, "external\n"),
+    ids=("empty_foreign_directory", "non_empty_foreign_directory"),
+)
+def test_publish_rejects_successfully_opened_substituted_foreign_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    foreign_contents: str | None,
+) -> None:
+    source = tmp_path / "owned-source"
+    _write_owned_publish_tree(source)
+    parent = tmp_path / "output-parent"
+    parent.mkdir()
+    output = parent / "release"
+    external = tmp_path / "external-target"
+    external.mkdir()
+    external.chmod(0o755)
+    if foreign_contents is not None:
+        (external / "keep.txt").write_text(foreign_contents, encoding="utf-8")
+    original_open = release_artifacts._open_directory_at_no_follow
+    opened_staging_fds: set[int] = set()
+    staging_paths: list[Path] = []
+    copy_calls = 0
+
+    def replace_staging_then_open(parent_fd: int, name: str) -> int:
+        if name.startswith(release_artifacts._STAGING_NAME_PREFIX):
+            staging = parent / name
+            staging.rmdir()
+            external.rename(staging)
+            staging_paths.append(staging)
+            fd = original_open(parent_fd, name)
+            opened_staging_fds.add(fd)
+            return fd
+        return original_open(parent_fd, name)
+
+    def unexpected_copy(_source: Path, _destination_fd: int) -> None:
+        nonlocal copy_calls
+        copy_calls += 1
+        pytest.fail("publication copied into substituted foreign staging")
+
+    monkeypatch.setattr(
+        release_artifacts,
+        "_open_directory_at_no_follow",
+        replace_staging_then_open,
+    )
+    monkeypatch.setattr(release_artifacts, "_copy_verified_tree", unexpected_copy)
+    destination = release_artifacts._prepare_output_destination(output)
+    before = _open_file_descriptor_count()
+    after: int | None = None
+
+    try:
+        with pytest.raises(ReleaseGateError, match="^release_output_invalid$"):
+            release_artifacts._publish_owned_directory(source, destination)
+        after = _open_file_descriptor_count()
+    finally:
+        _close_output_destination(destination)
+
+    assert copy_calls == 0
+    assert len(staging_paths) == 1
+    assert staging_paths[0].is_dir()
+    if foreign_contents is None:
+        assert list(staging_paths[0].iterdir()) == []
+    else:
+        assert (staging_paths[0] / "keep.txt").read_text(encoding="utf-8") == foreign_contents
+    if before is not None and after is not None:
+        assert after <= before
+    for fd in opened_staging_fds:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+    assert not output.exists()
+
+
 def test_publish_never_stats_private_staging_before_no_follow_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1952,9 +2164,11 @@ def test_private_staging_cleanup_never_removes_a_competing_external_target(
     (external / "keep.txt").write_text("external\n", encoding="utf-8")
 
     def replace_staging_with_external(_source: Path, _destination_fd: int) -> None:
-        staging = next(iter(_private_staging_paths(parent)))
-        staging.rmdir()
-        external.rename(staging)
+        private_parent = next(iter(_private_staging_paths(parent)))
+        for child in private_parent.iterdir():
+            child.rmdir()
+        private_parent.rmdir()
+        external.rename(private_parent)
         raise OSError("copy failure after staging replacement")
 
     monkeypatch.setattr(release_artifacts, "_copy_verified_tree", replace_staging_with_external)
