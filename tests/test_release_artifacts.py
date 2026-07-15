@@ -1166,6 +1166,45 @@ def test_release_git_runner_rechecks_metadata_after_git_operation(
     assert replaced
 
 
+def test_release_git_runner_disables_detached_auto_maintenance_for_unbound_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = release_artifacts._ReleaseGitRunner.for_new_repository(tmp_path)
+    commands: list[tuple[object, ...]] = []
+
+    def capture_command(*args: object, **kwargs: object):
+        command = args[0]
+        assert isinstance(command, tuple)
+        commands.append(command)
+        return release_artifacts.CommandResult(exit_code=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(
+        release_artifacts,
+        "_run_exact_environment_command",
+        capture_command,
+    )
+
+    result = runner.run_unbound(
+        ("commit", "--quiet", "-m", "Mercury public staging"),
+        extra_environment={
+            "GIT_AUTHOR_DATE": "1784044800 +0000",
+            "GIT_COMMITTER_DATE": "1784044800 +0000",
+        },
+    )
+
+    assert result.exit_code == 0
+    assert len(commands) == 1
+    start = commands[0].index("maintenance.auto=false") - 1
+    assert commands[0][start : start + 4] == (
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "gc.auto=0",
+    )
+    assert start < commands[0].index("commit")
+
+
 def test_linked_release_git_runner_rechecks_metadata_after_git_operation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

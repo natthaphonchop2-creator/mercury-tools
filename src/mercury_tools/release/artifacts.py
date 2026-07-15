@@ -621,6 +621,10 @@ class _ReleaseGitRunner:
                     "--no-optional-locks",
                     "-c",
                     f"core.hooksPath={workspace / 'hooks'}",
+                    "-c",
+                    "maintenance.auto=false",
+                    "-c",
+                    "gc.auto=0",
                 ]
                 if self.metadata is not None and bind_repository:
                     command.extend(
