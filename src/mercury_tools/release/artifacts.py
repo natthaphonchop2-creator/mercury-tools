@@ -77,6 +77,10 @@ _MAX_PUBLICATION_DIRECTORY_NAME_BYTES = 2 * 1024 * 1024
 _MAX_PUBLICATION_FILE_BYTES = 512 * 1024 * 1024
 _MAX_PUBLICATION_BYTES = 2 * 1024 * 1024 * 1024
 _COPY_CHUNK_BYTES = 1024 * 1024
+_MAX_GIT_METADATA_ENTRIES = 250_000
+_MAX_GIT_METADATA_DEPTH = 64
+_MAX_GIT_METADATA_PATH_BYTES = 16 * 1024 * 1024
+_MAX_GIT_METADATA_TEXT_BYTES = 1024 * 1024
 _STORED_DEFLATE_BLOCK_BYTES = 65_535
 _STAGING_NAME_PREFIX = ".mercury-release-publish-"
 _RENAME_NOREPLACE = 1
@@ -253,6 +257,79 @@ class _PathIdentity:
 
 
 @dataclass(frozen=True)
+class _GitMetadataIdentity:
+    name: str
+    path: Path
+    present: bool
+    device: int | None
+    inode: int | None
+    mode: int | None
+    size: int | None
+    mtime_ns: int | None
+    ctime_ns: int | None
+
+
+@dataclass(frozen=True)
+class _GitMetadataManifest:
+    entries: tuple[_GitMetadataIdentity, ...]
+
+
+@dataclass
+class _GitMetadataManifestBuilder:
+    entries: list[_GitMetadataIdentity]
+    names: set[str]
+    path_bytes: int = 0
+
+    def add_present(self, name: str, path: Path, metadata: os.stat_result) -> None:
+        self._reserve(name, path)
+        self.entries.append(
+            _GitMetadataIdentity(
+                name=name,
+                path=path,
+                present=True,
+                device=metadata.st_dev,
+                inode=metadata.st_ino,
+                mode=metadata.st_mode,
+                size=metadata.st_size,
+                mtime_ns=metadata.st_mtime_ns,
+                ctime_ns=metadata.st_ctime_ns,
+            )
+        )
+
+    def add_absent(self, name: str, path: Path) -> None:
+        self._reserve(name, path)
+        self.entries.append(
+            _GitMetadataIdentity(
+                name=name,
+                path=path,
+                present=False,
+                device=None,
+                inode=None,
+                mode=None,
+                size=None,
+                mtime_ns=None,
+                ctime_ns=None,
+            )
+        )
+
+    def build(self) -> _GitMetadataManifest:
+        entries = tuple(sorted(self.entries, key=lambda entry: entry.name))
+        return _GitMetadataManifest(entries=entries)
+
+    def _reserve(self, name: str, path: Path) -> None:
+        if not name or name in self.names or len(self.entries) >= _MAX_GIT_METADATA_ENTRIES:
+            raise ReleaseGateError("release_repository_invalid")
+        try:
+            encoded = os.fsencode(name)
+        except UnicodeError as exc:
+            raise ReleaseGateError("release_repository_invalid") from exc
+        self.path_bytes += len(encoded)
+        if self.path_bytes > _MAX_GIT_METADATA_PATH_BYTES:
+            raise ReleaseGateError("release_repository_invalid")
+        self.names.add(name)
+
+
+@dataclass(frozen=True)
 class _GitRepositoryMetadata:
     root: Path
     git_dir: Path
@@ -263,6 +340,7 @@ class _GitRepositoryMetadata:
     common_dir_identity: _PathIdentity
     commondir_pointer_identity: _PathIdentity | None = None
     gitdir_backlink_identity: _PathIdentity | None = None
+    manifest: _GitMetadataManifest = _GitMetadataManifest(entries=())
 
 
 @dataclass(frozen=True)
@@ -270,6 +348,7 @@ class _BareGitRepositoryMetadata:
     root_identity: _PathIdentity
     head_identity: _PathIdentity
     config_identity: _PathIdentity
+    manifest: _GitMetadataManifest = _GitMetadataManifest(entries=())
 
 
 @dataclass(frozen=True)
@@ -428,19 +507,23 @@ class _ReleaseGitRunner:
     ) -> CommandResult:
         if self.metadata is None:
             raise ReleaseGateError("release_repository_invalid")
-        self._assert_repository_layout()
+        self._assert_metadata_current()
         return self._run(arguments, extra_environment=extra_environment)
 
-    def run_unbound(self, arguments: tuple[str, ...]) -> CommandResult:
+    def run_unbound(
+        self,
+        arguments: tuple[str, ...],
+        *,
+        extra_environment: dict[str, str] | None = None,
+    ) -> CommandResult:
         if self.metadata is not None:
             raise ReleaseGateError("release_repository_invalid")
-        return self._run(arguments)
+        return self._run(arguments, extra_environment=extra_environment)
 
     def _assert_repository_layout(self) -> None:
         if self.metadata is None:
             raise ReleaseGateError("release_repository_invalid")
-        if _read_git_repository_metadata(self.root) != self.metadata:
-            raise ReleaseGateError("release_repository_invalid")
+        self._assert_metadata_current()
         top_level = _git_result_path(
             self._run(("rev-parse", "--show-toplevel"), bind_repository=False),
             base=self.root,
@@ -460,6 +543,11 @@ class _ReleaseGitRunner:
         ):
             raise ReleaseGateError("release_repository_invalid")
 
+    def _assert_metadata_current(self) -> None:
+        if self.metadata is None:
+            raise ReleaseGateError("release_repository_invalid")
+        _require_current_git_repository_metadata(self.metadata)
+
     def _run(
         self,
         arguments: tuple[str, ...],
@@ -472,33 +560,39 @@ class _ReleaseGitRunner:
         allowed_extra = {"GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"}
         if extra_environment is not None and set(extra_environment) - allowed_extra:
             raise ReleaseGateError("release_repository_invalid")
-        with tempfile.TemporaryDirectory(prefix=".mercury-release-git-") as temporary:
-            workspace = Path(temporary)
-            environment = _release_git_environment(workspace)
-            if extra_environment is not None:
-                environment.update(extra_environment)
-            command: list[str] = [
-                str(self._executable),
-                "--no-replace-objects",
-                "--no-optional-locks",
-                "-c",
-                f"core.hooksPath={workspace / 'hooks'}",
-            ]
-            if self.metadata is not None and bind_repository:
-                command.extend(
-                    (
-                        f"--git-dir={self.metadata.git_dir}",
-                        f"--work-tree={self.metadata.root}",
+        if self.metadata is not None:
+            self._assert_metadata_current()
+        try:
+            with tempfile.TemporaryDirectory(prefix=".mercury-release-git-") as temporary:
+                workspace = Path(temporary)
+                environment = _release_git_environment(workspace)
+                if extra_environment is not None:
+                    environment.update(extra_environment)
+                command: list[str] = [
+                    str(self._executable),
+                    "--no-replace-objects",
+                    "--no-optional-locks",
+                    "-c",
+                    f"core.hooksPath={workspace / 'hooks'}",
+                ]
+                if self.metadata is not None and bind_repository:
+                    command.extend(
+                        (
+                            f"--git-dir={self.metadata.git_dir}",
+                            f"--work-tree={self.metadata.root}",
+                        )
                     )
+                command.extend(arguments)
+                return _run_exact_environment_command(
+                    tuple(command),
+                    cwd=self.root,
+                    environment=environment,
+                    timeout_seconds=_GIT_TIMEOUT_SECONDS,
+                    max_output_bytes=_MAX_COMMAND_OUTPUT,
                 )
-            command.extend(arguments)
-            return _run_exact_environment_command(
-                tuple(command),
-                cwd=self.root,
-                environment=environment,
-                timeout_seconds=_GIT_TIMEOUT_SECONDS,
-                max_output_bytes=_MAX_COMMAND_OUTPUT,
-            )
+        finally:
+            if self.metadata is not None:
+                self._assert_metadata_current()
 
 
 def _trusted_system_git_executable() -> Path:
@@ -607,7 +701,7 @@ class _ReleaseTask13GitRunner:
             raise ReleaseGateError("release_repository_invalid")
         self._assert_clone_identity(clone)
         try:
-            return self._run_trusted_command(
+            result = self._run_trusted_command(
                 arguments,
                 cwd=clone.root,
                 metadata=clone.metadata,
@@ -615,6 +709,9 @@ class _ReleaseTask13GitRunner:
                 max_output_bytes=output_limit,
                 timeout_seconds=timeout,
             )
+            if arguments[0] in {"fetch", "checkout"} and result.exit_code == 0:
+                clone = self._refresh_mutated_clone_identity(clone)
+            return result
         finally:
             self._assert_clone_identity(clone)
 
@@ -703,31 +800,55 @@ class _ReleaseTask13GitRunner:
                 metadata=metadata,
             )
             self._clones[root] = clone
-            self._assert_clone_identity(clone)
+            self._assert_clone_identity(clone, verify_origin=True)
         except ReleaseGateError:
             self._clones.pop(root, None)
             raise
 
-    def _assert_clone_identity(self, clone: _Task13GitClone) -> None:
+    def _assert_clone_identity(
+        self,
+        clone: _Task13GitClone,
+        *,
+        verify_origin: bool = False,
+    ) -> None:
         if isinstance(clone.metadata, _GitRepositoryMetadata):
-            runner = _ReleaseGitRunner.for_repository(
-                clone.root,
-                expected_metadata=clone.metadata,
-            )
+            _require_current_git_repository_metadata(clone.metadata)
+        else:
+            _require_current_bare_git_repository_metadata(clone.metadata)
+        if not verify_origin:
+            return
+        if isinstance(clone.metadata, _GitRepositoryMetadata):
+            runner = _ReleaseGitRunner(clone.root, clone.metadata)
             result = runner.run(("config", "--get", "remote.origin.url"))
         else:
-            if _read_bare_git_repository_metadata(clone.root) != clone.metadata:
-                raise ReleaseGateError("release_repository_invalid")
-            result = self._run_trusted_command(
-                ("config", "--get", "remote.origin.url"),
-                cwd=clone.root,
-                metadata=clone.metadata,
-                input_bytes=None,
-                max_output_bytes=_MAX_COMMAND_OUTPUT,
-                timeout_seconds=_TASK13_GIT_TIMEOUT_SECONDS,
-            )
+            try:
+                result = self._run_trusted_command(
+                    ("config", "--get", "remote.origin.url"),
+                    cwd=clone.root,
+                    metadata=clone.metadata,
+                    input_bytes=None,
+                    max_output_bytes=_MAX_COMMAND_OUTPUT,
+                    timeout_seconds=_TASK13_GIT_TIMEOUT_SECONDS,
+                )
+            finally:
+                _require_current_bare_git_repository_metadata(clone.metadata)
         if _single_git_config_value(result) != clone.origin_url:
             raise ReleaseGateError("release_repository_invalid")
+
+    def _refresh_mutated_clone_identity(self, clone: _Task13GitClone) -> _Task13GitClone:
+        if not isinstance(clone.metadata, _GitRepositoryMetadata):
+            raise ReleaseGateError("release_repository_invalid")
+        refreshed_metadata = _read_git_repository_metadata(clone.root)
+        if not _same_task13_mutable_clone_metadata(clone.metadata, refreshed_metadata):
+            raise ReleaseGateError("release_repository_invalid")
+        refreshed = _Task13GitClone(
+            root=clone.root,
+            origin_url=clone.origin_url,
+            metadata=refreshed_metadata,
+        )
+        self._assert_clone_identity(refreshed, verify_origin=True)
+        self._clones[clone.root] = refreshed
+        return refreshed
 
     def _allowed_bound_command(
         self,
@@ -899,10 +1020,14 @@ def _read_bare_git_repository_metadata(root: Path) -> _BareGitRepositoryMetadata
         root_identity = _require_git_directory_identity(root)
         _require_git_metadata_path_absent(root_identity.path / "commondir")
         _require_no_git_alternates((root_identity.path,))
+        head_identity = _require_git_regular_identity(root_identity.path / "HEAD")
+        config_identity = _require_git_regular_identity(root_identity.path / "config")
+        manifest = _build_bare_git_metadata_manifest(root_identity.path)
         return _BareGitRepositoryMetadata(
             root_identity=root_identity,
-            head_identity=_require_git_regular_identity(root_identity.path / "HEAD"),
-            config_identity=_require_git_regular_identity(root_identity.path / "config"),
+            head_identity=head_identity,
+            config_identity=config_identity,
+            manifest=manifest,
         )
     except ReleaseGateError:
         raise
@@ -929,6 +1054,7 @@ def _read_git_repository_metadata(root: Path) -> _GitRepositoryMetadata:
             dot_git_identity = _require_git_directory_identity(dot_git)
             _require_git_metadata_path_absent(dot_git / "commondir")
             _require_no_git_alternates((dot_git_identity.path,))
+            manifest = _build_normal_git_metadata_manifest(dot_git_identity.path)
             return _GitRepositoryMetadata(
                 root=root_identity.path,
                 git_dir=dot_git_identity.path,
@@ -937,6 +1063,7 @@ def _read_git_repository_metadata(root: Path) -> _GitRepositoryMetadata:
                 dot_git_identity=dot_git_identity,
                 git_dir_identity=dot_git_identity,
                 common_dir_identity=dot_git_identity,
+                manifest=manifest,
             )
         if not stat.S_ISREG(dot_git_metadata.st_mode):
             raise ReleaseGateError("release_repository_invalid")
@@ -963,6 +1090,11 @@ def _read_git_repository_metadata(root: Path) -> _GitRepositoryMetadata:
         ):
             raise ReleaseGateError("release_repository_invalid")
         _require_no_git_alternates((git_dir_identity.path, common_dir_identity.path))
+        manifest = _build_linked_git_metadata_manifest(
+            dot_git=dot_git_identity.path,
+            git_dir=git_dir_identity.path,
+            common_dir=common_dir_identity.path,
+        )
     except ReleaseGateError:
         raise
     except (OSError, UnicodeError) as exc:
@@ -977,6 +1109,7 @@ def _read_git_repository_metadata(root: Path) -> _GitRepositoryMetadata:
         common_dir_identity=common_dir_identity,
         commondir_pointer_identity=commondir_pointer_identity,
         gitdir_backlink_identity=backlink_identity,
+        manifest=manifest,
     )
 
 
@@ -999,8 +1132,7 @@ def _read_git_pointer_target(
     require_gitdir_prefix: bool,
 ) -> Path:
     try:
-        _require_git_regular_identity(pointer)
-        value = pointer.read_text(encoding="utf-8")
+        value = _read_git_metadata_text(pointer)
     except (OSError, UnicodeError) as exc:
         raise ReleaseGateError("release_repository_invalid") from exc
     lines = value.splitlines()
@@ -1072,6 +1204,605 @@ def _require_git_metadata_path_absent(path: Path) -> None:
 def _require_no_git_alternates(git_directories: Iterable[Path]) -> None:
     for git_directory in git_directories:
         _require_git_metadata_path_absent(git_directory / "objects" / "info" / "alternates")
+
+
+def _build_bare_git_metadata_manifest(root: Path) -> _GitMetadataManifest:
+    builder = _GitMetadataManifestBuilder(entries=[], names=set())
+    _record_required_git_metadata_path(builder, "bare/git-dir", root, directory=True)
+    _record_required_git_metadata_path(builder, "bare/git-dir/HEAD", root / "HEAD", directory=False)
+    _record_common_git_metadata(builder, prefix="bare/git-dir", git_dir=root)
+    _validate_git_head_symbolic_ref(root / "HEAD", ref_roots=(root,))
+    return builder.build()
+
+
+def _build_normal_git_metadata_manifest(git_dir: Path) -> _GitMetadataManifest:
+    builder = _GitMetadataManifestBuilder(entries=[], names=set())
+    _record_required_git_metadata_path(builder, "normal/.git", git_dir, directory=True)
+    _record_required_git_metadata_path(
+        builder,
+        "normal/git-dir/HEAD",
+        git_dir / "HEAD",
+        directory=False,
+    )
+    _record_optional_git_metadata_path(
+        builder,
+        "normal/git-dir/index",
+        git_dir / "index",
+        directory=False,
+    )
+    _record_common_git_metadata(builder, prefix="normal/git-dir", git_dir=git_dir)
+    _validate_git_head_symbolic_ref(git_dir / "HEAD", ref_roots=(git_dir,))
+    return builder.build()
+
+
+def _build_linked_git_metadata_manifest(
+    *,
+    dot_git: Path,
+    git_dir: Path,
+    common_dir: Path,
+) -> _GitMetadataManifest:
+    builder = _GitMetadataManifestBuilder(entries=[], names=set())
+    _record_required_git_metadata_path(builder, "linked/.git", dot_git, directory=False)
+    _record_required_git_metadata_path(builder, "linked/git-dir", git_dir, directory=True)
+    _record_required_git_metadata_path(
+        builder,
+        "linked/git-dir/commondir",
+        git_dir / "commondir",
+        directory=False,
+    )
+    _record_required_git_metadata_path(
+        builder,
+        "linked/git-dir/gitdir",
+        git_dir / "gitdir",
+        directory=False,
+    )
+    _record_required_git_metadata_path(
+        builder,
+        "linked/common-dir",
+        common_dir,
+        directory=True,
+    )
+    _record_required_git_metadata_path(
+        builder,
+        "linked/common-dir/worktrees",
+        common_dir / "worktrees",
+        directory=True,
+    )
+    _record_required_git_metadata_path(
+        builder,
+        "linked/git-dir/HEAD",
+        git_dir / "HEAD",
+        directory=False,
+    )
+    _record_optional_git_metadata_path(
+        builder,
+        "linked/git-dir/index",
+        git_dir / "index",
+        directory=False,
+    )
+    _record_optional_git_metadata_path(
+        builder,
+        "linked/git-dir/config.worktree",
+        git_dir / "config.worktree",
+        directory=False,
+    )
+    _require_optional_git_config_without_includes(git_dir / "config.worktree")
+    _record_optional_git_metadata_tree(
+        builder,
+        "linked/git-dir/refs",
+        git_dir / "refs",
+    )
+    _record_optional_git_metadata_path(
+        builder,
+        "linked/git-dir/packed-refs",
+        git_dir / "packed-refs",
+        directory=False,
+    )
+    _record_common_git_metadata(builder, prefix="linked/common-dir", git_dir=common_dir)
+    _validate_git_head_symbolic_ref(
+        git_dir / "HEAD",
+        ref_roots=(git_dir, common_dir),
+    )
+    return builder.build()
+
+
+def _record_common_git_metadata(
+    builder: _GitMetadataManifestBuilder,
+    *,
+    prefix: str,
+    git_dir: Path,
+) -> None:
+    _record_required_git_metadata_path(
+        builder,
+        f"{prefix}/config",
+        git_dir / "config",
+        directory=False,
+    )
+    _require_git_config_without_includes(git_dir / "config")
+    _record_required_git_metadata_tree(builder, f"{prefix}/refs", git_dir / "refs")
+    _record_optional_git_metadata_path(
+        builder,
+        f"{prefix}/packed-refs",
+        git_dir / "packed-refs",
+        directory=False,
+    )
+    _record_required_git_metadata_tree(builder, f"{prefix}/objects", git_dir / "objects")
+    _record_optional_git_metadata_path(
+        builder,
+        f"{prefix}/shallow",
+        git_dir / "shallow",
+        directory=False,
+    )
+    _record_optional_git_metadata_path(
+        builder,
+        f"{prefix}/info/grafts",
+        git_dir / "info" / "grafts",
+        directory=False,
+    )
+    _record_absent_git_metadata_path(
+        builder,
+        f"{prefix}/objects/info/alternates",
+        git_dir / "objects" / "info" / "alternates",
+    )
+
+
+def _record_required_git_metadata_path(
+    builder: _GitMetadataManifestBuilder,
+    name: str,
+    path: Path,
+    *,
+    directory: bool,
+) -> None:
+    path = _absolute_lexical_path(path)
+    fd: int | None = None
+    try:
+        fd, metadata = _open_git_metadata_path(path, directory=directory)
+        builder.add_present(name, path, metadata)
+    finally:
+        if fd is not None:
+            _close_fd(fd)
+
+
+def _record_optional_git_metadata_path(
+    builder: _GitMetadataManifestBuilder,
+    name: str,
+    path: Path,
+    *,
+    directory: bool,
+) -> None:
+    path = _absolute_lexical_path(path)
+    try:
+        os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        builder.add_absent(name, path)
+        return
+    _record_required_git_metadata_path(builder, name, path, directory=directory)
+
+
+def _record_required_git_metadata_tree(
+    builder: _GitMetadataManifestBuilder,
+    name: str,
+    path: Path,
+) -> None:
+    _record_git_metadata_tree(builder, name, path, required=True)
+
+
+def _record_optional_git_metadata_tree(
+    builder: _GitMetadataManifestBuilder,
+    name: str,
+    path: Path,
+) -> None:
+    _record_git_metadata_tree(builder, name, path, required=False)
+
+
+def _record_git_metadata_tree(
+    builder: _GitMetadataManifestBuilder,
+    name: str,
+    path: Path,
+    *,
+    required: bool,
+) -> None:
+    path = _absolute_lexical_path(path)
+    if not required:
+        try:
+            os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            builder.add_absent(name, path)
+            return
+    fd: int | None = None
+    try:
+        fd, metadata = _open_git_metadata_path(path, directory=True)
+        builder.add_present(name, path, metadata)
+        _record_git_metadata_tree_contents(builder, name, path, fd, depth=0)
+    finally:
+        if fd is not None:
+            _close_fd(fd)
+
+
+def _record_git_metadata_tree_contents(
+    builder: _GitMetadataManifestBuilder,
+    name: str,
+    path: Path,
+    directory_fd: int,
+    *,
+    depth: int,
+) -> None:
+    for child_name in _git_metadata_directory_names(directory_fd):
+        child_path = path / child_name
+        child_manifest_name = f"{name}/{child_name}"
+        try:
+            before = os.stat(
+                child_name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ReleaseGateError("release_repository_invalid") from exc
+        if stat.S_ISLNK(before.st_mode):
+            raise ReleaseGateError("release_repository_invalid")
+        if stat.S_ISDIR(before.st_mode):
+            if depth + 1 > _MAX_GIT_METADATA_DEPTH:
+                raise ReleaseGateError("release_repository_invalid")
+            child_fd: int | None = None
+            try:
+                child_fd, after = _open_git_metadata_at(
+                    directory_fd,
+                    child_name,
+                    directory=True,
+                )
+                if not _same_git_metadata_stat(before, after):
+                    raise ReleaseGateError("release_repository_invalid")
+                builder.add_present(child_manifest_name, child_path, after)
+                _record_git_metadata_tree_contents(
+                    builder,
+                    child_manifest_name,
+                    child_path,
+                    child_fd,
+                    depth=depth + 1,
+                )
+            finally:
+                if child_fd is not None:
+                    _close_fd(child_fd)
+            continue
+        if not stat.S_ISREG(before.st_mode):
+            raise ReleaseGateError("release_repository_invalid")
+        child_fd = None
+        try:
+            child_fd, after = _open_git_metadata_at(
+                directory_fd,
+                child_name,
+                directory=False,
+            )
+            if not _same_git_metadata_stat(before, after):
+                raise ReleaseGateError("release_repository_invalid")
+            builder.add_present(child_manifest_name, child_path, after)
+        finally:
+            if child_fd is not None:
+                _close_fd(child_fd)
+
+
+def _record_absent_git_metadata_path(
+    builder: _GitMetadataManifestBuilder,
+    name: str,
+    path: Path,
+) -> None:
+    path = _absolute_lexical_path(path)
+    try:
+        os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        builder.add_absent(name, path)
+        return
+    except OSError as exc:
+        raise ReleaseGateError("release_repository_invalid") from exc
+    raise ReleaseGateError("release_repository_invalid")
+
+
+def _git_metadata_directory_names(directory_fd: int) -> tuple[str, ...]:
+    names: list[str] = []
+    scan_fd: int | None = None
+    iterator: object | None = None
+    try:
+        scan_fd = os.dup(directory_fd)
+        iterator = os.scandir(scan_fd)
+        for entry in iterator:
+            name = entry.name
+            if (
+                not name
+                or name in {".", ".."}
+                or "/" in name
+                or "\\" in name
+                or "\0" in name
+                or len(names) >= _MAX_GIT_METADATA_ENTRIES
+            ):
+                raise ReleaseGateError("release_repository_invalid")
+            names.append(name)
+        return tuple(sorted(names))
+    except ReleaseGateError:
+        raise
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ReleaseGateError("release_repository_invalid") from exc
+    finally:
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            with contextlib.suppress(OSError):
+                close()
+        if scan_fd is not None:
+            _close_fd(scan_fd)
+
+
+def _open_git_metadata_path(path: Path, *, directory: bool) -> tuple[int, os.stat_result]:
+    fd = os.open(os.fspath(path), _git_metadata_open_flags(directory=directory))
+    try:
+        metadata = os.fstat(fd)
+        if (directory and not stat.S_ISDIR(metadata.st_mode)) or (
+            not directory and not stat.S_ISREG(metadata.st_mode)
+        ):
+            raise ReleaseGateError("release_repository_invalid")
+        return fd, metadata
+    except BaseException:
+        _close_fd(fd)
+        raise
+
+
+def _open_git_metadata_at(
+    parent_fd: int,
+    name: str,
+    *,
+    directory: bool,
+) -> tuple[int, os.stat_result]:
+    fd = os.open(
+        name,
+        _git_metadata_open_flags(directory=directory),
+        dir_fd=parent_fd,
+    )
+    try:
+        metadata = os.fstat(fd)
+        if (directory and not stat.S_ISDIR(metadata.st_mode)) or (
+            not directory and not stat.S_ISREG(metadata.st_mode)
+        ):
+            raise ReleaseGateError("release_repository_invalid")
+        return fd, metadata
+    except BaseException:
+        _close_fd(fd)
+        raise
+
+
+def _git_metadata_open_flags(*, directory: bool) -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow:
+        raise ReleaseGateError("release_repository_invalid")
+    flags = os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0)
+    if directory:
+        directory_flag = getattr(os, "O_DIRECTORY", 0)
+        if not directory_flag:
+            raise ReleaseGateError("release_repository_invalid")
+        flags |= directory_flag
+    return flags
+
+
+def _same_git_metadata_stat(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+        and left.st_mode == right.st_mode
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+        and left.st_ctime_ns == right.st_ctime_ns
+    )
+
+
+def _read_git_metadata_text(path: Path) -> str:
+    fd: int | None = None
+    try:
+        fd, metadata = _open_git_metadata_path(path, directory=False)
+        if metadata.st_size > _MAX_GIT_METADATA_TEXT_BYTES:
+            raise ReleaseGateError("release_repository_invalid")
+        remaining = metadata.st_size
+        payload = bytearray()
+        while remaining:
+            chunk = os.read(fd, min(64 * 1024, remaining))
+            if not chunk:
+                raise ReleaseGateError("release_repository_invalid")
+            payload.extend(chunk)
+            remaining -= len(chunk)
+        if os.read(fd, 1):
+            raise ReleaseGateError("release_repository_invalid")
+        if not _same_git_metadata_stat(metadata, os.fstat(fd)):
+            raise ReleaseGateError("release_repository_invalid")
+        return payload.decode("utf-8")
+    except UnicodeError as exc:
+        raise ReleaseGateError("release_repository_invalid") from exc
+    finally:
+        if fd is not None:
+            _close_fd(fd)
+
+
+def _require_optional_git_config_without_includes(path: Path) -> None:
+    try:
+        os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    _require_git_config_without_includes(path)
+
+
+def _require_git_config_without_includes(path: Path) -> None:
+    for raw_line in _read_git_metadata_text(path).splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("["):
+            closing = line.find("]")
+            if closing < 2:
+                raise ReleaseGateError("release_repository_invalid")
+            section = line[1:closing].strip().split(None, 1)[0].casefold()
+            if section in {"include", "includeif"}:
+                raise ReleaseGateError("release_repository_invalid")
+        elif line.casefold().startswith("include."):
+            raise ReleaseGateError("release_repository_invalid")
+
+
+def _validate_git_head_symbolic_ref(head: Path, *, ref_roots: tuple[Path, ...]) -> None:
+    value = _read_git_metadata_text(head)
+    line = value[:-1] if value.endswith("\n") else value
+    if not line or "\n" in line or "\r" in line or "\0" in line:
+        raise ReleaseGateError("release_repository_invalid")
+    if line.startswith("ref: "):
+        target = line.removeprefix("ref: ")
+        _require_safe_git_ref_name(target)
+        _require_git_symbolic_ref_components(target, ref_roots=ref_roots)
+        return
+    if _COMMIT_PATTERN.fullmatch(line) is None:
+        raise ReleaseGateError("release_repository_invalid")
+
+
+def _require_safe_git_ref_name(value: str) -> None:
+    parts = value.split("/")
+    if (
+        not value.startswith("refs/")
+        or len(parts) < 2
+        or any(
+            not part
+            or part in {".", "..", "@"}
+            or part.startswith(".")
+            or part.endswith((".", ".lock"))
+            or ".." in part
+            for part in parts
+        )
+        or "@{" in value
+        or any(
+            character <= " " or character in {"~", "^", ":", "?", "*", "[", "\\"}
+            for character in value
+        )
+    ):
+        raise ReleaseGateError("release_repository_invalid")
+
+
+def _require_git_symbolic_ref_components(
+    target: str,
+    *,
+    ref_roots: tuple[Path, ...],
+) -> None:
+    parts = target.split("/")
+    seen: set[Path] = set()
+    for root in ref_roots:
+        root = _absolute_lexical_path(root)
+        if root in seen:
+            continue
+        seen.add(root)
+        current = root
+        for index, part in enumerate(parts):
+            current = current / part
+            try:
+                metadata = os.stat(current, follow_symlinks=False)
+            except FileNotFoundError:
+                break
+            except OSError as exc:
+                raise ReleaseGateError("release_repository_invalid") from exc
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ReleaseGateError("release_repository_invalid")
+            if index + 1 < len(parts):
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise ReleaseGateError("release_repository_invalid")
+            elif not stat.S_ISREG(metadata.st_mode):
+                raise ReleaseGateError("release_repository_invalid")
+
+
+def _same_task13_mutable_clone_metadata(
+    before: _GitRepositoryMetadata,
+    after: _GitRepositoryMetadata,
+) -> bool:
+    if (
+        before.root != after.root
+        or before.git_dir != after.git_dir
+        or before.common_dir != after.common_dir
+        or before.root_identity != after.root_identity
+        or before.dot_git_identity != after.dot_git_identity
+        or before.git_dir_identity != after.git_dir_identity
+        or before.common_dir_identity != after.common_dir_identity
+        or before.commondir_pointer_identity != after.commondir_pointer_identity
+        or before.gitdir_backlink_identity != after.gitdir_backlink_identity
+    ):
+        return False
+    before_entries = {entry.name: entry for entry in before.manifest.entries}
+    after_entries = {entry.name: entry for entry in after.manifest.entries}
+    immutable_names = (
+        "normal/.git",
+        "normal/git-dir/config",
+        "normal/git-dir/objects",
+        "normal/git-dir/refs",
+    )
+    for name in immutable_names:
+        previous = before_entries.get(name)
+        current = after_entries.get(name)
+        if previous is None or current is None:
+            return False
+        if name.endswith(("/.git", "/objects", "/refs")):
+            if not _same_git_metadata_binding(previous, current):
+                return False
+        elif previous != current:
+            return False
+    return True
+
+
+def _same_git_metadata_binding(
+    left: _GitMetadataIdentity,
+    right: _GitMetadataIdentity,
+) -> bool:
+    return (
+        left.name == right.name
+        and left.path == right.path
+        and left.present == right.present
+        and left.device == right.device
+        and left.inode == right.inode
+        and left.mode == right.mode
+    )
+
+
+def _require_current_git_repository_metadata(metadata: _GitRepositoryMetadata) -> None:
+    _require_current_git_path_identity(metadata.root_identity)
+    _require_current_git_metadata_manifest(metadata.manifest)
+
+
+def _require_current_bare_git_repository_metadata(metadata: _BareGitRepositoryMetadata) -> None:
+    _require_current_git_path_identity(metadata.root_identity)
+    _require_current_git_metadata_manifest(metadata.manifest)
+
+
+def _require_current_git_path_identity(identity: _PathIdentity) -> None:
+    try:
+        metadata = os.stat(identity.path, follow_symlinks=False)
+    except OSError as exc:
+        raise ReleaseGateError("release_repository_invalid") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_dev != identity.device
+        or metadata.st_ino != identity.inode
+        or stat.S_IFMT(metadata.st_mode) != identity.mode
+    ):
+        raise ReleaseGateError("release_repository_invalid")
+
+
+def _require_current_git_metadata_manifest(manifest: _GitMetadataManifest) -> None:
+    for entry in manifest.entries:
+        try:
+            metadata = os.stat(entry.path, follow_symlinks=False)
+        except FileNotFoundError:
+            if not entry.present:
+                continue
+            raise ReleaseGateError("release_repository_invalid") from None
+        except OSError as exc:
+            raise ReleaseGateError("release_repository_invalid") from exc
+        if (
+            not entry.present
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_dev != entry.device
+            or metadata.st_ino != entry.inode
+            or metadata.st_mode != entry.mode
+            or metadata.st_size != entry.size
+            or metadata.st_mtime_ns != entry.mtime_ns
+            or metadata.st_ctime_ns != entry.ctime_ns
+        ):
+            raise ReleaseGateError("release_repository_invalid")
 
 
 def _git_result_path(result: CommandResult, *, base: Path) -> Path:
@@ -3135,9 +3866,7 @@ def _create_private_staging(parent_fd: int) -> _PrivateStaging:
         except (OSError, ValueError):
             if staging_fd is not None:
                 _close_fd(staging_fd)
-            if identity is None:
-                _safe_rmdir_unidentified_private_staging(parent_fd, name)
-            else:
+            if identity is not None:
                 _safe_remove_private_staging(parent_fd, identity)
             raise
     raise OSError(errno.EEXIST, "unable to reserve private staging directory")
@@ -3512,13 +4241,6 @@ def _safe_remove_private_staging(parent_fd: int, staging: _PrivateStaging) -> No
         current = os.stat(staging.name, dir_fd=parent_fd, follow_symlinks=False)
         if _same_staging(current, staging):
             os.rmdir(staging.name, dir_fd=parent_fd)
-    except OSError:
-        return
-
-
-def _safe_rmdir_unidentified_private_staging(parent_fd: int, name: str) -> None:
-    try:
-        os.rmdir(name, dir_fd=parent_fd)
     except OSError:
         return
 

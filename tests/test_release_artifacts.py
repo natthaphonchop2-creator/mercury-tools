@@ -956,6 +956,163 @@ def test_task13_trusted_git_runner_rejects_unallowlisted_executables_and_argv(
         runner.run(("git", "status"))
 
 
+def _make_foreign_same_tree_repository(root: Path, tmp_path: Path, *, ref: str) -> Path:
+    foreign = tmp_path / "foreign"
+    _run(["git", "clone", str(root), str(foreign)], cwd=tmp_path)
+    _run(["git", "config", "user.name", "Release Fixture"], cwd=foreign)
+    _run(["git", "config", "user.email", "release-fixture@example.test"], cwd=foreign)
+    tree = _run(["git", "rev-parse", "HEAD^{tree}"], cwd=foreign)
+    replacement_commit = _run(
+        ["git", "commit-tree", tree, "-m", "foreign same-tree candidate"],
+        cwd=foreign,
+    )
+    _run(["git", "update-ref", ref, replacement_commit], cwd=foreign)
+    assert tree == _run(["git", "rev-parse", "HEAD^{tree}"], cwd=root)
+    assert replacement_commit != _run(["git", "rev-parse", "HEAD"], cwd=root)
+    assert (foreign / ".git" / ref).is_file()
+    return foreign
+
+
+def _symlink_metadata_path(link: Path, target: Path, *, directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"symlink support unavailable: {exc}")
+
+
+def _replace_ref_and_object_store_with_foreign(
+    git_dir: Path,
+    foreign_git_dir: Path,
+    *,
+    ref: str,
+) -> None:
+    local_ref = git_dir / ref
+    assert local_ref.is_file()
+    local_ref.unlink()
+    _symlink_metadata_path(local_ref, foreign_git_dir / ref)
+    local_objects = git_dir / "objects"
+    local_objects.rename(git_dir / "objects-original")
+    _symlink_metadata_path(
+        local_objects,
+        foreign_git_dir / "objects",
+        directory=True,
+    )
+
+
+def test_release_candidate_rejects_foreign_same_tree_loose_ref_and_object_store(
+    tmp_path: Path,
+) -> None:
+    root = make_release_tree(tmp_path)
+    foreign = _make_foreign_same_tree_repository(root, tmp_path, ref="refs/heads/main")
+    _replace_ref_and_object_store_with_foreign(
+        root / ".git",
+        foreign / ".git",
+        ref="refs/heads/main",
+    )
+
+    with pytest.raises(ReleaseGateError, match="^release_repository_invalid$"):
+        release_artifacts.load_release_candidate(
+            root,
+            version=VERSION,
+            require_clean=True,
+        )
+
+
+def test_linked_release_candidate_rejects_foreign_same_tree_ref_and_object_store(
+    tmp_path: Path,
+) -> None:
+    root = make_release_tree(tmp_path)
+    ref = "refs/heads/release-linked"
+    _run(["git", "branch", "release-linked"], cwd=root)
+    linked = tmp_path / "linked-candidate"
+    _run(["git", "worktree", "add", str(linked), "release-linked"], cwd=root)
+    foreign = _make_foreign_same_tree_repository(root, tmp_path, ref=ref)
+    _replace_ref_and_object_store_with_foreign(
+        root / ".git",
+        foreign / ".git",
+        ref=ref,
+    )
+
+    with pytest.raises(ReleaseGateError, match="^release_repository_invalid$"):
+        release_artifacts.load_release_candidate(
+            linked,
+            version=VERSION,
+            require_clean=True,
+        )
+
+
+def test_release_git_runner_rechecks_metadata_after_git_operation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_release_tree(tmp_path)
+    foreign = _make_foreign_same_tree_repository(root, tmp_path, ref="refs/heads/main")
+    runner = release_artifacts._ReleaseGitRunner.for_repository(root)
+    original_run = release_artifacts._run_exact_environment_command
+    replaced = False
+
+    def replace_metadata_after_git_operation(*args: object, **kwargs: object):
+        nonlocal replaced
+        result = original_run(*args, **kwargs)
+        if not replaced:
+            replaced = True
+            _replace_ref_and_object_store_with_foreign(
+                root / ".git",
+                foreign / ".git",
+                ref="refs/heads/main",
+            )
+        return result
+
+    monkeypatch.setattr(
+        release_artifacts,
+        "_run_exact_environment_command",
+        replace_metadata_after_git_operation,
+    )
+
+    with pytest.raises(ReleaseGateError, match="^release_repository_invalid$"):
+        runner.run(("rev-parse", "--verify", "HEAD"))
+
+    assert replaced
+
+
+def test_linked_release_git_runner_rechecks_metadata_after_git_operation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_release_tree(tmp_path)
+    ref = "refs/heads/release-linked"
+    _run(["git", "branch", "release-linked"], cwd=root)
+    linked = tmp_path / "linked-candidate"
+    _run(["git", "worktree", "add", str(linked), "release-linked"], cwd=root)
+    foreign = _make_foreign_same_tree_repository(root, tmp_path, ref=ref)
+    runner = release_artifacts._ReleaseGitRunner.for_repository(linked)
+    original_run = release_artifacts._run_exact_environment_command
+    replaced = False
+
+    def replace_metadata_after_git_operation(*args: object, **kwargs: object):
+        nonlocal replaced
+        result = original_run(*args, **kwargs)
+        if not replaced:
+            replaced = True
+            _replace_ref_and_object_store_with_foreign(
+                root / ".git",
+                foreign / ".git",
+                ref=ref,
+            )
+        return result
+
+    monkeypatch.setattr(
+        release_artifacts,
+        "_run_exact_environment_command",
+        replace_metadata_after_git_operation,
+    )
+
+    with pytest.raises(ReleaseGateError, match="^release_repository_invalid$"):
+        runner.run(("rev-parse", "--verify", "HEAD"))
+
+    assert replaced
+
+
 def test_release_candidate_rejects_repointed_dot_git_to_foreign_same_tree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1020,6 +1177,24 @@ def test_release_candidate_rejects_git_alternates_without_output(
         build_release_artifacts(root, version=VERSION, output=output)
 
     assert not output.exists()
+
+
+def test_release_candidate_rejects_local_git_config_include(tmp_path: Path) -> None:
+    root = make_release_tree(tmp_path)
+    foreign_config = tmp_path / "foreign.gitconfig"
+    foreign_config.write_text("[advice]\n\tstatusHints = false\n", encoding="utf-8")
+    config = root / ".git" / "config"
+    config.write_text(
+        config.read_text(encoding="utf-8") + f"\n[include]\n\tpath = {foreign_config}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReleaseGateError, match="^release_repository_invalid$"):
+        release_artifacts.load_release_candidate(
+            root,
+            version=VERSION,
+            require_clean=True,
+        )
 
 
 def test_release_candidate_rejects_submodule_gitdir_pointer(tmp_path: Path) -> None:
@@ -1516,12 +1691,21 @@ def test_publish_cleans_staging_when_its_initial_open_fails(
 
     assert failed
     assert not output.exists()
-    assert _private_staging_paths(parent) == []
+    staging_paths = _private_staging_paths(parent)
+    assert len(staging_paths) == 1
+    assert staging_paths[0].is_dir()
+    assert list(staging_paths[0].iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    "foreign_contents",
+    (None, "external\n"),
+    ids=("empty_foreign_directory", "non_empty_foreign_directory"),
+)
 def test_preidentity_staging_open_failure_never_removes_external_competitor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    foreign_contents: str | None,
 ) -> None:
     source = tmp_path / "owned-source"
     _write_owned_publish_tree(source)
@@ -1530,7 +1714,8 @@ def test_preidentity_staging_open_failure_never_removes_external_competitor(
     output = parent / "release"
     external = tmp_path / "external-target"
     external.mkdir()
-    (external / "keep.txt").write_text("external\n", encoding="utf-8")
+    if foreign_contents is not None:
+        (external / "keep.txt").write_text(foreign_contents, encoding="utf-8")
     original_open = release_artifacts._open_directory_at_no_follow
     staging_path: list[Path] = []
 
@@ -1560,7 +1745,11 @@ def test_preidentity_staging_open_failure_never_removes_external_competitor(
         _close_output_destination(destination)
 
     assert len(staging_path) == 1
-    assert (staging_path[0] / "keep.txt").read_text(encoding="utf-8") == "external\n"
+    assert staging_path[0].is_dir()
+    if foreign_contents is None:
+        assert list(staging_path[0].iterdir()) == []
+    else:
+        assert (staging_path[0] / "keep.txt").read_text(encoding="utf-8") == foreign_contents
     if before is not None and after is not None:
         assert after <= before
     assert not output.exists()
@@ -1623,16 +1812,28 @@ def test_publish_never_stats_private_staging_before_no_follow_identity(
     assert _private_staging_paths(parent) == []
 
 
-def test_publish_cleans_staging_when_its_initial_fstat_fails(
+@pytest.mark.parametrize(
+    "foreign_contents",
+    (None, "external\n"),
+    ids=("empty_foreign_directory", "non_empty_foreign_directory"),
+)
+def test_preidentity_staging_fstat_failure_never_removes_substituted_foreign_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    foreign_contents: str | None,
 ) -> None:
     source = tmp_path / "owned-source"
     _write_owned_publish_tree(source)
     parent = tmp_path / "output-parent"
     parent.mkdir()
     output = parent / "release"
+    external = tmp_path / "external-target"
+    external.mkdir()
+    if foreign_contents is not None:
+        (external / "keep.txt").write_text(foreign_contents, encoding="utf-8")
     staging_fds: set[int] = set()
+    staging_names: list[str] = []
+    staging_paths: list[Path] = []
     original_open = release_artifacts._open_directory_at_no_follow
     original_fstat = release_artifacts.os.fstat
     failed = False
@@ -1641,13 +1842,18 @@ def test_publish_cleans_staging_when_its_initial_fstat_fails(
         fd = original_open(parent_fd, name)
         if name.startswith(release_artifacts._STAGING_NAME_PREFIX):
             staging_fds.add(fd)
+            staging_names.append(name)
         return fd
 
     def fail_initial_staging_fstat(fd: int):
         nonlocal failed
         if fd in staging_fds and not failed:
             failed = True
-            raise OSError("staging fstat failure")
+            staging = parent / staging_names[0]
+            staging.rmdir()
+            external.rename(staging)
+            staging_paths.append(staging)
+            raise OSError("staging fstat failure after replacement")
         return original_fstat(fd)
 
     monkeypatch.setattr(
@@ -1666,15 +1872,20 @@ def test_publish_cleans_staging_when_its_initial_fstat_fails(
         after = _open_file_descriptor_count()
     finally:
         _close_output_destination(destination)
-        for fd in staging_fds:
-            with contextlib.suppress(OSError):
-                os.close(fd)
 
     assert failed
+    assert len(staging_paths) == 1
+    assert staging_paths[0].is_dir()
+    if foreign_contents is None:
+        assert list(staging_paths[0].iterdir()) == []
+    else:
+        assert (staging_paths[0] / "keep.txt").read_text(encoding="utf-8") == foreign_contents
     if before is not None and after is not None:
         assert after <= before
     assert not output.exists()
-    assert _private_staging_paths(parent) == []
+    for fd in staging_fds:
+        with pytest.raises(OSError):
+            os.fstat(fd)
 
 
 def test_publish_closes_source_fd_when_fstat_fails(

@@ -586,17 +586,16 @@ def _initialize_history_free_repository(stage: Path, epoch: int) -> None:
     result = initializer.run_unbound(("init", "--initial-branch=main"))
     if result.exit_code != 0:
         raise ReleaseGateError("staging_repository_init_failed")
-    runner = _ReleaseGitRunner.for_repository(stage)
     commands = (
         ("config", "user.name", "Mercury Release"),
         ("config", "user.email", "release@mercury.invalid"),
         ("add", "--all"),
     )
     for command in commands:
-        result = runner.run(command)
+        result = initializer.run_unbound(command)
         if result.exit_code != 0:
             raise ReleaseGateError("staging_repository_init_failed")
-    result = runner.run(
+    result = initializer.run_unbound(
         ("commit", "--quiet", "-m", "Mercury public staging"),
         extra_environment={
             "GIT_AUTHOR_DATE": f"{epoch} +0000",
