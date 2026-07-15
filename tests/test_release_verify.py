@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 from test_release_artifacts import (
     VERSION,
+    _commit_release_tree,
     _run,
     install_task13_runner,
     make_release_tree,
@@ -166,8 +167,7 @@ def test_release_tree_rejects_moving_plugin_ref(tmp_path: Path) -> None:
         "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@main"
     )
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    _run(["git", "add", str(path.relative_to(root))], cwd=root)
-    _run(["git", "commit", "-m", "moving plugin ref"], cwd=root)
+    _commit_release_tree(root, "moving plugin ref")
 
     with pytest.raises(ReleaseGateError, match="^plugin_ref_not_immutable$"):
         verify_release_tree(root, version=VERSION)

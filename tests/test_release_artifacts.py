@@ -61,6 +61,12 @@ _FIXTURE_PYTHON_VERSION = platform.python_version()
 _FIXTURE_STDLIB_VERSION = sysconfig.get_python_version()
 _FIXTURE_ZLIB_RUNTIME_VERSION = zlib.ZLIB_RUNTIME_VERSION
 _ZERO_SHA256 = "0" * 64
+_NO_AUTO_MAINTENANCE = (
+    "-c",
+    "maintenance.auto=false",
+    "-c",
+    "gc.auto=0",
+)
 
 
 def _run(argv: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> str:
@@ -417,9 +423,52 @@ def _install_exact_build_toolchain_fixture(root: Path) -> None:
     pyproject.write_text(source, encoding="utf-8")
 
 
-def _commit_release_tree(root: Path, message: str) -> None:
+def _commit_release_tree(
+    root: Path,
+    message: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> None:
     _run(["git", "add", "-A"], cwd=root)
-    _run(["git", "commit", "-m", message], cwd=root)
+    _run(
+        ["git", *_NO_AUTO_MAINTENANCE, "commit", "-m", message],
+        cwd=root,
+        env=env,
+    )
+
+
+def test_release_fixture_commit_disables_background_auto_maintenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_env = {"GIT_AUTHOR_DATE": FIXTURE_TIMESTAMP}
+    calls: list[tuple[list[str], dict[str, str] | None]] = []
+
+    def capture(argv: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> str:
+        assert cwd == tmp_path
+        calls.append((argv, env))
+        return ""
+
+    monkeypatch.setattr(sys.modules[__name__], "_run", capture)
+
+    _commit_release_tree(tmp_path, "stable fixture", env=fixture_env)
+
+    assert calls == [
+        (["git", "add", "-A"], None),
+        (
+            [
+                "git",
+                "-c",
+                "maintenance.auto=false",
+                "-c",
+                "gc.auto=0",
+                "commit",
+                "-m",
+                "stable fixture",
+            ],
+            fixture_env,
+        ),
+    ]
 
 
 def make_unpinned_release_tree(tmp_path: Path) -> Path:
@@ -464,13 +513,12 @@ def make_release_tree(tmp_path: Path) -> Path:
     _run(["git", "init", "--initial-branch", "main"], cwd=root)
     _run(["git", "config", "user.name", "Release Fixture"], cwd=root)
     _run(["git", "config", "user.email", "release-fixture@example.test"], cwd=root)
-    _run(["git", "add", "-A"], cwd=root)
     fixture_env = {
         **os.environ,
         "GIT_AUTHOR_DATE": FIXTURE_TIMESTAMP,
         "GIT_COMMITTER_DATE": FIXTURE_TIMESTAMP,
     }
-    _run(["git", "commit", "-m", "release fixture"], cwd=root, env=fixture_env)
+    _commit_release_tree(root, "release fixture", env=fixture_env)
 
     (root / ".env").write_text("local-secret-state\n", encoding="utf-8")
     local_state = root / ".mercury"
