@@ -1,6 +1,6 @@
 {
   "name": "mercury-finance",
-  "version": "0.2.0+codex.20260711",
+  "version": "0.2.1+codex.20260713",
   "description": "Local ERP accounting tools for repository-scoped FlowAccount and PEAK work.",
   "author": {
     "name": "Mercury Agent",
@@ -21,7 +21,7 @@
   "interface": {
     "displayName": "Mercury Finance",
     "shortDescription": "Repository-local ERP tools for FlowAccount and PEAK workflows.",
-    "longDescription": "Mercury Finance runs one local stdio MCP for repository-scoped FlowAccount and PEAK setup, endpoint search, safe read actions, and approval-gated ERP writes. Credentials and execution audit data stay in the selected repository.",
+    "longDescription": "Mercury Finance runs one local stdio MCP for repository-scoped FlowAccount and PEAK setup, endpoint search, safe read actions, and approval-gated ERP writes. Credentials and execution audit data stay in the selected repository. Mercury Tools is an independent open-source project and is not affiliated with Mercury Technologies, Inc.",
     "developerName": "Mercury Agent",
     "category": "Finance",
     "capabilities": [

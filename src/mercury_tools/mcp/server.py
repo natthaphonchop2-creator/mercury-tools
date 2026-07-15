@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -17,6 +18,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
+from mercury_tools import __version__
 from mercury_tools.cloud.api import CloudDependencies, cloud_routes
 from mercury_tools.config import load_settings
 from mercury_tools.connectors.catalog import (
@@ -76,6 +78,7 @@ ENVIRONMENT_ENV_KEYS = ("environment", "connector_environment", "connector_env")
 CAPABILITY_KEYS = ("required_capabilities", "requiredCapabilities", "capabilities")
 CONNECTOR_BACKED_COMMANDS = {"connectorStatus"}
 CONNECTOR_TAGS = {"connector", "connectors", "connector-backed", "accounting-connector", "erp-connector"}
+_LOWER_HEX = frozenset("0123456789abcdef")
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -1990,8 +1993,13 @@ async def root(request: Request) -> Response:
 
 async def status(_: Request) -> Response:
     settings = load_settings()
+    deployment_commit = os.environ.get("MERCURY_DEPLOYMENT_COMMIT", "")
+    if len(deployment_commit) != 40 or not set(deployment_commit) <= _LOWER_HEX:
+        deployment_commit = None
     payload = {
         "name": "Mercury Tools MCP",
+        "version": __version__,
+        "deployment_commit": deployment_commit,
         "status": "ok",
         "supabase": settings.supabase_configured,
         "openai": settings.openai_configured,

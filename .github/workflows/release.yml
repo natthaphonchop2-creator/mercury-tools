@@ -1,0 +1,572 @@
+name: Release v0.2.1
+
+on:
+  workflow_dispatch:
+    inputs:
+      reviewed_main_sha:
+        description: Reviewed commit currently at origin/main and tagged v0.2.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: v0.2.1
+  RELEASE_VERSION: 0.2.1
+  UV_HTTP_TIMEOUT: "120"
+
+jobs:
+  validate-reviewed-sha:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      REVIEWED_MAIN_SHA: ${{ inputs.reviewed_main_sha }}
+    steps:
+      - name: Checkout reviewed commit with full history
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.reviewed_main_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Bind reviewed main and immutable annotated tag
+        run: |
+          set -euo pipefail
+          [[ "$REVIEWED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --force origin main "refs/tags/v0.2.1:refs/tags/v0.2.1"
+          test "$(git rev-parse HEAD)" = "$REVIEWED_MAIN_SHA"
+          test "$(git rev-parse origin/main)" = "$REVIEWED_MAIN_SHA"
+          test "$(git cat-file -t refs/tags/v0.2.1)" = "tag"
+          test "$(git rev-parse refs/tags/v0.2.1^{commit})" = "$REVIEWED_MAIN_SHA"
+          test -z "$(git status --porcelain)"
+
+  quality-security:
+    needs: validate-reviewed-sha
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      FLOWACCOUNT_SANDBOX_CLIENT_ID: ${{ secrets.FLOWACCOUNT_SANDBOX_CLIENT_ID }}
+      FLOWACCOUNT_SANDBOX_CLIENT_SECRET: ${{ secrets.FLOWACCOUNT_SANDBOX_CLIENT_SECRET }}
+      MERCURY_LIVE_FLOWACCOUNT: "0"
+      MERCURY_LIVE_FLOWACCOUNT_SANDBOX: "1"
+      MERCURY_LIVE_PEAK: "0"
+      REVIEWED_MAIN_SHA: ${{ inputs.reviewed_main_sha }}
+    steps:
+      - name: Checkout exact reviewed commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.reviewed_main_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install uv 0.11.9
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
+        with:
+          version: 0.11.9
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --extra dev --frozen
+      - name: Install pinned secret scanners
+        env:
+          GITLEAKS_URL: https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz
+          GITLEAKS_SHA256: 9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c
+          TRUFFLEHOG_URL: https://github.com/trufflesecurity/trufflehog/releases/download/v3.88.32/trufflehog_3.88.32_linux_amd64.tar.gz
+          TRUFFLEHOG_SHA256: cddd1f602da61a130580883f4dd96b3d206efaf55a22068321cc11237fbc88cd
+        run: |
+          set -euo pipefail
+          SCANNER_ROOT="$RUNNER_TEMP/mercury-scanners"
+          SCANNER_BIN="$SCANNER_ROOT/bin"
+          install -d -m 700 "$SCANNER_ROOT" "$SCANNER_BIN"
+          curl --fail --location --silent --show-error "$GITLEAKS_URL" \
+            --output "$SCANNER_ROOT/gitleaks.tar.gz"
+          printf '%s  %s\n' "$GITLEAKS_SHA256" "$SCANNER_ROOT/gitleaks.tar.gz" \
+            | sha256sum --check
+          curl --fail --location --silent --show-error "$TRUFFLEHOG_URL" \
+            --output "$SCANNER_ROOT/trufflehog.tar.gz"
+          printf '%s  %s\n' "$TRUFFLEHOG_SHA256" "$SCANNER_ROOT/trufflehog.tar.gz" \
+            | sha256sum --check
+          tar -xzf "$SCANNER_ROOT/gitleaks.tar.gz" -C "$SCANNER_BIN" gitleaks
+          tar -xzf "$SCANNER_ROOT/trufflehog.tar.gz" -C "$SCANNER_BIN" trufflehog
+          chmod 0555 "$SCANNER_BIN/gitleaks" "$SCANNER_BIN/trufflehog"
+          PATH="$SCANNER_BIN:$PATH"
+          export PATH
+          gitleaks version >"$SCANNER_ROOT/gitleaks-version.txt" 2>&1
+          trufflehog --version >"$SCANNER_ROOT/trufflehog-version.txt" 2>&1
+          printf '%s\n' "$SCANNER_BIN" >>"$GITHUB_PATH"
+      - name: Scan complete Git history
+        run: |
+          set -euo pipefail
+          SCAN_LOG="$RUNNER_TEMP/mercury-scanner-output"
+          install -d -m 700 "$SCAN_LOG"
+          if ! gitleaks git --no-banner --redact --exit-code 1 \
+            --log-opts="--all" . >"$SCAN_LOG/gitleaks-history.log" 2>&1; then
+            echo "secret gate failed: gitleaks_history"
+            exit 1
+          fi
+          if ! trufflehog git "file://$GITHUB_WORKSPACE" --no-update --fail \
+            >"$SCAN_LOG/trufflehog-history.log" 2>&1; then
+            echo "secret gate failed: trufflehog_history"
+            exit 1
+          fi
+      - name: Configure required repository-local sandbox credential
+        run: |
+          set -euo pipefail
+          test -n "$FLOWACCOUNT_SANDBOX_CLIENT_ID"
+          test -n "$FLOWACCOUNT_SANDBOX_CLIENT_SECRET"
+          uv run python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from mercury_tools.drivers.flowaccount import FlowAccountDriver
+          from mercury_tools.local.credentials import CredentialStore
+          from mercury_tools.local.repository import ensure_repository_state
+
+          context = ensure_repository_state(Path(".").resolve())
+          fields = FlowAccountDriver().credential_fields("sandbox")
+          values = {
+              "client_id": os.environ["FLOWACCOUNT_SANDBOX_CLIENT_ID"],
+              "client_secret": os.environ["FLOWACCOUNT_SANDBOX_CLIENT_SECRET"],
+          }
+          try:
+              CredentialStore(context).save("flowaccount", "sandbox", values, fields)
+          finally:
+              values.clear()
+          PY
+          uv run mercury credentials test flowaccount --env sandbox --repo-root . \
+            >"$RUNNER_TEMP/flowaccount-sandbox-status.json"
+      - name: Run all quality and release tests
+        run: |
+          set -euo pipefail
+          install -d -m 700 release-evidence
+          uv run ruff check .
+          uv run pytest -q --junitxml=release-evidence/pytest.xml
+          uv run python scripts/verify_test_skips.py \
+            --junit release-evidence/pytest.xml \
+            --waivers docs/release/v0.2.1-test-waivers.json
+          uv run mercury doctor --repo-root .
+          uv run python scripts/validate_release_plugin.py --root .
+          uv run python scripts/smoke_local_plugin.py
+      - name: Clear repository-local credentials
+        if: always()
+        run: |
+          uv run mercury credentials clear flowaccount --env sandbox --repo-root . \
+            >/dev/null 2>&1 || true
+
+  supabase-migration:
+    needs: quality-security
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      MERCURY_SUPABASE_TEST_GUARD: ${{ secrets.MERCURY_SUPABASE_TEST_GUARD }}
+      MERCURY_SUPABASE_TEST_ISOLATED: "1"
+      MERCURY_SUPABASE_VALIDATION_TEST: "1"
+      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+      SUPABASE_AUTHENTICATED_TEST_JWT: ${{ secrets.SUPABASE_AUTHENTICATED_TEST_JWT }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+    steps:
+      - name: Checkout exact reviewed commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.reviewed_main_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install uv 0.11.9
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
+        with:
+          version: 0.11.9
+          enable-cache: true
+      - name: Verify migration and isolated live store
+        run: |
+          set -euo pipefail
+          uv sync --extra dev --frozen
+          test -n "$SUPABASE_URL"
+          test -n "$SUPABASE_SERVICE_ROLE_KEY"
+          test -n "$SUPABASE_ANON_KEY"
+          test -n "$SUPABASE_AUTHENTICATED_TEST_JWT"
+          uv run pytest -q tests/test_validation_migration.py \
+            tests/integration/test_supabase_validation_knowledge.py \
+            --junitxml="$RUNNER_TEMP/supabase-migration.xml"
+          uv run python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(os.environ["RUNNER_TEMP"] + "/supabase-migration.xml").getroot()
+          if any(case.find("skipped") is not None for case in root.iter("testcase")):
+              raise SystemExit("required migration test skipped")
+          PY
+
+  flowaccount-coverage:
+    needs: supabase-migration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      FLOWACCOUNT_SANDBOX_CLIENT_ID: ${{ secrets.FLOWACCOUNT_SANDBOX_CLIENT_ID }}
+      FLOWACCOUNT_SANDBOX_CLIENT_SECRET: ${{ secrets.FLOWACCOUNT_SANDBOX_CLIENT_SECRET }}
+      MERCURY_LIVE_FLOWACCOUNT_SANDBOX: "1"
+    steps:
+      - name: Checkout exact reviewed commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.reviewed_main_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install uv 0.11.9
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
+        with:
+          version: 0.11.9
+          enable-cache: true
+      - name: Create exact sanitized FlowAccount coverage
+        run: |
+          set -euo pipefail
+          uv sync --extra dev --frozen
+          test -n "$FLOWACCOUNT_SANDBOX_CLIENT_ID"
+          test -n "$FLOWACCOUNT_SANDBOX_CLIENT_SECRET"
+          OUTPUT_PARENT="$RUNNER_TEMP/release-evidence/private"
+          install -d -m 700 "$OUTPUT_PARENT"
+          uv run python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from mercury_tools.drivers.flowaccount import FlowAccountDriver
+          from mercury_tools.local.credentials import CredentialStore
+          from mercury_tools.local.repository import ensure_repository_state
+
+          context = ensure_repository_state(Path(".").resolve())
+          fields = FlowAccountDriver().credential_fields("sandbox")
+          values = {
+              "client_id": os.environ["FLOWACCOUNT_SANDBOX_CLIENT_ID"],
+              "client_secret": os.environ["FLOWACCOUNT_SANDBOX_CLIENT_SECRET"],
+          }
+          try:
+              CredentialStore(context).save("flowaccount", "sandbox", values, fields)
+          finally:
+              values.clear()
+          PY
+          uv run mercury credentials test flowaccount --env sandbox --repo-root . \
+            >"$OUTPUT_PARENT/credential-status.json"
+          uv run pytest -q tests/integration/test_flowaccount_sandbox_qualification.py \
+            --junitxml="$OUTPUT_PARENT/flowaccount-live.xml"
+          uv run mercury catalog qualify --connector flowaccount --env sandbox --all \
+            --repo-root . >"$OUTPUT_PARENT/flowaccount-qualification.json"
+          uv run python - <<'PY'
+          import json
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "release-evidence" / "private"
+          junit = ET.parse(root / "flowaccount-live.xml").getroot()
+          if any(case.find("skipped") is not None for case in junit.iter("testcase")):
+              raise SystemExit("required live sandbox test skipped")
+          report = json.loads((root / "flowaccount-qualification.json").read_text())
+          if report.get("total") != 190 or len(report.get("records", [])) != 190:
+              raise SystemExit("flowaccount coverage mismatch")
+          PY
+      - name: Clear repository-local credentials
+        if: always()
+        run: |
+          uv run mercury credentials clear flowaccount --env sandbox --repo-root . \
+            >/dev/null 2>&1 || true
+      - name: Retain sanitized coverage only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: flowaccount-sanitized-coverage
+          path: ${{ runner.temp }}/release-evidence/private/flowaccount-qualification.json
+          if-no-files-found: error
+          retention-days: 1
+
+  peak-contract:
+    needs: flowaccount-coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact reviewed commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.reviewed_main_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install uv 0.11.9
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
+        with:
+          version: 0.11.9
+          enable-cache: true
+      - name: Create exact PEAK contract report
+        run: |
+          set -euo pipefail
+          uv sync --extra dev --frozen
+          OUTPUT_PARENT="$RUNNER_TEMP/release-evidence/private"
+          install -d -m 700 "$OUTPUT_PARENT"
+          uv run mercury catalog validate --connector peak --all --repo-root . \
+            >"$OUTPUT_PARENT/peak-contract-validation.json"
+          uv run python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "release-evidence" / "private" /
+               "peak-contract-validation.json").read_text()
+          )
+          if report.get("total") != 64 or report.get("http_attempts") != 0:
+              raise SystemExit("peak contract coverage mismatch")
+          PY
+      - name: Retain PEAK contract report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: peak-contract-coverage
+          path: ${{ runner.temp }}/release-evidence/private/peak-contract-validation.json
+          if-no-files-found: error
+          retention-days: 1
+
+  build-artifacts:
+    needs: peak-contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      MERCURY_MARKETPLACE_SNAPSHOT_URL: ${{ secrets.MERCURY_MARKETPLACE_SNAPSHOT_URL }}
+      MERCURY_PUBLIC_MCP_TOKEN: ${{ secrets.MERCURY_PUBLIC_MCP_TOKEN }}
+      MERCURY_PUBLIC_MCP_URL: ${{ secrets.MERCURY_PUBLIC_MCP_URL }}
+      MERCURY_RELEASE_KNOWLEDGE_TABLES: ${{ vars.MERCURY_RELEASE_KNOWLEDGE_TABLES }}
+      MERCURY_RELEASE_STORAGE_BUCKETS: ${{ vars.MERCURY_RELEASE_STORAGE_BUCKETS }}
+      MERCURY_RENDER_API_URL: https://api.render.com
+      MERCURY_RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+      RENDER_API_KEY: ${{ secrets.RENDER_API_TOKEN }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+    steps:
+      - name: Checkout exact reviewed commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.reviewed_main_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install checksum-verified scanners for the pinned build runtime
+        env:
+          GITLEAKS_URL: https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz
+          GITLEAKS_SHA256: 9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c
+          TRUFFLEHOG_URL: https://github.com/trufflesecurity/trufflehog/releases/download/v3.88.32/trufflehog_3.88.32_linux_amd64.tar.gz
+          TRUFFLEHOG_SHA256: cddd1f602da61a130580883f4dd96b3d206efaf55a22068321cc11237fbc88cd
+        run: |
+          set -euo pipefail
+          SCANNER_ROOT="$RUNNER_TEMP/mercury-scanners"
+          SCANNER_BIN="$SCANNER_ROOT/bin"
+          install -d -m 700 "$SCANNER_ROOT" "$SCANNER_BIN"
+          curl --fail --location --silent --show-error "$GITLEAKS_URL" \
+            --output "$SCANNER_ROOT/gitleaks.tar.gz"
+          printf '%s  %s\n' "$GITLEAKS_SHA256" "$SCANNER_ROOT/gitleaks.tar.gz" \
+            | sha256sum --check
+          curl --fail --location --silent --show-error "$TRUFFLEHOG_URL" \
+            --output "$SCANNER_ROOT/trufflehog.tar.gz"
+          printf '%s  %s\n' "$TRUFFLEHOG_SHA256" "$SCANNER_ROOT/trufflehog.tar.gz" \
+            | sha256sum --check
+          tar -xzf "$SCANNER_ROOT/gitleaks.tar.gz" -C "$SCANNER_BIN" gitleaks
+          tar -xzf "$SCANNER_ROOT/trufflehog.tar.gz" -C "$SCANNER_BIN" trufflehog
+          chmod 0555 "$SCANNER_BIN/gitleaks" "$SCANNER_BIN/trufflehog"
+      - name: Build and verify through the candidate-controlled platform
+        env:
+          REVIEWED_MAIN_SHA: ${{ inputs.reviewed_main_sha }}
+        run: |
+          set -euo pipefail
+          RELEASE_IMAGE="docker.io/library/python@sha256:fd95fa221297a88e1cf49c55ec1828edd7c5a428187e67b5d1805692d11588db"
+          OUTPUT_PARENT="$RUNNER_TEMP/release-evidence/private"
+          install -d -m 700 "$OUTPUT_PARENT"
+          test "$(stat -c '%a' "$OUTPUT_PARENT")" = "700"
+          test ! -e "$OUTPUT_PARENT/artifacts"
+          test "$(git rev-parse HEAD)" = "$REVIEWED_MAIN_SHA"
+          docker run --rm --platform linux/amd64 \
+            --user "$(id -u):$(id -g)" \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --volume "$RUNNER_TEMP/mercury-scanners/bin:/release-bin:ro" \
+            --volume "$OUTPUT_PARENT:/release-output" \
+            --workdir /workspace \
+            --env GH_TOKEN --env MERCURY_MARKETPLACE_SNAPSHOT_URL \
+            --env MERCURY_PUBLIC_MCP_TOKEN --env MERCURY_PUBLIC_MCP_URL \
+            --env MERCURY_RELEASE_KNOWLEDGE_TABLES \
+            --env MERCURY_RELEASE_STORAGE_BUCKETS \
+            --env MERCURY_RENDER_API_URL --env MERCURY_RENDER_SERVICE_ID \
+            --env RENDER_API_KEY --env SUPABASE_SERVICE_ROLE_KEY --env SUPABASE_URL \
+            --env HOME=/tmp/mercury-home --env UV_CACHE_DIR=/tmp/uv-cache \
+            --env UV_HTTP_TIMEOUT=120 --env UV_PYTHON=/usr/local/bin/python3.12 \
+            --env UV_PYTHON_DOWNLOADS=never \
+            "$RELEASE_IMAGE" sh -ceu '
+              export PATH="/release-bin:$PATH"
+              release-toolchain/uv-linux-x86_64 run --frozen --no-dev python \
+                scripts/build_release_artifacts.py --version 0.2.1 \
+                --output /release-output/artifacts
+              release-toolchain/uv-linux-x86_64 run --frozen --no-dev python \
+                scripts/verify_release.py --version 0.2.1 \
+                --artifacts /release-output/artifacts
+            '
+      - name: Retain verified release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mercury-v0.2.1-release-artifacts
+          path: ${{ runner.temp }}/release-evidence/private/artifacts
+          if-no-files-found: error
+          retention-days: 1
+
+  public-staging:
+    needs: build-artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      MERCURY_MARKETPLACE_SNAPSHOT_URL: ${{ secrets.MERCURY_MARKETPLACE_SNAPSHOT_URL }}
+      MERCURY_PUBLIC_MCP_TOKEN: ${{ secrets.MERCURY_PUBLIC_MCP_TOKEN }}
+      MERCURY_PUBLIC_MCP_URL: ${{ secrets.MERCURY_PUBLIC_MCP_URL }}
+      MERCURY_RENDER_API_URL: https://api.render.com
+      MERCURY_RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+      RENDER_API_KEY: ${{ secrets.RENDER_API_TOKEN }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+    steps:
+      - name: Checkout exact reviewed commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.reviewed_main_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download verified artifacts into a private parent
+        run: install -d -m 700 "$RUNNER_TEMP/release-evidence/private"
+      - name: Download exact release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: mercury-v0.2.1-release-artifacts
+          path: ${{ runner.temp }}/release-evidence/private/artifacts
+      - name: Install checksum-verified staging scanners
+        env:
+          GITLEAKS_URL: https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz
+          GITLEAKS_SHA256: 9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c
+          TRUFFLEHOG_URL: https://github.com/trufflesecurity/trufflehog/releases/download/v3.88.32/trufflehog_3.88.32_linux_amd64.tar.gz
+          TRUFFLEHOG_SHA256: cddd1f602da61a130580883f4dd96b3d206efaf55a22068321cc11237fbc88cd
+        run: |
+          set -euo pipefail
+          SCANNER_ROOT="$RUNNER_TEMP/mercury-scanners"
+          SCANNER_BIN="$SCANNER_ROOT/bin"
+          install -d -m 700 "$SCANNER_ROOT" "$SCANNER_BIN"
+          curl --fail --location --silent --show-error "$GITLEAKS_URL" \
+            --output "$SCANNER_ROOT/gitleaks.tar.gz"
+          printf '%s  %s\n' "$GITLEAKS_SHA256" "$SCANNER_ROOT/gitleaks.tar.gz" \
+            | sha256sum --check
+          curl --fail --location --silent --show-error "$TRUFFLEHOG_URL" \
+            --output "$SCANNER_ROOT/trufflehog.tar.gz"
+          printf '%s  %s\n' "$TRUFFLEHOG_SHA256" "$SCANNER_ROOT/trufflehog.tar.gz" \
+            | sha256sum --check
+          tar -xzf "$SCANNER_ROOT/gitleaks.tar.gz" -C "$SCANNER_BIN" gitleaks
+          tar -xzf "$SCANNER_ROOT/trufflehog.tar.gz" -C "$SCANNER_BIN" trufflehog
+          chmod 0555 "$SCANNER_BIN/gitleaks" "$SCANNER_BIN/trufflehog"
+      - name: Build history-free public staging through the pinned platform
+        run: |
+          set -euo pipefail
+          RELEASE_IMAGE="docker.io/library/python@sha256:fd95fa221297a88e1cf49c55ec1828edd7c5a428187e67b5d1805692d11588db"
+          OUTPUT_PARENT="$RUNNER_TEMP/release-evidence/private"
+          test ! -e "$OUTPUT_PARENT/public-staging"
+          docker run --rm --platform linux/amd64 \
+            --user "$(id -u):$(id -g)" \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --volume "$RUNNER_TEMP/mercury-scanners/bin:/release-bin:ro" \
+            --volume "$OUTPUT_PARENT:/release-output" \
+            --workdir /workspace \
+            --env GH_TOKEN --env MERCURY_MARKETPLACE_SNAPSHOT_URL \
+            --env MERCURY_PUBLIC_MCP_TOKEN --env MERCURY_PUBLIC_MCP_URL \
+            --env MERCURY_RENDER_API_URL --env MERCURY_RENDER_SERVICE_ID \
+            --env RENDER_API_KEY --env SUPABASE_SERVICE_ROLE_KEY --env SUPABASE_URL \
+            --env HOME=/tmp/mercury-home --env UV_CACHE_DIR=/tmp/uv-cache \
+            --env UV_HTTP_TIMEOUT=120 --env UV_PYTHON=/usr/local/bin/python3.12 \
+            --env UV_PYTHON_DOWNLOADS=never \
+            "$RELEASE_IMAGE" sh -ceu '
+              export PATH="/release-bin:$PATH"
+              release-toolchain/uv-linux-x86_64 run --frozen --no-dev python \
+                scripts/build_public_staging.py --version 0.2.1 \
+                --artifacts /release-output/artifacts \
+                --output /release-output/public-staging
+            '
+
+  tagged-marketplace:
+    needs: public-staging
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact reviewed commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.reviewed_main_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install uv 0.11.9
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
+        with:
+          version: 0.11.9
+          enable-cache: true
+      - name: Install exact tagged marketplace plugin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          uv sync --extra dev --frozen
+          uv run python scripts/smoke_tagged_marketplace.py \
+            --repo natthaphonchop2-creator/mercury-tools \
+            --tag v0.2.1 --expected-tools 19
+
+  render-release:
+    needs: tagged-marketplace
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      MERCURY_TOOLS_HTTP_BEARER_TOKEN: ${{ secrets.MERCURY_TOOLS_HTTP_BEARER_TOKEN }}
+      RENDER_API_TOKEN: ${{ secrets.RENDER_API_TOKEN }}
+      RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+      REVIEWED_MAIN_SHA: ${{ inputs.reviewed_main_sha }}
+    steps:
+      - name: Checkout exact reviewed commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.reviewed_main_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install uv 0.11.9
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
+        with:
+          version: 0.11.9
+          enable-cache: true
+      - name: Verify mandatory health and exact deployed commit
+        run: |
+          set -euo pipefail
+          uv sync --extra dev --frozen
+          uv run python scripts/verify_render_release.py \
+            --url https://mercury-tools-mcp.onrender.com \
+            --version 0.2.1 --commit "$REVIEWED_MAIN_SHA"
+
+  publish-assets:
+    needs: render-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout exact reviewed commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.reviewed_main_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Create private release output parent
+        run: install -d -m 700 "$RUNNER_TEMP/release-evidence/private"
+      - name: Download verified release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: mercury-v0.2.1-release-artifacts
+          path: ${{ runner.temp }}/release-evidence/private/artifacts
+      - name: Publish assets only after every release gate
+        run: |
+          set -euo pipefail
+          ARTIFACT_ROOT="$RUNNER_TEMP/release-evidence/private/artifacts"
+          test "$(git rev-parse refs/tags/v0.2.1^{commit})" = \
+            "${{ inputs.reviewed_main_sha }}"
+          gh release create "$RELEASE_TAG" "$ARTIFACT_ROOT"/* \
+            --verify-tag --title "Mercury Finance v0.2.1" \
+            --notes-file docs/RELEASE_V0.2.1.md

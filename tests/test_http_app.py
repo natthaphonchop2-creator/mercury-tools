@@ -1,6 +1,7 @@
 import pytest
 from starlette.testclient import TestClient
 
+from mercury_tools import __version__
 from mercury_tools.flows.templates import COMPANY_HEALTH_TEMPLATE
 from mercury_tools.mcp.server import create_http_app
 
@@ -17,6 +18,7 @@ def _clear_live_env(monkeypatch) -> None:
         "MERCURY_CONNECT_INVITE_CODE",
         "MERCURY_CONNECT_SIGNING_SECRET",
         "MERCURY_CLOUD_BASE_URL",
+        "MERCURY_DEPLOYMENT_COMMIT",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API", "true")
@@ -46,6 +48,26 @@ def test_remote_http_app_exposes_healthz(monkeypatch) -> None:
     assert response.json()["mcp_path"] == "/mcp"
     assert "private_mcp" not in response.json()
     assert client.post("/private-mcp").status_code == 404
+
+
+def test_status_exposes_exact_package_version_and_deployment_commit(monkeypatch) -> None:
+    commit = "a" * 40
+    monkeypatch.setenv("MERCURY_DEPLOYMENT_COMMIT", commit)
+
+    payload = TestClient(create_http_app(require_auth=False)).get("/api/status").json()
+
+    assert payload["version"] == __version__ == "0.2.1"
+    assert payload["deployment_commit"] == commit
+
+
+@pytest.mark.parametrize("value", ("main", "A" * 40, "a" * 39, "a" * 41))
+def test_status_rejects_unbounded_deployment_commit_values(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("MERCURY_DEPLOYMENT_COMMIT", value)
+
+    payload = TestClient(create_http_app(require_auth=False)).get("/api/status").json()
+
+    assert payload["deployment_commit"] is None
+    assert value not in str(payload)
 
 
 def test_public_contest_app_does_not_mount_legacy_http_api(monkeypatch) -> None:

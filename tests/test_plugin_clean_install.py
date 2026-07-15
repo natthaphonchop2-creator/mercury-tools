@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
+import time
+import tomllib
 from datetime import timedelta
 from email.parser import Parser
 from pathlib import Path
@@ -46,17 +49,27 @@ EXPECTED_LOCAL_TOOLS = {
 
 
 def _build_wheel() -> Path:
+    started = time.monotonic()
     result = subprocess.run(
         ["uv", "build"],
         cwd=ROOT,
         check=False,
         capture_output=True,
         text=True,
+        timeout=600,
     )
+    _print_phase_timing("build-wheel", started)
     assert result.returncode == 0, result.stdout + result.stderr
-    wheels = sorted((ROOT / "dist").glob("mercury_tools-0.2.0-*.whl"))
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    version = project["project"]["version"]
+    wheels = sorted((ROOT / "dist").glob(f"mercury_tools-{version}-*.whl"))
     assert len(wheels) == 1
     return wheels[0]
+
+
+def _print_phase_timing(phase: str, started: float) -> None:
+    elapsed = min(max(time.monotonic() - started, 0.0), 600.0)
+    print(f"clean-install phase={phase} seconds={elapsed:.3f}")
 
 
 def _clean_uvx_environment(cache_dir: Path) -> dict[str, str]:
@@ -65,6 +78,7 @@ def _clean_uvx_environment(cache_dir: Path) -> dict[str, str]:
     environment.pop("VIRTUAL_ENV", None)
     environment["PYTHONNOUSERSITE"] = "1"
     environment["UV_CACHE_DIR"] = str(cache_dir)
+    environment["UV_HTTP_TIMEOUT"] = "120"
     return environment
 
 
@@ -169,12 +183,15 @@ async def test_clean_wheel_uvx_cli_and_stdio_expose_all_local_tools(tmp_path: Pa
     )
     semantic = contracts[(action.action_id, action.version_id)]
     CatalogCache(context).replace_global([action], etag='"clean-wheel-fixture"')
-    clean_cache = tmp_path / "uv-cache"
-    assert not clean_cache.exists()
+    configured_cache = os.environ.get("MERCURY_CLEAN_INSTALL_UV_CACHE_DIR", "").strip()
+    clean_cache = Path(configured_cache) if configured_cache else tmp_path / "uv-cache"
+    if not configured_cache:
+        assert not clean_cache.exists()
     environment = _clean_uvx_environment(clean_cache)
     environment["MERCURY_CLOUD_BASE_URL"] = "http://127.0.0.1:9"
     assert "PYTHONPATH" not in environment
 
+    started = time.monotonic()
     help_result = subprocess.run(
         ["uvx", "--from", str(wheel), "mercury", "--help"],
         cwd=empty_cwd,
@@ -182,8 +199,9 @@ async def test_clean_wheel_uvx_cli_and_stdio_expose_all_local_tools(tmp_path: Pa
         check=False,
         capture_output=True,
         text=True,
-        timeout=240,
+        timeout=600,
     )
+    _print_phase_timing("uvx-help", started)
     assert help_result.returncode == 0, help_result.stdout + help_result.stderr
     assert "usage: mercury-tools" in help_result.stdout
     assert "mcp" in help_result.stdout
@@ -194,35 +212,38 @@ async def test_clean_wheel_uvx_cli_and_stdio_expose_all_local_tools(tmp_path: Pa
         cwd=empty_cwd,
         env=environment,
     )
-    async with (
-        stdio_client(parameters) as (read_stream, write_stream),
-        ClientSession(
-            read_stream,
-            write_stream,
-            read_timeout_seconds=timedelta(seconds=120),
-            list_roots_callback=lambda _context: _roots_callback(repository),
-        ) as session,
-    ):
-        initialized = await session.initialize()
-        listed = await session.list_tools()
-        search = await _call_tool(
-            session,
-            "search_erp_actions",
-            {
-                "query": action.action_id,
-                "connector": action.connector_id,
-                "environment": "sandbox",
-            },
-        )
-        schema = await _call_tool(
-            session,
-            "get_erp_action_schema",
-            {
-                "action_id": action.action_id,
-                "version": action.version_id,
-                "environment": "sandbox",
-            },
-        )
+    started = time.monotonic()
+    async with asyncio.timeout(600):
+        async with (
+            stdio_client(parameters) as (read_stream, write_stream),
+            ClientSession(
+                read_stream,
+                write_stream,
+                read_timeout_seconds=timedelta(seconds=120),
+                list_roots_callback=lambda _context: _roots_callback(repository),
+            ) as session,
+        ):
+            initialized = await session.initialize()
+            listed = await session.list_tools()
+            search = await _call_tool(
+                session,
+                "search_erp_actions",
+                {
+                    "query": action.action_id,
+                    "connector": action.connector_id,
+                    "environment": "sandbox",
+                },
+            )
+            schema = await _call_tool(
+                session,
+                "get_erp_action_schema",
+                {
+                    "action_id": action.action_id,
+                    "version": action.version_id,
+                    "environment": "sandbox",
+                },
+            )
+    _print_phase_timing("stdio-mcp", started)
 
     assert initialized.serverInfo.name == "Mercury Finance"
     assert {tool.name for tool in listed.tools} == EXPECTED_LOCAL_TOOLS

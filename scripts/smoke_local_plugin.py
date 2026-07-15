@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tomllib
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -59,12 +60,15 @@ def _build_local_wheel() -> Path:
         check=False,
         capture_output=True,
         text=True,
+        timeout=600,
     )
     if result.returncode != 0:
         raise RuntimeError(result.stdout + result.stderr)
-    wheels = sorted((ROOT / "dist").glob("mercury_tools-0.2.0-*.whl"))
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    version = project["project"]["version"]
+    wheels = sorted((ROOT / "dist").glob(f"mercury_tools-{version}-*.whl"))
     if len(wheels) != 1:
-        raise RuntimeError("expected_one_v020_wheel")
+        raise RuntimeError("expected_one_project_version_wheel")
     return wheels[0]
 
 
@@ -74,6 +78,7 @@ def _clean_environment(cache_dir: Path) -> dict[str, str]:
     environment.pop("VIRTUAL_ENV", None)
     environment["PYTHONNOUSERSITE"] = "1"
     environment["UV_CACHE_DIR"] = str(cache_dir)
+    environment["UV_HTTP_TIMEOUT"] = "120"
     return environment
 
 
