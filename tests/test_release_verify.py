@@ -4,6 +4,7 @@ import hashlib
 import inspect
 import io
 import json
+import os
 import shutil
 import stat
 import tarfile
@@ -298,6 +299,140 @@ def test_verifier_rejects_noncanonical_source_archive_members(
 def test_public_release_apis_do_not_accept_scanner_callback_override() -> None:
     for function in (build_release_artifacts, verify_release, build_public_staging):
         assert "scanner_gate" not in inspect.signature(function).parameters
+
+
+@pytest.mark.parametrize(
+    "namespace_violation",
+    (
+        "foreign_owner",
+        "group_writable",
+        "world_writable",
+        "effective_uid_unavailable",
+    ),
+)
+@pytest.mark.parametrize("api", ("artifact_builder", "public_staging"))
+def test_public_release_apis_reject_namespace_before_any_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    namespace_violation: str,
+    api: str,
+) -> None:
+    root = make_release_tree(tmp_path)
+    output_parent = tmp_path / "output-parent"
+    output_parent.mkdir()
+    if namespace_violation == "group_writable":
+        output_parent.chmod(0o720)
+    elif namespace_violation == "world_writable":
+        output_parent.chmod(0o702)
+    output = output_parent / "release"
+    entered: list[str] = []
+    prepared: list[tuple[object, int]] = []
+    original_prepare = release_artifacts._prepare_output_destination
+    original_fstat = release_artifacts.os.fstat
+
+    def unexpected(name: str):
+        def guard(*_args: object, **_kwargs: object) -> object:
+            entered.append(name)
+            pytest.fail(f"{name} entered before namespace validation")
+
+        return guard
+
+    def prepare(path: Path) -> object:
+        destination = original_prepare(path)
+        parent_fd = destination.require_parent_fd()
+        prepared.append((destination, parent_fd))
+        if namespace_violation == "foreign_owner":
+
+            def foreign_owner_fstat(fd: int) -> os.stat_result:
+                metadata = original_fstat(fd)
+                if fd != parent_fd:
+                    return metadata
+                return os.stat_result(
+                    (
+                        metadata.st_mode,
+                        metadata.st_ino,
+                        metadata.st_dev,
+                        metadata.st_nlink,
+                        metadata.st_uid + 1,
+                        metadata.st_gid,
+                        metadata.st_size,
+                        metadata.st_atime,
+                        metadata.st_mtime,
+                        metadata.st_ctime,
+                    )
+                )
+
+            monkeypatch.setattr(release_artifacts.os, "fstat", foreign_owner_fstat)
+        return destination
+
+    monkeypatch.setattr(release_artifacts, "_prepare_output_destination", prepare)
+    monkeypatch.setattr(release_verify, "_prepare_output_destination", prepare)
+    if namespace_violation == "effective_uid_unavailable":
+        monkeypatch.delattr(release_artifacts.os, "geteuid", raising=False)
+
+    for module in (release_artifacts, release_verify):
+        monkeypatch.setattr(module, "load_release_candidate", unexpected("load_candidate"))
+        monkeypatch.setattr(
+            module,
+            "materialize_release_candidate",
+            unexpected("materialize_candidate"),
+        )
+        monkeypatch.setattr(module, "_build_artifact_set", unexpected("build_artifacts"))
+        monkeypatch.setattr(
+            module,
+            "require_task13_scanner_gate",
+            unexpected("scanner_gate"),
+        )
+
+    monkeypatch.setattr(
+        release_artifacts,
+        "_create_private_staging",
+        unexpected("create_private_staging"),
+    )
+    monkeypatch.setattr(
+        release_artifacts,
+        "_copy_verified_tree",
+        unexpected("copy_verified_tree"),
+    )
+    monkeypatch.setattr(
+        release_verify,
+        "_write_candidate_tree",
+        unexpected("write_candidate_tree"),
+    )
+    monkeypatch.setattr(
+        release_verify,
+        "_initialize_history_free_repository",
+        unexpected("initialize_staging_repository"),
+    )
+    monkeypatch.setattr(
+        release_verify,
+        "_require_staging_scanner_gate",
+        unexpected("staging_scanner_gate"),
+    )
+    monkeypatch.setattr(
+        release_verify,
+        "_publish_owned_directory",
+        unexpected("publish_staging"),
+    )
+    monkeypatch.setattr(
+        release_artifacts.tempfile,
+        "TemporaryDirectory",
+        unexpected("temporary_directory"),
+    )
+
+    with pytest.raises(ReleaseGateError, match="^release_output_invalid$"):
+        if api == "artifact_builder":
+            build_release_artifacts(root, version=VERSION, output=output)
+        else:
+            build_public_staging(root=root, version=VERSION, output=output)
+
+    assert entered == []
+    assert len(prepared) == 1
+    destination, parent_fd = prepared[0]
+    assert destination.parent_fd is None
+    with pytest.raises(OSError):
+        original_fstat(parent_fd)
+    assert not output.exists()
 
 
 def test_cli_release_verify_keeps_current_v020_tree_blocked(

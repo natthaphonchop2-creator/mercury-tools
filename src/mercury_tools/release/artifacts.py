@@ -2043,6 +2043,7 @@ def build_release_artifacts(
 
     destination = _prepare_output_destination(output)
     try:
+        _require_private_destination_parent(destination)
         candidate = load_release_candidate(root, version=version, require_clean=True)
         with (
             materialize_release_candidate(candidate) as snapshot,
@@ -4000,8 +4001,7 @@ def _publish_owned_directory(source: Path, destination: _OutputDestination) -> N
     parent_fd: int | None = None
     private_parent_fd: int | None = None
     try:
-        parent_fd = _require_destination_parent_fd(destination)
-        _require_private_publication_namespace(parent_fd)
+        parent_fd = _require_private_destination_parent(destination)
         _require_child_absent(parent_fd, destination.name)
         private_parent = _create_private_staging(parent_fd, prefix=_STAGING_NAME_PREFIX)
         private_parent_fd = private_parent.require_fd()
@@ -4077,6 +4077,12 @@ def _require_destination_parent_fd(destination: _OutputDestination) -> int:
         or metadata.st_ino != destination.parent_inode
     ):
         raise ReleaseGateError("release_output_invalid")
+    return parent_fd
+
+
+def _require_private_destination_parent(destination: _OutputDestination) -> int:
+    parent_fd = _require_destination_parent_fd(destination)
+    _require_private_publication_namespace(parent_fd)
     return parent_fd
 
 

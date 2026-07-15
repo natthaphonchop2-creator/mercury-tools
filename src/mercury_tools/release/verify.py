@@ -25,6 +25,7 @@ from mercury_tools.release.artifacts import (
     _prepare_output_destination,
     _publish_owned_directory,
     _ReleaseGitRunner,
+    _require_private_destination_parent,
     _strict_json_loads,
     _write_candidate_tree,
     _zip_datetime,
@@ -288,6 +289,7 @@ def build_public_staging(
 
     destination = _prepare_output_destination(output)
     try:
+        _require_private_destination_parent(destination)
         candidate = load_release_candidate(root, version=version, require_clean=True)
         candidate_digest = source_tree_digest(candidate.entries)
         with materialize_release_candidate(candidate) as snapshot:
