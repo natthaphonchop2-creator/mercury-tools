@@ -407,7 +407,7 @@ def test_tracked_manifest_and_allowlist_are_secret_free_and_exactly_reviewed() -
         "scanner_versions": PINNED_SCANNER_VERSIONS,
     }
     reviewed = SecretScanAllowlist.model_validate(allowlist)
-    assert len(reviewed.entries) == 17
+    assert len(reviewed.entries) == 18
     assert {entry.rule.value for entry in reviewed.entries} == {"scanner_finding"}
     assert {entry.reviewer_role.value for entry in reviewed.entries} == {
         "security_reviewer"
@@ -419,8 +419,19 @@ def test_tracked_manifest_and_allowlist_are_secret_free_and_exactly_reviewed() -
         entry.classification == AllowlistClassification.DOCUMENTATION_PLACEHOLDER
         for entry in reviewed.entries
     ) == 1
+    vendored_binary_entries = [
+        entry
+        for entry in reviewed.entries
+        if entry.file == "release-toolchain/uv-linux-x86_64"
+    ]
+    assert len(vendored_binary_entries) == 1
+    assert (
+        vendored_binary_entries[0].classification
+        == AllowlistClassification.NON_SECRET_FIXTURE
+    )
     assert all(
         entry.file.startswith("tests/")
+        or entry.file == "release-toolchain/uv-linux-x86_64"
         or entry.file
         == "docs/superpowers/plans/2026-07-13-mercury-v0.2.1-public-endpoint-validation.md"
         for entry in reviewed.entries
