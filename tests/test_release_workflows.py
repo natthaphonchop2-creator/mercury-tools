@@ -165,6 +165,8 @@ def test_release_is_manual_sha_bound_and_publication_depends_on_every_gate() -> 
     assert "scripts/smoke_tagged_marketplace.py" in marketplace
     assert '"$STAGING_REPO"' in marketplace
     assert '"$STAGING_REF"' in marketplace
+    assert '--launcher-repo "$STAGING_REPO"' in marketplace
+    assert '--launcher-ref "$STAGING_REF"' in marketplace
     assert "history-free staging" in marketplace
     assert "refs/tags/$STAGING_REF" in marketplace
     assert "refs/tags/v0.2.1" not in marketplace

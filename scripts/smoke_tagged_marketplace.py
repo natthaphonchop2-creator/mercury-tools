@@ -73,13 +73,21 @@ def build_tagged_smoke_plan(
     tag: str,
     expected_tools: int,
     codex_home: Path,
+    launcher_repo: str | None = None,
+    launcher_ref: str | None = None,
 ) -> TaggedSmokePlan:
     """Build an immutable, isolated marketplace smoke plan."""
 
-    if _REPOSITORY_PATTERN.fullmatch(repo) is None:
+    if not isinstance(repo, str) or _REPOSITORY_PATTERN.fullmatch(repo) is None:
         raise TaggedMarketplaceError("repository_invalid")
-    if _TAG_PATTERN.fullmatch(tag) is None:
+    if not isinstance(tag, str) or _TAG_PATTERN.fullmatch(tag) is None:
         raise TaggedMarketplaceError("tag_invalid")
+    launcher_repo = repo if launcher_repo is None else launcher_repo
+    launcher_ref = tag if launcher_ref is None else launcher_ref
+    if not isinstance(launcher_repo, str) or _REPOSITORY_PATTERN.fullmatch(launcher_repo) is None:
+        raise TaggedMarketplaceError("launcher_repository_invalid")
+    if not isinstance(launcher_ref, str) or _TAG_PATTERN.fullmatch(launcher_ref) is None:
+        raise TaggedMarketplaceError("launcher_ref_invalid")
     if type(expected_tools) is not int or expected_tools <= 0:
         raise TaggedMarketplaceError("expected_tools_invalid")
 
@@ -109,7 +117,7 @@ def build_tagged_smoke_plan(
     return TaggedSmokePlan(
         repo=repo,
         tag=tag,
-        launcher_source=f"git+https://github.com/{repo}.git@{tag}",
+        launcher_source=f"git+https://github.com/{launcher_repo}.git@{launcher_ref}",
         expected_tools=expected_tools,
         codex_home=codex_home,
         environment=environment,
@@ -267,6 +275,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--tag", required=True)
+    parser.add_argument("--launcher-repo")
+    parser.add_argument("--launcher-ref")
     parser.add_argument("--expected-tools", required=True, type=int)
     parser.add_argument("--codex-home", type=Path)
     return parser
@@ -280,6 +290,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             tag=args.tag,
             expected_tools=args.expected_tools,
             codex_home=args.codex_home,
+            launcher_repo=args.launcher_repo,
+            launcher_ref=args.launcher_ref,
         )
         run_tagged_smoke(plan)
     else:
@@ -290,6 +302,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 tag=args.tag,
                 expected_tools=args.expected_tools,
                 codex_home=codex_home,
+                launcher_repo=args.launcher_repo,
+                launcher_ref=args.launcher_ref,
             )
             run_tagged_smoke(plan)
     print("tagged marketplace smoke passed (one local server, 19 tools)")

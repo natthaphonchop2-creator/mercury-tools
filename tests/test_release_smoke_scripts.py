@@ -12,13 +12,18 @@ from scripts.smoke_tagged_marketplace import (  # noqa: E402
     TaggedMarketplaceError,
     build_tagged_smoke_plan,
 )
+from scripts.smoke_tagged_marketplace import (  # noqa: E402
+    main as tagged_marketplace_main,
+)
 from scripts.verify_public_release import (  # noqa: E402
     PublicReleaseError,
     build_public_release_plan,
 )
 
 
-def test_tagged_marketplace_plan_is_immutable_and_isolated(tmp_path: Path) -> None:
+def test_tagged_marketplace_plan_defaults_launcher_to_marketplace_source(
+    tmp_path: Path,
+) -> None:
     codex_home = tmp_path / "codex-home"
 
     plan = build_tagged_smoke_plan(
@@ -55,6 +60,70 @@ def test_tagged_marketplace_plan_is_immutable_and_isolated(tmp_path: Path) -> No
         ("codex", "plugin", "add", "mercury-finance@mercury-tools"),
         ("codex", "mcp", "list", "--json"),
     )
+
+
+def test_tagged_marketplace_cli_supports_staging_launcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plans = []
+    monkeypatch.setattr(
+        "scripts.smoke_tagged_marketplace.run_tagged_smoke",
+        plans.append,
+    )
+
+    assert (
+        tagged_marketplace_main(
+            [
+                "--repo",
+                "natthaphonchop2-creator/mercury-tools",
+                "--tag",
+                "v0.2.1",
+                "--launcher-repo",
+                "natthaphonchop2-creator/mercury-tools-staging",
+                "--launcher-ref",
+                "v0.2.1-rc.1",
+                "--expected-tools",
+                "19",
+                "--codex-home",
+                str(tmp_path / "codex-home"),
+            ]
+        )
+        == 0
+    )
+
+    assert len(plans) == 1
+    assert plans[0].launcher_source == (
+        "git+https://github.com/natthaphonchop2-creator/mercury-tools-staging.git@v0.2.1-rc.1"
+    )
+    assert plans[0].commands[0][4:6] == (
+        "natthaphonchop2-creator/mercury-tools",
+        "--ref",
+    )
+
+
+@pytest.mark.parametrize(
+    ("launcher_repo", "launcher_ref", "error"),
+    (
+        ("invalid repo", "v0.2.1", "launcher_repository_invalid"),
+        ("natthaphonchop2-creator/mercury-tools-staging", "main", "launcher_ref_invalid"),
+    ),
+)
+def test_tagged_marketplace_plan_rejects_invalid_launcher_values(
+    tmp_path: Path,
+    launcher_repo: str,
+    launcher_ref: str,
+    error: str,
+) -> None:
+    with pytest.raises(TaggedMarketplaceError, match=error):
+        build_tagged_smoke_plan(
+            repo="natthaphonchop2-creator/mercury-tools",
+            tag="v0.2.1",
+            launcher_repo=launcher_repo,
+            launcher_ref=launcher_ref,
+            expected_tools=19,
+            codex_home=tmp_path / "codex-home",
+        )
 
 
 @pytest.mark.parametrize("tag", ("main", "0.2.1", "v0.2", "v0.2.1^{commit}"))

@@ -609,7 +609,10 @@ jobs:
           uv sync --extra dev --frozen
           uv run python scripts/smoke_tagged_marketplace.py \
             --repo "$STAGING_REPO" \
-            --tag "$STAGING_REF" --expected-tools 19
+            --tag "$STAGING_REF" \
+            --launcher-repo "$STAGING_REPO" \
+            --launcher-ref "$STAGING_REF" \
+            --expected-tools 19
 
   render-release:
     needs: tagged-marketplace
