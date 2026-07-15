@@ -692,7 +692,13 @@ def test_release_build_toolchain_is_candidate_owned_and_checksum_bound() -> None
         (ROOT / "release-toolchain/platform.json").read_text(encoding="utf-8")
     )
 
-    assert policy["schema_version"] == 2
+    assert policy["schema_version"] == 3
+    assert policy["platform"] == {
+        "path": "release-toolchain/platform.json",
+        "sha256": __import__("hashlib").sha256(
+            (ROOT / "release-toolchain/platform.json").read_bytes()
+        ).hexdigest(),
+    }
     assert policy["uv"]["version"] == "0.11.9"
     assert policy["uv"]["path"] == "release-toolchain/uv-linux-x86_64"
     assert policy["build"]["command"] == "uv build"

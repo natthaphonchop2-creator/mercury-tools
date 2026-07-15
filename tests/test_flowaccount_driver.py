@@ -85,6 +85,64 @@ async def test_flowaccount_sandbox_uses_exact_test_token_and_company_probe() -> 
 
 
 @pytest.mark.asyncio
+async def test_flowaccount_company_info_envelope_uses_nested_company_name() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/token"):
+            return httpx.Response(200, json={"access_token": "sandbox-token"})
+        return httpx.Response(
+            200,
+            json={
+                "status": True,
+                "message": "success",
+                "code": 0,
+                "data": {"companyName": "Sandbox Books"},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        probe = await FlowAccountDriver().validate_credentials(
+            environment="sandbox",
+            credentials={"client_id": "client-id", "client_secret": "client-secret"},
+            client=client,
+        )
+
+    assert probe.status == "connected"
+    assert probe.company_name == "Sandbox Books"
+
+
+@pytest.mark.asyncio
+async def test_flowaccount_company_info_envelope_redacts_nested_company_name() -> None:
+    client_secret = "client secret value"
+    access_token = "access token value"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/token"):
+            return httpx.Response(200, json={"access_token": access_token})
+        return httpx.Response(
+            200,
+            json={
+                "status": True,
+                "message": "success",
+                "code": 0,
+                "data": {"companyName": f"Example Books {access_token} {client_secret}"},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        probe = await FlowAccountDriver().validate_credentials(
+            environment="sandbox",
+            credentials={"client_id": "client-id", "client_secret": client_secret},
+            client=client,
+        )
+
+    assert probe.status == "connected"
+    assert probe.company_name == "[REDACTED]"
+    rendered = json.dumps(probe.public_dict()) + repr(probe)
+    assert client_secret not in rendered
+    assert access_token not in rendered
+
+
+@pytest.mark.asyncio
 async def test_flowaccount_sandbox_auth_and_probe_reuses_one_token() -> None:
     calls: list[str] = []
 

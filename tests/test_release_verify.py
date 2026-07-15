@@ -18,6 +18,7 @@ from test_release_artifacts import (
     _run,
     install_task13_runner,
     make_release_tree,
+    make_v020_release_tree,
     passing_task13_report,
 )
 
@@ -439,6 +440,7 @@ def test_cli_release_verify_keeps_current_v020_tree_blocked(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    root = make_v020_release_tree(tmp_path)
     exit_code = cli.main(
         [
             "release",
@@ -448,7 +450,7 @@ def test_cli_release_verify_keeps_current_v020_tree_blocked(
             "--artifacts",
             str(tmp_path / "artifacts"),
             "--repo-root",
-            str(ROOT),
+            str(root),
         ]
     )
     payload = json.loads(capsys.readouterr().out)

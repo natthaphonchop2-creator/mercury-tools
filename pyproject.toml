@@ -59,8 +59,12 @@ target-version = "py311"
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.mercury.release-build]
-schema_version = 2
+schema_version = 3
 lock_sha256 = "274fad7efee469c3c5f76d5885d56c2231995ba044a7db7d7c168cd3484cd524"
+
+[tool.mercury.release-build.platform]
+path = "release-toolchain/platform.json"
+sha256 = "7c1dd8ebae91fd1c61d96f93e16ebda07669f7fae424be2b68f3975d623cb20d"
 
 [tool.mercury.release-build.uv]
 path = "release-toolchain/uv-linux-x86_64"

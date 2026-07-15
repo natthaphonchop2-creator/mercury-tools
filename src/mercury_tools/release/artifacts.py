@@ -55,12 +55,14 @@ _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
 _PACKAGE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _BACKEND_MODULE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
+_CONTAINER_IMAGE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._/-]{0,255}@sha256:[0-9a-f]{64}$")
 _MAX_COMMAND_OUTPUT = 256 * 1024 * 1024
 _BUILD_TIMEOUT_SECONDS = 600.0
 _GIT_TIMEOUT_SECONDS = 60.0
 _TASK13_GIT_TIMEOUT_SECONDS = 300.0
-_BUILD_TOOLCHAIN_SCHEMA_VERSION = 2
-_RELEASE_MANIFEST_SCHEMA_VERSION = 3
+_BUILD_TOOLCHAIN_SCHEMA_VERSION = 3
+_RELEASE_MANIFEST_SCHEMA_VERSION = 4
+_PLATFORM_DESCRIPTOR_SCHEMA_VERSION = 1
 _NORMALIZER_NAME = "mercury-release-normalizer"
 _NORMALIZER_VERSION = "1"
 _NORMALIZER_ZIP_FORMAT = "stored-v1"
@@ -221,6 +223,24 @@ class ReleaseRuntimeProvenance:
 
 
 @dataclass(frozen=True)
+class ReleasePlatformDescriptor:
+    path: str
+    sha256: str
+    architecture: str
+    image: str
+    uv_source_image: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "architecture": self.architecture,
+            "image": self.image,
+            "path": self.path,
+            "sha256": self.sha256,
+            "uv_source_image": self.uv_source_image,
+        }
+
+
+@dataclass(frozen=True)
 class ReleaseBuilderProvenance:
     policy_sha256: str
     lock_sha256: str
@@ -231,6 +251,7 @@ class ReleaseBuilderProvenance:
     constraints_sha256: str
     backend_module: str
     backend_requirements: tuple[_BuildDependency, ...]
+    platform: ReleasePlatformDescriptor
     runtime: ReleaseRuntimeProvenance
 
     def as_dict(self) -> dict[str, object]:
@@ -247,6 +268,7 @@ class ReleaseBuilderProvenance:
                 "version": self.build_version,
             },
             "lock_sha256": self.lock_sha256,
+            "platform": self.platform.as_dict(),
             "policy_sha256": self.policy_sha256,
             "runtime": self.runtime.as_dict(),
             "uv": {
@@ -262,6 +284,7 @@ class _BuildToolchainPolicy:
     constraints_path: str
     constraints_sha256: str
     wheelhouse_path: str
+    platform: ReleasePlatformDescriptor
     provenance: ReleaseBuilderProvenance
 
 
@@ -2264,6 +2287,7 @@ def _parse_builder_provenance(value: object) -> ReleaseBuilderProvenance:
         "uv",
         "build",
         "backend",
+        "platform",
         "runtime",
     }:
         raise ReleaseGateError("release_manifest_invalid")
@@ -2272,6 +2296,7 @@ def _parse_builder_provenance(value: object) -> ReleaseBuilderProvenance:
     uv = value["uv"]
     build = value["build"]
     backend = value["backend"]
+    platform_descriptor = _parse_manifest_platform_descriptor(value["platform"])
     runtime = value["runtime"]
     if not isinstance(uv, dict) or set(uv) != {"version", "sha256"}:
         raise ReleaseGateError("release_manifest_invalid")
@@ -2309,6 +2334,7 @@ def _parse_builder_provenance(value: object) -> ReleaseBuilderProvenance:
         constraints_sha256=constraints_sha256,
         backend_module=backend_module,
         backend_requirements=requirements,
+        platform=platform_descriptor,
         runtime=runtime_provenance,
     )
 
@@ -2341,6 +2367,43 @@ def _parse_manifest_build_dependency(value: object) -> _BuildDependency:
     except ReleaseGateError as exc:
         raise ReleaseGateError("release_manifest_invalid") from exc
     return _BuildDependency(name=name, version=version, sha256=sha256, file_name=file_name)
+
+
+def _parse_manifest_platform_descriptor(value: object) -> ReleasePlatformDescriptor:
+    if not isinstance(value, dict) or set(value) != {
+        "path",
+        "sha256",
+        "architecture",
+        "image",
+        "uv_source_image",
+    }:
+        raise ReleaseGateError("release_manifest_invalid")
+    path = value["path"]
+    if not isinstance(path, str):
+        raise ReleaseGateError("release_manifest_invalid")
+    try:
+        validate_canonical_archive_member_names((path,))
+    except ReleaseGateError as exc:
+        raise ReleaseGateError("release_manifest_invalid") from exc
+    sha256 = _manifest_sha256(value["sha256"])
+    architecture = value["architecture"]
+    image = value["image"]
+    uv_source_image = value["uv_source_image"]
+    if (
+        architecture != "linux/amd64"
+        or not isinstance(image, str)
+        or not isinstance(uv_source_image, str)
+    ):
+        raise ReleaseGateError("release_manifest_invalid")
+    _require_pinned_container_image(image, error_code="release_manifest_invalid")
+    _require_pinned_container_image(uv_source_image, error_code="release_manifest_invalid")
+    return ReleasePlatformDescriptor(
+        path=path,
+        sha256=sha256,
+        architecture=architecture,
+        image=image,
+        uv_source_image=uv_source_image,
+    )
 
 
 def _parse_manifest_runtime_provenance(value: object) -> ReleaseRuntimeProvenance:
@@ -2545,6 +2608,7 @@ def _load_build_toolchain_policy(
         if set(policy) != {
             "schema_version",
             "lock_sha256",
+            "platform",
             "uv",
             "build",
             "backend",
@@ -2567,6 +2631,7 @@ def _load_build_toolchain_policy(
         uv = policy["uv"]
         build = policy["build"]
         backend = policy["backend"]
+        platform_descriptor = _load_platform_descriptor(policy["platform"], entry_map)
         runtime = _load_runtime_policy(policy["platforms"])
         if not isinstance(uv, dict) or set(uv) != {"path", "version", "sha256"}:
             raise ReleaseGateError("release_build_toolchain_invalid")
@@ -2636,6 +2701,7 @@ def _load_build_toolchain_policy(
         constraints_sha256=constraints_sha256,
         backend_module=backend_module,
         backend_requirements=dependencies,
+        platform=platform_descriptor,
         runtime=runtime,
     )
     return _BuildToolchainPolicy(
@@ -2643,8 +2709,60 @@ def _load_build_toolchain_policy(
         constraints_path=constraints_path,
         constraints_sha256=constraints_sha256,
         wheelhouse_path=wheelhouse_path,
+        platform=platform_descriptor,
         provenance=provenance,
     )
+
+
+def _load_platform_descriptor(
+    value: object,
+    entry_map: dict[str, CandidateEntry],
+) -> ReleasePlatformDescriptor:
+    if not isinstance(value, dict) or set(value) != {"path", "sha256"}:
+        raise ReleaseGateError("release_build_toolchain_invalid")
+    path = _require_toolchain_relative_path(value["path"])
+    sha256 = _require_toolchain_sha256(value["sha256"])
+    entry = entry_map.get(path)
+    if entry is None or _sha256_bytes(entry.data) != sha256:
+        raise ReleaseGateError("release_build_toolchain_invalid")
+    try:
+        payload = _strict_json_loads(entry.data.decode("utf-8"))
+    except (UnicodeError, ValueError, TypeError) as exc:
+        raise ReleaseGateError("release_build_toolchain_invalid") from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema_version",
+        "architecture",
+        "image",
+        "uv_source_image",
+    }:
+        raise ReleaseGateError("release_build_toolchain_invalid")
+    if payload["schema_version"] != _PLATFORM_DESCRIPTOR_SCHEMA_VERSION or type(
+        payload["schema_version"]
+    ) is not int:
+        raise ReleaseGateError("release_build_toolchain_invalid")
+    architecture = payload["architecture"]
+    image = payload["image"]
+    uv_source_image = payload["uv_source_image"]
+    if (
+        architecture != "linux/amd64"
+        or not isinstance(image, str)
+        or not isinstance(uv_source_image, str)
+    ):
+        raise ReleaseGateError("release_build_toolchain_invalid")
+    _require_pinned_container_image(image, error_code="release_build_toolchain_invalid")
+    _require_pinned_container_image(uv_source_image, error_code="release_build_toolchain_invalid")
+    return ReleasePlatformDescriptor(
+        path=path,
+        sha256=sha256,
+        architecture=architecture,
+        image=image,
+        uv_source_image=uv_source_image,
+    )
+
+
+def _require_pinned_container_image(value: str, *, error_code: str) -> None:
+    if _CONTAINER_IMAGE_PATTERN.fullmatch(value) is None:
+        raise ReleaseGateError(error_code)
 
 
 def _load_runtime_policy(value: object) -> ReleaseRuntimeProvenance:

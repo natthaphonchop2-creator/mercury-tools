@@ -4,7 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       reviewed_main_sha:
-        description: Reviewed commit currently at origin/main and tagged v0.2.1
+        description: Reviewed commit currently at origin/main before final tag publication
+        required: true
+        type: string
+      staging_repo:
+        description: History-free public staging repository for pre-publication smoke
+        required: true
+        type: string
+      staging_ref:
+        description: Immutable history-free staging tag or ref
         required: true
         type: string
 
@@ -22,6 +30,8 @@ jobs:
     timeout-minutes: 10
     env:
       REVIEWED_MAIN_SHA: ${{ inputs.reviewed_main_sha }}
+      STAGING_REPO: ${{ inputs.staging_repo }}
+      STAGING_REF: ${{ inputs.staging_ref }}
     steps:
       - name: Checkout reviewed commit with full history
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -33,11 +43,18 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$REVIEWED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
-          git fetch --force origin main "refs/tags/v0.2.1:refs/tags/v0.2.1"
+          [[ "$STAGING_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          [[ "$STAGING_REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]
+          test "$STAGING_REPO" != "natthaphonchop2-creator/mercury-tools"
+          test "$STAGING_REF" != "v0.2.1"
+          git fetch origin main
           test "$(git rev-parse HEAD)" = "$REVIEWED_MAIN_SHA"
           test "$(git rev-parse origin/main)" = "$REVIEWED_MAIN_SHA"
-          test "$(git cat-file -t refs/tags/v0.2.1)" = "tag"
-          test "$(git rev-parse refs/tags/v0.2.1^{commit})" = "$REVIEWED_MAIN_SHA"
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG" \
+            || git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "public release tag already exists; immutable release cannot be recreated"
+            exit 1
+          fi
           test -z "$(git status --porcelain)"
 
   quality-security:
@@ -50,6 +67,13 @@ jobs:
       MERCURY_LIVE_FLOWACCOUNT: "0"
       MERCURY_LIVE_FLOWACCOUNT_SANDBOX: "1"
       MERCURY_LIVE_PEAK: "0"
+      MERCURY_SUPABASE_VALIDATION_TEST: "1"
+      MERCURY_SUPABASE_TEST_ISOLATED: "1"
+      MERCURY_SUPABASE_TEST_GUARD: ${{ secrets.MERCURY_SUPABASE_TEST_GUARD }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+      SUPABASE_AUTHENTICATED_TEST_JWT: ${{ secrets.SUPABASE_AUTHENTICATED_TEST_JWT }}
       REVIEWED_MAIN_SHA: ${{ inputs.reviewed_main_sha }}
     steps:
       - name: Checkout exact reviewed commit
@@ -136,6 +160,11 @@ jobs:
       - name: Run all quality and release tests
         run: |
           set -euo pipefail
+          test -n "$MERCURY_SUPABASE_TEST_GUARD"
+          test -n "$SUPABASE_URL"
+          test -n "$SUPABASE_SERVICE_ROLE_KEY"
+          test -n "$SUPABASE_ANON_KEY"
+          test -n "$SUPABASE_AUTHENTICATED_TEST_JWT"
           install -d -m 700 release-evidence
           uv run ruff check .
           uv run pytest -q --junitxml=release-evidence/pytest.xml
@@ -369,13 +398,43 @@ jobs:
           REVIEWED_MAIN_SHA: ${{ inputs.reviewed_main_sha }}
         run: |
           set -euo pipefail
-          RELEASE_IMAGE="docker.io/library/python@sha256:fd95fa221297a88e1cf49c55ec1828edd7c5a428187e67b5d1805692d11588db"
+          IFS=$'\t' read -r RELEASE_PLATFORM RELEASE_IMAGE RELEASE_UV_SOURCE_IMAGE < <(
+            python3 - <<'PY'
+          import hashlib
+          import json
+          import re
+          import tomllib
+          from pathlib import Path
+
+          policy = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["tool"]["mercury"]["release-build"]
+          descriptor_policy = policy["platform"]
+          if descriptor_policy["path"] != "release-toolchain/platform.json":
+              raise SystemExit("unexpected platform descriptor path")
+          descriptor_path = Path(descriptor_policy["path"])
+          descriptor_bytes = descriptor_path.read_bytes()
+          if hashlib.sha256(descriptor_bytes).hexdigest() != descriptor_policy["sha256"]:
+              raise SystemExit("platform descriptor hash mismatch")
+          descriptor = json.loads(descriptor_bytes)
+          if set(descriptor) != {"schema_version", "architecture", "image", "uv_source_image"}:
+              raise SystemExit("platform descriptor schema mismatch")
+          if descriptor["schema_version"] != 1 or descriptor["architecture"] != "linux/amd64":
+              raise SystemExit("platform descriptor value mismatch")
+          image_pattern = re.compile(r"^[a-z0-9][a-z0-9._/-]{0,255}@sha256:[0-9a-f]{64}$")
+          for key in ("image", "uv_source_image"):
+              if not isinstance(descriptor[key], str) or image_pattern.fullmatch(descriptor[key]) is None:
+                  raise SystemExit(f"unpinned {key}")
+          print("\t".join((descriptor["architecture"], descriptor["image"], descriptor["uv_source_image"])))
+          PY
+          )
+          test -n "$RELEASE_PLATFORM"
+          test -n "$RELEASE_IMAGE"
+          test -n "$RELEASE_UV_SOURCE_IMAGE"
           OUTPUT_PARENT="$RUNNER_TEMP/release-evidence/private"
           install -d -m 700 "$OUTPUT_PARENT"
           test "$(stat -c '%a' "$OUTPUT_PARENT")" = "700"
           test ! -e "$OUTPUT_PARENT/artifacts"
           test "$(git rev-parse HEAD)" = "$REVIEWED_MAIN_SHA"
-          docker run --rm --platform linux/amd64 \
+          docker run --rm --platform "$RELEASE_PLATFORM" \
             --user "$(id -u):$(id -g)" \
             --volume "$GITHUB_WORKSPACE:/workspace" \
             --volume "$RUNNER_TEMP/mercury-scanners/bin:/release-bin:ro" \
@@ -387,10 +446,12 @@ jobs:
             --env MERCURY_RELEASE_STORAGE_BUCKETS \
             --env MERCURY_RENDER_API_URL --env MERCURY_RENDER_SERVICE_ID \
             --env RENDER_API_KEY --env SUPABASE_SERVICE_ROLE_KEY --env SUPABASE_URL \
+            --env RELEASE_UV_SOURCE_IMAGE \
             --env HOME=/tmp/mercury-home --env UV_CACHE_DIR=/tmp/uv-cache \
             --env UV_HTTP_TIMEOUT=120 --env UV_PYTHON=/usr/local/bin/python3.12 \
             --env UV_PYTHON_DOWNLOADS=never \
             "$RELEASE_IMAGE" sh -ceu '
+              test -n "$RELEASE_UV_SOURCE_IMAGE"
               export PATH="/release-bin:$PATH"
               release-toolchain/uv-linux-x86_64 run --frozen --no-dev python \
                 scripts/build_release_artifacts.py --version 0.2.1 \
@@ -460,10 +521,40 @@ jobs:
       - name: Build history-free public staging through the pinned platform
         run: |
           set -euo pipefail
-          RELEASE_IMAGE="docker.io/library/python@sha256:fd95fa221297a88e1cf49c55ec1828edd7c5a428187e67b5d1805692d11588db"
+          IFS=$'\t' read -r RELEASE_PLATFORM RELEASE_IMAGE RELEASE_UV_SOURCE_IMAGE < <(
+            python3 - <<'PY'
+          import hashlib
+          import json
+          import re
+          import tomllib
+          from pathlib import Path
+
+          policy = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["tool"]["mercury"]["release-build"]
+          descriptor_policy = policy["platform"]
+          if descriptor_policy["path"] != "release-toolchain/platform.json":
+              raise SystemExit("unexpected platform descriptor path")
+          descriptor_path = Path(descriptor_policy["path"])
+          descriptor_bytes = descriptor_path.read_bytes()
+          if hashlib.sha256(descriptor_bytes).hexdigest() != descriptor_policy["sha256"]:
+              raise SystemExit("platform descriptor hash mismatch")
+          descriptor = json.loads(descriptor_bytes)
+          if set(descriptor) != {"schema_version", "architecture", "image", "uv_source_image"}:
+              raise SystemExit("platform descriptor schema mismatch")
+          if descriptor["schema_version"] != 1 or descriptor["architecture"] != "linux/amd64":
+              raise SystemExit("platform descriptor value mismatch")
+          image_pattern = re.compile(r"^[a-z0-9][a-z0-9._/-]{0,255}@sha256:[0-9a-f]{64}$")
+          for key in ("image", "uv_source_image"):
+              if not isinstance(descriptor[key], str) or image_pattern.fullmatch(descriptor[key]) is None:
+                  raise SystemExit(f"unpinned {key}")
+          print("\t".join((descriptor["architecture"], descriptor["image"], descriptor["uv_source_image"])))
+          PY
+          )
+          test -n "$RELEASE_PLATFORM"
+          test -n "$RELEASE_IMAGE"
+          test -n "$RELEASE_UV_SOURCE_IMAGE"
           OUTPUT_PARENT="$RUNNER_TEMP/release-evidence/private"
           test ! -e "$OUTPUT_PARENT/public-staging"
-          docker run --rm --platform linux/amd64 \
+          docker run --rm --platform "$RELEASE_PLATFORM" \
             --user "$(id -u):$(id -g)" \
             --volume "$GITHUB_WORKSPACE:/workspace" \
             --volume "$RUNNER_TEMP/mercury-scanners/bin:/release-bin:ro" \
@@ -473,10 +564,12 @@ jobs:
             --env MERCURY_PUBLIC_MCP_TOKEN --env MERCURY_PUBLIC_MCP_URL \
             --env MERCURY_RENDER_API_URL --env MERCURY_RENDER_SERVICE_ID \
             --env RENDER_API_KEY --env SUPABASE_SERVICE_ROLE_KEY --env SUPABASE_URL \
+            --env RELEASE_UV_SOURCE_IMAGE \
             --env HOME=/tmp/mercury-home --env UV_CACHE_DIR=/tmp/uv-cache \
             --env UV_HTTP_TIMEOUT=120 --env UV_PYTHON=/usr/local/bin/python3.12 \
             --env UV_PYTHON_DOWNLOADS=never \
             "$RELEASE_IMAGE" sh -ceu '
+              test -n "$RELEASE_UV_SOURCE_IMAGE"
               export PATH="/release-bin:$PATH"
               release-toolchain/uv-linux-x86_64 run --frozen --no-dev python \
                 scripts/build_public_staging.py --version 0.2.1 \
@@ -503,12 +596,20 @@ jobs:
       - name: Install exact tagged marketplace plugin
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STAGING_REPO: ${{ inputs.staging_repo }}
+          STAGING_REF: ${{ inputs.staging_ref }}
         run: |
           set -euo pipefail
+          [[ "$STAGING_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          [[ "$STAGING_REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]
+          test "$STAGING_REPO" != "natthaphonchop2-creator/mercury-tools"
+          test "$STAGING_REF" != "v0.2.1"
+          test -n "$(git ls-remote --refs "https://github.com/$STAGING_REPO.git" "refs/tags/$STAGING_REF" | awk 'NF == 2 {print $1; exit}')"
+          echo "history-free staging marketplace ref verified"
           uv sync --extra dev --frozen
           uv run python scripts/smoke_tagged_marketplace.py \
-            --repo natthaphonchop2-creator/mercury-tools \
-            --tag v0.2.1 --expected-tools 19
+            --repo "$STAGING_REPO" \
+            --tag "$STAGING_REF" --expected-tools 19
 
   render-release:
     needs: tagged-marketplace
@@ -565,8 +666,22 @@ jobs:
         run: |
           set -euo pipefail
           ARTIFACT_ROOT="$RUNNER_TEMP/release-evidence/private/artifacts"
-          test "$(git rev-parse refs/tags/v0.2.1^{commit})" = \
-            "${{ inputs.reviewed_main_sha }}"
+          REVIEWED_MAIN_SHA="${{ inputs.reviewed_main_sha }}"
+          [[ "$REVIEWED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$REVIEWED_MAIN_SHA"
+          test "$(git rev-parse origin/main)" = "$REVIEWED_MAIN_SHA"
+          if git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "public release tag already exists; immutable release cannot be recreated"
+            exit 1
+          fi
+          gh auth setup-git
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$RELEASE_TAG" "$REVIEWED_MAIN_SHA" \
+            --message "Mercury Finance $RELEASE_TAG"
+          git push origin "refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$REVIEWED_MAIN_SHA"
           gh release create "$RELEASE_TAG" "$ARTIFACT_ROOT"/* \
             --verify-tag --title "Mercury Finance v0.2.1" \
             --notes-file docs/RELEASE_V0.2.1.md

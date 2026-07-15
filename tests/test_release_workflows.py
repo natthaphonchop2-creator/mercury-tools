@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +71,9 @@ def test_ci_is_full_history_fail_closed_and_emits_exact_skip_junit() -> None:
     assert "uv run pytest -q --junitxml=release-evidence/pytest.xml" in command
     assert "scripts/verify_test_skips.py" in command
     assert "docs/release/v0.2.1-test-waivers.json" in command
+    assert "MERCURY_SUPABASE_VALIDATION_TEST" in json.dumps(test["env"])
+    assert "SUPABASE_SERVICE_ROLE_KEY" in json.dumps(test["env"])
+    assert "test -n \"$MERCURY_SUPABASE_TEST_GUARD\"" in command
     assert "uv run mercury doctor --repo-root ." in command
     assert "scripts/validate_release_plugin.py --root ." in command
     assert "scripts/smoke_local_plugin.py" in command
@@ -85,6 +89,12 @@ def test_release_is_manual_sha_bound_and_publication_depends_on_every_gate() -> 
     reviewed = dispatch["inputs"]["reviewed_main_sha"]
     assert reviewed["required"] == "true"
     assert reviewed["type"] == "string"
+    staging_repo = dispatch["inputs"]["staging_repo"]
+    staging_ref = dispatch["inputs"]["staging_ref"]
+    assert staging_repo["required"] == "true"
+    assert staging_repo["type"] == "string"
+    assert staging_ref["required"] == "true"
+    assert staging_ref["type"] == "string"
 
     jobs = payload["jobs"]
     ordered = (
@@ -106,7 +116,8 @@ def test_release_is_manual_sha_bound_and_publication_depends_on_every_gate() -> 
     validate = _run_text(jobs["validate-reviewed-sha"])
     assert "origin/main" in validate
     assert "REVIEWED_MAIN_SHA" in validate
-    assert "refs/tags/v0.2.1" in validate
+    assert "refs/tags/v0.2.1" not in validate
+    assert "--force" not in validate
 
     quality = _run_text(jobs["quality-security"])
     _assert_scanner_install_and_gates(quality, jobs["quality-security"])
@@ -131,24 +142,42 @@ def test_release_is_manual_sha_bound_and_publication_depends_on_every_gate() -> 
     platform = json.loads(
         (ROOT / "release-toolchain" / "platform.json").read_text(encoding="utf-8")
     )
+    policy = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))[
+        "tool"
+    ]["mercury"]["release-build"]
+    descriptor_policy = policy["platform"]
+    assert descriptor_policy["path"] == "release-toolchain/platform.json"
+    assert descriptor_policy["sha256"] == __import__("hashlib").sha256(
+        (ROOT / descriptor_policy["path"]).read_bytes()
+    ).hexdigest()
     build = _run_text(jobs["build-artifacts"])
-    assert platform["image"] in build
-    assert "--platform linux/amd64" in build
+    assert "release-toolchain/platform.json" in build
+    assert platform["image"] not in build
+    assert 'docker run --rm --platform "$RELEASE_PLATFORM"' in build
+    assert '"$RELEASE_IMAGE" sh -ceu' in build
     assert "install -d -m 700" in build
     assert "scripts/build_release_artifacts.py --version 0.2.1" in build
     assert "scripts/verify_release.py --version 0.2.1" in build
     assert "release-evidence/private" in build
 
     assert "scripts/build_public_staging.py" in _run_text(jobs["public-staging"])
-    assert "scripts/smoke_tagged_marketplace.py" in _run_text(
-        jobs["tagged-marketplace"]
-    )
+    marketplace = _run_text(jobs["tagged-marketplace"])
+    assert "scripts/smoke_tagged_marketplace.py" in marketplace
+    assert '"$STAGING_REPO"' in marketplace
+    assert '"$STAGING_REF"' in marketplace
+    assert "history-free staging" in marketplace
+    assert "refs/tags/$STAGING_REF" in marketplace
+    assert "refs/tags/v0.2.1" not in marketplace
     render = _run_text(jobs["render-release"])
     assert "scripts/verify_render_release.py" in render
     assert '--commit "$REVIEWED_MAIN_SHA"' in render
     publish = _run_text(jobs["publish-assets"])
+    assert "git tag -a \"$RELEASE_TAG\" \"$REVIEWED_MAIN_SHA\"" in publish
+    assert "git push origin \"refs/tags/$RELEASE_TAG\"" in publish
+    assert "--force" not in publish
     assert "gh release create" in publish
     assert "--verify-tag" in publish
+    assert publish.index("git tag -a") < publish.index("gh release create")
 
 
 def test_post_public_workflow_is_anonymous_and_exact_release_bound() -> None:

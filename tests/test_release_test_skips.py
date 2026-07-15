@@ -12,7 +12,12 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.verify_test_skips import SkipVerificationError, verify_test_skips  # noqa: E402
+from scripts.verify_test_skips import (  # noqa: E402
+    SkipVerificationError,
+    _is_non_waivable,
+    _load_waivers,
+    verify_test_skips,
+)
 
 
 def _write_junit(path: Path, skipped: tuple[tuple[str, str], ...]) -> None:
@@ -42,6 +47,19 @@ def _waiver(test_id: str, **overrides: object) -> dict[str, object]:
     }
     row.update(overrides)
     return row
+
+
+def test_v021_release_waiver_manifest_exists_parses_and_names_only_approved_skips() -> None:
+    waivers = _load_waivers(
+        ROOT / "docs/release/v0.2.1-test-waivers.json",
+        today=date(2026, 7, 15),
+    )
+
+    assert tuple(waivers) == (
+        "tests/integration/test_local_erp_mcp.py::test_live_flowaccount_credential_probe_is_read_only",
+        "tests/integration/test_local_erp_mcp.py::test_live_peak_credential_probe_is_read_only",
+    )
+    assert not any(_is_non_waivable(test_id) for test_id in waivers)
 
 
 def test_verify_test_skips_accepts_no_skips_and_no_waivers(tmp_path: Path) -> None:

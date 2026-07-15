@@ -6,6 +6,7 @@ import io
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -281,7 +282,23 @@ if __name__ == "__main__":
 def _install_exact_build_toolchain_fixture(root: Path) -> None:
     toolchain = root / "release-toolchain"
     wheelhouse = toolchain / "wheelhouse"
-    wheelhouse.mkdir(parents=True)
+    wheelhouse.mkdir(parents=True, exist_ok=True)
+    platform_descriptor = toolchain / "platform.json"
+    platform_descriptor.write_text(
+        json.dumps(
+            {
+                "architecture": "linux/amd64",
+                "image": "example.invalid/mercury/python@sha256:" + "1" * 64,
+                "schema_version": 1,
+                "uv_source_image": "example.invalid/mercury/uv@sha256:" + "2" * 64,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    platform_descriptor_sha256 = _sha256_bytes(platform_descriptor.read_bytes())
     uv = toolchain / "uv"
     _write_fixture_uv(uv)
 
@@ -334,8 +351,8 @@ def _install_exact_build_toolchain_fixture(root: Path) -> None:
 
     pyproject = root / "pyproject.toml"
     source = pyproject.read_text(encoding="utf-8")
-    source = source.replace(
-        'requires = ["setuptools>=77", "wheel"]',
+    source = re.sub(
+        r'^requires = \[.*\]$',
         (
             'requires = ["setuptools=='
             + _FIXTURE_SETUPOOLS_VERSION
@@ -343,13 +360,17 @@ def _install_exact_build_toolchain_fixture(root: Path) -> None:
             + _FIXTURE_WHEEL_VERSION
             + '"]'
         ),
-        1,
+        source,
+        count=1,
+        flags=re.MULTILINE,
     )
-    source += (
-        "\n"
+    source = source.split(_TOOLCHAIN_POLICY_MARKER, 1)[0].rstrip() + "\n" + (
         "[tool.mercury.release-build]\n"
-        "schema_version = 2\n"
+        "schema_version = 3\n"
         f'lock_sha256 = "{lock_sha256}"\n\n'
+        "[tool.mercury.release-build.platform]\n"
+        'path = "release-toolchain/platform.json"\n'
+        f'sha256 = "{platform_descriptor_sha256}"\n\n'
         "[tool.mercury.release-build.uv]\n"
         'path = "release-toolchain/uv"\n'
         f'version = "{_FIXTURE_BUILD_TOOL_VERSION}"\n'
@@ -456,6 +477,21 @@ def make_release_tree(tmp_path: Path) -> Path:
     local_state.mkdir()
     (local_state / "audit-ledger.jsonl").write_text("local-audit-state\n", encoding="utf-8")
     assert _run(["git", "status", "--porcelain"], cwd=root) == ""
+    return root
+
+
+def make_v020_release_tree(tmp_path: Path) -> Path:
+    root = make_release_tree(tmp_path)
+    pyproject = root / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8").replace(
+            'version = "0.2.1"',
+            'version = "0.2.0"',
+            1,
+        ),
+        encoding="utf-8",
+    )
+    _commit_release_tree(root, "release fixture v0.2.0")
     return root
 
 
@@ -663,6 +699,13 @@ def test_release_runtime_policy_records_exact_platform_interpreter_and_normalize
     manifest = build_release_artifacts(root, version=VERSION, output=output)
 
     provenance = manifest.as_dict()["builder_provenance"]
+    assert provenance["platform"] == {
+        "architecture": "linux/amd64",
+        "image": "example.invalid/mercury/python@sha256:" + "1" * 64,
+        "path": "release-toolchain/platform.json",
+        "sha256": _sha256_bytes((root / "release-toolchain/platform.json").read_bytes()),
+        "uv_source_image": "example.invalid/mercury/uv@sha256:" + "2" * 64,
+    }
     assert provenance["runtime"] == {
         "architecture": _FIXTURE_ARCHITECTURE,
         "interpreter": {
@@ -1397,9 +1440,10 @@ def test_release_runtime_rejects_hash_valid_uv_launcher_with_different_interpret
 
 
 def test_current_v020_source_fails_closed_for_v021_request(tmp_path: Path) -> None:
+    root = make_v020_release_tree(tmp_path)
     with pytest.raises(ReleaseGateError, match="^release_version_mismatch$"):
         build_release_artifacts(
-            ROOT,
+            root,
             version=VERSION,
             output=tmp_path / "dist",
         )
@@ -1507,7 +1551,10 @@ def test_candidate_rejects_unpinned_backend_before_artifact_build(
     assert not output.exists()
 
 
-@pytest.mark.parametrize("relative_path", ("release-toolchain/uv", "uv.lock"))
+@pytest.mark.parametrize(
+    "relative_path",
+    ("release-toolchain/platform.json", "release-toolchain/uv", "uv.lock"),
+)
 def test_candidate_rejects_changed_toolchain_input_before_artifact_build(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

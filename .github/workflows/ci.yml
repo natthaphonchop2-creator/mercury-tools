@@ -17,6 +17,13 @@ jobs:
       MERCURY_LIVE_FLOWACCOUNT: "0"
       MERCURY_LIVE_FLOWACCOUNT_SANDBOX: "1"
       MERCURY_LIVE_PEAK: "0"
+      MERCURY_SUPABASE_VALIDATION_TEST: "1"
+      MERCURY_SUPABASE_TEST_ISOLATED: "1"
+      MERCURY_SUPABASE_TEST_GUARD: ${{ secrets.MERCURY_SUPABASE_TEST_GUARD }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+      SUPABASE_AUTHENTICATED_TEST_JWT: ${{ secrets.SUPABASE_AUTHENTICATED_TEST_JWT }}
       UV_HTTP_TIMEOUT: "120"
     steps:
       - name: Checkout full history
@@ -108,6 +115,11 @@ jobs:
       - name: Run complete quality and test gates
         run: |
           set -euo pipefail
+          test -n "$MERCURY_SUPABASE_TEST_GUARD"
+          test -n "$SUPABASE_URL"
+          test -n "$SUPABASE_SERVICE_ROLE_KEY"
+          test -n "$SUPABASE_ANON_KEY"
+          test -n "$SUPABASE_AUTHENTICATED_TEST_JWT"
           install -d -m 700 release-evidence
           uv run ruff check .
           uv run pytest -q --junitxml=release-evidence/pytest.xml

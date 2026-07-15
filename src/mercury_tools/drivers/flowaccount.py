@@ -307,10 +307,16 @@ def _nonzero_provider_code(value: Any) -> bool:
 
 
 def _company_name(payload: Mapping[str, Any], sensitive_values: tuple[str, ...]) -> str | None:
-    for key in ("companyName", "company_name", "name"):
-        value = payload.get(key)
-        if isinstance(value, str) and value:
-            return redact_credential_text(value, sensitive_values)
+    company_payloads: tuple[Mapping[str, Any], ...] = (payload,)
+    nested_data = payload.get("data")
+    if isinstance(nested_data, Mapping):
+        company_payloads += (nested_data,)
+
+    for company_payload in company_payloads:
+        for key in ("companyName", "company_name", "name"):
+            value = company_payload.get(key)
+            if isinstance(value, str) and value:
+                return redact_credential_text(value, sensitive_values)
     return None
 
 
