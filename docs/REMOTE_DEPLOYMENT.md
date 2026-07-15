@@ -1,108 +1,89 @@
-# Mercury Tools Public MCP Deployment
+# Mercury Tools Hosted HTTP Deployment
 
-This guide deploys the contest build as a public Streamable HTTP MCP. The AI
-experience stays inside Codex or another MCP host; Render serves tools and
-Supabase stores RAG, public workspace state, encrypted connector records, and
-sanitized audit events.
+The Render service is the separate hosted Mercury MCP. It does not replace the
+repository-local Mercury Finance plugin.
 
-## Current Deployment
+Cloud stores catalog, RAG, and audit metadata only. ERP credentials remain repository-local and never enter Render, Supabase, hosted workspace records, MCP arguments, or hosted tool results.
 
-- GitHub: `https://github.com/natthaphonchop2-creator/mercury-tools`
-- Render service: `mercury-tools-mcp`
+## Public Endpoints
+
 - Base URL: `https://mercury-tools-mcp.onrender.com`
-- MCP: `https://mercury-tools-mcp.onrender.com/mcp`
-- Health: `https://mercury-tools-mcp.onrender.com/healthz`
-- Supabase project: `vbnlkqvauqwnjbxngkas`
+- Mandatory health check: `https://mercury-tools-mcp.onrender.com/healthz`
+- Deployment status: `https://mercury-tools-mcp.onrender.com/api/status`
+- Streamable HTTP MCP: `https://mercury-tools-mcp.onrender.com/mcp`
 
-## 1. Apply Supabase Migrations
+The hosted endpoint exposes 20 tools for catalog, cited knowledge, accounting
+skills, flow validation, and public workspace metadata. It has no ERP
+credential schema and no arbitrary ERP write surface. The local plugin remains
+one `mercury-finance` stdio MCP with 19 tools and owns ERP execution.
 
-Run these files in order against the Mercury Supabase project:
+## Supabase Boundary
 
-1. `supabase/migrations/0001_mercury_tools_rag.sql`
-2. `supabase/migrations/0002_mercury_product_layer.sql`
-3. `supabase/migrations/0003_match_knowledge_chunks_null_embedding.sql`
-4. `supabase/migrations/0004_match_knowledge_chunks_endpoint_terms.sql`
+Apply every tracked migration in `supabase/migrations/` in lexical order. The
+release gate specifically verifies the validation-knowledge migration, RAG
+filters, reconciliation skill catalog, batch resolver, and the migration that
+removes obsolete Cloud ERP secret storage.
 
-Required extensions are `vector` and `pgcrypto`. Tables use RLS and revoke
-direct access from `public`, `anon`, and `authenticated`; the server-side
-service role performs RAG and product operations.
+Supabase may contain only:
 
-Migration 0004 is the final `match_knowledge_chunks` definition. It supports
-connector filters and deterministic endpoint-term matching when embeddings are
-null.
+- immutable ERP action catalog and version metadata;
+- approved, sanitized endpoint validation knowledge;
+- RAG documents, chunks, citations, and search indexes;
+- public skill and flow metadata;
+- redacted audit metadata that contains no credential or ERP payload value.
 
-## 2. Configure Render
+RLS revokes direct validation-table access from `public`, `anon`, and
+`authenticated`. Server-side publication uses the service role. ERP request
+bodies, local request state, confirmations, credentials, and the local audit
+ledger stay under the operator's repository.
 
-Deploy `render.yaml` as a Render Blueprint or Docker web service. Configure:
+## Render Settings
+
+Deploy the reviewed commit using `render.yaml`, then set only the server-side
+values required by the hosted metadata surface:
 
 ```text
 SUPABASE_URL
 SUPABASE_SERVICE_ROLE_KEY
-MERCURY_CREDENTIAL_VAULT_SECRET
+MERCURY_DEPLOYMENT_COMMIT=<40-character-lowercase-reviewed-git-commit>
 MERCURY_TOOLS_PUBLIC_BASE_URL=https://mercury-tools-mcp.onrender.com
 MERCURY_TOOLS_EMBEDDING_PROVIDER=hash
 MERCURY_TOOLS_HTTP_REQUIRE_AUTH=false
 MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API=false
 ```
 
-The vault secret must be a long random server-only value. Do not place the
-Supabase service role or vault secret in a plugin, MCP client config, repository
-secret file, or tool response.
+`MERCURY_DEPLOYMENT_COMMIT` is a deployment setting, not a value inferred from
+the filesystem, a mutable branch, or process state. Set it to the exact reviewed
+commit deployed by Render. Do not add FlowAccount, PEAK, or imported ERP
+credentials to the Render environment.
 
-Mercury does not call an LLM. Hash embeddings plus hybrid keyword search serve
-cited context to the user's host AI. An external embedding provider is optional
-after the contest.
+## Catalog And RAG Ingestion
 
-## 3. Ingest The Wiki
-
-With Supabase variables available locally:
+With Supabase settings available only to the operator process:
 
 ```bash
-uv run mercury-tools ingest wiki --path ./wiki
-uv run mercury-tools search "FlowAccount invoice endpoint" --json
-uv run mercury-tools search "PEAK invoice endpoint" --json
+uv run mercury ingest wiki --path ./wiki
+uv run mercury search "FlowAccount invoice endpoint" --json
+uv run mercury search "PEAK invoice endpoint" --json
 ```
 
-Alternatively, configure `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` as
-GitHub repository secrets and run the **Ingest Mercury Wiki** workflow.
+Results must preserve connector routing and include citations. Published
+validation rows must already be reviewed and sanitized; raw provider traffic is
+not an ingestion input.
 
-Expected routing:
+## Release Verification
 
-- a FlowAccount query returns FlowAccount sources only;
-- a PEAK query returns PEAK sources only;
-- each result includes source metadata and citation fields.
-
-## 4. Verify The Service
+The release verifier requires `/healthz` independently of `/api/status` and
+compares both requested identity values exactly:
 
 ```bash
-uv run mercury-tools remote verify \
-  --url https://mercury-tools-mcp.onrender.com
+export REVIEWED_MAIN_SHA='<40-character-lowercase-reviewed-git-commit>'
+uv run python scripts/verify_render_release.py \
+  --url https://mercury-tools-mcp.onrender.com \
+  --version 0.2.1 \
+  --commit "$REVIEWED_MAIN_SHA"
 ```
 
-Expected health properties:
-
-```json
-{
-  "status": "ok",
-  "supabase": true,
-  "embedding_provider": "hash",
-  "embedding_configured": true,
-  "mcp_path": "/mcp",
-  "http_auth_required": false,
-  "legacy_http_api": "disabled"
-}
-```
-
-Then initialize an MCP session and verify `tools/list`,
-`create_public_workspace`, connector discovery, inferred RAG routing, skill
-loading, and a read-only flow dry run.
-
-## Contest Boundary
-
-- The MCP endpoint has no login and public `workspace_id` values are routing,
-  not authorization.
-- Use contest, UAT, sandbox, or disposable demo ERP credentials only.
-- Connector values are encrypted server-side and never returned.
-- Production-changing ERP capabilities are blocked before connector dispatch.
-- Private tenant authentication and production mutations are deferred until
-  after the contest.
+The command fails unless health, exact package version, exact deployment
+commit, MCP initialize/list, 254-action catalog, cited RAG retrieval, hosted
+read-only boundary, and Render build/runtime log scans all pass.

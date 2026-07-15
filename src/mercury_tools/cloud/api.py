@@ -9,7 +9,7 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Any
 
 import httpx
@@ -26,10 +26,15 @@ from mercury_tools.catalog.models import (
 from mercury_tools.cloud.models import (
     PublicConnectorsEnvelope,
     PublicDocument,
+    PublicEvidenceRequest,
+    PublicEvidenceSelection,
+    PublicEvidenceSelectionsEnvelope,
     PublicSearchEnvelope,
     PublicSkill,
     PublicSkillDetail,
     PublicSkillsEnvelope,
+    PublicValidationEvidence,
+    PublicValidationResolveRequest,
     is_canonical_document_identifier,
     is_canonical_public_wiki_uri,
     is_canonical_skill_id,
@@ -41,8 +46,19 @@ from mercury_tools.config import Settings, load_settings
 from mercury_tools.db.catalog import SupabaseCatalogStore
 from mercury_tools.db.product import SKILL_CATALOG_SEED
 from mercury_tools.db.supabase import SupabaseRagStore
+from mercury_tools.db.validation import ResolveResult, SupabaseValidationStore
 from mercury_tools.mercury_runtime import skill_markdown
-from mercury_tools.rag.models import SearchFilters, SearchResult
+from mercury_tools.qualification.selection import (
+    EvidenceRequest,
+    EvidenceSelection,
+    select_evidence,
+)
+from mercury_tools.rag.models import (
+    SearchFilters,
+    SearchResult,
+    is_validation_knowledge,
+    project_public_knowledge_metadata,
+)
 from mercury_tools.safety.redaction import redact_json
 
 _FILTER_FIELDS = {
@@ -51,9 +67,17 @@ _FILTER_FIELDS = {
     "doc_type",
     "review_status",
     "effective_date",
+    "action_id",
+    "version_id",
+    "environment",
+    "capability",
+    "accounting_use",
 }
 _SELECTOR_RE = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 _ACTION_ID_RE = re.compile(r"^act_[0-9a-f]{24}$")
+_VERSION_ID_RE = re.compile(r"^av_[0-9a-f]{64}$")
+_DOTTED_TERM_RE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$")
+_ENVIRONMENTS = frozenset({"sandbox", "test", "uat", "production"})
 _PUBLIC_RESULT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _PRIVATE_KEY_RE = re.compile(r"(?i)(?:repository|source)?_?path|credential")
 _PUBLIC_SKILL_FIELDS = (
@@ -81,13 +105,19 @@ _ORDINARY_DEPENDENCY_ERRORS = (
 )
 
 
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 @dataclass
 class CloudDependencies:
     settings: Settings | None = None
     catalog_store: Any | None = None
     rag_store: Any | None = None
+    validation_store: Any | None = None
     skills: Sequence[Mapping[str, Any]] | None = None
     skill_loader: Callable[[str], str | None] = skill_markdown
+    clock: Callable[[], datetime] | None = None
 
     def _catalog_store(self) -> Any:
         if self.catalog_store is None:
@@ -98,6 +128,13 @@ class CloudDependencies:
         if self.rag_store is None:
             self.rag_store = SupabaseRagStore(self.settings or load_settings())
         return self.rag_store
+
+    def _validation_store(self) -> Any:
+        if self.validation_store is None:
+            self.validation_store = SupabaseValidationStore(
+                self.settings or load_settings()
+            )
+        return self.validation_store
 
     def _skills(self) -> Sequence[Mapping[str, Any]]:
         return _CANONICAL_SKILLS
@@ -150,6 +187,38 @@ class CloudDependencies:
         except _ORDINARY_DEPENDENCY_ERRORS:
             return _service_unavailable()
         return JSONResponse({"action": payload})
+
+    async def resolve_validation(self, request: Request) -> Response:
+        try:
+            batch = PublicValidationResolveRequest.model_validate_json(
+                await request.body()
+            )
+            evidence_requests = tuple(
+                EvidenceRequest.model_validate(item.model_dump(mode="python"))
+                for item in batch.requests
+            )
+        except (TypeError, ValueError, UnicodeDecodeError):
+            return _bad_request()
+
+        try:
+            resolved_at = (self.clock or _utc_now)()
+            resolved = await run_in_threadpool(
+                self._validation_store().resolve,
+                evidence_requests,
+                resolved_at,
+            )
+            validated = ResolveResult.model_validate(resolved)
+            selections = _ordered_public_evidence_selections(
+                batch,
+                validated,
+                now=resolved_at,
+            )
+            envelope = PublicEvidenceSelectionsEnvelope.model_validate(
+                {"selections": selections}
+            )
+        except _ORDINARY_DEPENDENCY_ERRORS:
+            return _service_unavailable()
+        return JSONResponse(envelope.model_dump(mode="json"))
 
     async def list_connectors(self, request: Request) -> Response:
         try:
@@ -331,6 +400,11 @@ def cloud_routes(dependencies: CloudDependencies) -> list[Route]:
             dependencies.get_action,
             methods=["GET"],
         ),
+        Route(
+            "/api/cloud/v1/catalog/validation/resolve",
+            dependencies.resolve_validation,
+            methods=["POST"],
+        ),
         Route("/api/cloud/v1/connectors", dependencies.list_connectors, methods=["GET"]),
         Route("/api/cloud/v1/skills", dependencies.list_skills, methods=["GET"]),
         Route(
@@ -351,6 +425,74 @@ def cloud_routes(dependencies: CloudDependencies) -> list[Route]:
     ]
 
 
+def _ordered_public_evidence_selections(
+    batch: PublicValidationResolveRequest,
+    resolved: ResolveResult,
+    *,
+    now: datetime,
+) -> tuple[PublicEvidenceSelection, ...]:
+    by_scope: dict[tuple[str, str, str, str], EvidenceSelection] = {}
+    for entry in resolved.entries:
+        scope = entry.request.scope_key
+        if scope in by_scope:
+            raise ValueError("cloud_validation_response_invalid")
+        selected_again = select_evidence(
+            entry.selection.records,
+            request=entry.request,
+            now=now,
+        )
+        if selected_again != entry.selection:
+            raise ValueError("cloud_validation_response_invalid")
+        by_scope[scope] = entry.selection
+
+    expected = {request.scope_key for request in batch.requests}
+    if set(by_scope) != expected:
+        raise ValueError("cloud_validation_response_invalid")
+
+    return tuple(
+        _public_evidence_selection(request, by_scope[request.scope_key], now=now)
+        for request in batch.requests
+    )
+
+
+def _public_evidence_selection(
+    request: PublicEvidenceRequest,
+    selection: EvidenceSelection,
+    *,
+    now: datetime,
+) -> PublicEvidenceSelection:
+    selected = selection.selected
+    if selected is None:
+        blockers = selection.blocking_conditions or ("validation_unavailable",)
+        return PublicEvidenceSelection.model_validate(
+            {"selected": None, "blocking_conditions": blockers}
+        )
+    if not selected.approved_public or request.scope_key != (
+        selected.connector_id,
+        selected.action_id,
+        selected.version_id,
+        selected.environment,
+    ):
+        raise ValueError("cloud_validation_response_invalid")
+
+    evidence = PublicValidationEvidence.model_validate(
+        {
+            field: getattr(selected, field)
+            for field in PublicValidationEvidence.model_fields
+        }
+    )
+    if not evidence.is_admissible_at(now):
+        return PublicEvidenceSelection.model_validate(
+            {
+                "selected": None,
+                "blocking_conditions": ("validation_unavailable",),
+            }
+        )
+    return PublicEvidenceSelection.model_validate(
+        {"selected": evidence, "blocking_conditions": ()}
+    )
+
+
 def sanitize_search_query(value: str) -> str:
     return sanitize_public_text(value)
 
@@ -368,7 +510,27 @@ def sanitize_search_filters(value: Any) -> dict[str, str]:
                     raise ValueError
             except ValueError:
                 raise ValueError("cloud_search_filters_invalid") from None
-        elif not _SELECTOR_RE.fullmatch(item):
+        elif (
+            (key == "action_id" and _ACTION_ID_RE.fullmatch(item) is None)
+            or (key == "version_id" and _VERSION_ID_RE.fullmatch(item) is None)
+            or (key == "environment" and item not in _ENVIRONMENTS)
+            or (
+                key in {"capability", "accounting_use"}
+                and _DOTTED_TERM_RE.fullmatch(item) is None
+            )
+            or (
+                key
+                not in {
+                    "effective_date",
+                    "action_id",
+                    "version_id",
+                    "environment",
+                    "capability",
+                    "accounting_use",
+                }
+                and not _SELECTOR_RE.fullmatch(item)
+            )
+        ):
             raise ValueError("cloud_search_filters_invalid")
         clean = sanitize_public_text(item)
         if clean != item:
@@ -379,7 +541,17 @@ def sanitize_search_filters(value: Any) -> dict[str, str]:
 
 
 def _public_search_result(result: SearchResult) -> dict[str, Any]:
-    return {
+    validation = is_validation_knowledge(
+        result.metadata,
+        document_uri=result.document_uri,
+        source_uri=result.source_uri,
+    )
+    metadata = project_public_knowledge_metadata(
+        result.metadata,
+        document_uri=result.document_uri,
+        source_uri=result.source_uri,
+    )
+    payload = {
         "chunk_id": result.chunk_id,
         "document_id": result.document_id,
         "document_uri": sanitize_public_text(result.document_uri),
@@ -388,9 +560,19 @@ def _public_search_result(result: SearchResult) -> dict[str, Any]:
         "score": result.score,
         "source_title": sanitize_public_text(result.source_title),
         "source_uri": sanitize_public_text(result.source_uri),
-        "source_url": sanitize_public_text(result.source_url) if result.source_url else None,
-        "citation": _public_citation(result.citation),
+        "source_url": (
+            None
+            if validation or not result.source_url
+            else sanitize_public_text(result.source_url)
+        ),
+        "citation": _public_citation(
+            result.citation,
+            include_source_url=not validation,
+        ),
     }
+    if validation:
+        payload["metadata"] = metadata
+    return payload
 
 
 def _project_public_search_results(
@@ -448,7 +630,19 @@ def _validate_search_result_shape(result: SearchResult) -> None:
 
 def _public_document(document: Mapping[str, Any]) -> dict[str, Any]:
     source = _document_source(document) or {}
-    return {
+    validation = is_validation_knowledge(
+        document.get("metadata"),
+        document_uri=document.get("document_uri"),
+        source_uri=source.get("source_uri"),
+        doc_type=source.get("doc_type"),
+    )
+    metadata = project_public_knowledge_metadata(
+        document.get("metadata"),
+        document_uri=document.get("document_uri"),
+        source_uri=source.get("source_uri"),
+        doc_type=source.get("doc_type"),
+    )
+    payload = {
         "id": _clean_public_value(document.get("id")),
         "document_uri": _clean_public_value(document.get("document_uri")),
         "title": _clean_public_value(document.get("title")),
@@ -457,9 +651,14 @@ def _public_document(document: Mapping[str, Any]) -> dict[str, Any]:
         "source": {
             "title": _clean_public_value(source.get("title")),
             "source_uri": _clean_public_value(source.get("source_uri")),
-            "source_url": _clean_public_value(source.get("source_url")),
+            "source_url": (
+                None if validation else _clean_public_value(source.get("source_url"))
+            ),
         },
     }
+    if validation:
+        payload["metadata"] = metadata
+    return payload
 
 
 def _project_public_document(
@@ -499,6 +698,15 @@ def _project_public_document(
         raise ValueError("cloud_document_invalid")
     if review_status != "reviewed":
         return None
+    try:
+        project_public_knowledge_metadata(
+            document.get("metadata"),
+            document_uri=document_uri,
+            source_uri=source_uri,
+            doc_type=source.get("doc_type"),
+        )
+    except ValueError:
+        return None
     for field in ("id", "title", "body", "sha256"):
         if not isinstance(document.get(field), str):
             raise ValueError("cloud_document_invalid")
@@ -527,7 +735,11 @@ def _clean_public_value(value: Any) -> Any:
     return redact_json(value)
 
 
-def _public_citation(citation: Mapping[str, Any]) -> dict[str, Any]:
+def _public_citation(
+    citation: Mapping[str, Any],
+    *,
+    include_source_url: bool,
+) -> dict[str, Any]:
     return {
         key: _clean_public_value(citation[key])
         for key in (
@@ -540,7 +752,7 @@ def _public_citation(citation: Mapping[str, Any]) -> dict[str, Any]:
             "page",
             "section",
         )
-        if key in citation
+        if key in citation and (include_source_url or key != "source_url")
     }
 
 
@@ -583,7 +795,17 @@ def _is_public_search_result(result: Any) -> bool:
         or not result.chunk_uri.startswith(f"{result.document_uri}#")
     ):
         raise ValueError("cloud_search_result_invalid")
-    return result.metadata.get("review_status") == "reviewed"
+    if result.metadata.get("review_status") != "reviewed":
+        return False
+    try:
+        project_public_knowledge_metadata(
+            result.metadata,
+            document_uri=result.document_uri,
+            source_uri=result.source_uri,
+        )
+    except ValueError:
+        return False
+    return True
 
 
 def _looks_like_wiki_uri(value: Any) -> bool:

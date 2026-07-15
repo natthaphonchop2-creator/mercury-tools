@@ -9,7 +9,12 @@ from typing import Any
 
 import yaml
 
-from mercury_tools.rag.models import KnowledgeChunk, KnowledgeDocument
+from mercury_tools.rag.models import (
+    VALIDATION_METADATA_FIELDS,
+    KnowledgeChunk,
+    KnowledgeDocument,
+    project_approved_validation_metadata,
+)
 
 FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
@@ -128,6 +133,32 @@ def chunk_document(document: KnowledgeDocument, *, max_chars: int = 1800) -> lis
                 "heading": heading,
                 "chunk_index": index,
             }
+            if document.doc_type == "endpoint_validation":
+                try:
+                    projected_metadata = project_approved_validation_metadata(
+                        document.metadata
+                    )
+                except ValueError:
+                    raise ValueError("validation_document_metadata_invalid") from None
+                if (
+                    projected_metadata is None
+                    or set(document.metadata) != set(VALIDATION_METADATA_FIELDS)
+                    or document.metadata.get("jurisdiction") != document.jurisdiction
+                    or document.metadata.get("connector") != document.connector
+                    or document.metadata.get("doc_type") != document.doc_type
+                    or document.metadata.get("review_status") != document.review_status
+                ):
+                    raise ValueError("validation_document_metadata_invalid")
+                chunk_metadata = projected_metadata
+            else:
+                chunk_metadata = {
+                    "jurisdiction": document.jurisdiction,
+                    "connector": document.connector,
+                    "doc_type": document.doc_type,
+                    "review_status": document.review_status,
+                    "effective_date": document.effective_date,
+                    **action_metadata,
+                }
             chunks.append(
                 KnowledgeChunk(
                     document_uri=document.document_uri,
@@ -140,14 +171,7 @@ def chunk_document(document: KnowledgeDocument, *, max_chars: int = 1800) -> lis
                     source_path=source_path,
                     heading=heading,
                     citation=citation,
-                    metadata={
-                        "jurisdiction": document.jurisdiction,
-                        "connector": document.connector,
-                        "doc_type": document.doc_type,
-                        "review_status": document.review_status,
-                        "effective_date": document.effective_date,
-                        **action_metadata,
-                    },
+                    metadata=chunk_metadata,
                 )
             )
     return chunks

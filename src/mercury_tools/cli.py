@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import os
+import re
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -23,9 +27,16 @@ from mercury_tools.flows.workspace import (
     workspace_manifest,
 )
 from mercury_tools.local.credential_cli import add_credential_parsers
+from mercury_tools.qualification.flowaccount import (
+    SandboxRunApproval,
+    build_flowaccount_preflight_failure_report,
+    create_flowaccount_qualification_runner,
+)
+from mercury_tools.qualification.models import QualificationRunState
+from mercury_tools.qualification.peak import load_peak_contract_report
 from mercury_tools.rag.embeddings import create_embedding_provider
 from mercury_tools.rag.ingest import ingest_wiki
-from mercury_tools.rag.models import SearchFilters
+from mercury_tools.rag.models import SearchFilters, public_search_result_payload
 from mercury_tools.rag.routing import apply_knowledge_routing
 from mercury_tools.rag.service import RagService
 from mercury_tools.remote import DEFAULT_RENDER_URL, DEFAULT_TOKEN_FILE, read_token, verify_remote
@@ -76,6 +87,11 @@ def cmd_search(args: argparse.Namespace) -> int:
             "doc_type": args.doc_type,
             "review_status": args.review_status,
             "effective_date": args.effective_date,
+            "action_id": args.action_id,
+            "version_id": args.version_id,
+            "environment": args.environment,
+            "capability": args.capability,
+            "accounting_use": args.accounting_use,
         }.items()
         if value is not None
     }
@@ -89,23 +105,14 @@ def cmd_search(args: argparse.Namespace) -> int:
         doc_type=applied_filters.get("doc_type"),
         review_status=applied_filters.get("review_status"),
         effective_date=applied_filters.get("effective_date"),
+        action_id=applied_filters.get("action_id"),
+        version_id=applied_filters.get("version_id"),
+        environment=applied_filters.get("environment"),
+        capability=applied_filters.get("capability"),
+        accounting_use=applied_filters.get("accounting_use"),
     )
     results = service.search(args.query, filters=filters, top_k=args.top_k, mode=args.mode)
-    payload = [
-        {
-            "chunk_id": result.chunk_id,
-            "document_uri": result.document_uri,
-            "score": result.score,
-            "text": result.text,
-            "citation": result.citation,
-            "metadata": result.metadata,
-            "source_title": result.source_title,
-            "source_uri": result.source_uri,
-            "source_url": result.source_url,
-            "source_path": result.source_path,
-        }
-        for result in results
-    ]
+    payload = [public_search_result_payload(result) for result in results]
     if args.json:
         _print_json(
             {
@@ -121,6 +128,262 @@ def cmd_search(args: argparse.Namespace) -> int:
             print(f"- {item['source_title']} ({item['score']:.3f})")
             print(f"  {item['text'][:240].replace(chr(10), ' ')}")
             print(f"  citation: {item['citation']}")
+    return 0
+
+
+def cmd_catalog_qualify(args: argparse.Namespace) -> int:
+    if (args.connector, args.environment, args.all) != (
+        "flowaccount",
+        "sandbox",
+        True,
+    ):
+        _print_json(
+            {
+                "status": "error",
+                "error": "qualification_scope_not_supported",
+            }
+        )
+        return 2
+
+    try:
+        runner = create_flowaccount_qualification_runner(
+            Path(args.repo_root),
+            dry_run=bool(args.dry_run),
+        )
+    except Exception:
+        report = build_flowaccount_preflight_failure_report()
+    else:
+        report = asyncio.run(
+            runner.qualify_all(
+                approval=SandboxRunApproval(
+                    reads=True,
+                    writes=bool(args.sandbox_writes),
+                    dry_run=bool(args.dry_run),
+                ),
+                dry_run=bool(args.dry_run),
+            )
+        )
+    _print_json(report.public_dict())
+    return 0 if report.run_state is QualificationRunState.COMPLETED else 1
+
+
+def cmd_catalog_validate(args: argparse.Namespace) -> int:
+    if (args.connector, args.all) != ("peak", True):
+        _print_json(
+            {
+                "status": "error",
+                "error": "qualification_scope_not_supported",
+            }
+        )
+        return 2
+
+    try:
+        report = load_peak_contract_report(Path(args.repo_root))
+    except Exception:
+        _print_json(
+            {
+                "status": "error",
+                "error": "catalog_validation_failed",
+            }
+        )
+        return 1
+    _print_json(report.public_dict())
+    return 0
+
+
+def cmd_release_scan_secrets(args: argparse.Namespace) -> int:
+    from pydantic import ValidationError
+
+    from mercury_tools.release.models import SecretScanPolicy, SecretScanRequest
+    from mercury_tools.release.scanner import (
+        ReleaseGateError,
+        build_blocked_report,
+        invalidate_report_output,
+        load_known_secret_digests,
+        load_public_surface_manifest,
+        load_secret_scan_allowlist,
+        scan_public_release,
+        write_secret_scan_report,
+    )
+
+    output = Path(args.output) if args.output else None
+    if output is not None:
+        try:
+            invalidate_report_output(output)
+        except OSError:
+            report = build_blocked_report("report_write_failed")
+            _print_json(report.public_dict())
+            return 1
+
+    try:
+        manifest = load_public_surface_manifest(Path(args.manifest))
+        allowlist = load_secret_scan_allowlist(Path(args.allowlist))
+        fingerprints = load_known_secret_digests(
+            paths=tuple(Path(path) for path in args.known_fingerprint_file),
+            interactive=bool(args.known_fingerprint_stdin),
+            repo_root=Path(args.repo_root),
+        )
+        request = SecretScanRequest(
+            repo=args.repo,
+            artifacts=Path(args.artifacts),
+            all_history=bool(args.all_history),
+            hosted=bool(args.hosted),
+            manifest=manifest,
+            allowlist=allowlist,
+            policy=SecretScanPolicy(
+                scanner_versions=manifest.scanner_versions,
+                known_secret_digests=fingerprints,
+            ),
+        )
+    except ReleaseGateError as exc:
+        report = build_blocked_report(str(exc))
+    except ValidationError:
+        report = build_blocked_report("scan_request_malformed")
+    else:
+        try:
+            from mercury_tools.release.hosted import (
+                HostedAdapterConfig,
+                build_hosted_clients,
+            )
+
+            def secret_from_env(name: str) -> str | None:
+                if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name):
+                    return None
+                return os.environ.get(name, "").strip() or None
+
+            def configured_tuple(values: list[str], environment_name: str) -> tuple[str, ...]:
+                configured = values or [
+                    item.strip()
+                    for item in os.environ.get(environment_name, "").split(",")
+                    if item.strip()
+                ]
+                return tuple(dict.fromkeys(configured))
+
+            gh_path = shutil.which(args.gh_executable)
+            config = HostedAdapterConfig(
+                repo=request.repo,
+                gh_executable=Path(gh_path) if gh_path else None,
+                github_token=secret_from_env(args.github_token_env),
+                marketplace_url=(
+                    args.marketplace_snapshot_url
+                    or os.environ.get("MERCURY_MARKETPLACE_SNAPSHOT_URL")
+                    or None
+                ),
+                render_api_url=(
+                    args.render_api_url
+                    or os.environ.get("MERCURY_RENDER_API_URL")
+                    or None
+                ),
+                render_service_id=(
+                    args.render_service_id
+                    or os.environ.get("MERCURY_RENDER_SERVICE_ID")
+                    or None
+                ),
+                render_token=secret_from_env(args.render_token_env),
+                supabase_url=(args.supabase_url or os.environ.get("SUPABASE_URL") or None),
+                supabase_key=secret_from_env(args.supabase_key_env),
+                supabase_knowledge_tables=configured_tuple(
+                    args.supabase_knowledge_table,
+                    "MERCURY_RELEASE_KNOWLEDGE_TABLES",
+                ),
+                supabase_storage_buckets=configured_tuple(
+                    args.supabase_storage_bucket,
+                    "MERCURY_RELEASE_STORAGE_BUCKETS",
+                ),
+                public_mcp_url=(
+                    args.public_mcp_url
+                    or os.environ.get("MERCURY_PUBLIC_MCP_URL")
+                    or None
+                ),
+                public_mcp_token=secret_from_env(args.public_mcp_token_env),
+            )
+            hosted_clients = build_hosted_clients(config) if request.hosted else {}
+            report = scan_public_release(request, hosted_clients=hosted_clients)
+        except Exception:
+            report = build_blocked_report("release_scan_failed")
+
+    payload = report.public_dict()
+    if output is not None:
+        try:
+            write_secret_scan_report(output, payload)
+        except OSError:
+            report = build_blocked_report("report_write_failed")
+            payload = report.public_dict()
+    _print_json(payload)
+    return 0 if report.passed else 1
+
+
+def cmd_release_build_artifacts(args: argparse.Namespace) -> int:
+    from mercury_tools.release.artifacts import build_release_artifacts
+    from mercury_tools.release.scanner import ReleaseGateError
+
+    try:
+        manifest = build_release_artifacts(
+            Path(args.repo_root),
+            version=args.version,
+            output=Path(args.output),
+        )
+    except ReleaseGateError as exc:
+        _print_json({"status": "error", "error": str(exc)})
+        return 1
+    _print_json({"status": "ok", "manifest": manifest.as_dict()})
+    return 0
+
+
+def cmd_release_verify(args: argparse.Namespace) -> int:
+    from mercury_tools.release.scanner import ReleaseGateError
+    from mercury_tools.release.verify import verify_release
+
+    try:
+        verification = verify_release(
+            root=Path(args.repo_root),
+            version=args.version,
+            artifacts=Path(args.artifacts),
+        )
+    except ReleaseGateError as exc:
+        _print_json({"status": "error", "error": str(exc)})
+        return 1
+    _print_json({"status": "ok", "verification": verification.as_dict()})
+    return 0
+
+
+def cmd_release_verify_test_skips(args: argparse.Namespace) -> int:
+    from mercury_tools.release.scanner import ReleaseGateError
+    from mercury_tools.release.verify import verify_required_release_test_skips
+
+    try:
+        verify_required_release_test_skips(
+            Path(args.junit),
+            known_device=not args.allow_capability_skip,
+        )
+    except ReleaseGateError as exc:
+        _print_json({"status": "error", "error": str(exc)})
+        return 1
+    _print_json(
+        {
+            "status": "ok",
+            "junit": str(Path(args.junit)),
+            "known_device": not args.allow_capability_skip,
+        }
+    )
+    return 0
+
+
+def cmd_release_build_public_staging(args: argparse.Namespace) -> int:
+    from mercury_tools.release.scanner import ReleaseGateError
+    from mercury_tools.release.verify import build_public_staging
+
+    try:
+        staging = build_public_staging(
+            root=Path(args.repo_root),
+            version=args.version,
+            output=Path(args.output),
+            artifacts=Path(args.artifacts) if args.artifacts else None,
+        )
+    except ReleaseGateError as exc:
+        _print_json({"status": "error", "error": str(exc)})
+        return 1
+    _print_json({"status": "ok", "staging": staging.as_dict()})
     return 0
 
 
@@ -306,8 +569,7 @@ def cmd_flow_manifest(args: argparse.Namespace) -> int:
         print(f"Mercury flow manifest: {payload['workspace']['root']}")
         print(f"runtime: {payload['runtime_boundary']['primary_runtime']}")
         print(
-            f"flows: {discovery['selected_count']} selected / "
-            f"{discovery['flow_count']} discovered"
+            f"flows: {discovery['selected_count']} selected / {discovery['flow_count']} discovered"
         )
         if discovery["tags"]:
             print("tags: " + ", ".join(discovery["tags"]))
@@ -615,6 +877,83 @@ def build_parser() -> argparse.ArgumentParser:
 
     add_credential_parsers(sub)
 
+    catalog = sub.add_parser("catalog")
+    catalog_sub = catalog.add_subparsers(dest="catalog_command", required=True)
+    qualify = catalog_sub.add_parser("qualify")
+    qualify.add_argument("--connector", required=True)
+    qualify.add_argument("--env", dest="environment", required=True)
+    qualify.add_argument("--all", action="store_true")
+    qualify.add_argument("--sandbox-writes", action="store_true")
+    qualify.add_argument("--dry-run", action="store_true")
+    qualify.add_argument("--repo-root", default=".")
+    qualify.set_defaults(func=cmd_catalog_qualify)
+
+    validate = catalog_sub.add_parser("validate")
+    validate.add_argument("--connector", required=True)
+    validate.add_argument("--all", action="store_true")
+    validate.add_argument("--repo-root", default=".")
+    validate.set_defaults(func=cmd_catalog_validate)
+
+    release = sub.add_parser("release")
+    release_sub = release.add_subparsers(dest="release_command", required=True)
+    scan_secrets = release_sub.add_parser("scan-secrets")
+    scan_secrets.add_argument("--all-history", action="store_true")
+    scan_secrets.add_argument("--hosted", action="store_true")
+    scan_secrets.add_argument("--artifacts", required=True)
+    scan_secrets.add_argument("--repo", required=True)
+    scan_secrets.add_argument("--output")
+    scan_secrets.add_argument(
+        "--manifest",
+        default="docs/release/public-surface-manifest.json",
+    )
+    scan_secrets.add_argument(
+        "--allowlist",
+        default="docs/release/secret-scan-allowlist.json",
+    )
+    scan_secrets.add_argument("--known-fingerprint-stdin", action="store_true")
+    scan_secrets.add_argument("--known-fingerprint-file", action="append", default=[])
+    scan_secrets.add_argument("--repo-root", default=".")
+    scan_secrets.add_argument("--gh-executable", default="gh")
+    scan_secrets.add_argument("--github-token-env", default="GH_TOKEN")
+    scan_secrets.add_argument("--marketplace-snapshot-url")
+    scan_secrets.add_argument("--render-api-url")
+    scan_secrets.add_argument("--render-service-id")
+    scan_secrets.add_argument("--render-token-env", default="RENDER_API_KEY")
+    scan_secrets.add_argument("--supabase-url")
+    scan_secrets.add_argument("--supabase-key-env", default="SUPABASE_SERVICE_ROLE_KEY")
+    scan_secrets.add_argument("--supabase-knowledge-table", action="append", default=[])
+    scan_secrets.add_argument("--supabase-storage-bucket", action="append", default=[])
+    scan_secrets.add_argument("--public-mcp-url")
+    scan_secrets.add_argument(
+        "--public-mcp-token-env",
+        default="MERCURY_PUBLIC_MCP_TOKEN",
+    )
+    scan_secrets.set_defaults(func=cmd_release_scan_secrets)
+
+    build_artifacts = release_sub.add_parser("build-artifacts")
+    build_artifacts.add_argument("--version", required=True)
+    build_artifacts.add_argument("--output", default="dist")
+    build_artifacts.add_argument("--repo-root", default=".")
+    build_artifacts.set_defaults(func=cmd_release_build_artifacts)
+
+    release_verify = release_sub.add_parser("verify")
+    release_verify.add_argument("--version", required=True)
+    release_verify.add_argument("--artifacts", required=True)
+    release_verify.add_argument("--repo-root", default=".")
+    release_verify.set_defaults(func=cmd_release_verify)
+
+    release_verify_test_skips = release_sub.add_parser("verify-test-skips")
+    release_verify_test_skips.add_argument("--junit", required=True)
+    release_verify_test_skips.add_argument("--allow-capability-skip", action="store_true")
+    release_verify_test_skips.set_defaults(func=cmd_release_verify_test_skips)
+
+    build_public_staging = release_sub.add_parser("build-public-staging")
+    build_public_staging.add_argument("--version", required=True)
+    build_public_staging.add_argument("--output", default="public-staging")
+    build_public_staging.add_argument("--artifacts")
+    build_public_staging.add_argument("--repo-root", default=".")
+    build_public_staging.set_defaults(func=cmd_release_build_public_staging)
+
     ingest = sub.add_parser("ingest")
     ingest_sub = ingest.add_subparsers(dest="ingest_command", required=True)
     wiki = ingest_sub.add_parser("wiki")
@@ -632,6 +971,11 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--doc-type")
     search.add_argument("--review-status")
     search.add_argument("--effective-date")
+    search.add_argument("--action-id")
+    search.add_argument("--version-id")
+    search.add_argument("--environment")
+    search.add_argument("--capability")
+    search.add_argument("--accounting-use")
     search.add_argument("--embedding-provider", choices=["openai", "hash"])
     search.set_defaults(func=cmd_search)
 

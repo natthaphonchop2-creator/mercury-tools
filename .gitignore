@@ -12,3 +12,8 @@ build/
 htmlcov/
 .worktrees/
 .superpowers/
+.mercury/
+release-evidence/
+.mercury/credentials.env
+.mercury/cache/
+.mercury/audit/

@@ -1,136 +1,108 @@
 # Mercury Tools
 
-Mercury Finance is one repository-local `stdio` MCP for accounting and ERP
-work. It gives an MCP host such as Codex a cited knowledge/catalog layer plus
-local FlowAccount, PEAK, and configured-ERP actions. The host remains the AI;
-Mercury does not run a local LLM and does not provide a web UI.
+Mercury Finance is a repository-local accounting and ERP plugin for Codex. It
+combines cited accounting knowledge with FlowAccount, PEAK, and imported ERP
+action catalogs. Codex remains the host AI; Mercury does not run a local LLM.
 
-## Local Boundary
+Mercury Tools is an independent open-source project and is not affiliated with Mercury Technologies, Inc.
 
-- The installed plugin exposes exactly one server: `mercury-finance`.
-- ERP credentials live only in the selected repository under
-  `.mercury/credentials.env`; they are not sent to Mercury Cloud or stored in
-  Cloud credential storage.
-- ERP request execution, confirmation state, and audit recording happen in
-  the local process. Cloud-backed knowledge and catalog retrieval never receive
-  ERP request bodies or credential values.
-- The local audit ledger is `.mercury/audit/audit.jsonl`. It is append-only and
-  redacts credentials, personal data, request inputs, and provider values.
-- Dotenv files are not a credential source for local ERP execution. Use the
-  `mercury credentials` commands below instead of putting ERP credentials in
-  `.env`, plugin configuration, or chat.
+## Product Boundaries
 
-## Marketplace Install
+- The Codex plugin installs exactly one local `stdio` MCP named
+  `mercury-finance` and exposes exactly 19 local tools.
+- The Render deployment is a separate 20-tool hosted HTTP surface at `/mcp`.
+  Installing the local plugin does not register that hosted endpoint.
+- ERP credentials remain in `.mercury/credentials.env` under the selected
+  repository. They are never stored in Mercury Cloud, plugin metadata, chat,
+  or dotenv files.
+- ERP reads, write previews, confirmations, execution state, and the redacted
+  audit ledger run locally. Cloud stores catalog, RAG, and audit metadata only.
+- A write requires a fresh preview and the catalog's required number of
+  explicit confirmations. Mercury never retries an `outcome_unknown` write.
 
-The released plugin requires `uvx`, which is included with
-[uv](https://docs.astral.sh/uv/). Confirm it is available before installing:
+## Install v0.2.1
+
+Install [uv](https://docs.astral.sh/uv/) first and confirm `uvx` is available:
 
 ```bash
 uvx --version
 ```
 
-After the release owner creates the immutable `v0.2.0` tag, install the GitHub
-marketplace plugin:
+After the reviewed `v0.2.1` release is published, install the immutable
+marketplace source:
 
 ```bash
 codex plugin marketplace add natthaphonchop2-creator/mercury-tools \
-  --ref v0.2.0 \
+  --ref v0.2.1 \
   --sparse .agents/plugins \
   --sparse plugins/mercury-finance
 codex plugin add mercury-finance@mercury-tools
-codex mcp list
+codex mcp list --json
 ```
 
-The launcher uses `uvx` and the released package. It does not register a
-hosted HTTP MCP, request a Mercury owner token, or configure Cloud credentials.
-Before the tag exists, use the local source checkout and the verification
-commands in [docs/JUDGE_QUICKSTART.md](docs/JUDGE_QUICKSTART.md).
+The installed launcher source is:
 
-## Repository Setup
+```text
+git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.1
+```
 
-For development or a local judge run:
+The expected result is one enabled local MCP named `mercury-finance`. See the
+[judge quickstart](docs/JUDGE_QUICKSTART.md) for credential setup, safe read,
+write preview, Cross-MCP reconciliation, and cleanup commands.
+
+## Local Development
 
 ```bash
 uv sync --extra dev
 uv run mercury doctor --repo-root .
-uv run mercury mcp serve-local
-```
-
-Set up credentials in the repository where the ERP work belongs. The commands
-prompt locally and print field names/status only.
-
-```bash
-uv run mercury credentials setup flowaccount --env production --repo-root .
-uv run mercury credentials status --repo-root .
-uv run mercury credentials test flowaccount --env production --repo-root .
-```
-
-`credentials test` performs the connector's credential validation and safe GET
-probe only: FlowAccount uses `GET /company/info`; PEAK uses `GET /user`.
-Choose the intended PEAK environment explicitly:
-
-```bash
-uv run mercury credentials setup peak --env uat --repo-root .
-uv run mercury credentials test peak --env uat --repo-root .
-```
-
-Clear a single profile only when it is no longer needed:
-
-```bash
-uv run mercury credentials clear flowaccount --env production --repo-root .
-```
-
-To remove every local credential profile for the repository:
-
-```bash
-uv run mercury credentials clear --all --repo-root .
-```
-
-`clear --all` unlinks the local credential file and invalidates pending local
-requests. It is not a claim of forensic secure erase from backups, snapshots,
-or storage media. See [docs/LOCAL_CREDENTIALS.md](docs/LOCAL_CREDENTIALS.md).
-
-## Catalogs And Writes
-
-Use `import_erp_spec` to import an OpenAPI, Swagger, Postman, or explicit
-endpoint document into the active repository. Repository-configured custom
-hosts require an interactive trusted-host confirmation before the executor can
-call them. Imported actions remain local overlays; they do not publish
-credentials or ERP payloads.
-
-`search_erp_actions` and `get_erp_action_schema` identify an action before it
-runs. Effective risk tiers govern execution:
-
-- Tier 0 safe GET actions run through `run_erp_read`.
-- Tier 1 writes require `preview_erp_write`, one distinct explicit user
-  confirmation through `confirm_erp_write`, then one `execute_erp_write`.
-- Tier 2 writes, and actions requiring two confirmations, require two distinct
-  confirmations for the same fresh preview before one execution.
-
-Never retry an `outcome_unknown` write. Call `get_erp_request_status`, reconcile
-the provider result through an approved safe status action or manually, then
-create a fresh preview only after the outcome is definite. Full procedures are
-in [docs/ACTION_CATALOG.md](docs/ACTION_CATALOG.md).
-
-## Documentation
-
-- [Judge quickstart](docs/JUDGE_QUICKSTART.md)
-- [Repository-local credentials](docs/LOCAL_CREDENTIALS.md)
-- [Action catalog and confirmation model](docs/ACTION_CATALOG.md)
-- [v0.2.0 release checklist](docs/RELEASE_V0.2.0.md)
-
-## Verification
-
-```bash
-uv sync --extra dev
-uv run ruff check .
-uv run pytest -m "not integration" -q
-uv run pytest tests/integration/test_local_erp_mcp.py -q
-uv run python scripts/validate_release_plugin.py
+uv run python scripts/validate_release_plugin.py --root .
 uv run python scripts/smoke_local_plugin.py
 ```
 
-The Task 18 integration test uses only fake Cloud and fake ERP transports.
-Optional live FlowAccount and PEAK probes run only when their explicit
-`MERCURY_LIVE_FLOWACCOUNT=1` or `MERCURY_LIVE_PEAK=1` flag is set, and they are
-limited to credential validation plus the safe GET probe.
+Set up ERP credentials only in the repository that owns the accounting work:
+
+```bash
+uv run mercury credentials setup flowaccount --env sandbox --repo-root .
+uv run mercury credentials test flowaccount --env sandbox --repo-root .
+uv run mercury credentials status --repo-root .
+```
+
+The setup command prompts locally and does not accept credential values on the
+command line. Clear the profile when the work is complete:
+
+```bash
+uv run mercury credentials clear flowaccount --env sandbox --repo-root .
+```
+
+## Catalog And Write Safety
+
+Use `search_erp_actions` and `get_erp_action_schema` before executing an action.
+Tier 0 safe reads run through `run_erp_read`. Tier 1 and Tier 2 mutations start
+with `preview_erp_write`, then require one or two distinct confirmations before
+`execute_erp_write` can run once. Imported API specifications and trusted-host
+decisions remain repository-local.
+
+When a provider outcome is unknown, call `get_erp_request_status` and reconcile
+with an approved safe status action or manually. Do not retry the mutation.
+See [ACTION_CATALOG.md](docs/ACTION_CATALOG.md) for the complete state model.
+
+## Release Verification
+
+Task 15 prepares release files and workflows only. It does not tag, publish,
+deploy, push, open a pull request, or change repository visibility. The manual
+release workflow binds every gate to a reviewed `main` SHA before it can
+publish assets.
+
+```bash
+uv run ruff check .
+uv run pytest -q --junitxml=release-evidence/pytest.xml
+uv run python scripts/verify_test_skips.py \
+  --junit release-evidence/pytest.xml \
+  --waivers docs/release/v0.2.1-test-waivers.json
+uv run python scripts/validate_release_plugin.py --root .
+```
+
+Release details and operator gates are in
+[RELEASE_V0.2.1.md](docs/RELEASE_V0.2.1.md). Deployment boundaries are in
+[REMOTE_DEPLOYMENT.md](docs/REMOTE_DEPLOYMENT.md), and repository credential
+handling is in [LOCAL_CREDENTIALS.md](docs/LOCAL_CREDENTIALS.md).

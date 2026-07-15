@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -11,8 +12,10 @@ from mercury_tools.catalog.identity import build_action_id, build_version_id
 from mercury_tools.cloud.client import CloudBrainClient
 from mercury_tools.config import DEFAULT_CLOUD_BASE_URL, load_settings
 from mercury_tools.execution.request_builder import build_request
+from mercury_tools.qualification.selection import EvidenceRequest
 
 PUBLIC_RESPONSE_ERROR = "cloud_public_response_invalid"
+NOW = datetime(2026, 7, 14, 9, tzinfo=UTC)
 
 
 class ThreadTrackingCache:
@@ -94,6 +97,71 @@ def _public_search_result() -> dict:
     }
 
 
+def _public_validation_metadata() -> dict:
+    return {
+        "jurisdiction": "TH",
+        "connector": "flowaccount",
+        "doc_type": "endpoint_validation",
+        "review_status": "reviewed",
+        "action_id": "act_1234567890abcdef12345678",
+        "version_id": "av_" + "1" * 64,
+        "environment": "sandbox",
+        "capability": "documents.invoice.list",
+        "accounting_use": ["revenue_review"],
+        "validation_status": "contract_validated",
+        "evidence_level": "contract_validated",
+        "approval_state": "approved_public",
+    }
+
+
+def _evidence_request(action, *, environment: str = "sandbox") -> EvidenceRequest:
+    return EvidenceRequest.model_validate(
+        {
+            "connector_id": action.connector_id,
+            "action_id": action.action_id,
+            "version_id": action.version_id,
+            "environment": environment,
+        }
+    )
+
+
+def _public_validation_evidence(
+    action,
+    *,
+    environment: str = "sandbox",
+    evidence_number: int = 1,
+) -> dict:
+    return {
+        "action_id": action.action_id,
+        "version_id": action.version_id,
+        "connector_id": action.connector_id,
+        "environment": environment,
+        "validation_status": "contract_validated",
+        "evidence_level": "contract_validated",
+        "execution_eligibility": "discovery_only",
+        "summary_th": "Endpoint contract validation completed.",
+        "summary_en": "Endpoint contract validated without a provider call.",
+        "limitations": ["provider_call_not_observed"],
+        "prerequisites": ["configure_sandbox"],
+        "recommended_next_step": "complete_sandbox_validation",
+        "semantic_contract": {
+            "business_object": "invoice",
+            "operation": "list",
+            "accounting_uses": ["revenue_review", "vat_output_review"],
+            "output_semantics": {"document_id": "invoice identifier"},
+            "join_keys": ["document_id"],
+            "next_action_ids": [],
+            "required_external_capabilities": [],
+            "optional_external_capabilities": [],
+            "fallbacks": [],
+        },
+        "opaque_evidence_id": f"ev_{evidence_number:026d}",
+        "evidence_sha256": f"{evidence_number:064x}",
+        "evaluated_at": "2026-07-14T08:00:00Z",
+        "expires_at": "2026-07-15T08:00:00Z",
+    }
+
+
 def _public_document(document_id: str) -> dict:
     return {
         "id": document_id,
@@ -107,6 +175,339 @@ def _public_document(document_id: str) -> dict:
             "source_url": "https://example.test/vat",
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_client_resolves_action_evidence_in_one_exact_batch(
+    repository_context,
+    action_factory,
+) -> None:
+    first = _read_action(action_factory)
+    second = _read_action(
+        action_factory,
+        connector_id="peak",
+        path_template="/contacts",
+        operation_id="listContacts",
+        capability="contacts.read",
+    )
+    requests = (_evidence_request(second), _evidence_request(first))
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        payload = json.loads(request.content)
+        assert payload == {
+            "requests": [item.model_dump(mode="json") for item in requests]
+        }
+        return httpx.Response(
+            200,
+            json={
+                "selections": [
+                    {
+                        "selected": _public_validation_evidence(second, evidence_number=2),
+                        "blocking_conditions": [],
+                    },
+                    {
+                        "selected": _public_validation_evidence(first, evidence_number=1),
+                        "blocking_conditions": [],
+                    },
+                ]
+            },
+        )
+
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=CatalogCache(repository_context),
+        transport=httpx.MockTransport(handler),
+        clock=lambda: NOW,
+    )
+    try:
+        selections = await client.resolve_validations(requests)
+    finally:
+        await client.aclose()
+
+    assert len(seen) == 1
+    assert seen[0].url.path == "/api/cloud/v1/catalog/validation/resolve"
+    assert "authorization" not in seen[0].headers
+    assert [selection.selected.action_id for selection in selections] == [
+        second.action_id,
+        first.action_id,
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["offline", "service_unavailable"])
+async def test_client_returns_unavailable_blockers_when_validation_cloud_is_unavailable(
+    repository_context,
+    action_factory,
+    failure: str,
+) -> None:
+    action = _read_action(action_factory)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if failure == "offline":
+            raise httpx.ConnectError("offline", request=request)
+        return httpx.Response(503, json={"error": "service_unavailable"})
+
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=CatalogCache(repository_context),
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        selection = await client.resolve_validation(
+            connector_id=action.connector_id,
+            action_id=action.action_id,
+            version_id=action.version_id,
+            environment="sandbox",
+        )
+    finally:
+        await client.aclose()
+
+    assert selection.selected is None
+    assert selection.blocking_conditions == ("validation_unavailable",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "request_environment"),
+    [
+        (
+            {
+                "validation_status": "live_failed",
+                "evidence_level": "sandbox_observed",
+                "execution_eligibility": "sandbox_read",
+            },
+            "sandbox",
+        ),
+        (
+            {
+                "validation_status": "contract_validated",
+                "evidence_level": "contract_validated",
+                "execution_eligibility": "sandbox_read",
+            },
+            "sandbox",
+        ),
+        (
+            {"expires_at": "2026-07-14T08:30:00Z"},
+            "sandbox",
+        ),
+        (
+            {
+                "evaluated_at": "2026-07-14T10:00:00Z",
+                "expires_at": "2026-07-14T11:00:00Z",
+            },
+            "sandbox",
+        ),
+        (
+            {
+                "environment": "production",
+                "validation_status": "live_success",
+                "evidence_level": "sandbox_observed",
+                "execution_eligibility": "sandbox_read",
+            },
+            "production",
+        ),
+    ],
+    ids=(
+        "failed-status-cannot-execute",
+        "contract-cannot-widen-eligibility",
+        "expired-replay",
+        "future-evaluation",
+        "sandbox-evidence-cannot-authorize-production",
+    ),
+)
+async def test_client_downgrades_inadmissible_selected_evidence_with_injected_clock(
+    repository_context,
+    action_factory,
+    overrides: dict,
+    request_environment: str,
+) -> None:
+    action = _read_action(action_factory)
+    evidence = {
+        **_public_validation_evidence(action, environment=request_environment),
+        **overrides,
+    }
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=CatalogCache(repository_context),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "selections": [
+                        {
+                            "selected": evidence,
+                            "blocking_conditions": [],
+                        }
+                    ]
+                },
+            )
+        ),
+        clock=lambda: NOW,
+    )
+    try:
+        selection = await client.resolve_validations(
+            (_evidence_request(action, environment=request_environment),)
+        )
+    finally:
+        await client.aclose()
+
+    assert len(selection) == 1
+    assert selection[0].selected is None
+    assert selection[0].blocking_conditions == ("validation_unavailable",)
+
+
+@pytest.mark.asyncio
+async def test_client_accepts_current_coherent_live_success_evidence(
+    repository_context,
+    action_factory,
+) -> None:
+    action = _read_action(action_factory)
+    evidence = {
+        **_public_validation_evidence(action),
+        "validation_status": "live_success",
+        "evidence_level": "sandbox_observed",
+        "execution_eligibility": "sandbox_read",
+    }
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=CatalogCache(repository_context),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "selections": [
+                        {
+                            "selected": evidence,
+                            "blocking_conditions": [],
+                        }
+                    ]
+                },
+            )
+        ),
+        clock=lambda: NOW,
+    )
+    try:
+        selection = await client.resolve_validations((_evidence_request(action),))
+    finally:
+        await client.aclose()
+
+    assert selection[0].selected is not None
+    assert selection[0].selected.validation_status.value == "live_success"
+    assert selection[0].selected.execution_eligibility.value == "sandbox_read"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"selections": []},
+        {
+            "selections": [
+                {
+                    "selected": None,
+                    "blocking_conditions": [],
+                }
+            ]
+        },
+        {
+            "selections": [
+                {
+                    "selected": None,
+                    "blocking_conditions": ["validation_unavailable"],
+                    "raw_response": {},
+                }
+            ]
+        },
+    ],
+)
+async def test_client_rejects_incomplete_or_extra_validation_response_keys(
+    repository_context,
+    action_factory,
+    response: dict,
+) -> None:
+    action = _read_action(action_factory)
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=CatalogCache(repository_context),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json=response)
+        ),
+    )
+    try:
+        with pytest.raises(ValueError, match=f"^{PUBLIC_RESPONSE_ERROR}$"):
+            await client.resolve_validations((_evidence_request(action),))
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_client_rejects_validation_evidence_bound_to_another_action(
+    repository_context,
+    action_factory,
+) -> None:
+    requested = _read_action(action_factory)
+    other = _read_action(
+        action_factory,
+        path_template="/contacts",
+        operation_id="listContacts",
+        capability="contacts.read",
+    )
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=CatalogCache(repository_context),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "selections": [
+                        {
+                            "selected": _public_validation_evidence(other),
+                            "blocking_conditions": [],
+                        }
+                    ]
+                },
+            )
+        ),
+    )
+    try:
+        with pytest.raises(ValueError, match=f"^{PUBLIC_RESPONSE_ERROR}$"):
+            await client.resolve_validations((_evidence_request(requested),))
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_client_rejects_more_than_one_hundred_validation_requests_before_http(
+    repository_context,
+) -> None:
+    seen: list[httpx.Request] = []
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=CatalogCache(repository_context),
+        transport=httpx.MockTransport(
+            lambda request: seen.append(request) or httpx.Response(500)
+        ),
+    )
+    requests = tuple(
+        EvidenceRequest.model_validate(
+            {
+                "connector_id": "flowaccount",
+                "action_id": f"act_{index:024x}",
+                "version_id": f"av_{index:064x}",
+                "environment": "sandbox",
+            }
+        )
+        for index in range(101)
+    )
+    try:
+        with pytest.raises(ValueError, match="^cloud_validation_request_invalid$"):
+            await client.resolve_validations(requests)
+    finally:
+        await client.aclose()
+
+    assert seen == []
 
 
 @pytest.mark.asyncio
@@ -856,6 +1257,45 @@ async def test_client_redacts_sensitive_search_text_before_network(repository_co
     assert "person@example.com" not in serialized
     assert "0105559999999" not in serialized
     assert "private-value" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_client_routes_exact_filters_and_accepts_typed_validation_metadata(
+    repository_context,
+) -> None:
+    captured = {}
+    public_result = {
+        **_public_search_result(),
+        "metadata": _public_validation_metadata(),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, json={"results": [public_result]})
+
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=CatalogCache(repository_context),
+        transport=httpx.MockTransport(handler),
+    )
+    filters = {
+        "connector": "flowaccount",
+        "action_id": "act_1234567890abcdef12345678",
+        "version_id": "av_" + "1" * 64,
+        "environment": "sandbox",
+        "capability": "documents.invoice.list",
+        "accounting_use": "revenue_review",
+    }
+    try:
+        [result] = await client.search_knowledge(
+            "qualified evidence",
+            filters=filters,
+        )
+    finally:
+        await client.aclose()
+
+    assert captured["filters"] == {**filters, "review_status": "reviewed"}
+    assert result["metadata"] == _public_validation_metadata()
 
 
 def test_cloud_base_url_defaults_and_loads_from_environment(monkeypatch) -> None:

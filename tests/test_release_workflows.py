@@ -1,0 +1,289 @@
+from __future__ import annotations
+
+import json
+import re
+import tomllib
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKFLOWS = ROOT / ".github" / "workflows"
+FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+GITLEAKS_SHA256 = "9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c"
+TRUFFLEHOG_SHA256 = "cddd1f602da61a130580883f4dd96b3d206efaf55a22068321cc11237fbc88cd"
+
+
+def _workflow(name: str) -> dict[str, Any]:
+    payload = yaml.load((WORKFLOWS / name).read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    assert isinstance(payload, dict)
+    return payload
+
+
+def _run_text(job: dict[str, Any]) -> str:
+    steps = job.get("steps")
+    assert isinstance(steps, list)
+    return "\n".join(step.get("run", "") for step in steps if isinstance(step, dict))
+
+
+def _assert_pinned_actions_and_no_bypasses(payload: dict[str, Any]) -> None:
+    serialized = json.dumps(payload, sort_keys=True)
+    assert "continue-on-error" not in serialized
+    jobs = payload.get("jobs")
+    assert isinstance(jobs, dict)
+    for job in jobs.values():
+        assert isinstance(job, dict)
+        for step in job.get("steps", []):
+            assert isinstance(step, dict)
+            action = step.get("uses")
+            if action is not None:
+                assert "@" in action
+                assert FULL_SHA.fullmatch(action.rsplit("@", 1)[1])
+            command = step.get("run", "")
+            assert "secrets." not in command
+
+
+def _assert_scanner_install_and_gates(command: str, job: dict[str, Any]) -> None:
+    serialized = json.dumps(job, sort_keys=True)
+    assert "gitleaks_8.24.3_linux_x64.tar.gz" in serialized
+    assert GITLEAKS_SHA256 in serialized
+    assert "trufflehog_3.88.32_linux_amd64.tar.gz" in serialized
+    assert TRUFFLEHOG_SHA256 in serialized
+    assert "sha256sum --check" in command
+    assert "gitleaks version" in command
+    assert "trufflehog --version" in command
+    assert "gitleaks git" in command
+    assert "trufflehog git" in command
+    trufflehog_invocations = [
+        line.strip()
+        for line in command.splitlines()
+        if re.search(r"\btrufflehog (?:git|filesystem)\b", line)
+    ]
+    assert trufflehog_invocations
+    assert all("--no-update" in line for line in trufflehog_invocations)
+    assert all("--no-verification" in line for line in trufflehog_invocations)
+    assert all("--concurrency=1" in line for line in trufflehog_invocations)
+    assert all("--json" in line for line in trufflehog_invocations)
+    assert command.count('>"$TRUFFLEHOG_REPORT" 2>/dev/null') == len(
+        trufflehog_invocations
+    )
+    assert "trufflehog-history.log" not in command
+    assert "trufflehog-artifacts.log" not in command
+    assert "scripts/verify_trufflehog_report.py" in command
+    assert command.count("--config .gitleaks.toml") == (
+        command.count("gitleaks git") + command.count("gitleaks dir")
+    )
+    assert ">\"$" in command or "> \"$" in command
+
+
+def test_gitleaks_fixture_allowlists_are_exact_and_fail_closed() -> None:
+    config = tomllib.loads((ROOT / ".gitleaks.toml").read_text(encoding="utf-8"))
+
+    assert set(config) == {"title", "extend", "rules"}
+    assert config["extend"] == {"useDefault": True}
+    rules = config["rules"]
+    assert [rule["id"] for rule in rules] == [
+        "generic-api-key",
+        "aws-access-token",
+        "jwt",
+    ]
+
+    expected_signatures = {
+        ("generic-api-key", r"^tests/test_release_secret_scanner\.py$"): (
+            r'^\s*credential\s*=\s*"[0-9a-f]{16}"\s*\*\s*8\s*$',
+        ),
+        ("generic-api-key", r"^tests/test_cloud_secret_removal\.py$"): (
+            r'^\s*\{"id":\s*"event-1",\s*"summary":\s*\{"api_key":\s*'
+            r'"live-api-key-123456789"\},\s*"metadata":\s*\{\}\}\s*$',
+        ),
+        ("generic-api-key", r"^tests/test_plugin_package\.py$"): (
+            r'^\s*\("api_key",\s*"sk-live-[0-9a-f]{24}"\),\s*$',
+            r'^\s*\("client_secret",\s*"v1\.[A-Za-z0-9]{20}"\),\s*$',
+        ),
+        ("generic-api-key", r"^tests/test_cloud_api\.py$"): (
+            r'^\s*for secret in \("inbound-secret",\s*"inbound-secret2",'
+            r'\s*"inbound-session"\):\s*$',
+        ),
+        ("aws-access-token", r"^tests/test_cloud_secret_removal\.py$"): (
+            r'^\s*"aws=AKIA[0-9]{10}ABCDEF",\s*$',
+            r'^\s*"AKIA[0-9]{10}ABCDEF",\s*$',
+        ),
+        ("jwt", r"^tests/test_cloud_secret_removal\.py$"): (
+            r'^\s*"jwt=eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIn0\.signaturevalue1234",\s*$',
+        ),
+    }
+    actual_signatures: dict[tuple[str, str], tuple[str, ...]] = {}
+    for rule in rules:
+        assert set(rule) == {"id", "allowlists"}
+        for allowlist in rule["allowlists"]:
+            assert set(allowlist) == {
+                "description",
+                "condition",
+                "regexTarget",
+                "paths",
+                "regexes",
+            }
+            assert allowlist["condition"] == "AND"
+            assert allowlist["regexTarget"] == "line"
+            assert len(allowlist["paths"]) == 1
+            assert all(".*" not in regex for regex in allowlist["regexes"])
+            assert all(
+                regex.startswith("^") and regex.endswith("$")
+                for regex in allowlist["regexes"]
+            )
+            signature = (rule["id"], allowlist["paths"][0])
+            assert signature not in actual_signatures
+            actual_signatures[signature] = tuple(allowlist["regexes"])
+
+    assert actual_signatures == expected_signatures
+
+
+def test_ci_is_full_history_fail_closed_and_emits_exact_skip_junit() -> None:
+    payload = _workflow("ci.yml")
+    _assert_pinned_actions_and_no_bypasses(payload)
+    test = payload["jobs"]["test"]
+    assert test["if"] == "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+    checkout = test["steps"][0]
+    assert checkout["with"]["fetch-depth"] == "0"
+    command = _run_text(test)
+
+    _assert_scanner_install_and_gates(command, test)
+    assert "uv run ruff check ." in command
+    assert "uv run pytest -q --junitxml=release-evidence/pytest.xml" in command
+    assert "scripts/verify_test_skips.py" in command
+    assert "docs/release/v0.2.1-test-waivers.json" in command
+    assert "MERCURY_SUPABASE_VALIDATION_TEST" in json.dumps(test["env"])
+    assert "SUPABASE_SERVICE_ROLE_KEY" in json.dumps(test["env"])
+    assert "test -n \"$MERCURY_SUPABASE_TEST_GUARD\"" in command
+    assert "uv run mercury doctor --repo-root ." in command
+    assert "scripts/validate_release_plugin.py --root ." in command
+    assert "scripts/smoke_local_plugin.py" in command
+    assert "uv build --wheel --sdist" in command
+    assert "gitleaks dir" in command
+    assert "trufflehog filesystem" in command
+
+    public = payload["jobs"]["public"]
+    assert public["if"] == "github.event_name == 'pull_request' || github.ref != 'refs/heads/main'"
+    assert "secrets." not in json.dumps(public)
+    public_command = _run_text(public)
+    assert "uv run pytest -q --ignore=tests/integration" in public_command
+    assert "gitleaks git" in public_command
+    assert "trufflehog git" in public_command
+
+
+def test_release_is_manual_sha_bound_and_publication_depends_on_every_gate() -> None:
+    payload = _workflow("release.yml")
+    _assert_pinned_actions_and_no_bypasses(payload)
+    dispatch = payload["on"]["workflow_dispatch"]
+    reviewed = dispatch["inputs"]["reviewed_main_sha"]
+    assert reviewed["required"] == "true"
+    assert reviewed["type"] == "string"
+    staging_repo = dispatch["inputs"]["staging_repo"]
+    staging_ref = dispatch["inputs"]["staging_ref"]
+    assert staging_repo["required"] == "true"
+    assert staging_repo["type"] == "string"
+    assert staging_ref["required"] == "true"
+    assert staging_ref["type"] == "string"
+
+    jobs = payload["jobs"]
+    ordered = (
+        "validate-reviewed-sha",
+        "quality-security",
+        "supabase-migration",
+        "flowaccount-coverage",
+        "peak-contract",
+        "build-artifacts",
+        "public-staging",
+        "tagged-marketplace",
+        "render-release",
+        "publish-assets",
+    )
+    assert tuple(jobs) == ordered
+    for previous, current in zip(ordered, ordered[1:], strict=False):
+        assert jobs[current]["needs"] == previous
+
+    validate = _run_text(jobs["validate-reviewed-sha"])
+    assert "origin/main" in validate
+    assert "REVIEWED_MAIN_SHA" in validate
+    assert "refs/tags/v0.2.1" not in validate
+    assert "--force" not in validate
+
+    quality = _run_text(jobs["quality-security"])
+    _assert_scanner_install_and_gates(quality, jobs["quality-security"])
+    assert "--junitxml=release-evidence/pytest.xml" in quality
+    assert "scripts/verify_test_skips.py" in quality
+    assert "scripts/validate_release_plugin.py --root ." in quality
+
+    assert "test_validation_migration.py" in _run_text(jobs["supabase-migration"])
+    assert "test_supabase_validation_knowledge.py" in _run_text(
+        jobs["supabase-migration"]
+    )
+    flowaccount = _run_text(jobs["flowaccount-coverage"])
+    assert "MERCURY_LIVE_FLOWACCOUNT_SANDBOX" in json.dumps(
+        jobs["flowaccount-coverage"]
+    )
+    assert "catalog qualify" in flowaccount
+    assert "total" in flowaccount and "190" in flowaccount
+    peak = _run_text(jobs["peak-contract"])
+    assert "catalog validate" in peak
+    assert "total" in peak and "64" in peak and "http_attempts" in peak
+
+    platform = json.loads(
+        (ROOT / "release-toolchain" / "platform.json").read_text(encoding="utf-8")
+    )
+    policy = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))[
+        "tool"
+    ]["mercury"]["release-build"]
+    descriptor_policy = policy["platform"]
+    assert descriptor_policy["path"] == "release-toolchain/platform.json"
+    assert descriptor_policy["sha256"] == __import__("hashlib").sha256(
+        (ROOT / descriptor_policy["path"]).read_bytes()
+    ).hexdigest()
+    build = _run_text(jobs["build-artifacts"])
+    assert "release-toolchain/platform.json" in build
+    assert platform["image"] not in build
+    assert 'docker run --rm --platform "$RELEASE_PLATFORM"' in build
+    assert '"$RELEASE_IMAGE" sh -ceu' in build
+    assert "install -d -m 700" in build
+    assert "scripts/build_release_artifacts.py --version 0.2.1" in build
+    assert "scripts/verify_release.py --version 0.2.1" in build
+    assert "release-evidence/private" in build
+
+    assert "scripts/build_public_staging.py" in _run_text(jobs["public-staging"])
+    marketplace = _run_text(jobs["tagged-marketplace"])
+    assert "scripts/smoke_tagged_marketplace.py" in marketplace
+    assert '"$STAGING_REPO"' in marketplace
+    assert '"$STAGING_REF"' in marketplace
+    assert '--launcher-repo "$STAGING_REPO"' in marketplace
+    assert '--launcher-ref "$STAGING_REF"' in marketplace
+    assert "history-free staging" in marketplace
+    assert "refs/tags/$STAGING_REF" in marketplace
+    assert "verify_staging_snapshot.py" in marketplace
+    assert "mercury-v0.2.1-public-staging-identity" in json.dumps(jobs["public-staging"])
+    assert "refs/tags/v0.2.1" not in marketplace
+    render = _run_text(jobs["render-release"])
+    assert "scripts/verify_render_release.py" in render
+    assert '--commit "$REVIEWED_MAIN_SHA"' in render
+    publish = _run_text(jobs["publish-assets"])
+    assert "git tag -a \"$RELEASE_TAG\" \"$REVIEWED_MAIN_SHA\"" in publish
+    assert "git push origin \"refs/tags/$RELEASE_TAG\"" in publish
+    assert "--force" not in publish
+    assert "gh release create" in publish
+    assert "gh release upload" in publish
+    assert "existing annotated release tag" in validate
+    assert "--verify-tag" in publish
+    assert publish.index("git tag -a") < publish.index("gh release create")
+
+
+def test_post_public_workflow_is_anonymous_and_exact_release_bound() -> None:
+    payload = _workflow("post-public-verify.yml")
+    _assert_pinned_actions_and_no_bypasses(payload)
+    assert "workflow_dispatch" in payload["on"]
+    assert payload["permissions"]["contents"] == "read"
+    command = _run_text(payload["jobs"]["verify-public"])
+    assert "scripts/verify_public_release.py" in command
+    assert "--tag v0.2.1" in command
+    assert "--release v0.2.1" in command
+    assert "--expected-tools 19" in command
+    assert "GH_TOKEN" not in json.dumps(payload["jobs"]["verify-public"].get("env", {}))

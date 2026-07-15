@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+from collections.abc import Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,6 +18,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
+from mercury_tools import __version__
 from mercury_tools.cloud.api import CloudDependencies, cloud_routes
 from mercury_tools.config import load_settings
 from mercury_tools.connectors.catalog import (
@@ -50,7 +53,13 @@ from mercury_tools.product import (
 from mercury_tools.prompts import get_prompt
 from mercury_tools.rag.chunking import chunk_document, sha256_text
 from mercury_tools.rag.embeddings import create_embedding_provider
-from mercury_tools.rag.models import ContextPack, KnowledgeDocument, SearchFilters, SearchResult
+from mercury_tools.rag.models import (
+    ContextPack,
+    KnowledgeDocument,
+    SearchFilters,
+    SearchResult,
+    public_search_result_payload,
+)
 from mercury_tools.rag.routing import apply_knowledge_routing, infer_knowledge_domain
 from mercury_tools.rag.service import MIN_RELEVANCE_SCORE, RagService
 from mercury_tools.safety.redaction import redact_json
@@ -61,6 +70,7 @@ from mercury_tools.workspaces import (
 
 mcp = FastMCP("Mercury Tools")
 
+_SEARCH_FILTER_FIELDS = frozenset(SearchFilters.__dataclass_fields__)
 MAX_MCP_FLOW_FILES = 50
 MAX_MCP_FLOW_FILE_CHARS = 500_000
 CONNECTOR_ENV_KEYS = ("connector", "connector_id", "accounting_connector", "erp_connector")
@@ -68,6 +78,7 @@ ENVIRONMENT_ENV_KEYS = ("environment", "connector_environment", "connector_env")
 CAPABILITY_KEYS = ("required_capabilities", "requiredCapabilities", "capabilities")
 CONNECTOR_BACKED_COMMANDS = {"connectorStatus"}
 CONNECTOR_TAGS = {"connector", "connectors", "connector-backed", "accounting-connector", "erp-connector"}
+_LOWER_HEX = frozenset("0123456789abcdef")
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -114,32 +125,18 @@ def _audit(tool_name: str, input_payload: dict[str, Any], output_summary: dict[s
 
 
 def _filters(filters: dict[str, Any] | None) -> SearchFilters:
-    filters = filters or {}
-    return SearchFilters(
-        jurisdiction=filters.get("jurisdiction"),
-        connector=filters.get("connector"),
-        doc_type=filters.get("doc_type"),
-        review_status=filters.get("review_status"),
-        effective_date=filters.get("effective_date"),
-    )
+    if filters is None:
+        return SearchFilters()
+    if not isinstance(filters, Mapping) or set(filters) - _SEARCH_FILTER_FIELDS:
+        raise ValueError("search_filters_invalid")
+    try:
+        return SearchFilters(**dict(filters))
+    except (TypeError, ValueError):
+        raise ValueError("search_filters_invalid") from None
 
 
 def _serialize_search_results(results: list[SearchResult]) -> list[dict[str, Any]]:
-    return [
-        {
-            "chunk_id": result.chunk_id,
-            "document_uri": result.document_uri,
-            "score": result.score,
-            "text": result.text,
-            "citation": result.citation,
-            "metadata": result.metadata,
-            "source_title": result.source_title,
-            "source_uri": result.source_uri,
-            "source_url": result.source_url,
-            "source_path": result.source_path,
-        }
-        for result in results
-    ]
+    return [public_search_result_payload(result) for result in results]
 
 
 def _merge_search_results(
@@ -1996,8 +1993,13 @@ async def root(request: Request) -> Response:
 
 async def status(_: Request) -> Response:
     settings = load_settings()
+    deployment_commit = os.environ.get("MERCURY_DEPLOYMENT_COMMIT", "")
+    if len(deployment_commit) != 40 or not set(deployment_commit) <= _LOWER_HEX:
+        deployment_commit = None
     payload = {
         "name": "Mercury Tools MCP",
+        "version": __version__,
+        "deployment_commit": deployment_commit,
         "status": "ok",
         "supabase": settings.supabase_configured,
         "openai": settings.openai_configured,

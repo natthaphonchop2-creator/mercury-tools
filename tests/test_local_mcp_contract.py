@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,16 +15,27 @@ from mcp.shared.memory import create_connected_server_and_client_session
 
 from mercury_tools.catalog.cache import CatalogCache
 from mercury_tools.catalog.local_store import LocalCatalogStore
+from mercury_tools.catalog.search import search_actions
 from mercury_tools.cloud.client import CatalogFetchResult, CloudBrainClient
+from mercury_tools.cloud.models import (
+    PublicEvidenceSelection,
+    PublicValidationEvidence,
+)
 from mercury_tools.drivers.models import ConnectorResult
 from mercury_tools.execution.executor import ExecutionPolicyError
 from mercury_tools.execution.store import RequestStateError
 from mercury_tools.local.audit import AuditLedger
 from mercury_tools.local.credentials import CredentialStore
-from mercury_tools.local.repository import ensure_repository_state
+from mercury_tools.local.repository import RepositoryConfig, ensure_repository_state
 from mercury_tools.mcp import local_server
 from mercury_tools.mcp.local_runtime import LocalMercuryRuntime
 from mercury_tools.mcp.local_server import audit_resource, execute_erp_write, local_mcp
+from mercury_tools.qualification.models import (
+    EvidenceLevel,
+    ExecutionEligibility,
+    SemanticContract,
+    ValidationStatus,
+)
 
 EXPECTED_TOOLS = {
     "search_knowledge",
@@ -61,6 +72,535 @@ EXPECTED_PROMPTS = {
     "management_report_th",
     "connector_setup_guide_th",
 }
+NOW = datetime(2026, 7, 14, 9, tzinfo=UTC)
+
+
+def _semantic_contract(*, operation: str = "list") -> SemanticContract:
+    return SemanticContract(
+        business_object="invoice",
+        operation=operation,
+        accounting_uses=("revenue_review", "vat_output_review"),
+        output_semantics={"document_id": "invoice identifier"},
+        join_keys=("document_id",),
+        next_action_ids=(),
+    )
+
+
+def _public_selection(
+    action,
+    *,
+    semantic: SemanticContract | None = None,
+    environment: str = "sandbox",
+    evidence_number: int = 1,
+    evidence_overrides: dict[str, object] | None = None,
+) -> PublicEvidenceSelection:
+    contract = semantic or _semantic_contract()
+    evidence_payload = {
+        "action_id": action.action_id,
+        "version_id": action.version_id,
+        "connector_id": action.connector_id,
+        "environment": environment,
+        "validation_status": ValidationStatus.CONTRACT_VALIDATED,
+        "evidence_level": EvidenceLevel.CONTRACT_VALIDATED,
+        "execution_eligibility": ExecutionEligibility.DISCOVERY_ONLY,
+        "summary_th": "Endpoint contract validation completed.",
+        "summary_en": "Endpoint contract validated without a provider call.",
+        "limitations": ("provider_call_not_observed",),
+        "prerequisites": ("configure_sandbox",),
+        "recommended_next_step": "complete_sandbox_validation",
+        "semantic_contract": contract,
+        "opaque_evidence_id": f"ev_{evidence_number:026d}",
+        "evidence_sha256": f"{evidence_number:064x}",
+        "evaluated_at": NOW,
+        "expires_at": NOW + timedelta(days=1),
+    }
+    evidence_payload.update(evidence_overrides or {})
+    evidence = PublicValidationEvidence.model_validate(
+        evidence_payload
+    )
+    return PublicEvidenceSelection.model_validate(
+        {"selected": evidence, "blocking_conditions": ()}
+    )
+
+
+def _context_payload(
+    action,
+    *,
+    semantic: SemanticContract | None = None,
+    environment: str = "sandbox",
+) -> dict:
+    contract = semantic or _semantic_contract()
+    return {
+        "environment": environment,
+        "semantic_contract": contract.model_dump(mode="json"),
+        "validation": _public_selection(
+            action,
+            semantic=contract,
+            environment=environment,
+        ).model_dump(mode="json"),
+    }
+
+
+def test_local_flow_adapter_routes_exact_validation_filters() -> None:
+    filters = SimpleNamespace(
+        jurisdiction="TH",
+        connector="flowaccount",
+        doc_type="endpoint_validation",
+        review_status="reviewed",
+        effective_date=None,
+        action_id="act_1234567890abcdef12345678",
+        version_id="av_" + "1" * 64,
+        environment="sandbox",
+        capability="documents.invoice.list",
+        accounting_use="revenue_review",
+    )
+
+    assert local_server._flow_filters(filters) == {
+        "jurisdiction": "TH",
+        "connector": "flowaccount",
+        "doc_type": "endpoint_validation",
+        "review_status": "reviewed",
+        "action_id": "act_1234567890abcdef12345678",
+        "version_id": "av_" + "1" * 64,
+        "environment": "sandbox",
+        "capability": "documents.invoice.list",
+        "accounting_use": "revenue_review",
+    }
+
+
+def test_local_flow_result_carries_only_approved_validation_metadata() -> None:
+    metadata = {
+        "jurisdiction": "TH",
+        "connector": "flowaccount",
+        "doc_type": "endpoint_validation",
+        "review_status": "reviewed",
+        "action_id": "act_1234567890abcdef12345678",
+        "version_id": "av_" + "1" * 64,
+        "environment": "sandbox",
+        "capability": "documents.invoice.list",
+        "accounting_use": ["revenue_review"],
+        "validation_status": "contract_validated",
+        "evidence_level": "contract_validated",
+        "approval_state": "approved_public",
+    }
+    result = local_server._flow_result(
+        {
+            "chunk_id": "chunk-1",
+            "metadata": {**metadata, "raw_response": "private-value"},
+        }
+    )
+
+    assert result.metadata == metadata
+    assert "private-value" not in str(vars(result))
+
+
+def test_local_flow_result_preserves_only_safe_general_metadata() -> None:
+    result = local_server._flow_result(
+        {
+            "chunk_id": "chunk-1",
+            "document_uri": "mercury://wiki/tax/vat",
+            "source_uri": "mercury://wiki/tax/vat",
+            "metadata": {
+                "jurisdiction": "TH",
+                "doc_type": "tax",
+                "review_status": "reviewed",
+                "provider_record_id": "provider-private-value",
+            },
+        }
+    )
+
+    assert result.metadata == {
+        "jurisdiction": "TH",
+        "doc_type": "tax",
+        "review_status": "reviewed",
+    }
+    assert "provider-private-value" not in str(vars(result))
+
+
+def test_local_flow_result_rejects_partial_validation_metadata_without_echo() -> None:
+    unsafe_value = "provider-private-value"
+    validation_uri = "mercury://wiki/validation/flowaccount/action/version/run"
+
+    with pytest.raises(
+        ValueError,
+        match="^public_knowledge_metadata_invalid$",
+    ) as raised:
+        local_server._flow_result(
+            {
+                "chunk_id": "chunk-validation",
+                "document_uri": validation_uri,
+                "source_uri": validation_uri,
+                "metadata": {
+                    "review_status": "reviewed",
+                    "provider_record_id": unsafe_value,
+                },
+            }
+        )
+
+    assert unsafe_value not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_local_runtime_rejects_unknown_search_filter_before_cloud() -> None:
+    runtime = object.__new__(LocalMercuryRuntime)
+    calls = []
+
+    class FakeCloud:
+        async def search_knowledge(self, query, *, filters, top_k):
+            calls.append(filters)
+            return ()
+
+    runtime.cloud = FakeCloud()
+
+    with pytest.raises(ValueError, match="^cloud_search_invalid$") as raised:
+        await runtime.search_knowledge(
+            "qualified evidence",
+            filters={"raw_response": "private-value"},
+        )
+
+    assert calls == []
+    assert "private-value" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_runtime_batches_exact_action_context_resolution(action_factory) -> None:
+    first = action_factory(operation_id="first")
+    second = action_factory(operation_id="second")
+    first_semantic = _semantic_contract(operation="create")
+    second_semantic = _semantic_contract(operation="create")
+    calls = []
+
+    class FakeCloud:
+        async def resolve_validations(self, requests):
+            calls.append(tuple(requests))
+            return tuple(
+                _public_selection(
+                    first if request.action_id == first.action_id else second,
+                    semantic=(
+                        first_semantic
+                        if request.action_id == first.action_id
+                        else second_semantic
+                    ),
+                    evidence_number=index,
+                )
+                for index, request in enumerate(requests, start=1)
+            )
+
+    runtime = object.__new__(LocalMercuryRuntime)
+    runtime.cloud = FakeCloud()
+    runtime.repository_config = RepositoryConfig(
+        connectors={"flowaccount": {"sandbox": {}}},
+        validations={"flowaccount": {"sandbox": {"validation_state": "connected"}}},
+    )
+    runtime.semantic_contracts = {
+        (first.action_id, first.version_id): first_semantic,
+        (second.action_id, second.version_id): second_semantic,
+    }
+    runtime._clock = lambda: NOW
+
+    contexts = await runtime.action_contexts((second, first), environment=None)
+
+    assert len(calls) == 1
+    assert [request.action_id for request in calls[0]] == [
+        second.action_id,
+        first.action_id,
+    ]
+    assert contexts[(second.action_id, second.version_id)]["environment"] == "sandbox"
+    assert contexts[(first.action_id, first.version_id)]["validation"]["selected"][
+        "action_id"
+    ] == first.action_id
+
+
+@pytest.mark.asyncio
+async def test_runtime_caps_validation_batches_at_one_hundred(action_factory) -> None:
+    actions = tuple(
+        action_factory(
+            operation_id=f"createInvoice{index}",
+            path_template=f"/invoices/{index}",
+        )
+        for index in range(101)
+    )
+    semantic = _semantic_contract(operation="create")
+    calls = []
+
+    class FakeCloud:
+        async def resolve_validations(self, requests):
+            calls.append(tuple(requests))
+            return tuple(
+                PublicEvidenceSelection.model_validate(
+                    {
+                        "selected": None,
+                        "blocking_conditions": ("validation_unavailable",),
+                    }
+                )
+                for _request in requests
+            )
+
+    runtime = object.__new__(LocalMercuryRuntime)
+    runtime.cloud = FakeCloud()
+    runtime.repository_config = RepositoryConfig()
+    runtime.semantic_contracts = {
+        (action.action_id, action.version_id): semantic for action in actions
+    }
+
+    contexts = await runtime.action_contexts(actions, environment="sandbox")
+
+    assert [len(call) for call in calls] == [100, 1]
+    assert len(contexts) == 101
+    assert all(
+        context["validation"]["blocking_conditions"] == ["validation_unavailable"]
+        for context in contexts.values()
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "repository_config",
+    [
+        RepositoryConfig(
+            connectors={"flowaccount": {"sandbox": {}}},
+            validations={},
+        ),
+        RepositoryConfig(
+            connectors={"flowaccount": {"sandbox": {}, "production": {}}},
+            validations={
+                "flowaccount": {
+                    "sandbox": {"validation_state": "connected"},
+                    "production": {"validation_state": "connected"},
+                }
+            },
+        ),
+    ],
+)
+async def test_runtime_omitted_environment_never_defaults_to_production(
+    action_factory,
+    repository_config: RepositoryConfig,
+) -> None:
+    action = action_factory()
+    calls = []
+
+    class FakeCloud:
+        async def resolve_validations(self, requests):
+            calls.append(tuple(requests))
+            return ()
+
+    runtime = object.__new__(LocalMercuryRuntime)
+    runtime.cloud = FakeCloud()
+    runtime.repository_config = repository_config
+    runtime.semantic_contracts = {
+        (action.action_id, action.version_id): _semantic_contract(operation="create")
+    }
+
+    contexts = await runtime.action_contexts((action,), environment=None)
+
+    context = contexts[(action.action_id, action.version_id)]
+    assert context["environment"] is None
+    assert context["validation"] == {
+        "selected": None,
+        "blocking_conditions": ["validation_environment_ambiguous"],
+    }
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_invalid_explicit_environment_never_uses_configured_production(
+    action_factory,
+) -> None:
+    action = action_factory()
+    calls = []
+
+    class FakeCloud:
+        async def resolve_validations(self, requests):
+            calls.append(tuple(requests))
+            return ()
+
+    runtime = object.__new__(LocalMercuryRuntime)
+    runtime.cloud = FakeCloud()
+    runtime.repository_config = RepositoryConfig(
+        connectors={"flowaccount": {"production": {}}},
+        validations={
+            "flowaccount": {
+                "production": {"validation_state": "connected"},
+            }
+        },
+    )
+    runtime.semantic_contracts = {
+        (action.action_id, action.version_id): _semantic_contract(operation="create")
+    }
+
+    with pytest.raises(ValueError, match="^cloud_validation_request_invalid$"):
+        await runtime.action_contexts((action,), environment="")
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_missing_exact_semantic_sidecar_blocks_without_cloud(
+    action_factory,
+) -> None:
+    action = action_factory()
+    calls = []
+
+    class FakeCloud:
+        async def resolve_validations(self, requests):
+            calls.append(tuple(requests))
+            return ()
+
+    runtime = object.__new__(LocalMercuryRuntime)
+    runtime.cloud = FakeCloud()
+    runtime.repository_config = RepositoryConfig()
+    runtime.semantic_contracts = {}
+
+    contexts = await runtime.action_contexts((action,), environment="sandbox")
+
+    context = contexts[(action.action_id, action.version_id)]
+    assert context["semantic_contract"] is None
+    assert context["validation"] == {
+        "selected": None,
+        "blocking_conditions": ["semantic_contract_unavailable"],
+    }
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_rejects_selected_evidence_semantics_that_differ_from_sidecar(
+    action_factory,
+) -> None:
+    action = action_factory()
+    semantic = _semantic_contract(operation="create")
+    mismatched_semantic = _semantic_contract(operation="read")
+    calls = []
+
+    class FakeCloud:
+        async def resolve_validations(self, requests):
+            calls.append(tuple(requests))
+            return (_public_selection(action, semantic=mismatched_semantic),)
+
+    runtime = object.__new__(LocalMercuryRuntime)
+    runtime.cloud = FakeCloud()
+    runtime.repository_config = RepositoryConfig()
+    runtime.semantic_contracts = {
+        (action.action_id, action.version_id): semantic,
+    }
+
+    contexts = await runtime.action_contexts((action,), environment="sandbox")
+
+    context = contexts[(action.action_id, action.version_id)]
+    assert len(calls) == 1
+    assert context["semantic_contract"] == semantic.model_dump(mode="json")
+    assert context["validation"] == {
+        "selected": None,
+        "blocking_conditions": ["validation_unavailable"],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("evidence_overrides", "clock_now"),
+    [
+        (
+            {
+                "validation_status": ValidationStatus.LIVE_FAILED,
+                "evidence_level": EvidenceLevel.SANDBOX_OBSERVED,
+                "execution_eligibility": ExecutionEligibility.SANDBOX_READ,
+            },
+            NOW,
+        ),
+        ({}, NOW + timedelta(days=2)),
+        (
+            {
+                "evaluated_at": NOW + timedelta(hours=1),
+                "expires_at": NOW + timedelta(hours=2),
+            },
+            NOW,
+        ),
+    ],
+    ids=("contradictory", "expired-replay", "future-evaluation"),
+)
+async def test_runtime_downgrades_inadmissible_selected_evidence(
+    action_factory,
+    evidence_overrides: dict[str, object],
+    clock_now: datetime,
+) -> None:
+    action = action_factory()
+    semantic = _semantic_contract(operation="create")
+
+    class FakeCloud:
+        async def resolve_validations(self, requests):
+            return (
+                _public_selection(
+                    action,
+                    semantic=semantic,
+                    evidence_overrides=evidence_overrides,
+                ),
+            )
+
+    runtime = object.__new__(LocalMercuryRuntime)
+    runtime.cloud = FakeCloud()
+    runtime.repository_config = RepositoryConfig()
+    runtime.semantic_contracts = {
+        (action.action_id, action.version_id): semantic,
+    }
+    runtime._clock = lambda: clock_now
+
+    contexts = await runtime.action_contexts((action,), environment="sandbox")
+
+    assert contexts[(action.action_id, action.version_id)]["validation"] == {
+        "selected": None,
+        "blocking_conditions": ["validation_unavailable"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_retrieve_context_pack_forwards_only_documented_validation_filters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    class FakeRuntime:
+        async def search_knowledge(self, query, *, filters, top_k):
+            calls.append((query, filters, top_k))
+            return ()
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        local_server.LocalMercuryRuntime,
+        "for_repository",
+        classmethod(lambda cls, context: FakeRuntime()),
+    )
+    action_id = "act_1234567890abcdef12345678"
+    version_id = "av_" + "1" * 64
+
+    result = await local_server.retrieve_context_pack(
+        query="qualified invoice evidence",
+        ctx=_direct_context(tmp_path),
+        filters={"jurisdiction": "TH", "connector": "flowaccount"},
+        action_id=action_id,
+        version_id=version_id,
+        environment="sandbox",
+        capability="documents.invoice.list",
+        accounting_use="revenue_review",
+    )
+
+    assert result["status"] == "no_relevant_knowledge"
+    assert calls == [
+        (
+            "qualified invoice evidence",
+            {
+                "jurisdiction": "TH",
+                "connector": "flowaccount",
+                "action_id": action_id,
+                "version_id": version_id,
+                "environment": "sandbox",
+                "capability": "documents.invoice.list",
+                "accounting_use": "revenue_review",
+            },
+            12,
+        )
+    ]
 READ_ONLY_TOOLS = {
     "search_knowledge",
     "retrieve_context_pack",
@@ -303,6 +843,9 @@ async def test_get_erp_action_schema_keeps_credential_field_shapes_without_value
         async def refresh_catalog(self) -> None:
             return None
 
+        async def action_context(self, selected_action, *, environment):
+            return _context_payload(selected_action)
+
         async def aclose(self) -> None:
             return None
 
@@ -332,6 +875,122 @@ async def test_get_erp_action_schema_keeps_credential_field_shapes_without_value
     assert result["action"]["examples"] == []
     assert raw_credential not in str(result)
     assert "REF-EXAMPLE" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_existing_action_tools_add_controlled_semantic_and_validation_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action_factory,
+) -> None:
+    action = _public_read_action(action_factory)
+    semantic = _semantic_contract(operation="read")
+    search_result = search_actions([action], action.action_id)
+    calls = []
+
+    class Catalog:
+        @staticmethod
+        def require(action_id):
+            assert action_id == action.action_id
+            return action
+
+        @staticmethod
+        def require_version(action_id, version_id):
+            assert (action_id, version_id) == (action.action_id, action.version_id)
+            return action
+
+    class FakeRuntime:
+        catalog = Catalog()
+
+        async def search_actions(self, *_args, **_kwargs):
+            return search_result
+
+        async def action_contexts(self, actions, *, environment):
+            calls.append((tuple(actions), environment))
+            return {
+                (action.action_id, action.version_id): _context_payload(
+                    action,
+                    semantic=semantic,
+                    environment="sandbox",
+                )
+            }
+
+        async def action_context(self, selected_action, *, environment):
+            calls.append((selected_action, environment))
+            return _context_payload(
+                selected_action,
+                semantic=semantic,
+                environment="sandbox",
+            )
+
+        async def refresh_catalog(self) -> None:
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        local_server.LocalMercuryRuntime,
+        "for_repository",
+        classmethod(lambda cls, context: FakeRuntime()),
+    )
+
+    search = await local_server.search_erp_actions(
+        query=action.action_id,
+        connector="flowaccount",
+        environment="sandbox",
+        ctx=_direct_context(tmp_path),
+    )
+    schema = await local_server.get_erp_action_schema(
+        action_id=action.action_id,
+        version=action.version_id,
+        environment="sandbox",
+        ctx=_direct_context(tmp_path),
+    )
+
+    candidate = search["candidates"][0]
+    assert search["ambiguous"] is False
+    assert candidate["accounting_uses"] == ["revenue_review", "vat_output_review"]
+    assert set(candidate["validation"]) == {
+        "status",
+        "execution_eligibility",
+        "evidence_level",
+        "summary_th",
+        "summary_en",
+        "blocking_conditions",
+    }
+    assert candidate["validation"]["status"] == "contract_validated"
+    assert schema["status"] == "ok"
+    assert schema["action"]["semantic_contract"] == semantic.model_dump(mode="json")
+    assert schema["action"]["selected_evidence"]["action_id"] == action.action_id
+    assert schema["action"]["prerequisites"] == ["configure_sandbox"]
+    assert schema["action"]["limitations"] == ["provider_call_not_observed"]
+    assert schema["action"]["recommended_next_step"] == "complete_sandbox_validation"
+    assert schema["action"]["next_actions"] == []
+    assert schema["action"]["validation_environment"] == "sandbox"
+    assert calls[0][1] == "sandbox"
+    assert calls[1][1] == "sandbox"
+
+
+@pytest.mark.asyncio
+async def test_existing_mcp_input_schemas_add_only_optional_task_11_fields() -> None:
+    async with create_connected_server_and_client_session(local_mcp) as session:
+        tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+
+    assert len(tools) == 19
+    assert set(tools) == EXPECTED_TOOLS
+    assert "environment" in tools["search_erp_actions"].inputSchema["properties"]
+    assert "environment" not in tools["search_erp_actions"].inputSchema.get("required", [])
+    assert "environment" in tools["get_erp_action_schema"].inputSchema["properties"]
+    assert "environment" not in tools["get_erp_action_schema"].inputSchema.get("required", [])
+    context_properties = tools["retrieve_context_pack"].inputSchema["properties"]
+    assert {
+        "action_id",
+        "version_id",
+        "environment",
+        "capability",
+        "accounting_use",
+    }.issubset(context_properties)
 
 
 def _public_read_action(action_factory, **overrides):
@@ -664,6 +1323,62 @@ async def test_connector_status_reports_field_presence_without_values(
 
 
 @pytest.mark.asyncio
+async def test_connector_status_enrichment_exposes_count_only_validation_coverage(
+    repository_context,
+    action_factory,
+) -> None:
+    action = _public_read_action(action_factory)
+    semantic = _semantic_contract(operation="read")
+    calls = []
+
+    class FakeCloud:
+        async def resolve_validations(self, requests):
+            calls.append(tuple(requests))
+            return tuple(
+                _public_selection(
+                    action,
+                    semantic=semantic,
+                    environment=request.environment,
+                    evidence_number=index,
+                )
+                for index, request in enumerate(requests, start=1)
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    runtime = LocalMercuryRuntime.for_repository(repository_context)
+    await runtime.cloud.aclose()
+    runtime.cloud = FakeCloud()
+    runtime.catalog.replace([action])
+    runtime.semantic_contracts = {
+        (action.action_id, action.version_id): semantic,
+    }
+    runtime._clock = lambda: NOW
+    try:
+        rows = await runtime.enriched_connector_summaries(
+            connector="flowaccount",
+        )
+    finally:
+        await runtime.aclose()
+
+    assert len(calls) == 1
+    assert [request.environment for request in calls[0]] == ["production", "sandbox"]
+    assert {row["environment"] for row in rows} == {"production", "sandbox"}
+    for row in rows:
+        assert row["catalog_action_count"] == 1
+        assert row["validation_coverage"] == {
+            "selected_count": 1,
+            "blocked_count": 0,
+            "unavailable_count": 0,
+        }
+    serialized = str(rows)
+    assert "opaque_evidence_id" not in serialized
+    assert "evidence_sha256" not in serialized
+    assert "private-client" not in serialized
+
+
+@pytest.mark.asyncio
 async def test_repo_bound_tools_construct_and_close_a_fresh_runtime_per_request(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -721,7 +1436,7 @@ async def test_connector_status_refreshes_catalog_before_combining_capabilities(
         async def refresh_catalog(self) -> None:
             events.append("refresh")
 
-        def connector_summaries(self, **kwargs):
+        async def enriched_connector_summaries(self, **kwargs):
             events.append("summaries")
             return [{"connector_id": "flowaccount", "capabilities": ["company.info.read"]}]
 

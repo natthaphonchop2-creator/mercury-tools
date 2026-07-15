@@ -30,6 +30,11 @@ from mercury_tools.local.repository import (
 )
 from mercury_tools.mcp.local_runtime import LocalMercuryRuntime
 from mercury_tools.prompts import PROMPTS, get_prompt
+from mercury_tools.rag.models import (
+    DOCUMENTED_SEARCH_FILTER_FIELDS,
+    VALIDATION_CONTEXT_FILTER_FIELDS,
+    project_public_knowledge_metadata,
+)
 from mercury_tools.safety.redaction import redact_json
 
 local_mcp = FastMCP("Mercury Finance")
@@ -110,6 +115,100 @@ def _public_action_schema(action: Any) -> dict[str, Any]:
     return projected
 
 
+def _validation_summary(context: Mapping[str, Any]) -> dict[str, Any]:
+    validation = context.get("validation")
+    if not isinstance(validation, Mapping):
+        raise ValueError("cloud_validation_response_invalid")
+    selected = validation.get("selected")
+    blockers = validation.get("blocking_conditions")
+    if selected is not None and not isinstance(selected, Mapping):
+        raise ValueError("cloud_validation_response_invalid")
+    if not isinstance(blockers, list | tuple) or any(
+        not isinstance(item, str) for item in blockers
+    ):
+        raise ValueError("cloud_validation_response_invalid")
+    return {
+        "status": selected.get("validation_status") if selected else None,
+        "execution_eligibility": (
+            selected.get("execution_eligibility") if selected else "blocked"
+        ),
+        "evidence_level": selected.get("evidence_level") if selected else None,
+        "summary_th": selected.get("summary_th") if selected else None,
+        "summary_en": selected.get("summary_en") if selected else None,
+        "blocking_conditions": list(blockers),
+    }
+
+
+def _search_action_context(context: Mapping[str, Any]) -> dict[str, Any]:
+    semantic = context.get("semantic_contract")
+    if semantic is not None and not isinstance(semantic, Mapping):
+        raise ValueError("semantic_contract_invalid")
+    accounting_uses = semantic.get("accounting_uses", ()) if semantic else ()
+    if not isinstance(accounting_uses, list | tuple) or any(
+        not isinstance(item, str) for item in accounting_uses
+    ):
+        raise ValueError("semantic_contract_invalid")
+    return {
+        "accounting_uses": list(accounting_uses),
+        "validation": _validation_summary(context),
+    }
+
+
+def _enriched_action_schema(
+    action: Any,
+    context: Mapping[str, Any],
+) -> dict[str, Any]:
+    projected = _public_action_schema(action)
+    semantic = context.get("semantic_contract")
+    validation = context.get("validation")
+    environment = context.get("environment")
+    if semantic is not None and not isinstance(semantic, Mapping):
+        raise ValueError("semantic_contract_invalid")
+    if not isinstance(validation, Mapping):
+        raise ValueError("cloud_validation_response_invalid")
+    selected = validation.get("selected")
+    if selected is not None and not isinstance(selected, Mapping):
+        raise ValueError("cloud_validation_response_invalid")
+    projected.update(
+        {
+            "validation_environment": environment,
+            "semantic_contract": dict(semantic) if semantic is not None else None,
+            "validation": _validation_summary(context),
+            "selected_evidence": dict(selected) if selected is not None else None,
+            "prerequisites": list(selected.get("prerequisites", ())) if selected else [],
+            "limitations": list(selected.get("limitations", ())) if selected else [],
+            "recommended_next_step": (
+                selected.get("recommended_next_step") if selected else None
+            ),
+            "next_actions": list(semantic.get("next_action_ids", ())) if semantic else [],
+        }
+    )
+    return projected
+
+
+def _context_pack_filters(
+    filters: Mapping[str, str] | None,
+    **validation_filters: str | None,
+) -> dict[str, str] | None:
+    if filters is None:
+        merged: dict[str, str] = {}
+    elif not isinstance(filters, Mapping) or set(filters) - DOCUMENTED_SEARCH_FILTER_FIELDS:
+        raise ValueError("cloud_search_invalid")
+    else:
+        merged = dict(filters)
+    if set(validation_filters) != VALIDATION_CONTEXT_FILTER_FIELDS:
+        raise ValueError("cloud_search_invalid")
+    for key, value in validation_filters.items():
+        if value is None:
+            continue
+        if key in merged and merged[key] != value:
+            raise ValueError("cloud_search_invalid")
+        merged[key] = value
+    if set(merged) - DOCUMENTED_SEARCH_FILTER_FIELDS:
+        raise ValueError("cloud_search_invalid")
+    return merged or None
+
+
 def _public_executable_schema(value: Any, *, field_map: bool = False) -> Any:
     if isinstance(value, Mapping):
         projected: dict[str, Any] = {}
@@ -163,6 +262,11 @@ async def retrieve_context_pack(
     filters: dict[str, str] | None = None,
     max_chunks: int = 12,
     repo_root: str | None = None,
+    action_id: str | None = None,
+    version_id: str | None = None,
+    environment: str | None = None,
+    capability: str | None = None,
+    accounting_use: str | None = None,
 ) -> dict[str, Any]:
     """Return citation-bearing Cloud context without invoking an LLM."""
 
@@ -170,7 +274,14 @@ async def retrieve_context_pack(
         async with _request_runtime(ctx, repo_root) as runtime:
             results = await runtime.search_knowledge(
                 query,
-                filters=filters,
+                filters=_context_pack_filters(
+                    filters,
+                    action_id=action_id,
+                    version_id=version_id,
+                    environment=environment,
+                    capability=capability,
+                    accounting_use=accounting_use,
+                ),
                 top_k=max_chunks,
             )
         return redact_json(
@@ -218,7 +329,7 @@ async def connector_status(
     try:
         async with _request_runtime(ctx, repo_root) as runtime:
             await runtime.refresh_catalog()
-            rows = runtime.connector_summaries(
+            rows = await runtime.enriched_connector_summaries(
                 connector=connector,
                 environment=environment,
             )
@@ -372,6 +483,7 @@ async def search_erp_actions(
     risk_tier: int | None = None,
     top_k: int = 8,
     repo_root: str | None = None,
+    environment: str | None = None,
 ) -> dict[str, Any]:
     """Rank merged global and local actions, preserving ambiguity."""
 
@@ -386,17 +498,25 @@ async def search_erp_actions(
                 risk_tier=selected_risk,
                 top_k=top_k,
             )
+            contexts = await runtime.action_contexts(
+                tuple(match.action for match in result.matches),
+                environment=environment,
+            )
         candidates = [
             {
                 **_action_summary(match.action),
                 "rank_bucket": match.rank_bucket,
                 "score": match.score,
                 "reasons": list(match.reasons),
+                **_search_action_context(
+                    contexts[(match.action.action_id, match.action.version_id)]
+                ),
             }
             for match in result.matches
         ]
         payload: dict[str, Any] = {
             "status": "ambiguous" if result.ambiguous else "ok",
+            "ambiguous": result.ambiguous,
             "candidates": candidates,
         }
         if not result.ambiguous and len(candidates) == 1:
@@ -412,6 +532,7 @@ async def get_erp_action_schema(
     ctx: Context,
     version: str | None = None,
     repo_root: str | None = None,
+    environment: str | None = None,
 ) -> dict[str, Any]:
     """Return one active merged action schema."""
 
@@ -423,7 +544,14 @@ async def get_erp_action_schema(
                 if version
                 else runtime.catalog.require(action_id)
             )
-        return {"status": "ok", "action": _public_action_schema(action)}
+            context = await runtime.action_context(
+                action,
+                environment=environment,
+            )
+        return {
+            "status": "ok",
+            "action": _enriched_action_schema(action, context),
+        }
     except (httpx.HTTPError, LookupError, OSError, RuntimeError, ValueError) as error:
         return _error_payload(error)
 
@@ -777,12 +905,22 @@ def _flow_filters(filters: Any) -> dict[str, str]:
             "doc_type",
             "review_status",
             "effective_date",
+            "action_id",
+            "version_id",
+            "environment",
+            "capability",
+            "accounting_use",
         )
     }
     return {name: value for name, value in values.items() if isinstance(value, str) and value}
 
 
 def _flow_result(result: Mapping[str, Any]) -> SimpleNamespace:
+    metadata = project_public_knowledge_metadata(
+        result.get("metadata"),
+        document_uri=result.get("document_uri"),
+        source_uri=result.get("source_uri"),
+    )
     return SimpleNamespace(
         chunk_id=result.get("chunk_id"),
         document_id=result.get("document_id"),
@@ -795,7 +933,7 @@ def _flow_result(result: Mapping[str, Any]) -> SimpleNamespace:
         source_uri=result.get("source_uri"),
         source_url=result.get("source_url"),
         source_path=None,
-        metadata={},
+        metadata=metadata,
     )
 
 

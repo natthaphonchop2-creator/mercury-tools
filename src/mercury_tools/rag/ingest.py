@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -50,10 +51,31 @@ def iter_markdown_files(root: Path) -> list[Path]:
 
 def ingest_wiki(root: Path, *, store: RagStore, embedder: EmbeddingProvider) -> IngestStats:
     root = root.expanduser().resolve()
+    documents = [
+        document_from_markdown(path, root=root) for path in iter_markdown_files(root)
+    ]
+    return ingest_documents(documents, store=store, embedder=embedder)
+
+
+def ingest_documents(
+    documents: Sequence[KnowledgeDocument],
+    *,
+    store: RagStore,
+    embedder: EmbeddingProvider,
+) -> IngestStats:
+    if isinstance(documents, (str, bytes, bytearray)) or not isinstance(
+        documents, Sequence
+    ):
+        raise ValueError("knowledge_documents_invalid")
+    if any(not isinstance(document, KnowledgeDocument) for document in documents):
+        raise ValueError("knowledge_documents_invalid")
+    ordered = sorted(documents, key=lambda document: document.document_uri)
+    if len({document.document_uri for document in ordered}) != len(ordered):
+        raise ValueError("knowledge_documents_invalid")
+
     scanned = inserted_or_updated = skipped = chunk_count = 0
-    for path in iter_markdown_files(root):
+    for document in ordered:
         scanned += 1
-        document = document_from_markdown(path, root=root)
         existing = store.get_document_by_uri(document.document_uri)
         if existing and existing.get("sha256") == document.sha256:
             skipped += 1
@@ -69,4 +91,3 @@ def ingest_wiki(root: Path, *, store: RagStore, embedder: EmbeddingProvider) -> 
         skipped_unchanged=skipped,
         chunks=chunk_count,
     )
-

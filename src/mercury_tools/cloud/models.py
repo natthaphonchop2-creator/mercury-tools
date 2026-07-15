@@ -6,7 +6,8 @@ import math
 import re
 import uuid
 from collections.abc import Mapping, Sequence
-from typing import Any
+from datetime import UTC, datetime
+from typing import Any, Literal
 from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -16,6 +17,13 @@ from mercury_tools.catalog.schema_contract import (
     is_canonical_schema_name,
     validate_required_schema_contract,
 )
+from mercury_tools.qualification.models import (
+    EvidenceLevel,
+    ExecutionEligibility,
+    SemanticContract,
+    ValidationStatus,
+)
+from mercury_tools.rag.models import project_approved_validation_metadata
 from mercury_tools.safety.redaction import (
     is_safe_public_http_url,
     redact_absolute_paths,
@@ -31,6 +39,10 @@ _PUBLIC_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 _CATALOG_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _ACTION_ID_RE = re.compile(r"^act_[0-9a-f]{24}$")
 _ACTION_VERSION_ID_RE = re.compile(r"^av_[0-9a-f]{64}$")
+_OPAQUE_EVIDENCE_ID_RE = re.compile(
+    r"^ev_[0-9A-HJKMNP-TV-Z]{26}$",
+    re.IGNORECASE,
+)
 _VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$")
 _WIKI_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,199}$")
 _CHUNK_FRAGMENT_RE = re.compile(r"^chunk-[0-9]+$")
@@ -136,6 +148,7 @@ _AUTH_IDENTIFIER_RE = re.compile(
 _MAX_SCHEMA_DEPTH = 20
 _MAX_SCHEMA_NODES = 8_192
 _MAX_RULE_STRING_BYTES = 2_048
+_BLOCKING_CONDITION_RE = re.compile(r"^[a-z][a-z0-9_]{1,127}$")
 
 
 def sanitize_public_text(value: str, *, redact_paths: bool = True) -> str:
@@ -815,6 +828,184 @@ class PublicCitation(StrictPublicModel):
         return self
 
 
+class PublicValidationMetadata(StrictPublicModel):
+    jurisdiction: Literal["TH"]
+    connector: Literal["flowaccount", "peak"]
+    doc_type: Literal["endpoint_validation"]
+    review_status: Literal["reviewed"]
+    action_id: str
+    version_id: str
+    environment: Literal["sandbox", "test", "uat", "production"]
+    capability: str
+    accounting_use: list[str]
+    validation_status: Literal[
+        "live_success",
+        "live_failed",
+        "contract_validated",
+        "blocked_missing_credentials",
+        "blocked_missing_prerequisite",
+        "blocked_external_effect",
+        "unsupported_by_sandbox",
+    ]
+    evidence_level: Literal[
+        "documented",
+        "contract_validated",
+        "sandbox_observed",
+        "accountant_reviewed",
+    ]
+    approval_state: Literal["approved_public"]
+
+    @model_validator(mode="after")
+    def validate_metadata(self) -> PublicValidationMetadata:
+        try:
+            projected = project_approved_validation_metadata(
+                self.model_dump(mode="python")
+            )
+        except ValueError:
+            raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR) from None
+        if projected is None:
+            raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
+        return self
+
+
+class PublicEvidenceRequest(StrictPublicModel):
+    connector_id: str
+    action_id: str
+    version_id: str
+    environment: Literal["sandbox", "test", "uat", "production"]
+
+    @model_validator(mode="after")
+    def validate_exact_scope(self) -> PublicEvidenceRequest:
+        if (
+            not is_canonical_catalog_identity(self.connector_id)
+            or _ACTION_ID_RE.fullmatch(self.action_id) is None
+            or _ACTION_VERSION_ID_RE.fullmatch(self.version_id) is None
+        ):
+            raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
+        return self
+
+    @property
+    def scope_key(self) -> tuple[str, str, str, str]:
+        return (
+            self.connector_id,
+            self.action_id,
+            self.version_id,
+            self.environment,
+        )
+
+
+class PublicValidationEvidence(StrictPublicModel):
+    action_id: str
+    version_id: str
+    connector_id: str
+    environment: Literal["sandbox", "test", "uat", "production"]
+    validation_status: ValidationStatus
+    evidence_level: EvidenceLevel
+    execution_eligibility: ExecutionEligibility
+    summary_th: str
+    summary_en: str
+    limitations: tuple[str, ...]
+    prerequisites: tuple[str, ...]
+    recommended_next_step: str
+    semantic_contract: SemanticContract
+    opaque_evidence_id: str
+    evidence_sha256: str
+    evaluated_at: datetime
+    expires_at: datetime | None
+
+    @model_validator(mode="after")
+    def validate_evidence(self) -> PublicValidationEvidence:
+        if (
+            _ACTION_ID_RE.fullmatch(self.action_id) is None
+            or _ACTION_VERSION_ID_RE.fullmatch(self.version_id) is None
+            or not is_canonical_catalog_identity(self.connector_id)
+            or _OPAQUE_EVIDENCE_ID_RE.fullmatch(self.opaque_evidence_id) is None
+            or _SHA256_RE.fullmatch(self.evidence_sha256) is None
+            or self.evaluated_at.tzinfo is None
+            or self.evaluated_at.utcoffset() is None
+            or (
+                self.expires_at is not None
+                and (
+                    self.expires_at.tzinfo is None
+                    or self.expires_at.utcoffset() is None
+                    or self.expires_at <= self.evaluated_at
+                )
+            )
+        ):
+            raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
+        return self
+
+    def is_admissible_at(self, now: datetime) -> bool:
+        """Return whether this evidence may be exposed as the selected result now."""
+
+        normalized_now = _normalize_public_evidence_time(now)
+        evaluated_at = self.evaluated_at.astimezone(UTC)
+        expires_at = self.expires_at.astimezone(UTC) if self.expires_at is not None else None
+        if evaluated_at > normalized_now or (
+            expires_at is not None and expires_at <= normalized_now
+        ):
+            return False
+        if self.validation_status is ValidationStatus.CONTRACT_VALIDATED:
+            return (
+                self.evidence_level is EvidenceLevel.CONTRACT_VALIDATED
+                and self.execution_eligibility is ExecutionEligibility.DISCOVERY_ONLY
+            )
+        if self.validation_status is not ValidationStatus.LIVE_SUCCESS:
+            return False
+        return (
+            self.environment == "sandbox"
+            and self.evidence_level
+            in {EvidenceLevel.SANDBOX_OBSERVED, EvidenceLevel.ACCOUNTANT_REVIEWED}
+            and self.execution_eligibility
+            in {
+                ExecutionEligibility.SANDBOX_READ,
+                ExecutionEligibility.SANDBOX_WRITE_WITH_APPROVAL,
+            }
+        )
+
+
+class PublicEvidenceSelection(StrictPublicModel):
+    selected: PublicValidationEvidence | None
+    blocking_conditions: tuple[str, ...]
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> PublicEvidenceSelection:
+        if (
+            (self.selected is None) == (not self.blocking_conditions)
+            or len(set(self.blocking_conditions)) != len(self.blocking_conditions)
+            or any(
+                _BLOCKING_CONDITION_RE.fullmatch(condition) is None
+                for condition in self.blocking_conditions
+            )
+        ):
+            raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
+        return self
+
+
+def _normalize_public_evidence_time(value: datetime) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
+    return value.astimezone(UTC)
+
+
+class PublicValidationResolveRequest(StrictPublicModel):
+    requests: tuple[PublicEvidenceRequest, ...] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_unique_requests(self) -> PublicValidationResolveRequest:
+        scopes = tuple(request.scope_key for request in self.requests)
+        if len(set(scopes)) != len(scopes):
+            raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
+        return self
+
+
+class PublicEvidenceSelectionsEnvelope(StrictPublicModel):
+    selections: tuple[PublicEvidenceSelection, ...] = Field(
+        min_length=1,
+        max_length=100,
+    )
+
+
 class PublicSearchResult(StrictPublicModel):
     chunk_id: str
     document_id: str
@@ -826,6 +1017,10 @@ class PublicSearchResult(StrictPublicModel):
     source_uri: str
     source_url: str | None
     citation: PublicCitation
+    metadata: PublicValidationMetadata | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def validate_search_result(self) -> PublicSearchResult:
@@ -864,6 +1059,10 @@ class PublicDocument(StrictPublicModel):
     body: str
     sha256: str
     source: PublicDocumentSource
+    metadata: PublicValidationMetadata | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def validate_document(self) -> PublicDocument:
@@ -907,6 +1106,10 @@ def _validate_public_value(value: Any) -> None:
         return
     if isinstance(value, float):
         if not math.isfinite(value):
+            raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
+        return
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR)
         return
     if isinstance(value, str):

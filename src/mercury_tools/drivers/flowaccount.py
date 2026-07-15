@@ -17,6 +17,10 @@ from mercury_tools.drivers.models import (
     ConnectorResult,
     CredentialField,
 )
+from mercury_tools.qualification.network import (
+    SandboxOrigins,
+    validate_flowaccount_sandbox_origins,
+)
 from mercury_tools.safety.redaction import redact_credential_text
 
 
@@ -83,9 +87,58 @@ class FlowAccountDriver(_GenericDriver):
         except ConnectorAuthError as exc:
             return self._failed_probe(environment, {"error": str(exc)})
 
+        return await self._probe_company(
+            environment=environment,
+            credentials=credentials,
+            client=client,
+            auth=auth,
+            token_status=token_status,
+        )
+
+    async def prepare_sandbox_auth_and_probe(
+        self,
+        *,
+        environment: str,
+        credentials: Mapping[str, str],
+        client: httpx.AsyncClient,
+        origins: SandboxOrigins | None = None,
+    ) -> tuple[AuthContext, ConnectionProbe]:
+        """Issue one sandbox token and retain it only for the qualified request hook."""
+        if environment != "sandbox":
+            raise ConnectorAuthError("flowaccount_sandbox_environment_invalid")
+        validated_origins = validate_flowaccount_sandbox_origins(self)
+        if origins is not None and origins != validated_origins:
+            raise ValueError("flowaccount_sandbox_origin_invalid")
+        origins = validated_origins
+        auth, token_status = await self._prepare_auth_with_status(
+            environment=environment,
+            credentials=credentials,
+            client=client,
+            token_url=origins.token_url,
+        )
+        probe = await self._probe_company(
+            environment=environment,
+            credentials=credentials,
+            client=client,
+            auth=auth,
+            token_status=token_status,
+            base_url=origins.api_url,
+        )
+        return auth, probe
+
+    async def _probe_company(
+        self,
+        *,
+        environment: str,
+        credentials: Mapping[str, str],
+        client: httpx.AsyncClient,
+        auth: AuthContext,
+        token_status: int,
+        base_url: str | None = None,
+    ) -> ConnectionProbe:
         try:
             response = await client.get(
-                f"{self.resolve_base_url(environment)}/company/info",
+                f"{base_url or self.resolve_base_url(environment)}/company/info",
                 headers=dict(auth.headers),
             )
         except (httpx.HTTPError, httpx.InvalidURL, TypeError, ValueError) as exc:
@@ -157,12 +210,13 @@ class FlowAccountDriver(_GenericDriver):
         environment: str,
         credentials: Mapping[str, str],
         client: httpx.AsyncClient,
+        token_url: str | None = None,
     ) -> tuple[AuthContext, int]:
         self.resolve_base_url(environment)
         values = self._required_credentials(credentials)
         try:
             response = await client.post(
-                self.TOKEN_URLS[environment],
+                token_url or self.TOKEN_URLS[environment],
                 data={
                     "grant_type": "client_credentials",
                     "scope": "flowaccount-api",
@@ -253,10 +307,16 @@ def _nonzero_provider_code(value: Any) -> bool:
 
 
 def _company_name(payload: Mapping[str, Any], sensitive_values: tuple[str, ...]) -> str | None:
-    for key in ("companyName", "company_name", "name"):
-        value = payload.get(key)
-        if isinstance(value, str) and value:
-            return redact_credential_text(value, sensitive_values)
+    company_payloads: tuple[Mapping[str, Any], ...] = (payload,)
+    nested_data = payload.get("data")
+    if isinstance(nested_data, Mapping):
+        company_payloads += (nested_data,)
+
+    for company_payload in company_payloads:
+        for key in ("companyName", "company_name", "name"):
+            value = company_payload.get(key)
+            if isinstance(value, str) and value:
+                return redact_credential_text(value, sensitive_values)
     return None
 
 

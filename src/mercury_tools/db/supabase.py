@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from typing import Any
 
 import httpx
@@ -13,6 +14,84 @@ from mercury_tools.rag.models import KnowledgeChunk, KnowledgeDocument, SearchFi
 from mercury_tools.safety.redaction import redact_json
 
 CHUNK_UPLOAD_BATCH_SIZE = 10
+
+
+def _response_rows(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+        raise RuntimeError("supabase_rag_response_invalid")
+    return value
+
+
+def _optional_response_row(value: Any) -> dict[str, Any] | None:
+    rows = _response_rows(value)
+    if len(rows) > 1:
+        raise RuntimeError("supabase_rag_response_invalid")
+    return rows[0] if rows else None
+
+
+def _upsert_response_row(value: Any) -> dict[str, Any]:
+    rows = _response_rows(value)
+    if len(rows) != 1:
+        raise RuntimeError("supabase_rag_response_invalid")
+    row = rows[0]
+    if not isinstance(row.get("id"), str) or not row["id"]:
+        raise RuntimeError("supabase_rag_response_invalid")
+    return row
+
+
+def _validate_empty_write_response(value: Any) -> None:
+    if value is None or (isinstance(value, list) and not value):
+        return
+    raise RuntimeError("supabase_rag_response_invalid")
+
+
+def _search_result_from_row(row: dict[str, Any]) -> SearchResult:
+    string_fields = (
+        "chunk_id",
+        "document_id",
+        "document_uri",
+        "chunk_uri",
+        "chunk_text",
+        "source_title",
+        "source_uri",
+    )
+    if any(not isinstance(row.get(field), str) for field in string_fields):
+        raise RuntimeError("supabase_rag_response_invalid")
+    raw_score = row.get("score")
+    if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
+        raise RuntimeError("supabase_rag_response_invalid")
+    try:
+        score = float(raw_score)
+    except (TypeError, ValueError, OverflowError):
+        raise RuntimeError("supabase_rag_response_invalid") from None
+    if not math.isfinite(score):
+        raise RuntimeError("supabase_rag_response_invalid")
+    if any(
+        value is not None and not isinstance(value, str)
+        for value in (row.get("source_url"), row.get("source_path"))
+    ):
+        raise RuntimeError("supabase_rag_response_invalid")
+    citation = row.get("citation")
+    metadata = row.get("metadata")
+    if not isinstance(citation, dict) or not isinstance(metadata, dict):
+        raise RuntimeError("supabase_rag_response_invalid")
+    try:
+        return SearchResult(
+            chunk_id=row["chunk_id"],
+            document_id=row["document_id"],
+            document_uri=row["document_uri"],
+            chunk_uri=row["chunk_uri"],
+            text=row["chunk_text"],
+            score=score,
+            source_title=row["source_title"],
+            source_uri=row["source_uri"],
+            source_url=row.get("source_url"),
+            source_path=row.get("source_path"),
+            citation=citation,
+            metadata=metadata,
+        )
+    except (TypeError, ValueError, OverflowError):
+        raise RuntimeError("supabase_rag_response_invalid") from None
 
 
 class SupabaseRagStore:
@@ -30,14 +109,18 @@ class SupabaseRagStore:
         url = f"{self.base_url}/{path.lstrip('/')}"
         extra_headers = kwargs.pop("headers", {})
         headers = {**self.headers, **extra_headers}
-        response = httpx.request(method, url, headers=headers, timeout=60, **kwargs)
+        try:
+            response = httpx.request(method, url, headers=headers, timeout=60, **kwargs)
+        except httpx.HTTPError:
+            raise RuntimeError("supabase_rag_request_failed") from None
         if response.status_code >= 300:
-            raise RuntimeError(
-                f"Supabase request failed: HTTP {response.status_code} {response.text[:300]}"
-            )
+            raise RuntimeError("supabase_rag_request_failed")
         if not response.text:
             return None
-        return response.json()
+        try:
+            return response.json()
+        except (TypeError, ValueError):
+            raise RuntimeError("supabase_rag_response_invalid") from None
 
     def get_document_by_uri(self, document_uri: str) -> dict | None:
         rows = self._request(
@@ -49,7 +132,13 @@ class SupabaseRagStore:
                 "limit": "1",
             },
         )
-        return rows[0] if rows else None
+        row = _optional_response_row(rows)
+        if row is not None and any(
+            not isinstance(row.get(field), str)
+            for field in ("id", "document_uri", "sha256", "title")
+        ):
+            raise RuntimeError("supabase_rag_response_invalid")
+        return row
 
     def _upsert_source(self, document: KnowledgeDocument) -> dict:
         payload = {
@@ -70,7 +159,7 @@ class SupabaseRagStore:
             headers={**self.headers, "Prefer": "resolution=merge-duplicates,return=representation"},
             json=[payload],
         )
-        return rows[0]
+        return _upsert_response_row(rows)
 
     def _upsert_document(
         self,
@@ -95,7 +184,7 @@ class SupabaseRagStore:
             headers={**self.headers, "Prefer": "resolution=merge-duplicates,return=representation"},
             json=[payload],
         )
-        return rows[0]
+        return _upsert_response_row(rows)
 
     def upsert_document_with_chunks(
         self,
@@ -113,10 +202,12 @@ class SupabaseRagStore:
             )
         else:
             doc = existing
-        self._request(
-            "DELETE",
-            "knowledge_chunks",
-            params={"document_id": f"eq.{doc['id']}"},
+        _validate_empty_write_response(
+            self._request(
+                "DELETE",
+                "knowledge_chunks",
+                params={"document_id": f"eq.{doc['id']}"},
+            )
         )
         payload = []
         for chunk, embedding in zip(chunks, embeddings, strict=True):
@@ -132,10 +223,12 @@ class SupabaseRagStore:
                 }
             )
         for offset in range(0, len(payload), CHUNK_UPLOAD_BATCH_SIZE):
-            self._request(
-                "POST",
-                "knowledge_chunks",
-                json=payload[offset : offset + CHUNK_UPLOAD_BATCH_SIZE],
+            _validate_empty_write_response(
+                self._request(
+                    "POST",
+                    "knowledge_chunks",
+                    json=payload[offset : offset + CHUNK_UPLOAD_BATCH_SIZE],
+                )
             )
         self._upsert_document(document, source["id"])
 
@@ -155,24 +248,10 @@ class SupabaseRagStore:
             "search_mode": mode,
             **filters.to_rpc_payload(),
         }
-        rows = self._request("POST", "rpc/match_knowledge_chunks", json=payload) or []
-        return [
-            SearchResult(
-                chunk_id=str(row["chunk_id"]),
-                document_id=str(row["document_id"]),
-                document_uri=str(row["document_uri"]),
-                chunk_uri=str(row["chunk_uri"]),
-                text=str(row["chunk_text"]),
-                score=float(row.get("score") or 0),
-                source_title=str(row.get("source_title") or ""),
-                source_uri=str(row.get("source_uri") or ""),
-                source_url=row.get("source_url"),
-                source_path=row.get("source_path"),
-                citation=row.get("citation") or {},
-                metadata=row.get("metadata") or {},
-            )
-            for row in rows
-        ]
+        rows = _response_rows(
+            self._request("POST", "rpc/match_knowledge_chunks", json=payload)
+        )
+        return [_search_result_from_row(row) for row in rows]
 
     def get_document(self, document_id: str) -> dict | None:
         rows = self._request(
@@ -184,7 +263,19 @@ class SupabaseRagStore:
                 "limit": "1",
             },
         )
-        return rows[0] if rows else None
+        row = _optional_response_row(rows)
+        if row is None:
+            return None
+        if (
+            any(
+                not isinstance(row.get(field), str)
+                for field in ("id", "document_uri", "title", "body", "sha256")
+            )
+            or not isinstance(row.get("metadata"), dict)
+            or not isinstance(row.get("knowledge_sources"), dict)
+        ):
+            raise RuntimeError("supabase_rag_response_invalid")
+        return row
 
     def record_audit_event(self, event: dict[str, Any]) -> dict:
         sanitized = redact_json(event)

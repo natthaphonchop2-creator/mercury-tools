@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
 import httpx
 import pytest
 import pytest_asyncio
+from pydantic import ValidationError
 from starlette.applications import Starlette
 
 from mercury_tools.catalog import identity as catalog_identity
@@ -15,8 +17,26 @@ from mercury_tools.catalog.identity import build_action_id, build_version_id
 from mercury_tools.catalog.models import CatalogAction, revalidate_catalog_action
 from mercury_tools.cloud import api as cloud_api
 from mercury_tools.cloud.api import CloudDependencies, cloud_routes
-from mercury_tools.cloud.models import validate_raw_catalog_action_payload
+from mercury_tools.cloud.models import (
+    PublicValidationEvidence,
+    validate_raw_catalog_action_payload,
+)
 from mercury_tools.db.product import SKILL_CATALOG_SEED
+from mercury_tools.db.validation import ResolutionEntry, ResolveResult
+from mercury_tools.qualification.models import (
+    EvidenceLevel,
+    ExecutionEligibility,
+    QualificationRunState,
+    SemanticContract,
+    ValidationKnowledge,
+    ValidationStatus,
+)
+from mercury_tools.qualification.selection import (
+    EvidenceOutcome,
+    EvidenceSelection,
+    select_evidence,
+)
+from mercury_tools.qualification.templates import SUMMARY_EN, SUMMARY_TH
 from mercury_tools.rag.models import SearchResult
 from mercury_tools.safety.redaction import redact_json
 
@@ -30,6 +50,124 @@ ORDINARY_DEPENDENCY_ERROR_TYPES = (
     OverflowError,
 )
 ROOT = Path(__file__).resolve().parents[1]
+NOW = datetime(2026, 7, 14, 9, tzinfo=UTC)
+
+
+def _semantic_contract(*, operation: str = "list") -> SemanticContract:
+    return SemanticContract(
+        business_object="invoice",
+        operation=operation,
+        accounting_uses=("revenue_review", "vat_output_review"),
+        output_semantics={"document_id": "invoice identifier"},
+        join_keys=("document_id",),
+        next_action_ids=(),
+    )
+
+
+def _validation_record(action, *, run_number: int = 1) -> ValidationKnowledge:
+    status = ValidationStatus.CONTRACT_VALIDATED
+    return ValidationKnowledge.model_validate(
+        {
+            "opaque_evidence_id": f"ev_{run_number:026d}",
+            "run_id": f"run_{run_number:026d}",
+            "action_id": action.action_id,
+            "version_id": action.version_id,
+            "connector_id": action.connector_id,
+            "environment": "sandbox",
+            "validation_status": status,
+            "evidence_level": EvidenceLevel.CONTRACT_VALIDATED,
+            "execution_eligibility": ExecutionEligibility.DISCOVERY_ONLY,
+            "approved_public": True,
+            "summary_th": SUMMARY_TH[status],
+            "summary_en": SUMMARY_EN[status],
+            "prerequisites": ("configure_sandbox",),
+            "limitations": ("provider_call_not_observed",),
+            "recommended_next_step": "complete_sandbox_validation",
+            "response_shape": {},
+            "status_class": "not_attempted",
+            "latency_ms": None,
+            "semantic_contract": _semantic_contract(),
+            "evidence_sha256": f"{run_number:064x}",
+            "reviewed_by": "release_reviewer",
+            "runner_version": "v0.2.1",
+            "run_state": QualificationRunState.COMPLETED,
+            "evaluated_at": NOW - timedelta(hours=1),
+            "expires_at": NOW + timedelta(days=1),
+        }
+    )
+
+
+def _public_evidence_payload(action) -> dict:
+    record = _validation_record(action)
+    return {
+        "action_id": record.action_id,
+        "version_id": record.version_id,
+        "connector_id": record.connector_id,
+        "environment": record.environment,
+        "validation_status": record.validation_status,
+        "evidence_level": record.evidence_level,
+        "execution_eligibility": record.execution_eligibility,
+        "summary_th": record.summary_th,
+        "summary_en": record.summary_en,
+        "limitations": record.limitations,
+        "prerequisites": record.prerequisites,
+        "recommended_next_step": record.recommended_next_step,
+        "semantic_contract": record.semantic_contract,
+        "opaque_evidence_id": record.opaque_evidence_id,
+        "evidence_sha256": record.evidence_sha256,
+        "evaluated_at": record.evaluated_at,
+        "expires_at": record.expires_at,
+    }
+
+
+class ValidationStoreSpy:
+    def __init__(self, records=()) -> None:
+        self.records = {
+            (
+                record.connector_id,
+                record.action_id,
+                record.version_id,
+                record.environment,
+            ): record
+            for record in records
+        }
+        self.calls = 0
+        self.requests = ()
+        self.thread_id = None
+
+    def resolve(self, requests, now):
+        self.calls += 1
+        self.requests = tuple(requests)
+        self.thread_id = threading.get_ident()
+        entries = []
+        for request in self.requests:
+            record = self.records.get(request.scope_key)
+            selection = select_evidence(
+                [record] if record is not None else [],
+                request=request,
+                now=now,
+            )
+            entries.append(ResolutionEntry(request=request, selection=selection))
+        return ResolveResult(entries=tuple(entries))
+
+
+def _validation_metadata(**overrides):
+    metadata = {
+        "jurisdiction": "TH",
+        "connector": "flowaccount",
+        "doc_type": "endpoint_validation",
+        "review_status": "reviewed",
+        "action_id": "act_1234567890abcdef12345678",
+        "version_id": "av_" + "1" * 64,
+        "environment": "sandbox",
+        "capability": "documents.invoice.list",
+        "accounting_use": ["revenue_review"],
+        "validation_status": "contract_validated",
+        "evidence_level": "contract_validated",
+        "approval_state": "approved_public",
+    }
+    metadata.update(overrides)
+    return metadata
 
 
 class CatalogStoreSpy:
@@ -194,6 +332,7 @@ def cloud_dependencies(action_factory):
             },
         ),
         skill_loader=skill_loader,
+        clock=lambda: NOW,
     )
     return dependencies, read_action, rag_store, catalog_store, skill_loader
 
@@ -207,6 +346,307 @@ async def client(cloud_dependencies):
         base_url="https://cloud.example.test",
     ) as http:
         yield http
+
+
+@pytest.mark.parametrize(
+    "private_field",
+    [
+        "raw_response",
+        "provider_id",
+        "credential",
+        "local_path",
+        "metadata",
+    ],
+)
+def test_public_validation_dto_rejects_raw_provider_and_arbitrary_fields(
+    action_factory,
+    private_field: str,
+) -> None:
+    payload = _public_evidence_payload(action_factory())
+
+    with pytest.raises(ValidationError):
+        PublicValidationEvidence.model_validate(
+            {**payload, private_field: {"private": "must-not-leak"}}
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("summary_en", "Contact private.person@example.test"),
+        ("summary_en", "Tax ID 0105559999999"),
+        ("recommended_next_step", "/Users/operator/private/evidence.json"),
+    ],
+)
+def test_public_validation_dto_rejects_secret_personal_and_path_values(
+    action_factory,
+    field: str,
+    value: str,
+) -> None:
+    payload = _public_evidence_payload(action_factory())
+
+    with pytest.raises(ValidationError):
+        PublicValidationEvidence.model_validate({**payload, field: value})
+
+
+@pytest.mark.asyncio
+async def test_cloud_validation_resolve_batches_exact_requests_and_projects_only_public_dtos(
+    cloud_dependencies,
+) -> None:
+    dependencies, _, _, catalog_store, _ = cloud_dependencies
+    first, second = catalog_store.actions
+    validation_store = ValidationStoreSpy(
+        (_validation_record(first, run_number=1), _validation_record(second, run_number=2))
+    )
+    dependencies.validation_store = validation_store
+    app = Starlette(routes=cloud_routes(dependencies))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://cloud.example.test",
+    ) as http:
+        response = await http.post(
+            "/api/cloud/v1/catalog/validation/resolve",
+            json={
+                "requests": [
+                    {
+                        "connector_id": action.connector_id,
+                        "action_id": action.action_id,
+                        "version_id": action.version_id,
+                        "environment": "sandbox",
+                    }
+                    for action in (second, first)
+                ]
+            },
+        )
+
+    assert response.status_code == 200
+    assert validation_store.calls == 1
+    assert [request.action_id for request in validation_store.requests] == [
+        second.action_id,
+        first.action_id,
+    ]
+    selections = response.json()["selections"]
+    assert [selection["selected"]["action_id"] for selection in selections] == [
+        second.action_id,
+        first.action_id,
+    ]
+    assert set(selections[0]) == {"selected", "blocking_conditions"}
+    assert set(selections[0]["selected"]) == set(PublicValidationEvidence.model_fields)
+    serialized = json.dumps(response.json())
+    for forbidden in (
+        "run_id",
+        "response_shape",
+        "reviewed_by",
+        "runner_version",
+        "raw_response",
+        "provider_id",
+        "credential",
+        "local_path",
+        "metadata",
+    ):
+        assert forbidden not in serialized
+
+
+@pytest.mark.asyncio
+async def test_cloud_validation_resolve_marks_missing_evidence_unavailable(
+    cloud_dependencies,
+) -> None:
+    dependencies, action, *_ = cloud_dependencies
+    validation_store = ValidationStoreSpy()
+    dependencies.validation_store = validation_store
+    app = Starlette(routes=cloud_routes(dependencies))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://cloud.example.test",
+    ) as http:
+        response = await http.post(
+            "/api/cloud/v1/catalog/validation/resolve",
+            json={
+                "requests": [
+                    {
+                        "connector_id": action.connector_id,
+                        "action_id": action.action_id,
+                        "version_id": action.version_id,
+                        "environment": "sandbox",
+                    }
+                ]
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "selections": [
+            {
+                "selected": None,
+                "blocking_conditions": ["validation_unavailable"],
+            }
+        ]
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["contract_executable", "future_evaluation"])
+async def test_cloud_validation_resolve_downgrades_inadmissible_selected_evidence(
+    cloud_dependencies,
+    case: str,
+) -> None:
+    dependencies, action, *_ = cloud_dependencies
+    record = _validation_record(action)
+    if case == "contract_executable":
+        record = record.model_copy(
+            update={"execution_eligibility": ExecutionEligibility.SANDBOX_READ}
+        )
+    else:
+        record = record.model_copy(
+            update={
+                "evaluated_at": datetime(2099, 1, 1, tzinfo=UTC),
+                "expires_at": datetime(2099, 1, 2, tzinfo=UTC),
+            }
+        )
+    dependencies.validation_store = ValidationStoreSpy((record,))
+    app = Starlette(routes=cloud_routes(dependencies))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://cloud.example.test",
+    ) as http:
+        response = await http.post(
+            "/api/cloud/v1/catalog/validation/resolve",
+            json={
+                "requests": [
+                    {
+                        "connector_id": action.connector_id,
+                        "action_id": action.action_id,
+                        "version_id": action.version_id,
+                        "environment": "sandbox",
+                    }
+                ]
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "selections": [
+            {
+                "selected": None,
+                "blocking_conditions": ["validation_unavailable"],
+            }
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_cloud_validation_resolve_rejects_internally_inconsistent_selection(
+    cloud_dependencies,
+) -> None:
+    dependencies, action, *_ = cloud_dependencies
+    record = _validation_record(action)
+
+    class MalformedValidationStore:
+        def resolve(self, requests, now):
+            request = tuple(requests)[0]
+            return ResolveResult(
+                entries=(
+                    ResolutionEntry(
+                        request=request,
+                        selection=EvidenceSelection(
+                            outcome=EvidenceOutcome.CONTRACT_ONLY,
+                            selected=record,
+                            blocking_conditions=("validation_unavailable",),
+                            records=(record,),
+                        ),
+                    ),
+                )
+            )
+
+    dependencies.validation_store = MalformedValidationStore()
+    app = Starlette(routes=cloud_routes(dependencies))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://cloud.example.test",
+    ) as http:
+        response = await http.post(
+            "/api/cloud/v1/catalog/validation/resolve",
+            json={
+                "requests": [
+                    {
+                        "connector_id": action.connector_id,
+                        "action_id": action.action_id,
+                        "version_id": action.version_id,
+                        "environment": "sandbox",
+                    }
+                ]
+            },
+        )
+
+    assert response.status_code == 503
+    assert "selected" not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"requests": []},
+        {"requests": [{"connector_id": "flowaccount"}]},
+        {
+            "requests": [
+                {
+                    "connector_id": "flowaccount",
+                    "action_id": "act_1234567890abcdef12345678",
+                    "version_id": "av_" + "1" * 64,
+                    "environment": "sandbox",
+                    "provider_id": "private-provider-value",
+                }
+            ]
+        },
+        {
+            "requests": [
+                {
+                    "connector_id": "flowaccount",
+                    "action_id": "act_1234567890abcdef12345678",
+                    "version_id": "av_" + "1" * 64,
+                    "environment": "sandbox",
+                }
+            ],
+            "metadata": {},
+        },
+        {
+            "requests": [
+                {
+                    "connector_id": "flowaccount",
+                    "action_id": f"act_{index:024x}",
+                    "version_id": f"av_{index:064x}",
+                    "environment": "sandbox",
+                }
+                for index in range(101)
+            ]
+        },
+    ],
+)
+async def test_cloud_validation_resolve_rejects_non_exact_or_oversized_batches(
+    cloud_dependencies,
+    payload: dict,
+) -> None:
+    dependencies, *_ = cloud_dependencies
+    validation_store = ValidationStoreSpy()
+    dependencies.validation_store = validation_store
+    app = Starlette(routes=cloud_routes(dependencies))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://cloud.example.test",
+    ) as http:
+        response = await http.post(
+            "/api/cloud/v1/catalog/validation/resolve",
+            json=payload,
+        )
+
+    assert response.status_code == 400
+    assert validation_store.calls == 0
 
 
 @pytest.mark.asyncio
@@ -520,6 +960,7 @@ def test_cloud_routes_have_exact_read_only_method_matrix(cloud_dependencies) -> 
     assert [(route.path, route.methods) for route in routes] == [
         ("/api/cloud/v1/catalog/actions", {"GET", "HEAD"}),
         ("/api/cloud/v1/catalog/actions/{action_id}", {"GET", "HEAD"}),
+        ("/api/cloud/v1/catalog/validation/resolve", {"POST"}),
         ("/api/cloud/v1/connectors", {"GET", "HEAD"}),
         ("/api/cloud/v1/skills", {"GET", "HEAD"}),
         ("/api/cloud/v1/skills/{skill_id}", {"GET", "HEAD"}),
@@ -788,6 +1229,11 @@ async def test_cloud_search_sanitizes_filters_and_forces_reviewed_before_rag(
                 "doc_type": "tax",
                 "review_status": "draft",
                 "effective_date": "2026-07-12",
+                "action_id": "act_1234567890abcdef12345678",
+                "version_id": "av_" + "1" * 64,
+                "environment": "sandbox",
+                "capability": "documents.invoice.list",
+                "accounting_use": "revenue_review",
             },
             "top_k": 4,
         },
@@ -799,6 +1245,284 @@ async def test_cloud_search_sanitizes_filters_and_forces_reviewed_before_rag(
     assert rag_store.last_filters.doc_type == "tax"
     assert rag_store.last_filters.review_status == "reviewed"
     assert rag_store.last_filters.effective_date == "2026-07-12"
+    assert rag_store.last_filters.action_id == "act_1234567890abcdef12345678"
+    assert rag_store.last_filters.version_id == "av_" + "1" * 64
+    assert rag_store.last_filters.environment == "sandbox"
+    assert rag_store.last_filters.capability == "documents.invoice.list"
+    assert rag_store.last_filters.accounting_use == "revenue_review"
+
+
+@pytest.mark.asyncio
+async def test_cloud_search_projects_only_typed_approved_validation_metadata(
+    client,
+    cloud_dependencies,
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    document_uri = (
+        "mercury://wiki/validation/flowaccount/"
+        "act_1234567890abcdef12345678/"
+        f"av_{'1' * 64}/run_{'2' * 26}"
+    )
+    metadata = _validation_metadata(raw_response="private-value")
+    rag_store.search_knowledge = lambda **_kwargs: [
+        SearchResult(
+            chunk_id="chunk-validation",
+            document_id="document-validation",
+            document_uri=document_uri,
+            chunk_uri=f"{document_uri}#chunk-0",
+            text="Reviewed endpoint validation.",
+            score=0.99,
+            source_title="Endpoint validation",
+            source_uri=document_uri,
+            source_url="https://provider.example.test/private",
+            source_path="/Users/operator/private.md",
+            citation={
+                "heading": "Validation",
+                "source_url": "https://provider.example.test/private",
+                "source_path": "/Users/operator/private.md",
+            },
+            metadata=metadata,
+        )
+    ]
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": "qualified evidence", "filters": {}, "top_k": 4},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["results"][0]["metadata"] == _validation_metadata()
+    assert response.json()["results"][0]["source_url"] is None
+    assert "private-value" not in response.text
+    assert "provider.example.test" not in response.text
+    assert "/Users/" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_cloud_search_does_not_infer_approval_from_reviewed_status(
+    client,
+    cloud_dependencies,
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    document_uri = (
+        "mercury://wiki/validation/flowaccount/"
+        "act_1234567890abcdef12345678/"
+        f"av_{'1' * 64}/run_{'2' * 26}"
+    )
+    rag_store.search_knowledge = lambda **_kwargs: [
+        SearchResult(
+            chunk_id="chunk-validation",
+            document_id="document-validation",
+            document_uri=document_uri,
+            chunk_uri=f"{document_uri}#chunk-0",
+            text="Unapproved endpoint validation.",
+            score=0.99,
+            source_title="Endpoint validation",
+            source_uri=document_uri,
+            source_url=None,
+            source_path=None,
+            citation={"heading": "Validation"},
+            metadata=_validation_metadata(approval_state="pending_review"),
+        )
+    ]
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": "qualified evidence", "filters": {}, "top_k": 4},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"results": []}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("document_uri", "metadata"),
+    [
+        (
+            "mercury://wiki/validation/flowaccount/action/version/run",
+            {"review_status": "reviewed"},
+        ),
+        (
+            "mercury://wiki/general/partial-validation",
+            {
+                "doc_type": "endpoint_validation",
+                "review_status": "reviewed",
+            },
+        ),
+        (
+            "mercury://wiki/general/wrong-validation",
+            _validation_metadata(capability="Bearer private-value"),
+        ),
+    ],
+)
+async def test_cloud_search_fails_closed_for_partial_or_wrong_validation_shape(
+    client,
+    cloud_dependencies,
+    document_uri,
+    metadata,
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    rag_store.search_knowledge = lambda **_kwargs: [
+        SearchResult(
+            chunk_id="chunk-validation",
+            document_id="document-validation",
+            document_uri=document_uri,
+            chunk_uri=f"{document_uri}#chunk-0",
+            text="Must not become public",
+            score=0.99,
+            source_title="Validation",
+            source_uri=document_uri,
+            source_url=None,
+            source_path=None,
+            citation={"heading": "Validation"},
+            metadata={**metadata, "provider_record_id": "provider-private-value"},
+        )
+    ]
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": "qualified evidence", "filters": {}, "top_k": 4},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"results": []}
+    assert "provider-private-value" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_cloud_search_keeps_general_reviewed_knowledge_without_approval(
+    client,
+    cloud_dependencies,
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    document_uri = "mercury://wiki/tax/vat"
+    rag_store.search_knowledge = lambda **_kwargs: [
+        SearchResult(
+            chunk_id="chunk-general",
+            document_id="document-general",
+            document_uri=document_uri,
+            chunk_uri=f"{document_uri}#chunk-0",
+            text="Reviewed VAT guidance",
+            score=0.99,
+            source_title="VAT",
+            source_uri=document_uri,
+            source_url=None,
+            source_path=None,
+            citation={"heading": "VAT"},
+            metadata={"doc_type": "tax", "review_status": "reviewed"},
+        )
+    ]
+
+    response = await client.post(
+        "/api/cloud/v1/knowledge/search",
+        json={"query": "VAT", "filters": {}, "top_k": 4},
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()["results"]) == 1
+    assert "metadata" not in response.json()["results"][0]
+
+
+@pytest.mark.asyncio
+async def test_cloud_document_projects_only_typed_approved_validation_metadata(
+    client,
+    cloud_dependencies,
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    document_id = "11111111-1111-4111-8111-111111111111"
+    document_uri = (
+        "mercury://wiki/validation/flowaccount/"
+        "act_1234567890abcdef12345678/"
+        f"av_{'1' * 64}/run_{'2' * 26}"
+    )
+    rag_store.get_document = lambda _document_id: {
+        "id": document_id,
+        "document_uri": document_uri,
+        "title": "Endpoint validation",
+        "body": "Reviewed endpoint validation.",
+        "sha256": "1" * 64,
+        "metadata": _validation_metadata(raw_response="private-value"),
+        "knowledge_sources": {
+            "title": "Endpoint validation",
+            "source_uri": document_uri,
+            "source_url": "https://provider.example.test/private",
+            "review_status": "reviewed",
+            "doc_type": "endpoint_validation",
+        },
+    }
+
+    response = await client.get(f"/api/cloud/v1/documents/{document_id}")
+
+    assert response.status_code == 200
+    assert response.json()["metadata"] == _validation_metadata()
+    assert response.json()["source"]["source_url"] is None
+    assert "private-value" not in response.text
+    assert "provider.example.test" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_cloud_document_fails_closed_from_trusted_validation_source_type(
+    client,
+    cloud_dependencies,
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    document_id = "11111111-1111-4111-8111-111111111111"
+    document_uri = "mercury://wiki/validation/flowaccount/action/version/run"
+    rag_store.get_document = lambda _document_id: {
+        "id": document_id,
+        "document_uri": document_uri,
+        "title": "Endpoint validation",
+        "body": "Must not become public",
+        "sha256": "1" * 64,
+        "metadata": {
+            "review_status": "reviewed",
+            "provider_record_id": "provider-private-value",
+        },
+        "knowledge_sources": {
+            "title": "Endpoint validation",
+            "source_uri": document_uri,
+            "source_url": None,
+            "review_status": "reviewed",
+            "doc_type": "endpoint_validation",
+        },
+    }
+
+    response = await client.get(f"/api/cloud/v1/documents/{document_id}")
+
+    assert response.status_code == 404
+    assert "provider-private-value" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_cloud_document_keeps_general_reviewed_source_without_approval(
+    client,
+    cloud_dependencies,
+) -> None:
+    _, _, rag_store, _, _ = cloud_dependencies
+    document_id = "11111111-1111-4111-8111-111111111111"
+    document_uri = "mercury://wiki/tax/vat"
+    rag_store.get_document = lambda _document_id: {
+        "id": document_id,
+        "document_uri": document_uri,
+        "title": "VAT",
+        "body": "Reviewed VAT guidance",
+        "sha256": "1" * 64,
+        "metadata": {"doc_type": "tax", "review_status": "reviewed"},
+        "knowledge_sources": {
+            "title": "VAT",
+            "source_uri": document_uri,
+            "source_url": None,
+            "review_status": "reviewed",
+            "doc_type": "tax",
+        },
+    }
+
+    response = await client.get(f"/api/cloud/v1/documents/{document_id}")
+
+    assert response.status_code == 200
+    assert response.json()["body"] == "Reviewed VAT guidance"
+    assert "metadata" not in response.json()
 
 
 @pytest.mark.asyncio

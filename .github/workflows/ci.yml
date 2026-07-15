@@ -4,19 +4,284 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      FLOWACCOUNT_SANDBOX_CLIENT_ID: ${{ secrets.FLOWACCOUNT_SANDBOX_CLIENT_ID }}
+      FLOWACCOUNT_SANDBOX_CLIENT_SECRET: ${{ secrets.FLOWACCOUNT_SANDBOX_CLIENT_SECRET }}
+      MERCURY_LIVE_FLOWACCOUNT: "0"
+      MERCURY_LIVE_FLOWACCOUNT_SANDBOX: "1"
+      MERCURY_LIVE_PEAK: "0"
+      MERCURY_SUPABASE_VALIDATION_TEST: "1"
+      MERCURY_SUPABASE_TEST_ISOLATED: "1"
+      MERCURY_SUPABASE_TEST_GUARD: ${{ secrets.MERCURY_SUPABASE_TEST_GUARD }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+      SUPABASE_AUTHENTICATED_TEST_JWT: ${{ secrets.SUPABASE_AUTHENTICATED_TEST_JWT }}
+      UV_HTTP_TIMEOUT: "120"
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install uv 0.11.9
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
+        with:
+          version: 0.11.9
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --extra dev --frozen
+
+      - name: Install pinned secret scanners
+        env:
+          GITLEAKS_URL: https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz
+          GITLEAKS_SHA256: 9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c
+          TRUFFLEHOG_URL: https://github.com/trufflesecurity/trufflehog/releases/download/v3.88.32/trufflehog_3.88.32_linux_amd64.tar.gz
+          TRUFFLEHOG_SHA256: cddd1f602da61a130580883f4dd96b3d206efaf55a22068321cc11237fbc88cd
+        run: |
+          set -euo pipefail
+          SCANNER_ROOT="$RUNNER_TEMP/mercury-scanners"
+          SCANNER_BIN="$SCANNER_ROOT/bin"
+          install -d -m 700 "$SCANNER_ROOT" "$SCANNER_BIN"
+          curl --fail --location --silent --show-error "$GITLEAKS_URL" \
+            --output "$SCANNER_ROOT/gitleaks.tar.gz"
+          printf '%s  %s\n' "$GITLEAKS_SHA256" "$SCANNER_ROOT/gitleaks.tar.gz" \
+            | sha256sum --check
+          curl --fail --location --silent --show-error "$TRUFFLEHOG_URL" \
+            --output "$SCANNER_ROOT/trufflehog.tar.gz"
+          printf '%s  %s\n' "$TRUFFLEHOG_SHA256" "$SCANNER_ROOT/trufflehog.tar.gz" \
+            | sha256sum --check
+          tar -xzf "$SCANNER_ROOT/gitleaks.tar.gz" -C "$SCANNER_BIN" gitleaks
+          tar -xzf "$SCANNER_ROOT/trufflehog.tar.gz" -C "$SCANNER_BIN" trufflehog
+          chmod 0555 "$SCANNER_BIN/gitleaks" "$SCANNER_BIN/trufflehog"
+          PATH="$SCANNER_BIN:$PATH"
+          export PATH
+          gitleaks version >"$SCANNER_ROOT/gitleaks-version.txt" 2>&1
+          trufflehog --version >"$SCANNER_ROOT/trufflehog-version.txt" 2>&1
+          printf '%s\n' "$SCANNER_BIN" >>"$GITHUB_PATH"
+
+      - name: Scan full Git history
+        run: |
+          set -euo pipefail
+          SCAN_LOG="$RUNNER_TEMP/mercury-scanner-output"
+          install -d -m 700 "$SCAN_LOG"
+          if ! gitleaks git --config .gitleaks.toml --no-banner --redact --exit-code 1 \
+            --log-opts="--all" . >"$SCAN_LOG/gitleaks-history.log" 2>&1; then
+            echo "secret gate failed: gitleaks_history"
+            exit 1
+          fi
+          TRUFFLEHOG_REPORT="$SCAN_LOG/trufflehog-history.jsonl"
+          trap 'rm -f "$TRUFFLEHOG_REPORT"' EXIT
+          umask 077
+          if ! trufflehog git "file://$GITHUB_WORKSPACE" --concurrency=1 --no-update --no-verification --json \
+            >"$TRUFFLEHOG_REPORT" 2>/dev/null; then
+            echo "secret gate failed: trufflehog_history"
+            exit 1
+          fi
+          if ! uv run python scripts/verify_trufflehog_report.py \
+            --report "$TRUFFLEHOG_REPORT" \
+            --allowlist docs/release/secret-scan-allowlist.json >/dev/null; then
+            echo "secret gate failed: trufflehog_history"
+            exit 1
+          fi
+          rm -f "$TRUFFLEHOG_REPORT"
+          trap - EXIT
+
+      - name: Configure repository-local FlowAccount sandbox credentials
+        run: |
+          set -euo pipefail
+          test -n "$FLOWACCOUNT_SANDBOX_CLIENT_ID"
+          test -n "$FLOWACCOUNT_SANDBOX_CLIENT_SECRET"
+          uv run python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from mercury_tools.drivers.flowaccount import FlowAccountDriver
+          from mercury_tools.local.credentials import CredentialStore
+          from mercury_tools.local.repository import ensure_repository_state
+
+          context = ensure_repository_state(Path(".").resolve())
+          fields = FlowAccountDriver().credential_fields("sandbox")
+          values = {
+              "client_id": os.environ["FLOWACCOUNT_SANDBOX_CLIENT_ID"],
+              "client_secret": os.environ["FLOWACCOUNT_SANDBOX_CLIENT_SECRET"],
+          }
+          try:
+              CredentialStore(context).save("flowaccount", "sandbox", values, fields)
+          finally:
+              values.clear()
+          PY
+          uv run mercury credentials test flowaccount --env sandbox --repo-root . \
+            >"$RUNNER_TEMP/flowaccount-sandbox-status.json"
+
+      - name: Run complete quality and test gates
+        run: |
+          set -euo pipefail
+          test -n "$MERCURY_SUPABASE_TEST_GUARD"
+          test -n "$SUPABASE_URL"
+          test -n "$SUPABASE_SERVICE_ROLE_KEY"
+          test -n "$SUPABASE_ANON_KEY"
+          test -n "$SUPABASE_AUTHENTICATED_TEST_JWT"
+          install -d -m 700 release-evidence
+          uv run ruff check .
+          uv run pytest -q --junitxml=release-evidence/pytest.xml
+          uv run python scripts/verify_test_skips.py \
+            --junit release-evidence/pytest.xml \
+            --waivers docs/release/v0.2.1-test-waivers.json
+          uv run mercury doctor --repo-root .
+          uv run python scripts/validate_release_plugin.py --root .
+          uv run python scripts/smoke_local_plugin.py
+
+      - name: Build and scan package artifacts
+        run: |
+          set -euo pipefail
+          ARTIFACT_ROOT="$RUNNER_TEMP/ci-dist"
+          SCAN_LOG="$RUNNER_TEMP/mercury-artifact-scan"
+          install -d -m 700 "$ARTIFACT_ROOT" "$SCAN_LOG"
+          uv build --wheel --sdist --out-dir "$ARTIFACT_ROOT"
+          if ! gitleaks dir --config .gitleaks.toml --no-banner --redact --exit-code 1 "$ARTIFACT_ROOT" \
+            >"$SCAN_LOG/gitleaks-artifacts.log" 2>&1; then
+            echo "secret gate failed: gitleaks_artifacts"
+            exit 1
+          fi
+          TRUFFLEHOG_REPORT="$SCAN_LOG/trufflehog-artifacts.jsonl"
+          trap 'rm -f "$TRUFFLEHOG_REPORT"' EXIT
+          umask 077
+          if ! trufflehog filesystem "$ARTIFACT_ROOT" --concurrency=1 --no-update --no-verification --fail --json \
+            >"$TRUFFLEHOG_REPORT" 2>/dev/null; then
+            echo "secret gate failed: trufflehog_artifacts"
+            exit 1
+          fi
+          rm -f "$TRUFFLEHOG_REPORT"
+          trap - EXIT
+
+      - name: Clear repository-local credentials
+        if: always()
+        run: |
+          uv run mercury credentials clear flowaccount --env sandbox --repo-root . \
+            >/dev/null 2>&1 || true
+
+  public:
+    if: github.event_name == 'pull_request' || github.ref != 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
     env:
       MERCURY_LIVE_FLOWACCOUNT: "0"
+      MERCURY_LIVE_FLOWACCOUNT_SANDBOX: "0"
       MERCURY_LIVE_PEAK: "0"
+      MERCURY_SUPABASE_VALIDATION_TEST: "0"
+      MERCURY_SUPABASE_TEST_ISOLATED: "0"
+      UV_HTTP_TIMEOUT: "120"
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv sync --extra dev
-      - run: uv run ruff check .
-      - run: uv run pytest -m "not integration" -q
-      - run: uv run pytest tests/integration/test_local_erp_mcp.py -q
-      - run: uv run python scripts/validate_release_plugin.py
-      - run: uv run pytest tests/test_plugin_package.py tests/test_plugin_clean_install.py -q
-      - run: uv run python scripts/smoke_local_plugin.py
+      - name: Checkout untrusted PR or branch source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install uv 0.11.9
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
+        with:
+          version: 0.11.9
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --extra dev --frozen
+
+      - name: Install pinned secret scanners
+        env:
+          GITLEAKS_URL: https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz
+          GITLEAKS_SHA256: 9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c
+          TRUFFLEHOG_URL: https://github.com/trufflesecurity/trufflehog/releases/download/v3.88.32/trufflehog_3.88.32_linux_amd64.tar.gz
+          TRUFFLEHOG_SHA256: cddd1f602da61a130580883f4dd96b3d206efaf55a22068321cc11237fbc88cd
+        run: |
+          set -euo pipefail
+          SCANNER_ROOT="$RUNNER_TEMP/mercury-scanners"
+          SCANNER_BIN="$SCANNER_ROOT/bin"
+          install -d -m 700 "$SCANNER_ROOT" "$SCANNER_BIN"
+          curl --fail --location --silent --show-error "$GITLEAKS_URL" \
+            --output "$SCANNER_ROOT/gitleaks.tar.gz"
+          printf '%s  %s\n' "$GITLEAKS_SHA256" "$SCANNER_ROOT/gitleaks.tar.gz" \
+            | sha256sum --check
+          curl --fail --location --silent --show-error "$TRUFFLEHOG_URL" \
+            --output "$SCANNER_ROOT/trufflehog.tar.gz"
+          printf '%s  %s\n' "$TRUFFLEHOG_SHA256" "$SCANNER_ROOT/trufflehog.tar.gz" \
+            | sha256sum --check
+          tar -xzf "$SCANNER_ROOT/gitleaks.tar.gz" -C "$SCANNER_BIN" gitleaks
+          tar -xzf "$SCANNER_ROOT/trufflehog.tar.gz" -C "$SCANNER_BIN" trufflehog
+          chmod 0555 "$SCANNER_BIN/gitleaks" "$SCANNER_BIN/trufflehog"
+          PATH="$SCANNER_BIN:$PATH"
+          export PATH
+          gitleaks version >"$SCANNER_ROOT/gitleaks-version.txt" 2>&1
+          trufflehog --version >"$SCANNER_ROOT/trufflehog-version.txt" 2>&1
+          printf '%s\n' "$SCANNER_BIN" >>"$GITHUB_PATH"
+
+      - name: Scan untrusted source history without credentials
+        run: |
+          set -euo pipefail
+          SCAN_LOG="$RUNNER_TEMP/mercury-scanner-output"
+          install -d -m 700 "$SCAN_LOG"
+          if ! gitleaks git --config .gitleaks.toml --no-banner --redact --exit-code 1 \
+            --log-opts="--all" . >"$SCAN_LOG/gitleaks-history.log" 2>&1; then
+            echo "secret gate failed: gitleaks_history"
+            exit 1
+          fi
+          TRUFFLEHOG_REPORT="$SCAN_LOG/trufflehog-history.jsonl"
+          trap 'rm -f "$TRUFFLEHOG_REPORT"' EXIT
+          umask 077
+          if ! trufflehog git "file://$GITHUB_WORKSPACE" --concurrency=1 --no-update --no-verification --json \
+            >"$TRUFFLEHOG_REPORT" 2>/dev/null; then
+            echo "secret gate failed: trufflehog_history"
+            exit 1
+          fi
+          if ! uv run python scripts/verify_trufflehog_report.py \
+            --report "$TRUFFLEHOG_REPORT" \
+            --allowlist docs/release/secret-scan-allowlist.json >/dev/null; then
+            echo "secret gate failed: trufflehog_history"
+            exit 1
+          fi
+          rm -f "$TRUFFLEHOG_REPORT"
+          trap - EXIT
+
+      - name: Run public quality and static gates
+        run: |
+          set -euo pipefail
+          uv run ruff check .
+          uv run pytest -q --ignore=tests/integration
+          uv run python scripts/validate_release_plugin.py --root .
+          uv run python scripts/smoke_local_plugin.py
+
+      - name: Build and scan public package artifacts
+        run: |
+          set -euo pipefail
+          ARTIFACT_ROOT="$RUNNER_TEMP/ci-dist"
+          SCAN_LOG="$RUNNER_TEMP/mercury-artifact-scan"
+          install -d -m 700 "$ARTIFACT_ROOT" "$SCAN_LOG"
+          uv build --wheel --sdist --out-dir "$ARTIFACT_ROOT"
+          if ! gitleaks dir --config .gitleaks.toml --no-banner --redact --exit-code 1 "$ARTIFACT_ROOT" \
+            >"$SCAN_LOG/gitleaks-artifacts.log" 2>&1; then
+            echo "secret gate failed: gitleaks_artifacts"
+            exit 1
+          fi
+          TRUFFLEHOG_REPORT="$SCAN_LOG/trufflehog-artifacts.jsonl"
+          trap 'rm -f "$TRUFFLEHOG_REPORT"' EXIT
+          umask 077
+          if ! trufflehog filesystem "$ARTIFACT_ROOT" --concurrency=1 --no-update --no-verification --fail --json \
+            >"$TRUFFLEHOG_REPORT" 2>/dev/null; then
+            echo "secret gate failed: trufflehog_artifacts"
+            exit 1
+          fi
+          rm -f "$TRUFFLEHOG_REPORT"
+          trap - EXIT

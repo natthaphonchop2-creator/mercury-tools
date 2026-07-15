@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "architecture": "linux/amd64",
+  "image": "docker.io/library/python@sha256:fd95fa221297a88e1cf49c55ec1828edd7c5a428187e67b5d1805692d11588db",
+  "uv_source_image": "ghcr.io/astral-sh/uv@sha256:6b6fa841d71a48fbc9e2c55651c5ad570e01104d7a7d701f57b2b22c0f58e9b1"
+}

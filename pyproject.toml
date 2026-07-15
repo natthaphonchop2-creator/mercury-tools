@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=77", "wheel"]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mercury-tools"
-version = "0.2.0"
+version = "0.2.1"
 description = "Mercury Tools: MCP server and Supabase-backed RAG for accounting agents"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -29,12 +29,21 @@ dev = [
   "ruff>=0.15,<1",
 ]
 
+[dependency-groups]
+release-build = [
+  "setuptools==80.9.0",
+  "wheel==0.45.1",
+]
+
 [project.scripts]
 mercury = "mercury_tools.cli:main"
 mercury-tools = "mercury_tools.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"mercury_tools.catalog" = ["global/*/semantic-contracts.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -48,3 +57,58 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mercury.release-build]
+schema_version = 3
+lock_sha256 = "274fad7efee469c3c5f76d5885d56c2231995ba044a7db7d7c168cd3484cd524"
+
+[tool.mercury.release-build.platform]
+path = "release-toolchain/platform.json"
+sha256 = "7c1dd8ebae91fd1c61d96f93e16ebda07669f7fae424be2b68f3975d623cb20d"
+
+[tool.mercury.release-build.uv]
+path = "release-toolchain/uv-linux-x86_64"
+version = "0.11.9"
+sha256 = "f05934ddce884a121981d94c16f274a12bfc7829e48943a7f9455bb255b0be40"
+
+[tool.mercury.release-build.build]
+command = "uv build"
+version = "0.11.9"
+sha256 = "f05934ddce884a121981d94c16f274a12bfc7829e48943a7f9455bb255b0be40"
+constraints = "release-toolchain/build-constraints.txt"
+constraints_sha256 = "83f111e093bad00e18d8ee645a55359e4a3b9ea26a1b2d8b91776712a0db30fb"
+wheelhouse = "release-toolchain/wheelhouse"
+
+[tool.mercury.release-build.backend]
+module = "setuptools.build_meta"
+
+[[tool.mercury.release-build.backend.requirements]]
+name = "setuptools"
+version = "80.9.0"
+sha256 = "062d34222ad13e0cc312a4c02d73f059e86a4acbfbdea8f8f76b28c99f306922"
+file = "release-toolchain/wheelhouse/setuptools-80.9.0-py3-none-any.whl"
+
+[[tool.mercury.release-build.backend.requirements]]
+name = "wheel"
+version = "0.45.1"
+sha256 = "708e7481cc80179af0e556bbf0cc00b8444c7321e2700b8d8580231d13017248"
+file = "release-toolchain/wheelhouse/wheel-0.45.1-py3-none-any.whl"
+
+[[tool.mercury.release-build.platforms]]
+system = "Linux"
+architecture = "x86_64"
+
+[tool.mercury.release-build.platforms.interpreter]
+path = "/usr/local/bin/python3.12"
+sha256 = "837a48d7afd08447fb43e28b282026fadb59368620072e57e01f66d12977e5ce"
+implementation = "cpython"
+version = "3.12.10"
+stdlib_version = "3.12"
+zlib_runtime_version = "1.2.13"
+
+[tool.mercury.release-build.platforms.normalizer]
+name = "mercury-release-normalizer"
+version = "1"
+zip_format = "stored-v1"
+gzip_format = "stored-deflate-v1"
+tar_format = "gnu-v1"
