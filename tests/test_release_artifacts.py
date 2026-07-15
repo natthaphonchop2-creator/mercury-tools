@@ -1607,6 +1607,143 @@ def _open_file_descriptor_count() -> int | None:
     return None
 
 
+@pytest.mark.parametrize(
+    "mode",
+    (0o720, 0o702),
+    ids=("group_writable", "world_writable"),
+)
+def test_publish_rejects_non_private_parent_before_staging_or_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: int,
+) -> None:
+    source = tmp_path / "owned-source"
+    _write_owned_publish_tree(source)
+    parent = tmp_path / "output-parent"
+    parent.mkdir()
+    parent.chmod(mode)
+    output = parent / "release"
+    staging_calls = 0
+    copy_calls = 0
+
+    def unexpected_staging(_parent_fd: int, *, prefix: str) -> object:
+        nonlocal staging_calls
+        staging_calls += 1
+        pytest.fail("publication created staging in a non-private namespace")
+
+    def unexpected_copy(_source: Path, _destination_fd: int) -> None:
+        nonlocal copy_calls
+        copy_calls += 1
+        pytest.fail("publication copied in a non-private namespace")
+
+    monkeypatch.setattr(release_artifacts, "_create_private_staging", unexpected_staging)
+    monkeypatch.setattr(release_artifacts, "_copy_verified_tree", unexpected_copy)
+    destination = release_artifacts._prepare_output_destination(output)
+
+    try:
+        with pytest.raises(ReleaseGateError, match="^release_output_invalid$"):
+            release_artifacts._publish_owned_directory(source, destination)
+    finally:
+        _close_output_destination(destination)
+
+    assert staging_calls == 0
+    assert copy_calls == 0
+    assert not output.exists()
+    assert _private_staging_paths(parent) == []
+
+
+def test_publish_rejects_foreign_owner_parent_before_staging_or_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "owned-source"
+    _write_owned_publish_tree(source)
+    parent = tmp_path / "output-parent"
+    parent.mkdir()
+    output = parent / "release"
+    staging_calls = 0
+    copy_calls = 0
+
+    def unexpected_staging(_parent_fd: int, *, prefix: str) -> object:
+        nonlocal staging_calls
+        staging_calls += 1
+        pytest.fail("publication created staging in a foreign-owned namespace")
+
+    def unexpected_copy(_source: Path, _destination_fd: int) -> None:
+        nonlocal copy_calls
+        copy_calls += 1
+        pytest.fail("publication copied in a foreign-owned namespace")
+
+    monkeypatch.setattr(release_artifacts, "_create_private_staging", unexpected_staging)
+    monkeypatch.setattr(release_artifacts, "_copy_verified_tree", unexpected_copy)
+    destination = release_artifacts._prepare_output_destination(output)
+    parent_fd = destination.require_parent_fd()
+    original_fstat = release_artifacts.os.fstat
+
+    def foreign_owner_fstat(fd: int) -> os.stat_result:
+        metadata = original_fstat(fd)
+        if fd != parent_fd:
+            return metadata
+        return os.stat_result(
+            (
+                metadata.st_mode,
+                metadata.st_ino,
+                metadata.st_dev,
+                metadata.st_nlink,
+                metadata.st_uid + 1,
+                metadata.st_gid,
+                metadata.st_size,
+                metadata.st_atime,
+                metadata.st_mtime,
+                metadata.st_ctime,
+            )
+        )
+
+    monkeypatch.setattr(release_artifacts.os, "fstat", foreign_owner_fstat)
+
+    try:
+        with pytest.raises(ReleaseGateError, match="^release_output_invalid$"):
+            release_artifacts._publish_owned_directory(source, destination)
+    finally:
+        _close_output_destination(destination)
+
+    assert staging_calls == 0
+    assert copy_calls == 0
+    assert not output.exists()
+    assert _private_staging_paths(parent) == []
+
+
+def test_publish_rejects_parent_when_effective_uid_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "owned-source"
+    _write_owned_publish_tree(source)
+    parent = tmp_path / "output-parent"
+    parent.mkdir()
+    output = parent / "release"
+    staging_calls = 0
+
+    def unexpected_staging(_parent_fd: int, *, prefix: str) -> object:
+        nonlocal staging_calls
+        staging_calls += 1
+        pytest.fail("publication created staging without an effective UID")
+
+    monkeypatch.setattr(release_artifacts, "_create_private_staging", unexpected_staging)
+    monkeypatch.delattr(release_artifacts.os, "geteuid")
+    destination = release_artifacts._prepare_output_destination(output)
+
+    try:
+        with pytest.raises(ReleaseGateError, match="^release_output_invalid$"):
+            release_artifacts._publish_owned_directory(source, destination)
+    finally:
+        _close_output_destination(destination)
+
+    assert staging_calls == 0
+    assert not output.exists()
+    assert _private_staging_paths(parent) == []
+
+
 def test_publish_holds_verified_parent_fd_when_parent_is_replaced_by_symlink(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

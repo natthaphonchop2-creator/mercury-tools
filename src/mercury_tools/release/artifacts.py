@@ -2032,7 +2032,14 @@ def build_release_artifacts(
     version: str,
     output: Path,
 ) -> ReleaseArtifactManifest:
-    """Build exactly four reproducible artifacts from the clean candidate commit."""
+    """Build exactly four reproducible artifacts from the clean candidate commit.
+
+    ``output.parent`` is a release-output trust boundary: it must remain an
+    owner-controlled, exclusive namespace for this call. It must be owned by
+    the effective UID and not be group- or world-writable; another same-UID
+    process must not concurrently mutate it. Same-UID processes are treated as
+    the same local principal.
+    """
 
     destination = _prepare_output_destination(output)
     try:
@@ -3978,6 +3985,16 @@ def _prepare_output_destination(output: Path) -> _OutputDestination:
 
 
 def _publish_owned_directory(source: Path, destination: _OutputDestination) -> None:
+    """Publish ``source`` into a caller-owned, exclusive destination namespace.
+
+    The opened destination parent must remain owned by the effective UID and
+    private from group/world writers for the duration of publication. It must
+    not be concurrently mutated by another same-UID process, which is treated
+    as the same local principal. Descriptor and inode checks protect this
+    helper from other principals; ownership and mode do not prove which
+    same-UID process created a directory.
+    """
+
     private_parent: _PrivateStaging | None = None
     staging: _PrivateStaging | None = None
     parent_fd: int | None = None
@@ -4076,10 +4093,15 @@ def _require_child_absent(parent_fd: int, name: str) -> None:
 def _require_private_publication_namespace(parent_fd: int) -> None:
     try:
         metadata = os.fstat(parent_fd)
-    except OSError as exc:
+        owner = os.geteuid()
+    except (AttributeError, OSError) as exc:
         raise ReleaseGateError("release_output_invalid") from exc
     mode = stat.S_IMODE(metadata.st_mode)
-    if not stat.S_ISDIR(metadata.st_mode) or mode & 0o022:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != owner
+        or mode & 0o022
+    ):
         raise ReleaseGateError("release_output_invalid")
 
 

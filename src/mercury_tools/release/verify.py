@@ -277,7 +277,14 @@ def build_public_staging(
     output: Path,
     artifacts: Path | None = None,
 ) -> PublicStaging:
-    """Create a one-commit, history-free staging repository from ``git archive`` only."""
+    """Create a one-commit, history-free staging repository from ``git archive`` only.
+
+    ``output.parent`` is a release-output trust boundary: it must remain an
+    owner-controlled, exclusive namespace for this call. It must be owned by
+    the effective UID and not be group- or world-writable; another same-UID
+    process must not concurrently mutate it. Same-UID processes are treated as
+    the same local principal.
+    """
 
     destination = _prepare_output_destination(output)
     try:
