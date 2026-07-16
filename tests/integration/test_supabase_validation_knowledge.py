@@ -19,6 +19,7 @@ pytestmark = pytest.mark.integration
 
 _OPT_IN = "MERCURY_SUPABASE_VALIDATION_TEST"
 _ISOLATED_OPT_IN = "MERCURY_SUPABASE_TEST_ISOLATED"
+_LOCAL_ONLY_OPT_IN = "MERCURY_SUPABASE_TEST_LOCAL_ONLY"
 _GUARD_MARKER_ENV = "MERCURY_SUPABASE_TEST_GUARD"
 _GUARD_RPC = "mercury_validation_test_guard_matches"
 _BATCH_RESOLVE_RPC = "resolve_erp_action_validation_batch"
@@ -235,6 +236,27 @@ _REPEATED_DELIMITER_SAFE_METADATA = tuple(
     f"{label}{separator}{candidate}"
     for _, label, separator, candidate in _REPEATED_DELIMITER_SAFE_CASES
 )
+_MIXED_ASSIGNMENT_CONTAMINATION_CASES = (
+    "provider123 source_id: string",
+    "source_id: string provider123",
+    "customer987 source_id: string",
+    "source_id: string customer987",
+    "12345 source_id: string",
+    "source_id: string 12345",
+    "client2provider123Id=redacted",
+    "CLIENT2.Provider123Id=REDACTED",
+    "client2-provider123-id:omitted",
+    "api2customer987Key=omitted",
+    "API2.Customer987Key:REDACTED",
+    "api2-customer987-key=omitted",
+)
+_EXACT_SAFE_ASSIGNMENT_CASES = (
+    "source_id: string",
+    "client2:Id=redacted",
+    "CLIENT2.ID=REDACTED",
+    "api2Key=omitted",
+    "API2-Key:REDACTED",
+)
 _FORBIDDEN_PROVIDER_COMPOUND_LABELS = (
     "documentAuthorizationId",
     "sourceTokenId",
@@ -314,6 +336,12 @@ def _test_environment() -> _SupabaseTestEnvironment:
     if not is_loopback:
         with suppress(ValueError):
             is_loopback = ip_address(hostname).is_loopback
+
+    local_only = os.environ.get(_LOCAL_ONLY_OPT_IN) == "1"
+    if os.environ.get("GITHUB_ACTIONS") == "true" and not local_only:
+        raise ValueError("supabase_validation_test_local_only_required")
+    if local_only and not is_loopback:
+        raise ValueError("supabase_validation_test_loopback_required")
 
     if not is_loopback and parsed_url.scheme != "https":
         raise ValueError("supabase_validation_test_https_required")
@@ -481,6 +509,47 @@ def test_hosted_http_is_rejected_before_credentials_are_read(
     monkeypatch.setattr(os, "environ", guarded_environment)
 
     with pytest.raises(ValueError, match="^supabase_validation_test_https_required$"):
+        _test_environment()
+
+
+def test_github_actions_requires_local_only_before_credentials_are_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guarded_environment = _RejectCredentialReads(
+        {
+            _OPT_IN: "1",
+            _ISOLATED_OPT_IN: "0",
+            "GITHUB_ACTIONS": "true",
+            "SUPABASE_URL": "http://127.0.0.1:54321",
+        }
+    )
+    monkeypatch.setattr(os, "environ", guarded_environment)
+
+    with pytest.raises(
+        ValueError,
+        match="^supabase_validation_test_local_only_required$",
+    ):
+        _test_environment()
+
+
+def test_local_only_rejects_hosted_url_before_credentials_are_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guarded_environment = _RejectCredentialReads(
+        {
+            _OPT_IN: "1",
+            _ISOLATED_OPT_IN: "0",
+            _LOCAL_ONLY_OPT_IN: "1",
+            "GITHUB_ACTIONS": "true",
+            "SUPABASE_URL": "https://db.example.invalid",
+        }
+    )
+    monkeypatch.setattr(os, "environ", guarded_environment)
+
+    with pytest.raises(
+        ValueError,
+        match="^supabase_validation_test_loopback_required$",
+    ):
         _test_environment()
 
 
@@ -779,7 +848,7 @@ def test_repeated_delimiter_matrix_passes_actual_sql_helpers() -> None:
                     json={"value": payload},
                 )
                 _assert_status(response, 200)
-                assert response.json() is True
+                assert response.json() is True, unsafe_value
 
         for _, label, separator, candidate in _REPEATED_DELIMITER_SAFE_CASES:
             safe_value = f"{label}{separator}{candidate}"
@@ -788,6 +857,51 @@ def test_repeated_delimiter_matrix_passes_actual_sql_helpers() -> None:
                 {"allowed_metadata": safe_value},
                 {"nested": [{label: candidate}]},
             ):
+                rpc = (
+                    "validation_text_has_forbidden_value"
+                    if isinstance(payload, str)
+                    else "jsonb_has_forbidden_validation_value"
+                )
+                response = _guarded_request(
+                    client,
+                    environment,
+                    "POST",
+                    f"{environment.rest_url}/rpc/{rpc}",
+                    headers=environment.service_headers,
+                    json={"value": payload},
+                )
+                _assert_status(response, 200)
+                assert response.json() is False
+
+
+def test_safe_assignment_exemption_rejects_prefix_and_suffix_contamination() -> None:
+    environment = _test_environment()
+
+    with httpx.Client(timeout=10.0, follow_redirects=False) as client:
+        for unsafe_value in _MIXED_ASSIGNMENT_CONTAMINATION_CASES:
+            for payload in (
+                unsafe_value,
+                {"allowed_metadata": unsafe_value},
+                {"nested": [{"allowed_metadata": unsafe_value}]},
+            ):
+                rpc = (
+                    "validation_text_has_forbidden_value"
+                    if isinstance(payload, str)
+                    else "jsonb_has_forbidden_validation_value"
+                )
+                response = _guarded_request(
+                    client,
+                    environment,
+                    "POST",
+                    f"{environment.rest_url}/rpc/{rpc}",
+                    headers=environment.service_headers,
+                    json={"value": payload},
+                )
+                _assert_status(response, 200)
+                assert response.json() is True, unsafe_value
+
+        for safe_value in _EXACT_SAFE_ASSIGNMENT_CASES:
+            for payload in (safe_value, {"allowed_metadata": safe_value}):
                 rpc = (
                     "validation_text_has_forbidden_value"
                     if isinstance(payload, str)
@@ -878,6 +992,268 @@ def test_all_controlled_summaries_pass_actual_sql_text_function() -> None:
             checked += 1
 
     assert checked == 16
+
+
+def test_validation_identifier_constraints_match_runtime_publication_rules() -> None:
+    environment = _test_environment()
+    suffix = uuid.uuid4().hex
+    connector_id = f"identifier_{suffix[:12]}"
+    source_id = f"src_{suffix[:24]}"
+    action_id = f"act_{suffix[:24]}"
+    version_id = f"av_{suffix}{suffix}"
+
+    def validation_record(
+        opaque_evidence_id: str,
+        run_id: str,
+        *,
+        approved_public: bool,
+        record_action_id: str = action_id,
+        record_version_id: str = version_id,
+        record_connector_id: str = connector_id,
+    ) -> dict[str, object]:
+        return {
+            "opaque_evidence_id": opaque_evidence_id,
+            "run_id": run_id,
+            "action_id": record_action_id,
+            "version_id": record_version_id,
+            "connector_id": record_connector_id,
+            "environment": "test",
+            "validation_status": "contract_validated",
+            "evidence_level": "contract_validated",
+            "execution_eligibility": "discovery_only",
+            "run_state": "completed",
+            "approved_public": approved_public,
+            "summary_th": "synthetic_th_summary",
+            "summary_en": "provider credentials are not available",
+            "prerequisites": ["synthetic_prerequisite"],
+            "limitations": ["synthetic_limitation"],
+            "recommended_next_step": "synthetic_next_step",
+            "response_shape": {},
+            "status_class": "not_attempted",
+            "latency_ms": None,
+            "semantic_contract": {
+                "business_object": "synthetic_document",
+                "operation": "read",
+                "output_semantics": {},
+            },
+            "evidence_sha256": suffix * 2,
+            "reviewed_by": "synthetic_reviewer_role",
+            "runner_version": "synthetic_runner",
+            "evaluated_at": "2026-07-16T00:00:00Z",
+        }
+
+    def insert_action_version(
+        test_connector_id: str,
+        test_action_id: str,
+        test_version_id: str,
+        *,
+        label: str,
+        client: httpx.Client,
+    ) -> None:
+        test_source_id = f"src_{suffix[:16]}_{label}"
+        response = _post_rows(
+            client,
+            environment,
+            "erp_spec_sources",
+            {
+                "source_id": test_source_id,
+                "connector_id": test_connector_id,
+                "source_type": "documentation",
+                "source_uri": f"https://example.invalid/identifier-contract/{label}",
+                "source_hash": suffix * 2,
+                "imported_version": "synthetic-v1",
+                "sanitization": {},
+                "metadata": {},
+                "imported_at": "2026-07-16T00:00:00Z",
+            },
+        )
+        _assert_status(response, 201)
+        response = _post_rows(
+            client,
+            environment,
+            "erp_action_versions",
+            {
+                "action_id": test_action_id,
+                "version_id": test_version_id,
+                "connector_id": test_connector_id,
+                "method": "GET",
+                "path_template": f"/synthetic-identifier/{label}",
+                "definition": {},
+                "source_id": test_source_id,
+            },
+        )
+        _assert_status(response, 201)
+
+    with httpx.Client(timeout=10.0, follow_redirects=False) as client:
+        response = _post_rows(
+            client,
+            environment,
+            "erp_spec_sources",
+            {
+                "source_id": source_id,
+                "connector_id": connector_id,
+                "source_type": "documentation",
+                "source_uri": "https://example.invalid/identifier-contract",
+                "source_hash": suffix * 2,
+                "imported_version": "synthetic-v1",
+                "sanitization": {},
+                "metadata": {},
+                "imported_at": "2026-07-16T00:00:00Z",
+            },
+        )
+        _assert_status(response, 201)
+
+        unsafe_bindings = (
+            (f"connector {suffix[:8]}", f"act_{suffix[:24]}c", f"av_{suffix}{suffix}c"),
+            (connector_id, f"action/{suffix[:8]}", f"av_{suffix}{suffix}a"),
+            (connector_id, f"act_{suffix[:24]}v", f"version {suffix[:8]}"),
+        )
+        for index, (
+            unsafe_connector_id,
+            unsafe_action_id,
+            unsafe_version_id,
+        ) in enumerate(unsafe_bindings):
+            insert_action_version(
+                unsafe_connector_id,
+                unsafe_action_id,
+                unsafe_version_id,
+                label=f"unsafe_{index}",
+                client=client,
+            )
+            response = _post_rows(
+                client,
+                environment,
+                "erp_action_validation_knowledge",
+                validation_record(
+                    f"evidence_unsafe_{index}_{suffix}",
+                    f"validation_run_unsafe_{index}_{suffix}",
+                    approved_public=False,
+                    record_connector_id=unsafe_connector_id,
+                    record_action_id=unsafe_action_id,
+                    record_version_id=unsafe_version_id,
+                ),
+            )
+            _assert_status(response, 400)
+
+        response = _post_rows(
+            client,
+            environment,
+            "erp_action_versions",
+            {
+                "action_id": action_id,
+                "version_id": version_id,
+                "connector_id": connector_id,
+                "method": "GET",
+                "path_template": "/synthetic-identifier",
+                "definition": {},
+                "source_id": source_id,
+            },
+        )
+        _assert_status(response, 201)
+
+        approved_evidence_id = f"ev_{suffix[:26].upper()}"
+        approved_run_id = f"run_{suffix[:26].upper()}"
+        response = _post_rows(
+            client,
+            environment,
+            "erp_action_validation_knowledge",
+            validation_record(
+                approved_evidence_id,
+                approved_run_id,
+                approved_public=True,
+            ),
+        )
+        _assert_status(response, 201)
+
+        response = _post_rows(
+            client,
+            environment,
+            "erp_action_validation_knowledge",
+            validation_record(
+                f"evidence_{suffix}",
+                f"validation_run_{suffix}",
+                approved_public=False,
+            ),
+        )
+        _assert_status(response, 201)
+
+        for opaque_evidence_id, run_id in (
+            (f"public_evidence_{suffix}", f"public_run_{suffix}"),
+            ("ev_" + "I" * 26, "run_" + "O" * 26),
+        ):
+            response = _post_rows(
+                client,
+                environment,
+                "erp_action_validation_knowledge",
+                validation_record(
+                    opaque_evidence_id,
+                    run_id,
+                    approved_public=True,
+                ),
+            )
+            _assert_status(response, 400)
+
+        for opaque_evidence_id, run_id in (
+            (f"evidence {suffix}", f"run_whitespace_{suffix}"),
+            (f"evidence_punctuation_{suffix}", f"run/{suffix}"),
+        ):
+            response = _post_rows(
+                client,
+                environment,
+                "erp_action_validation_knowledge",
+                validation_record(
+                    opaque_evidence_id,
+                    run_id,
+                    approved_public=False,
+                ),
+            )
+            _assert_status(response, 400)
+
+        observation = {
+            "action_id": action_id,
+            "version_id": version_id,
+            "connector_id": connector_id,
+            "method": "GET",
+            "observed_state": "success",
+            "status_class": "2xx",
+            "latency_ms": 1,
+            "metadata": {"source": "synthetic_test"},
+        }
+        response = _post_rows(
+            client,
+            environment,
+            "erp_action_observations",
+            {**observation, "opaque_event_id": f"event:{suffix}.local-test"},
+        )
+        _assert_status(response, 201)
+
+        for index, (
+            unsafe_connector_id,
+            unsafe_action_id,
+            unsafe_version_id,
+        ) in enumerate(unsafe_bindings):
+            response = _post_rows(
+                client,
+                environment,
+                "erp_action_observations",
+                {
+                    **observation,
+                    "opaque_event_id": f"event_unsafe_{index}_{suffix}",
+                    "connector_id": unsafe_connector_id,
+                    "action_id": unsafe_action_id,
+                    "version_id": unsafe_version_id,
+                },
+            )
+            _assert_status(response, 400)
+
+        for opaque_event_id in (f"event {suffix}", f"event/{suffix}"):
+            response = _post_rows(
+                client,
+                environment,
+                "erp_action_observations",
+                {**observation, "opaque_event_id": opaque_event_id},
+            )
+            _assert_status(response, 400)
 
 
 def test_validation_knowledge_allows_typed_schema_names_and_enforces_security() -> None:

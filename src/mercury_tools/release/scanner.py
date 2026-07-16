@@ -73,6 +73,11 @@ _CREDENTIAL_ASSIGNMENT = re.compile(
 )
 _TOKEN_CANDIDATE = re.compile(rb"[A-Za-z0-9_./+=:-]{8,512}")
 _HIGH_ENTROPY_CANDIDATE = re.compile(rb"[A-Za-z0-9+/=_-]{32,256}")
+_TRUSTED_HOSTED_ATTESTATION_SURFACES = frozenset(
+    surface
+    for surface in REQUIRED_PUBLIC_SURFACES
+    if surface != "wheel_sdist_plugin_source_archives"
+)
 _FORBIDDEN_FILE_STEMS = frozenset(
     {
         "credential",
@@ -680,6 +685,7 @@ def scan_public_release(
     git_command_runner: CommandRunner | None = None,
     require_trusted_git_runner: bool = False,
     hosted_clients: Mapping[str, object] | None = None,
+    hosted_attestations: Mapping[str, SurfaceAttestation] | None = None,
 ) -> SecretScanReport:
     started_at = datetime.now(UTC)
     blockers = [
@@ -696,8 +702,26 @@ def scan_public_release(
     except ReleaseGateError as exc:
         blockers.append(str(exc))
 
+    trusted_attestations: dict[str, SurfaceAttestation] = {}
+    try:
+        for surface, attestation in dict(hosted_attestations or {}).items():
+            validated = SurfaceAttestation.model_validate(attestation.model_dump())
+            if (
+                surface not in _TRUSTED_HOSTED_ATTESTATION_SURFACES
+                or validated.surface != surface
+                or validated.status is not GateStatus.PASSED
+            ):
+                raise ValueError
+            trusted_attestations[surface] = validated
+    except Exception as exc:
+        raise ReleaseGateError("trusted_hosted_attestation_invalid") from exc
+
     runner = command_runner or SubprocessCommandRunner()
-    if require_trusted_git_runner and git_command_runner is None:
+    if (
+        require_trusted_git_runner
+        and git_command_runner is None
+        and "git_all_refs" not in trusted_attestations
+    ):
         raise ReleaseGateError("release_git_runner_required")
     git_runner = git_command_runner or runner
     scanner_versions, scanner_blockers, scanner_binaries = _scanner_versions(
@@ -717,14 +741,16 @@ def scan_public_release(
             blockers=tuple(blockers),
         )
 
-    git_result = scan_git_repository(
-        request.repo_url or f"https://github.com/{request.repo}.git",
-        request.policy,
-        scanner_binaries=scanner_binaries,
-        command_runner=runner,
-        git_command_runner=git_runner,
-        require_trusted_git_runner=require_trusted_git_runner,
-    )
+    git_result: GitRepositoryScanResult | None = None
+    if "git_all_refs" not in trusted_attestations:
+        git_result = scan_git_repository(
+            request.repo_url or f"https://github.com/{request.repo}.git",
+            request.policy,
+            scanner_binaries=scanner_binaries,
+            command_runner=runner,
+            git_command_runner=git_runner,
+            require_trusted_git_runner=require_trusted_git_runner,
+        )
     artifact_result = scan_artifacts(request.artifacts, request.policy)
 
     from mercury_tools.release.hosted import (
@@ -737,6 +763,8 @@ def scan_public_release(
     hosted_results: dict[str, HostedSurfaceScanResult] = {}
     client_map = dict(hosted_clients or {})
     for surface in HOSTED_PUBLIC_SURFACES:
+        if surface in trusted_attestations:
+            continue
         client = client_map.get(surface)
         if client is None:
             hosted_results[surface] = HostedSurfaceScanResult(
@@ -748,31 +776,16 @@ def scan_public_release(
             hosted_results[surface] = scan_hosted_surface(surface, client, request.policy)
 
     completed_at = datetime.now(UTC)
+    report_started_at = min(
+        (started_at, *(item.started_at for item in trusted_attestations.values()))
+    )
+    report_completed_at = max(
+        (completed_at, *(item.completed_at for item in trusted_attestations.values()))
+    )
     verified_versions = tuple(
         attestation.version
         for attestation in scanner_versions
         if attestation.version is not None
-    )
-    git_attestation = _surface_attestation(
-        "git_all_refs",
-        findings=git_result.findings,
-        blockers=git_result.blockers,
-        evidence_hashes=git_result.evidence_hashes,
-        exit_codes=git_result.exit_codes,
-        scanner_versions=(*verified_versions, HOSTED_SCANNER_VERSION),
-        allowlist=request.allowlist,
-        at=completed_at,
-    )
-    pull_result = hosted_results["github_pull_request_refs"]
-    pull_attestation = _surface_attestation(
-        "github_pull_request_refs",
-        findings=(*git_result.findings, *pull_result.findings),
-        blockers=(*git_result.blockers, *pull_result.blockers),
-        evidence_hashes=(*git_result.evidence_hashes, *pull_result.evidence_hashes),
-        exit_codes=(*git_result.exit_codes, *pull_result.exit_codes),
-        scanner_versions=(*verified_versions, HOSTED_SCANNER_VERSION),
-        allowlist=request.allowlist,
-        at=completed_at,
     )
     artifact_attestation = _surface_attestation(
         "wheel_sdist_plugin_source_archives",
@@ -785,10 +798,36 @@ def scan_public_release(
         at=completed_at,
     )
     attestation_map = {
-        "git_all_refs": git_attestation,
-        "github_pull_request_refs": pull_attestation,
         "wheel_sdist_plugin_source_archives": artifact_attestation,
+        **trusted_attestations,
     }
+    if git_result is not None:
+        attestation_map["git_all_refs"] = _surface_attestation(
+            "git_all_refs",
+            findings=git_result.findings,
+            blockers=git_result.blockers,
+            evidence_hashes=git_result.evidence_hashes,
+            exit_codes=git_result.exit_codes,
+            scanner_versions=(*verified_versions, HOSTED_SCANNER_VERSION),
+            allowlist=request.allowlist,
+            at=completed_at,
+        )
+    if "github_pull_request_refs" not in trusted_attestations:
+        pull_result = hosted_results["github_pull_request_refs"]
+        git_findings = git_result.findings if git_result is not None else ()
+        git_blockers = git_result.blockers if git_result is not None else ()
+        git_hashes = git_result.evidence_hashes if git_result is not None else ()
+        git_exit_codes = git_result.exit_codes if git_result is not None else ()
+        attestation_map["github_pull_request_refs"] = _surface_attestation(
+            "github_pull_request_refs",
+            findings=(*git_findings, *pull_result.findings),
+            blockers=(*git_blockers, *pull_result.blockers),
+            evidence_hashes=(*git_hashes, *pull_result.evidence_hashes),
+            exit_codes=(*git_exit_codes, *pull_result.exit_codes),
+            scanner_versions=(*verified_versions, HOSTED_SCANNER_VERSION),
+            allowlist=request.allowlist,
+            at=completed_at,
+        )
     for surface, result in hosted_results.items():
         if surface == "github_pull_request_refs":
             continue
@@ -816,8 +855,8 @@ def scan_public_release(
     )
     return SecretScanReport(
         status=status,
-        started_at=started_at,
-        completed_at=completed_at,
+        started_at=report_started_at,
+        completed_at=report_completed_at,
         scanner_versions=scanner_versions,
         surfaces=surfaces,
         blockers=report_blockers,

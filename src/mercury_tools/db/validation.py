@@ -32,6 +32,8 @@ _VALIDATION_CONFLICT_FIELDS = (
     "run_id",
 )
 _VALIDATION_SELECT = ",".join(ValidationKnowledge.model_fields)
+VALIDATION_PUBLISH_BATCH_SIZE = 10
+VALIDATION_GET_REQUEST_TARGET_MAX_BYTES = 4096
 _OBSERVATION_SELECT = (
     "opaque_event_id,action_id,version_id,connector_id,method,observed_state,"
     "status_class,latency_ms,metadata"
@@ -151,47 +153,52 @@ class SupabaseValidationStore:
 
     def publish(self, records: Sequence[ValidationKnowledge]) -> int:
         validated = _validated_publish_batch(records)
+        existing_by_identity = self._existing_validations(validated)
         pending: list[ValidationKnowledge] = []
         for record in validated:
-            existing = self._existing_validation(record)
+            existing = existing_by_identity.get(_validation_identity(record))
             if existing is None:
                 pending.append(record)
-            elif _validation_payload(existing) != _validation_payload(record):
+            elif not _matching_validation_record(existing, record):
                 raise RuntimeError("supabase_validation_conflict")
 
         if not pending:
             return 0
 
-        response = self._request(
-            "POST",
-            "erp_action_validation_knowledge",
-            headers={"Prefer": "resolution=ignore-duplicates,return=representation"},
-            params={
-                "on_conflict": "connector_id,action_id,version_id,environment,run_id",
-                "select": _VALIDATION_SELECT,
-            },
-            json=[_validation_payload(record) for record in pending],
-        )
-        returned = _validation_response_rows(response)
-        pending_by_identity = {_validation_identity(record): record for record in pending}
         created: set[tuple[str, str, str, str, str]] = set()
-        for record in returned:
-            identity = _validation_identity(record)
-            expected = pending_by_identity.get(identity)
-            if expected is None or identity in created:
-                raise RuntimeError("supabase_validation_response_invalid")
-            if _validation_payload(record) != _validation_payload(expected):
-                raise RuntimeError("supabase_validation_conflict")
-            created.add(identity)
+        unresolved: list[ValidationKnowledge] = []
+        for batch in _validation_batches(pending):
+            batch_by_identity = {_validation_identity(record): record for record in batch}
+            response = self._request(
+                "POST",
+                "erp_action_validation_knowledge",
+                headers={"Prefer": "resolution=ignore-duplicates,return=representation"},
+                params={
+                    "on_conflict": "connector_id,action_id,version_id,environment,run_id",
+                    "select": _VALIDATION_SELECT,
+                },
+                json=[_validation_payload(record) for record in batch],
+            )
+            for returned in _validation_response_rows(response):
+                identity = _validation_identity(returned)
+                expected = batch_by_identity.get(identity)
+                if expected is None or identity in created:
+                    raise RuntimeError("supabase_validation_response_invalid")
+                if not _matching_validation_record(returned, expected):
+                    raise RuntimeError("supabase_validation_conflict")
+                created.add(identity)
+            unresolved.extend(
+                record for record in batch if _validation_identity(record) not in created
+            )
 
-        for identity, expected in pending_by_identity.items():
-            if identity in created:
-                continue
-            existing = self._existing_validation(expected)
-            if existing is None:
-                raise RuntimeError("supabase_validation_response_invalid")
-            if _validation_payload(existing) != _validation_payload(expected):
-                raise RuntimeError("supabase_validation_conflict")
+        if unresolved:
+            existing_by_identity = self._existing_validations(unresolved)
+            for record in unresolved:
+                existing = existing_by_identity.get(_validation_identity(record))
+                if existing is None:
+                    raise RuntimeError("supabase_validation_response_invalid")
+                if not _matching_validation_record(existing, record):
+                    raise RuntimeError("supabase_validation_conflict")
 
         return len(created)
 
@@ -291,20 +298,26 @@ class SupabaseValidationStore:
             records=ordered,
         )
 
-    def _existing_validation(
+    def _existing_validations(
         self,
-        record: ValidationKnowledge,
-    ) -> ValidationKnowledge | None:
-        response = self._request(
-            "GET",
-            "erp_action_validation_knowledge",
-            params={field: f"eq.{getattr(record, field)}" for field in _VALIDATION_CONFLICT_FIELDS}
-            | {"select": _VALIDATION_SELECT},
-        )
-        rows = _validation_response_rows(response)
-        if len(rows) > 1:
-            raise RuntimeError("supabase_validation_response_invalid")
-        return rows[0] if rows else None
+        records: Sequence[ValidationKnowledge],
+    ) -> dict[tuple[str, str, str, str, str], ValidationKnowledge]:
+        existing: dict[tuple[str, str, str, str, str], ValidationKnowledge] = {}
+        path = "erp_action_validation_knowledge"
+        request_url = f"{self.base_url}/{path}"
+        for batch in _validation_get_batches(records, request_url=request_url):
+            expected_identities = {_validation_identity(record) for record in batch}
+            response = self._request(
+                "GET",
+                path,
+                params=_validation_identity_params(batch),
+            )
+            for record in _validation_response_rows(response):
+                identity = _validation_identity(record)
+                if identity not in expected_identities or identity in existing:
+                    raise RuntimeError("supabase_validation_response_invalid")
+                existing[identity] = record
+        return existing
 
     def _existing_observation(self, opaque_event_id: str) -> ValidationObservation | None:
         response = self._request(
@@ -359,6 +372,94 @@ class SupabaseValidationStore:
             return response.json()
         except ValueError:
             raise RuntimeError("supabase_validation_response_invalid") from None
+
+
+def _validation_batches(
+    records: Sequence[ValidationKnowledge],
+) -> tuple[tuple[ValidationKnowledge, ...], ...]:
+    return tuple(
+        tuple(records[offset : offset + VALIDATION_PUBLISH_BATCH_SIZE])
+        for offset in range(0, len(records), VALIDATION_PUBLISH_BATCH_SIZE)
+    )
+
+
+def _validation_identity_filter(records: Sequence[ValidationKnowledge]) -> str:
+    clauses = []
+    for record in records:
+        clauses.append(
+            "and("
+            + ",".join(
+                f"{field}.eq.{getattr(record, field)}"
+                for field in _VALIDATION_CONFLICT_FIELDS
+            )
+            + ")"
+        )
+    return "(" + ",".join(clauses) + ")"
+
+
+def _validation_identity_params(
+    records: Sequence[ValidationKnowledge],
+) -> dict[str, str]:
+    return {
+        "or": _validation_identity_filter(records),
+        "select": _VALIDATION_SELECT,
+    }
+
+
+def _validation_get_batches(
+    records: Sequence[ValidationKnowledge],
+    *,
+    request_url: str,
+) -> tuple[tuple[ValidationKnowledge, ...], ...]:
+    batches: list[tuple[ValidationKnowledge, ...]] = []
+    current: list[ValidationKnowledge] = []
+    for record in records:
+        if len(current) == VALIDATION_PUBLISH_BATCH_SIZE:
+            batches.append(tuple(current))
+            current = []
+        candidate = (*current, record)
+        if _validation_request_target_bytes(request_url, candidate) <= (
+            VALIDATION_GET_REQUEST_TARGET_MAX_BYTES
+        ):
+            current.append(record)
+            continue
+        if not current:
+            raise RuntimeError("supabase_validation_request_failed")
+        batches.append(tuple(current))
+        current = [record]
+        if _validation_request_target_bytes(request_url, current) > (
+            VALIDATION_GET_REQUEST_TARGET_MAX_BYTES
+        ):
+            raise RuntimeError("supabase_validation_request_failed")
+    if current:
+        batches.append(tuple(current))
+    return tuple(batches)
+
+
+def _validation_request_target_bytes(
+    request_url: str,
+    records: Sequence[ValidationKnowledge],
+) -> int:
+    try:
+        return len(
+            httpx.URL(
+                request_url,
+                params=_validation_identity_params(records),
+            ).raw_path
+        )
+    except (httpx.InvalidURL, UnicodeError):
+        raise RuntimeError("supabase_validation_request_failed") from None
+
+
+def _matching_validation_record(
+    actual: ValidationKnowledge,
+    expected: ValidationKnowledge,
+) -> bool:
+    return (
+        actual.opaque_evidence_id == expected.opaque_evidence_id
+        and _validation_identity(actual) == _validation_identity(expected)
+        and _validation_payload(actual) == _validation_payload(expected)
+    )
 
 
 def _validated_publish_batch(

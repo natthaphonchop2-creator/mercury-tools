@@ -31,6 +31,7 @@ from mercury_tools.qualification.selection import EvidenceOutcome, EvidenceReque
 from mercury_tools.qualification.templates import SUMMARY_EN, SUMMARY_TH
 
 NOW = datetime(2026, 7, 13, 12, tzinfo=UTC)
+GET_REQUEST_TARGET_MAX_BYTES = 4096
 ROOT = Path(__file__).resolve().parents[1]
 BATCH_RESOLVE_MIGRATION = (
     ROOT
@@ -176,6 +177,34 @@ def _identity(row: dict[str, Any]) -> tuple[str, str, str, str, str]:
     )
 
 
+def _identity_clause(row: dict[str, Any]) -> str:
+    return "and(" + ",".join(
+        f"{field}.eq.{row[field]}"
+        for field in ("connector_id", "action_id", "version_id", "environment", "run_id")
+    ) + ")"
+
+
+def _identity_filter(rows: list[dict[str, Any]]) -> str:
+    return "(" + ",".join(_identity_clause(row) for row in rows) + ")"
+
+
+def _encoded_request_target_bytes(call: dict[str, Any]) -> int:
+    return len(httpx.URL(call["url"], params=call["params"]).raw_path)
+
+
+def _maximal_identity_record(index: int) -> ValidationKnowledge:
+    suffix = f"{index:03d}"
+    identity_value = ":" * (200 - len(suffix)) + suffix
+    return _record(
+        run_number=index,
+        connector_id=identity_value,
+        action_id=identity_value,
+        version_id=identity_value,
+        run_id=identity_value,
+        approved_public=False,
+    )
+
+
 def _binding_row(observation: ValidationObservation) -> dict[str, str]:
     return {
         "connector_id": observation.connector_id,
@@ -231,6 +260,11 @@ def test_publish_uses_json_mode_and_exact_append_conflict_identity(
     created = SupabaseValidationStore(_settings()).publish([_record()])
 
     assert created == 1
+    get = next(call for call in calls if call["method"] == "GET")
+    assert get["params"] == {
+        "or": _identity_filter([_record().model_dump(mode="json")]),
+        "select": ",".join(ValidationKnowledge.model_fields),
+    }
     post = next(call for call in calls if call["method"] == "POST")
     row = post["json"][0]
     assert post["params"] == {
@@ -257,6 +291,149 @@ def test_publish_uses_json_mode_and_exact_append_conflict_identity(
     assert not any(call["method"] in {"PATCH", "PUT", "DELETE"} for call in calls)
 
 
+def test_publish_batches_254_records_with_bounded_deterministic_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = tuple(
+        _record(run_number=run_number, action_number=255 - run_number)
+        for run_number in range(1, 255)
+    )
+    expected_rows = sorted(
+        (record.model_dump(mode="json") for record in records),
+        key=_identity,
+    )
+    batch_size = 10
+    expected_batches = [
+        expected_rows[offset : offset + batch_size]
+        for offset in range(0, len(expected_rows), batch_size)
+    ]
+    calls: list[dict[str, Any]] = []
+
+    def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        if method == "GET":
+            return FakeResponse(body=[])
+        return FakeResponse(
+            status_code=201,
+            body=_postgrest_insert_representation(
+                kwargs["json"],
+                kwargs["params"].get("select"),
+            ),
+        )
+
+    monkeypatch.setattr(validation_module.httpx, "request", request)
+
+    assert SupabaseValidationStore(_settings()).publish(tuple(reversed(records))) == 254
+
+    get_calls = [call for call in calls if call["method"] == "GET"]
+    post_calls = [call for call in calls if call["method"] == "POST"]
+    assert len(calls) == 52
+    assert [call["method"] for call in calls] == ["GET"] * 26 + ["POST"] * 26
+    assert [len(call["json"]) for call in post_calls] == [10] * 25 + [4]
+    assert [call["json"] for call in post_calls] == expected_batches
+    assert [
+        call["params"]["or"]
+        for call in get_calls
+    ] == [_identity_filter(batch) for batch in expected_batches]
+    assert all(
+        _encoded_request_target_bytes(call) <= GET_REQUEST_TARGET_MAX_BYTES
+        for call in get_calls
+    )
+    assert not any(call["method"] in {"PATCH", "PUT", "DELETE"} for call in calls)
+
+
+def test_publish_splits_maximal_identities_by_encoded_get_request_target_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = tuple(_maximal_identity_record(index) for index in range(1, 11))
+    expected_rows = sorted(
+        (record.model_dump(mode="json") for record in records),
+        key=_identity,
+    )
+    calls: list[dict[str, Any]] = []
+
+    def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        if method == "GET":
+            return FakeResponse(body=[])
+        return FakeResponse(
+            status_code=201,
+            body=_postgrest_insert_representation(
+                kwargs["json"],
+                kwargs["params"].get("select"),
+            ),
+        )
+
+    monkeypatch.setattr(validation_module.httpx, "request", request)
+
+    assert SupabaseValidationStore(_settings()).publish(tuple(reversed(records))) == 10
+
+    get_calls = [call for call in calls if call["method"] == "GET"]
+    post_calls = [call for call in calls if call["method"] == "POST"]
+    assert len(get_calls) == 10
+    assert all(
+        _encoded_request_target_bytes(call) <= GET_REQUEST_TARGET_MAX_BYTES
+        for call in get_calls
+    )
+    assert [call["params"]["or"] for call in get_calls] == [
+        _identity_filter([row]) for row in expected_rows
+    ]
+    assert [call["json"] for call in post_calls] == [expected_rows]
+    assert validation_module.VALIDATION_GET_REQUEST_TARGET_MAX_BYTES == (
+        GET_REQUEST_TARGET_MAX_BYTES
+    )
+
+
+def test_publish_accepts_one_valid_maximal_identity_within_get_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _maximal_identity_record(1)
+    calls: list[dict[str, Any]] = []
+
+    def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        if method == "GET":
+            return FakeResponse(body=[])
+        return FakeResponse(
+            status_code=201,
+            body=_postgrest_insert_representation(
+                kwargs["json"],
+                kwargs["params"].get("select"),
+            ),
+        )
+
+    monkeypatch.setattr(validation_module.httpx, "request", request)
+
+    assert SupabaseValidationStore(_settings()).publish([record]) == 1
+
+    get_calls = [call for call in calls if call["method"] == "GET"]
+    assert len(get_calls) == 1
+    assert _encoded_request_target_bytes(get_calls[0]) <= GET_REQUEST_TARGET_MAX_BYTES
+    assert get_calls[0]["params"]["or"] == _identity_filter(
+        [record.model_dump(mode="json")]
+    )
+
+
+def test_publish_rejects_insert_response_for_a_different_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = tuple(_record(run_number=index, action_number=index) for index in range(1, 12))
+    calls: list[dict[str, Any]] = []
+
+    def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        if method == "GET":
+            return FakeResponse(body=[])
+        return FakeResponse(body=[records[-1].model_dump(mode="json")])
+
+    monkeypatch.setattr(validation_module.httpx, "request", request)
+
+    with pytest.raises(RuntimeError, match="^supabase_validation_response_invalid$"):
+        SupabaseValidationStore(_settings()).publish(records)
+
+    assert [call["method"] for call in calls] == ["GET", "GET", "POST"]
+
+
 def test_identical_publish_retry_is_idempotent_and_never_updates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -266,20 +443,26 @@ def test_identical_publish_retry_is_idempotent_and_never_updates(
     def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
         calls.append({"method": method, "url": url, **kwargs})
         if method == "GET":
-            matched = [
-                row
-                for row in stored.values()
-                if all(
-                    kwargs["params"][field] == f"eq.{row[field]}"
-                    for field in (
-                        "connector_id",
-                        "action_id",
-                        "version_id",
-                        "environment",
-                        "run_id",
+            params = kwargs["params"]
+            if "or" in params:
+                matched = [
+                    row for row in stored.values() if _identity_clause(row) in params["or"]
+                ]
+            else:
+                matched = [
+                    row
+                    for row in stored.values()
+                    if all(
+                        params[field] == f"eq.{row[field]}"
+                        for field in (
+                            "connector_id",
+                            "action_id",
+                            "version_id",
+                            "environment",
+                            "run_id",
+                        )
                     )
-                )
-            ]
+                ]
             return FakeResponse(body=matched)
         inserted = []
         for row in kwargs["json"]:
@@ -295,6 +478,11 @@ def test_identical_publish_retry_is_idempotent_and_never_updates(
     assert store.publish([record, record]) == 1
     assert store.publish([record]) == 0
     assert sum(call["method"] == "POST" for call in calls) == 1
+    assert all(
+        "or" in call["params"]
+        for call in calls
+        if call["method"] == "GET"
+    )
     assert not any(call["method"] in {"PATCH", "PUT", "DELETE"} for call in calls)
 
 
@@ -328,6 +516,38 @@ def test_conflicting_duplicate_publish_raises_constant_error_without_update(
         SupabaseValidationStore(_settings()).publish([conflict])
 
     assert calls == ["GET"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("action_id", "act_ffffffffffffffffffffffff"),
+        ("version_id", "av_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+        ("environment", "production"),
+    ],
+)
+def test_publish_rejects_existing_identity_drift_before_insert(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: str,
+) -> None:
+    expected = _record()
+    drifted = expected.model_copy(update={field: value}).model_dump(mode="json")
+    calls: list[dict[str, Any]] = []
+
+    def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        return FakeResponse(body=[drifted])
+
+    monkeypatch.setattr(validation_module.httpx, "request", request)
+
+    with pytest.raises(RuntimeError, match="^supabase_validation_response_invalid$") as raised:
+        SupabaseValidationStore(_settings()).publish([expected])
+
+    assert str(raised.value) == "supabase_validation_response_invalid"
+    assert value not in str(raised.value)
+    assert [call["method"] for call in calls] == ["GET"]
+    assert calls[0]["params"]["or"] == _identity_filter([expected.model_dump(mode="json")])
 
 
 def test_conflicting_duplicate_inside_batch_is_rejected_before_network(
@@ -959,6 +1179,43 @@ def test_store_errors_never_echo_bodies_exceptions_urls_headers_or_credentials(
     assert secret not in error
     assert "example.supabase.co" not in error
     assert "test-service-role-key" not in error
+
+
+@pytest.mark.parametrize(
+    ("factory", "expected_error"),
+    [
+        (_non_2xx, "supabase_validation_request_failed"),
+        (_transport_error, "supabase_validation_request_failed"),
+        (_malformed_json, "supabase_validation_response_invalid"),
+        (_wrong_shape, "supabase_validation_response_invalid"),
+    ],
+)
+def test_publish_batch_write_failures_are_constant_and_secret_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    factory: Callable[[str], Callable[..., FakeResponse]],
+    expected_error: str,
+) -> None:
+    secret = "synthetic-publisher-write-secret"
+    failure = factory(secret)
+    calls: list[dict[str, Any]] = []
+
+    def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        if method == "GET":
+            return FakeResponse(body=[])
+        return failure(method, url, **kwargs)
+
+    monkeypatch.setattr(validation_module.httpx, "request", request)
+
+    with pytest.raises(RuntimeError, match=f"^{expected_error}$") as raised:
+        SupabaseValidationStore(_settings()).publish([_record()])
+
+    error = str(raised.value)
+    assert error == expected_error
+    assert secret not in error
+    assert "example.supabase.co" not in error
+    assert "test-service-role-key" not in error
+    assert [call["method"] for call in calls] == ["GET", "POST"]
 
 
 def test_malformed_row_raises_constant_no_echo_error(

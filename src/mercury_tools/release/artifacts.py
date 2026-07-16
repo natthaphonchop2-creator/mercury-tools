@@ -48,6 +48,17 @@ from mercury_tools.release.scanner import (
     load_secret_scan_allowlist,
     scan_public_release,
 )
+from mercury_tools.release.trusted_attestation import (
+    TRUSTED_HOSTED_ATTESTATION_ENV,
+    TRUSTED_HOSTED_ATTESTATION_SHA256_ENV,
+    TRUSTED_RELEASE_CONTROL_REPOSITORY_ENV,
+    TRUSTED_RELEASE_CONTROL_RUN_ATTEMPT_ENV,
+    TRUSTED_RELEASE_CONTROL_RUN_ID_ENV,
+    TRUSTED_RELEASE_CONTROL_SHA_ENV,
+    TRUSTED_STAGING_REF_ENV,
+    TRUSTED_STAGING_REPOSITORY_ENV,
+    load_trusted_hosted_release_attestation,
+)
 
 MANIFEST_FILE_NAME = "SHA256SUMS.json"
 _VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
@@ -1750,7 +1761,7 @@ def _read_git_config_entries(path: Path) -> tuple[tuple[str, str], ...]:
                     str(_trusted_system_git_executable()),
                     "--no-pager",
                     "config",
-                    "list",
+                    "--list",
                     f"--file={path}",
                     "--null",
                     "--no-includes",
@@ -3948,13 +3959,10 @@ def _run_task13_artifact_gate(
     if repo is None:
         raise ReleaseGateError("release_scanner_context_unavailable")
     try:
-        from mercury_tools.release.hosted import HostedAdapterConfig, build_hosted_clients
-
-        git_runner = _ReleaseTask13GitRunner.for_candidate(candidate)
-        manifest = load_public_surface_manifest(
-            snapshot / "docs/release/public-surface-manifest.json"
-        )
-        allowlist = load_secret_scan_allowlist(snapshot / "docs/release/secret-scan-allowlist.json")
+        manifest_path = snapshot / "docs/release/public-surface-manifest.json"
+        allowlist_path = snapshot / "docs/release/secret-scan-allowlist.json"
+        manifest = load_public_surface_manifest(manifest_path)
+        allowlist = load_secret_scan_allowlist(allowlist_path)
         request = SecretScanRequest(
             repo=repo,
             repo_url=candidate.origin_url,
@@ -3965,31 +3973,37 @@ def _run_task13_artifact_gate(
             allowlist=allowlist,
             policy=SecretScanPolicy(scanner_versions=manifest.scanner_versions),
         )
-        gh_path = shutil.which("gh")
-        hosted_clients = build_hosted_clients(
-            HostedAdapterConfig(
-                repo=repo,
-                gh_executable=Path(gh_path) if gh_path else None,
-                github_token=_environment_secret("GH_TOKEN"),
-                marketplace_url=os.environ.get("MERCURY_MARKETPLACE_SNAPSHOT_URL") or None,
-                render_api_url=os.environ.get("MERCURY_RENDER_API_URL") or None,
-                render_service_id=os.environ.get("MERCURY_RENDER_SERVICE_ID") or None,
-                render_token=_environment_secret("RENDER_API_KEY"),
-                supabase_url=os.environ.get("SUPABASE_URL") or None,
-                supabase_key=_environment_secret("SUPABASE_SERVICE_ROLE_KEY"),
-                supabase_knowledge_tables=_environment_values("MERCURY_RELEASE_KNOWLEDGE_TABLES"),
-                supabase_storage_buckets=_environment_values("MERCURY_RELEASE_STORAGE_BUCKETS"),
-                public_mcp_url=os.environ.get("MERCURY_PUBLIC_MCP_URL") or None,
-                public_mcp_token=_environment_secret("MERCURY_PUBLIC_MCP_TOKEN"),
+        trusted = load_trusted_hosted_release_attestation(
+            Path(_required_release_environment(TRUSTED_HOSTED_ATTESTATION_ENV)),
+            expected_payload_sha256=_required_release_environment(
+                TRUSTED_HOSTED_ATTESTATION_SHA256_ENV
             ),
-            git_command_runner=git_runner,
-            require_trusted_git_runner=True,
+            expected_repository=repo,
+            expected_commit_sha=candidate.commit_sha,
+            expected_producer_repository=_required_release_environment(
+                TRUSTED_RELEASE_CONTROL_REPOSITORY_ENV
+            ),
+            expected_producer_sha=_required_release_environment(
+                TRUSTED_RELEASE_CONTROL_SHA_ENV
+            ),
+            expected_producer_run_id=_positive_release_environment(
+                TRUSTED_RELEASE_CONTROL_RUN_ID_ENV
+            ),
+            expected_producer_run_attempt=_positive_release_environment(
+                TRUSTED_RELEASE_CONTROL_RUN_ATTEMPT_ENV
+            ),
+            expected_staging_repository=_required_release_environment(
+                TRUSTED_STAGING_REPOSITORY_ENV
+            ),
+            expected_staging_ref=_required_release_environment(
+                TRUSTED_STAGING_REF_ENV
+            ),
+            public_surface_manifest=manifest_path,
+            secret_scan_allowlist=allowlist_path,
         )
         report = scan_public_release(
             request,
-            git_command_runner=git_runner,
-            require_trusted_git_runner=True,
-            hosted_clients=hosted_clients,
+            hosted_attestations=trusted.surface_map(),
         )
     except ReleaseGateError:
         raise
@@ -3998,14 +4012,18 @@ def _run_task13_artifact_gate(
     return report
 
 
-def _environment_secret(name: str) -> str | None:
+def _required_release_environment(name: str) -> str:
     value = os.environ.get(name, "").strip()
-    return value or None
+    if not value:
+        raise ReleaseGateError("trusted_hosted_attestation_context_missing")
+    return value
 
 
-def _environment_values(name: str) -> tuple[str, ...]:
-    values = (item.strip() for item in os.environ.get(name, "").split(","))
-    return tuple(dict.fromkeys(item for item in values if item))
+def _positive_release_environment(name: str) -> int:
+    value = _required_release_environment(name)
+    if re.fullmatch(r"[1-9][0-9]*", value) is None:
+        raise ReleaseGateError("trusted_hosted_attestation_context_invalid")
+    return int(value)
 
 
 def _origin_url(

@@ -7,7 +7,8 @@ import argparse
 import json
 import re
 import sys
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from mercury_tools.qualification.models import QualificationReport
@@ -21,6 +22,56 @@ from mercury_tools.qualification.publisher import (
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_CATALOG_ROOT = _REPOSITORY_ROOT / "catalog" / "global"
 _SAFE_ERROR = re.compile(r"^[a-z][a-z0-9_]{1,127}$")
+_REPORT_KEYS = frozenset(QualificationReport.model_fields)
+_PUBLIC_REPORT_KEYS = _REPORT_KEYS | {
+    "counts",
+    "http_attempts",
+    "mutation_attempts",
+    "total",
+}
+_ATTEMPT_LIMITS = {
+    "flowaccount": (40, 1),
+    "peak": (0, 0),
+}
+
+
+def _validated_input_report(payload: object) -> QualificationReport:
+    if not isinstance(payload, Mapping):
+        raise ValueError("validation_report_invalid")
+    keys = frozenset(payload)
+    if keys not in {_REPORT_KEYS, _PUBLIC_REPORT_KEYS}:
+        raise ValueError("validation_report_invalid")
+
+    try:
+        report = QualificationReport.model_validate(
+            {key: payload[key] for key in _REPORT_KEYS}
+        )
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("validation_report_invalid") from None
+
+    if keys == _REPORT_KEYS:
+        return report
+
+    http_attempts = payload.get("http_attempts")
+    mutation_attempts = payload.get("mutation_attempts")
+    limits = _ATTEMPT_LIMITS.get(report.connector_id)
+    expected_counts = Counter(
+        record.validation_status.value for record in report.records
+    )
+    if (
+        limits is None
+        or not isinstance(http_attempts, int)
+        or isinstance(http_attempts, bool)
+        or not 0 <= http_attempts <= limits[0]
+        or not isinstance(mutation_attempts, int)
+        or isinstance(mutation_attempts, bool)
+        or not 0 <= mutation_attempts <= limits[1]
+        or payload.get("total") != report.total
+        or payload.get("counts")
+        != {key: expected_counts[key] for key in sorted(expected_counts)}
+    ):
+        raise ValueError("validation_report_invalid")
+    return report
 
 
 def review_inputs(
@@ -43,7 +94,7 @@ def review_inputs(
     for input_path in sorted(input_paths, key=lambda path: path.as_posix()):
         try:
             payload = json.loads(input_path.read_text(encoding="utf-8"))
-            report = QualificationReport.model_validate(payload)
+            report = _validated_input_report(payload)
         except (AttributeError, OSError, TypeError, ValueError, json.JSONDecodeError):
             raise ValueError("validation_report_invalid") from None
         if report.connector_id in reviewed_by_connector:

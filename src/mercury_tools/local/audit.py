@@ -45,6 +45,17 @@ _TOKEN_VALUE = re.compile(
     r"(?i)(?:\b(?:bearer|basic)\s+[A-Za-z0-9+/=._-]+|"
     r"\b(?:github_pat_|ghp_|sk-|sk_|xox[bp]-|ya29\.)[A-Za-z0-9._-]+)"
 )
+_OPAQUE_IDENTIFIER_FIELDS = frozenset(
+    {
+        "action_id",
+        "event_id",
+        "local_session_id",
+        "payload_hash",
+        "repository_id",
+        "request_id",
+        "version_id",
+    }
+)
 
 MAX_AUDIT_LINE_BYTES = 64 * 1024
 MAX_AUDIT_TOP_LEVEL_KEYS = 64
@@ -783,6 +794,8 @@ def _sanitize_event_field(name: str, value: Any) -> Any:
         scalar = _bounded_integer(scalar, maximum=2)
     elif name == "latency_ms":
         scalar = _bounded_number(scalar, maximum=86_400_000)
+    if name in _OPAQUE_IDENTIFIER_FIELDS:
+        return scalar
     return _redact_scalar(scalar)
 
 

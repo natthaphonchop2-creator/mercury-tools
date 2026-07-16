@@ -407,7 +407,7 @@ def test_tracked_manifest_and_allowlist_are_secret_free_and_exactly_reviewed() -
         "scanner_versions": PINNED_SCANNER_VERSIONS,
     }
     reviewed = SecretScanAllowlist.model_validate(allowlist)
-    assert len(reviewed.entries) == 18
+    assert len(reviewed.entries) == 35
     assert {entry.rule.value for entry in reviewed.entries} == {"scanner_finding"}
     assert {entry.reviewer_role.value for entry in reviewed.entries} == {
         "security_reviewer"
@@ -418,7 +418,7 @@ def test_tracked_manifest_and_allowlist_are_secret_free_and_exactly_reviewed() -
     assert sum(
         entry.classification == AllowlistClassification.DOCUMENTATION_PLACEHOLDER
         for entry in reviewed.entries
-    ) == 1
+    ) == 2
     vendored_binary_entries = [
         entry
         for entry in reviewed.entries

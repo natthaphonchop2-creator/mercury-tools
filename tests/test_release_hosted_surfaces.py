@@ -6,6 +6,7 @@ import shutil
 import stat
 import zipfile
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -30,16 +31,19 @@ from mercury_tools.release.hosted import (
     scan_hosted_surface,
 )
 from mercury_tools.release.models import (
+    EXPECTED_SURFACE_SCANNER_VERSIONS,
     PINNED_SCANNER_VERSIONS,
     REQUIRED_PUBLIC_SURFACES,
     ArtifactKind,
     ArtifactScanResult,
+    GateStatus,
     GitRepositoryScanResult,
     HostedSurface,
     PublicSurfaceManifest,
     SecretScanAllowlist,
     SecretScanPolicy,
     SecretScanRequest,
+    SurfaceAttestation,
 )
 from mercury_tools.release.scanner import (
     CommandResult,
@@ -1173,6 +1177,66 @@ def test_missing_required_hosted_client_blocks_full_report(
     assert report.passed is False
     assert "hosted_client_missing:public_mcp_responses" in report.blockers
     assert "/mock" not in serialized
+
+
+def test_complete_trusted_bundle_skips_git_and_all_hosted_clients(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completed = datetime.now(UTC)
+    monkeypatch.setattr(shutil, "which", lambda name: f"/mock/{name}")
+    trusted = {
+        surface: SurfaceAttestation(
+            surface=surface,
+            status=GateStatus.PASSED,
+            scanner_versions=EXPECTED_SURFACE_SCANNER_VERSIONS[surface],
+            started_at=completed,
+            completed_at=completed,
+            finding_count=0,
+            evidence_hashes=("a" * 64,),
+            exit_codes=(0,),
+        )
+        for surface in REQUIRED_PUBLIC_SURFACES
+        if surface != "wheel_sdist_plugin_source_archives"
+    }
+    clients = _hosted_clients()
+
+    def reject_git(*_args: object, **_kwargs: object) -> GitRepositoryScanResult:
+        raise AssertionError("trusted git attestation must prevent network git scan")
+
+    monkeypatch.setattr(scanner_module, "scan_git_repository", reject_git)
+    monkeypatch.setattr(
+        scanner_module,
+        "scan_artifacts",
+        lambda *_args, **_kwargs: ArtifactScanResult(kinds=tuple(ArtifactKind)),
+    )
+    runner = FakeCommandRunner(
+        {
+            "gitleaks": CommandResult(
+                exit_code=0,
+                stdout=f"gitleaks {PINNED_SCANNER_VERSIONS['gitleaks']}".encode(),
+                stderr=b"",
+            ),
+            "trufflehog": CommandResult(
+                exit_code=0,
+                stdout=f"trufflehog {PINNED_SCANNER_VERSIONS['trufflehog']}".encode(),
+                stderr=b"",
+            ),
+        }
+    )
+
+    report = scan_public_release(
+        _request(tmp_path),
+        command_runner=runner,
+        hosted_clients=clients,
+        hosted_attestations=trusted,
+    )
+
+    assert report.passed is True
+    assert all(client.calls == [] for client in clients.values())
+    assert tuple(surface.surface for surface in report.surfaces) == (
+        REQUIRED_PUBLIC_SURFACES
+    )
 
 
 def test_cli_wires_concrete_hosted_clients_from_env_names_without_token_argv(

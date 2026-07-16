@@ -19,6 +19,7 @@ def _clear_live_env(monkeypatch) -> None:
         "MERCURY_CONNECT_SIGNING_SECRET",
         "MERCURY_CLOUD_BASE_URL",
         "MERCURY_DEPLOYMENT_COMMIT",
+        "RENDER_GIT_COMMIT",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API", "true")
@@ -58,6 +59,45 @@ def test_status_exposes_exact_package_version_and_deployment_commit(monkeypatch)
 
     assert payload["version"] == __version__ == "0.2.1"
     assert payload["deployment_commit"] == commit
+
+
+def test_status_uses_render_git_commit_when_explicit_commit_is_unset(monkeypatch) -> None:
+    commit = "b" * 40
+    monkeypatch.setenv("RENDER_GIT_COMMIT", commit)
+
+    payload = TestClient(create_http_app(require_auth=False)).get("/api/status").json()
+
+    assert payload["deployment_commit"] == commit
+
+
+def test_status_prefers_explicit_commit_over_render_fallback(monkeypatch) -> None:
+    explicit = "c" * 40
+    fallback = "d" * 40
+    monkeypatch.setenv("MERCURY_DEPLOYMENT_COMMIT", explicit)
+    monkeypatch.setenv("RENDER_GIT_COMMIT", fallback)
+
+    payload = TestClient(create_http_app(require_auth=False)).get("/api/status").json()
+
+    assert payload["deployment_commit"] == explicit
+
+
+@pytest.mark.parametrize("value", ("main", "E" * 40, "e" * 39, "e" * 41))
+def test_status_rejects_invalid_render_git_commit(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("RENDER_GIT_COMMIT", value)
+
+    payload = TestClient(create_http_app(require_auth=False)).get("/api/status").json()
+
+    assert payload["deployment_commit"] is None
+    assert value not in str(payload)
+
+
+def test_status_invalid_explicit_commit_does_not_fall_through(monkeypatch) -> None:
+    monkeypatch.setenv("MERCURY_DEPLOYMENT_COMMIT", "main")
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "f" * 40)
+
+    payload = TestClient(create_http_app(require_auth=False)).get("/api/status").json()
+
+    assert payload["deployment_commit"] is None
 
 
 @pytest.mark.parametrize("value", ("main", "A" * 40, "a" * 39, "a" * 41))

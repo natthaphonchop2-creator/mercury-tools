@@ -287,6 +287,63 @@ def test_audit_ledger_stale_index_rebuilds_from_append_only_jsonl(tmp_path: Path
     }
 
 
+def test_opaque_event_id_with_tax_id_substring_survives_index_rebuild(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generated_id = "evt_75c7be7383233160222e10b2"
+    monkeypatch.setattr(audit.secrets, "token_hex", lambda _size: generated_id.removeprefix("evt_"))
+    path = tmp_path / "audit.jsonl"
+    ledger = AuditLedger(path)
+
+    assert ledger.record({"event": "preview_created"}) == generated_id
+    appended_id = "evt_" + "b" * 24
+    with path.open("ab") as handle:
+        handle.write(
+            json.dumps({"event_id": appended_id, "event": "confirmed"}).encode()
+            + b"\n"
+        )
+
+    assert ledger.get(appended_id) == {
+        "event": "confirmed",
+        "event_id": appended_id,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("repository_id", "repo_abc1234567890123"),
+        ("action_id", "act_" + "a" * 11 + "1234567890123"),
+        ("version_id", "av_" + "a" * 51 + "1234567890123"),
+        ("request_id", "req_a1234567890123"),
+        ("local_session_id", "ses_a1234567890123"),
+        ("event_id", "evt_75c7be7383233160222e10b2"),
+        ("payload_hash", "a" * 51 + "1234567890123"),
+    ],
+)
+def test_validated_opaque_identifiers_are_not_reinterpreted_as_personal_data(
+    field: str,
+    value: str,
+) -> None:
+    assert audit._sanitize_mapping_for_read({field: value}) == {field: value}
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("connector_id", "sk-aaaaaaaaaaaaaaaa", "[REDACTED_TOKEN]"),
+        ("environment", "ghp_aaaaaaaaaaaaaaaa", "[REDACTED]"),
+    ],
+)
+def test_generic_identifiers_still_redact_credential_shaped_values(
+    field: str,
+    value: str,
+    expected: str,
+) -> None:
+    assert audit._sanitize_mapping_for_read({field: value}) == {field: expected}
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX ctime regression")
 def test_repeated_get_keeps_ledger_fingerprint_and_does_not_rebuild(
     tmp_path: Path,

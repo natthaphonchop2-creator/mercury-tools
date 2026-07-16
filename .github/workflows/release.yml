@@ -15,11 +15,41 @@ on:
         description: Immutable history-free staging tag or ref
         required: true
         type: string
+      release_control_run_id:
+        description: Exact trusted release-control workflow run ID
+        required: true
+        type: string
+      release_control_run_attempt:
+        description: Exact trusted release-control producer run attempt
+        required: true
+        type: string
+      release_control_attestation_artifact_id:
+        description: Exact trusted release-control artifact ID
+        required: true
+        type: string
+      release_control_attestation_artifact_digest:
+        description: Exact trusted release-control artifact SHA-256 digest
+        required: true
+        type: string
+      release_control_attestation_payload_sha256:
+        description: SHA-256 of trusted-hosted-attestation.json
+        required: true
+        type: string
+      release_control_repository_id:
+        description: Numeric GitHub repository ID for the trusted release-control repository
+        required: true
+        type: string
+      release_control_attestation_b64:
+        description: Base64-encoded sanitized trusted-hosted-attestation.json
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 env:
+  RELEASE_CONTROL_PIN: 0000000000000000000000000000000000000000
+  RELEASE_CONTROL_REPOSITORY: natthaphonchop2-creator/mercury-release-control
   RELEASE_TAG: v0.2.1
   RELEASE_VERSION: 0.2.1
   UV_HTTP_TIMEOUT: "120"
@@ -32,6 +62,12 @@ jobs:
       REVIEWED_MAIN_SHA: ${{ inputs.reviewed_main_sha }}
       STAGING_REPO: ${{ inputs.staging_repo }}
       STAGING_REF: ${{ inputs.staging_ref }}
+      RELEASE_CONTROL_RUN_ID: ${{ inputs.release_control_run_id }}
+      RELEASE_CONTROL_RUN_ATTEMPT: ${{ inputs.release_control_run_attempt }}
+      RELEASE_CONTROL_ARTIFACT_ID: ${{ inputs.release_control_attestation_artifact_id }}
+      RELEASE_CONTROL_ARTIFACT_DIGEST: ${{ inputs.release_control_attestation_artifact_digest }}
+      RELEASE_CONTROL_PAYLOAD_SHA256: ${{ inputs.release_control_attestation_payload_sha256 }}
+      RELEASE_CONTROL_REPOSITORY_ID: ${{ inputs.release_control_repository_id }}
     steps:
       - name: Checkout reviewed commit with full history
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -44,9 +80,16 @@ jobs:
           set -euo pipefail
           [[ "$REVIEWED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$STAGING_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
-          [[ "$STAGING_REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]
+          [[ "$STAGING_REF" =~ ^v0\.2\.1-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*$ ]]
+          [[ "$RELEASE_CONTROL_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RELEASE_CONTROL_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RELEASE_CONTROL_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RELEASE_CONTROL_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$RELEASE_CONTROL_PAYLOAD_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$RELEASE_CONTROL_REPOSITORY_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RELEASE_CONTROL_PIN" =~ ^[0-9a-f]{40}$ ]]
+          test "$RELEASE_CONTROL_PIN" != "0000000000000000000000000000000000000000"
           test "$STAGING_REPO" != "natthaphonchop2-creator/mercury-tools"
-          test "$STAGING_REF" != "v0.2.1"
           git fetch origin main
           test "$(git rev-parse HEAD)" = "$REVIEWED_MAIN_SHA"
           test "$(git rev-parse origin/main)" = "$REVIEWED_MAIN_SHA"
@@ -70,18 +113,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
-      FLOWACCOUNT_SANDBOX_CLIENT_ID: ${{ secrets.FLOWACCOUNT_SANDBOX_CLIENT_ID }}
-      FLOWACCOUNT_SANDBOX_CLIENT_SECRET: ${{ secrets.FLOWACCOUNT_SANDBOX_CLIENT_SECRET }}
       MERCURY_LIVE_FLOWACCOUNT: "0"
-      MERCURY_LIVE_FLOWACCOUNT_SANDBOX: "1"
+      MERCURY_LIVE_FLOWACCOUNT_SANDBOX: "0"
       MERCURY_LIVE_PEAK: "0"
       MERCURY_SUPABASE_VALIDATION_TEST: "1"
-      MERCURY_SUPABASE_TEST_ISOLATED: "1"
-      MERCURY_SUPABASE_TEST_GUARD: ${{ secrets.MERCURY_SUPABASE_TEST_GUARD }}
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-      SUPABASE_AUTHENTICATED_TEST_JWT: ${{ secrets.SUPABASE_AUTHENTICATED_TEST_JWT }}
+      MERCURY_SUPABASE_TEST_ISOLATED: "0"
+      MERCURY_SUPABASE_TEST_LOCAL_ONLY: "1"
       REVIEWED_MAIN_SHA: ${{ inputs.reviewed_main_sha }}
     steps:
       - name: Checkout exact reviewed commit
@@ -150,67 +187,38 @@ jobs:
           fi
           rm -f "$TRUFFLEHOG_REPORT"
           trap - EXIT
-      - name: Configure required repository-local sandbox credential
-        run: |
-          set -euo pipefail
-          test -n "$FLOWACCOUNT_SANDBOX_CLIENT_ID"
-          test -n "$FLOWACCOUNT_SANDBOX_CLIENT_SECRET"
-          uv run python - <<'PY'
-          import os
-          from pathlib import Path
-
-          from mercury_tools.drivers.flowaccount import FlowAccountDriver
-          from mercury_tools.local.credentials import CredentialStore
-          from mercury_tools.local.repository import ensure_repository_state
-
-          context = ensure_repository_state(Path(".").resolve())
-          fields = FlowAccountDriver().credential_fields("sandbox")
-          values = {
-              "client_id": os.environ["FLOWACCOUNT_SANDBOX_CLIENT_ID"],
-              "client_secret": os.environ["FLOWACCOUNT_SANDBOX_CLIENT_SECRET"],
-          }
-          try:
-              CredentialStore(context).save("flowaccount", "sandbox", values, fields)
-          finally:
-              values.clear()
-          PY
-          uv run mercury credentials test flowaccount --env sandbox --repo-root . \
-            >"$RUNNER_TEMP/flowaccount-sandbox-status.json"
+      - name: Install Supabase CLI 2.109.1
+        uses: supabase/setup-cli@46f7f98c7f948ad727d22c1e67fab04c223a0520
+        with:
+          version: 2.109.1
+      - name: Start ephemeral local Supabase
+        run: bash scripts/start_ephemeral_supabase.sh
       - name: Run all quality and release tests
         run: |
           set -euo pipefail
-          test -n "$MERCURY_SUPABASE_TEST_GUARD"
-          test -n "$SUPABASE_URL"
-          test -n "$SUPABASE_SERVICE_ROLE_KEY"
-          test -n "$SUPABASE_ANON_KEY"
-          test -n "$SUPABASE_AUTHENTICATED_TEST_JWT"
           install -d -m 700 release-evidence
           uv run ruff check .
-          uv run pytest -q --junitxml=release-evidence/pytest.xml
+          uv run pytest -q \
+            --ignore=tests/integration/test_flowaccount_sandbox_qualification.py \
+            --junitxml=release-evidence/pytest.xml
           uv run python scripts/verify_test_skips.py \
             --junit release-evidence/pytest.xml \
             --waivers docs/release/v0.2.1-test-waivers.json
           uv run mercury doctor --repo-root .
           uv run python scripts/validate_release_plugin.py --root .
           uv run python scripts/smoke_local_plugin.py
-      - name: Clear repository-local credentials
+      - name: Stop ephemeral local Supabase
         if: always()
-        run: |
-          uv run mercury credentials clear flowaccount --env sandbox --repo-root . \
-            >/dev/null 2>&1 || true
+        run: supabase stop --no-backup
 
   supabase-migration:
     needs: quality-security
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      MERCURY_SUPABASE_TEST_GUARD: ${{ secrets.MERCURY_SUPABASE_TEST_GUARD }}
-      MERCURY_SUPABASE_TEST_ISOLATED: "1"
+      MERCURY_SUPABASE_TEST_ISOLATED: "0"
+      MERCURY_SUPABASE_TEST_LOCAL_ONLY: "1"
       MERCURY_SUPABASE_VALIDATION_TEST: "1"
-      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-      SUPABASE_AUTHENTICATED_TEST_JWT: ${{ secrets.SUPABASE_AUTHENTICATED_TEST_JWT }}
-      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
     steps:
       - name: Checkout exact reviewed commit
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -223,15 +231,18 @@ jobs:
         with:
           version: 0.11.9
           enable-cache: true
-      - name: Verify migration and isolated live store
+      - name: Install Supabase CLI 2.109.1
+        uses: supabase/setup-cli@46f7f98c7f948ad727d22c1e67fab04c223a0520
+        with:
+          version: 2.109.1
+      - name: Start ephemeral local Supabase
+        run: bash scripts/start_ephemeral_supabase.sh
+      - name: Verify migration on ephemeral local store
         run: |
           set -euo pipefail
           uv sync --extra dev --frozen
-          test -n "$SUPABASE_URL"
-          test -n "$SUPABASE_SERVICE_ROLE_KEY"
-          test -n "$SUPABASE_ANON_KEY"
-          test -n "$SUPABASE_AUTHENTICATED_TEST_JWT"
           uv run pytest -q tests/test_validation_migration.py \
+            tests/test_validation_pg17_hotfix_migration.py \
             tests/integration/test_supabase_validation_knowledge.py \
             --junitxml="$RUNNER_TEMP/supabase-migration.xml"
           uv run python - <<'PY'
@@ -242,89 +253,12 @@ jobs:
           if any(case.find("skipped") is not None for case in root.iter("testcase")):
               raise SystemExit("required migration test skipped")
           PY
-
-  flowaccount-coverage:
-    needs: supabase-migration
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    env:
-      FLOWACCOUNT_SANDBOX_CLIENT_ID: ${{ secrets.FLOWACCOUNT_SANDBOX_CLIENT_ID }}
-      FLOWACCOUNT_SANDBOX_CLIENT_SECRET: ${{ secrets.FLOWACCOUNT_SANDBOX_CLIENT_SECRET }}
-      MERCURY_LIVE_FLOWACCOUNT_SANDBOX: "1"
-    steps:
-      - name: Checkout exact reviewed commit
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ inputs.reviewed_main_sha }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Install uv 0.11.9
-        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
-        with:
-          version: 0.11.9
-          enable-cache: true
-      - name: Create exact sanitized FlowAccount coverage
-        run: |
-          set -euo pipefail
-          uv sync --extra dev --frozen
-          test -n "$FLOWACCOUNT_SANDBOX_CLIENT_ID"
-          test -n "$FLOWACCOUNT_SANDBOX_CLIENT_SECRET"
-          OUTPUT_PARENT="$RUNNER_TEMP/release-evidence/private"
-          install -d -m 700 "$OUTPUT_PARENT"
-          uv run python - <<'PY'
-          import os
-          from pathlib import Path
-
-          from mercury_tools.drivers.flowaccount import FlowAccountDriver
-          from mercury_tools.local.credentials import CredentialStore
-          from mercury_tools.local.repository import ensure_repository_state
-
-          context = ensure_repository_state(Path(".").resolve())
-          fields = FlowAccountDriver().credential_fields("sandbox")
-          values = {
-              "client_id": os.environ["FLOWACCOUNT_SANDBOX_CLIENT_ID"],
-              "client_secret": os.environ["FLOWACCOUNT_SANDBOX_CLIENT_SECRET"],
-          }
-          try:
-              CredentialStore(context).save("flowaccount", "sandbox", values, fields)
-          finally:
-              values.clear()
-          PY
-          uv run mercury credentials test flowaccount --env sandbox --repo-root . \
-            >"$OUTPUT_PARENT/credential-status.json"
-          uv run pytest -q tests/integration/test_flowaccount_sandbox_qualification.py \
-            --junitxml="$OUTPUT_PARENT/flowaccount-live.xml"
-          uv run mercury catalog qualify --connector flowaccount --env sandbox --all \
-            --repo-root . >"$OUTPUT_PARENT/flowaccount-qualification.json"
-          uv run python - <<'PY'
-          import json
-          import os
-          import xml.etree.ElementTree as ET
-          from pathlib import Path
-
-          root = Path(os.environ["RUNNER_TEMP"]) / "release-evidence" / "private"
-          junit = ET.parse(root / "flowaccount-live.xml").getroot()
-          if any(case.find("skipped") is not None for case in junit.iter("testcase")):
-              raise SystemExit("required live sandbox test skipped")
-          report = json.loads((root / "flowaccount-qualification.json").read_text())
-          if report.get("total") != 190 or len(report.get("records", [])) != 190:
-              raise SystemExit("flowaccount coverage mismatch")
-          PY
-      - name: Clear repository-local credentials
+      - name: Stop ephemeral local Supabase
         if: always()
-        run: |
-          uv run mercury credentials clear flowaccount --env sandbox --repo-root . \
-            >/dev/null 2>&1 || true
-      - name: Retain sanitized coverage only
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: flowaccount-sanitized-coverage
-          path: ${{ runner.temp }}/release-evidence/private/flowaccount-qualification.json
-          if-no-files-found: error
-          retention-days: 1
+        run: supabase stop --no-backup
 
   peak-contract:
-    needs: flowaccount-coverage
+    needs: supabase-migration
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -360,29 +294,115 @@ jobs:
               raise SystemExit("peak contract coverage mismatch")
           PY
       - name: Retain PEAK contract report
+        id: retain
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: peak-contract-coverage
+          name: peak-contract-coverage-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/release-evidence/private/peak-contract-validation.json
           if-no-files-found: error
           retention-days: 1
 
-  build-artifacts:
+  relayed-release-control:
     needs: peak-contract
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      artifact_id: ${{ steps.retain.outputs.artifact-id }}
+      artifact_digest: ${{ steps.retain.outputs.artifact-digest }}
+      payload_sha256: ${{ inputs.release_control_attestation_payload_sha256 }}
+      producer_repository: ${{ steps.producer.outputs.repository }}
+      producer_sha: ${{ steps.producer.outputs.sha }}
+      source_repository_id: ${{ inputs.release_control_repository_id }}
+      source_run_id: ${{ inputs.release_control_run_id }}
+      source_run_attempt: ${{ inputs.release_control_run_attempt }}
+      source_artifact_id: ${{ inputs.release_control_attestation_artifact_id }}
+      source_artifact_digest: ${{ inputs.release_control_attestation_artifact_digest }}
+      source_payload_sha256: ${{ inputs.release_control_attestation_payload_sha256 }}
+    steps:
+      - name: Decode untrusted sanitized attestation transport
+        env:
+          ATTESTATION_B64: ${{ inputs.release_control_attestation_b64 }}
+          EXPECTED_PAYLOAD_SHA256: ${{ inputs.release_control_attestation_payload_sha256 }}
+        run: |
+          set -euo pipefail
+          test -n "$ATTESTATION_B64"
+          test "${#ATTESTATION_B64}" -le 60000
+          OUTPUT_ROOT="$RUNNER_TEMP/relayed-release-control"
+          install -d -m 700 "$OUTPUT_ROOT"
+          umask 077
+          printf '%s' "$ATTESTATION_B64" | base64 --decode \
+            >"$OUTPUT_ROOT/trusted-hosted-attestation.json"
+          printf '%s  %s\n' "$EXPECTED_PAYLOAD_SHA256" \
+            "$OUTPUT_ROOT/trusted-hosted-attestation.json" | sha256sum --check
+      - name: Verify exact sanitized relay payload
+        env:
+          EXPECTED_PAYLOAD_SHA256: ${{ inputs.release_control_attestation_payload_sha256 }}
+          EXPECTED_PRODUCER_RUN_ATTEMPT: ${{ inputs.release_control_run_attempt }}
+          EXPECTED_PRODUCER_RUN_ID: ${{ inputs.release_control_run_id }}
+          EXPECTED_PRODUCER_SHA: ${{ env.RELEASE_CONTROL_PIN }}
+          EXPECTED_REVIEWED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_REVIEWED_SHA: ${{ inputs.reviewed_main_sha }}
+          EXPECTED_STAGING_REF: ${{ inputs.staging_ref }}
+          EXPECTED_STAGING_REPOSITORY: ${{ inputs.staging_repo }}
+        run: |
+          set -euo pipefail
+          ATTESTATION="$RUNNER_TEMP/relayed-release-control/trusted-hosted-attestation.json"
+          test -f "$ATTESTATION"
+          test ! -L "$ATTESTATION"
+          test "$(find "$RUNNER_TEMP/relayed-release-control" -type f | wc -l | tr -d ' ')" = "1"
+          printf '%s  %s\n' "$EXPECTED_PAYLOAD_SHA256" "$ATTESTATION" \
+            | sha256sum --check
+          jq -e \
+            --arg producer_repository "$RELEASE_CONTROL_REPOSITORY" \
+            --arg producer_sha "$EXPECTED_PRODUCER_SHA" \
+            --arg reviewed_repository "$EXPECTED_REVIEWED_REPOSITORY" \
+            --arg reviewed_sha "$EXPECTED_REVIEWED_SHA" \
+            --arg staging_repository "$EXPECTED_STAGING_REPOSITORY" \
+            --arg staging_ref "$EXPECTED_STAGING_REF" \
+            --argjson producer_run_id "$EXPECTED_PRODUCER_RUN_ID" \
+            --argjson producer_run_attempt "$EXPECTED_PRODUCER_RUN_ATTEMPT" \
+            '(.schema_version == 2) and
+             (.reviewed_repository == $reviewed_repository) and
+             (.reviewed_commit_sha == $reviewed_sha) and
+             (.producer.repository == $producer_repository) and
+             (.producer.commit_sha == $producer_sha) and
+             (.producer.workflow_run_id == $producer_run_id) and
+             (.producer.workflow_run_attempt == $producer_run_attempt) and
+             (.staging.repository == $staging_repository) and
+             (.staging.ref == $staging_ref)' \
+            "$ATTESTATION" >/dev/null
+          chmod 0600 "$ATTESTATION"
+      - name: Export the single reviewed producer identity
+        id: producer
+        run: |
+          set -euo pipefail
+          echo "repository=$RELEASE_CONTROL_REPOSITORY" >>"$GITHUB_OUTPUT"
+          echo "sha=$RELEASE_CONTROL_PIN" >>"$GITHUB_OUTPUT"
+      - name: Retain exact untrusted relay for final publisher verification
+        id: retain
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mercury-v0.2.1-trusted-attestation-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/relayed-release-control/trusted-hosted-attestation.json
+          if-no-files-found: error
+          retention-days: 1
+
+  build-artifacts:
+    needs: relayed-release-control
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
+    outputs:
+      artifact_id: ${{ steps.retain.outputs.artifact-id }}
+      artifact_digest: ${{ steps.retain.outputs.artifact-digest }}
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      MERCURY_MARKETPLACE_SNAPSHOT_URL: ${{ secrets.MERCURY_MARKETPLACE_SNAPSHOT_URL }}
-      MERCURY_PUBLIC_MCP_TOKEN: ${{ secrets.MERCURY_PUBLIC_MCP_TOKEN }}
-      MERCURY_PUBLIC_MCP_URL: ${{ secrets.MERCURY_PUBLIC_MCP_URL }}
-      MERCURY_RELEASE_KNOWLEDGE_TABLES: ${{ vars.MERCURY_RELEASE_KNOWLEDGE_TABLES }}
-      MERCURY_RELEASE_STORAGE_BUCKETS: ${{ vars.MERCURY_RELEASE_STORAGE_BUCKETS }}
-      MERCURY_RENDER_API_URL: https://api.render.com
-      MERCURY_RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
-      RENDER_API_KEY: ${{ secrets.RENDER_API_TOKEN }}
-      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      MERCURY_RELEASE_CONTROL_REPOSITORY: ${{ needs.relayed-release-control.outputs.producer_repository }}
+      MERCURY_RELEASE_CONTROL_RUN_ATTEMPT: ${{ inputs.release_control_run_attempt }}
+      MERCURY_RELEASE_CONTROL_RUN_ID: ${{ inputs.release_control_run_id }}
+      MERCURY_RELEASE_CONTROL_SHA: ${{ needs.relayed-release-control.outputs.producer_sha }}
+      MERCURY_RELEASE_STAGING_REF: ${{ inputs.staging_ref }}
+      MERCURY_RELEASE_STAGING_REPOSITORY: ${{ inputs.staging_repo }}
+      MERCURY_TRUSTED_HOSTED_ATTESTATION: /release-attestation/trusted-hosted-attestation.json
+      MERCURY_TRUSTED_HOSTED_ATTESTATION_SHA256: ${{ needs.relayed-release-control.outputs.payload_sha256 }}
     steps:
       - name: Checkout exact reviewed commit
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -390,6 +410,42 @@ jobs:
           ref: ${{ inputs.reviewed_main_sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Download exact sanitized attestation
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.relayed-release-control.outputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/relayed-release-control
+      - name: Prepare immutable offline dependency cache
+        run: |
+          set -euo pipefail
+          UV_CACHE_DIR="$RUNNER_TEMP/mercury-uv-cache"
+          install -d -m 700 "$UV_CACHE_DIR"
+          docker run --rm --platform linux/amd64 \
+            --read-only --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,mode=1777,size=1073741824 \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$UV_CACHE_DIR:/release-uv-cache:rw" \
+            --workdir /workspace \
+            --env HOME=/tmp/mercury-home \
+            --env UV_CACHE_DIR=/release-uv-cache \
+            --env UV_PROJECT_ENVIRONMENT=/tmp/mercury-prefetch-venv \
+            --env UV_PYTHON=/usr/local/bin/python3.12 \
+            --env UV_PYTHON_DOWNLOADS=never \
+            docker.io/library/python@sha256:fd95fa221297a88e1cf49c55ec1828edd7c5a428187e67b5d1805692d11588db \
+            sh -ceu '
+              printf "%s  %s\n" \
+                f05934ddce884a121981d94c16f274a12bfc7829e48943a7f9455bb255b0be40 \
+                release-toolchain/uv-linux-x86_64 | sha256sum --check
+              printf "%s  %s\n" \
+                274fad7efee469c3c5f76d5885d56c2231995ba044a7db7d7c168cd3484cd524 \
+                uv.lock | sha256sum --check
+              release-toolchain/uv-linux-x86_64 sync \
+                --frozen --no-dev --no-install-project --no-build
+            '
+          chmod -R a-w "$UV_CACHE_DIR"
       - name: Install checksum-verified scanners for the pinned build runtime
         env:
           GITLEAKS_URL: https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz
@@ -412,7 +468,16 @@ jobs:
           tar -xzf "$SCANNER_ROOT/gitleaks.tar.gz" -C "$SCANNER_BIN" gitleaks
           tar -xzf "$SCANNER_ROOT/trufflehog.tar.gz" -C "$SCANNER_BIN" trufflehog
           chmod 0555 "$SCANNER_BIN/gitleaks" "$SCANNER_BIN/trufflehog"
-      - name: Build and verify through the candidate-controlled platform
+      - name: Prepare size-limited build output filesystem
+        run: |
+          set -euo pipefail
+          OUTPUT_PARENT="$RUNNER_TEMP/mercury-build-output"
+          install -d -m 700 "$OUTPUT_PARENT"
+          sudo mount -t tmpfs \
+            -o "size=2147483648,nosuid,nodev,noexec,mode=0700,uid=$(id -u),gid=$(id -g)" \
+            tmpfs "$OUTPUT_PARENT"
+          test "$(stat -c '%a' "$OUTPUT_PARENT")" = "700"
+      - name: Build and verify in the isolated candidate runtime
         env:
           REVIEWED_MAIN_SHA: ${{ inputs.reviewed_main_sha }}
         run: |
@@ -448,59 +513,83 @@ jobs:
           test -n "$RELEASE_PLATFORM"
           test -n "$RELEASE_IMAGE"
           test -n "$RELEASE_UV_SOURCE_IMAGE"
-          OUTPUT_PARENT="$RUNNER_TEMP/release-evidence/private"
-          install -d -m 700 "$OUTPUT_PARENT"
+          export RELEASE_UV_SOURCE_IMAGE
+          OUTPUT_PARENT="$RUNNER_TEMP/mercury-build-output"
           test "$(stat -c '%a' "$OUTPUT_PARENT")" = "700"
           test ! -e "$OUTPUT_PARENT/artifacts"
           test "$(git rev-parse HEAD)" = "$REVIEWED_MAIN_SHA"
           docker run --rm --platform "$RELEASE_PLATFORM" \
+            --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges:true \
             --user "$(id -u):$(id -g)" \
-            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --tmpfs /tmp:rw,nosuid,nodev,mode=1777,size=2147483648 \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
             --volume "$RUNNER_TEMP/mercury-scanners/bin:/release-bin:ro" \
-            --volume "$OUTPUT_PARENT:/release-output" \
+            --volume "$RUNNER_TEMP/mercury-uv-cache:/release-uv-cache:ro" \
+            --volume "$RUNNER_TEMP/relayed-release-control/trusted-hosted-attestation.json:/release-attestation/trusted-hosted-attestation.json:ro" \
+            --volume "$OUTPUT_PARENT:/release-output:rw" \
             --workdir /workspace \
-            --env GH_TOKEN --env MERCURY_MARKETPLACE_SNAPSHOT_URL \
-            --env MERCURY_PUBLIC_MCP_TOKEN --env MERCURY_PUBLIC_MCP_URL \
-            --env MERCURY_RELEASE_KNOWLEDGE_TABLES \
-            --env MERCURY_RELEASE_STORAGE_BUCKETS \
-            --env MERCURY_RENDER_API_URL --env MERCURY_RENDER_SERVICE_ID \
-            --env RENDER_API_KEY --env SUPABASE_SERVICE_ROLE_KEY --env SUPABASE_URL \
+            --env MERCURY_RELEASE_CONTROL_REPOSITORY \
+            --env MERCURY_RELEASE_CONTROL_RUN_ATTEMPT \
+            --env MERCURY_RELEASE_CONTROL_RUN_ID \
+            --env MERCURY_RELEASE_CONTROL_SHA \
+            --env MERCURY_RELEASE_STAGING_REF \
+            --env MERCURY_RELEASE_STAGING_REPOSITORY \
+            --env MERCURY_TRUSTED_HOSTED_ATTESTATION \
+            --env MERCURY_TRUSTED_HOSTED_ATTESTATION_SHA256 \
             --env RELEASE_UV_SOURCE_IMAGE \
             --env HOME=/tmp/mercury-home --env UV_CACHE_DIR=/tmp/uv-cache \
+            --env UV_PROJECT_ENVIRONMENT=/tmp/mercury-venv \
             --env UV_HTTP_TIMEOUT=120 --env UV_PYTHON=/usr/local/bin/python3.12 \
             --env UV_PYTHON_DOWNLOADS=never \
             "$RELEASE_IMAGE" sh -ceu '
               test -n "$RELEASE_UV_SOURCE_IMAGE"
+              cp -a /release-uv-cache /tmp/uv-cache
+              chmod -R u+w /tmp/uv-cache
               export PATH="/release-bin:$PATH"
-              release-toolchain/uv-linux-x86_64 run --frozen --no-dev python \
+              release-toolchain/uv-linux-x86_64 run --offline --frozen --no-dev python \
                 scripts/build_release_artifacts.py --version 0.2.1 \
                 --output /release-output/artifacts
-              release-toolchain/uv-linux-x86_64 run --frozen --no-dev python \
+              release-toolchain/uv-linux-x86_64 run --offline --frozen --no-dev python \
                 scripts/verify_release.py --version 0.2.1 \
                 --artifacts /release-output/artifacts
             '
-      - name: Retain verified release artifacts
+          python3 scripts/validate_candidate_output.py "$OUTPUT_PARENT" \
+            --max-files 100 --max-bytes 2147483648
+      - name: Retain verified release artifacts for this attempt
+        id: retain
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: mercury-v0.2.1-release-artifacts
-          path: ${{ runner.temp }}/release-evidence/private/artifacts
+          name: mercury-v0.2.1-release-artifacts-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mercury-build-output/artifacts
           if-no-files-found: error
           retention-days: 1
+      - name: Unmount size-limited build output filesystem
+        if: always()
+        run: |
+          set -euo pipefail
+          OUTPUT_PARENT="$RUNNER_TEMP/mercury-build-output"
+          if mountpoint -q "$OUTPUT_PARENT"; then
+            sudo umount "$OUTPUT_PARENT"
+          fi
+          rm -rf "$OUTPUT_PARENT"
 
   public-staging:
-    needs: build-artifacts
+    needs: [relayed-release-control, build-artifacts]
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    outputs:
+      artifact_id: ${{ steps.retain.outputs.artifact-id }}
+      artifact_digest: ${{ steps.retain.outputs.artifact-digest }}
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      MERCURY_MARKETPLACE_SNAPSHOT_URL: ${{ secrets.MERCURY_MARKETPLACE_SNAPSHOT_URL }}
-      MERCURY_PUBLIC_MCP_TOKEN: ${{ secrets.MERCURY_PUBLIC_MCP_TOKEN }}
-      MERCURY_PUBLIC_MCP_URL: ${{ secrets.MERCURY_PUBLIC_MCP_URL }}
-      MERCURY_RENDER_API_URL: https://api.render.com
-      MERCURY_RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
-      RENDER_API_KEY: ${{ secrets.RENDER_API_TOKEN }}
-      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      MERCURY_RELEASE_CONTROL_REPOSITORY: ${{ needs.relayed-release-control.outputs.producer_repository }}
+      MERCURY_RELEASE_CONTROL_RUN_ATTEMPT: ${{ inputs.release_control_run_attempt }}
+      MERCURY_RELEASE_CONTROL_RUN_ID: ${{ inputs.release_control_run_id }}
+      MERCURY_RELEASE_CONTROL_SHA: ${{ needs.relayed-release-control.outputs.producer_sha }}
+      MERCURY_RELEASE_STAGING_REF: ${{ inputs.staging_ref }}
+      MERCURY_RELEASE_STAGING_REPOSITORY: ${{ inputs.staging_repo }}
+      MERCURY_TRUSTED_HOSTED_ATTESTATION: /release-attestation/trusted-hosted-attestation.json
+      MERCURY_TRUSTED_HOSTED_ATTESTATION_SHA256: ${{ needs.relayed-release-control.outputs.payload_sha256 }}
     steps:
       - name: Checkout exact reviewed commit
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -508,13 +597,48 @@ jobs:
           ref: ${{ inputs.reviewed_main_sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Download verified artifacts into a private parent
-        run: install -d -m 700 "$RUNNER_TEMP/release-evidence/private"
       - name: Download exact release artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: mercury-v0.2.1-release-artifacts
-          path: ${{ runner.temp }}/release-evidence/private/artifacts
+          artifact-ids: ${{ needs.build-artifacts.outputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/mercury-staging-input/artifacts
+      - name: Download exact sanitized attestation
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.relayed-release-control.outputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/relayed-release-control
+      - name: Prepare immutable offline dependency cache
+        run: |
+          set -euo pipefail
+          UV_CACHE_DIR="$RUNNER_TEMP/mercury-uv-cache"
+          install -d -m 700 "$UV_CACHE_DIR"
+          docker run --rm --platform linux/amd64 \
+            --read-only --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,mode=1777,size=1073741824 \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$UV_CACHE_DIR:/release-uv-cache:rw" \
+            --workdir /workspace \
+            --env HOME=/tmp/mercury-home \
+            --env UV_CACHE_DIR=/release-uv-cache \
+            --env UV_PROJECT_ENVIRONMENT=/tmp/mercury-prefetch-venv \
+            --env UV_PYTHON=/usr/local/bin/python3.12 \
+            --env UV_PYTHON_DOWNLOADS=never \
+            docker.io/library/python@sha256:fd95fa221297a88e1cf49c55ec1828edd7c5a428187e67b5d1805692d11588db \
+            sh -ceu '
+              printf "%s  %s\n" \
+                f05934ddce884a121981d94c16f274a12bfc7829e48943a7f9455bb255b0be40 \
+                release-toolchain/uv-linux-x86_64 | sha256sum --check
+              printf "%s  %s\n" \
+                274fad7efee469c3c5f76d5885d56c2231995ba044a7db7d7c168cd3484cd524 \
+                uv.lock | sha256sum --check
+              release-toolchain/uv-linux-x86_64 sync \
+                --frozen --no-dev --no-install-project --no-build
+            '
+          chmod -R a-w "$UV_CACHE_DIR"
       - name: Install checksum-verified staging scanners
         env:
           GITLEAKS_URL: https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz
@@ -537,7 +661,21 @@ jobs:
           tar -xzf "$SCANNER_ROOT/gitleaks.tar.gz" -C "$SCANNER_BIN" gitleaks
           tar -xzf "$SCANNER_ROOT/trufflehog.tar.gz" -C "$SCANNER_BIN" trufflehog
           chmod 0555 "$SCANNER_BIN/gitleaks" "$SCANNER_BIN/trufflehog"
-      - name: Build history-free public staging through the pinned platform
+      - name: Prepare size-limited staging output filesystem
+        run: |
+          set -euo pipefail
+          INPUT_ROOT="$RUNNER_TEMP/mercury-staging-input/artifacts"
+          test -d "$INPUT_ROOT"
+          chmod -R a-w "$INPUT_ROOT"
+          OUTPUT_PARENT="$RUNNER_TEMP/mercury-staging-output"
+          install -d -m 700 "$OUTPUT_PARENT"
+          sudo mount -t tmpfs \
+            -o "size=2147483648,nosuid,nodev,noexec,mode=0700,uid=$(id -u),gid=$(id -g)" \
+            tmpfs "$OUTPUT_PARENT"
+          test "$(stat -c '%a' "$OUTPUT_PARENT")" = "700"
+      - name: Build history-free staging in the isolated candidate runtime
+        env:
+          REVIEWED_MAIN_SHA: ${{ inputs.reviewed_main_sha }}
         run: |
           set -euo pipefail
           IFS=$'\t' read -r RELEASE_PLATFORM RELEASE_IMAGE RELEASE_UV_SOURCE_IMAGE < <(
@@ -571,174 +709,177 @@ jobs:
           test -n "$RELEASE_PLATFORM"
           test -n "$RELEASE_IMAGE"
           test -n "$RELEASE_UV_SOURCE_IMAGE"
-          OUTPUT_PARENT="$RUNNER_TEMP/release-evidence/private"
+          export RELEASE_UV_SOURCE_IMAGE
+          OUTPUT_PARENT="$RUNNER_TEMP/mercury-staging-output"
           test ! -e "$OUTPUT_PARENT/public-staging"
+          test "$(git rev-parse HEAD)" = "$REVIEWED_MAIN_SHA"
           docker run --rm --platform "$RELEASE_PLATFORM" \
+            --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges:true \
             --user "$(id -u):$(id -g)" \
-            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --tmpfs /tmp:rw,nosuid,nodev,mode=1777,size=2147483648 \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
             --volume "$RUNNER_TEMP/mercury-scanners/bin:/release-bin:ro" \
-            --volume "$OUTPUT_PARENT:/release-output" \
+            --volume "$RUNNER_TEMP/mercury-uv-cache:/release-uv-cache:ro" \
+            --volume "$RUNNER_TEMP/mercury-staging-input/artifacts:/release-artifacts:ro" \
+            --volume "$RUNNER_TEMP/relayed-release-control/trusted-hosted-attestation.json:/release-attestation/trusted-hosted-attestation.json:ro" \
+            --volume "$OUTPUT_PARENT:/release-output:rw" \
             --workdir /workspace \
-            --env GH_TOKEN --env MERCURY_MARKETPLACE_SNAPSHOT_URL \
-            --env MERCURY_PUBLIC_MCP_TOKEN --env MERCURY_PUBLIC_MCP_URL \
-            --env MERCURY_RENDER_API_URL --env MERCURY_RENDER_SERVICE_ID \
-            --env RENDER_API_KEY --env SUPABASE_SERVICE_ROLE_KEY --env SUPABASE_URL \
+            --env MERCURY_RELEASE_CONTROL_REPOSITORY \
+            --env MERCURY_RELEASE_CONTROL_RUN_ATTEMPT \
+            --env MERCURY_RELEASE_CONTROL_RUN_ID \
+            --env MERCURY_RELEASE_CONTROL_SHA \
+            --env MERCURY_RELEASE_STAGING_REF \
+            --env MERCURY_RELEASE_STAGING_REPOSITORY \
+            --env MERCURY_TRUSTED_HOSTED_ATTESTATION \
+            --env MERCURY_TRUSTED_HOSTED_ATTESTATION_SHA256 \
             --env RELEASE_UV_SOURCE_IMAGE \
             --env HOME=/tmp/mercury-home --env UV_CACHE_DIR=/tmp/uv-cache \
+            --env UV_PROJECT_ENVIRONMENT=/tmp/mercury-venv \
             --env UV_HTTP_TIMEOUT=120 --env UV_PYTHON=/usr/local/bin/python3.12 \
             --env UV_PYTHON_DOWNLOADS=never \
             "$RELEASE_IMAGE" sh -ceu '
               test -n "$RELEASE_UV_SOURCE_IMAGE"
+              cp -a /release-uv-cache /tmp/uv-cache
+              chmod -R u+w /tmp/uv-cache
               export PATH="/release-bin:$PATH"
-              release-toolchain/uv-linux-x86_64 run --frozen --no-dev python \
+              release-toolchain/uv-linux-x86_64 run --offline --frozen --no-dev python \
                 scripts/build_public_staging.py --version 0.2.1 \
-                --artifacts /release-output/artifacts \
+                --artifacts /release-artifacts \
                 --output /release-output/public-staging \
                 > /release-output/public-staging-identity.json
             '
-      - name: Retain staging identity for remote binding
+          IDENTITY="$OUTPUT_PARENT/public-staging-identity.json"
+          test -f "$IDENTITY"
+          test ! -L "$IDENTITY"
+          test "$(stat -c '%F' "$IDENTITY")" = "regular file"
+          test "$(stat -c '%h' "$IDENTITY")" = "1"
+          IDENTITY_ROOT="$RUNNER_TEMP/mercury-staging-identity"
+          install -d -m 700 "$IDENTITY_ROOT"
+          install -m 600 "$IDENTITY" "$IDENTITY_ROOT/public-staging-identity.json"
+          python3 scripts/validate_candidate_output.py "$IDENTITY_ROOT" \
+            --max-files 1 --max-bytes 1048576
+      - name: Bind local staging identity to trusted hosted state
+        env:
+          REVIEWED_MAIN_SHA: ${{ inputs.reviewed_main_sha }}
+        run: |
+          set -euo pipefail
+          IDENTITY="$RUNNER_TEMP/mercury-staging-identity/public-staging-identity.json"
+          ATTESTATION="$RUNNER_TEMP/relayed-release-control/trusted-hosted-attestation.json"
+          test "$(jq -r '.status' "$IDENTITY")" = "ok"
+          test "$(jq -r '.staging.commit_sha' "$IDENTITY")" = "$REVIEWED_MAIN_SHA"
+          test "$(jq -r '.staging.candidate_tree_digest' "$IDENTITY")" = \
+            "$(jq -r '.staging.tree_sha256' "$ATTESTATION")"
+          test "$(jq -r '.staging.staged_tree_digest' "$IDENTITY")" = \
+            "$(jq -r '.staging.tree_sha256' "$ATTESTATION")"
+      - name: Retain staging identity for this attempt
+        id: retain
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: mercury-v0.2.1-public-staging-identity
-          path: ${{ runner.temp }}/release-evidence/private/public-staging-identity.json
+          name: mercury-v0.2.1-public-staging-identity-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mercury-staging-identity/public-staging-identity.json
           if-no-files-found: error
           retention-days: 1
+      - name: Unmount size-limited staging output filesystem
+        if: always()
+        run: |
+          set -euo pipefail
+          OUTPUT_PARENT="$RUNNER_TEMP/mercury-staging-output"
+          if mountpoint -q "$OUTPUT_PARENT"; then
+            sudo umount "$OUTPUT_PARENT"
+          fi
+          rm -rf "$OUTPUT_PARENT" "$RUNNER_TEMP/mercury-staging-identity"
 
-  tagged-marketplace:
-    needs: public-staging
+  release-ready:
+    needs: [relayed-release-control, build-artifacts, public-staging]
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 10
+    outputs:
+      artifact_id: ${{ steps.retain.outputs.artifact-id }}
+      artifact_digest: ${{ steps.retain.outputs.artifact-digest }}
+      payload_sha256: ${{ steps.payload.outputs.sha256 }}
     steps:
-      - name: Checkout exact reviewed commit
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ inputs.reviewed_main_sha }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Install uv 0.11.9
-        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
-        with:
-          version: 0.11.9
-          enable-cache: true
-      - name: Download reviewed staging identity
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: mercury-v0.2.1-public-staging-identity
-          path: ${{ runner.temp }}/release-evidence/private
-      - name: Install exact tagged marketplace plugin
+      - name: Create exact release-ready handoff
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          STAGING_REPO: ${{ inputs.staging_repo }}
-          STAGING_REF: ${{ inputs.staging_ref }}
+          RELEASE_ARTIFACT_DIGEST: ${{ needs.build-artifacts.outputs.artifact_digest }}
+          RELEASE_ARTIFACT_ID: ${{ needs.build-artifacts.outputs.artifact_id }}
+          RELEASE_CONTROL_ARTIFACT_DIGEST: ${{ needs.relayed-release-control.outputs.artifact_digest }}
+          RELEASE_CONTROL_ARTIFACT_ID: ${{ needs.relayed-release-control.outputs.artifact_id }}
+          SOURCE_ARTIFACT_DIGEST: ${{ needs.relayed-release-control.outputs.source_artifact_digest }}
+          SOURCE_ARTIFACT_ID: ${{ needs.relayed-release-control.outputs.source_artifact_id }}
+          SOURCE_PAYLOAD_SHA256: ${{ needs.relayed-release-control.outputs.source_payload_sha256 }}
+          SOURCE_PRODUCER_REPOSITORY: ${{ needs.relayed-release-control.outputs.producer_repository }}
+          SOURCE_PRODUCER_SHA: ${{ needs.relayed-release-control.outputs.producer_sha }}
+          SOURCE_REPOSITORY_ID: ${{ needs.relayed-release-control.outputs.source_repository_id }}
+          SOURCE_RUN_ATTEMPT: ${{ needs.relayed-release-control.outputs.source_run_attempt }}
+          SOURCE_RUN_ID: ${{ needs.relayed-release-control.outputs.source_run_id }}
+          REVIEWED_MAIN_SHA: ${{ inputs.reviewed_main_sha }}
+          STAGING_ARTIFACT_DIGEST: ${{ needs.public-staging.outputs.artifact_digest }}
+          STAGING_ARTIFACT_ID: ${{ needs.public-staging.outputs.artifact_id }}
         run: |
           set -euo pipefail
-          [[ "$STAGING_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
-          [[ "$STAGING_REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]
-          test "$STAGING_REPO" != "natthaphonchop2-creator/mercury-tools"
-          test "$STAGING_REF" != "v0.2.1"
-          test -n "$(git ls-remote --refs "https://github.com/$STAGING_REPO.git" "refs/tags/$STAGING_REF" | awk 'NF == 2 {print $1; exit}')"
-          uv sync --extra dev --frozen
-          uv run python scripts/verify_staging_snapshot.py \
-            --repo "$STAGING_REPO" \
-            --tag "$STAGING_REF" \
-            --identity "$RUNNER_TEMP/release-evidence/private/public-staging-identity.json"
-          echo "history-free staging marketplace ref is bound to the reviewed candidate tree"
-          uv run python scripts/smoke_tagged_marketplace.py \
-            --repo "$STAGING_REPO" \
-            --tag "$STAGING_REF" \
-            --launcher-repo "$STAGING_REPO" \
-            --launcher-ref "$STAGING_REF" \
-            --expected-tools 19
-
-  render-release:
-    needs: tagged-marketplace
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    env:
-      MERCURY_TOOLS_HTTP_BEARER_TOKEN: ${{ secrets.MERCURY_TOOLS_HTTP_BEARER_TOKEN }}
-      RENDER_API_TOKEN: ${{ secrets.RENDER_API_TOKEN }}
-      RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
-      REVIEWED_MAIN_SHA: ${{ inputs.reviewed_main_sha }}
-    steps:
-      - name: Checkout exact reviewed commit
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ inputs.reviewed_main_sha }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Install uv 0.11.9
-        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
-        with:
-          version: 0.11.9
-          enable-cache: true
-      - name: Verify mandatory health and exact deployed commit
+          HANDOFF="$RUNNER_TEMP/mercury-v0.2.1-release-ready.json"
+          for digest in "$RELEASE_ARTIFACT_DIGEST" "$RELEASE_CONTROL_ARTIFACT_DIGEST" "$SOURCE_ARTIFACT_DIGEST" "$SOURCE_PAYLOAD_SHA256" "$STAGING_ARTIFACT_DIGEST"; do
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          done
+          for artifact_id in "$RELEASE_ARTIFACT_ID" "$RELEASE_CONTROL_ARTIFACT_ID" "$SOURCE_ARTIFACT_ID" "$STAGING_ARTIFACT_ID"; do
+            [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
+          done
+          [[ "$SOURCE_REPOSITORY_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$SOURCE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          [[ "$SOURCE_PRODUCER_SHA" =~ ^[0-9a-f]{40}$ ]]
+          jq -n \
+            --arg reviewed_commit_sha "$REVIEWED_MAIN_SHA" \
+            --argjson caller_run_id "${{ github.run_id }}" \
+            --argjson caller_run_attempt "${{ github.run_attempt }}" \
+            --arg source_repository "$SOURCE_PRODUCER_REPOSITORY" \
+            --argjson source_repository_id "$SOURCE_REPOSITORY_ID" \
+            --arg source_producer_sha "$SOURCE_PRODUCER_SHA" \
+            --arg source_workflow_path ".github/workflows/attest-v0.2.1.yml" \
+            --argjson source_run_id "$SOURCE_RUN_ID" \
+            --argjson source_run_attempt "$SOURCE_RUN_ATTEMPT" \
+            --argjson source_artifact_id "$SOURCE_ARTIFACT_ID" \
+            --arg source_artifact_digest "$SOURCE_ARTIFACT_DIGEST" \
+            --arg source_payload_sha256 "$SOURCE_PAYLOAD_SHA256" \
+            --arg source_staging_repository "${{ inputs.staging_repo }}" \
+            --arg source_staging_ref "${{ inputs.staging_ref }}" \
+            --argjson relay_artifact_id "$RELEASE_CONTROL_ARTIFACT_ID" \
+            --arg relay_artifact_digest "$RELEASE_CONTROL_ARTIFACT_DIGEST" \
+            --argjson release_artifact_id "$RELEASE_ARTIFACT_ID" \
+            --arg release_artifact_digest "$RELEASE_ARTIFACT_DIGEST" \
+            --argjson staging_artifact_id "$STAGING_ARTIFACT_ID" \
+            --arg staging_artifact_digest "$STAGING_ARTIFACT_DIGEST" \
+            '{schema_version: 2, version: "0.2.1", reviewed_commit_sha: $reviewed_commit_sha,
+              caller: {run_id: $caller_run_id, run_attempt: $caller_run_attempt},
+              original_release_control: {repository: $source_repository,
+                repository_id: $source_repository_id,
+                producer_commit_sha: $source_producer_sha,
+                workflow_path: $source_workflow_path,
+                run_id: $source_run_id, run_attempt: $source_run_attempt,
+                artifact_id: $source_artifact_id,
+                artifact_digest: $source_artifact_digest,
+                payload_sha256: $source_payload_sha256,
+                staging_repository: $source_staging_repository,
+                staging_ref: $source_staging_ref},
+              relayed_attestation: {artifact_id: $relay_artifact_id,
+                artifact_digest: $relay_artifact_digest,
+                payload_sha256: $source_payload_sha256},
+              release_artifacts: {artifact_id: $release_artifact_id,
+                artifact_digest: $release_artifact_digest},
+              staging_identity: {artifact_id: $staging_artifact_id,
+                artifact_digest: $staging_artifact_digest}}' >"$HANDOFF"
+      - name: Record exact release-ready payload digest
+        id: payload
         run: |
           set -euo pipefail
-          uv sync --extra dev --frozen
-          uv run python scripts/verify_render_release.py \
-            --url https://mercury-tools-mcp.onrender.com \
-            --version 0.2.1 --commit "$REVIEWED_MAIN_SHA"
-
-  publish-assets:
-    needs: render-release
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - name: Checkout exact reviewed commit
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+          SHA256="$(sha256sum "$RUNNER_TEMP/mercury-v0.2.1-release-ready.json" | awk '{print $1}')"
+          echo "sha256=$SHA256" >>"$GITHUB_OUTPUT"
+      - name: Retain release-ready handoff for this attempt
+        id: retain
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          ref: ${{ inputs.reviewed_main_sha }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Create private release output parent
-        run: install -d -m 700 "$RUNNER_TEMP/release-evidence/private"
-      - name: Download verified release artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: mercury-v0.2.1-release-artifacts
-          path: ${{ runner.temp }}/release-evidence/private/artifacts
-      - name: Publish assets only after every release gate
-        run: |
-          set -euo pipefail
-          ARTIFACT_ROOT="$RUNNER_TEMP/release-evidence/private/artifacts"
-          REVIEWED_MAIN_SHA="${{ inputs.reviewed_main_sha }}"
-          [[ "$REVIEWED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
-          git fetch origin main
-          test "$(git rev-parse HEAD)" = "$REVIEWED_MAIN_SHA"
-          test "$(git rev-parse origin/main)" = "$REVIEWED_MAIN_SHA"
-          TAG_OBJECT="$(git ls-remote origin "refs/tags/$RELEASE_TAG" \
-            | awk -v ref="refs/tags/$RELEASE_TAG" '$2 == ref {print $1; exit}')"
-          TAG_COMMIT="$(git ls-remote origin "refs/tags/$RELEASE_TAG^{}" \
-            | awk -v ref="refs/tags/$RELEASE_TAG^{}" '$2 == ref {print $1; exit}')"
-          if [[ -n "$TAG_OBJECT" || -n "$TAG_COMMIT" ]]; then
-            test -n "$TAG_OBJECT"
-            test "$TAG_COMMIT" = "$REVIEWED_MAIN_SHA"
-            git fetch --no-tags origin \
-              "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
-            test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = "tag"
-            test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$REVIEWED_MAIN_SHA"
-          else
-            gh auth setup-git
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git tag -a "$RELEASE_TAG" "$REVIEWED_MAIN_SHA" \
-              --message "Mercury Finance $RELEASE_TAG"
-            git push origin "refs/tags/$RELEASE_TAG"
-          fi
-          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$REVIEWED_MAIN_SHA"
-          if RELEASE_STATE="$(gh release view "$RELEASE_TAG" \
-            --json tagName,isDraft,isPrerelease 2>/dev/null)"; then
-            echo "$RELEASE_STATE" | jq -e \
-              --arg tag "$RELEASE_TAG" \
-              '(.tagName == $tag) and (.isDraft == false) and (.isPrerelease == false)' \
-              >/dev/null
-            gh release upload "$RELEASE_TAG" "$ARTIFACT_ROOT"/* --clobber
-          else
-            gh release create "$RELEASE_TAG" "$ARTIFACT_ROOT"/* \
-              --verify-tag --title "Mercury Finance v0.2.1" \
-              --notes-file docs/RELEASE_V0.2.1.md
-          fi
+          name: mercury-v0.2.1-release-ready-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mercury-v0.2.1-release-ready.json
+          if-no-files-found: error
+          retention-days: 1

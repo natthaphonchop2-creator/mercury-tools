@@ -74,8 +74,8 @@ class RenderReleaseError(RuntimeError):
 class McpReleaseEvidence:
     server_name: str
     tools: tuple[dict[str, object], ...]
-    search: dict[str, object]
-    context: dict[str, object]
+    searches: dict[str, dict[str, object]]
+    contexts: dict[str, dict[str, object]]
 
 
 @dataclass(frozen=True)
@@ -131,7 +131,11 @@ def _contains_credential_schema(value: object) -> bool:
     return bool(pending)
 
 
-def _has_citation(payload: object, result_field: str) -> bool:
+def _has_connector_validation_citations(
+    payload: object,
+    result_field: str,
+    connector: str,
+) -> bool:
     if not isinstance(payload, dict) or payload.get("status") != "ok":
         return False
     rows = payload.get(result_field)
@@ -142,6 +146,10 @@ def _has_citation(payload: object, result_field: str) -> bool:
             isinstance(row, dict)
             and isinstance(row.get("citation"), dict)
             and row["citation"]
+            and isinstance(row.get("metadata"), dict)
+            and row["metadata"].get("connector") == connector
+            and row["metadata"].get("doc_type") == "endpoint_validation"
+            and row["metadata"].get("review_status") == "reviewed"
             for row in rows
         )
     )
@@ -203,10 +211,21 @@ def verify_render_release(
     for tool in mcp.tools:
         if _contains_credential_schema(tool.get("inputSchema")):
             raise RenderReleaseError("public_credential_surface")
-    if not _has_citation(mcp.search, "results"):
-        raise RenderReleaseError("rag_search_citation_missing")
-    if not _has_citation(mcp.context, "context"):
-        raise RenderReleaseError("rag_context_citation_missing")
+    for collection_name, collection, result_field in (
+        ("searches", mcp.searches, "results"),
+        ("contexts", mcp.contexts, "context"),
+    ):
+        if set(collection) != {"flowaccount", "peak"}:
+            raise RenderReleaseError(f"rag_{collection_name}_inventory_invalid")
+        for connector in ("flowaccount", "peak"):
+            if not _has_connector_validation_citations(
+                collection[connector],
+                result_field,
+                connector,
+            ):
+                raise RenderReleaseError(
+                    f"rag_{collection_name}_{connector}_citation_missing"
+                )
 
     try:
         logs_clean = probe.scan_logs()
@@ -304,31 +323,47 @@ class LiveRenderProbe:
             async with ClientSession(read_stream, write_stream) as session:
                 initialized = await session.initialize()
                 listed = await session.list_tools()
-                search = await session.call_tool(
-                    "search_knowledge",
-                    {
-                        "query": "FlowAccount invoice accounting validation",
-                        "filters": {"connector": "flowaccount"},
-                        "top_k": 5,
-                    },
-                )
-                context = await session.call_tool(
-                    "retrieve_context_pack",
-                    {
-                        "query": "FlowAccount invoice accounting validation",
-                        "task": "release verification",
-                        "filters": {"connector": "flowaccount"},
-                        "max_chunks": 5,
-                    },
-                )
+                searches: dict[str, dict[str, object]] = {}
+                contexts: dict[str, dict[str, object]] = {}
+                for connector, label in (
+                    ("flowaccount", "FlowAccount"),
+                    ("peak", "PEAK"),
+                ):
+                    search = await session.call_tool(
+                        "search_knowledge",
+                        {
+                            "query": f"{label} invoice accounting validation",
+                            "filters": {
+                                "connector": connector,
+                                "doc_type": "endpoint_validation",
+                                "review_status": "reviewed",
+                            },
+                            "top_k": 5,
+                        },
+                    )
+                    context = await session.call_tool(
+                        "retrieve_context_pack",
+                        {
+                            "query": f"{label} invoice accounting validation",
+                            "task": "release verification",
+                            "filters": {
+                                "connector": connector,
+                                "doc_type": "endpoint_validation",
+                                "review_status": "reviewed",
+                            },
+                            "max_chunks": 5,
+                        },
+                    )
+                    searches[connector] = _result_payload(search)
+                    contexts[connector] = _result_payload(context)
         return McpReleaseEvidence(
             server_name=initialized.serverInfo.name,
             tools=tuple(
                 {"name": tool.name, "inputSchema": tool.inputSchema}
                 for tool in listed.tools
             ),
-            search=_result_payload(search),
-            context=_result_payload(context),
+            searches=searches,
+            contexts=contexts,
         )
 
     def scan_logs(self) -> bool:

@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Pinned entrypoint for the standalone Mercury release-control inspector."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import stat
+import sys
+import types
+from pathlib import Path
+
+_CORE_SHA256 = "dc8b7667154dcaf812693f7bab1253d9f945fbc0c93d7afa9a5902fd6a9d40a9"
+
+
+def _load_pinned_core() -> types.ModuleType:
+    core_path = Path(__file__).resolve().parents[1] / "scripts" / "inspector_core.py"
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(core_path, flags)
+    except OSError as exc:
+        raise RuntimeError("inspector_core_unavailable") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or metadata.st_size <= 0
+            or metadata.st_size > 4 * 1024 * 1024
+        ):
+            raise RuntimeError("inspector_core_permissions_invalid")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            source = handle.read()
+        if hashlib.sha256(source).hexdigest() != _CORE_SHA256:
+            raise RuntimeError("inspector_core_digest_mismatch")
+    finally:
+        os.close(descriptor)
+    module = types.ModuleType("inspector_core")
+    module.__file__ = str(core_path)
+    sys.modules["inspector_core"] = module
+    exec(compile(source, str(core_path), "exec"), module.__dict__)
+    return module
+
+
+def main() -> int:
+    try:
+        return _load_pinned_core().main()
+    except RuntimeError as exc:
+        print(f"release-control inspector failed: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

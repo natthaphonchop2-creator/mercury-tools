@@ -14,6 +14,8 @@ htmlcov/
 .superpowers/
 .mercury/
 release-evidence/
+supabase/.temp/
+supabase/.branches/
 .mercury/credentials.env
 .mercury/cache/
 .mercury/audit/

@@ -1,0 +1,287 @@
+name: Mercury v0.2.1 trusted hosted attestation
+
+on:
+  workflow_dispatch:
+    inputs:
+      reviewed_commit_sha:
+        description: Exact reviewed mercury-tools commit
+        required: true
+        type: string
+      staging_ref:
+        description: Immutable history-free staging ref
+        required: true
+        type: string
+      public_surface_manifest_sha256:
+        description: Expected candidate public-surface manifest SHA-256
+        required: true
+        type: string
+      secret_scan_allowlist_sha256:
+        description: Expected candidate secret-scan allowlist SHA-256
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  remote-preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: production-release
+    outputs:
+      artifact_id: ${{ steps.retain.outputs.artifact-id }}
+      artifact_digest: ${{ steps.retain.outputs.artifact-digest }}
+    steps:
+      - name: Checkout exact release-control implementation
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Bind protected branch and exact implementation
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+      - name: Verify remote environment and branch protections
+        env:
+          RELEASE_CONTROL_PREFLIGHT_TOKEN: ${{ secrets.RELEASE_CONTROL_PREFLIGHT_TOKEN }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$RUNNER_TEMP/release-control-preflight"
+          python3 scripts/verify_remote_preflight.py \
+            --policy policy-v0.2.1.json \
+            --output "$RUNNER_TEMP/release-control-preflight/preflight.json"
+      - name: Retain exact preflight receipt for this attempt
+        id: retain
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mercury-v0.2.1-preflight-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-control-preflight/preflight.json
+          if-no-files-found: error
+          retention-days: 1
+
+  trusted-attestation:
+    needs: remote-preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment: production-release
+    outputs:
+      artifact_id: ${{ steps.retain.outputs.artifact-id }}
+      artifact_digest: ${{ steps.retain.outputs.artifact-digest }}
+      payload_sha256: ${{ steps.payload.outputs.sha256 }}
+    steps:
+      - name: Checkout exact release-control implementation
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download exact preflight receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.remote-preflight.outputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/release-control-preflight
+      - name: Bind policy target identity before protected input reads
+        id: target
+        env:
+          CONFIGURED_TARGET_REPOSITORY: ${{ vars.TARGET_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          POLICY_TARGET_REPOSITORY="$(jq -er '.reviewed_repository | strings' policy-v0.2.1.json)"
+          POLICY_TARGET_REPOSITORY_ID="$(jq -er '.reviewed_repository_id | numbers | select(. > 0)' policy-v0.2.1.json)"
+          test "$CONFIGURED_TARGET_REPOSITORY" = "$POLICY_TARGET_REPOSITORY"
+          TARGET_METADATA="$(curl --fail --location --silent --show-error \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/$POLICY_TARGET_REPOSITORY")"
+          jq -en \
+            --arg repository "$POLICY_TARGET_REPOSITORY" \
+            --argjson repository_id "$POLICY_TARGET_REPOSITORY_ID" \
+            --argjson observed "$TARGET_METADATA" \
+            '$observed.full_name == $repository and $observed.id == $repository_id' >/dev/null
+          printf 'repository=%s\n' "$POLICY_TARGET_REPOSITORY" >>"$GITHUB_OUTPUT"
+          printf 'repository_id=%s\n' "$POLICY_TARGET_REPOSITORY_ID" >>"$GITHUB_OUTPUT"
+      - name: Download candidate inputs as untrusted data only
+        env:
+          EXPECTED_ALLOWLIST_SHA256: ${{ inputs.secret_scan_allowlist_sha256 }}
+          EXPECTED_MANIFEST_SHA256: ${{ inputs.public_surface_manifest_sha256 }}
+          GH_TOKEN: ${{ secrets.MERCURY_TARGET_REPOSITORY_READ_TOKEN }}
+          REVIEWED_SHA: ${{ inputs.reviewed_commit_sha }}
+          STAGING_REPOSITORY: ${{ vars.STAGING_REPOSITORY }}
+          TARGET_REPOSITORY: ${{ steps.target.outputs.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$REVIEWED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_ALLOWLIST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          jq -e \
+            --arg target "$TARGET_REPOSITORY" \
+            --arg staging "$STAGING_REPOSITORY" \
+            '(.reviewed_repository == $target) and (.staging_repository == $staging)' \
+            policy-v0.2.1.json >/dev/null
+          INPUT_ROOT="$RUNNER_TEMP/release-control-inputs"
+          install -d -m 700 "$INPUT_ROOT"
+          gh api \
+            -H "Accept: application/vnd.github.raw+json" \
+            "repos/$TARGET_REPOSITORY/contents/docs/release/public-surface-manifest.json?ref=$REVIEWED_SHA" \
+            >"$INPUT_ROOT/public-surface-manifest.json"
+          gh api \
+            -H "Accept: application/vnd.github.raw+json" \
+            "repos/$TARGET_REPOSITORY/contents/docs/release/secret-scan-allowlist.json?ref=$REVIEWED_SHA" \
+            >"$INPUT_ROOT/secret-scan-allowlist.json"
+          printf '%s  %s\n' "$EXPECTED_MANIFEST_SHA256" \
+            "$INPUT_ROOT/public-surface-manifest.json" | sha256sum --check
+          printf '%s  %s\n' "$EXPECTED_ALLOWLIST_SHA256" \
+            "$INPUT_ROOT/secret-scan-allowlist.json" | sha256sum --check
+      - name: Install checksum-verified inspector prerequisites
+        env:
+          GITLEAKS_URL: https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz
+          GITLEAKS_SHA256: 9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c
+          TRUFFLEHOG_URL: https://github.com/trufflesecurity/trufflehog/releases/download/v3.88.32/trufflehog_3.88.32_linux_amd64.tar.gz
+          TRUFFLEHOG_SHA256: cddd1f602da61a130580883f4dd96b3d206efaf55a22068321cc11237fbc88cd
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "x86_64"
+          test "$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:2])))')" = "3.12"
+          INSTALL_ROOT="$RUNNER_TEMP/release-control-inspector-tools"
+          SCANNER_ROOT="$INSTALL_ROOT/scanners"
+          SCANNER_BIN="$SCANNER_ROOT/bin"
+          INSPECTOR_VENV="$INSTALL_ROOT/venv"
+          GIT_BIN=/usr/bin/git
+          test -x "$GIT_BIN"
+          install -d -m 700 "$SCANNER_ROOT" "$SCANNER_BIN"
+          curl --fail --location --silent --show-error "$GITLEAKS_URL" \
+            --output "$SCANNER_ROOT/gitleaks.tar.gz"
+          printf '%s  %s\n' "$GITLEAKS_SHA256" "$SCANNER_ROOT/gitleaks.tar.gz" \
+            | sha256sum --check
+          curl --fail --location --silent --show-error "$TRUFFLEHOG_URL" \
+            --output "$SCANNER_ROOT/trufflehog.tar.gz"
+          printf '%s  %s\n' "$TRUFFLEHOG_SHA256" "$SCANNER_ROOT/trufflehog.tar.gz" \
+            | sha256sum --check
+          tar --extract --gzip --file "$SCANNER_ROOT/gitleaks.tar.gz" \
+            --directory "$SCANNER_BIN" gitleaks
+          tar --extract --gzip --file "$SCANNER_ROOT/trufflehog.tar.gz" \
+            --directory "$SCANNER_BIN" trufflehog
+          chmod 0555 "$SCANNER_BIN/gitleaks" "$SCANNER_BIN/trufflehog"
+          python3 -m venv "$INSPECTOR_VENV"
+          "$INSPECTOR_VENV/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --isolated \
+            --no-cache-dir \
+            --no-deps \
+            --only-binary=:all: \
+            --require-hashes \
+            --requirement requirements-inspector.txt
+          "$INSPECTOR_VENV/bin/python" -c \
+            'import psycopg; assert psycopg.__version__ == "3.2.10"; assert psycopg.pq.__impl__ == "binary"'
+          printf '%s\n' "INSPECTOR_GIT=$GIT_BIN" >>"$GITHUB_ENV"
+          printf '%s\n' "INSPECTOR_GITLEAKS=$SCANNER_BIN/gitleaks" >>"$GITHUB_ENV"
+          printf '%s\n' "INSPECTOR_TRUFFLEHOG=$SCANNER_BIN/trufflehog" >>"$GITHUB_ENV"
+          printf '%s\n' "INSPECTOR_PYTHON=$INSPECTOR_VENV/bin/python" >>"$GITHUB_ENV"
+      - name: Run separately pinned trusted inspector
+        env:
+          FLOWACCOUNT_SANDBOX_BASE_URL: ${{ vars.FLOWACCOUNT_SANDBOX_BASE_URL }}
+          FLOWACCOUNT_SANDBOX_CLIENT_ID: ${{ secrets.FLOWACCOUNT_SANDBOX_CLIENT_ID }}
+          FLOWACCOUNT_SANDBOX_CLIENT_SECRET: ${{ secrets.FLOWACCOUNT_SANDBOX_CLIENT_SECRET }}
+          MERCURY_MARKETPLACE_SNAPSHOT_URL: ${{ vars.MERCURY_MARKETPLACE_SNAPSHOT_URL }}
+          MERCURY_PUBLIC_MCP_TOKEN: ${{ secrets.MERCURY_PUBLIC_MCP_TOKEN }}
+          MERCURY_PUBLIC_MCP_URL: ${{ vars.MERCURY_PUBLIC_MCP_URL }}
+          MERCURY_STAGING_REPOSITORY_TOKEN: ${{ secrets.MERCURY_STAGING_REPOSITORY_TOKEN }}
+          MERCURY_TARGET_REPOSITORY_READ_TOKEN: ${{ secrets.MERCURY_TARGET_REPOSITORY_READ_TOKEN }}
+          RENDER_API_TOKEN: ${{ secrets.RENDER_API_TOKEN }}
+          RENDER_API_URL: ${{ vars.RENDER_API_URL }}
+          RENDER_SERVICE_ID: ${{ vars.RENDER_SERVICE_ID }}
+          REVIEWED_SHA: ${{ inputs.reviewed_commit_sha }}
+          STAGING_REF: ${{ inputs.staging_ref }}
+          STAGING_REPOSITORY: ${{ vars.STAGING_REPOSITORY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          TARGET_REPOSITORY: ${{ steps.target.outputs.repository }}
+        run: |
+          set -euo pipefail
+          EVIDENCE_ROOT="$RUNNER_TEMP/release-control-evidence"
+          install -d -m 700 "$EVIDENCE_ROOT"
+          "$INSPECTOR_PYTHON" scripts/run_pinned_inspector.py \
+            --root . \
+            --policy policy-v0.2.1.json \
+            --reviewed-sha "$REVIEWED_SHA" \
+            --staging-ref "$STAGING_REF" \
+            --manifest "$RUNNER_TEMP/release-control-inputs/public-surface-manifest.json" \
+            --allowlist "$RUNNER_TEMP/release-control-inputs/secret-scan-allowlist.json" \
+            --output "$EVIDENCE_ROOT/hosted-evidence-v1.json"
+      - name: Assemble strict sanitized attestation
+        env:
+          REVIEWED_SHA: ${{ inputs.reviewed_commit_sha }}
+          STAGING_REF: ${{ inputs.staging_ref }}
+        run: |
+          set -euo pipefail
+          OUTPUT_ROOT="$RUNNER_TEMP/release-control-output"
+          install -d -m 700 "$OUTPUT_ROOT"
+          python3 scripts/assemble_trusted_attestation.py \
+            --evidence "$RUNNER_TEMP/release-control-evidence/hosted-evidence-v1.json" \
+            --preflight "$RUNNER_TEMP/release-control-preflight/preflight.json" \
+            --policy policy-v0.2.1.json \
+            --producer-repository "$GITHUB_REPOSITORY" \
+            --producer-sha "$GITHUB_SHA" \
+            --producer-run-id "$GITHUB_RUN_ID" \
+            --producer-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --staging-ref "$STAGING_REF" \
+            --manifest "$RUNNER_TEMP/release-control-inputs/public-surface-manifest.json" \
+            --allowlist "$RUNNER_TEMP/release-control-inputs/secret-scan-allowlist.json" \
+            --output "$OUTPUT_ROOT/trusted-hosted-attestation.json"
+      - name: Record exact payload digest
+        id: payload
+        run: |
+          set -euo pipefail
+          SHA256="$(sha256sum "$RUNNER_TEMP/release-control-output/trusted-hosted-attestation.json" | awk '{print $1}')"
+          echo "sha256=$SHA256" >>"$GITHUB_OUTPUT"
+      - name: Retain trusted attestation for this attempt
+        id: retain
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mercury-v0.2.1-trusted-attestation-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-control-output/trusted-hosted-attestation.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Dispatch secretless Mercury release verification
+        env:
+          ARTIFACT_DIGEST: ${{ steps.retain.outputs.artifact-digest }}
+          ARTIFACT_ID: ${{ steps.retain.outputs.artifact-id }}
+          GH_TOKEN: ${{ secrets.MERCURY_TARGET_WORKFLOW_DISPATCH_TOKEN }}
+          PAYLOAD_SHA256: ${{ steps.payload.outputs.sha256 }}
+          REVIEWED_SHA: ${{ inputs.reviewed_commit_sha }}
+          STAGING_REF: ${{ inputs.staging_ref }}
+          STAGING_REPOSITORY: ${{ vars.STAGING_REPOSITORY }}
+          TARGET_REPOSITORY: ${{ steps.target.outputs.repository }}
+        run: |
+          set -euo pipefail
+          ATTESTATION="$RUNNER_TEMP/release-control-output/trusted-hosted-attestation.json"
+          ATTESTATION_B64="$(base64 --wrap=0 "$ATTESTATION")"
+          test -n "$ATTESTATION_B64"
+          test "${#ATTESTATION_B64}" -le 60000
+          jq -n \
+            --arg ref "main" \
+            --arg reviewed_main_sha "$REVIEWED_SHA" \
+            --arg staging_repo "$STAGING_REPOSITORY" \
+            --arg staging_ref "$STAGING_REF" \
+            --arg control_run_id "$GITHUB_RUN_ID" \
+            --arg control_run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg control_artifact_id "$ARTIFACT_ID" \
+            --arg control_artifact_digest "$ARTIFACT_DIGEST" \
+            --arg control_payload_sha256 "$PAYLOAD_SHA256" \
+            --arg control_repository_id "$GITHUB_REPOSITORY_ID" \
+            --arg control_attestation_b64 "$ATTESTATION_B64" \
+            '{ref: $ref, inputs: {reviewed_main_sha: $reviewed_main_sha,
+              staging_repo: $staging_repo, staging_ref: $staging_ref,
+              release_control_run_id: $control_run_id,
+              release_control_run_attempt: $control_run_attempt,
+              release_control_attestation_artifact_id: $control_artifact_id,
+              release_control_attestation_artifact_digest: $control_artifact_digest,
+              release_control_attestation_payload_sha256: $control_payload_sha256,
+              release_control_repository_id: $control_repository_id,
+              release_control_attestation_b64: $control_attestation_b64}}' \
+            | gh api --method POST \
+              "repos/$TARGET_REPOSITORY/actions/workflows/release.yml/dispatches" \
+              --input - >/dev/null

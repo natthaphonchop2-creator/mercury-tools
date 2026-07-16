@@ -1,0 +1,5 @@
+# Ubuntu 24.04 x86_64 / CPython 3.12 wheels only; installed with --require-hashes.
+psycopg==3.2.10 \
+    --hash=sha256:ab5caf09a9ec42e314a21f5216dbcceac528e0e05142e42eea83a3b28b320ac3
+psycopg-binary==3.2.10 \
+    --hash=sha256:14bcbcac0cab465d88b2581e43ec01af4b01c9833e663f1352e05cb41be19e44
