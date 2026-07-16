@@ -289,6 +289,17 @@ def test_publisher_cli_and_workflow_use_secret_hygiene(
     assert "SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" in workflow
     assert "uv run python scripts/publish_catalog.py --path catalog/global" in workflow
     assert "test-service-role-key" not in workflow
-    triggers = yaml.load(workflow, Loader=yaml.BaseLoader)["on"]
+    workflow_payload = yaml.load(workflow, Loader=yaml.BaseLoader)
+    assert workflow_payload["jobs"]["publish"]["environment"] == "production-data"
+    triggers = workflow_payload["on"]
     assert "workflow_dispatch" in triggers
     assert triggers["push"]["branches"] == ["main"]
+
+
+def test_wiki_ingest_workflow_uses_production_data_environment() -> None:
+    workflow = Path(".github/workflows/ingest-wiki.yml").read_text()
+    workflow_payload = yaml.load(workflow, Loader=yaml.BaseLoader)
+
+    assert workflow_payload["jobs"]["ingest"]["environment"] == "production-data"
+    assert "SUPABASE_URL: ${{ secrets.SUPABASE_URL }}" in workflow
+    assert "SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" in workflow
