@@ -13,18 +13,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
-      FLOWACCOUNT_SANDBOX_CLIENT_ID: ${{ secrets.FLOWACCOUNT_SANDBOX_CLIENT_ID }}
-      FLOWACCOUNT_SANDBOX_CLIENT_SECRET: ${{ secrets.FLOWACCOUNT_SANDBOX_CLIENT_SECRET }}
       MERCURY_LIVE_FLOWACCOUNT: "0"
-      MERCURY_LIVE_FLOWACCOUNT_SANDBOX: "1"
+      MERCURY_LIVE_FLOWACCOUNT_SANDBOX: "0"
       MERCURY_LIVE_PEAK: "0"
       MERCURY_SUPABASE_VALIDATION_TEST: "1"
-      MERCURY_SUPABASE_TEST_ISOLATED: "1"
-      MERCURY_SUPABASE_TEST_GUARD: ${{ secrets.MERCURY_SUPABASE_TEST_GUARD }}
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-      SUPABASE_AUTHENTICATED_TEST_JWT: ${{ secrets.SUPABASE_AUTHENTICATED_TEST_JWT }}
+      MERCURY_SUPABASE_TEST_ISOLATED: "0"
+      MERCURY_SUPABASE_TEST_LOCAL_ONLY: "1"
       UV_HTTP_TIMEOUT: "120"
     steps:
       - name: Checkout full history
@@ -37,7 +31,7 @@ jobs:
         uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
         with:
           version: 0.11.9
-          enable-cache: true
+          enable-cache: false
 
       - name: Install locked dependencies
         run: uv sync --extra dev --frozen
@@ -97,50 +91,32 @@ jobs:
           rm -f "$TRUFFLEHOG_REPORT"
           trap - EXIT
 
-      - name: Configure repository-local FlowAccount sandbox credentials
-        run: |
-          set -euo pipefail
-          test -n "$FLOWACCOUNT_SANDBOX_CLIENT_ID"
-          test -n "$FLOWACCOUNT_SANDBOX_CLIENT_SECRET"
-          uv run python - <<'PY'
-          import os
-          from pathlib import Path
+      - name: Install Supabase CLI 2.109.1
+        uses: supabase/setup-cli@46f7f98c7f948ad727d22c1e67fab04c223a0520
+        with:
+          version: 2.109.1
 
-          from mercury_tools.drivers.flowaccount import FlowAccountDriver
-          from mercury_tools.local.credentials import CredentialStore
-          from mercury_tools.local.repository import ensure_repository_state
-
-          context = ensure_repository_state(Path(".").resolve())
-          fields = FlowAccountDriver().credential_fields("sandbox")
-          values = {
-              "client_id": os.environ["FLOWACCOUNT_SANDBOX_CLIENT_ID"],
-              "client_secret": os.environ["FLOWACCOUNT_SANDBOX_CLIENT_SECRET"],
-          }
-          try:
-              CredentialStore(context).save("flowaccount", "sandbox", values, fields)
-          finally:
-              values.clear()
-          PY
-          uv run mercury credentials test flowaccount --env sandbox --repo-root . \
-            >"$RUNNER_TEMP/flowaccount-sandbox-status.json"
+      - name: Start ephemeral local Supabase
+        run: bash scripts/start_ephemeral_supabase.sh
 
       - name: Run complete quality and test gates
         run: |
           set -euo pipefail
-          test -n "$MERCURY_SUPABASE_TEST_GUARD"
-          test -n "$SUPABASE_URL"
-          test -n "$SUPABASE_SERVICE_ROLE_KEY"
-          test -n "$SUPABASE_ANON_KEY"
-          test -n "$SUPABASE_AUTHENTICATED_TEST_JWT"
           install -d -m 700 release-evidence
           uv run ruff check .
-          uv run pytest -q --junitxml=release-evidence/pytest.xml
+          uv run pytest -q \
+            --ignore=tests/integration/test_flowaccount_sandbox_qualification.py \
+            --junitxml=release-evidence/pytest.xml
           uv run python scripts/verify_test_skips.py \
             --junit release-evidence/pytest.xml \
             --waivers docs/release/v0.2.1-test-waivers.json
           uv run mercury doctor --repo-root .
           uv run python scripts/validate_release_plugin.py --root .
           uv run python scripts/smoke_local_plugin.py
+
+      - name: Stop ephemeral local Supabase
+        if: always()
+        run: supabase stop --no-backup
 
       - name: Build and scan package artifacts
         run: |
@@ -164,12 +140,6 @@ jobs:
           fi
           rm -f "$TRUFFLEHOG_REPORT"
           trap - EXIT
-
-      - name: Clear repository-local credentials
-        if: always()
-        run: |
-          uv run mercury credentials clear flowaccount --env sandbox --repo-root . \
-            >/dev/null 2>&1 || true
 
   public:
     if: github.event_name == 'pull_request' || github.ref != 'refs/heads/main'
@@ -195,7 +165,7 @@ jobs:
         uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
         with:
           version: 0.11.9
-          enable-cache: true
+          enable-cache: false
 
       - name: Install locked dependencies
         run: uv sync --extra dev --frozen

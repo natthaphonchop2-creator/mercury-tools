@@ -45,31 +45,47 @@ values required by the hosted metadata surface:
 ```text
 SUPABASE_URL
 SUPABASE_SERVICE_ROLE_KEY
-MERCURY_DEPLOYMENT_COMMIT=<40-character-lowercase-reviewed-git-commit>
 MERCURY_TOOLS_PUBLIC_BASE_URL=https://mercury-tools-mcp.onrender.com
 MERCURY_TOOLS_EMBEDDING_PROVIDER=hash
 MERCURY_TOOLS_HTTP_REQUIRE_AUTH=false
 MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API=false
 ```
 
-`MERCURY_DEPLOYMENT_COMMIT` is a deployment setting, not a value inferred from
-the filesystem, a mutable branch, or process state. Set it to the exact reviewed
-commit deployed by Render. Do not add FlowAccount, PEAK, or imported ERP
-credentials to the Render environment.
+Render supplies `RENDER_GIT_COMMIT`; `/api/status` uses that native exact commit
+when `MERCURY_DEPLOYMENT_COMMIT` is unset or empty.
+`MERCURY_DEPLOYMENT_COMMIT` is an optional explicit override for non-Render
+deployments. A nonempty override always takes
+precedence, and an invalid override fails closed instead of falling through to
+`RENDER_GIT_COMMIT`. Both values must be a lowercase 40-character Git SHA.
+Neither value is inferred from the filesystem or a mutable branch. Do not add
+FlowAccount, PEAK, or imported ERP credentials to the Render environment.
 
 ## Catalog And RAG Ingestion
 
-With Supabase settings available only to the operator process:
+With Supabase settings available only to the operator process, ingest the
+curated wiki and publish only a complete reviewed validation report:
 
 ```bash
 uv run mercury ingest wiki --path ./wiki
+uv run python scripts/review_validation_knowledge.py \
+  --input release-evidence/flowaccount-qualification.json \
+  --input release-evidence/peak-contract-validation.json \
+  --reviewer-role release_reviewer \
+  --output release-evidence/approved-validation.json
+uv run python scripts/publish_validation_knowledge.py \
+  --input release-evidence/approved-validation.json \
+  --reviewer-role release_reviewer \
+  --ingest-rag
 uv run mercury search "FlowAccount invoice endpoint" --json
 uv run mercury search "PEAK invoice endpoint" --json
 ```
 
 Results must preserve connector routing and include citations. Published
 validation rows must already be reviewed and sanitized; raw provider traffic is
-not an ingestion input.
+not an ingestion input. Release-control independently requires exactly 190
+FlowAccount and 64 PEAK approved validation identities, one reviewed validation
+document and chunk per identity, and connector-bound cited retrieval through the
+hosted MCP for both providers.
 
 ## Release Verification
 

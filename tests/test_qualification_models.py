@@ -65,6 +65,21 @@ def test_validation_knowledge_rejects_unknown_fields():
         valid_record(raw_response={"status": "ok"})
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("opaque_evidence_id", "unsafe evidence"),
+        ("run_id", "unsafe/run"),
+        ("action_id", "unsafe action"),
+        ("version_id", "unsafe/version"),
+        ("connector_id", "unsafe connector"),
+    ],
+)
+def test_validation_knowledge_rejects_unsafe_identifiers_for_internal_records(field, value):
+    with pytest.raises(ValidationError):
+        valid_record(**{field: value})
+
+
 @pytest.mark.parametrize("field", ["summary_th", "summary_en", "recommended_next_step"])
 def test_validation_knowledge_rejects_secret_literals(field):
     with pytest.raises((ValueError, ValidationError), match="catalog_credentials_unsafe"):
@@ -86,6 +101,32 @@ def test_validation_knowledge_rejects_credential_bearing_paths():
 def test_public_approval_requires_controlled_status_summaries(field, summary):
     with pytest.raises(ValidationError, match="approved_public_summary_not_controlled"):
         valid_record(approved_public=True, **{field: summary})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("opaque_evidence_id", "public_evidence_alpha"),
+        ("run_id", "validation_run_alpha"),
+        ("opaque_evidence_id", "ev_" + "I" * 26),
+        ("run_id", "run_" + "O" * 26),
+    ],
+)
+def test_public_approval_requires_canonical_internal_identifiers(field, value):
+    with pytest.raises(ValidationError, match="approved_public_identifier_invalid"):
+        valid_record(approved_public=True, **{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("opaque_evidence_id", "ev_" + "\u212a" * 26),
+        ("run_id", "run_" + "\u017f" * 26),
+    ],
+)
+def test_validation_knowledge_rejects_unicode_identifier_confusables(field, value):
+    with pytest.raises(ValidationError):
+        valid_record(approved_public=True, **{field: value})
 
 
 @pytest.mark.parametrize(

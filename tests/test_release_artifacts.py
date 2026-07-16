@@ -959,31 +959,11 @@ def test_release_git_bootstrap_ignores_local_replace_refs(
     assert (output / "SHA256SUMS.json").is_file()
 
 
-def test_release_task13_gate_uses_trusted_git_for_real_scanner_commands(
+def test_release_task13_gate_consumes_only_strict_sanitized_attestations(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = make_release_tree(tmp_path)
-    remote = tmp_path / "gate-remote.git"
-    _run(["git", "clone", "--bare", str(root), str(remote)], cwd=tmp_path)
-    foreign_parent = tmp_path / "foreign-parent"
-    foreign_parent.mkdir()
-    foreign = make_release_tree(foreign_parent)
-    fake_bin = tmp_path / "fake-bin"
-    fake_bin.mkdir()
-    marker = tmp_path / "fake-git-ran"
-    fake_git = fake_bin / "git"
-    fake_git.write_text(
-        f"#!/bin/sh\nprintf '%s' fake > '{marker}'\nexit 97\n",
-        encoding="utf-8",
-    )
-    fake_git.chmod(0o755)
-    _write_release_gate_fake_scanners(fake_bin)
-    poison_config = tmp_path / "poison.gitconfig"
-    poison_config.write_text("[core]\nrepositoryformatversion = 0\n", encoding="utf-8")
-    poison_template = tmp_path / "poison-template"
-    poison_template.mkdir()
-
     candidate = release_artifacts.load_release_candidate(
         root,
         version=VERSION,
@@ -991,37 +971,108 @@ def test_release_task13_gate_uses_trusted_git_for_real_scanner_commands(
     )
     gate_candidate = replace(
         candidate,
-        origin_url=str(remote),
+        origin_url="https://github.com/example/mercury-tools.git",
         repository_name="example/mercury-tools",
     )
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    _write_release_gate_fake_scanners(fake_bin)
+    attestation_path = tmp_path / "trusted-hosted-attestation.json"
+    attestation_path.write_text("sanitized fixture", encoding="utf-8")
+    trusted_surfaces = {
+        surface.surface: surface
+        for surface in passing_task13_report().surfaces
+        if surface.surface != "wheel_sdist_plugin_source_archives"
+    }
+    captured: dict[str, object] = {}
+
+    class TrustedBundle:
+        def surface_map(self) -> dict[str, SurfaceAttestation]:
+            return trusted_surfaces
+
+    def load_attestation(path: Path, **kwargs: object) -> TrustedBundle:
+        captured["attestation_path"] = path
+        captured["loader"] = kwargs
+        return TrustedBundle()
+
+    def scan(
+        request: object,
+        **kwargs: object,
+    ) -> SecretScanReport:
+        captured["request"] = request
+        captured["scan"] = kwargs
+        return passing_task13_report()
+
+    monkeypatch.setattr(
+        release_artifacts,
+        "load_trusted_hosted_release_attestation",
+        load_attestation,
+    )
+    monkeypatch.setattr(release_artifacts, "scan_public_release", scan)
+    monkeypatch.setenv("PATH", f"{fake_bin}:/usr/bin:/bin")
+    monkeypatch.setenv(
+        "MERCURY_TRUSTED_HOSTED_ATTESTATION",
+        str(attestation_path),
+    )
+    monkeypatch.setenv("MERCURY_TRUSTED_HOSTED_ATTESTATION_SHA256", "a" * 64)
+    monkeypatch.setenv(
+        "MERCURY_RELEASE_CONTROL_REPOSITORY",
+        "example/release-control",
+    )
+    monkeypatch.setenv("MERCURY_RELEASE_CONTROL_SHA", "b" * 40)
+    monkeypatch.setenv("MERCURY_RELEASE_CONTROL_RUN_ID", "123")
+    monkeypatch.setenv("MERCURY_RELEASE_CONTROL_RUN_ATTEMPT", "2")
+    monkeypatch.setenv("MERCURY_RELEASE_STAGING_REPOSITORY", "example/staging")
+    monkeypatch.setenv("MERCURY_RELEASE_STAGING_REF", "v0.2.1-rc1")
+
     with release_artifacts.materialize_release_candidate(candidate) as snapshot:
         artifacts = tmp_path / "gate-artifacts"
         artifacts.mkdir()
         release_artifacts._build_artifact_set(candidate, snapshot, artifacts)
-        monkeypatch.setenv("PATH", f"{fake_bin}:/usr/bin:/bin")
-        monkeypatch.setenv("GIT_DIR", str(foreign / ".git"))
-        monkeypatch.setenv("GIT_WORK_TREE", str(foreign))
-        monkeypatch.setenv("GIT_INDEX_FILE", str(foreign / ".git" / "index"))
-        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(poison_config))
-        monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(poison_config))
-        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-        monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
-        monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(poison_template))
-        monkeypatch.setenv("GIT_TEMPLATE_DIR", str(poison_template))
-        monkeypatch.setenv("GIT_REPLACE_REF_BASE", str(foreign / "replace"))
-        monkeypatch.delenv("GH_TOKEN", raising=False)
-
         report = release_artifacts._run_task13_artifact_gate(
             gate_candidate,
             snapshot,
             artifacts,
         )
 
-    git_surface = next(surface for surface in report.surfaces if surface.surface == "git_all_refs")
-    assert "command_failed:git_clone" not in report.blockers
-    assert not any(code.startswith("command_failed:git_") for code in git_surface.blocker_codes)
-    assert git_surface.exit_codes
-    assert not marker.exists()
+    assert report.passed is True
+    assert captured["attestation_path"] == attestation_path
+    loader = captured["loader"]
+    assert isinstance(loader, dict)
+    assert loader["expected_commit_sha"] == gate_candidate.commit_sha
+    assert loader["expected_producer_run_id"] == 123
+    assert loader["expected_producer_run_attempt"] == 2
+    assert captured["scan"] == {"hosted_attestations": trusted_surfaces}
+
+
+def test_release_task13_gate_fails_closed_without_attestation_context(
+    tmp_path: Path,
+) -> None:
+    root = make_release_tree(tmp_path)
+    candidate = release_artifacts.load_release_candidate(
+        root,
+        version=VERSION,
+        require_clean=True,
+    )
+    gate_candidate = replace(
+        candidate,
+        origin_url="https://github.com/example/mercury-tools.git",
+        repository_name="example/mercury-tools",
+    )
+
+    with release_artifacts.materialize_release_candidate(candidate) as snapshot:
+        artifacts = tmp_path / "gate-artifacts"
+        artifacts.mkdir()
+        release_artifacts._build_artifact_set(candidate, snapshot, artifacts)
+        with pytest.raises(
+            ReleaseGateError,
+            match="^trusted_hosted_attestation_context_missing$",
+        ):
+            release_artifacts._run_task13_artifact_gate(
+                gate_candidate,
+                snapshot,
+                artifacts,
+            )
 
 
 def test_task13_trusted_git_runner_rejects_unallowlisted_executables_and_argv(
@@ -1203,6 +1254,52 @@ def test_release_git_runner_disables_detached_auto_maintenance_for_unbound_commi
         "gc.auto=0",
     )
     assert start < commands[0].index("commit")
+
+
+def test_git_config_reader_uses_git_239_compatible_list_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config"
+    config.write_text("[core]\n\trepositoryformatversion = 0\n", encoding="utf-8")
+    commands: list[tuple[str, ...]] = []
+
+    def capture_command(
+        command: tuple[str, ...],
+        **_kwargs: object,
+    ) -> release_artifacts.CommandResult:
+        commands.append(command)
+        return release_artifacts.CommandResult(
+            exit_code=0,
+            stdout=b"core.repositoryformatversion\n0\0",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(
+        release_artifacts,
+        "_trusted_system_git_executable",
+        lambda: Path("/usr/bin/git"),
+    )
+    monkeypatch.setattr(
+        release_artifacts,
+        "_run_exact_environment_command",
+        capture_command,
+    )
+
+    assert release_artifacts._read_git_config_entries(config) == (
+        ("core.repositoryformatversion", "0"),
+    )
+    assert commands == [
+        (
+            "/usr/bin/git",
+            "--no-pager",
+            "config",
+            "--list",
+            f"--file={config}",
+            "--null",
+            "--no-includes",
+        )
+    ]
 
 
 def test_linked_release_git_runner_rechecks_metadata_after_git_operation(

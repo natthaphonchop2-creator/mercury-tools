@@ -44,7 +44,10 @@ def test_remote_deployment_and_environment_keep_erp_credentials_local() -> None:
     assert "Cloud stores catalog, RAG, and audit metadata only." in deployment
     assert "ERP credentials remain repository-local" in deployment
     assert "MERCURY_DEPLOYMENT_COMMIT=" in example
-    assert "40-character lowercase Git commit" in example
+    assert "RENDER_GIT_COMMIT=" in example
+    assert "optional explicit override" in deployment
+    assert "invalid override fails closed" in deployment
+    assert "Render supplies `RENDER_GIT_COMMIT`" in deployment
     for obsolete in (
         "MERCURY_PRIVATE_MCP_PATH",
         "MERCURY_PRIVATE_MCP_TOKEN",
@@ -83,14 +86,18 @@ def test_release_notes_are_candidate_safe_and_name_every_required_gate() -> None
     for marker in (
         "Gitleaks 8.24.3",
         "TruffleHog 3.88.32",
-        "Supabase migration",
-        "FlowAccount 190-action",
+        "Supabase stack",
+        "FlowAccount exact",
+        "190-action coverage",
         "PEAK 64-action",
         "one `mercury-finance` stdio MCP",
         "19 local tools",
         "20 hosted tools",
         "`/healthz`",
-        "deployment commit",
+        "Render exact commit",
         "post-public",
+        "release-control",
+        "secretless, networkless, read-only candidate container",
+        "exact artifact IDs",
     ):
         assert marker in text

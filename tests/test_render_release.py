@@ -28,12 +28,36 @@ def _tools() -> tuple[dict[str, object], ...]:
 
 
 def _mcp_evidence() -> McpReleaseEvidence:
-    citation = {"source_uri": "mercury://wiki/flowaccount", "heading": "Invoices"}
+    def payload(connector: str, field: str) -> dict[str, object]:
+        citation = {
+            "source_uri": f"mercury://wiki/validation/{connector}/invoice",
+            "heading": "Invoices",
+        }
+        return {
+            "status": "ok",
+            field: [
+                {
+                    "citation": citation,
+                    "metadata": {
+                        "connector": connector,
+                        "doc_type": "endpoint_validation",
+                        "review_status": "reviewed",
+                    },
+                }
+            ],
+        }
+
     return McpReleaseEvidence(
         server_name="Mercury Tools",
         tools=_tools(),
-        search={"status": "ok", "results": [{"citation": citation}]},
-        context={"status": "ok", "context": [{"citation": citation}]},
+        searches={
+            connector: payload(connector, "results")
+            for connector in ("flowaccount", "peak")
+        },
+        contexts={
+            connector: payload(connector, "context")
+            for connector in ("flowaccount", "peak")
+        },
     )
 
 
@@ -125,12 +149,39 @@ def test_render_release_requires_exact_catalog_count() -> None:
         verify_render_release(probe, version=VERSION, commit=COMMIT)
 
 
-@pytest.mark.parametrize("field", ("search", "context"))
-def test_render_release_requires_rag_citations(field: str) -> None:
+@pytest.mark.parametrize(
+    ("collection", "result_field"),
+    (("searches", "results"), ("contexts", "context")),
+)
+@pytest.mark.parametrize("connector", ("flowaccount", "peak"))
+def test_render_release_requires_connector_bound_rag_citations(
+    collection: str,
+    result_field: str,
+    connector: str,
+) -> None:
     probe = FakeProbe()
-    probe.mcp_payload = replace(probe.mcp_payload, **{field: {"status": "ok", field: [{}]}})
+    payloads = dict(getattr(probe.mcp_payload, collection))
+    payloads[connector] = {"status": "ok", result_field: [{}]}
+    probe.mcp_payload = replace(probe.mcp_payload, **{collection: payloads})
 
-    with pytest.raises(RenderReleaseError, match=f"rag_{field}_citation_missing"):
+    with pytest.raises(
+        RenderReleaseError,
+        match=f"rag_{collection}_{connector}_citation_missing",
+    ):
+        verify_render_release(probe, version=VERSION, commit=COMMIT)
+
+
+def test_render_release_rejects_cross_connector_rag_result() -> None:
+    probe = FakeProbe()
+    searches = dict(probe.mcp_payload.searches)
+    peak = dict(searches["peak"])
+    rows = [dict(row) for row in peak["results"]]
+    rows[0]["metadata"] = {**rows[0]["metadata"], "connector": "flowaccount"}
+    peak["results"] = rows
+    searches["peak"] = peak
+    probe.mcp_payload = replace(probe.mcp_payload, searches=searches)
+
+    with pytest.raises(RenderReleaseError, match="rag_searches_peak_citation_missing"):
         verify_render_release(probe, version=VERSION, commit=COMMIT)
 
 

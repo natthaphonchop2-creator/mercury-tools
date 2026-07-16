@@ -68,9 +68,16 @@ _PUBLIC_CAPABILITY_PATHS = frozenset(
         ("semantic_contract", "required_external_capabilities"),
     }
 )
+_SAFE_IDENTIFIER_PATTERN = r"^[A-Za-z0-9._:-]+$"
 _INTERNAL_PUBLIC_ID_PATTERNS = {
-    "opaque_evidence_id": re.compile(r"^ev_[0-9A-HJKMNP-TV-Z]{26}$", re.IGNORECASE),
-    "run_id": re.compile(r"^run_[0-9A-HJKMNP-TV-Z]{26}$", re.IGNORECASE),
+    "opaque_evidence_id": re.compile(
+        r"^ev_[0-9A-HJKMNP-TV-Z]{26}$",
+        re.IGNORECASE | re.ASCII,
+    ),
+    "run_id": re.compile(
+        r"^run_[0-9A-HJKMNP-TV-Z]{26}$",
+        re.IGNORECASE | re.ASCII,
+    ),
     "action_id": re.compile(r"^act_[0-9a-f]{24}$"),
     "version_id": re.compile(r"^av_[0-9a-f]{64}$"),
     "evidence_sha256": re.compile(r"^[0-9a-f]{64}$"),
@@ -174,11 +181,31 @@ class SemanticContract(StrictSafeModel):
 
 
 class ValidationKnowledge(StrictSafeModel):
-    opaque_evidence_id: str
-    run_id: str
-    action_id: str
-    version_id: str
-    connector_id: str
+    opaque_evidence_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=_SAFE_IDENTIFIER_PATTERN,
+    )
+    run_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=_SAFE_IDENTIFIER_PATTERN,
+    )
+    action_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=_SAFE_IDENTIFIER_PATTERN,
+    )
+    version_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=_SAFE_IDENTIFIER_PATTERN,
+    )
+    connector_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=_SAFE_IDENTIFIER_PATTERN,
+    )
     environment: str
     validation_status: ValidationStatus
     evidence_level: EvidenceLevel
@@ -210,6 +237,10 @@ class ValidationKnowledge(StrictSafeModel):
         )
         from mercury_tools.qualification.templates import SUMMARY_EN, SUMMARY_TH
 
+        for field_name in ("opaque_evidence_id", "run_id"):
+            pattern = _INTERNAL_PUBLIC_ID_PATTERNS[field_name]
+            if pattern.fullmatch(getattr(self, field_name)) is None:
+                raise ValueError("approved_public_identifier_invalid")
         if (
             self.summary_th != SUMMARY_TH[self.validation_status]
             or self.summary_en != SUMMARY_EN[self.validation_status]

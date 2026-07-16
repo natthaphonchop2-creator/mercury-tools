@@ -1993,7 +1993,9 @@ async def root(request: Request) -> Response:
 
 async def status(_: Request) -> Response:
     settings = load_settings()
-    deployment_commit = os.environ.get("MERCURY_DEPLOYMENT_COMMIT", "")
+    deployment_commit = os.environ.get("MERCURY_DEPLOYMENT_COMMIT") or os.environ.get(
+        "RENDER_GIT_COMMIT", ""
+    )
     if len(deployment_commit) != 40 or not set(deployment_commit) <= _LOWER_HEX:
         deployment_commit = None
     payload = {

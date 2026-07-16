@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sys
+from collections import Counter
 from datetime import UTC, datetime
 from functools import lru_cache
 from importlib import util as importlib_util
@@ -343,6 +345,64 @@ def test_review_script_combines_inputs_and_writes_deterministic_json(tmp_path: P
     assert first.read_bytes() == second.read_bytes()
     assert first.read_bytes().endswith(b"\n")
     assert "raw_response" not in first.read_text(encoding="utf-8")
+
+
+def test_review_script_accepts_exact_cli_public_report_envelope(tmp_path: Path) -> None:
+    script = _load_script("review_validation_knowledge")
+    inputs = []
+    for connector_id in ("flowaccount", "peak"):
+        report, _ = _report(connector_id)
+        counts = Counter(record.validation_status.value for record in report.records)
+        payload = {
+            **report.model_dump(mode="json"),
+            "counts": {key: counts[key] for key in sorted(counts)},
+            "http_attempts": 0,
+            "mutation_attempts": 0,
+            "total": report.total,
+        }
+        path = tmp_path / f"{connector_id}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        inputs.append(path)
+
+    reviewed = script.review_inputs(
+        inputs,
+        reviewer_role="release_reviewer",
+        catalog_root=ROOT / "catalog" / "global",
+    )
+
+    assert len(reviewed.records) == 254
+
+
+@pytest.mark.parametrize("tampered_field", ["counts", "total", "unknown"])
+def test_review_script_rejects_tampered_public_report_envelope(
+    tmp_path: Path,
+    tampered_field: str,
+) -> None:
+    script = _load_script("review_validation_knowledge")
+    report, _ = _report("peak")
+    counts = Counter(record.validation_status.value for record in report.records)
+    payload = {
+        **report.model_dump(mode="json"),
+        "counts": {key: counts[key] for key in sorted(counts)},
+        "http_attempts": 0,
+        "mutation_attempts": 0,
+        "total": report.total,
+    }
+    if tampered_field == "counts":
+        payload["counts"] = {}
+    elif tampered_field == "total":
+        payload["total"] = report.total - 1
+    else:
+        payload["raw_response"] = "must-not-be-accepted"
+    path = tmp_path / "peak.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="^validation_report_invalid$"):
+        script.review_inputs(
+            [path],
+            reviewer_role="release_reviewer",
+            catalog_root=ROOT / "catalog" / "global",
+        )
 
 
 def test_review_script_rejects_duplicate_connector_inputs(tmp_path: Path) -> None:
