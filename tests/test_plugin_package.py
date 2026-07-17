@@ -213,7 +213,7 @@ def test_marketplace_points_to_plugin_folder() -> None:
     assert mercury["category"] == "Finance"
 
 
-def test_v021_versions_and_launcher_are_consistent() -> None:
+def test_v022_versions_and_launcher_are_consistent() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     package_source = (ROOT / "src/mercury_tools/__init__.py").read_text(
         encoding="utf-8"
@@ -223,11 +223,11 @@ def test_v021_versions_and_launcher_are_consistent() -> None:
     )
     mcp = json.loads((PLUGIN_ROOT / ".mcp.json").read_text(encoding="utf-8"))
 
-    assert project["project"]["version"] == "0.2.1"
-    assert package_source.strip().endswith('__version__ = "0.2.1"')
-    assert plugin["version"] == "0.2.1+codex.20260713"
+    assert project["project"]["version"] == "0.2.2"
+    assert package_source.strip().endswith('__version__ = "0.2.2"')
+    assert plugin["version"] == "0.2.2+codex.20260717"
     assert mcp["mcpServers"]["mercury-finance"]["args"][1] == (
-        "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.1"
+        "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.2"
     )
 
 
@@ -621,7 +621,7 @@ def test_plugin_registers_one_pinned_local_stdio_server() -> None:
     assert server["command"] == "uvx"
     assert server["args"] == [
         "--from",
-        "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.1",
+        "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.2",
         "mercury",
         "mcp",
         "serve-local",
@@ -670,7 +670,7 @@ def test_plugin_declares_read_and_write_without_embedded_secrets() -> None:
     )
     serialized = json.dumps(manifest)
 
-    assert manifest["version"] == "0.2.1+codex.20260713"
+    assert manifest["version"] == "0.2.2+codex.20260717"
     assert manifest["interface"]["capabilities"] == ["Interactive", "Read", "Write"]
     assert manifest["interface"]["defaultPrompt"] == [
         "Set up local FlowAccount access for this repository and verify it.",
@@ -685,7 +685,7 @@ def test_release_runtime_dependencies_are_exactly_pinned() -> None:
     data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     dependencies = data["project"]["dependencies"]
 
-    assert data["project"]["version"] == "0.2.1"
+    assert data["project"]["version"] == "0.2.2"
     assert all("==" in dependency for dependency in dependencies)
     assert dependencies == [
         "httpx==0.28.1",
@@ -699,7 +699,7 @@ def test_release_runtime_dependencies_are_exactly_pinned() -> None:
     assert data["project"]["optional-dependencies"]["openai"] == ["openai==2.44.0"]
     assert "openai" not in "\n".join(dependencies)
     assert (ROOT / "src/mercury_tools/__init__.py").read_text(encoding="utf-8").strip().endswith(
-        '__version__ = "0.2.1"'
+        '__version__ = "0.2.2"'
     )
 
 
@@ -843,7 +843,7 @@ def _release_layout(tmp_path: Path, *, pinned_launcher: bool = False) -> Path:
                             "command": "uvx",
                             "args": [
                                 "--from",
-                                "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.1",
+                                "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.2",
                                 "mercury",
                                 "mcp",
                                 "serve-local",
@@ -908,7 +908,7 @@ def test_release_validator_rejects_empty_server_with_every_required_contract(
     assert result.returncode == 1
     for expected_error in (
         "command must be uvx",
-        "immutable v0.2.1 Git tag",
+        "immutable v0.2.2 Git tag",
         "cwd must be .",
         "tool_timeout_sec must be 900",
     ):
@@ -1011,7 +1011,7 @@ def test_release_validator_fails_closed_when_credential_scan_budget_is_exceeded(
                     ]
                 }
             ),
-            "immutable v0.2.1 Git tag",
+            "immutable v0.2.2 Git tag",
         ),
         (
             lambda data: data["mcpServers"].update(
@@ -1091,7 +1091,7 @@ def test_judge_quickstart_matches_current_public_plugin() -> None:
 
     assert "Mercury Finance" in text
     assert "codex plugin marketplace add" in text
-    assert "v0.2.1" in text
+    assert "v0.2.2" in text
     assert "repository-local" in text
     assert "run_erp_read" in text
     assert "preview_erp_write" in text

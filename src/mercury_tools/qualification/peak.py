@@ -705,7 +705,7 @@ def _blocked_contract_record(
         semantic_contract=contract,
         evidence_sha256=evidence_sha256,
         reviewed_by="local_reviewer",
-        runner_version="0.2.1",
+        runner_version="0.2.2",
         run_state=QualificationRunState.COMPLETED,
         evaluated_at=_EVALUATED_AT,
         expires_at=None,

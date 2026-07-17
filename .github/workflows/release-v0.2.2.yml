@@ -468,7 +468,7 @@ jobs:
                 f05934ddce884a121981d94c16f274a12bfc7829e48943a7f9455bb255b0be40 \
                 release-toolchain/uv-linux-x86_64 | sha256sum --check
               printf "%s  %s\n" \
-                274fad7efee469c3c5f76d5885d56c2231995ba044a7db7d7c168cd3484cd524 \
+                d23bde521bbed06d7c62b9bf5dcf799e844e86875e7f8e0cde983eeb0772e2e4 \
                 uv.lock | sha256sum --check
               release-toolchain/uv-linux-x86_64 sync \
                 --frozen --no-dev --no-install-project --no-build

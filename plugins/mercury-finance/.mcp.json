@@ -4,7 +4,7 @@
       "command": "uvx",
       "args": [
         "--from",
-        "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.1",
+        "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.2",
         "mercury",
         "mcp",
         "serve-local"

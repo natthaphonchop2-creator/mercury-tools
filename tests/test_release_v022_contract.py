@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import tomllib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -290,3 +291,31 @@ def test_v022_release_workflow_is_secretless_read_only_and_attempt_bound() -> No
     assert re.search(r"(?:gh api|curl)[^\n]*/repos/[^\n]*/releases", serialized) is None
     assert "release_bundle" in serialized
     assert "schema_version" in serialized
+
+
+def test_all_active_public_version_surfaces_are_v022() -> None:
+    root = Path(__file__).resolve().parents[1]
+    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    plugin = json.loads(
+        (root / "plugins/mercury-finance/.codex-plugin/plugin.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    mcp = json.loads(
+        (root / "plugins/mercury-finance/.mcp.json").read_text(encoding="utf-8")
+    )
+    package_source = (root / "src/mercury_tools/__init__.py").read_text(
+        encoding="utf-8"
+    )
+    ci = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    post_public = (root / ".github/workflows/post-public-verify.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert project["project"]["version"] == "0.2.2"
+    assert plugin["version"] == "0.2.2+codex.20260717"
+    assert package_source.strip().endswith('__version__ = "0.2.2"')
+    assert mcp["mcpServers"]["mercury-finance"]["args"][1].endswith("@v0.2.2")
+    assert "docs/release/v0.2.2-test-waivers.json" in ci
+    assert "ref: v0.2.2" in post_public
+    assert "--tag v0.2.2 --release v0.2.2" in post_public

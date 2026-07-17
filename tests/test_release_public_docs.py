@@ -10,15 +10,15 @@ STATEMENT = (
 )
 LAUNCHER = (
     "git+https://github.com/natthaphonchop2-creator/"
-    "mercury-tools.git@v0.2.1"
+    "mercury-tools.git@v0.2.2"
 )
 
 
-def test_readme_is_exact_v021_public_surface() -> None:
+def test_readme_is_exact_v022_public_surface() -> None:
     text = (ROOT / "README.md").read_text(encoding="utf-8")
 
     assert STATEMENT in text
-    assert "--ref v0.2.1" in text
+    assert "--ref v0.2.2" in text
     assert LAUNCHER in text
     assert "exactly 19 local tools" in text
     assert "20-tool hosted HTTP surface" in text
@@ -62,7 +62,7 @@ def test_judge_quickstart_has_all_exact_copy_paste_workflows() -> None:
     text = (ROOT / "docs/JUDGE_QUICKSTART.md").read_text(encoding="utf-8")
 
     assert "codex plugin marketplace add natthaphonchop2-creator/mercury-tools" in text
-    assert "--ref v0.2.1" in text
+    assert "--ref v0.2.2" in text
     assert "codex plugin add mercury-finance@mercury-tools" in text
     assert LAUNCHER in text
     assert "credentials setup flowaccount --env sandbox" in text
@@ -78,7 +78,7 @@ def test_judge_quickstart_has_all_exact_copy_paste_workflows() -> None:
 
 
 def test_release_notes_are_candidate_safe_and_name_every_required_gate() -> None:
-    text = (ROOT / "docs/RELEASE_V0.2.1.md").read_text(encoding="utf-8")
+    text = (ROOT / "docs/RELEASE_V0.2.2.md").read_text(encoding="utf-8")
 
     assert STATEMENT in text
     assert "Release candidate" in text

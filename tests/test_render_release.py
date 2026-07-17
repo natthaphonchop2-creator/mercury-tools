@@ -16,7 +16,7 @@ from scripts.verify_render_release import (  # noqa: E402
     verify_render_release,
 )
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 COMMIT = "a" * 40
 
 

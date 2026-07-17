@@ -1,4 +1,4 @@
-# Mercury Finance v0.2.1 Judge Quickstart
+# Mercury Finance v0.2.2 Judge Quickstart
 
 Mercury Finance installs one repository-local `stdio` MCP named
 `mercury-finance` with 19 tools. Run these commands from the repository that
@@ -10,7 +10,7 @@ arguments, plugin configuration, or `.env` files.
 ```bash
 uvx --version
 codex plugin marketplace add natthaphonchop2-creator/mercury-tools \
-  --ref v0.2.1 \
+  --ref v0.2.2 \
   --sparse .agents/plugins \
   --sparse plugins/mercury-finance
 codex plugin add mercury-finance@mercury-tools
@@ -20,7 +20,7 @@ codex mcp list --json
 The expected launcher is exactly:
 
 ```text
-git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.1
+git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.2
 ```
 
 The list must contain one local server named `mercury-finance` and no second or
@@ -32,7 +32,7 @@ The `connector-credential-setup-th` skill follows this same local sequence. The
 CLI prompts for values without placing them in shell history:
 
 ```bash
-export MERCURY_LAUNCHER='git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.1'
+export MERCURY_LAUNCHER='git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.2'
 uvx --from "$MERCURY_LAUNCHER" mercury credentials setup flowaccount --env sandbox --repo-root "$PWD"
 uvx --from "$MERCURY_LAUNCHER" mercury credentials test flowaccount --env sandbox --repo-root "$PWD"
 uvx --from "$MERCURY_LAUNCHER" mercury credentials status --repo-root "$PWD"

@@ -236,7 +236,7 @@ def test_ci_is_full_history_fail_closed_and_emits_exact_skip_junit() -> None:
     assert "--ignore=tests/integration/test_flowaccount_sandbox_qualification.py" in command
     assert "--junitxml=release-evidence/pytest.xml" in command
     assert "scripts/verify_test_skips.py" in command
-    assert "docs/release/v0.2.1-test-waivers.json" in command
+    assert "docs/release/v0.2.2-test-waivers.json" in command
     _assert_ephemeral_local_supabase(test)
     test_serialized = json.dumps(test, sort_keys=True)
     assert "secrets." not in test_serialized
@@ -887,7 +887,7 @@ def test_post_public_workflow_is_anonymous_and_exact_release_bound() -> None:
     assert payload["permissions"]["contents"] == "read"
     command = _run_text(payload["jobs"]["verify-public"])
     assert "scripts/verify_public_release.py" in command
-    assert "--tag v0.2.1" in command
-    assert "--release v0.2.1" in command
+    assert "--tag v0.2.2" in command
+    assert "--release v0.2.2" in command
     assert "--expected-tools 19" in command
     assert "GH_TOKEN" not in json.dumps(payload["jobs"]["verify-public"].get("env", {}))

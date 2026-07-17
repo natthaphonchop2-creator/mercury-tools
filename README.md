@@ -20,7 +20,7 @@ Mercury Tools is an independent open-source project and is not affiliated with M
 - A write requires a fresh preview and the catalog's required number of
   explicit confirmations. Mercury never retries an `outcome_unknown` write.
 
-## Install v0.2.1
+## Install v0.2.2
 
 Install [uv](https://docs.astral.sh/uv/) first and confirm `uvx` is available:
 
@@ -28,12 +28,12 @@ Install [uv](https://docs.astral.sh/uv/) first and confirm `uvx` is available:
 uvx --version
 ```
 
-After the reviewed `v0.2.1` release is published, install the immutable
+After the reviewed `v0.2.2` release is published, install the immutable
 marketplace source:
 
 ```bash
 codex plugin marketplace add natthaphonchop2-creator/mercury-tools \
-  --ref v0.2.1 \
+  --ref v0.2.2 \
   --sparse .agents/plugins \
   --sparse plugins/mercury-finance
 codex plugin add mercury-finance@mercury-tools
@@ -43,7 +43,7 @@ codex mcp list --json
 The installed launcher source is:
 
 ```text
-git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.1
+git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.2
 ```
 
 The expected result is one enabled local MCP named `mercury-finance`. See the
@@ -98,11 +98,11 @@ uv run ruff check .
 uv run pytest -q --junitxml=release-evidence/pytest.xml
 uv run python scripts/verify_test_skips.py \
   --junit release-evidence/pytest.xml \
-  --waivers docs/release/v0.2.1-test-waivers.json
+  --waivers docs/release/v0.2.2-test-waivers.json
 uv run python scripts/validate_release_plugin.py --root .
 ```
 
 Release details and operator gates are in
-[RELEASE_V0.2.1.md](docs/RELEASE_V0.2.1.md). Deployment boundaries are in
+[RELEASE_V0.2.2.md](docs/RELEASE_V0.2.2.md). Deployment boundaries are in
 [REMOTE_DEPLOYMENT.md](docs/REMOTE_DEPLOYMENT.md), and repository credential
 handling is in [LOCAL_CREDENTIALS.md](docs/LOCAL_CREDENTIALS.md).
