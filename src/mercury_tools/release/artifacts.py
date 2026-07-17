@@ -41,6 +41,15 @@ from mercury_tools.release.models import (
     SecretScanReport,
     SecretScanRequest,
 )
+from mercury_tools.release.public_tree import (
+    PublicTreeEntry,
+    PublicTreeError,
+    build_public_tree,
+    public_tree_digest,
+)
+from mercury_tools.release.public_tree import (
+    is_excluded_public_path as _is_excluded_public_path,
+)
 from mercury_tools.release.scanner import (
     CommandResult,
     ReleaseGateError,
@@ -110,31 +119,6 @@ _LINUX_RENAMEAT2_SYSCALLS = {
     "s390x": 347,
     "x86_64": 316,
 }
-_EXCLUDED_DIRECTORY_NAMES = frozenset(
-    {
-        ".git",
-        ".mercury",
-        ".superpowers",
-        "__pycache__",
-        "build",
-        "dist",
-        "release-evidence",
-    }
-)
-_EXCLUDED_STATE_FILES = frozenset(
-    {
-        "audit-ledger.jsonl",
-        "credential-store.json",
-        "credentials-store.json",
-        "downloaded-provider-payload.json",
-        "provider-payload.json",
-        "provider-response.json",
-        "raw-provider-payload.json",
-        "raw-provider-response.json",
-        "validation-raw-traffic.json",
-        "validation-traffic.json",
-    }
-)
 _GIT_CONFIG_KEY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
 _GIT_CONFIG_BRANCH_KEY_PATTERN = re.compile(
     r"^branch\.([a-z0-9][a-z0-9._/-]*)\.(merge|rebase|remote)$"
@@ -2550,21 +2534,23 @@ def _require_complete_task13_report(report: object) -> None:
 
 
 def source_tree_digest(entries: Iterable[CandidateEntry]) -> str:
-    digest = hashlib.sha256()
-    for entry in _ordered_entries(entries):
-        digest.update(f"{entry.mode:o} {entry.name}\0".encode())
-        digest.update(hashlib.sha256(entry.data).digest())
-    return digest.hexdigest()
+    public_entries = tuple(
+        PublicTreeEntry(
+            path=entry.name,
+            mode=entry.mode,
+            sha256=hashlib.sha256(entry.data).hexdigest(),
+            content=entry.data,
+        )
+        for entry in entries
+    )
+    try:
+        return public_tree_digest(public_entries)
+    except PublicTreeError as exc:
+        raise ReleaseGateError("release_archive_member_invalid") from exc
 
 
 def is_excluded_public_path(name: str) -> bool:
-    path = PurePosixPath(name)
-    lowered_parts = tuple(part.casefold() for part in path.parts)
-    if any(part in _EXCLUDED_DIRECTORY_NAMES for part in lowered_parts):
-        return True
-    if any(part == ".env" or part.startswith(".env.") for part in lowered_parts):
-        return True
-    return bool(lowered_parts and lowered_parts[-1] in _EXCLUDED_STATE_FILES)
+    return _is_excluded_public_path(name)
 
 
 def _resolve_root(root: Path) -> Path:
@@ -3202,33 +3188,15 @@ def _candidate_entries(
     if result.exit_code != 0:
         raise ReleaseGateError("release_git_archive_failed")
     try:
-        with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:") as archive:
-            members = tuple(member for member in archive.getmembers() if not member.isdir())
-            if any(not member.isfile() for member in members):
-                raise ReleaseGateError("release_archive_member_invalid")
-            validate_canonical_archive_member_names(member.name for member in members)
-            entries: list[CandidateEntry] = []
-            for member in members:
-                if is_excluded_public_path(member.name):
-                    continue
-                source = archive.extractfile(member)
-                if source is None:
-                    raise ReleaseGateError("release_archive_member_invalid")
-                entries.append(
-                    CandidateEntry(
-                        name=member.name,
-                        mode=0o755 if member.mode & 0o111 else 0o644,
-                        data=source.read(),
-                    )
-                )
-    except ReleaseGateError:
-        raise
-    except (OSError, tarfile.TarError) as exc:
+        snapshot = build_public_tree(result.stdout)
+    except PublicTreeError as exc:
+        raise ReleaseGateError("release_archive_member_invalid") from exc
+    except OSError as exc:
         raise ReleaseGateError("release_git_archive_failed") from exc
-    ordered = tuple(sorted(entries, key=lambda item: item.name))
-    if len({item.name for item in ordered}) != len(ordered):
-        raise ReleaseGateError("release_archive_member_invalid")
-    return ordered
+    return tuple(
+        CandidateEntry(name=entry.path, mode=entry.mode, data=entry.content)
+        for entry in snapshot.entries
+    )
 
 
 def _write_candidate_tree(entries: Iterable[CandidateEntry], destination: Path) -> None:
