@@ -274,6 +274,11 @@ def cmd_release_scan_secrets(args: argparse.Namespace) -> int:
                     or os.environ.get("MERCURY_RENDER_API_URL")
                     or None
                 ),
+                render_owner_id=(
+                    args.render_owner_id
+                    or os.environ.get("MERCURY_RENDER_OWNER_ID")
+                    or None
+                ),
                 render_service_id=(
                     args.render_service_id
                     or os.environ.get("MERCURY_RENDER_SERVICE_ID")
@@ -917,6 +922,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan_secrets.add_argument("--github-token-env", default="GH_TOKEN")
     scan_secrets.add_argument("--marketplace-snapshot-url")
     scan_secrets.add_argument("--render-api-url")
+    scan_secrets.add_argument("--render-owner-id")
     scan_secrets.add_argument("--render-service-id")
     scan_secrets.add_argument("--render-token-env", default="RENDER_API_KEY")
     scan_secrets.add_argument("--supabase-url")

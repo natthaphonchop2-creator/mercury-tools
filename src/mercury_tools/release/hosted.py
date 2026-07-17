@@ -348,6 +348,7 @@ class HostedAdapterConfig:
     github_token: str | None = field(default=None, repr=False)
     marketplace_url: str | None = None
     render_api_url: str | None = None
+    render_owner_id: str | None = None
     render_service_id: str | None = None
     render_token: str | None = field(default=None, repr=False)
     supabase_url: str | None = None
@@ -2511,11 +2512,13 @@ class RenderHostedClient:
         self,
         *,
         api_url: str,
+        owner_id: str,
         service_id: str,
         token: str,
         transport: HostedHttpTransport,
     ) -> None:
         self._api_url = api_url.rstrip("/")
+        self._owner_id = owner_id
         self._service_id = service_id
         self._token = token
         self._transport = transport
@@ -2529,7 +2532,8 @@ class RenderHostedClient:
                 f"render_{log_type}_logs_query",
                 self._transport,
                 "GET",
-                f"{self._api_url}/v1/logs?resource={quote(self._service_id)}"
+                f"{self._api_url}/v1/logs?ownerId={quote(self._owner_id)}"
+                f"&resource={quote(self._service_id)}"
                 f"&type={log_type}",
                 headers=headers,
                 policy=policy,
@@ -3007,9 +3011,15 @@ def build_hosted_clients(
             snapshot_url=config.marketplace_url,
             transport=transport,
         )
-    if config.render_api_url and config.render_service_id and config.render_token:
+    if (
+        config.render_api_url
+        and config.render_owner_id
+        and config.render_service_id
+        and config.render_token
+    ):
         clients["render_build_and_runtime_logs"] = RenderHostedClient(
             api_url=config.render_api_url,
+            owner_id=config.render_owner_id,
             service_id=config.render_service_id,
             token=config.render_token,
             transport=transport,

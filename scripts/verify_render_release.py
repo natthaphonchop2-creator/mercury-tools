@@ -265,6 +265,7 @@ class LiveRenderProbe:
         base_url: str,
         mcp_token: str | None,
         render_api_url: str,
+        render_owner_id: str | None,
         render_service_id: str | None,
         render_token: str | None,
     ) -> None:
@@ -273,6 +274,11 @@ class LiveRenderProbe:
         if not _valid_https_url(render_api_url):
             raise RenderReleaseError("render_api_url_invalid")
         if (
+            render_owner_id is not None
+            and _SAFE_SERVICE_ID_RE.fullmatch(render_owner_id) is None
+        ):
+            raise RenderReleaseError("render_owner_id_invalid")
+        if (
             render_service_id is not None
             and _SAFE_SERVICE_ID_RE.fullmatch(render_service_id) is None
         ):
@@ -280,6 +286,7 @@ class LiveRenderProbe:
         self._base_url = base_url.rstrip("/")
         self._mcp_token = mcp_token
         self._render_api_url = render_api_url.rstrip("/")
+        self._render_owner_id = render_owner_id
         self._render_service_id = render_service_id
         self._render_token = render_token
 
@@ -367,12 +374,13 @@ class LiveRenderProbe:
         )
 
     def scan_logs(self) -> bool:
-        if not self._render_service_id or not self._render_token:
+        if not self._render_owner_id or not self._render_service_id or not self._render_token:
             return False
         clients = build_hosted_clients(
             HostedAdapterConfig(
                 repo="natthaphonchop2-creator/mercury-tools",
                 render_api_url=self._render_api_url,
+                render_owner_id=self._render_owner_id,
                 render_service_id=self._render_service_id,
                 render_token=self._render_token,
             )
@@ -389,8 +397,8 @@ class LiveRenderProbe:
             result.scanner_version
             and not result.findings
             and not result.blockers
-            and len(result.exit_codes) == 2
-            and all(code == 200 for code in result.exit_codes)
+            and len(result.evidence_hashes) == 2
+            and all(code == 0 for code in result.exit_codes)
         )
 
 
@@ -405,6 +413,7 @@ def main() -> int:
     parser.add_argument("--version", required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--render-api-url", default="https://api.render.com")
+    parser.add_argument("--render-owner-id-env", default="RENDER_OWNER_ID")
     parser.add_argument("--render-service-id-env", default="RENDER_SERVICE_ID")
     parser.add_argument("--render-token-env", default="RENDER_API_TOKEN")
     parser.add_argument("--mcp-token-env", default="MERCURY_TOOLS_HTTP_BEARER_TOKEN")
@@ -414,6 +423,7 @@ def main() -> int:
             base_url=args.url,
             mcp_token=_env_value(args.mcp_token_env),
             render_api_url=args.render_api_url,
+            render_owner_id=_env_value(args.render_owner_id_env),
             render_service_id=_env_value(args.render_service_id_env),
             render_token=_env_value(args.render_token_env),
         )

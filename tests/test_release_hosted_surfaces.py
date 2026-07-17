@@ -677,6 +677,7 @@ def test_render_adapter_proves_build_and_runtime_pagination_without_leaking_toke
     )
     client = RenderHostedClient(
         api_url="https://api.render.example",
+        owner_id="tea-safe",
         service_id="srv-safe",
         token=token,
         transport=transport,
@@ -686,6 +687,7 @@ def test_render_adapter_proves_build_and_runtime_pagination_without_leaking_toke
 
     assert result.blockers == ()
     assert len(transport.calls) == 2
+    assert all("ownerId=tea-safe" in str(call["url"]) for call in transport.calls)
     assert all(call["headers"] == {"Authorization": f"Bearer {token}"} for call in transport.calls)
     assert token not in result.model_dump_json()
 
@@ -704,6 +706,7 @@ def test_render_adapter_follows_provider_cursor_to_completion() -> None:
     transport = CallbackHttpTransport(handler)
     client = RenderHostedClient(
         api_url="https://api.render.example",
+        owner_id="tea-safe",
         service_id="srv-safe",
         token="operator-token",
         transport=transport,
@@ -725,6 +728,7 @@ def test_render_adapter_rejects_a_page_over_the_record_budget() -> None:
     )
     client = RenderHostedClient(
         api_url="https://api.render.example",
+        owner_id="tea-safe",
         service_id="srv-safe",
         token="operator-token",
         transport=transport,
@@ -1042,6 +1046,7 @@ def test_adapter_factory_instantiates_every_hosted_surface_from_secret_safe_conf
         github_token=token,
         marketplace_url="https://marketplace.example/snapshot",
         render_api_url="https://api.render.example",
+        render_owner_id="tea-safe",
         render_service_id="srv-safe",
         render_token=token,
         supabase_url="https://project.supabase.example",
@@ -1291,6 +1296,8 @@ def test_cli_wires_concrete_hosted_clients_from_env_names_without_token_argv(
             "https://marketplace.example/snapshot",
             "--render-api-url",
             "https://api.render.example",
+            "--render-owner-id",
+            "tea-safe",
             "--render-service-id",
             "srv-safe",
             "--render-token-env",
@@ -1313,6 +1320,7 @@ def test_cli_wires_concrete_hosted_clients_from_env_names_without_token_argv(
 
     assert exit_code == 1
     assert set(captured["clients"]) == set(HOSTED_PUBLIC_SURFACES)
+    assert captured["config"].render_owner_id == "tea-safe"
     assert raw_token not in json.dumps(payload, sort_keys=True)
     assert raw_token not in repr(captured["config"])
 

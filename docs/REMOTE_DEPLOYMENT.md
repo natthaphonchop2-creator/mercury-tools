@@ -94,6 +94,7 @@ compares both requested identity values exactly:
 
 ```bash
 export REVIEWED_MAIN_SHA='<40-character-lowercase-reviewed-git-commit>'
+export RENDER_OWNER_ID='<Render workspace owner ID>'
 uv run python scripts/verify_render_release.py \
   --url https://mercury-tools-mcp.onrender.com \
   --version 0.2.2 \
