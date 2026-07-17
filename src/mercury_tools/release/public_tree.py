@@ -71,6 +71,13 @@ class PublicTreeSnapshot:
     def public_inventory(self) -> tuple[dict[str, str | int], ...]:
         return tuple(entry.public_identity() for entry in self.entries)
 
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "digest": self.digest,
+            "entries": list(self.public_inventory()),
+            "schema_version": 1,
+        }
+
 
 def public_tree_digest(entries: tuple[PublicTreeEntry, ...]) -> str:
     """Compute the PublicTreeV1 digest for an exact canonical entry inventory."""
