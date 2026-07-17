@@ -20,6 +20,17 @@ Mercury Tools is an independent open-source project and is not affiliated with M
 - A write requires a fresh preview and the catalog's required number of
   explicit confirmations. Mercury never retries an `outcome_unknown` write.
 
+## Public one-click plugin
+
+The public **Mercury Finance** app-plus-skills submission is prepared under
+[`submission/openai-plugin`](submission/openai-plugin). It uses the hosted MCP
+at `https://mercury-tools-mcp.onrender.com/mcp`, has no custom web UI, and does
+not ask end users to clone this repository. After OpenAI review and publication,
+users install it directly from the Plugins Directory with one click.
+
+Until the directory review is approved, use the immutable repository
+marketplace install below for local ERP execution.
+
 ## Install v0.2.2
 
 Install [uv](https://docs.astral.sh/uv/) first and confirm `uvx` is available:

@@ -12,6 +12,7 @@ def _clear_live_env(monkeypatch) -> None:
         "SUPABASE_URL",
         "SUPABASE_SERVICE_ROLE_KEY",
         "OPENAI_API_KEY",
+        "OPENAI_APPS_CHALLENGE_TOKEN",
         "MERCURY_TOOLS_PUBLIC_BASE_URL",
         "MERCURY_TOOLS_HTTP_BEARER_TOKEN",
         "MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API",
@@ -127,6 +128,40 @@ def test_public_contest_app_does_not_mount_legacy_http_api(monkeypatch) -> None:
     assert status["legacy_http_api"] == "disabled"
     assert "dashboard" not in status
     assert "skill_upload" not in status
+
+
+def test_public_app_exposes_required_plugin_legal_endpoints(monkeypatch) -> None:
+    monkeypatch.delenv("MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API", raising=False)
+
+    client = TestClient(create_http_app(require_auth=False))
+
+    privacy = client.get("/privacy")
+    terms = client.get("/terms")
+    support = client.get("/support")
+    assert privacy.status_code == terms.status_code == support.status_code == 200
+    assert privacy.headers["content-type"].startswith("text/plain")
+    assert "Raw ERP API keys" in privacy.text
+    assert "does not directly post production ERP transactions" in terms.text
+    assert "github.com/natthaphonchop2-creator/mercury-tools/issues" in support.text
+
+    status = client.get("/api/status").json()
+    assert status["privacy"] == "/privacy"
+    assert status["terms"] == "/terms"
+    assert status["support"] == "/support"
+
+
+def test_openai_apps_challenge_is_exact_and_opt_in(monkeypatch) -> None:
+    client = TestClient(create_http_app(require_auth=False))
+    missing = client.get("/.well-known/openai-apps-challenge")
+    assert missing.status_code == 404
+
+    monkeypatch.setenv("OPENAI_APPS_CHALLENGE_TOKEN", "x")
+    configured = TestClient(create_http_app(require_auth=False)).get(
+        "/.well-known/openai-apps-challenge"
+    )
+    assert configured.status_code == 200
+    assert configured.text == "x"
+    assert configured.headers["content-type"].startswith("text/plain")
 
 
 def test_public_app_mounts_cloud_reads_without_cloud_write_or_legacy_routes(

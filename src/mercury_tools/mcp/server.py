@@ -13,10 +13,11 @@ from typing import Any
 from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
 from mercury_tools import __version__
 from mercury_tools.cloud.api import CloudDependencies, cloud_routes
@@ -79,6 +80,12 @@ CAPABILITY_KEYS = ("required_capabilities", "requiredCapabilities", "capabilitie
 CONNECTOR_BACKED_COMMANDS = {"connectorStatus"}
 CONNECTOR_TAGS = {"connector", "connectors", "connector-backed", "accounting-connector", "erp-connector"}
 _LOWER_HEX = frozenset("0123456789abcdef")
+_AUDITED_PRIVATE = ToolAnnotations(
+    readOnlyHint=False,
+    openWorldHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+)
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -821,7 +828,16 @@ def _json_error(error: str, message: str, *, status_code: int) -> JSONResponse:
     return JSONResponse({"error": error, "message": message}, status_code=status_code)
 
 
-@mcp.tool()
+def _reject_sensitive_storage_input(**values: Any) -> None:
+    for label, value in values.items():
+        if value is not None and redact_json(value) != value:
+            raise ValueError(
+                f"{label} contains sensitive data. Public Mercury storage does not "
+                "accept credentials, personal identifiers, or secret-bearing values."
+            )
+
+
+@mcp.tool(annotations=_AUDITED_PRIVATE)
 def search_knowledge(
     query: str,
     filters: dict[str, Any] | None = None,
@@ -856,7 +872,7 @@ def search_knowledge(
     return payload
 
 
-@mcp.tool()
+@mcp.tool(annotations=_AUDITED_PRIVATE)
 def retrieve_context_pack(
     query: str,
     task: str | None = None,
@@ -892,7 +908,7 @@ def retrieve_context_pack(
     return payload
 
 
-@mcp.tool()
+@mcp.tool(annotations=_AUDITED_PRIVATE)
 def retrieve_workspace_context_pack(
     workspace_id: str,
     query: str,
@@ -999,7 +1015,7 @@ def retrieve_workspace_context_pack(
         return payload
 
 
-@mcp.tool()
+@mcp.tool(annotations=_AUDITED_PRIVATE)
 def get_document(document_id: str) -> dict[str, Any]:
     """Fetch one indexed knowledge document by UUID or document URI."""
     document = SupabaseRagStore(load_settings()).get_document(document_id)
@@ -1008,10 +1024,11 @@ def get_document(document_id: str) -> dict[str, Any]:
     return payload
 
 
-@mcp.tool()
+@mcp.tool(annotations=_AUDITED_PRIVATE)
 def create_public_workspace(company_name: str | None = None) -> dict[str, Any]:
     """Create an opaque public Mercury workspace for the contest experience."""
     try:
+        _reject_sensitive_storage_input(company_name=company_name)
         settings = load_settings()
         if not settings.supabase_configured:
             raise RuntimeError("Supabase is required to create a public workspace.")
@@ -1033,7 +1050,7 @@ def create_public_workspace(company_name: str | None = None) -> dict[str, Any]:
         return payload
 
 
-@mcp.tool()
+@mcp.tool(annotations=_AUDITED_PRIVATE)
 def get_public_workspace(workspace_id: str) -> dict[str, Any]:
     """Return sanitized Mercury workspace, connector, and flow state."""
     audit_input = _public_workspace_audit_ref(workspace_id)
@@ -1060,7 +1077,7 @@ def get_public_workspace(workspace_id: str) -> dict[str, Any]:
         return payload
 
 
-@mcp.tool()
+@mcp.tool(annotations=_AUDITED_PRIVATE)
 def list_connectors() -> dict[str, Any]:
     """List Mercury accounting and ERP connector options without secrets."""
     payload = {"status": "ok", "connectors": list_connector_public_summaries()}
@@ -1068,7 +1085,7 @@ def list_connectors() -> dict[str, Any]:
     return payload
 
 
-@mcp.tool()
+@mcp.tool(annotations=_AUDITED_PRIVATE)
 def connector_capabilities(connector_id: str) -> dict[str, Any]:
     """List declared capabilities for one Mercury connector."""
     manifest = connector_by_id(connector_id)
@@ -1092,7 +1109,7 @@ def connector_capabilities(connector_id: str) -> dict[str, Any]:
     return payload
 
 
-@mcp.tool()
+@mcp.tool(annotations=_AUDITED_PRIVATE)
 def start_connector_setup(
     workspace_id: str,
     connector_id: str,
@@ -1101,6 +1118,7 @@ def start_connector_setup(
 ) -> dict[str, Any]:
     """Start gated connector setup for one workspace."""
     try:
+        _reject_sensitive_storage_input(company_name=company_name)
         settings = load_settings()
         token_payload = _public_workspace_payload_from_value(workspace_id)
         profile = _product_store(settings).start_connector_setup(
@@ -1133,7 +1151,7 @@ def start_connector_setup(
         return payload
 
 
-@mcp.tool()
+@mcp.tool(annotations=_AUDITED_PRIVATE)
 def connector_status(workspace_id: str | None = None) -> dict[str, Any]:
     """Read sanitized connector status for a Mercury public workspace."""
     if not workspace_id:
@@ -1190,7 +1208,7 @@ def connector_status(workspace_id: str | None = None) -> dict[str, Any]:
         return payload
 
 
-@mcp.tool()
+@mcp.tool(annotations=_AUDITED_PRIVATE)
 def run_accounting_skill(
     skill_id: str,
     inputs: dict[str, Any],
@@ -1219,7 +1237,7 @@ def run_accounting_skill(
     return payload
 
 
-@mcp.tool()
+@mcp.tool(annotations=_AUDITED_PRIVATE)
 def flow_cheat_sheet() -> dict[str, Any]:
     """Return Mercury Flow command syntax and examples."""
     payload = {"status": "ok", "cheat_sheet": FLOW_CHEAT_SHEET}
@@ -1227,7 +1245,7 @@ def flow_cheat_sheet() -> dict[str, Any]:
     return payload
 
 
-@mcp.tool()
+@mcp.tool(annotations=_AUDITED_PRIVATE)
 def check_flow_syntax(flow_yaml: str) -> dict[str, Any]:
     """Validate a Mercury YAML flow without executing it."""
     try:
@@ -1244,7 +1262,7 @@ def check_flow_syntax(flow_yaml: str) -> dict[str, Any]:
         return payload
 
 
-@mcp.tool()
+@mcp.tool(annotations=_AUDITED_PRIVATE)
 def inspect_flow_files(
     flow_files: dict[str, str] | list[dict[str, Any]],
     config_yaml: str | None = None,
@@ -1309,7 +1327,7 @@ def inspect_flow_files(
         return payload
 
 
-@mcp.tool()
+@mcp.tool(annotations=_AUDITED_PRIVATE)
 def run_flow(
     flow_yaml: str,
     dry_run: bool = False,
@@ -1379,7 +1397,7 @@ def run_flow(
         return payload
 
 
-@mcp.tool()
+@mcp.tool(annotations=_AUDITED_PRIVATE)
 def run_flow_files(
     flow_files: dict[str, str] | list[dict[str, Any]],
     config_yaml: str | None = None,
@@ -1591,7 +1609,7 @@ def run_flow_files(
         return payload
 
 
-@mcp.tool()
+@mcp.tool(annotations=_AUDITED_PRIVATE)
 def run_mercury_flow(
     flow_yaml: str | None = None,
     flow_files: dict[str, str] | list[dict[str, Any]] | None = None,
@@ -1677,7 +1695,7 @@ def run_mercury_flow(
     return payload
 
 
-@mcp.tool()
+@mcp.tool(annotations=_AUDITED_PRIVATE)
 def list_workspace_flows(workspace_id: str) -> dict[str, Any]:
     """List saved Mercury flows for a public workspace."""
     try:
@@ -1710,7 +1728,7 @@ def list_workspace_flows(workspace_id: str) -> dict[str, Any]:
         return payload
 
 
-@mcp.tool(name="run_workspace_flow")
+@mcp.tool(name="run_workspace_flow", annotations=_AUDITED_PRIVATE)
 def run_workspace_flow_tool(
     workspace_id: str,
     flow_id: str,
@@ -1824,7 +1842,7 @@ def run_workspace_flow_tool(
         return payload
 
 
-@mcp.tool(name="save_workspace_flow")
+@mcp.tool(name="save_workspace_flow", annotations=_AUDITED_PRIVATE)
 def save_workspace_flow_tool(
     workspace_id: str,
     title: str,
@@ -1833,6 +1851,11 @@ def save_workspace_flow_tool(
 ) -> dict[str, Any]:
     """Save one Mercury flow into the connected workspace."""
     try:
+        _reject_sensitive_storage_input(
+            title=title,
+            flow_yaml=flow_yaml,
+            metadata=metadata,
+        )
         settings = load_settings()
         if not settings.supabase_configured:
             raise RuntimeError("Supabase is required to save workspace flows.")
@@ -1991,6 +2014,62 @@ async def root(request: Request) -> Response:
     return HTMLResponse(body)
 
 
+async def privacy_policy(_: Request) -> Response:
+    return PlainTextResponse(
+        """Mercury Finance Privacy Policy
+Effective: 17 July 2026
+
+Mercury Finance is an independent open-source accounting-agent plugin. The hosted MCP processes requests from the user's AI host to provide accounting knowledge, ERP connector catalogs, workspace metadata, and Mercury Flow execution.
+
+Data processed and stored may include workspace display names, selected connector and environment metadata, saved Mercury Flow definitions, hashed tool-input fingerprints, and sanitized audit summaries. Knowledge searches and tool inputs are processed to return requested results. Raw ERP API keys, bearer tokens, client secrets, tax identifiers, and email addresses are not intended to be stored by the public MCP. Do not submit secrets or unnecessary personal data to public MCP tools.
+
+The hosted service uses Render for application hosting and Supabase for knowledge, workspace, flow, and audit storage. The AI host used to call the plugin may process data under its own privacy terms. Mercury Finance does not sell personal data.
+
+To request access, correction, or deletion of data associated with a Mercury public workspace, open a private-safe support request without including credentials at https://github.com/natthaphonchop2-creator/mercury-tools/issues.
+
+Source and security information: https://github.com/natthaphonchop2-creator/mercury-tools
+"""
+    )
+
+
+async def terms_of_use(_: Request) -> Response:
+    return PlainTextResponse(
+        """Mercury Finance Terms of Use
+Effective: 17 July 2026
+
+Mercury Finance provides accounting knowledge, connector metadata, workflow planning, and closed-system Mercury Flow tools. It is not a replacement for an accountant, auditor, tax adviser, or legal adviser. Users must review source citations, calculations, approvals, and resulting records before relying on them.
+
+The public hosted MCP does not accept or retain ERP credentials and does not directly post production ERP transactions. Direct ERP execution is available only through the separate repository-local Mercury connector, where the user controls credentials and approvals.
+
+Do not use the service for unlawful activity, unauthorized access, credential collection, or irreversible financial actions without proper authority and review. The software and hosted service are provided as-is without warranties. To the extent permitted by law, the publisher is not liable for losses caused by inaccurate inputs, model outputs, unavailable third-party systems, or actions taken without appropriate review.
+
+Project license and source: https://github.com/natthaphonchop2-creator/mercury-tools
+"""
+    )
+
+
+async def support(_: Request) -> Response:
+    return PlainTextResponse(
+        """Mercury Finance Support
+
+Documentation and source:
+https://github.com/natthaphonchop2-creator/mercury-tools
+
+Support and data requests:
+https://github.com/natthaphonchop2-creator/mercury-tools/issues
+
+Do not include ERP API keys, client secrets, bearer tokens, tax identifiers, or other confidential accounting data in a public issue.
+"""
+    )
+
+
+async def openai_apps_challenge(_: Request) -> Response:
+    token = load_settings().openai_apps_challenge_token
+    if not token:
+        return PlainTextResponse("Not configured", status_code=404)
+    return PlainTextResponse(token)
+
+
 async def status(_: Request) -> Response:
     settings = load_settings()
     deployment_commit = os.environ.get("MERCURY_DEPLOYMENT_COMMIT") or os.environ.get(
@@ -2011,6 +2090,9 @@ async def status(_: Request) -> Response:
         "mcp_path": settings.mcp_path,
         "mcp_endpoint": settings.mcp_endpoint,
         "health": "/healthz",
+        "privacy": "/privacy",
+        "terms": "/terms",
+        "support": "/support",
         "surface": "mcp-plugin-first",
         "browser_ui": "disabled",
         "legacy_http_api": (
@@ -2508,6 +2590,14 @@ def create_http_app(
     app.add_route("/", root, methods=["GET"])
     app.add_route("/api/status", status, methods=["GET"])
     app.add_route("/healthz", healthz, methods=["GET"])
+    app.add_route("/privacy", privacy_policy, methods=["GET"])
+    app.add_route("/terms", terms_of_use, methods=["GET"])
+    app.add_route("/support", support, methods=["GET"])
+    app.add_route(
+        "/.well-known/openai-apps-challenge",
+        openai_apps_challenge,
+        methods=["GET"],
+    )
     if settings.enable_legacy_http_api:
         for page_path in (
             "/start",

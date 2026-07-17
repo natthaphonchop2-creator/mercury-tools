@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from mercury_tools.prompts import get_prompt
@@ -16,6 +18,70 @@ def test_local_mcp_is_a_separate_one_server_surface() -> None:
 
     assert local_mcp.name == "Mercury Finance"
     assert local_mcp is not mcp
+
+
+def test_public_mcp_tools_have_submission_annotations() -> None:
+    from mercury_tools.mcp.server import mcp
+
+    tools = {tool.name: tool for tool in asyncio.run(mcp.list_tools())}
+    audited_tools = {
+        "search_knowledge",
+        "retrieve_context_pack",
+        "retrieve_workspace_context_pack",
+        "get_document",
+        "get_public_workspace",
+        "list_connectors",
+        "connector_capabilities",
+        "connector_status",
+        "run_accounting_skill",
+        "flow_cheat_sheet",
+        "check_flow_syntax",
+        "inspect_flow_files",
+        "list_workspace_flows",
+        "create_public_workspace",
+        "start_connector_setup",
+        "run_flow",
+        "run_flow_files",
+        "run_mercury_flow",
+        "run_workspace_flow",
+        "save_workspace_flow",
+    }
+
+    assert set(tools) == audited_tools
+    for name in audited_tools:
+        annotations = tools[name].annotations
+        assert annotations is not None
+        assert annotations.readOnlyHint is False
+        assert annotations.openWorldHint is False
+        assert annotations.destructiveHint is False
+        assert annotations.idempotentHint is False
+
+
+def test_public_storage_tools_reject_secret_bearing_inputs_before_persistence() -> None:
+    from mercury_tools.mcp.server import (
+        create_public_workspace,
+        save_workspace_flow_tool,
+        start_connector_setup,
+    )
+
+    workspace = create_public_workspace("client_secret=do-not-store-this-value")
+    connector = start_connector_setup(
+        "workspace-demo",
+        "flowaccount",
+        "production",
+        company_name="private@example.com",
+    )
+    flow = save_workspace_flow_tool(
+        "workspace-demo",
+        "Demo",
+        "name: Demo\n---\n- emitReport:\n    title: api_key=do-not-store-this-value\n",
+    )
+
+    for payload in (workspace, connector, flow):
+        assert payload["status"] == "error"
+        assert "Public Mercury storage does not accept" in payload["message"]
+        assert "do-not-store-this-value" not in str(payload)
+        assert "private@example.com" not in str(payload)
 
 
 def test_prompt_templates_exist() -> None:

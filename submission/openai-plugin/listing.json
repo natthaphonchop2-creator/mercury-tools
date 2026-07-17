@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "submission_type": "app-plus-skills",
+  "plugin_name": "Mercury Finance",
+  "short_description": "Cited accounting knowledge, ERP API catalogs, and finance workflows for AI agents.",
+  "long_description": "Mercury Finance helps AI agents research Thai and international accounting topics, retrieve citation-bearing context, discover supported ERP connectors and endpoint capabilities, and plan or run controlled Mercury Flows. The public hosted MCP never asks for or stores ERP API secrets and does not directly post production ERP transactions. A separate repository-local connector is available for organizations that need locally controlled ERP execution.",
+  "category": "Finance",
+  "logo_file": "assets/mercury-finance-logo.png",
+  "developer_identity_instruction": "Select the verified individual or business identity from the publishing OpenAI organization.",
+  "website_url": "https://mercury-tools-mcp.onrender.com/",
+  "support_url": "https://mercury-tools-mcp.onrender.com/support",
+  "privacy_policy_url": "https://mercury-tools-mcp.onrender.com/privacy",
+  "terms_url": "https://mercury-tools-mcp.onrender.com/terms",
+  "source_url": "https://github.com/natthaphonchop2-creator/mercury-tools",
+  "mcp": {
+    "url": "https://mercury-tools-mcp.onrender.com/mcp",
+    "authentication": "none",
+    "custom_ui": false,
+    "challenge_url": "https://mercury-tools-mcp.onrender.com/.well-known/openai-apps-challenge",
+    "content_security_policy": {
+      "connect_domains": [
+        "https://mercury-tools-mcp.onrender.com"
+      ],
+      "resource_domains": []
+    }
+  },
+  "recommended_availability": [
+    "TH"
+  ],
+  "data_handling_summary": "Stores optional public-workspace display metadata, connector selection, saved Mercury Flow definitions, hashed tool-input fingerprints, and sanitized audit summaries. Does not accept or store ERP credentials in the hosted MCP.",
+  "independence_notice": "Mercury Finance is an independent open-source project and is not affiliated with Mercury Technologies, Inc."
+}

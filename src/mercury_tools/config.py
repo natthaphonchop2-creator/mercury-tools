@@ -38,6 +38,7 @@ class Settings:
     enable_legacy_http_api: bool = False
     connect_invite_code: str = ""
     connect_signing_secret: str = ""
+    openai_apps_challenge_token: str = ""
     cloud_base_url: str = DEFAULT_CLOUD_BASE_URL
 
     @property
@@ -137,6 +138,9 @@ def load_settings(*, dotenv_path: str | Path | None = None) -> Settings:
         ),
         connect_invite_code=os.environ.get("MERCURY_CONNECT_INVITE_CODE", "").strip(),
         connect_signing_secret=os.environ.get("MERCURY_CONNECT_SIGNING_SECRET", "").strip(),
+        openai_apps_challenge_token=os.environ.get(
+            "OPENAI_APPS_CHALLENGE_TOKEN", ""
+        ).strip(),
         cloud_base_url=(
             os.environ.get("MERCURY_CLOUD_BASE_URL", DEFAULT_CLOUD_BASE_URL).strip().rstrip("/")
             or DEFAULT_CLOUD_BASE_URL
