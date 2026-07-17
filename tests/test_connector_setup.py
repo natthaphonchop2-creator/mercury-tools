@@ -679,7 +679,9 @@ class StoreForSetup(SupabaseProductStore):
                     "workspace_id": "ws-1",
                     "member_id": "member-1",
                     "host_app": "codex",
-                    "expires_at": "2026-07-09T00:00:00+00:00",
+                    "scopes": ["mcp:read"],
+                    "expires_at": "2099-01-01T00:00:00+00:00",
+                    "revoked_at": None,
                 }
             ]
         if path == "mercury_workspaces" and method == "GET":

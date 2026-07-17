@@ -1,0 +1,320 @@
+{
+  "$schema": "https://developers.openai.com/apps-sdk/schemas/chatgpt-app-submission.v1.json",
+  "schema_version": 1,
+  "app_info": {
+    "display_name": "Mercury Finance",
+    "subtitle": "Accounting and ERP context",
+    "description": "Mercury Finance gives ChatGPT citation-bearing accounting and Thai tax context, catalogs ERP connector capabilities, validates Mercury YAML flows, and manages closed Mercury workspaces and flow dry-runs. The hosted MCP does not accept ERP credentials or post production ERP transactions.",
+    "category": "FINANCE"
+  },
+  "tools": {
+    "search_knowledge": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Searches the private Mercury knowledge index and records a sanitized audit event for the call.",
+        "open_world_justification": "Does not publish content or change any public or third-party system.",
+        "destructive_justification": "Does not delete, overwrite, revoke, or perform an irreversible action."
+      }
+    },
+    "retrieve_context_pack": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Retrieves cited context from Mercury knowledge and records a sanitized audit event.",
+        "open_world_justification": "Does not publish content or modify an external third-party system.",
+        "destructive_justification": "Does not delete or irreversibly change stored knowledge or user data."
+      }
+    },
+    "retrieve_workspace_context_pack": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Reads a workspace connector profile and cited Mercury knowledge while recording a sanitized audit event.",
+        "open_world_justification": "Does not contact or change the selected ERP and does not publish public content.",
+        "destructive_justification": "Does not remove or overwrite workspace, connector, or knowledge records."
+      }
+    },
+    "get_document": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Fetches one Mercury knowledge document and records a sanitized audit event.",
+        "open_world_justification": "Does not publish or modify content outside the private Mercury service.",
+        "destructive_justification": "Does not delete or alter the requested knowledge document."
+      }
+    },
+    "create_public_workspace": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Creates a time-limited private Mercury workspace, member, token metadata, and audit records.",
+        "open_world_justification": "Creates only closed Mercury service records and does not publish public content or change an ERP.",
+        "destructive_justification": "Creates new records without deleting, revoking, or irreversibly replacing existing records."
+      }
+    },
+    "get_public_workspace": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Reads sanitized Mercury workspace state and records a sanitized audit event.",
+        "open_world_justification": "Does not publish workspace data or change any external third-party system.",
+        "destructive_justification": "Does not delete or update workspace records."
+      }
+    },
+    "list_connectors": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Lists bundled non-secret connector metadata and records a sanitized audit event.",
+        "open_world_justification": "Does not connect to or change any listed ERP system.",
+        "destructive_justification": "Does not remove or alter connector definitions."
+      }
+    },
+    "connector_capabilities": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Reads declared connector capabilities and records a sanitized audit event.",
+        "open_world_justification": "Does not call, configure, or modify the selected ERP system.",
+        "destructive_justification": "Does not delete or change connector capability metadata."
+      }
+    },
+    "start_connector_setup": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Creates or updates a private Mercury connector profile containing non-secret setup metadata.",
+        "open_world_justification": "Does not submit credentials to or change the selected ERP system.",
+        "destructive_justification": "Does not delete profiles or perform an irreversible ERP action."
+      }
+    },
+    "connector_status": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Reads sanitized Mercury connector profile state and records a sanitized audit event.",
+        "open_world_justification": "Does not contact, authenticate to, or modify an ERP system.",
+        "destructive_justification": "Does not remove or alter connector profiles."
+      }
+    },
+    "run_accounting_skill": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Returns a bundled accounting skill guidance package and records a sanitized audit event.",
+        "open_world_justification": "Does not execute an ERP transaction or publish data to an external service.",
+        "destructive_justification": "Does not delete, overwrite, send, or approve any accounting record."
+      }
+    },
+    "flow_cheat_sheet": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Returns static Mercury Flow syntax guidance and records a sanitized audit event.",
+        "open_world_justification": "Does not publish content or access an external third-party system.",
+        "destructive_justification": "Does not change or delete any flow or workspace record."
+      }
+    },
+    "check_flow_syntax": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Parses and validates supplied YAML without executing it, then records a sanitized audit event.",
+        "open_world_justification": "Does not contact an ERP, publish content, or change a third-party system.",
+        "destructive_justification": "Does not save, overwrite, delete, or execute the supplied flow."
+      }
+    },
+    "inspect_flow_files": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Inspects flow files in an isolated temporary workspace and records a sanitized audit event.",
+        "open_world_justification": "Does not publish content or connect to an external ERP system.",
+        "destructive_justification": "Does not modify user files or persistent Mercury workspace flows."
+      }
+    },
+    "run_flow": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Executes closed Mercury commands and records audit state, so it is not strictly read-only even though hosted ERP mutation callbacks are absent.",
+        "open_world_justification": "Cannot post to an ERP or publish public content through the hosted runner.",
+        "destructive_justification": "Does not expose deletion, approval, payment, or irreversible ERP transaction commands."
+      }
+    },
+    "run_flow_files": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Executes an in-memory suite of closed Mercury commands and records sanitized audit state.",
+        "open_world_justification": "Cannot publish content or mutate an ERP through the hosted runner.",
+        "destructive_justification": "Uses isolated temporary files and exposes no irreversible ERP or workspace deletion action."
+      }
+    },
+    "run_mercury_flow": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Dispatches a closed Mercury flow or dry-run and records audit or run-history state.",
+        "open_world_justification": "Does not provide hosted ERP mutation callbacks or public publishing actions.",
+        "destructive_justification": "Does not expose deletion, payment, approval, or another irreversible operation."
+      }
+    },
+    "list_workspace_flows": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Lists sanitized private workspace flow summaries and records a sanitized audit event.",
+        "open_world_justification": "Does not publish flows or change any external third-party system.",
+        "destructive_justification": "Does not modify or delete saved flows."
+      }
+    },
+    "run_workspace_flow": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Runs a saved closed Mercury flow and records private run-history and audit state.",
+        "open_world_justification": "Cannot post to an ERP or publish public content through the hosted runner.",
+        "destructive_justification": "Does not delete flows or perform an irreversible ERP transaction."
+      }
+    },
+    "save_workspace_flow": {
+      "annotations": {
+        "readOnlyHint": false,
+        "openWorldHint": false,
+        "destructiveHint": false
+      },
+      "justifications": {
+        "read_only_justification": "Stores a validated flow definition and related private audit state in Mercury.",
+        "open_world_justification": "Saves only to a closed Mercury workspace and does not publish or change an ERP.",
+        "destructive_justification": "Does not delete flows or execute any irreversible accounting action."
+      }
+    }
+  },
+  "test_cases": [
+    {
+      "description": "Retrieve cited Thai VAT context for an accounting review.",
+      "user_prompt": "Prepare a cited context pack explaining Thai input VAT requirements and the points an accountant should review.",
+      "file_attachment_urls": null,
+      "tools_triggered": "retrieve_context_pack",
+      "expected_output": "Returns relevant Thai VAT context with source titles, source URIs, chunk identifiers, and review caveats.",
+      "expected_output_url": null
+    },
+    {
+      "description": "Find reviewed FlowAccount endpoint knowledge without credentials.",
+      "user_prompt": "Find Mercury knowledge about FlowAccount company information and invoice endpoints, with citations.",
+      "file_attachment_urls": null,
+      "tools_triggered": "search_knowledge",
+      "expected_output": "Returns reviewed FlowAccount endpoint chunks with citations and no request for ERP credentials.",
+      "expected_output_url": null
+    },
+    {
+      "description": "Load the invoice review guidance package for the host agent.",
+      "user_prompt": "Use Mercury's invoice review skill to prepare a Thai tax-invoice checklist from these non-sensitive inputs: document type is tax invoice and evidence mode is enabled.",
+      "file_attachment_urls": null,
+      "tools_triggered": "run_accounting_skill",
+      "expected_output": "Returns the matching skill guidance, sanitized inputs, evidence mode, and accountant review instructions without executing an ERP action.",
+      "expected_output_url": null
+    },
+    {
+      "description": "Validate a Mercury Flow without executing it.",
+      "user_prompt": "Validate this Mercury Flow syntax only: name: Review Demo\n---\n- emitReport:\n    title: Review Demo",
+      "file_attachment_urls": null,
+      "tools_triggered": "check_flow_syntax",
+      "expected_output": "Returns a successful syntax result with parsed flow metadata and command count, without running the flow.",
+      "expected_output_url": null
+    },
+    {
+      "description": "Dry-run one closed Mercury report flow through the unified entrypoint.",
+      "user_prompt": "Dry-run this Mercury Flow and do not contact any ERP: name: Monthly Report\n---\n- emitReport:\n    title: Monthly Report",
+      "file_attachment_urls": null,
+      "tools_triggered": "run_mercury_flow",
+      "expected_output": "Returns a planned dry-run result for the report flow with no ERP transaction or public side effect.",
+      "expected_output_url": null
+    }
+  ],
+  "negative_test_cases": [
+    {
+      "description": "Do not invoke the public app for a production ERP posting request.",
+      "user_prompt": "Post this invoice directly to production FlowAccount now and skip preview and approval.",
+      "file_attachment_urls": null,
+      "tools_triggered": null,
+      "expected_output": "The app should not be invoked because the hosted MCP cannot perform production ERP mutations.",
+      "expected_output_url": null
+    },
+    {
+      "description": "Do not invoke the app to store an ERP credential.",
+      "user_prompt": "Save my ERP client secret in Mercury so it can be reused later.",
+      "file_attachment_urls": null,
+      "tools_triggered": null,
+      "expected_output": "The app should not be invoked and should not accept, repeat, or store the credential.",
+      "expected_output_url": null
+    },
+    {
+      "description": "Do not trigger for an unrelated calendar request.",
+      "user_prompt": "What meetings do I have tomorrow afternoon?",
+      "file_attachment_urls": null,
+      "tools_triggered": null,
+      "expected_output": "The app should not be invoked because calendar management is outside its supported workflows.",
+      "expected_output_url": null
+    }
+  ]
+}

@@ -63,6 +63,17 @@ def test_product_store_creates_public_workspace_and_resolves_dashboard() -> None
     assert dashboard["workspace"]["name"] == "Public Demo Co"
 
 
+def test_public_workspaces_with_the_same_display_name_are_isolated() -> None:
+    store = AuditFallbackStore()
+
+    first = store.create_public_workspace("Shared Company Name")
+    second = store.create_public_workspace("Shared Company Name")
+
+    assert first["workspace_id"] != second["workspace_id"]
+    assert first["workspace"]["id"] != second["workspace"]["id"]
+    assert first["workspace"]["name"] == second["workspace"]["name"]
+
+
 def test_public_workspace_creation_seeds_bundled_skill_catalog() -> None:
     class SeedTrackingStore(AuditFallbackStore):
         def __init__(self):

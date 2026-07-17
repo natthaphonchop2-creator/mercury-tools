@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
+from pydantic import BaseModel, TypeAdapter, ValidationError
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -43,6 +44,17 @@ from mercury_tools.flows.parser import (
 from mercury_tools.flows.runner import create_default_runner
 from mercury_tools.flows.templates import FLOW_CHEAT_SHEET
 from mercury_tools.flows.workspace import discover_workspace_flows, workspace_manifest
+from mercury_tools.mcp.schemas import (
+    AccountingSkillId,
+    AccountingSkillInputs,
+    ConnectorEnvironment,
+    ConnectorId,
+    FlowFileInput,
+    KnowledgeSearchFilters,
+    MercuryFlowSource,
+    SearchMode,
+    WorkspaceFlowMetadata,
+)
 from mercury_tools.mercury_runtime import skill_markdown
 from mercury_tools.product import (
     build_connection_payload,
@@ -86,6 +98,7 @@ _AUDITED_PRIVATE = ToolAnnotations(
     destructiveHint=False,
     idempotentHint=False,
 )
+_MERCURY_FLOW_SOURCE_ADAPTER = TypeAdapter(MercuryFlowSource)
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -131,13 +144,24 @@ def _audit(tool_name: str, input_payload: dict[str, Any], output_summary: dict[s
         pass
 
 
-def _filters(filters: dict[str, Any] | None) -> SearchFilters:
+def _model_payload(value: BaseModel | Mapping[str, Any] | None) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="python", exclude_none=True)
+    return dict(value)
+
+
+def _filters(
+    filters: KnowledgeSearchFilters | Mapping[str, Any] | None,
+) -> SearchFilters:
     if filters is None:
         return SearchFilters()
-    if not isinstance(filters, Mapping) or set(filters) - _SEARCH_FILTER_FIELDS:
+    values = _model_payload(filters)
+    if set(values) - _SEARCH_FILTER_FIELDS:
         raise ValueError("search_filters_invalid")
     try:
-        return SearchFilters(**dict(filters))
+        return SearchFilters(**values)
     except (TypeError, ValueError):
         raise ValueError("search_filters_invalid") from None
 
@@ -216,6 +240,8 @@ def _flow_files_from_payload(raw: Any) -> list[dict[str, str]]:
     elif isinstance(raw, list):
         items = []
         for index, item in enumerate(raw):
+            if isinstance(item, FlowFileInput):
+                item = item.model_dump(mode="python")
             if not isinstance(item, dict):
                 raise ValueError(f"flow_files[{index}] must be an object.")
             path = item.get("path") or item.get("filename") or item.get("name")
@@ -840,13 +866,14 @@ def _reject_sensitive_storage_input(**values: Any) -> None:
 @mcp.tool(annotations=_AUDITED_PRIVATE)
 def search_knowledge(
     query: str,
-    filters: dict[str, Any] | None = None,
+    filters: KnowledgeSearchFilters | None = None,
     top_k: int = 8,
-    mode: str = "hybrid",
+    mode: SearchMode = "hybrid",
 ) -> dict[str, Any]:
     """Search Mercury accounting knowledge and return citation-bearing chunks."""
+    explicit_filters = _model_payload(filters)
     applied_filters, inferred_connector, inferred_domain = apply_knowledge_routing(
-        query, filters
+        query, explicit_filters
     )
     results = _service().search(
         query,
@@ -876,12 +903,13 @@ def search_knowledge(
 def retrieve_context_pack(
     query: str,
     task: str | None = None,
-    filters: dict[str, Any] | None = None,
+    filters: KnowledgeSearchFilters | None = None,
     max_chunks: int = 12,
 ) -> dict[str, Any]:
     """Return a context pack with citations for the host agent to answer with."""
+    explicit_filters = _model_payload(filters)
     applied_filters, inferred_connector, inferred_domain = apply_knowledge_routing(
-        query, filters
+        query, explicit_filters
     )
     pack = _service().context_pack(
         query,
@@ -1026,7 +1054,7 @@ def get_document(document_id: str) -> dict[str, Any]:
 
 @mcp.tool(annotations=_AUDITED_PRIVATE)
 def create_public_workspace(company_name: str | None = None) -> dict[str, Any]:
-    """Create an opaque public Mercury workspace for the contest experience."""
+    """Create an opaque, time-limited Mercury plugin workspace."""
     try:
         _reject_sensitive_storage_input(company_name=company_name)
         settings = load_settings()
@@ -1112,8 +1140,8 @@ def connector_capabilities(connector_id: str) -> dict[str, Any]:
 @mcp.tool(annotations=_AUDITED_PRIVATE)
 def start_connector_setup(
     workspace_id: str,
-    connector_id: str,
-    environment: str,
+    connector_id: ConnectorId,
+    environment: ConnectorEnvironment,
     company_name: str | None = None,
 ) -> dict[str, Any]:
     """Start gated connector setup for one workspace."""
@@ -1152,7 +1180,7 @@ def start_connector_setup(
 
 
 @mcp.tool(annotations=_AUDITED_PRIVATE)
-def connector_status(workspace_id: str | None = None) -> dict[str, Any]:
+def connector_status(workspace_id: str) -> dict[str, Any]:
     """Read sanitized connector status for a Mercury public workspace."""
     if not workspace_id:
         payload = {
@@ -1210,17 +1238,18 @@ def connector_status(workspace_id: str | None = None) -> dict[str, Any]:
 
 @mcp.tool(annotations=_AUDITED_PRIVATE)
 def run_accounting_skill(
-    skill_id: str,
-    inputs: dict[str, Any],
+    skill_id: AccountingSkillId,
+    inputs: AccountingSkillInputs,
     evidence_mode: bool = False,
 ) -> dict[str, Any]:
     """Return an accounting skill execution package for the host agent."""
+    input_payload = _model_payload(inputs)
     markdown = skill_markdown(skill_id)
     payload = redact_json(
         {
             "status": "ok" if markdown else "not_found",
             "skill_id": skill_id,
-            "inputs": inputs,
+            "inputs": input_payload,
             "evidence_mode": evidence_mode,
             "skill_markdown": markdown,
             "note": (
@@ -1231,7 +1260,7 @@ def run_accounting_skill(
     )
     _audit(
         "run_accounting_skill",
-        {"skill_id": skill_id, "inputs": inputs},
+        {"skill_id": skill_id, "inputs": input_payload},
         {"status": payload["status"]},
     )
     return payload
@@ -1264,10 +1293,10 @@ def check_flow_syntax(flow_yaml: str) -> dict[str, Any]:
 
 @mcp.tool(annotations=_AUDITED_PRIVATE)
 def inspect_flow_files(
-    flow_files: dict[str, str] | list[dict[str, Any]],
+    flow_files: list[FlowFileInput],
     config_yaml: str | None = None,
-    include_tags: list[str] | str | None = None,
-    exclude_tags: list[str] | str | None = None,
+    include_tags: list[str] | None = None,
+    exclude_tags: list[str] | None = None,
 ) -> dict[str, Any]:
     """Inspect an in-memory Mercury flow workspace for an MCP host agent."""
     normalized_files: list[dict[str, str]] = []
@@ -1399,13 +1428,13 @@ def run_flow(
 
 @mcp.tool(annotations=_AUDITED_PRIVATE)
 def run_flow_files(
-    flow_files: dict[str, str] | list[dict[str, Any]],
+    flow_files: list[FlowFileInput],
     config_yaml: str | None = None,
     dry_run: bool = False,
     env: dict[str, Any] | None = None,
     workspace_id: str | None = None,
-    include_tags: list[str] | str | None = None,
-    exclude_tags: list[str] | str | None = None,
+    include_tags: list[str] | None = None,
+    exclude_tags: list[str] | None = None,
     continue_on_failure: bool = True,
 ) -> dict[str, Any]:
     """Run multiple Mercury YAML flow files as an in-memory suite."""
@@ -1609,7 +1638,69 @@ def run_flow_files(
         return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(name="run_mercury_flow", annotations=_AUDITED_PRIVATE)
+def _run_mercury_flow_tool(
+    source: MercuryFlowSource,
+    dry_run: bool = True,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Run exactly one typed Mercury source: inline YAML, files, or a saved flow."""
+    try:
+        selected = _MERCURY_FLOW_SOURCE_ADAPTER.validate_python(source)
+    except ValidationError as exc:
+        payload = {
+            "status": "error",
+            "message": "Invalid Mercury flow source.",
+            "details": [
+                {
+                    "location": ".".join(str(item) for item in error["loc"]),
+                    "message": error["msg"],
+                }
+                for error in exc.errors(include_input=False, include_url=False)
+            ],
+        }
+        _audit("run_mercury_flow", {"source_type": "invalid", "dry_run": dry_run}, payload)
+        return payload
+
+    source_payload = selected.model_dump(mode="python", exclude_none=True)
+    source_type = source_payload["source_type"]
+    if source_type == "flow_yaml":
+        payload = run_flow(
+            source_payload["flow_yaml"],
+            dry_run=dry_run,
+            env=env,
+            workspace_id=source_payload.get("workspace_id"),
+        )
+        payload["entrypoint"] = "run_mercury_flow"
+        payload["input_mode"] = "flow_yaml"
+        return payload
+
+    if source_type == "flow_files":
+        payload = run_flow_files(
+            source_payload["flow_files"],
+            config_yaml=source_payload.get("config_yaml"),
+            dry_run=dry_run,
+            env=env,
+            workspace_id=source_payload.get("workspace_id"),
+            include_tags=source_payload.get("include_tags"),
+            exclude_tags=source_payload.get("exclude_tags"),
+            continue_on_failure=source_payload.get("continue_on_failure", True),
+        )
+        payload["entrypoint"] = "run_mercury_flow"
+        payload["input_mode"] = "flow_files"
+        return payload
+
+    payload = run_workspace_flow_tool(
+        workspace_id=source_payload["workspace_id"],
+        flow_id=source_payload["workspace_flow_id"],
+        dry_run=dry_run,
+        env=env,
+    )
+    payload["entrypoint"] = "run_mercury_flow"
+    payload["input_mode"] = "workspace_flow_id"
+    return payload
+
+
 def run_mercury_flow(
     flow_yaml: str | None = None,
     flow_files: dict[str, str] | list[dict[str, Any]] | None = None,
@@ -1622,7 +1713,7 @@ def run_mercury_flow(
     exclude_tags: list[str] | str | None = None,
     continue_on_failure: bool = True,
 ) -> dict[str, Any]:
-    """Run Mercury flows through one Maestro-style MCP entrypoint."""
+    """Backward-compatible Python wrapper around the typed public MCP tool."""
     modes = _selected_flow_input_modes(
         flow_yaml=flow_yaml,
         flow_files=flow_files,
@@ -1631,68 +1722,44 @@ def run_mercury_flow(
     if len(modes) != 1:
         payload = {
             "status": "error",
-            "message": (
-                "Pass exactly one of flow_yaml, flow_files, or workspace_flow_id."
-            ),
+            "message": "Pass exactly one of flow_yaml, flow_files, or workspace_flow_id.",
             "selected_modes": modes,
         }
         _audit("run_mercury_flow", {"selected_modes": modes, "dry_run": dry_run}, payload)
         return payload
 
     if modes[0] == "flow_yaml":
-        if config_yaml is not None or include_tags is not None or exclude_tags is not None:
+        source: dict[str, Any] = {
+            "source_type": "flow_yaml",
+            "flow_yaml": flow_yaml,
+            "workspace_id": workspace_id,
+        }
+    elif modes[0] == "flow_files":
+        source = {
+            "source_type": "flow_files",
+            "flow_files": _flow_files_from_payload(flow_files),
+            "workspace_id": workspace_id,
+            "config_yaml": config_yaml,
+            "include_tags": _string_list_from_payload(include_tags, label="include_tags"),
+            "exclude_tags": _string_list_from_payload(exclude_tags, label="exclude_tags"),
+            "continue_on_failure": continue_on_failure,
+        }
+    else:
+        if not workspace_id:
             payload = {
-                "status": "error",
-                "message": (
-                    "config_yaml, include_tags, and exclude_tags are valid only "
-                    "with flow_files."
-                ),
+                **_public_workspace_required_payload(),
+                "message": "workspace_id is required with workspace_flow_id.",
                 "selected_modes": modes,
             }
             _audit("run_mercury_flow", {"selected_modes": modes, "dry_run": dry_run}, payload)
             return payload
-        payload = run_flow(
-            flow_yaml or "",
-            dry_run=dry_run,
-            env=env,
-            workspace_id=workspace_id,
-        )
-        payload["entrypoint"] = "run_mercury_flow"
-        payload["input_mode"] = "flow_yaml"
-        return payload
-
-    if modes[0] == "flow_files":
-        payload = run_flow_files(
-            flow_files or {},
-            config_yaml=config_yaml,
-            dry_run=dry_run,
-            env=env,
-            workspace_id=workspace_id,
-            include_tags=include_tags,
-            exclude_tags=exclude_tags,
-            continue_on_failure=continue_on_failure,
-        )
-        payload["entrypoint"] = "run_mercury_flow"
-        payload["input_mode"] = "flow_files"
-        return payload
-
-    if not workspace_id:
-        payload = {
-            **_public_workspace_required_payload(),
-            "message": "workspace_id is required with workspace_flow_id.",
-            "selected_modes": modes,
+        source = {
+            "source_type": "workspace_flow",
+            "workspace_id": workspace_id,
+            "workspace_flow_id": workspace_flow_id,
         }
-        _audit("run_mercury_flow", {"selected_modes": modes, "dry_run": dry_run}, payload)
-        return payload
-    payload = run_workspace_flow_tool(
-        workspace_id=workspace_id,
-        flow_id=workspace_flow_id or "",
-        dry_run=dry_run,
-        env=env,
-    )
-    payload["entrypoint"] = "run_mercury_flow"
-    payload["input_mode"] = "workspace_flow_id"
-    return payload
+
+    return _run_mercury_flow_tool(source, dry_run=dry_run, env=env)
 
 
 @mcp.tool(annotations=_AUDITED_PRIVATE)
@@ -1847,14 +1914,15 @@ def save_workspace_flow_tool(
     workspace_id: str,
     title: str,
     flow_yaml: str,
-    metadata: dict[str, Any] | None = None,
+    metadata: WorkspaceFlowMetadata | None = None,
 ) -> dict[str, Any]:
     """Save one Mercury flow into the connected workspace."""
     try:
+        metadata_payload = _model_payload(metadata) or {"source": "mcp"}
         _reject_sensitive_storage_input(
             title=title,
             flow_yaml=flow_yaml,
-            metadata=metadata,
+            metadata=metadata_payload,
         )
         settings = load_settings()
         if not settings.supabase_configured:
@@ -1864,7 +1932,7 @@ def save_workspace_flow_tool(
             token_payload=token_payload,
             title=title,
             flow_yaml=flow_yaml,
-            metadata=metadata or {"source": "mcp"},
+            metadata=metadata_payload,
         )
         payload = redact_json({"status": "ok", "flow": _public_flow_summary(flow)})
         _audit(
@@ -1923,8 +1991,14 @@ def flows_cheat_sheet_resource() -> str:
 
 @mcp.resource("mercury://connectors")
 def connectors_resource() -> str:
-    """Return sanitized connector status."""
-    return str(connector_status())
+    """Return the public connector catalog; workspace status requires its tool."""
+    return str(
+        {
+            "status": "workspace_required",
+            "connectors": list_connector_public_summaries(),
+            "next_tool": "connector_status",
+        }
+    )
 
 
 @mcp.resource("mercury://audit/{event_id}")

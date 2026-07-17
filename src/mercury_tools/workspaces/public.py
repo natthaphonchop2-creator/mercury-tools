@@ -9,7 +9,7 @@ from typing import Any
 from mercury_tools.product import ConnectRequest
 
 PUBLIC_WORKSPACE_RE = re.compile(r"^mw_[A-Za-z0-9_-]{20,80}$")
-PUBLIC_WORKSPACE_TTL_SECONDS = 60 * 60 * 24 * 365 * 10
+PUBLIC_WORKSPACE_TTL_SECONDS = 60 * 60 * 24 * 30
 
 
 def new_public_workspace_id() -> str:
@@ -30,11 +30,12 @@ def public_workspace_token_payload(workspace_id: str) -> dict[str, Any]:
     return {
         "sub": f"public-{subject_hash}@workspace.invalid",
         "company": normalized,
+        "workspace_key": normalized,
         "host_app": "generic",
         "iat": now,
         "exp": now + PUBLIC_WORKSPACE_TTL_SECONDS,
         "jti": normalized,
-        "scope": ["public:contest"],
+        "scope": ["public:workspace"],
     }
 
 
