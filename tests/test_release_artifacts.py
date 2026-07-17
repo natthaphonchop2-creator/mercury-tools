@@ -971,8 +971,10 @@ def test_release_task13_gate_consumes_only_strict_sanitized_attestations(
     )
     gate_candidate = replace(
         candidate,
-        origin_url="https://github.com/example/mercury-tools.git",
-        repository_name="example/mercury-tools",
+        origin_url=(
+            "https://github.com/natthaphonchop2-creator/mercury-tools.git"
+        ),
+        repository_name="natthaphonchop2-creator/mercury-tools",
     )
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
@@ -1015,15 +1017,11 @@ def test_release_task13_gate_consumes_only_strict_sanitized_attestations(
         str(attestation_path),
     )
     monkeypatch.setenv("MERCURY_TRUSTED_HOSTED_ATTESTATION_SHA256", "a" * 64)
-    monkeypatch.setenv(
-        "MERCURY_RELEASE_CONTROL_REPOSITORY",
-        "example/release-control",
-    )
+    monkeypatch.setenv("MERCURY_RELEASE_CONTROL_REPOSITORY_ID", "1303413748")
+    monkeypatch.setenv("MERCURY_REVIEWED_REPOSITORY_ID", "1290137723")
     monkeypatch.setenv("MERCURY_RELEASE_CONTROL_SHA", "b" * 40)
     monkeypatch.setenv("MERCURY_RELEASE_CONTROL_RUN_ID", "123")
     monkeypatch.setenv("MERCURY_RELEASE_CONTROL_RUN_ATTEMPT", "2")
-    monkeypatch.setenv("MERCURY_RELEASE_STAGING_REPOSITORY", "example/staging")
-    monkeypatch.setenv("MERCURY_RELEASE_STAGING_REF", "v0.2.1-rc1")
 
     with release_artifacts.materialize_release_candidate(candidate) as snapshot:
         artifacts = tmp_path / "gate-artifacts"
@@ -1039,9 +1037,14 @@ def test_release_task13_gate_consumes_only_strict_sanitized_attestations(
     assert captured["attestation_path"] == attestation_path
     loader = captured["loader"]
     assert isinstance(loader, dict)
-    assert loader["expected_commit_sha"] == gate_candidate.commit_sha
-    assert loader["expected_producer_run_id"] == 123
-    assert loader["expected_producer_run_attempt"] == 2
+    assert loader["expected_reviewed_sha"] == gate_candidate.commit_sha
+    assert loader["expected_reviewed_repository_id"] == 1290137723
+    assert loader["expected_control_repository_id"] == 1303413748
+    assert loader["expected_control_run_id"] == 123
+    assert loader["expected_control_run_attempt"] == 2
+    assert loader["expected_public_tree_digest"] == (
+        release_artifacts.source_tree_digest(gate_candidate.entries)
+    )
     assert captured["scan"] == {"hosted_attestations": trusted_surfaces}
 
 

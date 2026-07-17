@@ -57,16 +57,17 @@ from mercury_tools.release.scanner import (
     load_secret_scan_allowlist,
     scan_public_release,
 )
-from mercury_tools.release.trusted_attestation import (
+from mercury_tools.release.trusted_attestation_v2 import (
     TRUSTED_HOSTED_ATTESTATION_ENV,
     TRUSTED_HOSTED_ATTESTATION_SHA256_ENV,
-    TRUSTED_RELEASE_CONTROL_REPOSITORY_ENV,
+    TRUSTED_RELEASE_CONTROL_REPOSITORY_ID_ENV,
     TRUSTED_RELEASE_CONTROL_RUN_ATTEMPT_ENV,
     TRUSTED_RELEASE_CONTROL_RUN_ID_ENV,
     TRUSTED_RELEASE_CONTROL_SHA_ENV,
-    TRUSTED_STAGING_REF_ENV,
-    TRUSTED_STAGING_REPOSITORY_ENV,
-    load_trusted_hosted_release_attestation,
+    TRUSTED_REVIEWED_REPOSITORY_ID_ENV,
+)
+from mercury_tools.release.trusted_attestation_v2 import (
+    load_trusted_attestation_v2 as load_trusted_hosted_release_attestation,
 )
 
 MANIFEST_FILE_NAME = "SHA256SUMS.json"
@@ -3946,28 +3947,24 @@ def _run_task13_artifact_gate(
             expected_payload_sha256=_required_release_environment(
                 TRUSTED_HOSTED_ATTESTATION_SHA256_ENV
             ),
-            expected_repository=repo,
-            expected_commit_sha=candidate.commit_sha,
-            expected_producer_repository=_required_release_environment(
-                TRUSTED_RELEASE_CONTROL_REPOSITORY_ENV
+            expected_reviewed_repository=repo,
+            expected_reviewed_repository_id=_positive_release_environment(
+                TRUSTED_REVIEWED_REPOSITORY_ID_ENV
             ),
-            expected_producer_sha=_required_release_environment(
+            expected_reviewed_sha=candidate.commit_sha,
+            expected_control_repository_id=_positive_release_environment(
+                TRUSTED_RELEASE_CONTROL_REPOSITORY_ID_ENV
+            ),
+            expected_control_sha=_required_release_environment(
                 TRUSTED_RELEASE_CONTROL_SHA_ENV
             ),
-            expected_producer_run_id=_positive_release_environment(
+            expected_control_run_id=_positive_release_environment(
                 TRUSTED_RELEASE_CONTROL_RUN_ID_ENV
             ),
-            expected_producer_run_attempt=_positive_release_environment(
+            expected_control_run_attempt=_positive_release_environment(
                 TRUSTED_RELEASE_CONTROL_RUN_ATTEMPT_ENV
             ),
-            expected_staging_repository=_required_release_environment(
-                TRUSTED_STAGING_REPOSITORY_ENV
-            ),
-            expected_staging_ref=_required_release_environment(
-                TRUSTED_STAGING_REF_ENV
-            ),
-            public_surface_manifest=manifest_path,
-            secret_scan_allowlist=allowlist_path,
+            expected_public_tree_digest=source_tree_digest(candidate.entries),
         )
         report = scan_public_release(
             request,
