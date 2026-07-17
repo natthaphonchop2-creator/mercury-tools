@@ -414,3 +414,101 @@ async def test_public_mcp_tool_schemas_use_workspace_id() -> None:
 
     for tool in tools.values():
         assert "client_token" not in tool.inputSchema.get("properties", {}), tool.name
+
+
+@pytest.mark.asyncio
+async def test_public_mcp_tool_schemas_are_explicit_for_plugin_review() -> None:
+    from mercury_tools.mcp.server import mcp
+
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+
+    search_schema = tools["search_knowledge"].inputSchema
+    assert search_schema["properties"]["mode"]["enum"] == [
+        "hybrid",
+        "keyword",
+        "vector",
+    ]
+    search_filter_ref = search_schema["properties"]["filters"]["anyOf"][0]["$ref"]
+    search_filter_schema = search_schema["$defs"][search_filter_ref.rsplit("/", 1)[-1]]
+    assert search_filter_schema["additionalProperties"] is False
+    assert {
+        "jurisdiction",
+        "connector",
+        "doc_type",
+        "review_status",
+        "effective_date",
+        "environment",
+        "capability",
+    } <= set(search_filter_schema["properties"])
+
+    context_schema = tools["retrieve_context_pack"].inputSchema
+    context_filter_ref = context_schema["properties"]["filters"]["anyOf"][0]["$ref"]
+    assert context_filter_ref.rsplit("/", 1)[-1] in context_schema["$defs"]
+
+    setup_schema = tools["start_connector_setup"].inputSchema
+    assert setup_schema["properties"]["environment"]["enum"] == [
+        "production",
+        "sandbox",
+        "uat",
+        "local",
+        "gateway",
+    ]
+
+    status_schema = tools["connector_status"].inputSchema
+    assert "workspace_id" in status_schema["required"]
+
+    skill_schema = tools["run_accounting_skill"].inputSchema
+    skill_input_ref = skill_schema["properties"]["inputs"]["$ref"]
+    skill_input_schema = skill_schema["$defs"][skill_input_ref.rsplit("/", 1)[-1]]
+    assert skill_input_schema["additionalProperties"] is False
+    assert {"query", "connector_id", "environment", "period_start", "period_end"} <= set(
+        skill_input_schema["properties"]
+    )
+
+    for tool_name in {"inspect_flow_files", "run_flow_files"}:
+        flow_schema = tools[tool_name].inputSchema
+        assert flow_schema["properties"]["flow_files"]["type"] == "array"
+        assert "$ref" in flow_schema["properties"]["flow_files"]["items"]
+        assert flow_schema["properties"]["include_tags"]["anyOf"][0]["type"] == "array"
+        assert flow_schema["properties"]["exclude_tags"]["anyOf"][0]["type"] == "array"
+
+    unified_schema = tools["run_mercury_flow"].inputSchema
+    source_schema = unified_schema["properties"]["source"]
+    assert source_schema["discriminator"]["propertyName"] == "source_type"
+    assert len(source_schema["oneOf"]) == 3
+    assert "flow_yaml" not in unified_schema["properties"]
+    assert "flow_files" not in unified_schema["properties"]
+    assert "workspace_flow_id" not in unified_schema["properties"]
+
+    save_schema = tools["save_workspace_flow"].inputSchema
+    metadata_ref = save_schema["properties"]["metadata"]["anyOf"][0]["$ref"]
+    metadata_schema = save_schema["$defs"][metadata_ref.rsplit("/", 1)[-1]]
+    assert metadata_schema["additionalProperties"] is False
+    assert {"source", "connector_id", "environment", "required_capabilities"} <= set(
+        metadata_schema["properties"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_typed_run_mercury_flow_schema_executes_through_fastmcp() -> None:
+    from mercury_tools.mcp.server import mcp
+
+    _content, structured = await mcp.call_tool(
+        "run_mercury_flow",
+        {
+            "source": {
+                "source_type": "flow_yaml",
+                "flow_yaml": (
+                    "name: Typed schema smoke\n"
+                    "---\n"
+                    "- emitReport:\n"
+                    "    title: Typed schema smoke\n"
+                ),
+            },
+            "dry_run": True,
+        },
+    )
+
+    assert structured["status"] == "planned"
+    assert structured["input_mode"] == "flow_yaml"
+    assert structured["artifacts"][0]["title"] == "Typed schema smoke"

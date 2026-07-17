@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from mercury_tools.workspaces.public import (
@@ -31,7 +33,10 @@ def test_public_workspace_payload_uses_workspace_id_as_internal_jti() -> None:
     request = public_workspace_connect_request(workspace_id, "Demo Company")
 
     assert payload["jti"] == workspace_id
-    assert payload["scope"] == ["public:contest"]
+    assert payload["workspace_key"] == workspace_id
+    assert payload["scope"] == ["public:workspace"]
+    assert payload["exp"] - payload["iat"] == 60 * 60 * 24 * 30
+    assert payload["exp"] > int(time.time())
     assert request.company == "Demo Company"
     assert request.host_app == "generic"
     assert workspace_id not in request.email

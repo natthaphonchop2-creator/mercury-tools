@@ -444,7 +444,12 @@ class SupabaseProductStore:
 
     def _fallback_workspace_for_token(self, token_payload: dict[str, Any]) -> dict[str, Any]:
         key = workspace_key(
-            str(token_payload.get("company") or token_payload.get("sub") or "workspace")
+            str(
+                token_payload.get("workspace_key")
+                or token_payload.get("company")
+                or token_payload.get("sub")
+                or "workspace"
+            )
         )
         workspace = {
             "id": stable_id("workspace", key),
@@ -1072,7 +1077,9 @@ class SupabaseProductStore:
         workspace = self._upsert_one(
             "mercury_workspaces",
             {
-                "workspace_key": workspace_key(request.company),
+                "workspace_key": workspace_key(
+                    str(token_payload.get("workspace_key") or request.company)
+                ),
                 "name": request.company.strip(),
                 "plan": "invite-preview",
                 "status": "active",
@@ -1132,13 +1139,29 @@ class SupabaseProductStore:
             "mercury_client_tokens",
             params={
                 "token_jti": f"eq.{token_payload.get('jti')}",
-                "select": "id,status,workspace_id,member_id,host_app,expires_at",
+                "select": (
+                    "id,status,workspace_id,member_id,host_app,scopes,"
+                    "expires_at,revoked_at"
+                ),
                 "limit": "1",
             },
         )
         if not rows:
             return None
         token = rows[0]
+        expires_at = str(token.get("expires_at") or "").replace("Z", "+00:00")
+        try:
+            expires_at_value = datetime.fromisoformat(expires_at)
+        except ValueError:
+            return None
+        if expires_at_value.tzinfo is None:
+            expires_at_value = expires_at_value.replace(tzinfo=UTC)
+        if (
+            token.get("status") != "active"
+            or token.get("revoked_at")
+            or expires_at_value <= datetime.now(tz=UTC)
+        ):
+            return None
         workspace = self._request(
             "GET",
             "mercury_workspaces",
@@ -1157,6 +1180,8 @@ class SupabaseProductStore:
                 "limit": "1",
             },
         )[0]
+        if workspace.get("status") != "active" or member.get("status") != "active":
+            return None
         return {"token": token, "workspace": workspace, "member": member}
 
     def dashboard(self, token_payload: dict[str, Any]) -> dict[str, Any]:
