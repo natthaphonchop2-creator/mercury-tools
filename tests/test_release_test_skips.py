@@ -49,9 +49,9 @@ def _waiver(test_id: str, **overrides: object) -> dict[str, object]:
     return row
 
 
-def test_v021_release_waiver_manifest_exists_parses_and_names_only_approved_skips() -> None:
+def test_v022_release_waiver_manifest_exists_parses_and_names_only_approved_skips() -> None:
     waivers = _load_waivers(
-        ROOT / "docs/release/v0.2.1-test-waivers.json",
+        ROOT / "docs/release/v0.2.2-test-waivers.json",
         today=date(2026, 7, 15),
     )
 

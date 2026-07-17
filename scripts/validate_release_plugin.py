@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the static Mercury Finance v0.2.1 release package offline."""
+"""Validate the static Mercury Finance v0.2.2 release package offline."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ MARKETPLACE_PATH = Path(".agents/plugins/marketplace.json")
 PYPROJECT_PATH = Path("pyproject.toml")
 EXPECTED_ARGS = [
     "--from",
-    "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.1",
+    "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.2",
     "mercury",
     "mcp",
     "serve-local",
@@ -155,7 +155,7 @@ def validate_release(root: Path) -> list[str]:
     if server.get("command") != "uvx":
         errors.append("mcp launcher command must be uvx")
     if server.get("args") != EXPECTED_ARGS:
-        errors.append("mcp launcher must use the immutable v0.2.1 Git tag")
+        errors.append("mcp launcher must use the immutable v0.2.2 Git tag")
     if server.get("cwd") != ".":
         errors.append("mcp launcher cwd must be .")
     if server.get("tool_timeout_sec") != 900:
@@ -173,8 +173,8 @@ def validate_release(root: Path) -> list[str]:
     interface = plugin.get("interface") if isinstance(plugin.get("interface"), dict) else {}
     if plugin.get("name") != "mercury-finance":
         errors.append("plugin name must be mercury-finance")
-    if plugin.get("version") != "0.2.1+codex.20260713":
-        errors.append("plugin version must be 0.2.1+codex.20260713")
+    if plugin.get("version") != "0.2.2+codex.20260717":
+        errors.append("plugin version must be 0.2.2+codex.20260717")
     if plugin.get("mcpServers") != "./.mcp.json":
         errors.append("plugin must reference ./.mcp.json")
     if interface.get("capabilities") != ["Interactive", "Read", "Write"]:
@@ -213,10 +213,10 @@ def validate_release(root: Path) -> list[str]:
         if isinstance(project.get("optional-dependencies"), dict)
         else {}
     )
-    if project.get("version") != "0.2.1":
-        errors.append("package version must be 0.2.1")
+    if project.get("version") != "0.2.2":
+        errors.append("package version must be 0.2.2")
     if project.get("dependencies") != EXPECTED_DEPENDENCIES:
-        errors.append("release runtime dependencies must be exact v0.2.1 pins")
+        errors.append("release runtime dependencies must be exact v0.2.2 pins")
     if optional.get("openai") != ["openai==2.44.0"]:
         errors.append("openai must be optional at exactly 2.44.0")
 
@@ -235,7 +235,7 @@ def main() -> int:
         return 1
     print(
         "release plugin validation passed "
-        "(v0.2.1 static checks only; remote tag smoke is a post-review gate)"
+        "(v0.2.2 static checks only; remote tag smoke is a post-review gate)"
     )
     return 0
 

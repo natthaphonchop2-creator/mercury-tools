@@ -6,18 +6,61 @@ from pathlib import Path
 
 import pytest
 
+from mercury_tools.release.models import HostedSurfaceScanResult
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.verify_render_release import (  # noqa: E402
     EXPECTED_HOSTED_TOOLS,
+    LiveRenderProbe,
     McpReleaseEvidence,
     RenderReleaseError,
     verify_render_release,
 )
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 COMMIT = "a" * 40
+
+
+def test_live_render_probe_rejects_unsafe_owner_id() -> None:
+    with pytest.raises(RenderReleaseError, match="^render_owner_id_invalid$"):
+        LiveRenderProbe(
+            base_url="https://mercury.example",
+            mcp_token=None,
+            render_api_url="https://api.render.example",
+            render_owner_id="owner/unsafe",
+            render_service_id="srv-safe",
+            render_token="operator-token",
+        )
+
+
+def test_live_render_probe_accepts_clean_http_log_receipts_without_command_exit_codes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = LiveRenderProbe(
+        base_url="https://mercury.example",
+        mcp_token=None,
+        render_api_url="https://api.render.example",
+        render_owner_id="tea-safe",
+        render_service_id="srv-safe",
+        render_token="operator-token",
+    )
+    monkeypatch.setattr(
+        "scripts.verify_render_release.build_hosted_clients",
+        lambda _config: {"render_build_and_runtime_logs": object()},
+    )
+    monkeypatch.setattr(
+        "scripts.verify_render_release.scan_hosted_surface",
+        lambda *_args: HostedSurfaceScanResult(
+            surface="render_build_and_runtime_logs",
+            scanner_version="1.0.0",
+            evidence_hashes=("a" * 64, "b" * 64),
+            exit_codes=(),
+        ),
+    )
+
+    assert probe.scan_logs() is True
 
 
 def _tools() -> tuple[dict[str, object], ...]:

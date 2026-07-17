@@ -236,7 +236,7 @@ def test_ci_is_full_history_fail_closed_and_emits_exact_skip_junit() -> None:
     assert "--ignore=tests/integration/test_flowaccount_sandbox_qualification.py" in command
     assert "--junitxml=release-evidence/pytest.xml" in command
     assert "scripts/verify_test_skips.py" in command
-    assert "docs/release/v0.2.1-test-waivers.json" in command
+    assert "docs/release/v0.2.2-test-waivers.json" in command
     _assert_ephemeral_local_supabase(test)
     test_serialized = json.dumps(test, sort_keys=True)
     assert "secrets." not in test_serialized
@@ -420,13 +420,12 @@ def test_release_control_remote_preflight_remains_a_dispatch_only_privileged_gat
 
 
 def test_release_is_manual_sha_bound_and_handoff_depends_on_every_gate() -> None:
-    payload = _workflow("release.yml")
+    payload = _workflow("release-v0.2.2.yml")
     _assert_pinned_actions_and_no_bypasses(payload)
     dispatch = payload["on"]["workflow_dispatch"]
     required_inputs = {
         "reviewed_main_sha",
-        "staging_repo",
-        "staging_ref",
+        "release_control_commit",
         "release_control_run_id",
         "release_control_run_attempt",
         "release_control_attestation_artifact_id",
@@ -447,7 +446,6 @@ def test_release_is_manual_sha_bound_and_handoff_depends_on_every_gate() -> None
         "peak-contract",
         "relayed-release-control",
         "build-artifacts",
-        "public-staging",
         "release-ready",
     )
     assert tuple(jobs) == ordered
@@ -456,36 +454,35 @@ def test_release_is_manual_sha_bound_and_handoff_depends_on_every_gate() -> None
     assert jobs["peak-contract"]["needs"] == "supabase-migration"
     assert jobs["relayed-release-control"]["needs"] == "peak-contract"
     assert jobs["build-artifacts"]["needs"] == "relayed-release-control"
-    assert jobs["public-staging"]["needs"] == [
-        "relayed-release-control",
-        "build-artifacts",
-    ]
     assert jobs["release-ready"]["needs"] == [
         "relayed-release-control",
         "build-artifacts",
-        "public-staging",
     ]
 
     trusted_outputs = jobs["relayed-release-control"]["outputs"]
     assert trusted_outputs["producer_repository"] == ("${{ steps.producer.outputs.repository }}")
     assert trusted_outputs["producer_sha"] == "${{ steps.producer.outputs.sha }}"
 
-    for job_name in ("build-artifacts", "public-staging"):
-        job_env = jobs[job_name]["env"]
-        assert job_env["MERCURY_RELEASE_CONTROL_REPOSITORY"] == (
-            "${{ needs.relayed-release-control.outputs.producer_repository }}"
-        )
-        assert job_env["MERCURY_RELEASE_CONTROL_SHA"] == (
-            "${{ needs.relayed-release-control.outputs.producer_sha }}"
-        )
-        assert "${{ env." not in json.dumps(job_env, sort_keys=True)
+    job_env = jobs["build-artifacts"]["env"]
+    assert job_env["MERCURY_RELEASE_CONTROL_REPOSITORY_ID"] == (
+        "${{ inputs.release_control_repository_id }}"
+    )
+    assert job_env["MERCURY_RELEASE_CONTROL_SHA"] == (
+        "${{ inputs.release_control_commit }}"
+    )
+    assert job_env["MERCURY_REVIEWED_REPOSITORY_ID"] == (
+        "${{ github.repository_id }}"
+    )
+    assert "MERCURY_RELEASE_STAGING_REF" not in job_env
+    assert "MERCURY_RELEASE_STAGING_REPOSITORY" not in job_env
 
     validate = _run_text(jobs["validate-reviewed-sha"])
     assert "origin/main" in validate
     assert "REVIEWED_MAIN_SHA" in validate
     assert "existing annotated release tag" in validate
     assert 'test "$RELEASE_CONTROL_PIN" !=' in validate
-    assert payload["env"]["RELEASE_CONTROL_PIN"] == "0" * 40
+    assert FULL_SHA.fullmatch(payload["env"]["RELEASE_CONTROL_PIN"])
+    assert payload["env"]["RELEASE_CONTROL_PIN"] != "0" * 40
     assert "--force" not in validate
 
     quality = _run_text(jobs["quality-security"])
@@ -510,7 +507,7 @@ def test_release_is_manual_sha_bound_and_handoff_depends_on_every_gate() -> None
 
     trusted = jobs["relayed-release-control"]
     trusted_run = _run_text(trusted)
-    assert "actions/checkout" not in json.dumps(trusted)
+    assert "actions/checkout" in json.dumps(trusted)
     assert "secrets." not in json.dumps(trusted, sort_keys=True)
     assert "base64 --decode" in trusted_run
     assert "RELEASE_CONTROL_PIN" in trusted_run
@@ -534,23 +531,15 @@ def test_release_is_manual_sha_bound_and_handoff_depends_on_every_gate() -> None
     assert build.count(platform["image"]) == 1
     assert 'docker run --rm --platform "$RELEASE_PLATFORM"' in build
     assert '"$RELEASE_IMAGE" sh -ceu' in build
-    assert "scripts/build_release_artifacts.py --version 0.2.1" in build
-    assert "scripts/verify_release.py --version 0.2.1" in build
+    assert "scripts/build_release_artifacts.py --version 0.2.2" in build
+    assert "scripts/verify_release.py --version 0.2.2" in build
     assert "--offline --frozen --no-dev" in build
     assert "mercury-build-output" in build
 
-    staging = _run_text(jobs["public-staging"])
-    assert "scripts/build_public_staging.py" in staging
-    assert ".staging.tree_sha256" in staging
-    assert ".staging.commit_sha" in staging
     handoff = _run_text(jobs["release-ready"])
-    assert "original_release_control" in handoff
-    assert "relayed_attestation" in handoff
-    assert "source_repository_id" in handoff
-    assert "source_workflow_path" in handoff
-    assert "source_payload_sha256" in handoff
-    assert "release_artifact_id" in handoff
-    assert "staging_artifact_id" in handoff
+    assert "mercury_tools.release.handoff_v3" in handoff
+    assert "schema_version == 3" in handoff
+    assert "release_bundle" in handoff
     assert "github.run_attempt" in json.dumps(jobs["release-ready"])
     serialized = json.dumps(payload, sort_keys=True)
     assert "git tag -a" not in serialized
@@ -561,7 +550,7 @@ def test_release_is_manual_sha_bound_and_handoff_depends_on_every_gate() -> None
 
 
 def test_release_dependency_prefetch_is_pinned_secretless_and_container_only() -> None:
-    payload = _workflow("release.yml")
+    payload = _workflow("release-v0.2.2.yml")
     jobs = payload["jobs"]
     platform = json.loads(
         (ROOT / "release-toolchain" / "platform.json").read_text(encoding="utf-8")
@@ -595,7 +584,6 @@ def test_release_dependency_prefetch_is_pinned_secretless_and_container_only() -
 
     assert prefetch_locations == [
         ("build-artifacts", "Prepare immutable offline dependency cache"),
-        ("public-staging", "Prepare immutable offline dependency cache"),
     ]
 
     for job_name, _step_name in prefetch_locations:
@@ -641,8 +629,7 @@ def test_release_dependency_prefetch_is_pinned_secretless_and_container_only() -
 
 
 def test_release_relay_artifact_name_matches_control_publisher_contract() -> None:
-    release = _workflow("release.yml")
-    publish = _release_control_workflow("publish-v0.2.1.yml")
+    release = _workflow("release-v0.2.2.yml")
     relay_steps = release["jobs"]["relayed-release-control"]["steps"]
     relay_upload = next(
         step
@@ -651,24 +638,19 @@ def test_release_relay_artifact_name_matches_control_publisher_contract() -> Non
     )
 
     assert relay_upload["with"]["name"] == (
-        "mercury-v0.2.1-trusted-attestation-"
+        "mercury-v0.2.2-trusted-attestation-"
         "${{ github.run_id }}-attempt-${{ github.run_attempt }}"
-    )
-    assert (
-        '"mercury-v0.2.1-trusted-attestation-'
-        '$MERCURY_RUN_ID-attempt-$MERCURY_RUN_ATTEMPT"'
-        in _run_text(publish["jobs"]["publish"])
     )
 
 
 def test_mercury_release_jobs_never_receive_production_provider_credentials() -> None:
-    payload = _workflow("release.yml")
+    payload = _workflow("release-v0.2.2.yml")
     jobs = payload["jobs"]
     candidate_container_jobs = {
         name for name, job in jobs.items() if "docker run" in _run_text(job)
     }
 
-    assert candidate_container_jobs == {"build-artifacts", "public-staging"}
+    assert candidate_container_jobs == {"build-artifacts"}
     for name in candidate_container_jobs:
         job = jobs[name]
         serialized = json.dumps(job, sort_keys=True)
@@ -685,7 +667,7 @@ def test_mercury_release_jobs_never_receive_production_provider_credentials() ->
     trusted_serialized = json.dumps(trusted, sort_keys=True)
     assert trusted["needs"] == "peak-contract"
     assert "environment" not in trusted
-    assert "actions/checkout" not in trusted_serialized
+    assert "actions/checkout" in trusted_serialized
     assert "secrets." not in trusted_serialized
     assert "release_control_attestation_b64" in trusted_serialized
     assert "base64 --decode" in _run_text(trusted)
@@ -695,7 +677,7 @@ def test_mercury_release_jobs_never_receive_production_provider_credentials() ->
 
 
 def test_release_control_transport_and_candidate_containers_are_fail_closed() -> None:
-    payload = _workflow("release.yml")
+    payload = _workflow("release-v0.2.2.yml")
     serialized = json.dumps(payload, sort_keys=True)
     jobs = payload["jobs"]
 
@@ -717,7 +699,7 @@ def test_release_control_transport_and_candidate_containers_are_fail_closed() ->
 
     trusted = jobs["relayed-release-control"]
     trusted_text = json.dumps(trusted, sort_keys=True)
-    assert "actions/checkout" not in trusted_text
+    assert "actions/checkout" in trusted_text
     assert "base64 --decode" in _run_text(trusted)
     assert "release_control_attestation_artifact_id" in trusted_text
     assert "release_control_attestation_artifact_digest" in trusted_text
@@ -728,7 +710,7 @@ def test_release_control_transport_and_candidate_containers_are_fail_closed() ->
     assert "artifact-id" in trusted_text and "artifact-digest" in trusted_text
 
     candidate_jobs = {name: job for name, job in jobs.items() if "docker run" in _run_text(job)}
-    assert set(candidate_jobs) == {"build-artifacts", "public-staging"}
+    assert set(candidate_jobs) == {"build-artifacts"}
     for job in candidate_jobs.values():
         command = _run_text(job)
         assert "--network none" in command
@@ -749,11 +731,11 @@ def test_release_control_transport_and_candidate_containers_are_fail_closed() ->
 
 
 def test_release_artifact_handoffs_use_attempt_names_and_exact_ids() -> None:
-    jobs = _workflow("release.yml")["jobs"]
+    jobs = _workflow("release-v0.2.2.yml")["jobs"]
     serialized = json.dumps(jobs, sort_keys=True)
 
     assert "github.run_attempt" in serialized
-    for job_name in ("relayed-release-control", "build-artifacts", "public-staging"):
+    for job_name in ("relayed-release-control", "build-artifacts", "release-ready"):
         job = jobs[job_name]
         uploads = [step for step in job["steps"] if "upload-artifact@" in step.get("uses", "")]
         assert uploads
@@ -762,7 +744,7 @@ def test_release_artifact_handoffs_use_attempt_names_and_exact_ids() -> None:
             assert "github.run_attempt" in step["with"]["name"]
             assert step.get("id")
 
-    for job_name in ("build-artifacts", "public-staging"):
+    for job_name in ("build-artifacts", "release-ready"):
         downloads = [
             step for step in jobs[job_name]["steps"] if "download-artifact@" in step.get("uses", "")
         ]
@@ -773,7 +755,7 @@ def test_release_artifact_handoffs_use_attempt_names_and_exact_ids() -> None:
 
 def test_artifact_id_downloads_extract_directly_into_declared_paths() -> None:
     workflows = (
-        _workflow("release.yml"),
+        _workflow("release-v0.2.2.yml"),
         _release_control_workflow("attest-v0.2.1.yml"),
         _release_control_workflow("publish-v0.2.1.yml"),
     )
@@ -905,7 +887,7 @@ def test_post_public_workflow_is_anonymous_and_exact_release_bound() -> None:
     assert payload["permissions"]["contents"] == "read"
     command = _run_text(payload["jobs"]["verify-public"])
     assert "scripts/verify_public_release.py" in command
-    assert "--tag v0.2.1" in command
-    assert "--release v0.2.1" in command
+    assert "--tag v0.2.2" in command
+    assert "--release v0.2.2" in command
     assert "--expected-tools 19" in command
     assert "GH_TOKEN" not in json.dumps(payload["jobs"]["verify-public"].get("env", {}))

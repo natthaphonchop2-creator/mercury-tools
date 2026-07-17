@@ -1,6 +1,6 @@
 {
   "name": "mercury-finance",
-  "version": "0.2.1+codex.20260713",
+  "version": "0.2.2+codex.20260717",
   "description": "Local ERP accounting tools for repository-scoped FlowAccount and PEAK work.",
   "author": {
     "name": "Mercury Agent",
