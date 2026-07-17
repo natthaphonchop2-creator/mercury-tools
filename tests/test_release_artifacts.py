@@ -46,7 +46,7 @@ from mercury_tools.release.verify import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 FIXTURE_TIMESTAMP = "2026-07-14T00:00:00+00:00"
 _FIXTURE_BUILD_TOOL_VERSION = "0.0.1"
 _FIXTURE_SETUPOOLS_VERSION = "80.0.0"
@@ -493,7 +493,7 @@ def make_release_tree(tmp_path: Path) -> Path:
     pyproject.write_text(
         pyproject.read_text(encoding="utf-8").replace(
             'version = "0.2.0"',
-            'version = "0.2.1"',
+            'version = "0.2.2"',
             1,
         ),
         encoding="utf-8",
@@ -501,12 +501,12 @@ def make_release_tree(tmp_path: Path) -> Path:
     mcp_path = root / "plugins/mercury-finance/.mcp.json"
     mcp = json.loads(mcp_path.read_text(encoding="utf-8"))
     mcp["mcpServers"]["mercury-finance"]["args"][1] = (
-        "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.1"
+        "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.2"
     )
     mcp_path.write_text(json.dumps(mcp, indent=2) + "\n", encoding="utf-8")
     plugin_path = root / "plugins/mercury-finance/.codex-plugin/plugin.json"
     plugin = json.loads(plugin_path.read_text(encoding="utf-8"))
-    plugin["version"] = str(plugin["version"]).replace("0.2.0", "0.2.1", 1)
+    plugin["version"] = str(plugin["version"]).replace("0.2.0", "0.2.2", 1)
     plugin_path.write_text(json.dumps(plugin, indent=2) + "\n", encoding="utf-8")
     _install_exact_build_toolchain_fixture(root)
 
@@ -533,7 +533,7 @@ def make_v020_release_tree(tmp_path: Path) -> Path:
     pyproject = root / "pyproject.toml"
     pyproject.write_text(
         pyproject.read_text(encoding="utf-8").replace(
-            'version = "0.2.1"',
+            'version = "0.2.2"',
             'version = "0.2.0"',
             1,
         ),
@@ -1626,7 +1626,7 @@ def test_release_runtime_rejects_hash_valid_uv_launcher_with_different_interpret
     assert not output.exists()
 
 
-def test_current_v020_source_fails_closed_for_v021_request(tmp_path: Path) -> None:
+def test_current_v020_source_fails_closed_for_v022_request(tmp_path: Path) -> None:
     root = make_v020_release_tree(tmp_path)
     with pytest.raises(ReleaseGateError, match="^release_version_mismatch$"):
         build_release_artifacts(
