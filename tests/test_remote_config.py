@@ -50,3 +50,16 @@ def test_connect_signing_secret_is_loaded_independently(monkeypatch) -> None:
     settings = load_settings()
 
     assert settings.connect_signing_secret == "connect-secret"
+
+
+def test_openai_apps_challenge_token_is_loaded_without_affecting_http_auth(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_APPS_CHALLENGE_TOKEN", "x")
+    monkeypatch.delenv("MERCURY_TOOLS_HTTP_BEARER_TOKEN", raising=False)
+    monkeypatch.delenv("MERCURY_CONNECT_SIGNING_SECRET", raising=False)
+
+    settings = load_settings()
+
+    assert settings.openai_apps_challenge_token == "x"
+    assert settings.http_auth_configured is False

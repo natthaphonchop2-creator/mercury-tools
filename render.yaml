@@ -18,6 +18,8 @@ services:
         value: "false"
       - key: MERCURY_CONNECT_SIGNING_SECRET
         sync: false
+      - key: OPENAI_APPS_CHALLENGE_TOKEN
+        sync: false
       - key: MERCURY_TOOLS_PUBLIC_BASE_URL
         sync: false
       - key: SUPABASE_URL
