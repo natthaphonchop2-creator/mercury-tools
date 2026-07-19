@@ -8,7 +8,14 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 ConnectorId = Literal["flowaccount", "peak", "express", "custom", "generic_mcp"]
-ConnectorEnvironment = Literal["production", "sandbox", "uat", "local", "gateway"]
+ConnectorEnvironment = Literal[
+    "production",
+    "sandbox",
+    "uat",
+    "local",
+    "gateway",
+    "user_supplied",
+]
 ConnectorConnectionMode = Literal["native_mcp", "api_driver", "local_bridge"]
 ConnectorUnlinkConfirmation = Literal["unlink"]
 SearchMode = Literal["hybrid", "keyword", "vector"]

@@ -220,6 +220,82 @@ def test_link_connector_profile_returns_a_sanitized_mode_specific_profile(monkey
     assert "super-secret-value" not in str(payload)
 
 
+def test_generic_mcp_user_supplied_profile_links_and_validates_discovered_tools(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    configure_product_env(monkeypatch)
+    captured: dict[str, dict[str, Any]] = {}
+
+    class FakeStore:
+        def link_connector_profile(self, **kwargs: Any) -> dict[str, Any]:
+            captured["link"] = kwargs
+            return {
+                "connector_id": kwargs["connector_id"],
+                "connection_mode": kwargs["connection_mode"],
+                "environment": kwargs["environment"],
+                "external_server_name": kwargs["external_server_name"],
+                "capability_states": {},
+                "evidence_source": None,
+                "validated_at": None,
+                "status": "needs_validation",
+            }
+
+        def validate_connector_profile(self, **kwargs: Any) -> dict[str, Any]:
+            captured["validate"] = kwargs
+            return {
+                "connector_id": kwargs["connector_id"],
+                "connection_mode": kwargs["connection_mode"],
+                "environment": kwargs["environment"],
+                "capability_states": kwargs["capability_states"],
+                "evidence_source": kwargs["evidence_source"],
+                "validated_at": kwargs["validated_at"],
+                "status": "ready_read_only",
+            }
+
+    monkeypatch.setattr(server, "_product_store", lambda settings: FakeStore())
+
+    linked = server.link_connector_profile(
+        workspace_id=make_workspace_id(),
+        connector_id="generic_mcp",
+        connection_mode="native_mcp",
+        environment="user_supplied",
+        external_server_name="customer-ledger-mcp",
+    )
+    validated = server.validate_connector_connection(
+        workspace_id=make_workspace_id(),
+        connector_id="generic_mcp",
+        connection_mode="native_mcp",
+        environment="user_supplied",
+        evidence={
+            "source": "native_mcp_safe_read",
+            "status": "succeeded",
+            "observed_at": "2026-07-19T12:00:00Z",
+            "evidence_ref": "evidence_generic_tools_1234",
+            "provider_tool_name": "ledger.entries.list",
+            "capabilities": [
+                {"capability": "ledger.entries.list", "state": "observed"}
+            ],
+        },
+    )
+
+    assert linked["status"] == "ok"
+    assert captured["link"]["environment"] == "user_supplied"
+    assert validated["status"] == "ok"
+    assert captured["validate"]["capability_states"] == {
+        "ledger.entries.list": "observed"
+    }
+    resolution = server._workspace_connector_resolution(
+        {"connector_profiles": [validated["profile"]]},
+        connector_id="generic_mcp",
+        connection_mode="native_mcp",
+        environment="user_supplied",
+        required_capabilities=["ledger.entries.list"],
+    )
+    assert resolution["ready"] is True
+
+
 def test_validate_connector_connection_records_host_observed_evidence(monkeypatch) -> None:
     from mercury_tools.mcp import server
 

@@ -455,6 +455,8 @@ def test_product_mutation_requires_supabase(monkeypatch) -> None:
     )
 
     assert response.status_code == 503
+    assert response.json()["deprecated_tool"] == "start_connector_setup"
+    assert response.json()["replacement_tool"] == "link_connector_profile"
 
 
 def test_legacy_connector_setup_rejects_missing_mode_and_unsafe_fields(monkeypatch) -> None:
@@ -478,13 +480,14 @@ def test_legacy_connector_setup_rejects_missing_mode_and_unsafe_fields(monkeypat
     monkeypatch.setattr(server, "_product_store", lambda _settings=None: FakeStore())
     client = TestClient(create_http_app(require_auth=True), raise_server_exceptions=False)
     headers = {"Authorization": f"Bearer {make_client_token()}"}
+    rejected_secret = "arbitrary-extra-field-secret-7f89c2"
     unsafe_bodies = [
         {"connector_id": "flowaccount", "environment": "production"},
         {
             "connector_id": "flowaccount",
             "connection_mode": "api_driver",
             "environment": "production",
-            "client_secret": "secret",
+            "arbitrary_unknown_field": rejected_secret,
         },
         {
             "connector_id": "flowaccount",
@@ -506,6 +509,13 @@ def test_legacy_connector_setup_rejects_missing_mode_and_unsafe_fields(monkeypat
     ]
 
     assert all(400 <= response.status_code < 500 for response in responses)
+    assert all(
+        response.json()["deprecated_tool"] == "start_connector_setup"
+        and response.json()["replacement_tool"] == "link_connector_profile"
+        for response in responses
+    )
+    assert responses[1].json()["message"] == "Connector setup request validation failed."
+    assert rejected_secret not in responses[1].text
     assert calls == []
 
     safe_response = client.post(
@@ -520,6 +530,8 @@ def test_legacy_connector_setup_rejects_missing_mode_and_unsafe_fields(monkeypat
     )
 
     assert safe_response.status_code == 200
+    assert safe_response.json()["deprecated_tool"] == "start_connector_setup"
+    assert safe_response.json()["replacement_tool"] == "link_connector_profile"
     assert len(calls) == 1
     assert calls[0]["method"] == "link"
     assert {key: calls[0][key] for key in calls[0] if key != "token_payload"} == {
@@ -531,6 +543,71 @@ def test_legacy_connector_setup_rejects_missing_mode_and_unsafe_fields(monkeypat
         "company_name": "Demo Co",
         "external_server_name": None,
     }
+
+
+@pytest.mark.parametrize(
+    ("store_error", "expected_status"),
+    [
+        (ValueError("safe profile validation failed"), 400),
+        (RuntimeError("profile storage unavailable"), 503),
+    ],
+)
+def test_legacy_connector_setup_runtime_errors_include_migration_fields(
+    monkeypatch,
+    store_error: Exception,
+    expected_status: int,
+) -> None:
+    from mercury_tools.mcp import server
+
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
+    monkeypatch.setenv("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
+
+    class FakeStore:
+        def link_connector_profile(self, **kwargs):
+            raise store_error
+
+    monkeypatch.setattr(server, "_product_store", lambda _settings=None: FakeStore())
+    client = TestClient(create_http_app(require_auth=True), raise_server_exceptions=False)
+    response = client.post(
+        "/api/connectors/setup",
+        headers={"Authorization": f"Bearer {make_client_token()}"},
+        json={
+            "connector_id": "flowaccount",
+            "connection_mode": "api_driver",
+            "environment": "production",
+        },
+    )
+
+    assert response.status_code == expected_status
+    assert response.json()["deprecated_tool"] == "start_connector_setup"
+    assert response.json()["replacement_tool"] == "link_connector_profile"
+
+
+def test_legacy_connector_setup_unauthorized_error_includes_migration_fields(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
+    monkeypatch.setenv("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
+
+    response = TestClient(
+        create_http_app(require_auth=True),
+        raise_server_exceptions=False,
+    ).post(
+        "/api/connectors/setup",
+        json={
+            "connector_id": "flowaccount",
+            "connection_mode": "api_driver",
+            "environment": "production",
+        },
+    )
+
+    assert response.status_code == 401
+    assert response.json()["deprecated_tool"] == "start_connector_setup"
+    assert response.json()["replacement_tool"] == "link_connector_profile"
 
 
 def test_workspace_flow_validate_and_dry_run_use_client_token(monkeypatch) -> None:

@@ -787,6 +787,24 @@ def _profile_capability_states(profile: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def _profile_provider_actions(
+    manifest: Any,
+    mode: Any,
+    capability: str,
+) -> tuple[str, ...]:
+    normalized = str(capability).strip().lower()
+    provider_actions = manifest.provider_capabilities(mode.mode.value, normalized)
+    if provider_actions:
+        return provider_actions
+    if (
+        mode.capability_source == "discovered_tools"
+        and normalized
+        and not (set(normalized.split(".")) & _MUTATION_CAPABILITY_SEGMENTS)
+    ):
+        return (normalized,)
+    return ()
+
+
 def _connector_resolution(
     *,
     ready: bool,
@@ -921,7 +939,7 @@ def _workspace_connector_resolution(
         )
     if any(
         state == "observed"
-        and not manifest.provider_capabilities(mode.mode.value, capability)
+        and not _profile_provider_actions(manifest, mode, capability)
         for capability, state in states.items()
     ):
         return _connector_resolution(
@@ -952,7 +970,7 @@ def _workspace_connector_resolution(
             profile=profile,
         )
     for capability in required_capabilities or []:
-        actions = manifest.provider_capabilities(mode.mode.value, str(capability))
+        actions = _profile_provider_actions(manifest, mode, str(capability))
         if not actions:
             return _connector_resolution(
                 ready=False,
@@ -963,8 +981,8 @@ def _workspace_connector_resolution(
                 profile=profile,
             )
         for action in actions:
-            declared_state = str(mode.provider_capability_status[action].value)
-            if declared_state == "provider_unavailable":
+            declared_state = mode.provider_capability_status.get(action)
+            if declared_state is not None and declared_state.value == "provider_unavailable":
                 return _connector_resolution(
                     ready=False,
                     reason="provider_unavailable",
@@ -1066,6 +1084,33 @@ def _connector_setup_block_payload(
 
 def _json_error(error: str, message: str, *, status_code: int) -> JSONResponse:
     return JSONResponse({"error": error, "message": message}, status_code=status_code)
+
+
+def _legacy_connector_setup_response(
+    payload: Mapping[str, Any],
+    *,
+    status_code: int = 200,
+) -> JSONResponse:
+    return JSONResponse(
+        {
+            **payload,
+            "deprecated_tool": "start_connector_setup",
+            "replacement_tool": "link_connector_profile",
+        },
+        status_code=status_code,
+    )
+
+
+def _legacy_connector_setup_error(
+    error: str,
+    message: str,
+    *,
+    status_code: int,
+) -> JSONResponse:
+    return _legacy_connector_setup_response(
+        {"error": error, "message": message},
+        status_code=status_code,
+    )
 
 
 def _reject_sensitive_storage_input(**values: Any) -> None:
@@ -1510,10 +1555,12 @@ def _canonical_evidence_capability_states(
     evidence: ConnectorValidationEvidence,
 ) -> dict[str, str]:
     """Expand accepted evidence aliases into their declared provider-action keys."""
+    mode = manifest.connection_mode(connection_mode)
     capability_states: dict[str, str] = {}
     for observation in evidence.capabilities:
-        provider_actions = manifest.provider_capabilities(
-            connection_mode,
+        provider_actions = _profile_provider_actions(
+            manifest,
+            mode,
             observation.capability,
         )
         if not provider_actions:
@@ -1648,14 +1695,18 @@ def connector_capabilities(
             capability: state.value
             for capability, state in mode.provider_capability_status.items()
         }
-        capability_states = {
-            capability: (
-                "provider_unavailable"
-                if declared_state == "provider_unavailable"
-                else observed.get(capability, "not_validated")
-            )
-            for capability, declared_state in declared.items()
-        }
+        capability_states = (
+            dict(observed)
+            if mode.capability_source == "discovered_tools"
+            else {
+                capability: (
+                    "provider_unavailable"
+                    if declared_state == "provider_unavailable"
+                    else observed.get(capability, "not_validated")
+                )
+                for capability, declared_state in declared.items()
+            }
+        )
         payload = redact_json(
             {
                 "status": "ok" if resolution["ready"] else "not_ready",
@@ -3060,7 +3111,7 @@ async def setup_connector(request: Request) -> Response:
     try:
         token_payload = _client_token_payload(request)
         if not settings.supabase_configured:
-            return _json_error(
+            return _legacy_connector_setup_error(
                 "service_unavailable",
                 "Supabase is required to save connector profiles.",
                 status_code=503,
@@ -3076,15 +3127,25 @@ async def setup_connector(request: Request) -> Response:
             external_server_name=setup_request.external_server_name,
             store=_product_store(settings),
         )
-        return JSONResponse(
+        return _legacy_connector_setup_response(
             redact_json({"status": "ok", "profile": public_connector_profile(profile)})
         )
     except PermissionError as exc:
-        return _json_error("unauthorized", str(exc), status_code=401)
-    except (ValidationError, ValueError) as exc:
-        return _json_error("bad_request", str(exc), status_code=400)
+        return _legacy_connector_setup_error("unauthorized", str(exc), status_code=401)
+    except ValidationError:
+        return _legacy_connector_setup_error(
+            "bad_request",
+            "Connector setup request validation failed.",
+            status_code=400,
+        )
+    except ValueError as exc:
+        return _legacy_connector_setup_error("bad_request", str(exc), status_code=400)
     except RuntimeError as exc:
-        return _json_error("service_unavailable", str(exc), status_code=503)
+        return _legacy_connector_setup_error(
+            "service_unavailable",
+            str(exc),
+            status_code=503,
+        )
 
 
 async def enable_skill(request: Request) -> Response:

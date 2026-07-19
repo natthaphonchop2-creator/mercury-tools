@@ -1,3 +1,5 @@
+from typing import get_args
+
 import pytest
 
 from mercury_tools.connectors.catalog import (
@@ -7,6 +9,7 @@ from mercury_tools.connectors.catalog import (
     connector_by_id,
     list_connector_public_summaries,
 )
+from mercury_tools.mcp.schemas import ConnectorEnvironment
 
 
 def test_connector_catalog_is_mode_aware_and_connector_neutral() -> None:
@@ -26,6 +29,19 @@ def test_connector_catalog_is_mode_aware_and_connector_neutral() -> None:
     assert express.connection_mode_ids == ["local_bridge"]
     assert custom.connection_mode_ids == ["api_driver"]
     assert generic.connection_mode_ids == ["native_mcp"]
+
+
+def test_public_connector_environment_covers_every_catalog_environment() -> None:
+    public_environments = set(get_args(ConnectorEnvironment))
+    catalog_environments = {
+        environment
+        for summary in list_connector_public_summaries()
+        for mode in summary["connection_modes"]
+        for environment in mode["supported_environments"]
+    }
+
+    assert catalog_environments <= public_environments
+    assert "user_supplied" in public_environments
 
 
 def test_flowaccount_native_mcp_read_only_does_not_block_api_driver_writes() -> None:

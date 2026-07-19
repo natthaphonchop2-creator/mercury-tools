@@ -552,8 +552,15 @@ def _all_observed_capabilities_are_catalog_bound(
     capability_states: Mapping[str, str],
 ) -> bool:
     connector = connector_by_id(connector_id)
-    if connector is None or connector.connection_mode(connection_mode) is None:
+    mode = connector.connection_mode(connection_mode) if connector else None
+    if connector is None or mode is None:
         return False
+    if mode.capability_source == "discovered_tools":
+        return all(
+            not _is_observed_mutation(capability)
+            for capability, state in capability_states.items()
+            if state == "observed"
+        )
     return all(
         bool(connector.provider_capabilities(connection_mode, capability))
         for capability, state in capability_states.items()
@@ -801,19 +808,29 @@ class SupabaseProductStore:
         return context
 
     def _fallback_state_events(self, workspace_key_value: str) -> list[dict[str, Any]]:
-        rows = self._request(
-            "GET",
-            "mcp_audit_events",
-            params={
-                "tool_name": f"eq.{PRODUCT_STATE_TOOL}",
-                "select": "id,created_at,tool_name,output_summary,status,metadata",
-                "order": "created_at.asc",
-                "limit": str(PRODUCT_FALLBACK_LIMIT),
-            },
-        )
+        rows: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            page = self._request(
+                "GET",
+                "mcp_audit_events",
+                params={
+                    "tool_name": f"eq.{PRODUCT_STATE_TOOL}",
+                    "metadata->>workspace_key": f"eq.{workspace_key_value}",
+                    "select": "id,created_at,tool_name,output_summary,status,metadata",
+                    "order": "created_at.asc,id.asc",
+                    "limit": str(PRODUCT_FALLBACK_LIMIT),
+                    "offset": str(offset),
+                },
+            )
+            page_rows = page or []
+            rows.extend(page_rows)
+            if len(page_rows) < PRODUCT_FALLBACK_LIMIT:
+                break
+            offset += len(page_rows)
         return [
             row
-            for row in rows or []
+            for row in rows
             if (row.get("metadata") or {}).get("workspace_key") == workspace_key_value
         ]
 
@@ -1126,6 +1143,7 @@ class SupabaseProductStore:
         capability_states: Mapping[str, str] | None = None,
         evidence_source: str | None = None,
         validated_at: str | None = None,
+        reset_validation: bool = False,
     ) -> dict[str, Any]:
         context = self._fallback_workspace_for_token(token_payload)
         connector = connector_by_id(connector_id)
@@ -1160,26 +1178,40 @@ class SupabaseProductStore:
         existing_metadata = _public_connector_metadata(
             (existing_profile or {}).get("metadata")
         )
+        if reset_validation:
+            existing_metadata.pop("evidence_ref", None)
         merged_metadata = {
             **existing_metadata,
             "required_secret_fields": connector.required_secret_fields,
             "preset": connector.preset_for_environment(environment),
             **_public_connector_metadata(metadata),
         }
-        resolved_capability_states = _safe_capability_states(
-            capability_states
-            if capability_states is not None
-            else (existing_profile or {}).get("capability_states")
+        resolved_capability_states = (
+            {}
+            if reset_validation
+            else _safe_capability_states(
+                capability_states
+                if capability_states is not None
+                else (existing_profile or {}).get("capability_states")
+            )
         )
-        resolved_validated_at = _safe_validated_at(
-            validated_at
-            if validated_at is not None
-            else (existing_profile or {}).get("validated_at")
+        resolved_validated_at = (
+            None
+            if reset_validation
+            else _safe_validated_at(
+                validated_at
+                if validated_at is not None
+                else (existing_profile or {}).get("validated_at")
+            )
         )
-        resolved_evidence_source = _safe_evidence_source(
-            evidence_source
-            if evidence_source is not None
-            else (existing_profile or {}).get("evidence_source")
+        resolved_evidence_source = (
+            None
+            if reset_validation
+            else _safe_evidence_source(
+                evidence_source
+                if evidence_source is not None
+                else (existing_profile or {}).get("evidence_source")
+            )
         )
         profile = {
             "id": profile_id,
@@ -1327,6 +1359,7 @@ class SupabaseProductStore:
             company_name=company_name,
             external_server_name=external_server_name,
             metadata=metadata,
+            reset_validation=True,
         )
 
     def validate_connector_profile(
@@ -1363,10 +1396,15 @@ class SupabaseProductStore:
         if not states or len(states) != len(capability_states):
             raise ValueError("capability_states are invalid")
         for capability, state in states.items():
-            if state == "observed" and not connector.provider_capabilities(
+            catalog_bound = connector.provider_capabilities(
                 mode.mode.value,
                 capability,
-            ):
+            )
+            discovered_safe_read = (
+                mode.capability_source == "discovered_tools"
+                and not _is_observed_mutation(capability)
+            )
+            if state == "observed" and not (catalog_bound or discovered_safe_read):
                 raise ValueError("observed capability is not declared for connection mode")
         if not _safe_validated_at(validated_at):
             raise ValueError("validated_at is invalid")
@@ -2107,6 +2145,7 @@ class SupabaseProductStore:
         capability_states: Mapping[str, str] | None = None,
         evidence_source: str | None = None,
         validated_at: str | None = None,
+        reset_validation: bool = False,
     ) -> dict[str, Any]:
         connector = connector_by_id(connector_id)
         if not connector:
@@ -2126,6 +2165,7 @@ class SupabaseProductStore:
                 capability_states=capability_states,
                 evidence_source=evidence_source,
                 validated_at=validated_at,
+                reset_validation=reset_validation,
             )
         except RuntimeError as exc:
             if is_product_schema_error(exc):
@@ -2142,6 +2182,7 @@ class SupabaseProductStore:
                     capability_states=capability_states,
                     evidence_source=evidence_source,
                     validated_at=validated_at,
+                    reset_validation=reset_validation,
                 )
             raise
 
@@ -2160,6 +2201,7 @@ class SupabaseProductStore:
         capability_states: Mapping[str, str] | None = None,
         evidence_source: str | None = None,
         validated_at: str | None = None,
+        reset_validation: bool = False,
     ) -> dict[str, Any]:
         context = self.workspace_for_token(token_payload)
         if not context:
@@ -2197,6 +2239,8 @@ class SupabaseProductStore:
         existing_metadata = _public_connector_metadata(
             (existing_profile or {}).get("metadata")
         )
+        if reset_validation:
+            existing_metadata.pop("evidence_ref", None)
         merged_metadata = {
             **existing_metadata,
             "required_secret_fields": connector.required_secret_fields,
@@ -2225,20 +2269,32 @@ class SupabaseProductStore:
                 else (existing_profile or {}).get("external_server_name"),
                 pattern=SAFE_SERVER_NAME_RE,
             ),
-            "capability_states": _safe_capability_states(
-                capability_states
-                if capability_states is not None
-                else (existing_profile or {}).get("capability_states")
+            "capability_states": (
+                {}
+                if reset_validation
+                else _safe_capability_states(
+                    capability_states
+                    if capability_states is not None
+                    else (existing_profile or {}).get("capability_states")
+                )
             ),
-            "evidence_source": _safe_evidence_source(
-                evidence_source
-                if evidence_source is not None
-                else (existing_profile or {}).get("evidence_source")
+            "evidence_source": (
+                None
+                if reset_validation
+                else _safe_evidence_source(
+                    evidence_source
+                    if evidence_source is not None
+                    else (existing_profile or {}).get("evidence_source")
+                )
             ),
-            "validated_at": _safe_validated_at(
-                validated_at
-                if validated_at is not None
-                else (existing_profile or {}).get("validated_at")
+            "validated_at": (
+                None
+                if reset_validation
+                else _safe_validated_at(
+                    validated_at
+                    if validated_at is not None
+                    else (existing_profile or {}).get("validated_at")
+                )
             ),
             "metadata": merged_metadata,
         }

@@ -464,6 +464,7 @@ async def test_public_mcp_tool_schemas_are_explicit_for_plugin_review() -> None:
         "uat",
         "local",
         "gateway",
+        "user_supplied",
     ]
 
     status_schema = tools["connector_status"].inputSchema
