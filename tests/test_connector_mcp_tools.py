@@ -110,71 +110,297 @@ def test_connector_id_accepts_generic_mcp() -> None:
     assert payload.connector_id == "generic_mcp"
 
 
-def test_start_connector_setup_requires_valid_connector(monkeypatch) -> None:
-    from mercury_tools.mcp.server import start_connector_setup
+def test_get_connector_setup_exposes_native_mcp_and_secretless_api_driver_guidance() -> None:
+    from mercury_tools.mcp.server import get_connector_setup
+
+    payload = get_connector_setup("flowaccount")
+
+    assert payload["status"] == "ok"
+    native = next(item for item in payload["connection_modes"] if item["mode"] == "native_mcp")
+    assert native["official_mcp_url"] == "https://mcp.flowaccount.com/mcp"
+    assert native["capability_summary"] == {
+        "read": "declared",
+        "write": "provider_unavailable",
+    }
+    api_driver = next(item for item in payload["connection_modes"] if item["mode"] == "api_driver")
+    assert api_driver["required_user_values"] == ["client_id", "client_secret"]
+    assert api_driver["local_command"].startswith("mercury-tools ")
+    assert "client_secret=" not in str(api_driver)
+
+
+def test_link_connector_profile_requires_valid_mode_and_native_server_name(monkeypatch) -> None:
+    from mercury_tools.mcp.server import link_connector_profile
 
     configure_product_env(monkeypatch)
 
-    invalid = start_connector_setup(
+    invalid = link_connector_profile(
         workspace_id=make_workspace_id(),
         connector_id="unknown",
+        connection_mode="api_driver",
         environment="production",
     )
 
     assert invalid["status"] == "error"
     assert "Unknown connector" in invalid["message"]
 
+    missing_server_name = link_connector_profile(
+        workspace_id=make_workspace_id(),
+        connector_id="flowaccount",
+        connection_mode="native_mcp",
+        environment="production",
+    )
 
-def test_start_connector_setup_returns_redacted_profile(monkeypatch) -> None:
+    assert missing_server_name["status"] == "error"
+    assert "external_server_name" in missing_server_name["message"]
+
+    lan_address = link_connector_profile(
+        workspace_id=make_workspace_id(),
+        connector_id="flowaccount",
+        connection_mode="native_mcp",
+        environment="production",
+        external_server_name="192.168.1.10",
+    )
+
+    assert lan_address["status"] == "error"
+    assert "LAN address" in lan_address["message"]
+
+
+def test_link_connector_profile_returns_a_sanitized_mode_specific_profile(monkeypatch) -> None:
     from mercury_tools.mcp import server
 
     configure_product_env(monkeypatch)
 
     class FakeStore:
-        def start_connector_setup(
+        def link_connector_profile(
             self,
             *,
             token_payload: dict[str, Any],
             connector_id: str,
+            connection_mode: str,
             environment: str,
             company_name: str | None = None,
+            company_ref: str | None = None,
+            external_server_name: str | None = None,
         ) -> dict[str, Any]:
             assert token_payload["jti"] == make_workspace_id()
             return {
                 "connector_id": connector_id,
+                "connection_mode": connection_mode,
                 "environment": environment,
                 "company_name": company_name,
-                "status": "requires_credentials",
+                "external_server_name": external_server_name,
+                "status": "needs_validation",
                 "metadata": {
-                    "required_secret_fields": ["client_id", "client_secret"],
-                    "preset": {
-                        "token_url": "https://openapi.flowaccount.com/v1/token",
-                    },
                     "client_secret": "super-secret-value",
                 },
             }
 
     monkeypatch.setattr(server, "_product_store", lambda settings: FakeStore())
 
-    payload = server.start_connector_setup(
+    payload = server.link_connector_profile(
         workspace_id=make_workspace_id(),
         connector_id="flowaccount",
+        connection_mode="native_mcp",
         environment="production",
         company_name="Demo Co Books",
+        external_server_name="flowaccount-mcp",
     )
 
     assert payload["status"] == "ok"
     assert payload["profile"]["connector_id"] == "flowaccount"
+    assert payload["profile"]["connection_mode"] == "native_mcp"
     assert payload["profile"]["company_name"] == "Demo Co Books"
-    assert payload["profile"]["metadata"]["required_secret_fields"] == [
-        "client_id",
-        "client_secret",
-    ]
     assert payload["profile"]["metadata"]["client_secret"] == "[REDACTED]"
-    assert payload["profile"]["metadata"]["preset"]["token_url"] == (
-        "https://openapi.flowaccount.com/v1/token"
-    )
     assert "super-secret-value" not in str(payload)
+
+
+def test_validate_connector_connection_records_host_observed_evidence(monkeypatch) -> None:
+    from mercury_tools.mcp import server
+
+    configure_product_env(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    class FakeStore:
+        def validate_connector_profile(self, **kwargs: Any) -> dict[str, Any]:
+            captured.update(kwargs)
+            return {
+                "connector_id": kwargs["connector_id"],
+                "connection_mode": kwargs["connection_mode"],
+                "environment": kwargs["environment"],
+                "capability_states": kwargs["capability_states"],
+                "evidence_source": kwargs["evidence_source"],
+                "validated_at": kwargs["validated_at"],
+                "status": "ready_read_only",
+            }
+
+    monkeypatch.setattr(server, "_product_store", lambda settings: FakeStore())
+
+    payload = server.validate_connector_connection(
+        workspace_id=make_workspace_id(),
+        connector_id="flowaccount",
+        connection_mode="native_mcp",
+        environment="production",
+        evidence={
+            "source": "native_mcp_safe_read",
+            "status": "succeeded",
+            "observed_at": "2026-07-19T12:00:00Z",
+            "evidence_ref": "evidence_native_read_1234",
+            "provider_tool_name": "company.info.read",
+            "capabilities": [{"capability": "company.info.read", "state": "observed"}],
+        },
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["provider_called_by_mercury"] is False
+    assert payload["validation_scope"] == "host_observed_provider_result"
+    assert captured["capability_states"] == {"company.info.read": "observed"}
+    assert captured["evidence_ref"] == "evidence_native_read_1234"
+
+
+def test_connector_capabilities_uses_one_selected_profile_and_mode_specific_states(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    configure_product_env(monkeypatch)
+
+    class FakeStore:
+        def public_dashboard(self, workspace_id: str) -> dict[str, Any]:
+            return {
+                "workspace": {"name": "Demo Co"},
+                "connector_profiles": [
+                    {
+                        "connector_id": "flowaccount",
+                        "connection_mode": "native_mcp",
+                        "environment": "production",
+                        "status": "ready_read_only",
+                        "capability_states": {"documents.invoice.list": "observed"},
+                        "evidence_source": "native_mcp_safe_read",
+                        "validated_at": "2026-07-19T12:00:00+00:00",
+                    },
+                    {
+                        "connector_id": "flowaccount",
+                        "connection_mode": "api_driver",
+                        "environment": "production",
+                        "status": "needs_validation",
+                        "capability_states": {},
+                    },
+                ],
+            }
+
+    monkeypatch.setattr(server, "_product_store", lambda settings: FakeStore())
+
+    native = server.connector_capabilities(
+        make_workspace_id(), "flowaccount", "native_mcp", "production"
+    )
+    api = server.connector_capabilities(
+        make_workspace_id(), "flowaccount", "api_driver", "production"
+    )
+
+    assert native["capability_states"]["documents.invoice.create"] == "provider_unavailable"
+    assert api["capability_states"]["documents.invoice.create"] == "not_validated"
+    assert {"read_capabilities", "blocked_capabilities", "read_only_validation"}.isdisjoint(
+        native
+    )
+
+
+def test_flowaccount_create_readiness_is_scoped_to_mode_environment_and_evidence() -> None:
+    from mercury_tools.mcp.server import _workspace_connector_resolution
+
+    native = _workspace_connector_resolution(
+        {
+            "connector_profiles": [
+                {
+                    "connector_id": "flowaccount",
+                    "connection_mode": "native_mcp",
+                    "environment": "production",
+                    "status": "ready_read_only",
+                    "capability_states": {"documents.invoice.list": "observed"},
+                    "evidence_source": "native_mcp_safe_read",
+                    "validated_at": "2026-07-19T12:00:00+00:00",
+                }
+            ]
+        },
+        connector_id="flowaccount",
+        connection_mode="native_mcp",
+        environment="production",
+        required_capabilities=["documents.invoice.create"],
+    )
+    api_before_evidence = _workspace_connector_resolution(
+        {
+            "connector_profiles": [
+                {
+                    "connector_id": "flowaccount",
+                    "connection_mode": "api_driver",
+                    "environment": "production",
+                    "status": "needs_validation",
+                    "capability_states": {},
+                }
+            ]
+        },
+        connector_id="flowaccount",
+        connection_mode="api_driver",
+        environment="production",
+        required_capabilities=["documents.invoice.create"],
+    )
+    api_after_matching_evidence = _workspace_connector_resolution(
+        {
+            "connector_profiles": [
+                {
+                    "connector_id": "flowaccount",
+                    "connection_mode": "api_driver",
+                    "environment": "production",
+                    "status": "ready_read_write",
+                    "capability_states": {"documents.invoice.create": "observed"},
+                    "evidence_source": "api_driver_safe_probe",
+                    "validated_at": "2026-07-19T12:00:00+00:00",
+                }
+            ]
+        },
+        connector_id="flowaccount",
+        connection_mode="api_driver",
+        environment="production",
+        required_capabilities=["documents.invoice.create"],
+    )
+
+    assert native["ready"] is False
+    assert native["reason"] == "provider_unavailable"
+    assert api_before_evidence["ready"] is False
+    assert api_before_evidence["reason"] == "not_validated"
+    assert api_after_matching_evidence["ready"] is True
+    assert api_after_matching_evidence["profile"]["status"] == "ready_read_write"
+
+
+def test_unlink_connector_profile_requires_exact_confirmation(monkeypatch) -> None:
+    from mercury_tools.mcp import server
+
+    configure_product_env(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    class FakeStore:
+        def unlink_connector_profile(self, **kwargs: Any) -> dict[str, Any]:
+            captured.update(kwargs)
+            return {"deleted": True}
+
+    monkeypatch.setattr(server, "_product_store", lambda settings: FakeStore())
+
+    rejected = server.unlink_connector_profile(
+        make_workspace_id(), "flowaccount", "native_mcp", "production", confirm="delete"
+    )
+    payload = server.unlink_connector_profile(
+        make_workspace_id(), "flowaccount", "native_mcp", "production"
+    )
+
+    assert rejected["status"] == "error"
+    assert payload == {
+        "status": "ok",
+        "connector_id": "flowaccount",
+        "connection_mode": "native_mcp",
+        "environment": "production",
+        "deleted": True,
+        "provider_disconnect_required": True,
+    }
+    assert captured["connection_mode"] == "native_mcp"
 
 
 def ready_connector_profile(
@@ -183,17 +409,34 @@ def ready_connector_profile(
     environment: str = "production",
     capabilities: list[str] | None = None,
 ) -> dict[str, Any]:
-    metadata = {
-        "setup_state": "ready",
-        "enabled_capabilities": (
-            ["company.info.read"] if capabilities is None else capabilities
-        ),
+    selected_capabilities = ["company.info.read"] if capabilities is None else capabilities
+    mutation_segments = {
+        "approve",
+        "attach",
+        "create",
+        "delete",
+        "payment",
+        "post",
+        "send",
+        "update",
     }
     return {
         "connector_id": connector_id,
+        "connection_mode": "api_driver",
         "environment": environment,
-        "status": "connected",
-        "metadata": metadata,
+        "status": (
+            "ready_read_write"
+            if any(
+                mutation_segments & set(capability.split("."))
+                for capability in selected_capabilities
+            )
+            else "ready_read_only"
+        ),
+        "capability_states": {
+            capability: "observed" for capability in selected_capabilities
+        },
+        "evidence_source": "api_driver_safe_probe",
+        "validated_at": "2026-07-19T12:00:00+00:00",
     }
 
 
@@ -234,7 +477,7 @@ def test_run_flow_preserves_non_connector_raw_yaml_without_workspace() -> None:
     assert payload["artifacts"][0]["title"] == "Local raw"
 
 
-def test_run_flow_blocks_declared_mutation_before_workspace_setup() -> None:
+def test_run_flow_requires_workspace_before_profile_aware_mutation_readiness() -> None:
     from mercury_tools.mcp import server
 
     payload = server.run_flow(
@@ -252,11 +495,7 @@ env:
         dry_run=False,
     )
 
-    assert payload == {
-        "status": "blocked",
-        "reason": "public_preview_read_only",
-        "capability": "documents.invoice.create",
-    }
+    assert payload["status"] == "requires_workspace"
 
 
 def test_run_flow_blocks_connector_backed_raw_yaml_when_workspace_unready(
@@ -288,8 +527,8 @@ def test_run_flow_blocks_connector_backed_raw_yaml_when_workspace_unready(
         workspace_id=make_workspace_id(),
     )
 
-    assert payload["status"] == "blocked"
-    assert "connector credential setup" in payload["message"]
+    assert payload["status"] == "not_ready"
+    assert payload["reason"] == "not_validated"
 
 
 def test_run_flow_files_requires_workspace_for_connector_backed_raw_yaml() -> None:
@@ -501,12 +740,10 @@ def test_retrieve_workspace_context_pack_uses_active_connector(monkeypatch) -> N
             return {
                 "connector_profiles": [
                     {
-                        "connector_id": "flowaccount",
-                        "environment": "production",
-                        "status": "connected",
+                        **ready_connector_profile(
+                            capabilities=["documents.invoice.list"],
+                        ),
                         "metadata": {
-                            "setup_state": "ready",
-                            "enabled_capabilities": ["documents.invoice.list"],
                             "credential_storage": "encrypted_server_vault",
                             "credential_fields": ["client_id", "client_secret"],
                             "credential_fingerprints": {
@@ -762,7 +999,7 @@ def test_retrieve_workspace_context_pack_requires_setup_without_ready_available_
     )
 
     assert payload["status"] == "requires_setup"
-    assert payload["next_tool"] == "start_connector_setup"
+    assert payload["next_tool"] == "link_connector_profile"
     assert payload["next_skill"] == "connector-credential-setup-th"
     assert "connector credential setup" in payload["message"]
     assert workspace_id not in str(audit_events)
@@ -785,12 +1022,8 @@ def test_connector_status_returns_workspace_scoped_sanitized_profiles(
                 "workspace": {"name": "Demo Co"},
                 "connector_profiles": [
                     {
-                        "connector_id": "flowaccount",
-                        "environment": "production",
-                        "status": "connected",
+                        **ready_connector_profile(),
                         "metadata": {
-                            "setup_state": "ready",
-                            "enabled_capabilities": ["company.info.read"],
                             "credential_storage": "encrypted_server_vault",
                             "credential_fields": ["client_id", "client_secret"],
                             "credential_fingerprints": {
@@ -824,7 +1057,7 @@ def test_connector_status_returns_workspace_scoped_sanitized_profiles(
     assert payload["status"] == "ok"
     assert payload["setup_required"] is False
     assert payload["active_connector"]["connector_id"] == "flowaccount"
-    assert payload["connector_profiles"][0]["status"] == "connected"
+    assert payload["connector_profiles"][0]["status"] == "ready_read_only"
     assert "'server_vault':" not in str(payload)
     assert "ciphertext" not in str(payload)
     assert "encrypted-secret-derived-value" not in str(payload)
@@ -860,7 +1093,7 @@ def test_connector_status_requires_setup_without_ready_profile(
 
     assert payload["status"] == "requires_setup"
     assert payload["setup_required"] is True
-    assert payload["next_tool"] == "start_connector_setup"
+    assert payload["next_tool"] == "link_connector_profile"
     assert payload["next_skill"] == "connector-credential-setup-th"
 
 
@@ -900,8 +1133,8 @@ def test_run_workspace_flow_requires_ready_connector(monkeypatch) -> None:
         dry_run=False,
     )
 
-    assert payload["status"] == "blocked"
-    assert "connector credential setup" in payload["message"]
+    assert payload["status"] == "not_ready"
+    assert payload["reason"] == "not_validated"
 
 
 def test_run_workspace_flow_blocks_selected_connector_without_environment(monkeypatch) -> None:
@@ -946,8 +1179,8 @@ env:
         dry_run=False,
     )
 
-    assert payload["status"] == "blocked"
-    assert "connector credential setup" in payload["message"]
+    assert payload["status"] == "not_ready"
+    assert payload["reason"] == "environment_mismatch"
 
 
 def test_run_workspace_flow_connector_status_uses_public_workspace_state(
@@ -1036,8 +1269,8 @@ def test_run_workspace_flow_blocks_selected_connector_mismatch(monkeypatch) -> N
         env={"connector": "peak", "environment": "production"},
     )
 
-    assert payload["status"] == "blocked"
-    assert "connector credential setup" in payload["message"]
+    assert payload["status"] == "mode_required"
+    assert payload["reason"] == "connection_mode_required"
 
 
 def test_run_workspace_flow_blocks_peak_profile_with_unknown_capability(
@@ -1079,8 +1312,8 @@ def test_run_workspace_flow_blocks_peak_profile_with_unknown_capability(
         env={"connector": "peak", "environment": "production"},
     )
 
-    assert payload["status"] == "blocked"
-    assert "connector credential setup" in payload["message"]
+    assert payload["status"] == "not_ready"
+    assert payload["reason"] == "not_validated"
 
 
 def test_http_workspace_flow_run_requires_ready_connector(monkeypatch) -> None:
@@ -1123,5 +1356,5 @@ def test_http_workspace_flow_run_requires_ready_connector(monkeypatch) -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "blocked"
-    assert "connector credential setup" in payload["message"]
+    assert payload["status"] == "not_ready"
+    assert payload["reason"] == "not_validated"

@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
+import re
 from collections.abc import Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -26,7 +28,6 @@ from mercury_tools.config import load_settings
 from mercury_tools.connectors.catalog import (
     connector_by_id,
     list_connector_public_summaries,
-    public_capability_gate,
 )
 from mercury_tools.db.product import (
     SupabaseProductStore,
@@ -47,8 +48,10 @@ from mercury_tools.flows.workspace import discover_workspace_flows, workspace_ma
 from mercury_tools.mcp.schemas import (
     AccountingSkillId,
     AccountingSkillInputs,
+    ConnectorConnectionMode,
     ConnectorEnvironment,
     ConnectorId,
+    ConnectorValidationEvidence,
     FlowFileInput,
     KnowledgeSearchFilters,
     MercuryFlowSource,
@@ -88,10 +91,35 @@ MAX_MCP_FLOW_FILES = 50
 MAX_MCP_FLOW_FILE_CHARS = 500_000
 CONNECTOR_ENV_KEYS = ("connector", "connector_id", "accounting_connector", "erp_connector")
 ENVIRONMENT_ENV_KEYS = ("environment", "connector_environment", "connector_env")
+CONNECTION_MODE_ENV_KEYS = ("connection_mode", "connector_connection_mode")
 CAPABILITY_KEYS = ("required_capabilities", "requiredCapabilities", "capabilities")
 CONNECTOR_BACKED_COMMANDS = {"connectorStatus"}
 CONNECTOR_TAGS = {"connector", "connectors", "connector-backed", "accounting-connector", "erp-connector"}
 _LOWER_HEX = frozenset("0123456789abcdef")
+_SAFE_PUBLIC_PROFILE_TEXT_RE = re.compile(r"^[A-Za-z0-9._ -]{1,200}$")
+_SAFE_EXTERNAL_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
+_EVIDENCE_SOURCE_BY_CONNECTION_MODE = {
+    "native_mcp": "native_mcp_safe_read",
+    "api_driver": "api_driver_safe_probe",
+    "local_bridge": "local_bridge_safe_probe",
+}
+_MUTATION_CAPABILITY_SEGMENTS = frozenset(
+    {
+        "approve",
+        "attach",
+        "create",
+        "delete",
+        "invite",
+        "payment",
+        "post",
+        "remove",
+        "send",
+        "share",
+        "update",
+        "upload",
+        "void",
+    }
+)
 _AUDITED_PRIVATE = ToolAnnotations(
     readOnlyHint=False,
     openWorldHint=False,
@@ -618,6 +646,7 @@ def _raw_flow_readiness_selection(
     return {
         "connector_backed": connector_backed,
         "connector_id": connector_id,
+        "connection_mode": _first_mapping_value(effective_env, CONNECTION_MODE_ENV_KEYS),
         "environment": _first_mapping_value(effective_env, ENVIRONMENT_ENV_KEYS),
         "required_capabilities": _required_capabilities_from_sources(
             metadata={},
@@ -639,11 +668,6 @@ def _raw_mcp_connector_setup_block(
     if not readiness_selection["connector_backed"]:
         return None, readiness_selection
 
-    for capability in readiness_selection["required_capabilities"]:
-        blocked = public_capability_gate(capability)
-        if blocked is not None:
-            return blocked, readiness_selection
-
     if not isinstance(workspace_id, str) or not workspace_id.strip():
         return _public_workspace_required_payload(), readiness_selection
 
@@ -652,13 +676,15 @@ def _raw_mcp_connector_setup_block(
         return _connector_setup_block_payload(), readiness_selection
 
     dashboard_payload = _product_store(settings).public_dashboard(workspace_id)
-    if not readiness_selection["connector_id"] or not workspace_connector_ready(
+    resolution = _workspace_connector_resolution(
         dashboard_payload,
         connector_id=readiness_selection["connector_id"],
+        connection_mode=readiness_selection["connection_mode"],
         environment=readiness_selection["environment"],
         required_capabilities=readiness_selection["required_capabilities"],
-    ):
-        return _connector_setup_block_payload(), readiness_selection
+    )
+    if not resolution["ready"]:
+        return _connector_setup_block_payload(resolution), readiness_selection
     return None, readiness_selection
 
 
@@ -692,6 +718,10 @@ def _workspace_flow_readiness_selection(
             or _first_mapping_value(metadata, CONNECTOR_ENV_KEYS)
             or _connector_from_flow_tags(flow)
         ),
+        "connection_mode": (
+            _first_mapping_value(effective_env, CONNECTION_MODE_ENV_KEYS)
+            or _first_mapping_value(metadata, CONNECTION_MODE_ENV_KEYS)
+        ),
         "environment": (
             _first_mapping_value(effective_env, ENVIRONMENT_ENV_KEYS)
             or _first_mapping_value(metadata, ENVIRONMENT_ENV_KEYS)
@@ -707,12 +737,10 @@ def _workspace_connector_ready(
     dashboard_payload: dict[str, Any],
     *,
     connector_id: str | None = None,
+    connection_mode: str | None = None,
     environment: str | None = None,
     required_capabilities: list[str] | None = None,
 ) -> bool:
-    profiles = dashboard_payload.get("connector_profiles")
-    if not isinstance(profiles, list) or not profiles:
-        return False
     selected_connector = _clean_selector(connector_id)
     selected_environment = _clean_selector(environment)
     if not selected_connector or not selected_environment:
@@ -720,65 +748,246 @@ def _workspace_connector_ready(
     manifest = connector_by_id(selected_connector)
     if not manifest:
         return False
-    if _clean_selector(manifest.status) != "available":
-        return False
-    manifest_environments = {
-        str(item).strip().lower()
-        for item in manifest.environments
-        if str(item).strip()
-    }
-    if selected_environment not in manifest_environments:
-        return False
-    if not _manifest_has_connection_healthcheck_adapter(manifest):
-        return False
-    manifest_capabilities = {
-        str(capability).strip()
-        for capability in manifest.capabilities
-        if str(capability).strip()
-    }
-    if not manifest_capabilities:
-        return False
-    required = {str(capability).strip() for capability in required_capabilities or [] if str(capability).strip()}
-    if required and not required.issubset(manifest_capabilities):
-        return False
-    for profile in profiles:
-        if not isinstance(profile, dict):
-            continue
-        profile_connector = _clean_selector(profile.get("connector_id"))
-        profile_environment = _clean_selector(profile.get("environment"))
-        if selected_connector and profile_connector != selected_connector:
-            continue
-        if selected_environment and profile_environment != selected_environment:
-            continue
-        if _clean_selector(profile.get("status")) not in {"connected", "connected_read_only"}:
-            continue
-        metadata = profile.get("metadata") or {}
-        setup_state = _clean_selector(metadata.get("setup_state")) if isinstance(metadata, dict) else None
-        if setup_state != "ready":
-            continue
-        enabled_capabilities = {str(item).strip() for item in _profile_enabled_capabilities(profile)}
-        if not enabled_capabilities:
-            continue
-        if not enabled_capabilities.issubset(manifest_capabilities):
-            continue
-        if required and not required.issubset(enabled_capabilities):
-            continue
-        return True
-    return False
+    return _workspace_connector_resolution(
+        dashboard_payload,
+        connector_id=selected_connector,
+        connection_mode=connection_mode,
+        environment=selected_environment,
+        required_capabilities=required_capabilities,
+    )["ready"]
 
 
 def workspace_connector_ready(
     dashboard_payload: dict[str, Any],
     *,
     connector_id: str | None = None,
+    connection_mode: str | None = None,
     environment: str | None = None,
     required_capabilities: list[str] | None = None,
 ) -> bool:
     return _workspace_connector_ready(
         dashboard_payload,
         connector_id=connector_id,
+        connection_mode=connection_mode,
         environment=environment,
         required_capabilities=required_capabilities,
+    )
+
+
+def _profile_capability_states(profile: dict[str, Any]) -> dict[str, str]:
+    raw_states = profile.get("capability_states")
+    if not isinstance(raw_states, dict):
+        return {}
+    return {
+        str(capability).strip(): str(state).strip()
+        for capability, state in raw_states.items()
+        if str(capability).strip() and str(state).strip()
+    }
+
+
+def _connector_resolution(
+    *,
+    ready: bool,
+    reason: str | None,
+    connector_id: str | None,
+    connection_mode: str | None,
+    environment: str | None,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "ready": ready,
+        "reason": reason,
+        "connector_id": connector_id,
+        "connection_mode": connection_mode,
+        "environment": environment,
+        "profile": profile,
+    }
+
+
+def _workspace_connector_resolution(
+    dashboard_payload: dict[str, Any],
+    *,
+    connector_id: str | None,
+    connection_mode: str | None,
+    environment: str | None,
+    required_capabilities: list[str] | None = None,
+) -> dict[str, Any]:
+    selected_connector = _clean_selector(connector_id)
+    selected_environment = _clean_selector(environment)
+    selected_mode = _clean_selector(connection_mode)
+    if not selected_connector:
+        return _connector_resolution(
+            ready=False,
+            reason="connector_required",
+            connector_id=None,
+            connection_mode=selected_mode,
+            environment=selected_environment,
+        )
+    if not selected_environment:
+        return _connector_resolution(
+            ready=False,
+            reason="environment_mismatch",
+            connector_id=selected_connector,
+            connection_mode=selected_mode,
+            environment=None,
+        )
+    manifest = connector_by_id(selected_connector)
+    if manifest is None:
+        return _connector_resolution(
+            ready=False,
+            reason="not_validated",
+            connector_id=selected_connector,
+            connection_mode=selected_mode,
+            environment=selected_environment,
+        )
+    profiles = [
+        profile
+        for profile in dashboard_payload.get("connector_profiles") or []
+        if isinstance(profile, dict)
+        and _clean_selector(profile.get("connector_id")) == manifest.connector_id
+        and _clean_selector(profile.get("environment")) == selected_environment
+    ]
+    if not selected_mode:
+        if len(profiles) != 1:
+            return _connector_resolution(
+                ready=False,
+                reason="connection_mode_required",
+                connector_id=manifest.connector_id,
+                connection_mode=None,
+                environment=selected_environment,
+            )
+        selected_mode = _clean_selector(profiles[0].get("connection_mode"))
+    mode = manifest.connection_mode(selected_mode)
+    if mode is None:
+        return _connector_resolution(
+            ready=False,
+            reason="not_validated",
+            connector_id=manifest.connector_id,
+            connection_mode=selected_mode,
+            environment=selected_environment,
+        )
+    if selected_environment not in mode.supported_environments:
+        return _connector_resolution(
+            ready=False,
+            reason="environment_mismatch",
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=selected_environment,
+        )
+    profiles = [
+        profile
+        for profile in profiles
+        if _clean_selector(profile.get("connection_mode")) == mode.mode.value
+    ]
+    if len(profiles) > 1:
+        return _connector_resolution(
+            ready=False,
+            reason="connection_mode_required",
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=selected_environment,
+        )
+    if not profiles:
+        reason = "local_bridge_required" if mode.mode.value == "local_bridge" else "not_validated"
+        return _connector_resolution(
+            ready=False,
+            reason=reason,
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=selected_environment,
+        )
+    profile = public_connector_profile(profiles[0])
+    states = _profile_capability_states(profile)
+    expected_source = _EVIDENCE_SOURCE_BY_CONNECTION_MODE[mode.mode.value]
+    if _clean_selector(profile.get("evidence_source")) != expected_source:
+        return _connector_resolution(
+            ready=False,
+            reason="local_bridge_required" if mode.mode.value == "local_bridge" else "not_validated",
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=selected_environment,
+            profile=profile,
+        )
+    if not profile.get("validated_at") or not states:
+        return _connector_resolution(
+            ready=False,
+            reason="not_validated",
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=selected_environment,
+            profile=profile,
+        )
+    if any(
+        state == "observed"
+        and not manifest.provider_capabilities(mode.mode.value, capability)
+        for capability, state in states.items()
+    ):
+        return _connector_resolution(
+            ready=False,
+            reason="not_validated",
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=selected_environment,
+            profile=profile,
+        )
+    for state in states.values():
+        if state != "observed":
+            return _connector_resolution(
+                ready=False,
+                reason=state,
+                connector_id=manifest.connector_id,
+                connection_mode=mode.mode.value,
+                environment=selected_environment,
+                profile=profile,
+            )
+    if _clean_selector(profile.get("status")) not in {"ready_read_only", "ready_read_write"}:
+        return _connector_resolution(
+            ready=False,
+            reason="not_validated",
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=selected_environment,
+            profile=profile,
+        )
+    for capability in required_capabilities or []:
+        actions = manifest.provider_capabilities(mode.mode.value, str(capability))
+        if not actions:
+            return _connector_resolution(
+                ready=False,
+                reason="not_validated",
+                connector_id=manifest.connector_id,
+                connection_mode=mode.mode.value,
+                environment=selected_environment,
+                profile=profile,
+            )
+        for action in actions:
+            declared_state = str(mode.provider_capability_status[action].value)
+            if declared_state == "provider_unavailable":
+                return _connector_resolution(
+                    ready=False,
+                    reason="provider_unavailable",
+                    connector_id=manifest.connector_id,
+                    connection_mode=mode.mode.value,
+                    environment=selected_environment,
+                    profile=profile,
+                )
+            observed_state = states.get(action)
+            if observed_state != "observed":
+                return _connector_resolution(
+                    ready=False,
+                    reason=observed_state or "not_validated",
+                    connector_id=manifest.connector_id,
+                    connection_mode=mode.mode.value,
+                    environment=selected_environment,
+                    profile=profile,
+                )
+    return _connector_resolution(
+        ready=True,
+        reason=None,
+        connector_id=manifest.connector_id,
+        connection_mode=mode.mode.value,
+        environment=selected_environment,
+        profile=profile,
     )
 
 
@@ -786,35 +995,28 @@ def _active_workspace_connector_profile(dashboard_payload: dict[str, Any]) -> di
     profiles = dashboard_payload.get("connector_profiles")
     if not isinstance(profiles, list):
         return None
-    for profile in profiles:
-        if not isinstance(profile, dict):
-            continue
-        connector_id = _clean_selector(profile.get("connector_id"))
-        environment = _clean_selector(profile.get("environment"))
-        if not connector_id or not environment:
-            continue
-        if _workspace_connector_ready(
-            {"connector_profiles": [profile]},
-            connector_id=connector_id,
-            environment=environment,
-        ):
-            return profile
-    return None
+    if len(profiles) != 1 or not isinstance(profiles[0], dict):
+        return None
+    profile = profiles[0]
+    resolution = _workspace_connector_resolution(
+        {"connector_profiles": [profile]},
+        connector_id=_clean_selector(profile.get("connector_id")),
+        connection_mode=_clean_selector(profile.get("connection_mode")),
+        environment=_clean_selector(profile.get("environment")),
+    )
+    return profile if resolution["ready"] else None
 
 
 def _connector_context_from_profile(profile: dict[str, Any]) -> dict[str, Any]:
-    metadata = _mapping(profile.get("metadata"))
     context = {
         "connector_id": str(profile.get("connector_id") or "").strip().lower(),
+        "connection_mode": str(profile.get("connection_mode") or "").strip().lower(),
         "environment": str(profile.get("environment") or "").strip().lower(),
-        "status": str(profile.get("status") or metadata.get("setup_state") or "ready"),
-        "enabled_capabilities": sorted(
-            str(item).strip() for item in _profile_enabled_capabilities(profile)
-        ),
+        "status": str(profile.get("status") or "needs_validation"),
+        "capability_states": _profile_capability_states(profile),
+        "evidence_source": profile.get("evidence_source"),
+        "validated_at": profile.get("validated_at"),
     }
-    setup_state = metadata.get("setup_state")
-    if setup_state:
-        context["setup_state"] = str(setup_state)
     return context
 
 
@@ -825,7 +1027,7 @@ def _workspace_context_setup_required_payload() -> dict[str, Any]:
             "connector credential setup is required before retrieving workspace-specific "
             "accounting context."
         ),
-        "next_tool": "start_connector_setup",
+        "next_tool": "link_connector_profile",
         "next_skill": "connector-credential-setup-th",
     }
 
@@ -838,14 +1040,24 @@ def _public_workspace_required_payload() -> dict[str, Any]:
     }
 
 
-def _connector_setup_block_payload() -> dict[str, Any]:
+def _connector_setup_block_payload(
+    resolution: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    reason = (resolution or {}).get("reason") or "not_validated"
+    if reason == "connection_mode_required":
+        message = (
+            "connection_mode is required because multiple connector profiles match this "
+            "workspace selection."
+        )
+    elif reason == "provider_unavailable":
+        message = "The selected connector profile declares this provider action unavailable."
+    else:
+        message = "A validated connector profile is required before this connector-backed flow can run."
     return {
-        "status": "blocked",
-        "message": (
-            "connector credential setup is required before running connector-backed "
-            "accounting workflows."
-        ),
-        "next_tool": "start_connector_setup",
+        "status": "mode_required" if reason == "connection_mode_required" else "not_ready",
+        "reason": reason,
+        "message": message,
+        "next_tool": "get_connector_setup" if reason == "connection_mode_required" else "link_connector_profile",
         "next_skill": "connector-credential-setup-th",
     }
 
@@ -1114,120 +1326,435 @@ def list_connectors() -> dict[str, Any]:
 
 
 @mcp.tool(annotations=_AUDITED_PRIVATE)
-def connector_capabilities(connector_id: str) -> dict[str, Any]:
-    """List declared capabilities for one Mercury connector."""
+def get_connector_setup(
+    connector_id: ConnectorId,
+    connection_mode: ConnectorConnectionMode | None = None,
+) -> dict[str, Any]:
+    """Return secretless setup guidance for one connector mode or all supported modes."""
     manifest = connector_by_id(connector_id)
     if manifest is None:
-        payload = {"status": "not_found", "connector_id": connector_id}
-        _audit("connector_capabilities", {"connector_id": connector_id}, payload)
-        return payload
+        return {"status": "not_found", "connector_id": connector_id}
+    modes = list(manifest.connection_modes)
+    if connection_mode is not None:
+        selected = manifest.connection_mode(connection_mode)
+        if selected is None:
+            return {
+                "status": "not_found",
+                "connector_id": manifest.connector_id,
+                "connection_mode": connection_mode,
+            }
+        modes = [selected]
+
+    payload_modes: list[dict[str, Any]] = []
+    for mode in modes:
+        declared = mode.provider_capability_status
+        read_states = [
+            state.value
+            for capability, state in declared.items()
+            if not (set(capability.split(".")) & _MUTATION_CAPABILITY_SEGMENTS)
+        ]
+        write_states = [
+            state.value
+            for capability, state in declared.items()
+            if set(capability.split(".")) & _MUTATION_CAPABILITY_SEGMENTS
+        ]
+        item: dict[str, Any] = {
+            "mode": mode.mode.value,
+            "next_action": "link_connector_profile",
+            "provider_setup_url": mode.provider_setup_url,
+            "required_user_values": [],
+            "setup_defaults": {},
+            "capability_summary": {
+                "read": read_states[0] if read_states else "not_validated",
+                "write": write_states[0] if write_states else "not_validated",
+            },
+        }
+        if mode.mode.value == "native_mcp":
+            item["next_action"] = "connect_provider_mcp"
+            item["official_mcp_url"] = mode.official_mcp_url
+        elif mode.mode.value == "api_driver":
+            item["next_action"] = "configure_local_api_driver"
+            item["required_user_values"] = manifest.required_secret_fields
+            item["local_command"] = (
+                f"mercury-tools credentials configure --connector {manifest.connector_id} "
+                "--mode api_driver --environment <environment>"
+            )
+        else:
+            item["next_action"] = "local_bridge_required"
+            item["local_command"] = (
+                f"mercury-tools local-bridge discover --connector {manifest.connector_id}"
+            )
+            item["local_bridge_requirement"] = mode.local_bridge_requirement
+        payload_modes.append(item)
     payload = {
         "status": "ok",
         "connector_id": manifest.connector_id,
-        "capabilities": list(manifest.capabilities),
-        "read_capabilities": manifest.read_capabilities,
-        "blocked_capabilities": manifest.blocked_capabilities,
-        "public_policy": "read_only_validation",
+        "connection_modes": payload_modes,
     }
-    _audit(
-        "connector_capabilities",
-        {"connector_id": manifest.connector_id},
-        {"status": "ok", "capability_count": len(manifest.capabilities)},
-    )
+    _audit("get_connector_setup", {"connector_id": manifest.connector_id}, {"status": "ok"})
     return payload
 
 
+def _validate_safe_profile_input(
+    value: str | None,
+    *,
+    label: str,
+    pattern: re.Pattern[str] = _SAFE_PUBLIC_PROFILE_TEXT_RE,
+) -> None:
+    if value is None:
+        return
+    _reject_sensitive_storage_input(**{label: value})
+    if not pattern.fullmatch(value.strip()):
+        raise ValueError(f"{label} is invalid")
+
+
+def _validate_external_server_name(value: str | None) -> None:
+    if value is None:
+        return
+    _validate_safe_profile_input(
+        value,
+        label="external_server_name",
+        pattern=_SAFE_EXTERNAL_SERVER_NAME_RE,
+    )
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return
+    raise ValueError("external_server_name must be a server name, not a LAN address")
+
+
 @mcp.tool(annotations=_AUDITED_PRIVATE)
-def start_connector_setup(
+def link_connector_profile(
     workspace_id: str,
     connector_id: ConnectorId,
+    connection_mode: ConnectorConnectionMode,
     environment: ConnectorEnvironment,
+    company_ref: str | None = None,
     company_name: str | None = None,
+    external_server_name: str | None = None,
 ) -> dict[str, Any]:
-    """Start gated connector setup for one workspace."""
+    """Store one sanitized connector profile without credentials or provider payloads."""
     try:
-        _reject_sensitive_storage_input(company_name=company_name)
+        _validate_safe_profile_input(company_ref, label="company_ref")
+        _validate_safe_profile_input(company_name, label="company_name")
+        _validate_external_server_name(external_server_name)
+        manifest = connector_by_id(connector_id)
+        mode = manifest.connection_mode(connection_mode) if manifest else None
+        if manifest is None:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        if mode is None:
+            raise ValueError(f"Unsupported connection mode for {manifest.connector_id}: {connection_mode}")
+        if mode.mode.value == "native_mcp" and external_server_name is None:
+            raise ValueError("external_server_name is required for native_mcp profiles")
+        if mode.mode.value == "local_bridge" and external_server_name is not None:
+            raise ValueError("local_bridge profiles do not store external_server_name")
         settings = load_settings()
-        token_payload = _public_workspace_payload_from_value(workspace_id)
-        profile = _product_store(settings).start_connector_setup(
-            token_payload=token_payload,
-            connector_id=connector_id,
+        profile = _product_store(settings).link_connector_profile(
+            token_payload=_public_workspace_payload_from_value(workspace_id),
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
             environment=environment,
+            company_ref=company_ref,
             company_name=company_name,
+            external_server_name=external_server_name,
         )
         payload = redact_json({"status": "ok", "profile": profile})
         _audit(
-            "start_connector_setup",
-            {**_public_workspace_audit_ref(workspace_id), "connector_id": connector_id},
+            "link_connector_profile",
             {
-                "status": "ok",
-                "connector_id": connector_id,
+                **_public_workspace_audit_ref(workspace_id),
+                "connector_id": manifest.connector_id,
+                "connection_mode": mode.mode.value,
                 "environment": environment,
             },
+            {"status": "ok", "profile_status": profile.get("status")},
+        )
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit("link_connector_profile", _public_workspace_audit_ref_optional(workspace_id), payload)
+        return payload
+
+
+@mcp.tool(annotations=_AUDITED_PRIVATE)
+def validate_connector_connection(
+    workspace_id: str,
+    connector_id: ConnectorId,
+    connection_mode: ConnectorConnectionMode,
+    environment: ConnectorEnvironment,
+    evidence: ConnectorValidationEvidence,
+) -> dict[str, Any]:
+    """Persist host-observed, sanitized validation evidence for one exact profile."""
+    try:
+        evidence_payload = (
+            evidence
+            if isinstance(evidence, ConnectorValidationEvidence)
+            else ConnectorValidationEvidence.model_validate(evidence)
+        )
+        manifest = connector_by_id(connector_id)
+        mode = manifest.connection_mode(connection_mode) if manifest else None
+        if manifest is None:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        if mode is None or environment not in mode.supported_environments:
+            raise ValueError("connector mode or environment is not supported")
+        expected_source = _EVIDENCE_SOURCE_BY_CONNECTION_MODE[mode.mode.value]
+        if evidence_payload.source != expected_source:
+            raise ValueError("evidence source does not match connection mode")
+        capability_states = {
+            item.capability: item.state for item in evidence_payload.capabilities
+        }
+        if len(capability_states) != len(evidence_payload.capabilities):
+            raise ValueError("evidence contains duplicate capabilities")
+        for capability, state in capability_states.items():
+            if state == "observed" and not manifest.provider_capabilities(mode.mode.value, capability):
+                raise ValueError("observed capability is not declared for the selected mode")
+        profile = _product_store(load_settings()).validate_connector_profile(
+            token_payload=_public_workspace_payload_from_value(workspace_id),
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=environment,
+            capability_states=capability_states,
+            evidence_source=evidence_payload.source,
+            evidence_ref=evidence_payload.evidence_ref,
+            validated_at=evidence_payload.observed_at.isoformat(),
+        )
+        payload = redact_json(
+            {
+                "status": "ok",
+                "profile": profile,
+                "validation_scope": (
+                    "host_observed_provider_result"
+                    if mode.mode.value == "native_mcp"
+                    else "local_validation_evidence"
+                ),
+                "provider_called_by_mercury": False,
+            }
+        )
+        _audit(
+            "validate_connector_connection",
+            {
+                **_public_workspace_audit_ref(workspace_id),
+                "connector_id": manifest.connector_id,
+                "connection_mode": mode.mode.value,
+                "environment": environment,
+                "evidence_ref": evidence_payload.evidence_ref,
+            },
+            {"status": "ok", "profile_status": profile.get("status")},
         )
         return payload
     except (PermissionError, RuntimeError, ValueError) as exc:
         payload = {"status": "error", "message": str(exc)}
         _audit(
-            "start_connector_setup",
-            {
-                **_public_workspace_audit_ref_optional(workspace_id),
-                "connector_id": connector_id,
-            },
+            "validate_connector_connection",
+            _public_workspace_audit_ref_optional(workspace_id),
             payload,
         )
         return payload
 
 
 @mcp.tool(annotations=_AUDITED_PRIVATE)
-def connector_status(workspace_id: str) -> dict[str, Any]:
-    """Read sanitized connector status for a Mercury public workspace."""
-    if not workspace_id:
-        payload = {
-            **_public_workspace_required_payload(),
-            "connectors": list_connector_public_summaries(),
+def connector_capabilities(
+    workspace_id: str,
+    connector_id: ConnectorId,
+    connection_mode: ConnectorConnectionMode,
+    environment: ConnectorEnvironment,
+) -> dict[str, Any]:
+    """Return declared and observed capability states for one exact profile."""
+    manifest = connector_by_id(connector_id)
+    mode = manifest.connection_mode(connection_mode) if manifest else None
+    if manifest is None or mode is None or environment not in mode.supported_environments:
+        return {
+            "status": "not_found",
+            "connector_id": connector_id,
+            "connection_mode": connection_mode,
+            "environment": environment,
         }
-        _audit("connector_status", {}, {"status": payload["status"]})
+    try:
+        dashboard_payload = _product_store(load_settings()).public_dashboard(workspace_id)
+        resolution = _workspace_connector_resolution(
+            dashboard_payload,
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=environment,
+        )
+        profile = resolution.get("profile")
+        observed = _profile_capability_states(profile) if isinstance(profile, dict) else {}
+        declared = {
+            capability: state.value
+            for capability, state in mode.provider_capability_status.items()
+        }
+        capability_states = {
+            capability: (
+                "provider_unavailable"
+                if declared_state == "provider_unavailable"
+                else observed.get(capability, "not_validated")
+            )
+            for capability, declared_state in declared.items()
+        }
+        payload = redact_json(
+            {
+                "status": "ok" if resolution["ready"] else "not_ready",
+                "reason": resolution["reason"],
+                "connector_id": manifest.connector_id,
+                "connection_mode": mode.mode.value,
+                "environment": environment,
+                "profile": profile,
+                "declared_capability_states": declared,
+                "observed_capability_states": observed,
+                "capability_states": capability_states,
+            }
+        )
+        _audit(
+            "connector_capabilities",
+            {
+                **_public_workspace_audit_ref(workspace_id),
+                "connector_id": manifest.connector_id,
+                "connection_mode": mode.mode.value,
+                "environment": environment,
+            },
+            {"status": payload["status"], "reason": payload.get("reason")},
+        )
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit("connector_capabilities", _public_workspace_audit_ref_optional(workspace_id), payload)
         return payload
 
+
+@mcp.tool(annotations=_AUDITED_PRIVATE)
+def unlink_connector_profile(
+    workspace_id: str,
+    connector_id: ConnectorId,
+    connection_mode: ConnectorConnectionMode,
+    environment: ConnectorEnvironment,
+    confirm: str = "unlink",
+) -> dict[str, Any]:
+    """Delete one Mercury profile without revoking provider-side authorization."""
+    if confirm != "unlink":
+        return {"status": "error", "message": 'confirm must be exactly "unlink"'}
+    try:
+        manifest = connector_by_id(connector_id)
+        mode = manifest.connection_mode(connection_mode) if manifest else None
+        if manifest is None or mode is None or environment not in mode.supported_environments:
+            raise ValueError("connector mode or environment is not supported")
+        result = _product_store(load_settings()).unlink_connector_profile(
+            token_payload=_public_workspace_payload_from_value(workspace_id),
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=environment,
+        )
+        payload = {
+            "status": "ok",
+            "connector_id": manifest.connector_id,
+            "connection_mode": mode.mode.value,
+            "environment": environment,
+            "deleted": bool(result.get("deleted")),
+            "provider_disconnect_required": mode.mode.value == "native_mcp",
+        }
+        _audit(
+            "unlink_connector_profile",
+            {
+                **_public_workspace_audit_ref(workspace_id),
+                "connector_id": manifest.connector_id,
+                "connection_mode": mode.mode.value,
+                "environment": environment,
+            },
+            {"status": "ok", "deleted": payload["deleted"]},
+        )
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit("unlink_connector_profile", _public_workspace_audit_ref_optional(workspace_id), payload)
+        return payload
+
+
+def start_connector_setup(
+    workspace_id: str,
+    connector_id: ConnectorId,
+    environment: ConnectorEnvironment,
+    company_name: str | None = None,
+) -> dict[str, Any]:
+    """Deprecated Python compatibility wrapper for link_connector_profile."""
+    manifest = connector_by_id(connector_id)
+    if manifest is None or not manifest.connection_modes:
+        return {"status": "error", "message": f"Unknown connector: {connector_id}"}
+    mode = manifest.connection_modes[0]
+    if mode.mode.value == "native_mcp":
+        return {
+            "status": "error",
+            "message": "external_server_name is required for native_mcp profiles",
+            "deprecated_tool": "start_connector_setup",
+            "replacement_tool": "link_connector_profile",
+        }
+    payload = link_connector_profile(
+        workspace_id=workspace_id,
+        connector_id=manifest.connector_id,
+        connection_mode=mode.mode.value,
+        environment=environment,
+        company_name=company_name,
+    )
+    return {
+        **payload,
+        "deprecated_tool": "start_connector_setup",
+        "replacement_tool": "link_connector_profile",
+    }
+
+
+@mcp.tool(annotations=_AUDITED_PRIVATE)
+def connector_status(
+    workspace_id: str,
+    connector_id: ConnectorId | None = None,
+) -> dict[str, Any]:
+    """Read connector state without silently choosing between multiple profiles."""
+    if not workspace_id:
+        payload = {**_public_workspace_required_payload(), "connectors": list_connector_public_summaries()}
+        _audit("connector_status", {}, {"status": payload["status"]})
+        return payload
     audit_input = _public_workspace_audit_ref_optional(workspace_id)
     try:
-        settings = load_settings()
-        dashboard_payload = _product_store(settings).public_dashboard(workspace_id)
-        public_profiles = public_connector_profiles(
-            dashboard_payload.get("connector_profiles") or []
+        dashboard_payload = _product_store(load_settings()).public_dashboard(workspace_id)
+        public_profiles = public_connector_profiles(dashboard_payload.get("connector_profiles") or [])
+        if connector_id is not None:
+            public_profiles = [
+                profile
+                for profile in public_profiles
+                if profile.get("connector_id") == connector_id
+            ]
+        active_context = None
+        if len(public_profiles) == 1:
+            selected_profile = public_profiles[0]
+            resolution = _workspace_connector_resolution(
+                {"connector_profiles": public_profiles},
+                connector_id=_clean_selector(selected_profile.get("connector_id")),
+                connection_mode=_clean_selector(selected_profile.get("connection_mode")),
+                environment=_clean_selector(selected_profile.get("environment")),
+            )
+            if resolution["ready"]:
+                active_context = _connector_context_from_profile(selected_profile)
+        status = (
+            "ok"
+            if active_context
+            else ("mode_required" if len(public_profiles) > 1 else "requires_setup")
         )
-        active_profile = _active_workspace_connector_profile(dashboard_payload)
-        active_context = (
-            _connector_context_from_profile(active_profile)
-            if active_profile is not None
-            else None
+        payload = redact_json(
+            {
+                "status": status,
+                "reason": "connection_mode_required" if status == "mode_required" else None,
+                "workspace": {
+                    "name": (dashboard_payload.get("workspace") or {}).get("name"),
+                    "host_app": "generic",
+                },
+                "connector_profiles": public_profiles,
+                "active_connector": active_context,
+                "setup_required": not bool(active_context),
+                "next_tool": "get_connector_setup" if status == "mode_required" else ("link_connector_profile" if not active_context else None),
+                "next_skill": "connector-credential-setup-th" if not active_context else None,
+            }
         )
-        payload: dict[str, Any] = {
-            "status": "ok" if active_context else "requires_setup",
-            "workspace": {
-                "name": (dashboard_payload.get("workspace") or {}).get("name"),
-                "host_app": "generic",
-            },
-            "connector_profiles": public_profiles,
-            "active_connector": active_context,
-            "setup_required": active_context is None,
-            "next_tool": "start_connector_setup" if active_context is None else None,
-            "next_skill": (
-                "connector-credential-setup-th" if active_context is None else None
-            ),
-        }
-        payload = redact_json(payload)
         _audit(
             "connector_status",
             audit_input,
-            {
-                "status": payload["status"],
-                "profile_count": len(public_profiles),
-                "active_connector": (
-                    active_context.get("connector_id") if active_context else None
-                ),
-            },
+            {"status": payload["status"], "profile_count": len(public_profiles)},
         )
         return payload
     except (PermissionError, RuntimeError, ValueError) as exc:
@@ -1816,27 +2343,15 @@ def run_workspace_flow_tool(
             flow_id=flow_id,
             env_overrides=env_overrides,
         )
-        for capability in readiness_selection["required_capabilities"]:
-            blocked = public_capability_gate(capability)
-            if blocked is not None:
-                _audit(
-                    "run_workspace_flow",
-                    {
-                        **_public_workspace_audit_ref(workspace_id),
-                        "flow_id": flow_id,
-                        "dry_run": dry_run,
-                        "capability": capability,
-                    },
-                    blocked,
-                )
-                return blocked
-        if not readiness_selection["connector_id"] or not workspace_connector_ready(
+        resolution = _workspace_connector_resolution(
             dashboard_payload,
             connector_id=readiness_selection["connector_id"],
+            connection_mode=readiness_selection["connection_mode"],
             environment=readiness_selection["environment"],
             required_capabilities=readiness_selection["required_capabilities"],
-        ):
-            payload = _connector_setup_block_payload()
+        )
+        if not resolution["ready"]:
+            payload = _connector_setup_block_payload(resolution)
             _audit(
                 "run_workspace_flow",
                 {
@@ -1845,6 +2360,7 @@ def run_workspace_flow_tool(
                     "dry_run": dry_run,
                     "env_keys": _env_keys(env_overrides),
                     "connector_id": readiness_selection["connector_id"],
+                    "connection_mode": readiness_selection["connection_mode"],
                     "environment": readiness_selection["environment"],
                 },
                 payload,
@@ -1855,7 +2371,10 @@ def run_workspace_flow_tool(
             return {"status": "not_found", "message": f"Workspace flow not found: {flow_id}"}
         result = create_default_runner(
             dry_run=dry_run,
-            connector_status_getter=lambda: connector_status(workspace_id),
+            connector_status_getter=lambda: connector_status(
+                workspace_id,
+                connector_id=readiness_selection["connector_id"],
+            ),
         ).run_text(
             str(flow.get("yaml") or ""),
             env=env_overrides,
@@ -2399,13 +2918,15 @@ async def run_workspace_flow(request: Request) -> Response:
                 flow_id=flow_id,
                 env_overrides=env_overrides,
             )
-            if not readiness_selection["connector_id"] or not workspace_connector_ready(
+            resolution = _workspace_connector_resolution(
                 dashboard_payload,
                 connector_id=readiness_selection["connector_id"],
+                connection_mode=readiness_selection["connection_mode"],
                 environment=readiness_selection["environment"],
                 required_capabilities=readiness_selection["required_capabilities"],
-            ):
-                return JSONResponse(redact_json(_connector_setup_block_payload()))
+            )
+            if not resolution["ready"]:
+                return JSONResponse(redact_json(_connector_setup_block_payload(resolution)))
             flow = store.get_flow(token_payload=token_payload, flow_id=flow_id)
             if not flow:
                 return _json_error("not_found", f"Workspace flow not found: {flow_id}", status_code=404)
@@ -2422,13 +2943,15 @@ async def run_workspace_flow(request: Request) -> Response:
                     return JSONResponse(redact_json(_connector_setup_block_payload()))
                 store = store or _product_store(settings)
                 dashboard_payload = store.dashboard(token_payload)
-                if not readiness_selection["connector_id"] or not workspace_connector_ready(
+                resolution = _workspace_connector_resolution(
                     dashboard_payload,
                     connector_id=readiness_selection["connector_id"],
+                    connection_mode=readiness_selection["connection_mode"],
                     environment=readiness_selection["environment"],
                     required_capabilities=readiness_selection["required_capabilities"],
-                ):
-                    return JSONResponse(redact_json(_connector_setup_block_payload()))
+                )
+                if not resolution["ready"]:
+                    return JSONResponse(redact_json(_connector_setup_block_payload(resolution)))
         runner = create_default_runner(dry_run=dry_run)
         result = (
             runner.run_flow(parsed_raw_flow, env=env_overrides)

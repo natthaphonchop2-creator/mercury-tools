@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 
 import pytest
 
@@ -31,15 +32,18 @@ def test_public_mcp_tools_have_submission_annotations() -> None:
         "get_document",
         "get_public_workspace",
         "list_connectors",
+        "get_connector_setup",
+        "link_connector_profile",
+        "validate_connector_connection",
         "connector_capabilities",
         "connector_status",
+        "unlink_connector_profile",
         "run_accounting_skill",
         "flow_cheat_sheet",
         "check_flow_syntax",
         "inspect_flow_files",
         "list_workspace_flows",
         "create_public_workspace",
-        "start_connector_setup",
         "run_flow",
         "run_flow_files",
         "run_mercury_flow",
@@ -60,14 +64,15 @@ def test_public_mcp_tools_have_submission_annotations() -> None:
 def test_public_storage_tools_reject_secret_bearing_inputs_before_persistence() -> None:
     from mercury_tools.mcp.server import (
         create_public_workspace,
+        link_connector_profile,
         save_workspace_flow_tool,
-        start_connector_setup,
     )
 
     workspace = create_public_workspace("client_secret=do-not-store-this-value")
-    connector = start_connector_setup(
+    connector = link_connector_profile(
         "workspace-demo",
         "flowaccount",
+        "api_driver",
         "production",
         company_name="private@example.com",
     )
@@ -307,14 +312,16 @@ def test_mcp_workspace_flow_tools_use_public_workspace_id(monkeypatch) -> None:
             return {
                 "workspace": {"name": "Demo Co", "workspace_key": "demo"},
                 "connector_profiles": [
-                    {
-                        "connector_id": "flowaccount",
-                        "environment": "production",
-                        "status": "connected",
-                        "metadata": {
-                            "setup_state": "ready",
-                            "enabled_capabilities": ["company.info.read"],
-                            "credential_storage": "encrypted_server_vault",
+                        {
+                            "connector_id": "flowaccount",
+                            "connection_mode": "api_driver",
+                            "environment": "production",
+                            "status": "ready_read_only",
+                            "capability_states": {"company.info.read": "observed"},
+                            "evidence_source": "api_driver_safe_probe",
+                            "validated_at": "2026-07-19T12:00:00+00:00",
+                            "metadata": {
+                                "credential_storage": "encrypted_server_vault",
                             "credential_fields": ["client_id", "client_secret"],
                             "credential_fingerprints": {
                                 "client_id": "client-id-fp",
@@ -401,9 +408,14 @@ async def test_public_mcp_tool_schemas_use_workspace_id() -> None:
     assert "create_public_workspace" in tools
     assert "get_public_workspace" in tools
     assert "workspace_connector_status" not in tools
+    assert "start_connector_setup" not in tools
     for name in {
         "retrieve_workspace_context_pack",
-        "start_connector_setup",
+        "link_connector_profile",
+        "validate_connector_connection",
+        "connector_status",
+        "connector_capabilities",
+        "unlink_connector_profile",
         "list_workspace_flows",
         "run_workspace_flow",
         "save_workspace_flow",
@@ -445,8 +457,8 @@ async def test_public_mcp_tool_schemas_are_explicit_for_plugin_review() -> None:
     context_filter_ref = context_schema["properties"]["filters"]["anyOf"][0]["$ref"]
     assert context_filter_ref.rsplit("/", 1)[-1] in context_schema["$defs"]
 
-    setup_schema = tools["start_connector_setup"].inputSchema
-    assert setup_schema["properties"]["environment"]["enum"] == [
+    link_schema = tools["link_connector_profile"].inputSchema
+    assert link_schema["properties"]["environment"]["enum"] == [
         "production",
         "sandbox",
         "uat",
@@ -487,6 +499,104 @@ async def test_public_mcp_tool_schemas_are_explicit_for_plugin_review() -> None:
     assert {"source", "connector_id", "environment", "required_capabilities"} <= set(
         metadata_schema["properties"]
     )
+
+
+@pytest.mark.asyncio
+async def test_public_connector_lifecycle_contract_is_exact_and_secretless() -> None:
+    from mercury_tools.mcp import server
+
+    tools = {tool.name: tool for tool in await server.mcp.list_tools()}
+    expected = {
+        "list_connectors",
+        "get_connector_setup",
+        "link_connector_profile",
+        "validate_connector_connection",
+        "connector_status",
+        "connector_capabilities",
+        "unlink_connector_profile",
+    }
+    assert expected <= set(tools)
+    assert "start_connector_setup" not in tools
+    connector_tool_names = {
+        name for name in tools if "connector" in name or name == "list_connectors"
+    }
+    assert connector_tool_names == expected
+
+    expected_parameters = {
+        "get_connector_setup": ("connector_id", "connection_mode"),
+        "link_connector_profile": (
+            "workspace_id",
+            "connector_id",
+            "connection_mode",
+            "environment",
+            "company_ref",
+            "company_name",
+            "external_server_name",
+        ),
+        "validate_connector_connection": (
+            "workspace_id",
+            "connector_id",
+            "connection_mode",
+            "environment",
+            "evidence",
+        ),
+        "connector_status": ("workspace_id", "connector_id"),
+        "connector_capabilities": (
+            "workspace_id",
+            "connector_id",
+            "connection_mode",
+            "environment",
+        ),
+        "unlink_connector_profile": (
+            "workspace_id",
+            "connector_id",
+            "connection_mode",
+            "environment",
+            "confirm",
+        ),
+    }
+    for name, parameters in expected_parameters.items():
+        assert tuple(inspect.signature(getattr(server, name)).parameters) == parameters
+
+    assert (
+        inspect.signature(server.get_connector_setup).parameters["connection_mode"].default
+        is None
+    )
+    assert (
+        inspect.signature(server.unlink_connector_profile).parameters["confirm"].default
+        == "unlink"
+    )
+
+    forbidden = {
+        "client_id",
+        "client_secret",
+        "api_key",
+        "access_token",
+        "authorization",
+        "credentials",
+        "metadata",
+        "response_body",
+        "lan_address",
+    }
+
+    def assert_strict(schema: object) -> None:
+        if isinstance(schema, dict):
+            properties = schema.get("properties")
+            if isinstance(properties, dict):
+                assert not (set(properties) & forbidden)
+            if schema.get("type") == "object" and properties is None:
+                pytest.fail(f"unconstrained object schema: {schema}")
+            for value in schema.values():
+                assert_strict(value)
+        elif isinstance(schema, list):
+            for item in schema:
+                assert_strict(item)
+
+    for name in expected:
+        assert_strict(tools[name].inputSchema)
+
+    for name in expected - {"list_connectors", "get_connector_setup"}:
+        assert "workspace_id" in tools[name].inputSchema["required"]
 
 
 @pytest.mark.asyncio

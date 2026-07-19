@@ -29,12 +29,12 @@ def _clear_live_env(monkeypatch) -> None:
 def ready_connector_profile(connector_id: str = "flowaccount") -> dict:
     return {
         "connector_id": connector_id,
+        "connection_mode": "api_driver",
         "environment": "production",
-        "status": "connected",
-        "metadata": {
-            "setup_state": "ready",
-            "enabled_capabilities": ["company.info.read"],
-        },
+        "status": "ready_read_only",
+        "capability_states": {"company.info.read": "observed"},
+        "evidence_source": "api_driver_safe_probe",
+        "validated_at": "2026-07-19T12:00:00+00:00",
     }
 
 
@@ -540,8 +540,8 @@ def test_workspace_flow_run_blocks_connector_backed_raw_yaml_when_unready(monkey
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "blocked"
-    assert "connector credential setup" in payload["message"]
+    assert payload["status"] == "not_ready"
+    assert payload["reason"] == "not_validated"
 
 
 def test_workspace_flow_run_blocks_raw_yaml_with_connector_missing_environment(monkeypatch) -> None:
@@ -605,8 +605,8 @@ def test_workspace_flow_run_blocks_raw_yaml_with_connector_missing_environment(m
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "blocked"
-    assert "connector credential setup" in payload["message"]
+    assert payload["status"] == "not_ready"
+    assert payload["reason"] == "environment_mismatch"
 
 
 def test_workspace_flow_run_allows_non_connector_raw_yaml_without_readiness(monkeypatch) -> None:

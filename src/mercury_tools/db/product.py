@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import re
 from collections.abc import Mapping
@@ -205,6 +206,8 @@ PUBLIC_CONNECTOR_METADATA_KEYS = frozenset(
         "required_secret_fields",
         "preset",
         "source",
+        "driver_identity",
+        "evidence_ref",
     }
 )
 PUBLIC_CONNECTOR_PROFILE_COLUMNS = frozenset(
@@ -256,6 +259,7 @@ SENSITIVE_CAPABILITY_KEY_RE = re.compile(
 )
 SAFE_PROFILE_TEXT_RE = re.compile(r"^[A-Za-z0-9._ -]{1,200}$")
 SAFE_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
+SAFE_EVIDENCE_REF_RE = re.compile(r"^evidence_[0-9a-z_-]{8,128}$")
 SAFE_PRESET_KEYS = frozenset(
     {
         "api_base_url",
@@ -434,6 +438,15 @@ def _safe_connector_metadata(value: Any) -> dict[str, Any]:
     source = _safe_profile_text(value.get("source"))
     if source:
         metadata["source"] = source
+    driver_identity = _safe_profile_text(value.get("driver_identity"))
+    if driver_identity:
+        metadata["driver_identity"] = driver_identity
+    evidence_ref = _safe_profile_text(
+        value.get("evidence_ref"),
+        pattern=SAFE_EVIDENCE_REF_RE,
+    )
+    if evidence_ref:
+        metadata["evidence_ref"] = evidence_ref
     required_secret_fields = value.get("required_secret_fields")
     if isinstance(required_secret_fields, list):
         fields = [
@@ -493,6 +506,16 @@ def _safe_validated_at(value: Any) -> str | None:
     except ValueError:
         return None
     return parsed.astimezone(UTC).isoformat() if parsed.tzinfo else None
+
+
+def _is_ip_address(value: str | None) -> bool:
+    if not value:
+        return False
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _is_observed_mutation(capability: str) -> bool:
@@ -827,6 +850,13 @@ class SupabaseProductStore:
                     f":{profile.get('environment')}"
                 )
                 connector_profiles[profile_key] = public_connector_profile(profile)
+            elif event_type == "connector.profile_unlinked":
+                event_summary = summary.get("event_summary") or {}
+                profile_key = (
+                    f"{event_summary.get('connector_id')}:{event_summary.get('connection_mode')}"
+                    f":{event_summary.get('environment')}"
+                )
+                connector_profiles.pop(profile_key, None)
             elif event_type in {"skill.enabled", "skill.disabled"}:
                 skill_id = str(summary.get("skill_id") or "")
                 if skill_id in skills:
@@ -1231,6 +1261,218 @@ class SupabaseProductStore:
                 "capabilities": manifest.capabilities,
             },
         )
+
+    def link_connector_profile(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        connection_mode: str,
+        environment: str,
+        company_ref: str | None = None,
+        company_name: str | None = None,
+        external_server_name: str | None = None,
+    ) -> dict[str, Any]:
+        connector = connector_by_id(connector_id)
+        if connector is None:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        mode = connector.connection_mode(connection_mode)
+        if mode is None:
+            raise ValueError(
+                f"Unsupported connection mode for {connector.connector_id}: {connection_mode}"
+            )
+        if environment not in mode.supported_environments:
+            raise ValueError(
+                "Unsupported environment for "
+                f"{connector.connector_id}/{mode.mode.value}: {environment}"
+            )
+        native_server_name = _safe_profile_text(
+            external_server_name,
+            pattern=SAFE_SERVER_NAME_RE,
+        )
+        if mode.mode.value == "native_mcp" and not native_server_name:
+            raise ValueError("external_server_name is required for native_mcp profiles")
+        if mode.mode.value == "native_mcp" and _is_ip_address(native_server_name):
+            raise ValueError("external_server_name must be a server name, not a LAN address")
+        if mode.mode.value == "local_bridge" and external_server_name is not None:
+            raise ValueError("local_bridge profiles do not store external_server_name")
+
+        metadata = {
+            "source": mode.mode.value,
+            **(
+                {"driver_identity": "mercury_api_driver"}
+                if mode.mode.value == "api_driver"
+                else {}
+            ),
+        }
+        return self.set_connector_profile(
+            token_payload=token_payload,
+            connector_id=connector.connector_id,
+            connection_mode=mode.mode.value,
+            environment=environment,
+            company_ref=company_ref,
+            company_name=company_name,
+            external_server_name=external_server_name,
+            metadata=metadata,
+        )
+
+    def validate_connector_profile(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        connection_mode: str,
+        environment: str,
+        capability_states: Mapping[str, str],
+        evidence_source: str,
+        evidence_ref: str,
+        validated_at: str,
+    ) -> dict[str, Any]:
+        connector = connector_by_id(connector_id)
+        if connector is None:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        mode = connector.connection_mode(connection_mode)
+        if mode is None:
+            raise ValueError(
+                f"Unsupported connection mode for {connector.connector_id}: {connection_mode}"
+            )
+        if environment not in mode.supported_environments:
+            raise ValueError(
+                "Unsupported environment for "
+                f"{connector.connector_id}/{mode.mode.value}: {environment}"
+            )
+        expected_source = EVIDENCE_SOURCE_BY_CONNECTION_MODE[mode.mode.value]
+        if evidence_source != expected_source:
+            raise ValueError("evidence_source does not match connection_mode")
+        if not _safe_profile_text(evidence_ref, pattern=SAFE_EVIDENCE_REF_RE):
+            raise ValueError("evidence_ref is invalid")
+        states = _safe_capability_states(capability_states)
+        if not states or len(states) != len(capability_states):
+            raise ValueError("capability_states are invalid")
+        for capability, state in states.items():
+            if state == "observed" and not connector.provider_capabilities(
+                mode.mode.value,
+                capability,
+            ):
+                raise ValueError("observed capability is not declared for connection mode")
+        if not _safe_validated_at(validated_at):
+            raise ValueError("validated_at is invalid")
+        return self.set_connector_profile(
+            token_payload=token_payload,
+            connector_id=connector.connector_id,
+            connection_mode=mode.mode.value,
+            environment=environment,
+            capability_states=states,
+            evidence_source=evidence_source,
+            validated_at=validated_at,
+            metadata={"evidence_ref": evidence_ref},
+        )
+
+    def unlink_connector_profile(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        connection_mode: str,
+        environment: str,
+    ) -> dict[str, Any]:
+        connector = connector_by_id(connector_id)
+        if connector is None:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        mode = connector.connection_mode(connection_mode)
+        if mode is None:
+            raise ValueError(
+                f"Unsupported connection mode for {connector.connector_id}: {connection_mode}"
+            )
+        if environment not in mode.supported_environments:
+            raise ValueError(
+                "Unsupported environment for "
+                f"{connector.connector_id}/{mode.mode.value}: {environment}"
+            )
+        try:
+            return self._unlink_connector_profile_product_tables(
+                token_payload=token_payload,
+                connector_id=connector.connector_id,
+                connection_mode=mode.mode.value,
+                environment=environment,
+            )
+        except RuntimeError as exc:
+            if is_product_schema_error(exc):
+                return self._fallback_unlink_connector_profile(
+                    token_payload=token_payload,
+                    connector_id=connector.connector_id,
+                    connection_mode=mode.mode.value,
+                    environment=environment,
+                )
+            raise
+
+    def _fallback_unlink_connector_profile(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        connection_mode: str,
+        environment: str,
+    ) -> dict[str, Any]:
+        context = self._fallback_workspace_for_token(token_payload)
+        self._fallback_record_state_event(
+            workspace_key=context["workspace"]["workspace_key"],
+            client_jti=str(token_payload.get("jti") or ""),
+            event_type="connector.profile_unlinked",
+            input_payload={
+                "connector_id": connector_id,
+                "connection_mode": connection_mode,
+                "environment": environment,
+            },
+            summary={
+                "event_summary": {
+                    "connector_id": connector_id,
+                    "connection_mode": connection_mode,
+                    "environment": environment,
+                    "deleted": True,
+                },
+            },
+        )
+        return {"deleted": True}
+
+    def _unlink_connector_profile_product_tables(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        connection_mode: str,
+        environment: str,
+    ) -> dict[str, Any]:
+        context = self.workspace_for_token(token_payload)
+        if not context:
+            raise ValueError("Workspace is not registered for this client token.")
+        self._request(
+            "DELETE",
+            "mercury_connector_profiles",
+            params={
+                "workspace_id": f"eq.{context['workspace']['id']}",
+                "connector_id": f"eq.{connector_id}",
+                "connection_mode": f"eq.{connection_mode}",
+                "environment": f"eq.{environment}",
+            },
+        )
+        self.record_event(
+            workspace_id=context["workspace"]["id"],
+            member_id=context["member"]["id"],
+            event_type="connector.profile_unlinked",
+            input_payload={
+                "connector_id": connector_id,
+                "connection_mode": connection_mode,
+                "environment": environment,
+            },
+            summary={
+                "connector_id": connector_id,
+                "connection_mode": connection_mode,
+                "environment": environment,
+                "deleted": True,
+            },
+        )
+        return {"deleted": True}
 
     def _fallback_record_uploaded_skill(
         self,

@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 ConnectorId = Literal["flowaccount", "peak", "express", "custom", "generic_mcp"]
 ConnectorEnvironment = Literal["production", "sandbox", "uat", "local", "gateway"]
+ConnectorConnectionMode = Literal["native_mcp", "api_driver", "local_bridge"]
 SearchMode = Literal["hybrid", "keyword", "vector"]
 CAPABILITY_PATTERN = r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$"
 AccountingSkillId = Literal[
@@ -282,6 +283,10 @@ class WorkspaceFlowEnvironment(StrictMcpInput):
         default=None,
         description="Connector environment selected for this saved flow.",
     )
+    connection_mode: ConnectorConnectionMode | None = Field(
+        default=None,
+        description="Connector connection mode selected for this saved flow.",
+    )
 
 
 class WorkspaceFlowMetadata(StrictMcpInput):
@@ -296,6 +301,10 @@ class WorkspaceFlowMetadata(StrictMcpInput):
     environment: ConnectorEnvironment | None = Field(
         default=None,
         description="Connector environment required by the saved flow.",
+    )
+    connection_mode: ConnectorConnectionMode | None = Field(
+        default=None,
+        description="Connector connection mode required by the saved flow.",
     )
     required_capabilities: list[str] = Field(
         default_factory=list,
