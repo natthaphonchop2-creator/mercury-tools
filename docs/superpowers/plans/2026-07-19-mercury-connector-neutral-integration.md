@@ -178,6 +178,9 @@ git commit -m "refactor: model connector modes and capability states"
 - Modify: `tests/test_product_fallback.py`
 - Modify: `tests/test_connector_setup.py`
 - Modify: `tests/test_cloud_secret_removal.py`
+- Modify: `tests/test_cloud_api.py`
+- Modify: `tests/test_cloud_client.py`
+- Modify: `tests/test_plugin_package.py`
 
 - [ ] **Step 1: Write migration tests before SQL**
 
@@ -225,6 +228,20 @@ alter table public.mercury_skill_catalog
 
 Add constraints for allowed connection modes, JSON object/array shape, bounded safe text, and no obvious secret-bearing keys in `capability_states`. Backfill existing profiles as `api_driver`, retain their environment and display name, and derive only neutral status from existing non-secret metadata. Do not migrate any credential value.
 
+The migration must be rerun-safe. Let the new column default backfill legacy
+rows only when the column is first added; never run an unconditional update that
+rewrites an existing `native_mcp` or `local_bridge` profile to `api_driver`.
+Translate only explicit legacy status `requires_credentials` to
+`needs_validation`, and never reset a new neutral status on rerun.
+
+Before adding constraints, replace legacy profile `metadata` with a strictly
+allowlisted non-secret projection (or `{}` when it cannot be proven safe). Add a
+database-level capability-state validator that checks every key and value, not
+only exact top-level key membership. It must reject embedded secret-bearing names
+such as `provider_access_token`, credential/bearer/API-key variants, tax-ID or
+email fields, and response-body/payload fields. Capability-state values must be
+limited to the reviewed state enum.
+
 Drop `mercury_connector_profiles_workspace_id_connector_id_environment_key` when present and add a named unique constraint over `(workspace_id, connector_id, connection_mode, environment)`. Update PostgREST upsert conflict targets and fallback profile keys to use all four fields.
 
 - [ ] **Step 4: Define typed validation evidence**
@@ -264,21 +281,23 @@ Replace `connector_profile_status_from_metadata()` with:
 
 ```python
 def connector_profile_status(
+    connector_id: str,
     connection_mode: str,
     capability_states: Mapping[str, str],
     *,
+    evidence_source: str | None,
     validated_at: str | None,
 ) -> str:
     ...
 ```
 
-Return only `requires_authorization`, `requires_local_setup`, `needs_validation`, `ready_read_only`, or `ready_read_write`. A native profile with observed read capabilities becomes `ready_read_only`; a profile with an observed reviewed mutation capability becomes `ready_read_write`; failed or missing evidence never becomes ready.
+Return only `requires_authorization`, `requires_local_setup`, `needs_validation`, `ready_read_only`, or `ready_read_write`. Require the exact evidence source for the selected mode (`native_mcp_safe_read`, `api_driver_safe_probe`, or `local_bridge_safe_probe`) before any ready state. A native profile with matching observed read evidence becomes `ready_read_only`. Return `ready_read_write` only for an observed mutation capability that exists in the selected connector mode's reviewed catalog and only when that mode is eligible for API-driver writes. A native safe-read observation must never create write readiness. Failed, mismatched, missing, or unknown evidence never becomes ready.
 
 Extend `PUBLIC_CONNECTOR_METADATA_KEYS` only with non-secret setup fields. Return normalized profile columns at the top level and redact all unrecognized metadata recursively.
 
 - [ ] **Step 6: Make Skill rows capability-driven**
 
-Add `required_capabilities` to `SKILL_CATALOG_SEED`, cloud models, API allowlists, fallback state, and Supabase row selection. Generic Skills must set `required_connectors=[]`; provider-specific setup Skills may retain `required_connectors=["flowaccount"]` or `["peak"]`.
+Add `required_capabilities` to `SKILL_CATALOG_SEED`, cloud models, API allowlists, fallback state, plugin contract fixtures, and Supabase row selection. Generic Skills must set `required_connectors=[]`; provider-specific setup Skills may retain `required_connectors=["flowaccount"]` or `["peak"]`. Cloud clients reading an older server response may default a missing `required_capabilities` field to `[]`, while current server and plugin contract responses must emit the field explicitly.
 
 - [ ] **Step 7: Run storage and migration tests**
 
@@ -287,7 +306,10 @@ uv run pytest -q \
   tests/test_connector_neutral_profile_migration.py \
   tests/test_product_fallback.py \
   tests/test_connector_setup.py \
-  tests/test_cloud_secret_removal.py
+  tests/test_cloud_secret_removal.py \
+  tests/test_cloud_api.py \
+  tests/test_cloud_client.py \
+  tests/test_plugin_package.py
 ```
 
 Expected: all pass and serialized profiles contain no legacy vault key or credential value.
@@ -295,7 +317,7 @@ Expected: all pass and serialized profiles contain no legacy vault key or creden
 - [ ] **Step 8: Commit Task 2**
 
 ```bash
-git add supabase/migrations/20260719120000_connector_neutral_profiles.sql tests/test_connector_neutral_profile_migration.py src/mercury_tools/db/product.py src/mercury_tools/cloud/models.py src/mercury_tools/cloud/api.py src/mercury_tools/mcp/schemas.py tests/test_product_fallback.py tests/test_connector_setup.py tests/test_cloud_secret_removal.py
+git add supabase/migrations/20260719120000_connector_neutral_profiles.sql tests/test_connector_neutral_profile_migration.py src/mercury_tools/db/product.py src/mercury_tools/cloud/models.py src/mercury_tools/cloud/api.py src/mercury_tools/mcp/schemas.py tests/test_product_fallback.py tests/test_connector_setup.py tests/test_cloud_secret_removal.py tests/test_cloud_api.py tests/test_cloud_client.py tests/test_plugin_package.py
 git commit -m "feat: persist connector modes and capability evidence"
 ```
 
