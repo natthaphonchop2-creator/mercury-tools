@@ -387,6 +387,14 @@ unlink_connector_profile(
 
 Assert `workspace_id` is required for every workspace-scoped tool. Assert no tool schema contains `client_id`, `client_secret`, `api_key`, `access_token`, `authorization`, or an unconstrained object.
 
+Add negative lifecycle tests proving that failed evidence cannot produce a ready
+profile, validation cannot create a profile before the exact profile is linked,
+unlink followed by relink cannot resurrect historical evidence, and the legacy
+HTTP setup route rejects extra/secret/provider-body/LAN fields and requires an
+explicit connector mode. Assert safe reviewed setup defaults are returned,
+non-ready resolver reasons are preserved, and the unlink MCP schema constrains
+`confirm` to the literal `unlink`.
+
 Add runtime regression tests proving capability routing is selected by
 `connector_id + connection_mode + environment + persisted evidence`, not by a
 capability-name suffix. FlowAccount `native_mcp` invoice creation must return
@@ -424,7 +432,7 @@ Expected: failures because the server still exposes `start_connector_setup` and 
 }
 ```
 
-API-driver guidance lists only required secret field names and a secure local command. It never asks for values in chat. Local Bridge guidance returns `local_bridge_required` and a safe discovery handoff.
+API-driver guidance lists only required secret field names and a secure local command. It never asks for values in chat. Return a sanitized copy of the selected mode's reviewed non-secret `setup_defaults` so fixed grant type, scope, API base URL, and token URL are not asked from the user again. Local Bridge guidance returns `local_bridge_required` and a safe discovery handoff.
 
 - [ ] **Step 4: Implement sanitized profile linking and evidence validation**
 
@@ -432,11 +440,22 @@ API-driver guidance lists only required secret field names and a secure local co
 
 `validate_connector_connection` validates each observed capability against the explicitly selected connector mode and environment, stores the evidence reference and timestamp, and computes the neutral profile status. For `native_mcp_safe_read`, the tool records a host-observed provider result; it does not claim the Mercury server called the provider. For API-driver and Local Bridge evidence, accept only sanitized evidence produced by their local validation path.
 
+Validation requires an already linked profile with the exact workspace,
+connector, mode, and environment identity; it must never upsert a new profile on
+its own. A failed evidence envelope must either be rejected as inconsistent or
+persist only non-ready capability states. It can never persist observed evidence
+that produces `ready_read_only` or `ready_read_write`.
+
 - [ ] **Step 5: Implement status, capability reasons, and unlink**
 
 `connector_capabilities(workspace_id, connector_id, connection_mode, environment)` returns declared and observed states for one unambiguous profile plus exact non-ready reasons such as `provider_unavailable`, `not_authorized`, `not_validated`, `environment_mismatch`, or `local_bridge_required`.
 
-`unlink_connector_profile` requires connector, mode, environment, and the exact literal `confirm="unlink"`; it deletes only the selected Mercury profile metadata, does not revoke provider OAuth, and returns `provider_disconnect_required=true` for native MCP profiles.
+`connector_status` and `connector_capabilities` must preserve the resolver's exact
+non-ready reason. A linked but unvalidated profile returns `not_validated`, not a
+null reason or a generic setup status. A supported connector/mode with the wrong
+environment returns `environment_mismatch`, not `not_found`.
+
+`unlink_connector_profile` requires connector, mode, environment, and the exact literal `confirm="unlink"`; encode the literal in the generated MCP schema, not only in runtime branching. It deletes only the selected Mercury profile metadata, does not revoke provider OAuth, and returns `provider_disconnect_required=true` for native MCP profiles. Fallback state reconstruction must honor unlink tombstones so a later relink starts unvalidated and cannot recover evidence from an older configured event.
 
 - [ ] **Step 6: Replace the legacy global runtime gate with profile-aware routing**
 
@@ -453,6 +472,14 @@ flow runner routes through the global suffix/segment gate again.
 - [ ] **Step 7: Keep a non-MCP compatibility helper**
 
 Retain `start_connector_setup(...)` as a plain Python wrapper to `link_connector_profile(...)` with the manifest's default mode. Remove its `@mcp.tool` decorator and mark its response with `deprecated_tool="start_connector_setup"` and `replacement_tool="link_connector_profile"`.
+
+When the opt-in legacy HTTP API is enabled, keep `/api/connectors/setup` only as
+a strict compatibility route. Validate its body with an extra-forbidden typed
+model requiring `connector_id`, `connection_mode`, and `environment`; allow only
+the same safe profile fields as `link_connector_profile`, and route through the
+same lifecycle storage behavior. Never silently default a mode or ignore unknown,
+secret, provider-body, or LAN-address fields. The compatibility wrapper must add
+its deprecation and replacement fields on success and error responses alike.
 
 - [ ] **Step 8: Run lifecycle tests**
 
