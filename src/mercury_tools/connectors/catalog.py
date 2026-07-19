@@ -473,6 +473,7 @@ CONNECTOR_CATALOG: list[ConnectorManifest] = [
                     company_action="company.info.read",
                     invoice_action="documents.invoice.get",
                 ),
+                official_mcp_url="https://mcp.flowaccount.com/mcp",
                 provider_setup_url=(
                     "https://flowaccount.com/en/help-center/category/ai-connector-mcp"
                 ),

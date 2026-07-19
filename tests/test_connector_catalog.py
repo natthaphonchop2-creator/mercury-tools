@@ -43,6 +43,15 @@ def test_flowaccount_native_mcp_read_only_does_not_block_api_driver_writes() -> 
     )
 
 
+def test_flowaccount_native_mcp_uses_official_mcp_url() -> None:
+    flow = connector_by_id("flowaccount")
+
+    assert flow is not None
+    native_mcp = flow.connection_mode("native_mcp")
+    assert native_mcp is not None
+    assert native_mcp.official_mcp_url == "https://mcp.flowaccount.com/mcp"
+
+
 def test_public_catalog_rows_expose_mode_specific_readiness_without_defaults() -> None:
     required_keys = {
         "display_name",
