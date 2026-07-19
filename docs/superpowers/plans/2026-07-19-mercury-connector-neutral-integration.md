@@ -145,7 +145,12 @@ For FlowAccount native MCP, set `provider_setup_url` to `https://flowaccount.com
 
 - [ ] **Step 5: Update public connector IDs and assertions**
 
-Extend `ConnectorId` in `src/mercury_tools/mcp/schemas.py` with `generic_mcp`. Update catalog tests so public summaries contain mode-specific capability states and never return a single vendor-wide `blocked_capabilities` list.
+Extend `ConnectorId` in `src/mercury_tools/mcp/schemas.py` with `generic_mcp`.
+The public `ConnectorEnvironment` literal must cover every environment declared
+by the reviewed catalog, including Generic MCP's `user_supplied`; a catalog
+entry must never be advertised if its lifecycle schema cannot select it. Update
+catalog tests so public summaries contain mode-specific capability states and
+never return a single vendor-wide `blocked_capabilities` list.
 
 - [ ] **Step 6: Run focused tests**
 
@@ -393,7 +398,10 @@ unlink followed by relink cannot resurrect historical evidence, and the legacy
 HTTP setup route rejects extra/secret/provider-body/LAN fields and requires an
 explicit connector mode. Assert safe reviewed setup defaults are returned,
 non-ready resolver reasons are preserved, and the unlink MCP schema constrains
-`confirm` to the literal `unlink`.
+`confirm` to the literal `unlink`. A rejected legacy HTTP body must never echo
+the submitted input value, including an unknown credential field. Every legacy
+HTTP response must include `deprecated_tool="start_connector_setup"` and
+`replacement_tool="link_connector_profile"`.
 
 Add runtime regression tests proving capability routing is selected by
 `connector_id + connection_mode + environment + persisted evidence`, not by a
@@ -440,6 +448,11 @@ API-driver guidance lists only required secret field names and a secure local co
 
 `validate_connector_connection` validates each observed capability against the explicitly selected connector mode and environment, stores the evidence reference and timestamp, and computes the neutral profile status. For `native_mcp_safe_read`, the tool records a host-observed provider result; it does not claim the Mercury server called the provider. For API-driver and Local Bridge evidence, accept only sanitized evidence produced by their local validation path.
 
+Normalize every accepted capability alias to the selected mode's declared
+provider-action key before persistence. Reject duplicate or conflicting
+observations after alias expansion so two names cannot overwrite one canonical
+capability state.
+
 Validation requires an already linked profile with the exact workspace,
 connector, mode, and environment identity; it must never upsert a new profile on
 its own. A failed evidence envelope must either be rejected as inconsistent or
@@ -455,7 +468,7 @@ non-ready reason. A linked but unvalidated profile returns `not_validated`, not 
 null reason or a generic setup status. A supported connector/mode with the wrong
 environment returns `environment_mismatch`, not `not_found`.
 
-`unlink_connector_profile` requires connector, mode, environment, and the exact literal `confirm="unlink"`; encode the literal in the generated MCP schema, not only in runtime branching. It deletes only the selected Mercury profile metadata, does not revoke provider OAuth, and returns `provider_disconnect_required=true` for native MCP profiles. Fallback state reconstruction must honor unlink tombstones so a later relink starts unvalidated and cannot recover evidence from an older configured event.
+`unlink_connector_profile` requires connector, mode, environment, and the exact literal `confirm="unlink"`; encode the literal in the generated MCP schema, not only in runtime branching. It deletes only the selected Mercury profile metadata, does not revoke provider OAuth, and returns `provider_disconnect_required=true` for native MCP profiles. Fallback state reconstruction must honor unlink tombstones so a later relink starts unvalidated and cannot recover evidence from an older configured event. Query fallback events by workspace and paginate through the complete ordered state stream; never reconstruct from only the oldest fixed-size prefix. Calling `link_connector_profile` again always starts a fresh unvalidated link and clears prior capability evidence, even when the four-part profile identity is unchanged.
 
 - [ ] **Step 6: Replace the legacy global runtime gate with profile-aware routing**
 
@@ -480,6 +493,8 @@ the same safe profile fields as `link_connector_profile`, and route through the
 same lifecycle storage behavior. Never silently default a mode or ignore unknown,
 secret, provider-body, or LAN-address fields. The compatibility wrapper must add
 its deprecation and replacement fields on success and error responses alike.
+Handle typed-body validation without serializing Pydantic's rejected
+`input_value` back to the client.
 
 - [ ] **Step 8: Run lifecycle tests**
 
