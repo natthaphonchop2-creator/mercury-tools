@@ -241,7 +241,9 @@ database-level capability-state validator that checks every key and value, not
 only exact top-level key membership. It must reject embedded secret-bearing names
 such as `provider_access_token`, credential/bearer/API-key variants, tax-ID or
 email fields, and response-body/payload fields. Capability-state values must be
-limited to the reviewed state enum.
+limited to the reviewed state enum. Define the validator with a fixed
+`search_path = pg_catalog`, revoke its default execution privilege from
+`PUBLIC`, and grant execution only to `service_role`.
 
 Drop `mercury_connector_profiles_workspace_id_connector_id_environment_key` when present and add a named unique constraint over `(workspace_id, connector_id, connection_mode, environment)`. Update PostgREST upsert conflict targets and fallback profile keys to use all four fields.
 
@@ -292,7 +294,7 @@ def connector_profile_status(
     ...
 ```
 
-Return only `requires_authorization`, `requires_local_setup`, `needs_validation`, `ready_read_only`, or `ready_read_write`. Require the exact evidence source for the selected mode (`native_mcp_safe_read`, `api_driver_safe_probe`, or `local_bridge_safe_probe`) before any ready state. A native profile with matching observed read evidence becomes `ready_read_only`. Return `ready_read_write` only for an observed mutation capability that exists in the selected connector mode's reviewed catalog and only when that mode is eligible for API-driver writes. A native safe-read observation must never create write readiness. Failed, mismatched, missing, or unknown evidence never becomes ready.
+Return only `requires_authorization`, `requires_local_setup`, `needs_validation`, `ready_read_only`, or `ready_read_write`. Require the exact evidence source for the selected mode (`native_mcp_safe_read`, `api_driver_safe_probe`, or `local_bridge_safe_probe`) before any ready state. Every observed capability used to produce either ready state must resolve to an action declared in the selected connector and connection-mode catalog; unknown capabilities and draft/custom modes with no reviewed catalog remain `needs_validation`. A native profile with matching catalog-declared read evidence becomes `ready_read_only`. Return `ready_read_write` only for an observed mutation capability that exists in the selected connector mode's reviewed catalog and only when that mode is eligible for API-driver writes. A native safe-read observation must never create write readiness. Failed, mismatched, missing, or unknown evidence never becomes ready.
 
 Extend `PUBLIC_CONNECTOR_METADATA_KEYS` only with non-secret setup fields. Return normalized profile columns at the top level and redact all unrecognized metadata recursively.
 
