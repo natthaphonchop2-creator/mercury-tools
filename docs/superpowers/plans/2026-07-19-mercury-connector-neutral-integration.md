@@ -641,6 +641,7 @@ git commit -m "fix: annotate public tools by business behavior"
 - Modify: `tests/test_mcp_contract.py`
 - Modify: `tests/test_connector_mcp_tools.py`
 - Modify: `tests/test_plugin_package.py`
+- Modify: `tests/test_http_app.py`
 
 - [ ] **Step 1: Add failing schema tests for the revised flow surface**
 
@@ -711,11 +712,13 @@ uv run pytest -q tests/test_mcp_contract.py tests/test_connector_mcp_tools.py te
 ```
 
 Expected: all flow schemas are explicit and no compatibility helper appears in `mcp.list_tools()`.
+The HTTP `/api/status` flow-tool list must advertise the same revised public
+names and must not retain `run_flow` or `run_mercury_flow`.
 
 - [ ] **Step 7: Commit Task 5**
 
 ```bash
-git add src/mercury_tools/mcp/schemas.py src/mercury_tools/mcp/server.py tests/test_mcp_contract.py tests/test_connector_mcp_tools.py tests/test_plugin_package.py
+git add src/mercury_tools/mcp/schemas.py src/mercury_tools/mcp/server.py tests/test_mcp_contract.py tests/test_connector_mcp_tools.py tests/test_plugin_package.py tests/test_http_app.py
 git commit -m "refactor: split public Mercury flow sources"
 ```
 
