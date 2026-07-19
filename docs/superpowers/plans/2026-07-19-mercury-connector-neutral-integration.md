@@ -528,7 +528,21 @@ EXPECTED_ANNOTATIONS = {
 
 Tuple order is `(readOnlyHint, destructiveHint, idempotentHint, openWorldHint)`. Read tools use `idempotentHint=None`, not `False`, because the hint applies to mutation tools.
 
-Complete the same exact matrix for every registered hosted tool. These are closed reads: `retrieve_workspace_context_pack`, `get_public_workspace`, `list_accounting_skills`, `get_accounting_skill_schema`, `run_accounting_skill`, `flow_cheat_sheet`, `check_flow_syntax`, `inspect_flow_files`, `run_inline_flow`, `run_flow_files`, `list_workspace_flows`, and `run_workspace_flow`. `create_public_workspace` and `link_connector_profile` are closed non-idempotent creates; `validate_connector_connection` and `save_workspace_flow` are closed idempotent writes; `unlink_connector_profile` is a closed destructive idempotent write. No hosted core tool sets `openWorldHint=true` because provider MCP calls and local-driver network calls occur outside this server.
+Complete the same exact matrix for every tool registered at the end of Task 3.
+Do not register Task 5's future `run_inline_flow` tool or remove compatibility
+flow tools in this task. The currently registered planning tools, including
+`run_flow`, `run_flow_files`, and `run_mercury_flow`, are closed reads until Task
+5 replaces the ambiguous public names. Other closed reads include
+`retrieve_workspace_context_pack`, `get_public_workspace`,
+`list_accounting_skills`, `get_accounting_skill_schema`,
+`run_accounting_skill`, `flow_cheat_sheet`, `check_flow_syntax`,
+`inspect_flow_files`, `list_workspace_flows`, and `run_workspace_flow`.
+`create_public_workspace` and `link_connector_profile` are closed non-idempotent
+creates; `validate_connector_connection` and `save_workspace_flow` are closed
+idempotent writes; `unlink_connector_profile` is a closed destructive
+idempotent write. No hosted core tool sets `openWorldHint=true` because provider
+MCP calls and local-driver network calls occur outside this server. Task 5 must
+update the exact matrix when it changes the registered flow tool names.
 
 - [ ] **Step 2: Run the annotation test and confirm `_AUDITED_PRIVATE` fails**
 
