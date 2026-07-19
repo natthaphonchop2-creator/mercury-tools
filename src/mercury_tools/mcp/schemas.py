@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-ConnectorId = Literal["flowaccount", "peak", "express", "custom"]
+ConnectorId = Literal["flowaccount", "peak", "express", "custom", "generic_mcp"]
 ConnectorEnvironment = Literal["production", "sandbox", "uat", "local", "gateway"]
 SearchMode = Literal["hybrid", "keyword", "vector"]
 AccountingSkillId = Literal[

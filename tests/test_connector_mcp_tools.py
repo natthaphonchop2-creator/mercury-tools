@@ -88,29 +88,26 @@ def test_list_connectors_exposes_setup_targets_without_secrets() -> None:
         "peak",
         "express",
         "custom",
+        "generic_mcp",
     }
     assert "super-secret" not in str(payload)
     assert "client_secret_value" not in str(payload)
     flowaccount = next(
         item for item in payload["connectors"] if item["connector_id"] == "flowaccount"
     )
-    assert flowaccount["required_secret_fields"] == ["client_id", "client_secret"]
-    assert flowaccount["preset"]["token_url"] == (
-        "https://openapi.flowaccount.com/v1/token"
-    )
+    assert set(flowaccount["connection_mode_ids"]) == {"native_mcp", "api_driver"}
+    assert flowaccount["provider_capability_status"]["native_mcp"][
+        "documents.invoice.create"
+    ] == "provider_unavailable"
+    assert "blocked_capabilities" not in flowaccount
 
 
-def test_connector_capabilities_returns_public_policy() -> None:
-    from mercury_tools.mcp.server import connector_capabilities
+def test_connector_id_accepts_generic_mcp() -> None:
+    from mercury_tools.mcp.schemas import AccountingSkillInputs
 
-    payload = connector_capabilities("flowaccount")
+    payload = AccountingSkillInputs(connector_id="generic_mcp")
 
-    assert payload["status"] == "ok"
-    assert payload["connector_id"] == "flowaccount"
-    assert "documents.invoice.list" in payload["capabilities"]
-    assert "documents.invoice.list" in payload["read_capabilities"]
-    assert "documents.invoice.create" in payload["blocked_capabilities"]
-    assert payload["public_policy"] == "read_only_validation"
+    assert payload.connector_id == "generic_mcp"
 
 
 def test_start_connector_setup_requires_valid_connector(monkeypatch) -> None:
