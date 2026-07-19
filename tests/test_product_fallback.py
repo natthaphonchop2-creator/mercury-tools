@@ -529,7 +529,8 @@ def test_product_table_exact_relink_clears_existing_validation_evidence() -> Non
     assert "evidence_ref" not in relinked["metadata"]
 
 
-def test_fallback_generic_mcp_user_supplied_profile_accepts_discovered_read_evidence() -> None:
+def test_fallback_generic_mcp_user_supplied_profile_accepts_mutation_named_discovered_evidence(
+) -> None:
     store = AuditFallbackStore()
     linked = store.link_connector_profile(
         token_payload=token_payload(),
@@ -544,7 +545,7 @@ def test_fallback_generic_mcp_user_supplied_profile_accepts_discovered_read_evid
         connector_id="generic_mcp",
         connection_mode="native_mcp",
         environment="user_supplied",
-        capability_states={"ledger.entries.list": "observed"},
+        capability_states={"ledger.entries.delete": "observed"},
         evidence_source="native_mcp_safe_read",
         evidence_ref="evidence_generic_mcp_1234",
         validated_at="2026-07-19T12:00:00+00:00",
@@ -552,7 +553,30 @@ def test_fallback_generic_mcp_user_supplied_profile_accepts_discovered_read_evid
 
     assert linked["status"] == "needs_validation"
     assert validated["status"] == "ready_read_only"
-    assert validated["capability_states"] == {"ledger.entries.list": "observed"}
+    assert validated["capability_states"] == {"ledger.entries.delete": "observed"}
+
+
+def test_fallback_fixed_catalog_rejects_unknown_capability() -> None:
+    store = AuditFallbackStore()
+    store.link_connector_profile(
+        token_payload=token_payload(),
+        connector_id="flowaccount",
+        connection_mode="native_mcp",
+        environment="production",
+        external_server_name="flowaccount-mcp",
+    )
+
+    with pytest.raises(ValueError, match="capability is not declared for connection mode"):
+        store.validate_connector_profile(
+            token_payload=token_payload(),
+            connector_id="flowaccount",
+            connection_mode="native_mcp",
+            environment="production",
+            capability_states={"documents.invoice.delete": "observed"},
+            evidence_source="native_mcp_safe_read",
+            evidence_ref="evidence_fixed_catalog_1234",
+            validated_at="2026-07-19T12:00:00+00:00",
+        )
 
 
 def test_profile_status_requires_evidence_and_only_observed_mutations_are_write_ready() -> None:

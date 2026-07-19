@@ -796,11 +796,7 @@ def _profile_provider_actions(
     provider_actions = manifest.provider_capabilities(mode.mode.value, normalized)
     if provider_actions:
         return provider_actions
-    if (
-        mode.capability_source == "discovered_tools"
-        and normalized
-        and not (set(normalized.split(".")) & _MUTATION_CAPABILITY_SEGMENTS)
-    ):
+    if mode.capability_source == "discovered_tools" and normalized:
         return (normalized,)
     return ()
 
@@ -1644,6 +1640,17 @@ def validate_connector_connection(
                 "evidence_ref": evidence_payload.evidence_ref,
             },
             {"status": "ok", "profile_status": profile.get("status")},
+        )
+        return payload
+    except ValidationError:
+        payload = {
+            "status": "error",
+            "message": "Connector validation evidence is invalid.",
+        }
+        _audit(
+            "validate_connector_connection",
+            _public_workspace_audit_ref_optional(workspace_id),
+            payload,
         )
         return payload
     except (PermissionError, RuntimeError, ValueError) as exc:

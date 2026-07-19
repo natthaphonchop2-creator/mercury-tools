@@ -556,11 +556,7 @@ def _all_observed_capabilities_are_catalog_bound(
     if connector is None or mode is None:
         return False
     if mode.capability_source == "discovered_tools":
-        return all(
-            not _is_observed_mutation(capability)
-            for capability, state in capability_states.items()
-            if state == "observed"
-        )
+        return True
     return all(
         bool(connector.provider_capabilities(connection_mode, capability))
         for capability, state in capability_states.items()
@@ -652,6 +648,8 @@ def connector_profile_status(
         return "needs_validation"
     if not _all_observed_capabilities_are_catalog_bound(connector_id, mode, states):
         return "needs_validation"
+    if mode == "native_mcp" and catalog_mode.capability_source == "discovered_tools":
+        return "ready_read_only"
     if mode == "native_mcp":
         return (
             "ready_read_only"
@@ -1395,17 +1393,14 @@ class SupabaseProductStore:
         states = _safe_capability_states(capability_states)
         if not states or len(states) != len(capability_states):
             raise ValueError("capability_states are invalid")
-        for capability, state in states.items():
+        for capability, _state in states.items():
             catalog_bound = connector.provider_capabilities(
                 mode.mode.value,
                 capability,
             )
-            discovered_safe_read = (
-                mode.capability_source == "discovered_tools"
-                and not _is_observed_mutation(capability)
-            )
-            if state == "observed" and not (catalog_bound or discovered_safe_read):
-                raise ValueError("observed capability is not declared for connection mode")
+            discovered_capability = mode.capability_source == "discovered_tools"
+            if not (catalog_bound or discovered_capability):
+                raise ValueError("capability is not declared for connection mode")
         if not _safe_validated_at(validated_at):
             raise ValueError("validated_at is invalid")
         try:

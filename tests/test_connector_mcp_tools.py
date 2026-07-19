@@ -220,7 +220,7 @@ def test_link_connector_profile_returns_a_sanitized_mode_specific_profile(monkey
     assert "super-secret-value" not in str(payload)
 
 
-def test_generic_mcp_user_supplied_profile_links_and_validates_discovered_tools(
+def test_generic_mcp_user_supplied_profile_records_mutation_named_discovered_tools(
     monkeypatch,
 ) -> None:
     from mercury_tools.mcp import server
@@ -273,9 +273,9 @@ def test_generic_mcp_user_supplied_profile_links_and_validates_discovered_tools(
             "status": "succeeded",
             "observed_at": "2026-07-19T12:00:00Z",
             "evidence_ref": "evidence_generic_tools_1234",
-            "provider_tool_name": "ledger.entries.list",
+            "provider_tool_name": "ledger.entries.delete",
             "capabilities": [
-                {"capability": "ledger.entries.list", "state": "observed"}
+                {"capability": "ledger.entries.delete", "state": "observed"}
             ],
         },
     )
@@ -283,17 +283,106 @@ def test_generic_mcp_user_supplied_profile_links_and_validates_discovered_tools(
     assert linked["status"] == "ok"
     assert captured["link"]["environment"] == "user_supplied"
     assert validated["status"] == "ok"
+    assert validated["provider_called_by_mercury"] is False
     assert captured["validate"]["capability_states"] == {
-        "ledger.entries.list": "observed"
+        "ledger.entries.delete": "observed"
     }
     resolution = server._workspace_connector_resolution(
         {"connector_profiles": [validated["profile"]]},
         connector_id="generic_mcp",
         connection_mode="native_mcp",
         environment="user_supplied",
-        required_capabilities=["ledger.entries.list"],
+        required_capabilities=["ledger.entries.delete"],
     )
     assert resolution["ready"] is True
+
+
+def test_validate_connector_connection_hides_typed_evidence_input_from_result_and_audit(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    audit_events: list[dict[str, Any]] = []
+
+    def fake_audit(
+        tool_name: str,
+        input_payload: dict[str, Any],
+        output_summary: dict[str, Any],
+    ) -> None:
+        audit_events.append(
+            {
+                "tool_name": tool_name,
+                "input_payload": input_payload,
+                "output_summary": output_summary,
+            }
+        )
+
+    monkeypatch.setattr(server, "_audit", fake_audit)
+    marker = "provider_body_marker_must_not_leak_1234"
+
+    payload = server.validate_connector_connection(
+        workspace_id=make_workspace_id(),
+        connector_id="flowaccount",
+        connection_mode="native_mcp",
+        environment="production",
+        evidence={
+            "source": "native_mcp_safe_read",
+            "status": "succeeded",
+            "observed_at": "2026-07-19T12:00:00Z",
+            "evidence_ref": "evidence_typed_input_1234",
+            "capabilities": [{"capability": "company.info.read", "state": "observed"}],
+            "provider_body": marker,
+        },
+    )
+
+    assert payload == {
+        "status": "error",
+        "message": "Connector validation evidence is invalid.",
+    }
+    assert marker not in str(payload)
+    assert len(audit_events) == 1
+    assert audit_events[0]["tool_name"] == "validate_connector_connection"
+    assert audit_events[0]["output_summary"] == payload
+    assert marker not in str(audit_events)
+
+
+def test_validate_connector_connection_rejects_unknown_fixed_catalog_capability(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    calls = 0
+
+    class FakeStore:
+        def validate_connector_profile(self, **kwargs: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            return {}
+
+    configure_product_env(monkeypatch)
+    monkeypatch.setattr(server, "_product_store", lambda settings: FakeStore())
+
+    payload = server.validate_connector_connection(
+        workspace_id=make_workspace_id(),
+        connector_id="flowaccount",
+        connection_mode="native_mcp",
+        environment="production",
+        evidence={
+            "source": "native_mcp_safe_read",
+            "status": "succeeded",
+            "observed_at": "2026-07-19T12:00:00Z",
+            "evidence_ref": "evidence_fixed_unknown_1234",
+            "capabilities": [
+                {"capability": "documents.invoice.delete", "state": "observed"}
+            ],
+        },
+    )
+
+    assert payload == {
+        "status": "error",
+        "message": "evidence capability is not declared for the selected mode",
+    }
+    assert calls == 0
 
 
 def test_validate_connector_connection_records_host_observed_evidence(monkeypatch) -> None:
