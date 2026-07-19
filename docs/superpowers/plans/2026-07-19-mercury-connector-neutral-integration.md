@@ -641,6 +641,12 @@ class FlowEnvironmentValue(StrictMcpInput):
 
 Assert `flow_files` is always `list[FlowFileInput]`, tags are bounded string arrays, metadata references `WorkspaceFlowMetadata`, and public tools expose no `dict[str, Any]` input schema.
 
+Hosted flow environment values are non-secret runtime parameters only. Reject
+secret-bearing names such as `api_key`, `token`, `password`, `authorization`,
+or `client_secret`, and reject values detected by the shared redaction boundary
+before audit persistence or flow parsing. ERP and provider credentials remain
+local-only and never enter the hosted MCP arguments.
+
 - [ ] **Step 2: Run the schema tests and confirm the old generic source fails**
 
 ```bash
