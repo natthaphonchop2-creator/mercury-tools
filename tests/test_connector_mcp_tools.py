@@ -387,6 +387,7 @@ def test_validate_connector_connection_rejects_unknown_fixed_catalog_capability(
 
 def test_validate_connector_connection_records_host_observed_evidence(monkeypatch) -> None:
     from mercury_tools.mcp import server
+    from mercury_tools.mcp.schemas import ConnectorValidationEvidence
 
     configure_product_env(monkeypatch)
     captured: dict[str, Any] = {}
@@ -411,14 +412,14 @@ def test_validate_connector_connection_records_host_observed_evidence(monkeypatc
         connector_id="flowaccount",
         connection_mode="native_mcp",
         environment="production",
-        evidence={
-            "source": "native_mcp_safe_read",
-            "status": "succeeded",
-            "observed_at": "2026-07-19T12:00:00Z",
-            "evidence_ref": "evidence_native_read_1234",
-            "provider_tool_name": "company.info.read",
-            "capabilities": [{"capability": "company.info.read", "state": "observed"}],
-        },
+        evidence=ConnectorValidationEvidence(
+            source="native_mcp_safe_read",
+            status="succeeded",
+            observed_at="2026-07-19T12:00:00Z",
+            evidence_ref="evidence_native_read_1234",
+            provider_tool_name="company.info.read",
+            capabilities=[{"capability": "company.info.read", "state": "observed"}],
+        ),
     )
 
     assert payload["status"] == "ok"

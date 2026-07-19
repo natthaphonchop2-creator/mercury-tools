@@ -505,6 +505,7 @@ async def test_public_mcp_tool_schemas_are_explicit_for_plugin_review() -> None:
 @pytest.mark.asyncio
 async def test_public_connector_lifecycle_contract_is_exact_and_secretless() -> None:
     from mercury_tools.mcp import server
+    from mercury_tools.mcp.schemas import ConnectorValidationEvidence
 
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
     expected = {
@@ -570,6 +571,16 @@ async def test_public_connector_lifecycle_contract_is_exact_and_secretless() -> 
     confirm_schema = tools["unlink_connector_profile"].inputSchema["properties"]["confirm"]
     assert confirm_schema.get("const") == "unlink" or confirm_schema.get("enum") == ["unlink"]
 
+    evidence_schema = tools["validate_connector_connection"].inputSchema["properties"][
+        "evidence"
+    ]
+    expected_evidence_schema = ConnectorValidationEvidence.model_json_schema()
+    expected_capability_schemas = expected_evidence_schema.pop("$defs")
+    assert evidence_schema == expected_evidence_schema
+    assert tools["validate_connector_connection"].inputSchema["$defs"][
+        "CapabilityObservation"
+    ] == expected_capability_schemas["CapabilityObservation"]
+
     forbidden = {
         "client_id",
         "client_secret",
@@ -625,3 +636,60 @@ async def test_typed_run_mercury_flow_schema_executes_through_fastmcp() -> None:
     assert structured["status"] == "planned"
     assert structured["input_mode"] == "flow_yaml"
     assert structured["artifacts"][0]["title"] == "Typed schema smoke"
+
+
+@pytest.mark.asyncio
+async def test_validate_connector_connection_sanitizes_invalid_evidence_through_fastmcp(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    audit_events: list[dict[str, object]] = []
+
+    def fake_audit(
+        tool_name: str,
+        input_payload: dict[str, object],
+        output_summary: dict[str, object],
+    ) -> None:
+        audit_events.append(
+            {
+                "tool_name": tool_name,
+                "input_payload": input_payload,
+                "output_summary": output_summary,
+            }
+        )
+
+    marker = "provider_body_marker_must_not_leak_from_fastmcp_1234"
+    monkeypatch.setattr(server, "_audit", fake_audit)
+
+    content, structured = await server.mcp.call_tool(
+        "validate_connector_connection",
+        {
+            "workspace_id": "mw_publiccontestworkspace001",
+            "connector_id": "flowaccount",
+            "connection_mode": "native_mcp",
+            "environment": "production",
+            "evidence": {
+                "source": "native_mcp_safe_read",
+                "status": "succeeded",
+                "observed_at": "2026-07-19T12:00:00Z",
+                "evidence_ref": "evidence_fastmcp_input_1234",
+                "capabilities": [
+                    {"capability": "company.info.read", "state": "observed"}
+                ],
+                "provider_body": marker,
+            },
+        },
+    )
+
+    assert structured == {
+        "status": "error",
+        "message": "Connector validation evidence is invalid.",
+    }
+    assert marker not in str((content, structured))
+    assert "input_value" not in str((content, structured))
+    assert len(audit_events) == 1
+    assert audit_events[0]["tool_name"] == "validate_connector_connection"
+    assert audit_events[0]["output_summary"] == structured
+    assert marker not in str(audit_events)
+    assert "input_value" not in str(audit_events)

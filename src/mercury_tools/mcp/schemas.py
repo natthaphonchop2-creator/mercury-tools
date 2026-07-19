@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SkipValidation
 
 ConnectorId = Literal["flowaccount", "peak", "express", "custom", "generic_mcp"]
 ConnectorEnvironment = Literal[
@@ -65,6 +65,9 @@ class ConnectorValidationEvidence(StrictMcpInput):
     evidence_ref: str = Field(pattern=r"^evidence_[0-9a-z_-]{8,128}$")
     provider_tool_name: str | None = Field(default=None, max_length=200)
     capabilities: list[CapabilityObservation] = Field(min_length=1, max_length=500)
+
+
+ConnectorValidationEvidenceInput = SkipValidation[ConnectorValidationEvidence]
 
 
 class LegacyConnectorSetupRequest(StrictMcpInput):

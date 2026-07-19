@@ -53,6 +53,7 @@ from mercury_tools.mcp.schemas import (
     ConnectorId,
     ConnectorUnlinkConfirmation,
     ConnectorValidationEvidence,
+    ConnectorValidationEvidenceInput,
     FlowFileInput,
     KnowledgeSearchFilters,
     LegacyConnectorSetupRequest,
@@ -1581,7 +1582,7 @@ def validate_connector_connection(
     connector_id: ConnectorId,
     connection_mode: ConnectorConnectionMode,
     environment: ConnectorEnvironment,
-    evidence: ConnectorValidationEvidence,
+    evidence: ConnectorValidationEvidenceInput,
 ) -> dict[str, Any]:
     """Persist host-observed, sanitized validation evidence for one exact profile."""
     try:
