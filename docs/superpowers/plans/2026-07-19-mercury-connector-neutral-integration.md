@@ -696,6 +696,10 @@ run_flow_files(
 ```
 
 Use `Field(default_factory=list)` in Pydantic models rather than mutable Python defaults in implementation. Require `workspace_id` even for non-connector hosted runs so workspace audit and saved-flow behavior are never implicit.
+Reject blank, whitespace-only, and malformed workspace identifiers at the real
+FastMCP boundary before environment handling or flow parsing. Add
+`mcp.call_tool` regressions for both inline and file-based run tools and verify
+that no plan or audit event is produced for rejected identifiers.
 
 - [ ] **Step 4: Preserve compatibility outside the MCP registry**
 
