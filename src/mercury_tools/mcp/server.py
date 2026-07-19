@@ -1503,6 +1503,35 @@ def link_connector_profile(
         return payload
 
 
+def _canonical_evidence_capability_states(
+    *,
+    manifest: Any,
+    connection_mode: str,
+    evidence: ConnectorValidationEvidence,
+) -> dict[str, str]:
+    """Expand accepted evidence aliases into their declared provider-action keys."""
+    capability_states: dict[str, str] = {}
+    for observation in evidence.capabilities:
+        provider_actions = manifest.provider_capabilities(
+            connection_mode,
+            observation.capability,
+        )
+        if not provider_actions:
+            raise ValueError("evidence capability is not declared for the selected mode")
+        for provider_action in provider_actions:
+            existing_state = capability_states.get(provider_action)
+            if existing_state is not None:
+                if existing_state != observation.state:
+                    raise ValueError(
+                        "evidence contains conflicting capability observations after alias expansion"
+                    )
+                raise ValueError(
+                    "evidence contains duplicate capabilities after alias expansion"
+                )
+            capability_states[provider_action] = observation.state
+    return capability_states
+
+
 @mcp.tool(annotations=_AUDITED_PRIVATE)
 def validate_connector_connection(
     workspace_id: str,
@@ -1531,14 +1560,11 @@ def validate_connector_connection(
             item.state == "observed" for item in evidence_payload.capabilities
         ):
             raise ValueError("failed evidence cannot contain observed capabilities")
-        capability_states = {
-            item.capability: item.state for item in evidence_payload.capabilities
-        }
-        if len(capability_states) != len(evidence_payload.capabilities):
-            raise ValueError("evidence contains duplicate capabilities")
-        for capability, state in capability_states.items():
-            if state == "observed" and not manifest.provider_capabilities(mode.mode.value, capability):
-                raise ValueError("observed capability is not declared for the selected mode")
+        capability_states = _canonical_evidence_capability_states(
+            manifest=manifest,
+            connection_mode=mode.mode.value,
+            evidence=evidence_payload,
+        )
         profile = _product_store(load_settings()).validate_connector_profile(
             token_payload=_public_workspace_payload_from_value(workspace_id),
             connector_id=manifest.connector_id,

@@ -263,6 +263,116 @@ def test_validate_connector_connection_records_host_observed_evidence(monkeypatc
     assert captured["evidence_ref"] == "evidence_native_read_1234"
 
 
+def test_validate_connector_connection_canonicalizes_alias_evidence_for_runtime_lookup(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    configure_product_env(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    class FakeStore:
+        def validate_connector_profile(self, **kwargs: Any) -> dict[str, Any]:
+            captured.update(kwargs)
+            return {
+                "connector_id": kwargs["connector_id"],
+                "connection_mode": kwargs["connection_mode"],
+                "environment": kwargs["environment"],
+                "capability_states": kwargs["capability_states"],
+                "evidence_source": kwargs["evidence_source"],
+                "validated_at": kwargs["validated_at"],
+                "status": "ready_read_only",
+            }
+
+    monkeypatch.setattr(server, "_product_store", lambda settings: FakeStore())
+
+    payload = server.validate_connector_connection(
+        workspace_id=make_workspace_id(),
+        connector_id="flowaccount",
+        connection_mode="native_mcp",
+        environment="production",
+        evidence={
+            "source": "native_mcp_safe_read",
+            "status": "succeeded",
+            "observed_at": "2026-07-19T12:00:00Z",
+            "evidence_ref": "evidence_native_alias_1234",
+            "capabilities": [{"capability": "company.read", "state": "observed"}],
+        },
+    )
+
+    assert payload["status"] == "ok"
+    assert captured["capability_states"] == {"company.info.read": "observed"}
+    for required_capability in ("company.read", "company.info.read"):
+        resolution = server._workspace_connector_resolution(
+            {"connector_profiles": [payload["profile"]]},
+            connector_id="flowaccount",
+            connection_mode="native_mcp",
+            environment="production",
+            required_capabilities=[required_capability],
+        )
+        assert resolution["ready"] is True
+
+
+def test_validate_connector_connection_rejects_duplicate_and_conflicting_alias_evidence(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    configure_product_env(monkeypatch)
+    calls = 0
+
+    class FakeStore:
+        def validate_connector_profile(self, **kwargs: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            return {}
+
+    monkeypatch.setattr(server, "_product_store", lambda settings: FakeStore())
+    evidence = {
+        "source": "native_mcp_safe_read",
+        "status": "succeeded",
+        "observed_at": "2026-07-19T12:00:00Z",
+        "evidence_ref": "evidence_native_duplicate_1234",
+    }
+
+    duplicate = server.validate_connector_connection(
+        workspace_id=make_workspace_id(),
+        connector_id="flowaccount",
+        connection_mode="native_mcp",
+        environment="production",
+        evidence={
+            **evidence,
+            "capabilities": [
+                {"capability": "company.read", "state": "observed"},
+                {"capability": "company.info.read", "state": "observed"},
+            ],
+        },
+    )
+    conflicting = server.validate_connector_connection(
+        workspace_id=make_workspace_id(),
+        connector_id="flowaccount",
+        connection_mode="native_mcp",
+        environment="production",
+        evidence={
+            **evidence,
+            "capabilities": [
+                {"capability": "company.read", "state": "observed"},
+                {"capability": "company.info.read", "state": "validation_failed"},
+            ],
+        },
+    )
+
+    assert duplicate == {
+        "status": "error",
+        "message": "evidence contains duplicate capabilities after alias expansion",
+    }
+    assert conflicting == {
+        "status": "error",
+        "message": "evidence contains conflicting capability observations after alias expansion",
+    }
+    assert calls == 0
+
+
 def test_failed_validation_evidence_cannot_persist_a_ready_profile(monkeypatch) -> None:
     from mercury_tools.mcp import server
 
