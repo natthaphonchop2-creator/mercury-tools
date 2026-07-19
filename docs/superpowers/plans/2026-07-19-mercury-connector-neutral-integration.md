@@ -141,7 +141,7 @@ Use these factual mode states:
 | Custom ERP | `api_driver` | `draft` | imported actions `not_validated` |
 | Generic MCP | `native_mcp` | `user_supplied` | discovered tools `declared` until observed |
 
-For FlowAccount native MCP, set `provider_setup_url` to `https://flowaccount.com/en/help-center/category/ai-connector-mcp` and leave `official_mcp_url=None` until the provider publishes a stable directly configurable MCP URL. Do not invent an endpoint. Preserve the reviewed API-driver token URLs separately in that mode's setup defaults.
+For FlowAccount native MCP, set `provider_setup_url` to `https://flowaccount.com/en/help-center/category/ai-connector-mcp` and `official_mcp_url` to the provider-published `https://mcp.flowaccount.com/mcp`. Keep its documented capabilities read-only. Preserve the reviewed API-driver token URLs separately in that mode's setup defaults, and add an exact URL assertion so the catalog cannot silently regress to an invented or stale endpoint.
 
 - [ ] **Step 5: Update public connector IDs and assertions**
 
