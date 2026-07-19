@@ -116,11 +116,17 @@ class ConnectorModeManifest:
     local_bridge_requirement: str | None = None
 ```
 
+In `__post_init__`, defensively copy and freeze `provider_capability_status`,
+`capability_aliases`, and `setup_defaults` before storing them. A frozen dataclass
+must not expose mutable dictionaries through its `Mapping` fields. Add tests that
+both direct mutation and mutation of the caller-owned source dictionaries cannot
+change a catalog manifest after construction.
+
 Change `ConnectorManifest` to store `display_name`, `connection_modes`, and `last_reviewed_at`. Add `connection_mode(mode)`, `connection_mode_ids`, `capability_state(mode, capability)`, `provider_capabilities(mode, normalized_capability)`, and a connector-neutral `public_summary()`.
 
 `capability_aliases` maps a normalized Mercury capability to one or more provider actions. For example, FlowAccount maps `company.read -> company.info.read` and `documents.invoice.read -> documents.invoice.get`; PEAK maps the same normalized names to its reviewed catalog actions. Reject aliases whose provider action is absent from that mode's declared catalog.
 
-Keep `name`, `environments`, `preset`, and `required_secret_fields` as deprecated Python properties for v0.3.x callers, but remove `PUBLIC_ALLOWED_SUFFIXES`, `PUBLIC_BLOCKED_SEGMENTS`, `is_public_capability_allowed`, and `public_capability_gate` from routing decisions.
+Keep `name`, `environments`, `preset`, and `required_secret_fields` as deprecated Python properties for v0.3.x callers. Task 1 is model-layer only: retain `PUBLIC_ALLOWED_SUFFIXES`, `PUBLIC_BLOCKED_SEGMENTS`, `is_public_capability_allowed`, and `public_capability_gate` temporarily as deprecated Python compatibility helpers, and do not add new routing dependencies on them. Task 3 must remove every runtime routing dependency from `server.py` and `flows/runner.py` after profile persistence is available.
 
 - [ ] **Step 4: Populate the initial catalog without overstating readiness**
 
@@ -300,9 +306,11 @@ git commit -m "feat: persist connector modes and capability evidence"
 - Modify: `src/mercury_tools/mcp/server.py`
 - Modify: `src/mercury_tools/mcp/schemas.py`
 - Modify: `src/mercury_tools/db/product.py`
+- Modify: `src/mercury_tools/flows/runner.py`
 - Modify: `tests/test_connector_mcp_tools.py`
 - Modify: `tests/test_mcp_contract.py`
 - Modify: `tests/test_http_app.py`
+- Modify: `tests/test_flows.py`
 
 - [ ] **Step 1: Add failing public lifecycle contract tests**
 
@@ -353,6 +361,16 @@ unlink_connector_profile(
 
 Assert `workspace_id` is required for every workspace-scoped tool. Assert no tool schema contains `client_id`, `client_secret`, `api_key`, `access_token`, `authorization`, or an unconstrained object.
 
+Add runtime regression tests proving capability routing is selected by
+`connector_id + connection_mode + environment + persisted evidence`, not by a
+capability-name suffix. FlowAccount `native_mcp` invoice creation must return
+`provider_unavailable`; FlowAccount `api_driver` invoice creation must return
+`not_validated` before evidence and become eligible for the downstream mutation
+workflow only after matching validation evidence. Assert the registered
+`connector_capabilities` tool requires all four profile coordinates and does not
+return the legacy `read_capabilities`, `blocked_capabilities`, or
+`read_only_validation` fields.
+
 - [ ] **Step 2: Run contract tests and observe missing tools**
 
 ```bash
@@ -394,22 +412,34 @@ API-driver guidance lists only required secret field names and a secure local co
 
 `unlink_connector_profile` requires connector, mode, environment, and the exact literal `confirm="unlink"`; it deletes only the selected Mercury profile metadata, does not revoke provider OAuth, and returns `provider_disconnect_required=true` for native MCP profiles.
 
-- [ ] **Step 6: Keep a non-MCP compatibility helper**
+- [ ] **Step 6: Replace the legacy global runtime gate with profile-aware routing**
+
+Remove imports and calls to `public_capability_gate` from `mcp/server.py` and
+`flows/runner.py`. Runtime decisions must resolve the selected connector manifest,
+connection mode, environment, sanitized profile, and matching capability evidence.
+Capability class (`read`, `create`, `update`, or `sensitive`) describes approval
+behavior; it must not by itself grant or deny a provider action.
+
+Keep the old gate functions only as deprecated non-routing Python compatibility
+helpers through v0.3.x. Add regression coverage that fails if `server.py` or the
+flow runner routes through the global suffix/segment gate again.
+
+- [ ] **Step 7: Keep a non-MCP compatibility helper**
 
 Retain `start_connector_setup(...)` as a plain Python wrapper to `link_connector_profile(...)` with the manifest's default mode. Remove its `@mcp.tool` decorator and mark its response with `deprecated_tool="start_connector_setup"` and `replacement_tool="link_connector_profile"`.
 
-- [ ] **Step 7: Run lifecycle tests**
+- [ ] **Step 8: Run lifecycle tests**
 
 ```bash
-uv run pytest -q tests/test_connector_mcp_tools.py tests/test_mcp_contract.py tests/test_http_app.py
+uv run pytest -q tests/test_connector_mcp_tools.py tests/test_mcp_contract.py tests/test_http_app.py tests/test_flows.py
 ```
 
 Expected: all lifecycle, schema, redaction, fallback-store, and HTTP contract tests pass.
 
-- [ ] **Step 8: Commit Task 3**
+- [ ] **Step 9: Commit Task 3**
 
 ```bash
-git add src/mercury_tools/mcp/server.py src/mercury_tools/mcp/schemas.py src/mercury_tools/db/product.py tests/test_connector_mcp_tools.py tests/test_mcp_contract.py tests/test_http_app.py
+git add src/mercury_tools/mcp/server.py src/mercury_tools/mcp/schemas.py src/mercury_tools/db/product.py src/mercury_tools/flows/runner.py tests/test_connector_mcp_tools.py tests/test_mcp_contract.py tests/test_http_app.py tests/test_flows.py
 git commit -m "feat: expose connector-neutral lifecycle tools"
 ```
 
