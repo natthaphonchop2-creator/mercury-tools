@@ -469,6 +469,10 @@ that produces `ready_read_only` or `ready_read_write`.
 Catch typed evidence validation failures separately and return a fixed sanitized
 message. Never serialize Pydantic's rejected `input_value`, a provider body, or
 another unknown evidence field into the MCP result or audit payload.
+This guarantee applies at the real FastMCP `call_tool` boundary, not only direct
+Python calls. Keep the generated evidence JSON Schema explicit while deferring
+the actual model validation to the sanitized handler boundary so framework
+pre-validation cannot reflect rejected inputs before the handler runs.
 
 - [ ] **Step 5: Implement status, capability reasons, and unlink**
 
