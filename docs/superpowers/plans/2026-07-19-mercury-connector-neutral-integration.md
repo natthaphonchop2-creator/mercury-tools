@@ -772,7 +772,10 @@ tool to Task 4's exact annotation matrix as closed reads.
 uv run pytest -q tests/test_skill_routing.py tests/test_connector_mcp_tools.py -k skill
 ```
 
-Expected: failures because generic seed rows still require `flowaccount` and the server does not expose list/schema tools.
+Expected: failures because the canonical Skill catalog, deterministic routing,
+and public list/schema tools do not exist yet. Task 2 has already removed vendor
+requirements from the current generic seed rows; do not reintroduce them merely
+to create a failing test.
 
 - [ ] **Step 3: Create one canonical Skill catalog**
 
@@ -792,7 +795,12 @@ class AccountingSkillDefinition:
     output_schema_name: str
 ```
 
-`SKILL_CATALOG_SEED` must be generated from this catalog so the database, MCP schemas, and Markdown Skills cannot drift.
+`SKILL_CATALOG_SEED` and public MCP Skill schemas must be generated from this
+catalog. Generic Markdown Skills consume their contract by Skill ID through
+`get_accounting_skill_schema`; they must not duplicate provider mappings or a
+second independently maintained capability list. Plugin tests must verify each
+generic Markdown Skill references its own Skill ID, calls the schema/routing
+surface, and contains no conflicting vendor requirement.
 
 Use these minimum portable requirements:
 
