@@ -227,73 +227,23 @@ class FlowFileInput(StrictMcpInput):
     )
 
 
-class InlineFlowSource(StrictMcpInput):
-    source_type: Literal["flow_yaml"] = Field(description="Run one inline Mercury Flow.")
-    flow_yaml: str = Field(
-        min_length=1,
-        max_length=500_000,
-        description="Complete inline Mercury Flow YAML.",
-    )
-    workspace_id: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=2_048,
-        description="Workspace id required when the flow uses an ERP connector.",
-    )
+FlowFiles = Annotated[list[FlowFileInput], Field(min_length=1, max_length=50)]
 
 
-class FlowFilesSource(StrictMcpInput):
-    source_type: Literal["flow_files"] = Field(description="Run an in-memory flow suite.")
-    flow_files: list[FlowFileInput] = Field(
-        min_length=1,
-        max_length=50,
-        description="Mercury Flow files, each with a relative path and YAML content.",
-    )
-    workspace_id: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=2_048,
-        description="Workspace id required when a selected flow uses an ERP connector.",
-    )
-    config_yaml: str | None = Field(
-        default=None,
-        max_length=500_000,
-        description="Optional Mercury workspace config YAML for discovery and order.",
-    )
-    include_tags: list[str] = Field(
-        default_factory=list,
-        max_length=100,
-        description="Select flows containing at least one exact tag in this list.",
-    )
-    exclude_tags: list[str] = Field(
-        default_factory=list,
-        max_length=100,
-        description="Skip flows containing any exact tag in this list.",
-    )
-    continue_on_failure: bool = Field(
-        default=True,
-        description="Continue with later selected files after one flow fails.",
-    )
+class FlowEnvironmentValue(StrictMcpInput):
+    name: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_]{0,99}$")
+    value: str = Field(max_length=10_000)
 
 
-class WorkspaceFlowSource(StrictMcpInput):
-    source_type: Literal["workspace_flow"] = Field(description="Run one saved workspace flow.")
-    workspace_id: str = Field(
-        min_length=1,
-        max_length=2_048,
-        description="Mercury public workspace id that owns the saved flow.",
-    )
-    workspace_flow_id: str = Field(
-        min_length=1,
-        max_length=500,
-        description="Saved Mercury flow id returned by list_workspace_flows.",
-    )
-
-
-MercuryFlowSource = Annotated[
-    InlineFlowSource | FlowFilesSource | WorkspaceFlowSource,
-    Field(discriminator="source_type"),
+# Preserve an explicit item schema while validating hosted environment values
+# inside the tool handler, where invalid inputs can receive a fixed response.
+FlowEnvironmentValueInput = SkipValidation[FlowEnvironmentValue]
+FlowEnvironmentValues = Annotated[
+    list[FlowEnvironmentValueInput],
+    Field(max_length=100),
 ]
+FlowTag = Annotated[str, Field(min_length=1, max_length=100)]
+FlowTags = Annotated[list[FlowTag], Field(max_length=100)]
 
 
 class WorkspaceFlowEnvironment(StrictMcpInput):
@@ -347,7 +297,7 @@ class WorkspaceFlowMetadata(StrictMcpInput):
         max_length=2_000,
         description="Short, non-secret description of the flow.",
     )
-    tags: list[str] = Field(
+    tags: list[FlowTag] = Field(
         default_factory=list,
         max_length=100,
         description="Search and organization tags for the saved flow.",

@@ -44,9 +44,8 @@ def test_public_mcp_tools_have_submission_annotations() -> None:
         "check_flow_syntax": (True, False, None, False),
         "inspect_flow_files": (True, False, None, False),
         "list_workspace_flows": (True, False, None, False),
-        "run_flow": (True, False, None, False),
+        "run_inline_flow": (True, False, None, False),
         "run_flow_files": (True, False, None, False),
-        "run_mercury_flow": (True, False, None, False),
         "run_workspace_flow": (True, False, None, False),
         "save_workspace_flow": (False, False, True, False),
     }
@@ -112,6 +111,7 @@ def test_mcp_flow_tools_validate_and_dry_run() -> None:
         inspect_flow_files,
         run_flow,
         run_flow_files,
+        run_inline_flow,
         run_mercury_flow,
     )
 
@@ -148,8 +148,11 @@ env:
     assert parameterized["artifacts"][0]["title"] == "Month 2026-10"
 
     suite = run_flow_files(
-        {
-            "main.yaml": """name: Main
+        workspace_id="mw_publiccontestworkspace001",
+        flow_files=[
+            {
+                "path": "main.yaml",
+                "flow_yaml": """name: Main
 tags: [accounting]
 onFlowStart:
   - emitReport:
@@ -163,15 +166,19 @@ onFlowStart:
 - emitReport:
     title: "Main ${month}"
 """,
-            "sub.yaml": """name: Subflow
+            },
+            {
+                "path": "sub.yaml",
+                "flow_yaml": """name: Subflow
 tags: [helper]
 ---
 - emitReport:
     title: "Sub ${subMonth}"
 """,
-        },
+            },
+        ],
         dry_run=True,
-        env={"month": "2026-10"},
+        environment=[{"name": "month", "value": "2026-10"}],
         include_tags=["accounting"],
     )
     assert suite["status"] == "planned"
@@ -192,20 +199,27 @@ tags: [helper]
     assert suite["results"][0]["variables"]["subflow"]["artifacts"][0]["title"] == "Sub 2026-10"
 
     config_suite = run_flow_files(
-        {
-            "flows/b.yaml": """name: B
+        workspace_id="mw_publiccontestworkspace001",
+        flow_files=[
+            {
+                "path": "flows/b.yaml",
+                "flow_yaml": """name: B
 tags: [accounting]
 ---
 - emitReport:
     title: "B"
 """,
-            "flows/a.yaml": """name: A
+            },
+            {
+                "path": "flows/a.yaml",
+                "flow_yaml": """name: A
 tags: [accounting]
 ---
 - emitReport:
     title: "A"
 """,
-        },
+            },
+        ],
         config_yaml="""
 flows: flows/**/*.yaml
 includeTags: [accounting]
@@ -221,20 +235,26 @@ executionOrder:
     assert [result["flow"]["name"] for result in config_suite["results"]] == ["A", "B"]
 
     manifest = inspect_flow_files(
-        {
-            "flows/main.yaml": """name: Main
+        [
+            {
+                "path": "flows/main.yaml",
+                "flow_yaml": """name: Main
 tags: [accounting, smoke]
 ---
 - emitReport:
     title: "Main"
 """,
-            "flows/wip.yaml": """name: WIP
+            },
+            {
+                "path": "flows/wip.yaml",
+                "flow_yaml": """name: WIP
 tags: [disabled]
 ---
 - emitReport:
     title: "WIP"
 """,
-        },
+            },
+        ],
         config_yaml="flows: flows/**/*.yaml\nincludeTags: [accounting]\nexcludeTags: [disabled]\n",
     )
     assert manifest["status"] == "ok"
@@ -247,6 +267,19 @@ tags: [disabled]
     assert manifest["flows"][0]["path"] == "flows/main.yaml"
     assert "mercury-flow-inspect" not in str(manifest)
     assert "run_flow_files" in manifest["agent_handoff"]["mcp_tools"]
+
+    inline = run_inline_flow(
+        workspace_id="mw_publiccontestworkspace001",
+        flow_yaml="""name: Explicit Inline
+---
+- emitReport:
+    title: "Inline ${month}"
+""",
+        environment=[{"name": "month", "value": "2026-10"}],
+        dry_run=True,
+    )
+    assert inline["status"] == "planned"
+    assert inline["artifacts"][0]["title"] == "Inline 2026-10"
 
     unified_yaml = run_mercury_flow(
         flow_yaml="""name: Unified
@@ -382,7 +415,10 @@ def test_mcp_workspace_flow_tools_use_public_workspace_id(monkeypatch) -> None:
         workspace_id,
         "workspace-company-health-12345678",
         dry_run=True,
-        env={"connector": "flowaccount", "environment": "production"},
+        environment=[
+            {"name": "connector", "value": "flowaccount"},
+            {"name": "environment", "value": "production"},
+        ],
     )
 
     assert listed["status"] == "ok"
@@ -420,12 +456,17 @@ async def test_public_mcp_tool_schemas_use_workspace_id() -> None:
         "connector_capabilities",
         "unlink_connector_profile",
         "list_workspace_flows",
+        "run_inline_flow",
+        "run_flow_files",
         "run_workspace_flow",
         "save_workspace_flow",
     }:
         properties = tools[name].inputSchema["properties"]
         assert "workspace_id" in properties
         assert "client_token" not in properties
+
+    for name in {"run_inline_flow", "run_flow_files", "run_workspace_flow"}:
+        assert "workspace_id" in tools[name].inputSchema["required"]
 
     for tool in tools.values():
         assert "client_token" not in tool.inputSchema.get("properties", {}), tool.name
@@ -485,20 +526,82 @@ async def test_public_mcp_tool_schemas_are_explicit_for_plugin_review() -> None:
         flow_schema = tools[tool_name].inputSchema
         assert flow_schema["properties"]["flow_files"]["type"] == "array"
         assert "$ref" in flow_schema["properties"]["flow_files"]["items"]
-        assert flow_schema["properties"]["include_tags"]["anyOf"][0]["type"] == "array"
-        assert flow_schema["properties"]["exclude_tags"]["anyOf"][0]["type"] == "array"
+        for field_name in {"include_tags", "exclude_tags"}:
+            tag_schema = flow_schema["properties"][field_name]
+            assert tag_schema["type"] == "array"
+            assert tag_schema["maxItems"] == 100
+            assert tag_schema["items"] == {"maxLength": 100, "minLength": 1, "type": "string"}
 
-    unified_schema = tools["run_mercury_flow"].inputSchema
-    source_schema = unified_schema["properties"]["source"]
-    assert source_schema["discriminator"]["propertyName"] == "source_type"
-    assert len(source_schema["oneOf"]) == 3
-    assert "flow_yaml" not in unified_schema["properties"]
-    assert "flow_files" not in unified_schema["properties"]
-    assert "workspace_flow_id" not in unified_schema["properties"]
+    run_schemas = {
+        "run_inline_flow": tools["run_inline_flow"].inputSchema,
+        "run_flow_files": tools["run_flow_files"].inputSchema,
+        "run_workspace_flow": tools["run_workspace_flow"].inputSchema,
+    }
+    assert set(run_schemas["run_inline_flow"]["properties"]) == {
+        "workspace_id",
+        "flow_yaml",
+        "environment",
+        "dry_run",
+    }
+    assert set(run_schemas["run_flow_files"]["properties"]) == {
+        "workspace_id",
+        "flow_files",
+        "config_yaml",
+        "environment",
+        "include_tags",
+        "exclude_tags",
+        "continue_on_failure",
+        "dry_run",
+    }
+    assert set(run_schemas["run_workspace_flow"]["properties"]) == {
+        "workspace_id",
+        "flow_id",
+        "environment",
+        "dry_run",
+    }
+    for run_schema in run_schemas.values():
+        assert "env" not in run_schema["properties"]
+        environment_schema = run_schema["properties"]["environment"]
+        assert environment_schema["default"] == []
+        assert environment_schema["type"] == "array"
+        assert environment_schema["maxItems"] == 100
+        item_schema = environment_schema["items"]
+        assert item_schema["additionalProperties"] is False
+        assert item_schema["required"] == ["name", "value"]
+        assert item_schema["type"] == "object"
+        assert set(item_schema["properties"]) == {"name", "value"}
+        assert item_schema["properties"]["name"] == {
+            "pattern": "^[A-Za-z][A-Za-z0-9_]{0,99}$",
+            "title": "Name",
+            "type": "string",
+        }
+        assert item_schema["properties"]["value"] == {
+            "maxLength": 10000,
+            "title": "Value",
+            "type": "string",
+        }
+        assert "additionalProperties" not in environment_schema
+
+    assert "run_flow" not in tools
+    assert "run_mercury_flow" not in tools
+
+    def assert_no_untyped_object(schema: object) -> None:
+        if isinstance(schema, dict):
+            if schema.get("type") == "object":
+                assert "properties" in schema, schema
+            for value in schema.values():
+                assert_no_untyped_object(value)
+        elif isinstance(schema, list):
+            for value in schema:
+                assert_no_untyped_object(value)
+
+    for name in {"inspect_flow_files", *run_schemas, "save_workspace_flow"}:
+        assert_no_untyped_object(tools[name].inputSchema)
 
     save_schema = tools["save_workspace_flow"].inputSchema
     metadata_ref = save_schema["properties"]["metadata"]["anyOf"][0]["$ref"]
     metadata_schema = save_schema["$defs"][metadata_ref.rsplit("/", 1)[-1]]
+    assert metadata_schema["title"] == "WorkspaceFlowMetadata"
     assert metadata_schema["additionalProperties"] is False
     assert {"source", "connector_id", "environment", "required_capabilities"} <= set(
         metadata_schema["properties"]
@@ -617,28 +720,146 @@ async def test_public_connector_lifecycle_contract_is_exact_and_secretless() -> 
 
 
 @pytest.mark.asyncio
-async def test_typed_run_mercury_flow_schema_executes_through_fastmcp() -> None:
+async def test_run_inline_flow_schema_executes_through_fastmcp() -> None:
     from mercury_tools.mcp.server import mcp
 
     _content, structured = await mcp.call_tool(
-        "run_mercury_flow",
+        "run_inline_flow",
         {
-            "source": {
-                "source_type": "flow_yaml",
-                "flow_yaml": (
-                    "name: Typed schema smoke\n"
-                    "---\n"
-                    "- emitReport:\n"
-                    "    title: Typed schema smoke\n"
-                ),
-            },
+            "workspace_id": "mw_publiccontestworkspace001",
+            "flow_yaml": (
+                "name: Typed schema smoke\n"
+                "---\n"
+                "- emitReport:\n"
+                "    title: Typed schema smoke ${month}\n"
+            ),
+            "environment": [{"name": "month", "value": "2026-10"}],
             "dry_run": True,
         },
     )
 
     assert structured["status"] == "planned"
-    assert structured["input_mode"] == "flow_yaml"
-    assert structured["artifacts"][0]["title"] == "Typed schema smoke"
+    assert structured["artifacts"][0]["title"] == "Typed schema smoke 2026-10"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "tool_arguments"),
+    [
+        (
+            "run_inline_flow",
+            {
+                "workspace_id": "mw_publiccontestworkspace001",
+                "flow_yaml": "name: Secret boundary\n---\n- emitReport: {}\n",
+            },
+        ),
+        (
+            "run_flow_files",
+            {
+                "workspace_id": "mw_publiccontestworkspace001",
+                "flow_files": [
+                    {
+                        "path": "flows/secret-boundary.yaml",
+                        "flow_yaml": "name: Secret boundary\n---\n- emitReport: {}\n",
+                    }
+                ],
+            },
+        ),
+        (
+            "run_workspace_flow",
+            {
+                "workspace_id": "mw_publiccontestworkspace001",
+                "flow_id": "workspace-secret-boundary",
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("environment", "marker"),
+    [
+        (
+            [{"name": "client_secret_marker", "value": "2026-10"}],
+            "client_secret_marker",
+        ),
+        (
+            [{"name": "month", "value": "Bearer hosted_flow_secret_marker_value"}],
+            "hosted_flow_secret_marker_value",
+        ),
+        (
+            [
+                {
+                    "name": "month",
+                    "value": "2026-10",
+                    "client_secret": "hosted_flow_extra_marker_value",
+                }
+            ],
+            "hosted_flow_extra_marker_value",
+        ),
+    ],
+)
+async def test_hosted_flow_environment_rejection_is_sanitized_before_parse_and_audit(
+    monkeypatch,
+    tool_name,
+    tool_arguments,
+    environment,
+    marker,
+) -> None:
+    from mercury_tools.mcp import server
+
+    audit_events: list[dict[str, object]] = []
+
+    def fake_audit(
+        tool_name: str,
+        input_payload: dict[str, object],
+        output_summary: dict[str, object],
+    ) -> None:
+        audit_events.append(
+            {
+                "tool_name": tool_name,
+                "input_payload": input_payload,
+                "output_summary": output_summary,
+            }
+        )
+
+    def fail_if_parsed(*_args, **_kwargs):
+        pytest.fail("invalid hosted environment reached flow parsing")
+
+    monkeypatch.setattr(server, "_audit", fake_audit)
+    monkeypatch.setattr(server, "parse_flow_text", fail_if_parsed)
+
+    content, structured = await server.mcp.call_tool(
+        tool_name,
+        {
+            **tool_arguments,
+            "environment": environment,
+            "dry_run": True,
+        },
+    )
+
+    assert structured == {
+        "status": "error",
+        "message": "Hosted flow environment is invalid.",
+        "dry_run": True,
+    }
+    assert len(audit_events) == 1
+    audit_event = audit_events[0]
+    assert audit_event["tool_name"] == tool_name
+    assert audit_event["input_payload"]["workspace_id_prefix"] == "mw_pub"
+    assert set(audit_event["input_payload"]) == {
+        "workspace_id_prefix",
+        "workspace_id_hash",
+        "dry_run",
+        "environment_status",
+    }
+    assert audit_event["input_payload"]["dry_run"] is True
+    assert audit_event["input_payload"]["environment_status"] == "invalid"
+    assert audit_event["output_summary"] == {
+        "status": "error",
+        "reason": "invalid_environment",
+        "dry_run": True,
+    }
+    assert marker not in str((content, structured, audit_events))
+    assert "input_value" not in str(content)
 
 
 @pytest.mark.asyncio

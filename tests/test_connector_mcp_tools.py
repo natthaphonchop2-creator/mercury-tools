@@ -879,7 +879,10 @@ def test_run_flow_files_requires_workspace_for_connector_backed_raw_yaml() -> No
     from mercury_tools.mcp import server
 
     payload = server.run_flow_files(
-        {"flows/flowaccount.yaml": CONNECTOR_RAW_FLOW},
+        workspace_id="",
+        flow_files=[
+            {"path": "flows/flowaccount.yaml", "flow_yaml": CONNECTOR_RAW_FLOW}
+        ],
         dry_run=True,
     )
 
@@ -1611,7 +1614,10 @@ def test_run_workspace_flow_blocks_selected_connector_mismatch(monkeypatch) -> N
         workspace_id=make_workspace_id(),
         flow_id="workspace-revenue",
         dry_run=False,
-        env={"connector": "peak", "environment": "production"},
+        environment=[
+            {"name": "connector", "value": "peak"},
+            {"name": "environment", "value": "production"},
+        ],
     )
 
     assert payload["status"] == "mode_required"
@@ -1654,7 +1660,10 @@ def test_run_workspace_flow_blocks_peak_profile_with_unknown_capability(
         workspace_id=make_workspace_id(),
         flow_id="workspace-revenue",
         dry_run=False,
-        env={"connector": "peak", "environment": "production"},
+        environment=[
+            {"name": "connector", "value": "peak"},
+            {"name": "environment", "value": "production"},
+        ],
     )
 
     assert payload["status"] == "not_ready"

@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel, TypeAdapter, ValidationError
+from pydantic import BaseModel, ValidationError
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -54,10 +54,13 @@ from mercury_tools.mcp.schemas import (
     ConnectorUnlinkConfirmation,
     ConnectorValidationEvidence,
     ConnectorValidationEvidenceInput,
+    FlowEnvironmentValue,
+    FlowEnvironmentValues,
     FlowFileInput,
+    FlowFiles,
+    FlowTags,
     KnowledgeSearchFilters,
     LegacyConnectorSetupRequest,
-    MercuryFlowSource,
     SearchMode,
     WorkspaceFlowMetadata,
 )
@@ -101,6 +104,9 @@ CONNECTOR_TAGS = {"connector", "connectors", "connector-backed", "accounting-con
 _LOWER_HEX = frozenset("0123456789abcdef")
 _SAFE_PUBLIC_PROFILE_TEXT_RE = re.compile(r"^[A-Za-z0-9._ -]{1,200}$")
 _SAFE_EXTERNAL_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
+_HOSTED_FLOW_ENVIRONMENT_SECRET_NAME_RE = re.compile(
+    r"(?i)(?:secret|token|api[_-]?key|password|authorization)"
+)
 _EVIDENCE_SOURCE_BY_CONNECTION_MODE = {
     "native_mcp": "native_mcp_safe_read",
     "api_driver": "api_driver_safe_probe",
@@ -146,9 +152,6 @@ _CLOSED_DESTRUCTIVE_IDEMPOTENT = ToolAnnotations(
     idempotentHint=True,
     openWorldHint=False,
 )
-_MERCURY_FLOW_SOURCE_ADAPTER = TypeAdapter(MercuryFlowSource)
-
-
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, *, protected_path: str):
         super().__init__(app)
@@ -250,6 +253,62 @@ def _env_overrides_from_payload(raw: Any) -> dict[str, str]:
 
 def _env_keys(env: dict[str, str]) -> list[str]:
     return sorted(env)
+
+
+def _hosted_flow_environment_overrides(raw: Any) -> dict[str, str]:
+    values = [] if raw == () else raw
+    if not isinstance(values, list):
+        raise ValueError("hosted_flow_environment_invalid")
+
+    environment: dict[str, str] = {}
+    for item in values:
+        if isinstance(item, FlowEnvironmentValue):
+            item = item.model_dump(mode="python")
+        if not isinstance(item, Mapping) or set(item) != {"name", "value"}:
+            raise ValueError("hosted_flow_environment_invalid")
+
+        name = item["name"]
+        value = item["value"]
+        if (
+            not isinstance(name, str)
+            or not isinstance(value, str)
+            or _HOSTED_FLOW_ENVIRONMENT_SECRET_NAME_RE.search(name)
+            or redact_json(value) != value
+        ):
+            raise ValueError("hosted_flow_environment_invalid")
+        try:
+            normalized = FlowEnvironmentValue.model_validate(item)
+        except ValidationError as exc:
+            raise ValueError("hosted_flow_environment_invalid") from exc
+        environment[normalized.name] = normalized.value
+    return environment
+
+
+def _invalid_hosted_flow_environment_payload(
+    *,
+    tool_name: str,
+    workspace_id: str | None,
+    dry_run: bool,
+) -> dict[str, Any]:
+    payload = {
+        "status": "error",
+        "message": "Hosted flow environment is invalid.",
+        "dry_run": dry_run,
+    }
+    _audit(
+        tool_name,
+        {
+            **_public_workspace_audit_ref_optional(workspace_id),
+            "dry_run": dry_run,
+            "environment_status": "invalid",
+        },
+        {
+            "status": "error",
+            "reason": "invalid_environment",
+            "dry_run": dry_run,
+        },
+    )
+    return payload
 
 
 def _string_list_from_payload(raw: Any, *, label: str) -> list[str]:
@@ -1971,18 +2030,24 @@ def check_flow_syntax(flow_yaml: str) -> dict[str, Any]:
 
 @mcp.tool(annotations=_CLOSED_READ)
 def inspect_flow_files(
-    flow_files: list[FlowFileInput],
+    flow_files: FlowFiles,
     config_yaml: str | None = None,
-    include_tags: list[str] | None = None,
-    exclude_tags: list[str] | None = None,
+    include_tags: FlowTags = (),
+    exclude_tags: FlowTags = (),
 ) -> dict[str, Any]:
     """Inspect an in-memory Mercury flow workspace for an MCP host agent."""
     normalized_files: list[dict[str, str]] = []
     try:
         normalized_files = _flow_files_from_payload(flow_files)
         config_yaml = _validate_config_yaml(config_yaml)
-        include = _string_list_from_payload(include_tags, label="include_tags")
-        exclude = _string_list_from_payload(exclude_tags, label="exclude_tags")
+        include = _string_list_from_payload(
+            [] if include_tags == () else include_tags,
+            label="include_tags",
+        )
+        exclude = _string_list_from_payload(
+            [] if exclude_tags == () else exclude_tags,
+            label="exclude_tags",
+        )
 
         with TemporaryDirectory(prefix="mercury-flow-inspect-") as temp_dir:
             root = Path(temp_dir).resolve()
@@ -2034,12 +2099,13 @@ def inspect_flow_files(
         return payload
 
 
-@mcp.tool(annotations=_CLOSED_READ)
-def run_flow(
+def _run_flow(
     flow_yaml: str,
-    dry_run: bool = False,
-    env: dict[str, Any] | None = None,
-    workspace_id: str | None = None,
+    *,
+    dry_run: bool,
+    env: dict[str, Any] | None,
+    workspace_id: str | None,
+    audit_tool_name: str,
 ) -> dict[str, Any]:
     """Run a Mercury YAML flow or return an execution plan when dry_run is true."""
     try:
@@ -2053,7 +2119,7 @@ def run_flow(
         if block_payload:
             payload = redact_json(block_payload)
             _audit(
-                "run_flow",
+                audit_tool_name,
                 {
                     **_public_workspace_audit_ref_optional(workspace_id),
                     "flow_yaml_length": len(flow_yaml),
@@ -2074,7 +2140,7 @@ def run_flow(
         )
         payload = redact_json(result.as_dict())
         _audit(
-            "run_flow",
+            audit_tool_name,
             {
                 **_public_workspace_audit_ref_optional(workspace_id),
                 "flow_yaml_length": len(flow_yaml),
@@ -2092,7 +2158,7 @@ def run_flow(
         payload = {"status": "error", "message": str(exc), "dry_run": dry_run}
         safe_env_keys = _env_keys(env) if isinstance(env, dict) else []
         _audit(
-            "run_flow",
+            audit_tool_name,
             {
                 **_public_workspace_audit_ref_optional(workspace_id),
                 "flow_yaml_length": len(flow_yaml),
@@ -2104,8 +2170,48 @@ def run_flow(
         return payload
 
 
-@mcp.tool(annotations=_CLOSED_READ)
-def run_flow_files(
+def run_flow(
+    flow_yaml: str,
+    dry_run: bool = False,
+    env: dict[str, Any] | None = None,
+    workspace_id: str | None = None,
+) -> dict[str, Any]:
+    """Backward-compatible Python helper for a single inline Mercury Flow."""
+    return _run_flow(
+        flow_yaml,
+        dry_run=dry_run,
+        env=env,
+        workspace_id=workspace_id,
+        audit_tool_name="run_flow",
+    )
+
+
+@mcp.tool(name="run_inline_flow", annotations=_CLOSED_READ)
+def run_inline_flow(
+    workspace_id: str,
+    flow_yaml: str,
+    environment: FlowEnvironmentValues = (),
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Run one inline Mercury Flow in a public workspace."""
+    try:
+        env_overrides = _hosted_flow_environment_overrides(environment)
+    except ValueError:
+        return _invalid_hosted_flow_environment_payload(
+            tool_name="run_inline_flow",
+            workspace_id=workspace_id,
+            dry_run=dry_run,
+        )
+    return _run_flow(
+        flow_yaml,
+        dry_run=dry_run,
+        env=env_overrides,
+        workspace_id=workspace_id,
+        audit_tool_name="run_inline_flow",
+    )
+
+
+def _run_flow_files(
     flow_files: list[FlowFileInput],
     config_yaml: str | None = None,
     dry_run: bool = False,
@@ -2114,6 +2220,7 @@ def run_flow_files(
     include_tags: list[str] | None = None,
     exclude_tags: list[str] | None = None,
     continue_on_failure: bool = True,
+    audit_tool_name: str = "run_flow_files",
 ) -> dict[str, Any]:
     """Run multiple Mercury YAML flow files as an in-memory suite."""
     normalized_files: list[dict[str, str]] = []
@@ -2230,7 +2337,7 @@ def run_flow_files(
                         }
                     )
                     _audit(
-                        "run_flow_files",
+                        audit_tool_name,
                         {
                             **_public_workspace_audit_ref_optional(workspace_id),
                             "flow_count": len(normalized_files),
@@ -2281,7 +2388,7 @@ def run_flow_files(
             }
         )
         _audit(
-            "run_flow_files",
+            audit_tool_name,
             {
                 **_public_workspace_audit_ref_optional(workspace_id),
                 "flow_count": len(normalized_files),
@@ -2303,7 +2410,7 @@ def run_flow_files(
     except (PermissionError, FlowValidationError, RuntimeError, ValueError) as exc:
         payload = {"status": "error", "message": str(exc), "dry_run": dry_run}
         _audit(
-            "run_flow_files",
+            audit_tool_name,
             {
                 **_public_workspace_audit_ref_optional(workspace_id),
                 "flow_count": len(normalized_files),
@@ -2316,67 +2423,37 @@ def run_flow_files(
         return payload
 
 
-@mcp.tool(name="run_mercury_flow", annotations=_CLOSED_READ)
-def _run_mercury_flow_tool(
-    source: MercuryFlowSource,
+@mcp.tool(annotations=_CLOSED_READ)
+def run_flow_files(
+    workspace_id: str,
+    flow_files: FlowFiles,
+    config_yaml: str | None = None,
+    environment: FlowEnvironmentValues = (),
+    include_tags: FlowTags = (),
+    exclude_tags: FlowTags = (),
+    continue_on_failure: bool = True,
     dry_run: bool = True,
-    env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Run exactly one typed Mercury source: inline YAML, files, or a saved flow."""
+    """Run an in-memory Mercury Flow suite in a public workspace."""
     try:
-        selected = _MERCURY_FLOW_SOURCE_ADAPTER.validate_python(source)
-    except ValidationError as exc:
-        payload = {
-            "status": "error",
-            "message": "Invalid Mercury flow source.",
-            "details": [
-                {
-                    "location": ".".join(str(item) for item in error["loc"]),
-                    "message": error["msg"],
-                }
-                for error in exc.errors(include_input=False, include_url=False)
-            ],
-        }
-        _audit("run_mercury_flow", {"source_type": "invalid", "dry_run": dry_run}, payload)
-        return payload
-
-    source_payload = selected.model_dump(mode="python", exclude_none=True)
-    source_type = source_payload["source_type"]
-    if source_type == "flow_yaml":
-        payload = run_flow(
-            source_payload["flow_yaml"],
+        env_overrides = _hosted_flow_environment_overrides(environment)
+    except ValueError:
+        return _invalid_hosted_flow_environment_payload(
+            tool_name="run_flow_files",
+            workspace_id=workspace_id,
             dry_run=dry_run,
-            env=env,
-            workspace_id=source_payload.get("workspace_id"),
         )
-        payload["entrypoint"] = "run_mercury_flow"
-        payload["input_mode"] = "flow_yaml"
-        return payload
-
-    if source_type == "flow_files":
-        payload = run_flow_files(
-            source_payload["flow_files"],
-            config_yaml=source_payload.get("config_yaml"),
-            dry_run=dry_run,
-            env=env,
-            workspace_id=source_payload.get("workspace_id"),
-            include_tags=source_payload.get("include_tags"),
-            exclude_tags=source_payload.get("exclude_tags"),
-            continue_on_failure=source_payload.get("continue_on_failure", True),
-        )
-        payload["entrypoint"] = "run_mercury_flow"
-        payload["input_mode"] = "flow_files"
-        return payload
-
-    payload = run_workspace_flow_tool(
-        workspace_id=source_payload["workspace_id"],
-        flow_id=source_payload["workspace_flow_id"],
+    return _run_flow_files(
+        flow_files,
+        config_yaml=config_yaml,
         dry_run=dry_run,
-        env=env,
+        env=env_overrides,
+        workspace_id=workspace_id,
+        include_tags=[] if include_tags == () else include_tags,
+        exclude_tags=[] if exclude_tags == () else exclude_tags,
+        continue_on_failure=continue_on_failure,
+        audit_tool_name="run_flow_files",
     )
-    payload["entrypoint"] = "run_mercury_flow"
-    payload["input_mode"] = "workspace_flow_id"
-    return payload
 
 
 def run_mercury_flow(
@@ -2391,7 +2468,7 @@ def run_mercury_flow(
     exclude_tags: list[str] | str | None = None,
     continue_on_failure: bool = True,
 ) -> dict[str, Any]:
-    """Backward-compatible Python wrapper around the typed public MCP tool."""
+    """Backward-compatible Python wrapper for the former multi-source flow tool."""
     modes = _selected_flow_input_modes(
         flow_yaml=flow_yaml,
         flow_files=flow_files,
@@ -2407,22 +2484,32 @@ def run_mercury_flow(
         return payload
 
     if modes[0] == "flow_yaml":
-        source: dict[str, Any] = {
-            "source_type": "flow_yaml",
-            "flow_yaml": flow_yaml,
-            "workspace_id": workspace_id,
-        }
-    elif modes[0] == "flow_files":
-        source = {
-            "source_type": "flow_files",
-            "flow_files": _flow_files_from_payload(flow_files),
-            "workspace_id": workspace_id,
-            "config_yaml": config_yaml,
-            "include_tags": _string_list_from_payload(include_tags, label="include_tags"),
-            "exclude_tags": _string_list_from_payload(exclude_tags, label="exclude_tags"),
-            "continue_on_failure": continue_on_failure,
-        }
-    else:
+        payload = run_flow(
+            str(flow_yaml),
+            dry_run=dry_run,
+            env=env,
+            workspace_id=workspace_id,
+        )
+        payload["entrypoint"] = "run_mercury_flow"
+        payload["input_mode"] = "flow_yaml"
+        return payload
+
+    if modes[0] == "flow_files":
+        payload = _run_flow_files(
+            flow_files,
+            config_yaml=config_yaml,
+            dry_run=dry_run,
+            env=env,
+            workspace_id=workspace_id,
+            include_tags=_string_list_from_payload(include_tags, label="include_tags"),
+            exclude_tags=_string_list_from_payload(exclude_tags, label="exclude_tags"),
+            continue_on_failure=continue_on_failure,
+        )
+        payload["entrypoint"] = "run_mercury_flow"
+        payload["input_mode"] = "flow_files"
+        return payload
+
+    if modes[0] == "workspace_flow_id":
         if not workspace_id:
             payload = {
                 **_public_workspace_required_payload(),
@@ -2431,13 +2518,17 @@ def run_mercury_flow(
             }
             _audit("run_mercury_flow", {"selected_modes": modes, "dry_run": dry_run}, payload)
             return payload
-        source = {
-            "source_type": "workspace_flow",
-            "workspace_id": workspace_id,
-            "workspace_flow_id": workspace_flow_id,
-        }
+        payload = _run_workspace_flow(
+            workspace_id=workspace_id,
+            flow_id=str(workspace_flow_id),
+            dry_run=dry_run,
+            env=env,
+        )
+        payload["entrypoint"] = "run_mercury_flow"
+        payload["input_mode"] = "workspace_flow_id"
+        return payload
 
-    return _run_mercury_flow_tool(source, dry_run=dry_run, env=env)
+    raise AssertionError("unreachable flow input mode")
 
 
 @mcp.tool(annotations=_CLOSED_READ)
@@ -2473,8 +2564,7 @@ def list_workspace_flows(workspace_id: str) -> dict[str, Any]:
         return payload
 
 
-@mcp.tool(name="run_workspace_flow", annotations=_CLOSED_READ)
-def run_workspace_flow_tool(
+def _run_workspace_flow(
     workspace_id: str,
     flow_id: str,
     dry_run: bool = True,
@@ -2577,6 +2667,30 @@ def run_workspace_flow_tool(
             payload,
         )
         return payload
+
+
+@mcp.tool(name="run_workspace_flow", annotations=_CLOSED_READ)
+def run_workspace_flow_tool(
+    workspace_id: str,
+    flow_id: str,
+    environment: FlowEnvironmentValues = (),
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Run one saved Mercury Flow in a public workspace."""
+    try:
+        env_overrides = _hosted_flow_environment_overrides(environment)
+    except ValueError:
+        return _invalid_hosted_flow_environment_payload(
+            tool_name="run_workspace_flow",
+            workspace_id=workspace_id,
+            dry_run=dry_run,
+        )
+    return _run_workspace_flow(
+        workspace_id=workspace_id,
+        flow_id=flow_id,
+        dry_run=dry_run,
+        env=env_overrides,
+    )
 
 
 @mcp.tool(name="save_workspace_flow", annotations=_CLOSED_IDEMPOTENT_WRITE)
@@ -2847,8 +2961,7 @@ async def status(_: Request) -> Response:
             "flow_cheat_sheet",
             "check_flow_syntax",
             "inspect_flow_files",
-            "run_mercury_flow",
-            "run_flow",
+            "run_inline_flow",
             "run_flow_files",
             "save_workspace_flow",
             "list_workspace_flows",
