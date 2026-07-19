@@ -1,86 +1,41 @@
-# Task 5 Implementer Report
+# Task 5 Report
 
-## Status
+Status: complete with concern
 
-Implemented the immutable Supabase ERP action catalog, its service-role-only
-PostgREST publisher, deterministic artifact CLI, and GitHub Actions publisher.
+Files changed:
+- `src/mercury_tools/mcp/schemas.py`
+- `src/mercury_tools/mcp/server.py`
+- `tests/test_mcp_contract.py`
+- `tests/test_connector_mcp_tools.py`
+- `.superpowers/sdd/task-5-report.md`
 
-## RED
+Commit: `2462a7548983d8cc551e90abc2f14664450e4467` (`refactor: split public Mercury flow sources`)
 
-Before production files existed, ran:
+Test commands and results:
+- RED before implementation: `uv run pytest -q tests/test_mcp_contract.py tests/test_plugin_package.py -k 'flow and schema'` -> expected failure because `run_inline_flow` was not registered (`1 failed, 63 deselected`).
+- `uv run pytest -q tests/test_mcp_contract.py tests/test_plugin_package.py -k 'flow and schema'` -> `1 passed, 69 deselected`.
+- `uv run pytest -q tests/test_mcp_contract.py tests/test_connector_mcp_tools.py tests/test_plugin_package.py -k flow` -> `28 passed, 86 deselected`; one existing Starlette `TestClient` deprecation warning.
+- `uv run pytest -q tests/test_mcp_contract.py -k 'hosted_flow_environment or annotations or explicit_for_plugin_review or run_inline_flow_schema'` -> `12 passed, 10 deselected`.
+- Direct async registry/status check -> passed: `run_inline_flow`, `run_flow_files`, and `run_workspace_flow` are registered; `run_flow` and `run_mercury_flow` are not registered or listed in hosted flow tools.
+- `uv run ruff check src/mercury_tools/mcp/schemas.py src/mercury_tools/mcp/server.py tests/test_mcp_contract.py tests/test_connector_mcp_tools.py` -> passed.
+- `git diff --check` -> passed before commit.
+- Full suite was not run, as instructed.
 
-```text
-uv run pytest tests/test_catalog_migration.py tests/test_catalog_publisher.py -q
-8 failed in 0.14s
-```
+Self-review:
+- Replaced the registered multi-source and ambiguous flow tools with explicit `run_inline_flow` and `run_flow_files`; retained undecorated `run_flow` and `run_mercury_flow` compatibility functions.
+- Required `workspace_id` for every public hosted run path and kept planning/inspection tools as closed reads; `save_workspace_flow` remains the existing idempotent closed write.
+- Added typed flow-file/tag/environment schemas. Environment item validation is deferred with `SkipValidation` so FastMCP does not reflect nested invalid input; the handler performs fixed, secretless rejection before parsing, execution, or audit.
+- Exercised real asynchronous `mcp.call_tool` requests for invalid secret-bearing names, redaction-detected values, and extra fields across inline, files, and saved-workspace runs. Markers never reached output or audit assertions.
+- No provider lifecycle behavior or Task 6 tool surface changed.
 
-The migration contract tests failed because
-`20260711090000_erp_action_catalog.sql` was absent. Publisher tests failed with
-the expected missing `mercury_tools.db.catalog` module and absent
-`scripts/publish_catalog.py` file. The RED suite covered immutable migration
-contract, idempotent version publication, unsafe source preflight, deterministic
-active-action filter serialization and round-trip, artifact traversal, CLI error
-status, and workflow secret references.
+Concerns:
+- `tests/test_http_app.py`, outside the allowed write scope, still asserts retired names in `status().flow_tools`. The hosted status list was correctly updated so compatibility helpers are not advertised; its focused test needs an owner-scope follow-up. Full-suite status is therefore intentionally unverified.
 
-## Files
+Concern resolution:
+- Updated `tests/test_http_app.py::test_connect_page_and_status` to assert the exact emitted `flow_tools` contract: `flow_cheat_sheet`, `check_flow_syntax`, `inspect_flow_files`, `run_inline_flow`, `run_flow_files`, `save_workspace_flow`, `list_workspace_flows`, and `run_workspace_flow`.
+- The same assertion explicitly verifies that retired compatibility helpers `run_flow` and `run_mercury_flow` are excluded. Server behavior was unchanged because the emitted status list already matched the MCP registry.
 
-- `.github/workflows/publish-catalog.yml`
-- `scripts/publish_catalog.py`
-- `src/mercury_tools/db/catalog.py`
-- `supabase/migrations/20260711090000_erp_action_catalog.sql`
-- `tests/test_catalog_migration.py`
-- `tests/test_catalog_publisher.py`
-
-## GREEN
-
-Final verification:
-
-```text
-uv run pytest tests/test_catalog_migration.py tests/test_catalog_publisher.py -q
-8 passed in 0.08s
-
-uv run pytest -m "not integration" -q
-623 passed, 1 deselected, 1 warning in 2.11s
-
-uv run ruff check .
-All checks passed!
-
-git diff --check
-passed
-```
-
-The one warning is the existing Starlette `httpx` TestClient deprecation warning.
-All catalog HTTP tests monkeypatch `httpx.request`; no live Supabase migration or
-live Supabase call was performed.
-
-## Self-review
-
-- Version rows are insert-only: their trigger rejects both updates and deletes,
-  and the publisher only uses `POST` with `resolution=ignore-duplicates`.
-- Sources and active catalog rows use merge upserts. The active catalog's
-  deferrable composite foreign key points to the immutable version identity.
-- RLS is enabled on all four tables, `anon` and `authenticated` are explicitly
-  revoked, and `service_role` receives explicit table grants required by the
-  2026 Supabase Data API behavior. The trigger function is not directly
-  executable by public, anonymous, or authenticated roles.
-- The store revalidates all source/action models before its first request,
-  whitelists active-list filters, validates returned definitions, and never puts
-  arbitrary Supabase response text or service-role keys into error messages.
-- Observation rows have no local runtime writer. Their metadata schema permits
-  only `source`, `reviewed_by`, and `note` at the top level.
-- The CLI recursively discovers sorted `source.json`/`actions.json` pairs,
-  canonical-model validates them before publishing, returns nonzero for errors,
-  and prints no environment values. The workflow obtains both Supabase values
-  only from GitHub secrets.
-
-## Commit
-
-`d3d9bd75577f829cc0ccfa96b1355df13a90fd1f` - `feat: publish immutable ERP action catalog`
-
-## Residual risks
-
-- This task intentionally did not apply the migration. Parent review should run
-  the migration against the intended Supabase project and confirm the deployed
-  PostgREST relationship name used for the composite active-version embed.
-- The GitHub workflow is the trusted publication path. Repository protection and
-  secret access policy remain deployment configuration outside this worktree.
+Additional test evidence:
+- `uv run pytest -q tests/test_http_app.py::test_connect_page_and_status tests/test_mcp_contract.py tests/test_connector_mcp_tools.py tests/test_plugin_package.py -k 'flow or connect_page_and_status'` -> `29 passed, 86 deselected, 1 warning`; focused HTTP status and Task 5 flow tests passed.
+- `uv run ruff check tests/test_http_app.py` -> passed.
+- `git diff --check` -> passed.

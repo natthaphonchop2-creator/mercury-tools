@@ -250,11 +250,19 @@ def test_connect_page_and_status(monkeypatch) -> None:
     assert status.json()["browser_ui"] == "disabled"
     assert "pages" not in status.json()
     assert "console" not in status.json()
-    assert "run_flow" in status.json()["flow_tools"]
-    assert "run_flow_files" in status.json()["flow_tools"]
-    assert "save_workspace_flow" in status.json()["flow_tools"]
-    assert "list_workspace_flows" in status.json()["flow_tools"]
-    assert "run_workspace_flow" in status.json()["flow_tools"]
+    flow_tools = status.json()["flow_tools"]
+    assert flow_tools == [
+        "flow_cheat_sheet",
+        "check_flow_syntax",
+        "inspect_flow_files",
+        "run_inline_flow",
+        "run_flow_files",
+        "save_workspace_flow",
+        "list_workspace_flows",
+        "run_workspace_flow",
+    ]
+    assert "run_flow" not in flow_tools
+    assert "run_mercury_flow" not in flow_tools
     assert status.json()["dashboard"] == "/api/dashboard"
     assert "connector_credentials" not in status.json()
     assert client.post("/api/connectors/credentials", json={}).status_code == 404
