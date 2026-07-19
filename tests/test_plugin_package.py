@@ -68,8 +68,12 @@ SKILL_CATALOG_PUBLIC_FIELDS = (
     "summary",
     "status",
     "version",
+    "required_capabilities",
     "required_connectors",
     "tags",
+)
+LEGACY_SKILL_CATALOG_MIGRATION_FIELDS = tuple(
+    field for field in SKILL_CATALOG_PUBLIC_FIELDS if field != "required_capabilities"
 )
 EXPECTED_DESCRIPTIONS = {
     "accounts-receivable-reconciliation-th": (
@@ -186,6 +190,12 @@ def test_product_catalog_contains_every_bundled_plugin_skill() -> None:
     catalog = {row["skill_id"] for row in SKILL_CATALOG_SEED}
 
     assert catalog == bundled == set(EXPECTED_DESCRIPTIONS)
+
+
+def test_bundled_plugin_catalog_rows_emit_capability_requirements() -> None:
+    for row in SKILL_CATALOG_SEED:
+        assert "required_capabilities" in row
+        assert isinstance(row["required_capabilities"], list)
 
 
 def test_marketplace_contains_exactly_one_mercury_plugin() -> None:
@@ -357,6 +367,7 @@ def test_cross_mcp_catalog_rows_are_public_metadata_only() -> None:
             "summary",
             "status",
             "version",
+            "required_capabilities",
             "required_connectors",
             "tags",
         }
@@ -435,7 +446,7 @@ def test_cross_mcp_catalog_migration_matches_exact_public_seed_metadata() -> Non
     columns = tuple(
         column.strip().casefold() for column in header.group("columns").split(",")
     )
-    assert columns == SKILL_CATALOG_PUBLIC_FIELDS
+    assert columns == LEGACY_SKILL_CATALOG_MIGRATION_FIELDS
 
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
@@ -450,6 +461,7 @@ def test_cross_mcp_catalog_migration_matches_exact_public_seed_metadata() -> Non
           summary text not null,
           status text not null,
           version text not null,
+          required_capabilities text not null default '[]',
           required_connectors text not null,
           tags text not null,
           updated_at text
@@ -466,6 +478,7 @@ def test_cross_mcp_catalog_migration_matches_exact_public_seed_metadata() -> Non
     actual = []
     for stored_row in stored:
         row = dict(stored_row)
+        row["required_capabilities"] = json.loads(row["required_capabilities"])
         row["required_connectors"] = json.loads(row["required_connectors"])
         row["tags"] = json.loads(row["tags"])
         actual.append(row)
@@ -475,7 +488,10 @@ def test_cross_mcp_catalog_migration_matches_exact_public_seed_metadata() -> Non
     assert {row["skill_id"] for row in cross_mcp_seed} == set(CROSS_MCP_SKILLS)
     expected = sorted(
         (
-            {field: row[field] for field in SKILL_CATALOG_PUBLIC_FIELDS}
+            {
+                field: [] if field == "required_capabilities" else row[field]
+                for field in SKILL_CATALOG_PUBLIC_FIELDS
+            }
             for row in cross_mcp_seed
         ),
         key=lambda row: row["skill_id"],

@@ -309,6 +309,9 @@ def test_public_connector_profile_never_serializes_legacy_vault_or_credential_va
             "capability_states": {
                 "company.info.read": "observed",
                 "access_token": "observed",
+                "provider_access_token": "observed",
+                "documents.payload": "observed",
+                "vendor.tax_id": "observed",
             },
             "metadata": {
                 "setup_state": "ready",
@@ -326,6 +329,9 @@ def test_public_connector_profile_never_serializes_legacy_vault_or_credential_va
         "response_body",
         "owner@example.com",
         "access_token",
+        "provider_access_token",
+        "documents.payload",
+        "vendor.tax_id",
     ):
         assert forbidden not in serialized
     assert public["capability_states"] == {"company.info.read": "observed"}

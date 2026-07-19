@@ -243,9 +243,15 @@ EVIDENCE_SOURCES = frozenset(
         "local_bridge_safe_probe",
     }
 )
+EVIDENCE_SOURCE_BY_CONNECTION_MODE = {
+    "native_mcp": "native_mcp_safe_read",
+    "api_driver": "api_driver_safe_probe",
+    "local_bridge": "local_bridge_safe_probe",
+}
 CAPABILITY_RE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$")
 SENSITIVE_CAPABILITY_KEY_RE = re.compile(
-    r"(?:api[_-]?key|access[_-]?token|auth|credential|email|password|secret|token)",
+    r"(?:api[_-]?key|access[_-]?token|auth|bearer|credential|email|password|"
+    r"secret|tax[_-]?id|taxid|token|(?:response|request)[_-]?body|payload)",
     re.IGNORECASE,
 )
 SAFE_PROFILE_TEXT_RE = re.compile(r"^[A-Za-z0-9._ -]{1,200}$")
@@ -493,6 +499,30 @@ def _is_observed_mutation(capability: str) -> bool:
     return bool(set(capability.split(".")) & MUTATION_CAPABILITY_SEGMENTS)
 
 
+def _has_reviewed_api_driver_mutation(
+    connector_id: str,
+    connection_mode: str,
+    capability_states: Mapping[str, str],
+) -> bool:
+    connector = connector_by_id(connector_id)
+    mode = connector.connection_mode(connection_mode) if connector else None
+    if (
+        connector is None
+        or connector.status != "available"
+        or mode is None
+        or mode.mode.value != "api_driver"
+        or mode.status != "reviewed"
+        or mode.capability_source != "reviewed_api_catalog"
+    ):
+        return False
+    return any(
+        state == "observed"
+        and _is_observed_mutation(capability)
+        and bool(connector.provider_capabilities(connection_mode, capability))
+        for capability, state in capability_states.items()
+    )
+
+
 def public_connector_profile(profile: dict[str, Any]) -> dict[str, Any]:
     metadata = profile.get("metadata")
     public = {
@@ -551,22 +581,37 @@ def public_product_event(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def connector_profile_status(
+    connector_id: str,
     connection_mode: str,
     capability_states: Mapping[str, str],
     *,
+    evidence_source: str | None,
     validated_at: str | None,
 ) -> str:
     mode = str(connection_mode).strip().lower()
     states = _safe_capability_states(capability_states)
-    if mode not in CONNECTION_MODES:
+    connector = connector_by_id(connector_id)
+    catalog_mode = connector.connection_mode(mode) if connector else None
+    expected_evidence_source = EVIDENCE_SOURCE_BY_CONNECTION_MODE.get(mode)
+    if mode not in CONNECTION_MODES or catalog_mode is None:
         return "needs_validation"
-    if not _safe_validated_at(validated_at) or not states:
+    if (
+        _safe_evidence_source(evidence_source) != expected_evidence_source
+        or not _safe_validated_at(validated_at)
+        or not states
+    ):
         return "requires_local_setup" if mode == "local_bridge" else "needs_validation"
     if "not_authorized" in states.values():
         return "requires_authorization"
     if any(state != "observed" for state in states.values()):
         return "needs_validation"
-    if any(_is_observed_mutation(capability) for capability in states):
+    if mode == "native_mcp":
+        return (
+            "ready_read_only"
+            if any(not _is_observed_mutation(capability) for capability in states)
+            else "needs_validation"
+        )
+    if _has_reviewed_api_driver_mutation(connector_id, mode, states):
         return "ready_read_write"
     return "ready_read_only"
 
@@ -1071,6 +1116,11 @@ class SupabaseProductStore:
             if validated_at is not None
             else (existing_profile or {}).get("validated_at")
         )
+        resolved_evidence_source = _safe_evidence_source(
+            evidence_source
+            if evidence_source is not None
+            else (existing_profile or {}).get("evidence_source")
+        )
         profile = {
             "id": profile_id,
             "workspace_id": context["workspace"]["id"],
@@ -1099,15 +1149,13 @@ class SupabaseProductStore:
                 pattern=SAFE_SERVER_NAME_RE,
             ),
             "capability_states": resolved_capability_states,
-            "evidence_source": _safe_evidence_source(
-                evidence_source
-                if evidence_source is not None
-                else (existing_profile or {}).get("evidence_source")
-            ),
+            "evidence_source": resolved_evidence_source,
             "validated_at": resolved_validated_at,
             "status": connector_profile_status(
+                canonical_connector_id,
                 mode.mode.value,
                 resolved_capability_states,
+                evidence_source=resolved_evidence_source,
                 validated_at=resolved_validated_at,
             ),
             "metadata": merged_metadata,
@@ -1835,8 +1883,10 @@ class SupabaseProductStore:
             "metadata": merged_metadata,
         }
         payload["status"] = connector_profile_status(
+            canonical_connector_id,
             mode.mode.value,
             payload["capability_states"],
+            evidence_source=payload["evidence_source"],
             validated_at=payload["validated_at"],
         )
         if company_name is not None:

@@ -1,5 +1,29 @@
 begin;
 
+-- A pre-v0.3 profile has no connection_mode. Clear its unproven legacy JSON once,
+-- before the new profile columns make this migration distinguishable on rerun.
+do $$
+declare
+  profile_mode_column_existed boolean;
+begin
+  select exists (
+    select 1
+    from information_schema.columns
+    where table_schema = 'public'
+      and table_name = 'mercury_connector_profiles'
+      and column_name = 'connection_mode'
+  )
+  into profile_mode_column_existed;
+
+  if not profile_mode_column_existed then
+    update public.mercury_connector_profiles
+    set metadata = '{}'::jsonb,
+        updated_at = now()
+    where metadata is distinct from '{}'::jsonb;
+  end if;
+end
+$$;
+
 alter table public.mercury_connector_profiles
   add column if not exists connection_mode text not null default 'api_driver',
   add column if not exists company_ref text,
@@ -11,16 +35,37 @@ alter table public.mercury_connector_profiles
 alter table public.mercury_skill_catalog
   add column if not exists required_capabilities jsonb not null default '[]'::jsonb;
 
+-- Translate only the legacy status. New neutral statuses are preserved on rerun.
 update public.mercury_connector_profiles
-set
-  connection_mode = 'api_driver',
-  status = case
-    when connection_mode = 'local_bridge' then 'requires_local_setup'
-    else 'needs_validation'
-  end,
-  updated_at = now()
-where connection_mode is distinct from 'api_driver'
-   or status not in ('requires_authorization', 'requires_local_setup', 'needs_validation');
+set status = 'needs_validation',
+    updated_at = now()
+where status = 'requires_credentials';
+
+-- Reject every unsafe capability name, including embedded forms such as
+-- provider_access_token, and allow only reviewed state values.
+create or replace function public.mercury_capability_states_are_safe(capability_states jsonb)
+returns boolean
+language sql
+immutable
+as $$
+  select
+    jsonb_typeof(capability_states) = 'object'
+    and not exists (
+      select 1
+      from jsonb_each(capability_states) as state_entry(capability, capability_state)
+      where capability !~ '^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$'
+        or jsonb_typeof(capability_state) <> 'string'
+        or capability_state #>> '{}' not in (
+          'observed',
+          'provider_unavailable',
+          'not_authorized',
+          'validation_failed',
+          'environment_mismatch'
+        )
+        or regexp_replace(lower(capability), '[^a-z0-9]+', '_', 'g') ~
+          '(api[_-]?key|access[_-]?token|auth|bearer|credential|email|password|secret|tax[_-]?id|taxid|token|response[_-]?body|payload)'
+    );
+$$;
 
 alter table public.mercury_connector_profiles
   drop constraint if exists mercury_connector_profiles_connection_mode_check,
@@ -31,20 +76,7 @@ alter table public.mercury_connector_profiles
     check (jsonb_typeof(capability_states) = 'object'),
   drop constraint if exists mercury_connector_profiles_capability_states_safe_keys_check,
   add constraint mercury_connector_profiles_capability_states_safe_keys_check
-    check (
-      not capability_states ?| array[
-        'access_token',
-        'api_key',
-        'authorization',
-        'client_secret',
-        'credential',
-        'credentials',
-        'email',
-        'password',
-        'secret',
-        'token'
-      ]
-    ),
+    check (public.mercury_capability_states_are_safe(capability_states)),
   drop constraint if exists mercury_connector_profiles_company_ref_safe_check,
   add constraint mercury_connector_profiles_company_ref_safe_check
     check (company_ref is null or company_ref ~ '^[A-Za-z0-9._ -]{1,200}$'),

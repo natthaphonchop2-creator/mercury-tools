@@ -191,22 +191,81 @@ def test_fallback_profiles_are_mode_distinct_and_evidence_aware() -> None:
 
 
 def test_profile_status_requires_evidence_and_only_observed_mutations_are_write_ready() -> None:
-    assert connector_profile_status("local_bridge", {}, validated_at=None) == "requires_local_setup"
     assert (
         connector_profile_status(
+            "express",
+            "local_bridge",
+            {},
+            evidence_source=None,
+            validated_at=None,
+        )
+        == "requires_local_setup"
+    )
+    assert (
+        connector_profile_status(
+            "flowaccount",
             "api_driver",
             {"documents.invoice.create": "validation_failed"},
+            evidence_source="api_driver_safe_probe",
             validated_at="2026-07-19T12:00:00+00:00",
         )
         == "needs_validation"
     )
     assert (
         connector_profile_status(
+            "flowaccount",
             "api_driver",
             {"documents.invoice.create": "observed"},
+            evidence_source="api_driver_safe_probe",
             validated_at="2026-07-19T12:00:00+00:00",
         )
         == "ready_read_write"
+    )
+
+
+def test_profile_status_binds_readiness_to_matching_evidence_and_reviewed_mode() -> None:
+    observed_write = {"documents.invoice.create": "observed"}
+    timestamp = "2026-07-19T12:00:00+00:00"
+
+    assert (
+        connector_profile_status(
+            "flowaccount",
+            "api_driver",
+            observed_write,
+            evidence_source="native_mcp_safe_read",
+            validated_at=timestamp,
+        )
+        == "needs_validation"
+    )
+    assert (
+        connector_profile_status(
+            "custom",
+            "api_driver",
+            observed_write,
+            evidence_source="api_driver_safe_probe",
+            validated_at=timestamp,
+        )
+        == "ready_read_only"
+    )
+    assert (
+        connector_profile_status(
+            "flowaccount",
+            "native_mcp",
+            observed_write,
+            evidence_source="native_mcp_safe_read",
+            validated_at=timestamp,
+        )
+        == "needs_validation"
+    )
+    assert (
+        connector_profile_status(
+            "flowaccount",
+            "native_mcp",
+            {"documents.invoice.list": "observed"},
+            evidence_source="native_mcp_safe_read",
+            validated_at=timestamp,
+        )
+        == "ready_read_only"
     )
 
 
@@ -219,7 +278,13 @@ def test_profile_serialization_drops_unrecognized_and_sensitive_metadata() -> No
             "environment": "production",
             "company_ref": "company-123",
             "external_server_name": "connector-host",
-            "capability_states": {"company.info.read": "observed", "api_key": "observed"},
+            "capability_states": {
+                "company.info.read": "observed",
+                "api_key": "observed",
+                "provider_access_token": "observed",
+                "documents.response_body": "observed",
+                "vendor.tax_id": "observed",
+            },
             "evidence_source": "api_driver_safe_probe",
             "validated_at": "2026-07-19T12:00:00Z",
             "metadata": {

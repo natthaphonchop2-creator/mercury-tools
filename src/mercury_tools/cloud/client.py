@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -362,9 +363,36 @@ def _validate_public_catalog_action(action: CatalogAction) -> None:
 
 def _validate_public_response(response: httpx.Response, model_type: Any) -> Any:
     try:
-        return model_type.model_validate_json(response.content)
+        payload = response.json()
+        return model_type.model_validate_json(
+            json.dumps(_default_legacy_skill_capabilities(payload, model_type))
+        )
     except (KeyError, OverflowError, RecursionError, TypeError, ValueError):
         raise ValueError(PUBLIC_RESPONSE_VALIDATION_ERROR) from None
+
+
+def _default_legacy_skill_capabilities(payload: Any, model_type: Any) -> Any:
+    """Accept only the one omitted field returned by pre-capability cloud servers."""
+
+    if model_type is PublicSkillsEnvelope:
+        if not isinstance(payload, dict) or not isinstance(payload.get("skills"), list):
+            return payload
+        return {
+            **payload,
+            "skills": [
+                {**skill, "required_capabilities": []}
+                if isinstance(skill, dict) and "required_capabilities" not in skill
+                else skill
+                for skill in payload["skills"]
+            ],
+        }
+    if (
+        model_type is PublicSkillDetail
+        and isinstance(payload, dict)
+        and "required_capabilities" not in payload
+    ):
+        return {**payload, "required_capabilities": []}
+    return payload
 
 
 def _validation_request_batch(
