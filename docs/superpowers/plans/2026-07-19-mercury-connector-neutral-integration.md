@@ -754,8 +754,14 @@ Test exact public tools:
 ```python
 list_accounting_skills()
 get_accounting_skill_schema(skill_id)
-run_accounting_skill(skill_id, inputs, evidence_mode=False)
+run_accounting_skill(workspace_id, skill_id, inputs, evidence_mode=False)
 ```
+
+Catalog listing and schema discovery are workspace-independent closed reads.
+`run_accounting_skill` is workspace-scoped and requires `workspace_id` as an
+explicit top-level MCP argument; do not hide it as an optional field inside the
+skill-specific input payload. Add the two discovery tools and the revised run
+tool to Task 4's exact annotation matrix as closed reads.
 
 - [ ] **Step 2: Run the routing tests and confirm generic Skills are FlowAccount-bound**
 
@@ -800,7 +806,7 @@ Provider-specific setup Skills may retain connector requirements. Normalized cap
 
 - [ ] **Step 4: Implement deterministic profile resolution**
 
-`resolve_skill_route(skill, profiles)` returns:
+`resolve_skill_route(skill, profiles, requested_connector_id=None)` returns:
 
 ```json
 {
@@ -816,13 +822,22 @@ Provider-specific setup Skills may retain connector requirements. Normalized cap
 }
 ```
 
-Resolve explicit `inputs.connector_id` first. Otherwise select the single ready profile satisfying all required capabilities. If multiple profiles qualify, return `connector_selection_required` with sanitized choices rather than choosing a preferred vendor.
+Pass explicit `inputs.connector_id` into `requested_connector_id` and resolve it
+first. Otherwise select the single ready profile satisfying all required
+capabilities. If multiple profiles qualify, return
+`connector_selection_required` with sanitized choices rather than choosing a
+preferred vendor.
 
 For native MCP profiles, ordered steps name provider capabilities and tell the host to invoke the already-connected provider tools. For API drivers, return the advanced local Mercury handoff. For Local Bridge, return `local_bridge_required`.
 
 - [ ] **Step 5: Publish and enforce machine-readable Skill schemas**
 
 `get_accounting_skill_schema` returns the exact Pydantic JSON Schema. `run_accounting_skill` validates the typed common envelope plus named `SkillInputParameter` values against that schema before creating a route. Unknown, duplicate, missing, or secret-looking parameters fail before audit persistence.
+
+Keep the generated common-envelope schema explicit while ensuring invalid or
+secret-bearing nested values are validated inside a sanitized handler boundary.
+Add a real FastMCP `call_tool` regression proving rejected values and Pydantic
+`input_value` never appear in the MCP result or audit payload.
 
 - [ ] **Step 6: Rewrite generic Skill Markdown around capabilities and host orchestration**
 
