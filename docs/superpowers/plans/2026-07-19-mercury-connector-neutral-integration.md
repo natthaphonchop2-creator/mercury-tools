@@ -174,6 +174,7 @@ git commit -m "refactor: model connector modes and capability states"
 - Modify: `src/mercury_tools/db/product.py`
 - Modify: `src/mercury_tools/cloud/models.py`
 - Modify: `src/mercury_tools/cloud/api.py`
+- Modify: `src/mercury_tools/cloud/client.py`
 - Modify: `src/mercury_tools/mcp/schemas.py`
 - Modify: `tests/test_product_fallback.py`
 - Modify: `tests/test_connector_setup.py`
@@ -317,7 +318,7 @@ Expected: all pass and serialized profiles contain no legacy vault key or creden
 - [ ] **Step 8: Commit Task 2**
 
 ```bash
-git add supabase/migrations/20260719120000_connector_neutral_profiles.sql tests/test_connector_neutral_profile_migration.py src/mercury_tools/db/product.py src/mercury_tools/cloud/models.py src/mercury_tools/cloud/api.py src/mercury_tools/mcp/schemas.py tests/test_product_fallback.py tests/test_connector_setup.py tests/test_cloud_secret_removal.py tests/test_cloud_api.py tests/test_cloud_client.py tests/test_plugin_package.py
+git add supabase/migrations/20260719120000_connector_neutral_profiles.sql tests/test_connector_neutral_profile_migration.py src/mercury_tools/db/product.py src/mercury_tools/cloud/models.py src/mercury_tools/cloud/api.py src/mercury_tools/cloud/client.py src/mercury_tools/mcp/schemas.py tests/test_product_fallback.py tests/test_connector_setup.py tests/test_cloud_secret_removal.py tests/test_cloud_api.py tests/test_cloud_client.py tests/test_plugin_package.py
 git commit -m "feat: persist connector modes and capability evidence"
 ```
 
