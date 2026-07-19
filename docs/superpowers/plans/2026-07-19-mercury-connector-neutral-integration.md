@@ -532,11 +532,13 @@ Complete the same exact matrix for every tool registered at the end of Task 3.
 Do not register Task 5's future `run_inline_flow` tool or remove compatibility
 flow tools in this task. The currently registered planning tools, including
 `run_flow`, `run_flow_files`, and `run_mercury_flow`, are closed reads until Task
-5 replaces the ambiguous public names. Other closed reads include
-`retrieve_workspace_context_pack`, `get_public_workspace`,
-`list_accounting_skills`, `get_accounting_skill_schema`,
+5 replaces the ambiguous public names. Other currently registered closed reads
+include `retrieve_workspace_context_pack`, `get_public_workspace`,
 `run_accounting_skill`, `flow_cheat_sheet`, `check_flow_syntax`,
-`inspect_flow_files`, `list_workspace_flows`, and `run_workspace_flow`.
+`inspect_flow_files`, `list_workspace_flows`, and `run_workspace_flow`. Do not
+register Task 6's future `list_accounting_skills` or
+`get_accounting_skill_schema` tools in this task. Task 6 must add them to the
+exact annotation matrix when it registers them.
 `create_public_workspace` and `link_connector_profile` are closed non-idempotent
 creates; `validate_connector_connection` and `save_workspace_flow` are closed
 idempotent writes; `unlink_connector_profile` is a closed destructive
