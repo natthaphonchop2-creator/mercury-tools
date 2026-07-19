@@ -1,4 +1,9 @@
+import pytest
+
 from mercury_tools.connectors.catalog import (
+    CapabilityState,
+    ConnectionMode,
+    ConnectorModeManifest,
     connector_by_id,
     list_connector_public_summaries,
 )
@@ -87,3 +92,65 @@ def test_connector_compatibility_properties_remain_available_in_v0_3() -> None:
     assert flow.preset_for_environment("sandbox")["api_base_url"] == (
         "https://openapi.flowaccount.com/test"
     )
+
+
+def test_connector_mode_manifest_mappings_are_immutable() -> None:
+    manifest = ConnectorModeManifest(
+        mode=ConnectionMode.API_DRIVER,
+        status="reviewed",
+        auth_modes=("api_key",),
+        supported_environments=("sandbox",),
+        capability_source="test",
+        provider_capability_status={
+            "documents.invoice.list": CapabilityState.DECLARED,
+        },
+        capability_aliases={
+            "documents.invoice.read": ["documents.invoice.list"],
+        },
+        setup_defaults={"api_base_url": "https://example.test"},
+    )
+
+    with pytest.raises(TypeError):
+        manifest.provider_capability_status["documents.invoice.create"] = (
+            CapabilityState.NOT_VALIDATED
+        )
+    with pytest.raises(TypeError):
+        manifest.capability_aliases["documents.invoice.write"] = (
+            "documents.invoice.create",
+        )
+    with pytest.raises(TypeError):
+        manifest.setup_defaults["api_base_url"] = "https://changed.test"
+
+
+def test_connector_mode_manifest_defensively_copies_source_mappings() -> None:
+    provider_status = {
+        "documents.invoice.list": CapabilityState.DECLARED,
+    }
+    capability_aliases = {
+        "documents.invoice.read": ["documents.invoice.list"],
+    }
+    setup_defaults = {"api_base_url": "https://example.test"}
+
+    manifest = ConnectorModeManifest(
+        mode=ConnectionMode.API_DRIVER,
+        status="reviewed",
+        auth_modes=("api_key",),
+        supported_environments=("sandbox",),
+        capability_source="test",
+        provider_capability_status=provider_status,
+        capability_aliases=capability_aliases,
+        setup_defaults=setup_defaults,
+    )
+
+    provider_status["documents.invoice.create"] = CapabilityState.NOT_VALIDATED
+    capability_aliases["documents.invoice.read"].append("documents.invoice.get")
+    setup_defaults["api_base_url"] = "https://changed.test"
+
+    assert manifest.provider_capability_status == {
+        "documents.invoice.list": CapabilityState.DECLARED,
+    }
+    assert manifest.capability_aliases == {
+        "documents.invoice.read": ("documents.invoice.list",),
+    }
+    assert manifest.setup_defaults == {"api_base_url": "https://example.test"}
+    assert isinstance(manifest.capability_aliases["documents.invoice.read"], tuple)

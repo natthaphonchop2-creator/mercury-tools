@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any
 
 
@@ -47,8 +48,27 @@ class ConnectorModeManifest:
     local_bridge_requirement: str | None = None
 
     def __post_init__(self) -> None:
-        declared_actions = set(self.provider_capability_status)
-        for normalized_capability, provider_actions in self.capability_aliases.items():
+        provider_capability_status = dict(self.provider_capability_status)
+        capability_aliases = {
+            normalized_capability: tuple(provider_actions)
+            for normalized_capability, provider_actions in self.capability_aliases.items()
+        }
+        setup_defaults = dict(self.setup_defaults)
+
+        object.__setattr__(
+            self,
+            "provider_capability_status",
+            MappingProxyType(provider_capability_status),
+        )
+        object.__setattr__(
+            self,
+            "capability_aliases",
+            MappingProxyType(capability_aliases),
+        )
+        object.__setattr__(self, "setup_defaults", MappingProxyType(setup_defaults))
+
+        declared_actions = set(provider_capability_status)
+        for normalized_capability, provider_actions in capability_aliases.items():
             if not normalized_capability or not provider_actions:
                 raise ValueError("capability_alias_invalid")
             if any(action not in declared_actions for action in provider_actions):
