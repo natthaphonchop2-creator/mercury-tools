@@ -2,8 +2,10 @@ import pytest
 from starlette.testclient import TestClient
 
 from mercury_tools import __version__
+from mercury_tools.config import Settings
 from mercury_tools.flows.templates import COMPANY_HEALTH_TEMPLATE
 from mercury_tools.mcp.server import create_http_app
+from mercury_tools.product import ConnectRequest, create_client_token
 
 
 @pytest.fixture(autouse=True)
@@ -36,6 +38,23 @@ def ready_connector_profile(connector_id: str = "flowaccount") -> dict:
         "evidence_source": "api_driver_safe_probe",
         "validated_at": "2026-07-19T12:00:00+00:00",
     }
+
+
+def make_client_token() -> str:
+    return create_client_token(
+        Settings(
+            supabase_url="https://example.supabase.co",
+            supabase_service_role_key="service-role",
+            openai_api_key="",
+            connect_signing_secret="signing-secret",
+        ),
+        ConnectRequest(
+            email="owner@example.com",
+            company="Demo Co",
+            host_app="codex",
+            invite_code="invite",
+        ),
+    )
 
 
 def test_remote_http_app_exposes_healthz(monkeypatch) -> None:
@@ -436,6 +455,82 @@ def test_product_mutation_requires_supabase(monkeypatch) -> None:
     )
 
     assert response.status_code == 503
+
+
+def test_legacy_connector_setup_rejects_missing_mode_and_unsafe_fields(monkeypatch) -> None:
+    from mercury_tools.mcp import server
+
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
+    monkeypatch.setenv("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
+    calls: list[dict] = []
+
+    class FakeStore:
+        def set_connector_profile(self, **kwargs):
+            calls.append({"method": "set", **kwargs})
+            return ready_connector_profile()
+
+        def link_connector_profile(self, **kwargs):
+            calls.append({"method": "link", **kwargs})
+            return ready_connector_profile()
+
+    monkeypatch.setattr(server, "_product_store", lambda _settings=None: FakeStore())
+    client = TestClient(create_http_app(require_auth=True), raise_server_exceptions=False)
+    headers = {"Authorization": f"Bearer {make_client_token()}"}
+    unsafe_bodies = [
+        {"connector_id": "flowaccount", "environment": "production"},
+        {
+            "connector_id": "flowaccount",
+            "connection_mode": "api_driver",
+            "environment": "production",
+            "client_secret": "secret",
+        },
+        {
+            "connector_id": "flowaccount",
+            "connection_mode": "api_driver",
+            "environment": "production",
+            "provider_body": {"result": "provider response"},
+        },
+        {
+            "connector_id": "flowaccount",
+            "connection_mode": "native_mcp",
+            "environment": "production",
+            "external_server_name": "192.168.1.10",
+        },
+    ]
+
+    responses = [
+        client.post("/api/connectors/setup", headers=headers, json=body)
+        for body in unsafe_bodies
+    ]
+
+    assert all(400 <= response.status_code < 500 for response in responses)
+    assert calls == []
+
+    safe_response = client.post(
+        "/api/connectors/setup",
+        headers=headers,
+        json={
+            "connector_id": "flowaccount",
+            "connection_mode": "api_driver",
+            "environment": "production",
+            "company_name": "Demo Co",
+        },
+    )
+
+    assert safe_response.status_code == 200
+    assert len(calls) == 1
+    assert calls[0]["method"] == "link"
+    assert {key: calls[0][key] for key in calls[0] if key != "token_payload"} == {
+        "method": "link",
+        "connector_id": "flowaccount",
+        "connection_mode": "api_driver",
+        "environment": "production",
+        "company_ref": None,
+        "company_name": "Demo Co",
+        "external_server_name": None,
+    }
 
 
 def test_workspace_flow_validate_and_dry_run_use_client_token(monkeypatch) -> None:

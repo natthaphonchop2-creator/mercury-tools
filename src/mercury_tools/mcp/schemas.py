@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 ConnectorId = Literal["flowaccount", "peak", "express", "custom", "generic_mcp"]
 ConnectorEnvironment = Literal["production", "sandbox", "uat", "local", "gateway"]
 ConnectorConnectionMode = Literal["native_mcp", "api_driver", "local_bridge"]
+ConnectorUnlinkConfirmation = Literal["unlink"]
 SearchMode = Literal["hybrid", "keyword", "vector"]
 CAPABILITY_PATTERN = r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$"
 AccountingSkillId = Literal[
@@ -57,6 +58,17 @@ class ConnectorValidationEvidence(StrictMcpInput):
     evidence_ref: str = Field(pattern=r"^evidence_[0-9a-z_-]{8,128}$")
     provider_tool_name: str | None = Field(default=None, max_length=200)
     capabilities: list[CapabilityObservation] = Field(min_length=1, max_length=500)
+
+
+class LegacyConnectorSetupRequest(StrictMcpInput):
+    """Strict compatibility body for the opt-in legacy setup route."""
+
+    connector_id: ConnectorId
+    connection_mode: ConnectorConnectionMode
+    environment: ConnectorEnvironment
+    company_ref: str | None = Field(default=None, max_length=200)
+    company_name: str | None = Field(default=None, max_length=200)
+    external_server_name: str | None = Field(default=None, max_length=200)
 
 
 class KnowledgeSearchFilters(StrictMcpInput):

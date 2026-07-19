@@ -821,7 +821,7 @@ class SupabaseProductStore:
         context = self._fallback_workspace_for_token(token_payload)
         key = context["workspace"]["workspace_key"]
         skills = {skill["skill_id"]: skill for skill in skill_catalog_rows()}
-        connector_profiles: dict[str, dict[str, Any]] = {}
+        connector_profiles = self._fallback_current_connector_profiles(key)
         members: dict[str, dict[str, Any]] = {
             context["member"]["id"]: context["member"],
         }
@@ -843,20 +843,6 @@ class SupabaseProductStore:
                             if field in saved_workspace
                         },
                     }
-            elif event_type == "connector.profile_configured":
-                profile = summary.get("profile") or {}
-                profile_key = (
-                    f"{profile.get('connector_id')}:{profile.get('connection_mode', 'api_driver')}"
-                    f":{profile.get('environment')}"
-                )
-                connector_profiles[profile_key] = public_connector_profile(profile)
-            elif event_type == "connector.profile_unlinked":
-                event_summary = summary.get("event_summary") or {}
-                profile_key = (
-                    f"{event_summary.get('connector_id')}:{event_summary.get('connection_mode')}"
-                    f":{event_summary.get('environment')}"
-                )
-                connector_profiles.pop(profile_key, None)
             elif event_type in {"skill.enabled", "skill.disabled"}:
                 skill_id = str(summary.get("skill_id") or "")
                 if skill_id in skills:
@@ -914,6 +900,37 @@ class SupabaseProductStore:
             )[:12],
             "events": [public_product_event(event) for event in reversed(events[-12:])],
         }
+
+    @staticmethod
+    def _fallback_connector_profile_key(
+        connector_id: str | None,
+        connection_mode: str | None,
+        environment: str | None,
+    ) -> str:
+        return f"{connector_id}:{connection_mode}:{environment}"
+
+    def _fallback_current_connector_profiles(self, workspace_key: str) -> dict[str, dict[str, Any]]:
+        profiles: dict[str, dict[str, Any]] = {}
+        for row in self._fallback_state_events(workspace_key):
+            summary = row.get("output_summary") or {}
+            event_type = str(summary.get("event_type") or "")
+            if event_type == "connector.profile_configured":
+                profile = summary.get("profile") or {}
+                profile_key = self._fallback_connector_profile_key(
+                    profile.get("connector_id"),
+                    profile.get("connection_mode", "api_driver"),
+                    profile.get("environment"),
+                )
+                profiles[profile_key] = public_connector_profile(profile)
+            elif event_type == "connector.profile_unlinked":
+                event_summary = summary.get("event_summary") or {}
+                profile_key = self._fallback_connector_profile_key(
+                    event_summary.get("connector_id"),
+                    event_summary.get("connection_mode"),
+                    event_summary.get("environment"),
+                )
+                profiles.pop(profile_key, None)
+        return profiles
 
     def _fallback_flows_for_workspace_key(self, workspace_key_value: str) -> list[dict[str, Any]]:
         flows: dict[str, dict[str, Any]] = {}
@@ -1132,18 +1149,14 @@ class SupabaseProductStore:
             mode.mode.value,
             environment,
         )
-        existing_profile: dict[str, Any] | None = None
-        for row in self._fallback_state_events(context["workspace"]["workspace_key"]):
-            summary = row.get("output_summary") or {}
-            if summary.get("event_type") != "connector.profile_configured":
-                continue
-            profile = summary.get("profile") or {}
-            if (
-                profile.get("connector_id") == canonical_connector_id
-                and profile.get("connection_mode", "api_driver") == mode.mode.value
-                and profile.get("environment") == environment
-            ):
-                existing_profile = profile
+        profile_key = self._fallback_connector_profile_key(
+            canonical_connector_id,
+            mode.mode.value,
+            environment,
+        )
+        existing_profile = self._fallback_current_connector_profiles(
+            context["workspace"]["workspace_key"]
+        ).get(profile_key)
         existing_metadata = _public_connector_metadata(
             (existing_profile or {}).get("metadata")
         )
@@ -1357,12 +1370,100 @@ class SupabaseProductStore:
                 raise ValueError("observed capability is not declared for connection mode")
         if not _safe_validated_at(validated_at):
             raise ValueError("validated_at is invalid")
-        return self.set_connector_profile(
+        try:
+            return self._validate_connector_profile_product_tables(
+                token_payload=token_payload,
+                connector_id=connector.connector_id,
+                connection_mode=mode.mode.value,
+                environment=environment,
+                capability_states=states,
+                evidence_source=evidence_source,
+                evidence_ref=evidence_ref,
+                validated_at=validated_at,
+            )
+        except RuntimeError as exc:
+            if is_product_schema_error(exc):
+                return self._fallback_validate_connector_profile(
+                    token_payload=token_payload,
+                    connector_id=connector.connector_id,
+                    connection_mode=mode.mode.value,
+                    environment=environment,
+                    capability_states=states,
+                    evidence_source=evidence_source,
+                    evidence_ref=evidence_ref,
+                    validated_at=validated_at,
+                )
+            raise
+
+    def _fallback_validate_connector_profile(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        connection_mode: str,
+        environment: str,
+        capability_states: Mapping[str, str],
+        evidence_source: str,
+        evidence_ref: str,
+        validated_at: str,
+    ) -> dict[str, Any]:
+        context = self._fallback_workspace_for_token(token_payload)
+        profile_key = self._fallback_connector_profile_key(
+            connector_id,
+            connection_mode,
+            environment,
+        )
+        profiles = self._fallback_current_connector_profiles(context["workspace"]["workspace_key"])
+        if profile_key not in profiles:
+            raise ValueError("A linked connector profile is required before validation.")
+        return self._fallback_set_connector_profile(
             token_payload=token_payload,
-            connector_id=connector.connector_id,
-            connection_mode=mode.mode.value,
+            connector_id=connector_id,
+            connection_mode=connection_mode,
             environment=environment,
-            capability_states=states,
+            company_name=None,
+            capability_states=capability_states,
+            evidence_source=evidence_source,
+            validated_at=validated_at,
+            metadata={"evidence_ref": evidence_ref},
+        )
+
+    def _validate_connector_profile_product_tables(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        connection_mode: str,
+        environment: str,
+        capability_states: Mapping[str, str],
+        evidence_source: str,
+        evidence_ref: str,
+        validated_at: str,
+    ) -> dict[str, Any]:
+        context = self.workspace_for_token(token_payload)
+        if not context:
+            raise ValueError("Workspace is not registered for this client token.")
+        existing_rows = self._request(
+            "GET",
+            "mercury_connector_profiles",
+            params={
+                "workspace_id": f"eq.{context['workspace']['id']}",
+                "connector_id": f"eq.{connector_id}",
+                "connection_mode": f"eq.{connection_mode}",
+                "environment": f"eq.{environment}",
+                "select": "id",
+                "limit": "1",
+            },
+        )
+        if not existing_rows:
+            raise ValueError("A linked connector profile is required before validation.")
+        return self._set_connector_profile_product_tables(
+            token_payload=token_payload,
+            connector_id=connector_id,
+            connection_mode=connection_mode,
+            environment=environment,
+            company_name=None,
+            capability_states=capability_states,
             evidence_source=evidence_source,
             validated_at=validated_at,
             metadata={"evidence_ref": evidence_ref},

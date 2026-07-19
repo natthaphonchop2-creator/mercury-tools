@@ -566,6 +566,8 @@ async def test_public_connector_lifecycle_contract_is_exact_and_secretless() -> 
         inspect.signature(server.unlink_connector_profile).parameters["confirm"].default
         == "unlink"
     )
+    confirm_schema = tools["unlink_connector_profile"].inputSchema["properties"]["confirm"]
+    assert confirm_schema.get("const") == "unlink" or confirm_schema.get("enum") == ["unlink"]
 
     forbidden = {
         "client_id",

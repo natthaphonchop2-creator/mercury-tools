@@ -1,3 +1,5 @@
+import pytest
+
 from mercury_tools.config import Settings
 from mercury_tools.db.product import (
     SKILL_CATALOG_SEED,
@@ -188,6 +190,82 @@ def test_fallback_profiles_are_mode_distinct_and_evidence_aware() -> None:
         "api_driver",
         "native_mcp",
     }
+
+
+def test_product_validation_requires_an_existing_exact_linked_profile() -> None:
+    store = AuditFallbackStore()
+
+    with pytest.raises(ValueError, match="linked connector profile"):
+        store.validate_connector_profile(
+            token_payload=token_payload(),
+            connector_id="flowaccount",
+            connection_mode="api_driver",
+            environment="production",
+            capability_states={"company.info.read": "observed"},
+            evidence_source="api_driver_safe_probe",
+            evidence_ref="evidence_missing_link_1234",
+            validated_at="2026-07-19T12:00:00+00:00",
+        )
+
+    store.link_connector_profile(
+        token_payload=token_payload(),
+        connector_id="flowaccount",
+        connection_mode="api_driver",
+        environment="production",
+    )
+
+    with pytest.raises(ValueError, match="linked connector profile"):
+        store.validate_connector_profile(
+            token_payload=token_payload(),
+            connector_id="flowaccount",
+            connection_mode="api_driver",
+            environment="sandbox",
+            capability_states={"company.info.read": "observed"},
+            evidence_source="api_driver_safe_probe",
+            evidence_ref="evidence_wrong_environment_1234",
+            validated_at="2026-07-19T12:00:00+00:00",
+        )
+
+
+def test_fallback_relink_after_unlink_does_not_resurrect_validation_evidence() -> None:
+    store = AuditFallbackStore()
+    linked = store.link_connector_profile(
+        token_payload=token_payload(),
+        connector_id="flowaccount",
+        connection_mode="api_driver",
+        environment="production",
+    )
+    assert linked["status"] == "needs_validation"
+
+    validated = store.validate_connector_profile(
+        token_payload=token_payload(),
+        connector_id="flowaccount",
+        connection_mode="api_driver",
+        environment="production",
+        capability_states={"company.info.read": "observed"},
+        evidence_source="api_driver_safe_probe",
+        evidence_ref="evidence_relink_history_1234",
+        validated_at="2026-07-19T12:00:00+00:00",
+    )
+    assert validated["status"] == "ready_read_only"
+
+    store.unlink_connector_profile(
+        token_payload=token_payload(),
+        connector_id="flowaccount",
+        connection_mode="api_driver",
+        environment="production",
+    )
+    relinked = store.link_connector_profile(
+        token_payload=token_payload(),
+        connector_id="flowaccount",
+        connection_mode="api_driver",
+        environment="production",
+    )
+
+    assert relinked["status"] == "needs_validation"
+    assert relinked["capability_states"] == {}
+    assert relinked["evidence_source"] is None
+    assert relinked["validated_at"] is None
 
 
 def test_profile_status_requires_evidence_and_only_observed_mutations_are_write_ready() -> None:

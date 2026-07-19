@@ -51,9 +51,11 @@ from mercury_tools.mcp.schemas import (
     ConnectorConnectionMode,
     ConnectorEnvironment,
     ConnectorId,
+    ConnectorUnlinkConfirmation,
     ConnectorValidationEvidence,
     FlowFileInput,
     KnowledgeSearchFilters,
+    LegacyConnectorSetupRequest,
     MercuryFlowSource,
     SearchMode,
     WorkspaceFlowMetadata,
@@ -1363,7 +1365,7 @@ def get_connector_setup(
             "next_action": "link_connector_profile",
             "provider_setup_url": mode.provider_setup_url,
             "required_user_values": [],
-            "setup_defaults": {},
+            "setup_defaults": dict(mode.setup_defaults),
             "capability_summary": {
                 "read": read_states[0] if read_states else "not_validated",
                 "write": write_states[0] if write_states else "not_validated",
@@ -1423,6 +1425,42 @@ def _validate_external_server_name(value: str | None) -> None:
     raise ValueError("external_server_name must be a server name, not a LAN address")
 
 
+def _link_connector_profile_for_token(
+    *,
+    token_payload: dict[str, Any],
+    connector_id: ConnectorId,
+    connection_mode: ConnectorConnectionMode,
+    environment: ConnectorEnvironment,
+    company_ref: str | None = None,
+    company_name: str | None = None,
+    external_server_name: str | None = None,
+    store: Any | None = None,
+) -> tuple[str, str, dict[str, Any]]:
+    _validate_safe_profile_input(company_ref, label="company_ref")
+    _validate_safe_profile_input(company_name, label="company_name")
+    _validate_external_server_name(external_server_name)
+    manifest = connector_by_id(connector_id)
+    mode = manifest.connection_mode(connection_mode) if manifest else None
+    if manifest is None:
+        raise ValueError(f"Unknown connector: {connector_id}")
+    if mode is None:
+        raise ValueError(f"Unsupported connection mode for {manifest.connector_id}: {connection_mode}")
+    if mode.mode.value == "native_mcp" and external_server_name is None:
+        raise ValueError("external_server_name is required for native_mcp profiles")
+    if mode.mode.value == "local_bridge" and external_server_name is not None:
+        raise ValueError("local_bridge profiles do not store external_server_name")
+    profile = (store or _product_store(load_settings())).link_connector_profile(
+        token_payload=token_payload,
+        connector_id=manifest.connector_id,
+        connection_mode=mode.mode.value,
+        environment=environment,
+        company_ref=company_ref,
+        company_name=company_name,
+        external_server_name=external_server_name,
+    )
+    return manifest.connector_id, mode.mode.value, profile
+
+
 @mcp.tool(annotations=_AUDITED_PRIVATE)
 def link_connector_profile(
     workspace_id: str,
@@ -1438,21 +1476,10 @@ def link_connector_profile(
         _validate_safe_profile_input(company_ref, label="company_ref")
         _validate_safe_profile_input(company_name, label="company_name")
         _validate_external_server_name(external_server_name)
-        manifest = connector_by_id(connector_id)
-        mode = manifest.connection_mode(connection_mode) if manifest else None
-        if manifest is None:
-            raise ValueError(f"Unknown connector: {connector_id}")
-        if mode is None:
-            raise ValueError(f"Unsupported connection mode for {manifest.connector_id}: {connection_mode}")
-        if mode.mode.value == "native_mcp" and external_server_name is None:
-            raise ValueError("external_server_name is required for native_mcp profiles")
-        if mode.mode.value == "local_bridge" and external_server_name is not None:
-            raise ValueError("local_bridge profiles do not store external_server_name")
-        settings = load_settings()
-        profile = _product_store(settings).link_connector_profile(
+        canonical_connector_id, canonical_mode, profile = _link_connector_profile_for_token(
             token_payload=_public_workspace_payload_from_value(workspace_id),
-            connector_id=manifest.connector_id,
-            connection_mode=mode.mode.value,
+            connector_id=connector_id,
+            connection_mode=connection_mode,
             environment=environment,
             company_ref=company_ref,
             company_name=company_name,
@@ -1463,8 +1490,8 @@ def link_connector_profile(
             "link_connector_profile",
             {
                 **_public_workspace_audit_ref(workspace_id),
-                "connector_id": manifest.connector_id,
-                "connection_mode": mode.mode.value,
+                "connector_id": canonical_connector_id,
+                "connection_mode": canonical_mode,
                 "environment": environment,
             },
             {"status": "ok", "profile_status": profile.get("status")},
@@ -1500,6 +1527,10 @@ def validate_connector_connection(
         expected_source = _EVIDENCE_SOURCE_BY_CONNECTION_MODE[mode.mode.value]
         if evidence_payload.source != expected_source:
             raise ValueError("evidence source does not match connection mode")
+        if evidence_payload.status == "failed" and any(
+            item.state == "observed" for item in evidence_payload.capabilities
+        ):
+            raise ValueError("failed evidence cannot contain observed capabilities")
         capability_states = {
             item.capability: item.state for item in evidence_payload.capabilities
         }
@@ -1562,11 +1593,19 @@ def connector_capabilities(
     """Return declared and observed capability states for one exact profile."""
     manifest = connector_by_id(connector_id)
     mode = manifest.connection_mode(connection_mode) if manifest else None
-    if manifest is None or mode is None or environment not in mode.supported_environments:
+    if manifest is None or mode is None:
         return {
             "status": "not_found",
             "connector_id": connector_id,
             "connection_mode": connection_mode,
+            "environment": environment,
+        }
+    if environment not in mode.supported_environments:
+        return {
+            "status": "not_ready",
+            "reason": "environment_mismatch",
+            "connector_id": manifest.connector_id,
+            "connection_mode": mode.mode.value,
             "environment": environment,
         }
     try:
@@ -1627,7 +1666,7 @@ def unlink_connector_profile(
     connector_id: ConnectorId,
     connection_mode: ConnectorConnectionMode,
     environment: ConnectorEnvironment,
-    confirm: str = "unlink",
+    confirm: ConnectorUnlinkConfirmation = "unlink",
 ) -> dict[str, Any]:
     """Delete one Mercury profile without revoking provider-side authorization."""
     if confirm != "unlink":
@@ -1677,7 +1716,12 @@ def start_connector_setup(
     """Deprecated Python compatibility wrapper for link_connector_profile."""
     manifest = connector_by_id(connector_id)
     if manifest is None or not manifest.connection_modes:
-        return {"status": "error", "message": f"Unknown connector: {connector_id}"}
+        return {
+            "status": "error",
+            "message": f"Unknown connector: {connector_id}",
+            "deprecated_tool": "start_connector_setup",
+            "replacement_tool": "link_connector_profile",
+        }
     mode = manifest.connection_modes[0]
     if mode.mode.value == "native_mcp":
         return {
@@ -1721,6 +1765,7 @@ def connector_status(
                 if profile.get("connector_id") == connector_id
             ]
         active_context = None
+        resolution: dict[str, Any] | None = None
         if len(public_profiles) == 1:
             selected_profile = public_profiles[0]
             resolution = _workspace_connector_resolution(
@@ -1739,7 +1784,11 @@ def connector_status(
         payload = redact_json(
             {
                 "status": status,
-                "reason": "connection_mode_required" if status == "mode_required" else None,
+                "reason": (
+                    "connection_mode_required"
+                    if status == "mode_required"
+                    else (resolution or {}).get("reason")
+                ),
                 "workspace": {
                     "name": (dashboard_payload.get("workspace") or {}).get("name"),
                     "host_app": "generic",
@@ -2990,20 +3039,23 @@ async def setup_connector(request: Request) -> Response:
                 "Supabase is required to save connector profiles.",
                 status_code=503,
             )
-        data = await request.json()
-        profile = _product_store(settings).set_connector_profile(
+        setup_request = LegacyConnectorSetupRequest.model_validate(await request.json())
+        _connector_id, _connection_mode, profile = _link_connector_profile_for_token(
             token_payload=token_payload,
-            connector_id=str(data.get("connector_id") or "").strip().lower(),
-            environment=str(data.get("environment") or "").strip().lower(),
-            company_name=str(data.get("company_name") or "").strip(),
-            metadata={"source": "connect-ui"},
+            connector_id=setup_request.connector_id,
+            connection_mode=setup_request.connection_mode,
+            environment=setup_request.environment,
+            company_ref=setup_request.company_ref,
+            company_name=setup_request.company_name,
+            external_server_name=setup_request.external_server_name,
+            store=_product_store(settings),
         )
         return JSONResponse(
             redact_json({"status": "ok", "profile": public_connector_profile(profile)})
         )
     except PermissionError as exc:
         return _json_error("unauthorized", str(exc), status_code=401)
-    except ValueError as exc:
+    except (ValidationError, ValueError) as exc:
         return _json_error("bad_request", str(exc), status_code=400)
     except RuntimeError as exc:
         return _json_error("service_unavailable", str(exc), status_code=503)
