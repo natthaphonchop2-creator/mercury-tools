@@ -1056,6 +1056,7 @@ async def test_cloud_responses_use_exact_public_projection_keys(
         "summary",
         "status",
         "version",
+        "required_capabilities",
         "required_connectors",
         "tags",
     }

@@ -1,5 +1,10 @@
 from mercury_tools.config import Settings
-from mercury_tools.db.product import SupabaseProductStore
+from mercury_tools.db.product import (
+    SKILL_CATALOG_SEED,
+    SupabaseProductStore,
+    connector_profile_status,
+    public_connector_profile,
+)
 from mercury_tools.flows.runner import MercuryFlowRunner
 from mercury_tools.flows.templates import COMPANY_HEALTH_TEMPLATE
 from mercury_tools.product import ConnectRequest
@@ -135,7 +140,8 @@ def test_product_store_audit_fallback_persists_connector_and_skill_state() -> No
     )
     dashboard = store.dashboard(token_payload())
 
-    assert profile["status"] == "requires_credentials"
+    assert profile["status"] == "needs_validation"
+    assert profile["connection_mode"] == "api_driver"
     assert skill["enabled"] is True
     assert dashboard["connector_profiles"][0]["connector_id"] == "flowaccount"
     vat_skill = next(item for item in dashboard["skills"] if item["skill_id"] == "vat-summary-th")
@@ -144,6 +150,112 @@ def test_product_store_audit_fallback_persists_connector_and_skill_state() -> No
         "connector.profile_configured",
         "skill.enabled",
     }
+
+
+def test_fallback_profiles_are_mode_distinct_and_evidence_aware() -> None:
+    store = AuditFallbackStore()
+    request = ConnectRequest(
+        email="owner@example.com",
+        company="Demo Co",
+        host_app="codex",
+        invite_code="invite",
+    )
+    store.upsert_connection(request, token_payload())
+
+    api_profile = store.set_connector_profile(
+        token_payload=token_payload(),
+        connector_id="flowaccount",
+        connection_mode="api_driver",
+        environment="production",
+        capability_states={"company.info.read": "observed"},
+        evidence_source="api_driver_safe_probe",
+        validated_at="2026-07-19T12:00:00+00:00",
+    )
+    native_profile = store.set_connector_profile(
+        token_payload=token_payload(),
+        connector_id="flowaccount",
+        connection_mode="native_mcp",
+        environment="production",
+        capability_states={"documents.invoice.list": "observed"},
+        evidence_source="native_mcp_safe_read",
+        validated_at="2026-07-19T12:00:00+00:00",
+    )
+    dashboard = store.dashboard(token_payload())
+
+    assert api_profile["status"] == "ready_read_only"
+    assert native_profile["status"] == "ready_read_only"
+    assert {profile["connection_mode"] for profile in dashboard["connector_profiles"]} == {
+        "api_driver",
+        "native_mcp",
+    }
+
+
+def test_profile_status_requires_evidence_and_only_observed_mutations_are_write_ready() -> None:
+    assert connector_profile_status("local_bridge", {}, validated_at=None) == "requires_local_setup"
+    assert (
+        connector_profile_status(
+            "api_driver",
+            {"documents.invoice.create": "validation_failed"},
+            validated_at="2026-07-19T12:00:00+00:00",
+        )
+        == "needs_validation"
+    )
+    assert (
+        connector_profile_status(
+            "api_driver",
+            {"documents.invoice.create": "observed"},
+            validated_at="2026-07-19T12:00:00+00:00",
+        )
+        == "ready_read_write"
+    )
+
+
+def test_profile_serialization_drops_unrecognized_and_sensitive_metadata() -> None:
+    public = public_connector_profile(
+        {
+            "id": "profile-1",
+            "connector_id": "flowaccount",
+            "connection_mode": "api_driver",
+            "environment": "production",
+            "company_ref": "company-123",
+            "external_server_name": "connector-host",
+            "capability_states": {"company.info.read": "observed", "api_key": "observed"},
+            "evidence_source": "api_driver_safe_probe",
+            "validated_at": "2026-07-19T12:00:00Z",
+            "metadata": {
+                "setup_state": "awaiting_credentials",
+                "validation": {"response": "provider payload"},
+                "server_vault": {"ciphertext": "secret"},
+                "preset": {"api_base_url": "https://example.test", "api_key": "secret"},
+            },
+            "provider_payload": {"email": "owner@example.com"},
+        }
+    )
+
+    assert public["capability_states"] == {"company.info.read": "observed"}
+    assert public["metadata"] == {
+        "setup_state": "awaiting_credentials",
+        "preset": {"api_base_url": "https://example.test"},
+    }
+    assert "provider_payload" not in public
+    assert "server_vault" not in str(public)
+    assert "secret" not in str(public)
+
+
+def test_skill_seed_uses_portable_capability_requirements() -> None:
+    health_check = next(
+        item for item in SKILL_CATALOG_SEED if item["skill_id"] == "company-health-check-th"
+    )
+    flow_setup = next(
+        item
+        for item in SKILL_CATALOG_SEED
+        if item["skill_id"] == "flowaccount-connector-setup-th"
+    )
+
+    assert health_check["required_connectors"] == []
+    assert health_check["required_capabilities"] == ["company.read"]
+    assert flow_setup["required_connectors"] == ["flowaccount"]
+    assert flow_setup["required_capabilities"] == []
 
 
 def test_product_store_audit_fallback_records_team_invite() -> None:

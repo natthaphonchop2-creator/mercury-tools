@@ -7,7 +7,11 @@ from pathlib import Path
 import httpx
 import pytest
 
-from mercury_tools.db.product import public_product_event, public_product_value
+from mercury_tools.db.product import (
+    public_connector_profile,
+    public_product_event,
+    public_product_value,
+)
 
 ROOT = Path(__file__).parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -293,6 +297,38 @@ def test_historical_product_event_recursively_strips_legacy_vault_fields() -> No
     assert public["summary"]["details"]["safe_note"] == "keep me"
     assert public["summary"]["details"]["records"][0]["status"] == "ready"
     assert public["metadata"]["source"] == "historical-import"
+
+
+def test_public_connector_profile_never_serializes_legacy_vault_or_credential_values() -> None:
+    public = public_connector_profile(
+        {
+            "connector_id": "flowaccount",
+            "connection_mode": "api_driver",
+            "environment": "production",
+            "company_ref": "owner@example.com",
+            "capability_states": {
+                "company.info.read": "observed",
+                "access_token": "observed",
+            },
+            "metadata": {
+                "setup_state": "ready",
+                "server_vault": {"ciphertext": "legacy-secret"},
+                "validation": {"response_body": "provider payload"},
+            },
+        }
+    )
+
+    serialized = str(public)
+    for forbidden in (
+        "server_vault",
+        "ciphertext",
+        "legacy-secret",
+        "response_body",
+        "owner@example.com",
+        "access_token",
+    ):
+        assert forbidden not in serialized
+    assert public["capability_states"] == {"company.info.read": "observed"}
 
 
 def test_public_flow_run_value_strips_spaced_legacy_vault_keys() -> None:

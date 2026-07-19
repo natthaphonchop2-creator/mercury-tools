@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -9,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 ConnectorId = Literal["flowaccount", "peak", "express", "custom", "generic_mcp"]
 ConnectorEnvironment = Literal["production", "sandbox", "uat", "local", "gateway"]
 SearchMode = Literal["hybrid", "keyword", "vector"]
+CAPABILITY_PATTERN = r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$"
 AccountingSkillId = Literal[
     "accounts-payable-reconciliation-th",
     "accounts-receivable-reconciliation-th",
@@ -30,6 +32,30 @@ AccountingSkillId = Literal[
 
 class StrictMcpInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class CapabilityObservation(StrictMcpInput):
+    capability: str = Field(pattern=CAPABILITY_PATTERN, max_length=200)
+    state: Literal[
+        "observed",
+        "provider_unavailable",
+        "not_authorized",
+        "validation_failed",
+        "environment_mismatch",
+    ]
+
+
+class ConnectorValidationEvidence(StrictMcpInput):
+    source: Literal[
+        "native_mcp_safe_read",
+        "api_driver_safe_probe",
+        "local_bridge_safe_probe",
+    ]
+    status: Literal["succeeded", "failed"]
+    observed_at: datetime
+    evidence_ref: str = Field(pattern=r"^evidence_[0-9a-z_-]{8,128}$")
+    provider_tool_name: str | None = Field(default=None, max_length=200)
+    capabilities: list[CapabilityObservation] = Field(min_length=1, max_length=500)
 
 
 class KnowledgeSearchFilters(StrictMcpInput):
@@ -78,12 +104,12 @@ class KnowledgeSearchFilters(StrictMcpInput):
     )
     capability: str | None = Field(
         default=None,
-        pattern=r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$",
+        pattern=CAPABILITY_PATTERN,
         description="Dotted ERP capability such as documents.invoice.list.",
     )
     accounting_use: str | None = Field(
         default=None,
-        pattern=r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$",
+        pattern=CAPABILITY_PATTERN,
         description="Dotted accounting use case represented by the evidence.",
     )
 
