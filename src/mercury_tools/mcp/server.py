@@ -123,11 +123,28 @@ _MUTATION_CAPABILITY_SEGMENTS = frozenset(
         "void",
     }
 )
-_AUDITED_PRIVATE = ToolAnnotations(
-    readOnlyHint=False,
+_CLOSED_READ = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
     openWorldHint=False,
+)
+_CLOSED_CREATE = ToolAnnotations(
+    readOnlyHint=False,
     destructiveHint=False,
     idempotentHint=False,
+    openWorldHint=False,
+)
+_CLOSED_IDEMPOTENT_WRITE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+_CLOSED_DESTRUCTIVE_IDEMPOTENT = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=True,
+    openWorldHint=False,
 )
 _MERCURY_FLOW_SOURCE_ADAPTER = TypeAdapter(MercuryFlowSource)
 
@@ -1119,7 +1136,7 @@ def _reject_sensitive_storage_input(**values: Any) -> None:
             )
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def search_knowledge(
     query: str,
     filters: KnowledgeSearchFilters | None = None,
@@ -1155,7 +1172,7 @@ def search_knowledge(
     return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def retrieve_context_pack(
     query: str,
     task: str | None = None,
@@ -1192,7 +1209,7 @@ def retrieve_context_pack(
     return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def retrieve_workspace_context_pack(
     workspace_id: str,
     query: str,
@@ -1299,7 +1316,7 @@ def retrieve_workspace_context_pack(
         return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def get_document(document_id: str) -> dict[str, Any]:
     """Fetch one indexed knowledge document by UUID or document URI."""
     document = SupabaseRagStore(load_settings()).get_document(document_id)
@@ -1308,7 +1325,7 @@ def get_document(document_id: str) -> dict[str, Any]:
     return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_CREATE)
 def create_public_workspace(company_name: str | None = None) -> dict[str, Any]:
     """Create an opaque, time-limited Mercury plugin workspace."""
     try:
@@ -1334,7 +1351,7 @@ def create_public_workspace(company_name: str | None = None) -> dict[str, Any]:
         return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def get_public_workspace(workspace_id: str) -> dict[str, Any]:
     """Return sanitized Mercury workspace, connector, and flow state."""
     audit_input = _public_workspace_audit_ref(workspace_id)
@@ -1361,7 +1378,7 @@ def get_public_workspace(workspace_id: str) -> dict[str, Any]:
         return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def list_connectors() -> dict[str, Any]:
     """List Mercury accounting and ERP connector options without secrets."""
     payload = {"status": "ok", "connectors": list_connector_public_summaries()}
@@ -1369,7 +1386,7 @@ def list_connectors() -> dict[str, Any]:
     return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def get_connector_setup(
     connector_id: ConnectorId,
     connection_mode: ConnectorConnectionMode | None = None,
@@ -1503,7 +1520,7 @@ def _link_connector_profile_for_token(
     return manifest.connector_id, mode.mode.value, profile
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_CREATE)
 def link_connector_profile(
     workspace_id: str,
     connector_id: ConnectorId,
@@ -1576,7 +1593,7 @@ def _canonical_evidence_capability_states(
     return capability_states
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_IDEMPOTENT_WRITE)
 def validate_connector_connection(
     workspace_id: str,
     connector_id: ConnectorId,
@@ -1664,7 +1681,7 @@ def validate_connector_connection(
         return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def connector_capabilities(
     workspace_id: str,
     connector_id: ConnectorId,
@@ -1745,7 +1762,7 @@ def connector_capabilities(
         return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_DESTRUCTIVE_IDEMPOTENT)
 def unlink_connector_profile(
     workspace_id: str,
     connector_id: ConnectorId,
@@ -1829,7 +1846,7 @@ def start_connector_setup(
     }
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def connector_status(
     workspace_id: str,
     connector_id: ConnectorId | None = None,
@@ -1897,7 +1914,7 @@ def connector_status(
         return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def run_accounting_skill(
     skill_id: AccountingSkillId,
     inputs: AccountingSkillInputs,
@@ -1927,7 +1944,7 @@ def run_accounting_skill(
     return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def flow_cheat_sheet() -> dict[str, Any]:
     """Return Mercury Flow command syntax and examples."""
     payload = {"status": "ok", "cheat_sheet": FLOW_CHEAT_SHEET}
@@ -1935,7 +1952,7 @@ def flow_cheat_sheet() -> dict[str, Any]:
     return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def check_flow_syntax(flow_yaml: str) -> dict[str, Any]:
     """Validate a Mercury YAML flow without executing it."""
     try:
@@ -1952,7 +1969,7 @@ def check_flow_syntax(flow_yaml: str) -> dict[str, Any]:
         return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def inspect_flow_files(
     flow_files: list[FlowFileInput],
     config_yaml: str | None = None,
@@ -2017,7 +2034,7 @@ def inspect_flow_files(
         return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def run_flow(
     flow_yaml: str,
     dry_run: bool = False,
@@ -2087,7 +2104,7 @@ def run_flow(
         return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def run_flow_files(
     flow_files: list[FlowFileInput],
     config_yaml: str | None = None,
@@ -2299,7 +2316,7 @@ def run_flow_files(
         return payload
 
 
-@mcp.tool(name="run_mercury_flow", annotations=_AUDITED_PRIVATE)
+@mcp.tool(name="run_mercury_flow", annotations=_CLOSED_READ)
 def _run_mercury_flow_tool(
     source: MercuryFlowSource,
     dry_run: bool = True,
@@ -2423,7 +2440,7 @@ def run_mercury_flow(
     return _run_mercury_flow_tool(source, dry_run=dry_run, env=env)
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def list_workspace_flows(workspace_id: str) -> dict[str, Any]:
     """List saved Mercury flows for a public workspace."""
     try:
@@ -2456,7 +2473,7 @@ def list_workspace_flows(workspace_id: str) -> dict[str, Any]:
         return payload
 
 
-@mcp.tool(name="run_workspace_flow", annotations=_AUDITED_PRIVATE)
+@mcp.tool(name="run_workspace_flow", annotations=_CLOSED_READ)
 def run_workspace_flow_tool(
     workspace_id: str,
     flow_id: str,
@@ -2562,7 +2579,7 @@ def run_workspace_flow_tool(
         return payload
 
 
-@mcp.tool(name="save_workspace_flow", annotations=_AUDITED_PRIVATE)
+@mcp.tool(name="save_workspace_flow", annotations=_CLOSED_IDEMPOTENT_WRITE)
 def save_workspace_flow_tool(
     workspace_id: str,
     title: str,

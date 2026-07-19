@@ -25,40 +25,43 @@ def test_public_mcp_tools_have_submission_annotations() -> None:
     from mercury_tools.mcp.server import mcp
 
     tools = {tool.name: tool for tool in asyncio.run(mcp.list_tools())}
-    audited_tools = {
-        "search_knowledge",
-        "retrieve_context_pack",
-        "retrieve_workspace_context_pack",
-        "get_document",
-        "get_public_workspace",
-        "list_connectors",
-        "get_connector_setup",
-        "link_connector_profile",
-        "validate_connector_connection",
-        "connector_capabilities",
-        "connector_status",
-        "unlink_connector_profile",
-        "run_accounting_skill",
-        "flow_cheat_sheet",
-        "check_flow_syntax",
-        "inspect_flow_files",
-        "list_workspace_flows",
-        "create_public_workspace",
-        "run_flow",
-        "run_flow_files",
-        "run_mercury_flow",
-        "run_workspace_flow",
-        "save_workspace_flow",
+    expected_annotations = {
+        "search_knowledge": (True, False, None, False),
+        "retrieve_context_pack": (True, False, None, False),
+        "retrieve_workspace_context_pack": (True, False, None, False),
+        "get_document": (True, False, None, False),
+        "get_public_workspace": (True, False, None, False),
+        "list_connectors": (True, False, None, False),
+        "get_connector_setup": (True, False, None, False),
+        "create_public_workspace": (False, False, False, False),
+        "link_connector_profile": (False, False, False, False),
+        "validate_connector_connection": (False, False, True, False),
+        "connector_capabilities": (True, False, None, False),
+        "connector_status": (True, False, None, False),
+        "unlink_connector_profile": (False, True, True, False),
+        "run_accounting_skill": (True, False, None, False),
+        "flow_cheat_sheet": (True, False, None, False),
+        "check_flow_syntax": (True, False, None, False),
+        "inspect_flow_files": (True, False, None, False),
+        "list_workspace_flows": (True, False, None, False),
+        "run_flow": (True, False, None, False),
+        "run_flow_files": (True, False, None, False),
+        "run_mercury_flow": (True, False, None, False),
+        "run_workspace_flow": (True, False, None, False),
+        "save_workspace_flow": (False, False, True, False),
     }
 
-    assert set(tools) == audited_tools
-    for name in audited_tools:
+    assert set(tools) == set(expected_annotations)
+    for name, expected in expected_annotations.items():
         annotations = tools[name].annotations
         assert annotations is not None
-        assert annotations.readOnlyHint is False
-        assert annotations.openWorldHint is False
-        assert annotations.destructiveHint is False
-        assert annotations.idempotentHint is False
+        actual = (
+            annotations.readOnlyHint,
+            annotations.destructiveHint,
+            annotations.idempotentHint,
+            annotations.openWorldHint,
+        )
+        assert actual == expected
 
 
 def test_public_storage_tools_reject_secret_bearing_inputs_before_persistence() -> None:
