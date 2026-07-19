@@ -834,12 +834,9 @@ git commit -m "refactor: bind ERP writes to one approval"
 **Files:**
 - Modify: `src/mercury_tools/mcp/local_server.py`
 - Modify: `src/mercury_tools/mcp/local_runtime.py`
+- Create: `docs/ADVANCED_LOCAL_ERP.md`
 - Modify: `tests/test_local_mcp_contract.py`
 - Modify: `tests/test_plugin_package.py`
-- Modify: `plugins/mercury-finance/skills/connector-credential-setup-th/SKILL.md`
-- Modify: `plugins/mercury-finance/skills/flowaccount-journal-posting-th/SKILL.md`
-- Modify: `plugins/mercury-finance/skills/flowaccount-connector-setup-th/SKILL.md`
-- Modify: `plugins/mercury-finance/skills/peak-connector-setup-th/SKILL.md`
 
 - [ ] **Step 1: Change the expected local MCP contract first**
 
@@ -894,9 +891,9 @@ Preparation returns sanitized summary, payload hash, mutation class, approval le
 
 Do not expose `confirm_erp_write`. Keep internal preview creation mandatory. The host approval UI is triggered by the selected execute tool's annotations and immutable summary. Sensitive actions use the explicitly named sensitive tool and elevated summary.
 
-- [ ] **Step 6: Update advanced local Skills**
+- [ ] **Step 6: Document the advanced local execution path outside the public plugin**
 
-Provider-specific Skills must use `prepare_erp_mutation -> execute_erp_create/update/sensitive` and state that official FlowAccount MCP remains read-only while a separately reviewed FlowAccount API-driver action may write. Never tell the host that a provider limitation is a Mercury-wide prohibition.
+Create `docs/ADVANCED_LOCAL_ERP.md` with the `mercury mcp serve-local` setup, local credential boundary, and `prepare_erp_mutation -> execute_erp_create/update/sensitive` sequence. State that official FlowAccount MCP remains read-only while a separately reviewed FlowAccount API-driver action may write. Public plugin Skills must return this advanced handoff and must not invoke local-only tool names as though they are present in the one-click hosted MCP.
 
 - [ ] **Step 7: Run local MCP tests**
 
@@ -909,7 +906,7 @@ Expected: the local server exposes the split write tools and one-call approval b
 - [ ] **Step 8: Commit Task 8**
 
 ```bash
-git add src/mercury_tools/mcp/local_server.py src/mercury_tools/mcp/local_runtime.py tests/test_local_mcp_contract.py tests/test_plugin_package.py plugins/mercury-finance/skills
+git add src/mercury_tools/mcp/local_server.py src/mercury_tools/mcp/local_runtime.py docs/ADVANCED_LOCAL_ERP.md tests/test_local_mcp_contract.py tests/test_plugin_package.py
 git commit -m "feat: split local ERP mutation tools by risk"
 ```
 
@@ -921,6 +918,10 @@ git commit -m "feat: split local ERP mutation tools by risk"
 - Modify: `plugins/mercury-finance/.mcp.json`
 - Modify: `plugins/mercury-finance/.codex-plugin/plugin.json`
 - Modify: `.agents/plugins/marketplace.json`
+- Modify: `plugins/mercury-finance/skills/connector-credential-setup-th/SKILL.md`
+- Modify: `plugins/mercury-finance/skills/flowaccount-journal-posting-th/SKILL.md`
+- Modify: `plugins/mercury-finance/skills/flowaccount-connector-setup-th/SKILL.md`
+- Modify: `plugins/mercury-finance/skills/peak-connector-setup-th/SKILL.md`
 - Modify: `README.md`
 - Create: `docs/CONNECTOR_CATALOG.md`
 - Modify: `docs/LOCAL_CREDENTIALS.md`
@@ -959,6 +960,8 @@ Expected: failures because `.mcp.json` launches `uvx ... serve-local`.
 Use the exact `.mcp.json` above. The installed plugin must require no clone, Python, uv, Supabase URL, Mercury Owner Token, or ERP secret.
 
 Keep `mercury mcp serve-local` documented as an alternative advanced connector path. Do not auto-register it beside the hosted core because two Mercury servers would duplicate tool names and confuse routing.
+
+Provider-specific public Skills use hosted connector lifecycle tools and return the advanced-local documentation handoff when a reviewed API-driver write is requested. They must not directly invoke `prepare_erp_mutation` or an `execute_erp_*` tool unless the user has separately connected the local MCP.
 
 - [ ] **Step 4: Rewrite product metadata and starter prompts**
 
@@ -1002,7 +1005,7 @@ Expected: clean install validates without a local runtime and the plugin validat
 - [ ] **Step 8: Commit Task 9**
 
 ```bash
-git add plugins/mercury-finance/.mcp.json plugins/mercury-finance/.codex-plugin/plugin.json .agents/plugins/marketplace.json README.md docs/CONNECTOR_CATALOG.md docs/LOCAL_CREDENTIALS.md tests/test_plugin_package.py tests/test_plugin_clean_install.py scripts/validate_release_plugin.py
+git add plugins/mercury-finance/.mcp.json plugins/mercury-finance/.codex-plugin/plugin.json plugins/mercury-finance/skills/connector-credential-setup-th/SKILL.md plugins/mercury-finance/skills/flowaccount-journal-posting-th/SKILL.md plugins/mercury-finance/skills/flowaccount-connector-setup-th/SKILL.md plugins/mercury-finance/skills/peak-connector-setup-th/SKILL.md .agents/plugins/marketplace.json README.md docs/CONNECTOR_CATALOG.md docs/LOCAL_CREDENTIALS.md tests/test_plugin_package.py tests/test_plugin_clean_install.py scripts/validate_release_plugin.py
 git commit -m "feat: make Mercury a hosted one-click plugin"
 ```
 
