@@ -453,11 +453,22 @@ provider-action key before persistence. Reject duplicate or conflicting
 observations after alias expansion so two names cannot overwrite one canonical
 capability state.
 
+For a `discovered_tools` Generic MCP mode, host-observed evidence may persist the
+exact discovered provider capability even though it is absent from a static
+vendor catalog. Do not grant or deny that evidence by parsing capability-name
+segments. Recording evidence does not execute the provider action; the provider
+MCP tool's own annotations and the later approval policy classify execution
+risk. Fixed-catalog modes must remain catalog-bound.
+
 Validation requires an already linked profile with the exact workspace,
 connector, mode, and environment identity; it must never upsert a new profile on
 its own. A failed evidence envelope must either be rejected as inconsistent or
 persist only non-ready capability states. It can never persist observed evidence
 that produces `ready_read_only` or `ready_read_write`.
+
+Catch typed evidence validation failures separately and return a fixed sanitized
+message. Never serialize Pydantic's rejected `input_value`, a provider body, or
+another unknown evidence field into the MCP result or audit payload.
 
 - [ ] **Step 5: Implement status, capability reasons, and unlink**
 
