@@ -47,6 +47,7 @@ create or replace function public.mercury_capability_states_are_safe(capability_
 returns boolean
 language sql
 immutable
+set search_path = pg_catalog
 as $$
   select
     jsonb_typeof(capability_states) = 'object'
@@ -66,6 +67,9 @@ as $$
           '(api[_-]?key|access[_-]?token|auth|bearer|credential|email|password|secret|tax[_-]?id|taxid|token|response[_-]?body|payload)'
     );
 $$;
+
+revoke execute on function public.mercury_capability_states_are_safe(jsonb) from public;
+grant execute on function public.mercury_capability_states_are_safe(jsonb) to service_role;
 
 alter table public.mercury_connector_profiles
   drop constraint if exists mercury_connector_profiles_connection_mode_check,

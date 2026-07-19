@@ -523,6 +523,21 @@ def _has_reviewed_api_driver_mutation(
     )
 
 
+def _all_observed_capabilities_are_catalog_bound(
+    connector_id: str,
+    connection_mode: str,
+    capability_states: Mapping[str, str],
+) -> bool:
+    connector = connector_by_id(connector_id)
+    if connector is None or connector.connection_mode(connection_mode) is None:
+        return False
+    return all(
+        bool(connector.provider_capabilities(connection_mode, capability))
+        for capability, state in capability_states.items()
+        if state == "observed"
+    )
+
+
 def public_connector_profile(profile: dict[str, Any]) -> dict[str, Any]:
     metadata = profile.get("metadata")
     public = {
@@ -604,6 +619,8 @@ def connector_profile_status(
     if "not_authorized" in states.values():
         return "requires_authorization"
     if any(state != "observed" for state in states.values()):
+        return "needs_validation"
+    if not _all_observed_capabilities_are_catalog_bound(connector_id, mode, states):
         return "needs_validation"
     if mode == "native_mcp":
         return (

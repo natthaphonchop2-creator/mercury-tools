@@ -71,3 +71,17 @@ def test_connector_neutral_profile_migration_validates_every_capability_state() 
         "environment_mismatch",
     ):
         assert state in normalized
+
+
+def test_capability_state_validator_has_explicit_function_security() -> None:
+    normalized = MIGRATION.read_text().lower()
+
+    assert "set search_path = pg_catalog" in normalized
+    assert (
+        "revoke execute on function public.mercury_capability_states_are_safe(jsonb) from public"
+        in normalized
+    )
+    assert (
+        "grant execute on function public.mercury_capability_states_are_safe(jsonb) to service_role"
+        in normalized
+    )

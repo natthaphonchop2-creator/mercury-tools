@@ -245,7 +245,7 @@ def test_profile_status_binds_readiness_to_matching_evidence_and_reviewed_mode()
             evidence_source="api_driver_safe_probe",
             validated_at=timestamp,
         )
-        == "ready_read_only"
+        == "needs_validation"
     )
     assert (
         connector_profile_status(
@@ -264,6 +264,58 @@ def test_profile_status_binds_readiness_to_matching_evidence_and_reviewed_mode()
             {"documents.invoice.list": "observed"},
             evidence_source="native_mcp_safe_read",
             validated_at=timestamp,
+        )
+        == "ready_read_only"
+    )
+
+
+def test_unknown_flowaccount_native_mcp_read_capability_needs_validation() -> None:
+    assert (
+        connector_profile_status(
+            "flowaccount",
+            "native_mcp",
+            {"documents.invoice.unknown": "observed"},
+            evidence_source="native_mcp_safe_read",
+            validated_at="2026-07-19T12:00:00+00:00",
+        )
+        == "needs_validation"
+    )
+
+
+def test_unknown_flowaccount_api_driver_read_capability_needs_validation() -> None:
+    assert (
+        connector_profile_status(
+            "flowaccount",
+            "api_driver",
+            {"documents.invoice.unknown": "observed"},
+            evidence_source="api_driver_safe_probe",
+            validated_at="2026-07-19T12:00:00+00:00",
+        )
+        == "needs_validation"
+    )
+
+
+def test_custom_draft_observed_capability_without_catalog_action_needs_validation() -> None:
+    assert (
+        connector_profile_status(
+            "custom",
+            "api_driver",
+            {"company.info.read": "observed"},
+            evidence_source="api_driver_safe_probe",
+            validated_at="2026-07-19T12:00:00+00:00",
+        )
+        == "needs_validation"
+    )
+
+
+def test_known_reviewed_read_evidence_remains_ready_read_only() -> None:
+    assert (
+        connector_profile_status(
+            "flowaccount",
+            "api_driver",
+            {"company.info.read": "observed"},
+            evidence_source="api_driver_safe_probe",
+            validated_at="2026-07-19T12:00:00+00:00",
         )
         == "ready_read_only"
     )
