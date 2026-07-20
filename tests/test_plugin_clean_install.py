@@ -181,6 +181,9 @@ def test_clean_install_one_click_plugin_requires_no_local_runtime(tmp_path: Path
         }
     }
     assert not any((installed_plugin / path).exists() for path in ("src", "dist", "pyproject.toml"))
+    assert (installed_plugin / "docs/ADVANCED_LOCAL_ERP.md").read_text(encoding="utf-8") == (
+        ROOT / "docs/ADVANCED_LOCAL_ERP.md"
+    ).read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,7 @@ from typing import Any
 PLUGIN_PATH = Path("plugins/mercury-finance/.codex-plugin/plugin.json")
 MCP_PATH = Path("plugins/mercury-finance/.mcp.json")
 MARKETPLACE_PATH = Path(".agents/plugins/marketplace.json")
+PUBLIC_PLUGIN_DIRECTORY = Path("plugins/mercury-finance")
 PYPROJECT_PATH = Path("pyproject.toml")
 EXPECTED_HOSTED_SERVER = {
     "type": "http",
@@ -60,6 +61,7 @@ CREDENTIAL_LITERAL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~+/=-]{11,511}")
 MAX_SCAN_NODES = 10_000
 MAX_SCAN_STRING_CHARS = 4_096
 LOCAL_LAUNCHER_FIELD_NAMES = frozenset({"command", "args", "cwd", "env"})
+CODEX_MARKETPLACE_AUTHENTICATION_VALUES = frozenset({"ON_INSTALL", "ON_USE"})
 
 
 def _read_json(path: Path, errors: list[str]) -> dict[str, Any]:
@@ -144,6 +146,33 @@ def _contains_public_mcp_forbidden_field(payload: Any) -> bool:
     return bool(pending)
 
 
+def _text_contains_high_confidence_credential_literal(text: str) -> bool:
+    bearer = BEARER_LITERAL_RE.search(text)
+    if bearer is not None and not _is_placeholder(bearer.group("value")):
+        return True
+    return JWT_LITERAL_RE.search(text) is not None or TOKEN_PREFIX_RE.search(text) is not None
+
+
+def _scan_public_plugin_files(root: Path, errors: list[str]) -> None:
+    plugin_directory = root / PUBLIC_PLUGIN_DIRECTORY
+    if not plugin_directory.is_dir():
+        errors.append("public plugin directory must exist for recursive credential scanning")
+        return
+
+    files = sorted(candidate for candidate in plugin_directory.rglob("*") if candidate.is_file())
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as error:
+            errors.append(f"cannot scan public plugin file {path.relative_to(root)}: {error}")
+            continue
+        if _text_contains_high_confidence_credential_literal(text):
+            errors.append(
+                "public plugin recursive scan found a high-confidence credential literal: "
+                f"{path.relative_to(root)}"
+            )
+
+
 def validate_release(root: Path) -> list[str]:
     """Return static release-contract failures without network or subprocess use."""
 
@@ -176,6 +205,7 @@ def validate_release(root: Path) -> list[str]:
         errors.append("plugin manifest must not contain private token names")
     if _contains_credential_literal(release_manifests):
         errors.append("plugin manifest must not contain credential literal values")
+    _scan_public_plugin_files(root, errors)
 
     interface = plugin.get("interface") if isinstance(plugin.get("interface"), dict) else {}
     if plugin.get("name") != "mercury-finance":
@@ -211,8 +241,14 @@ def validate_release(root: Path) -> list[str]:
         marketplace_policy = {}
     if marketplace_policy.get("installation") != "AVAILABLE":
         errors.append("marketplace mercury-finance installation policy must be AVAILABLE")
-    if marketplace_policy.get("authentication") != "NONE":
-        errors.append("marketplace mercury-finance authentication policy must be NONE")
+    if "authentication" in marketplace_policy:
+        if marketplace_policy["authentication"] not in CODEX_MARKETPLACE_AUTHENTICATION_VALUES:
+            errors.append(
+                "marketplace authentication policy must use only Codex-supported values "
+                "ON_INSTALL or ON_USE"
+            )
+        else:
+            errors.append("marketplace no-auth hosted plugin must omit authentication")
 
     project = pyproject.get("project") if isinstance(pyproject.get("project"), dict) else {}
     optional = (

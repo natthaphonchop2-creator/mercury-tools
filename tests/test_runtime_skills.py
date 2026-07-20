@@ -104,13 +104,24 @@ def test_bundled_provider_setup_skills_use_hosted_connector_lifecycle() -> None:
         assert LOCAL_API_DRIVER_COMMANDS.isdisjoint(markdown)
 
 
-def test_generic_advanced_setup_guide_keeps_local_credential_commands() -> None:
+def test_generic_setup_guide_uses_the_hosted_lifecycle_and_local_handoff_boundary() -> None:
     markdown = skill_markdown("connector-setup-guide-th")
 
     assert markdown is not None
-    assert "credential_status" in markdown
-    assert "mercury credentials setup" in markdown
-    assert "mercury credentials test" in markdown
+    lifecycle = (
+        "list_connectors",
+        "get_connector_setup",
+        "link_connector_profile",
+        "validate_connector_connection",
+        "connector_status",
+    )
+    positions = [markdown.index(tool_name) for tool_name in lifecycle]
+
+    assert positions == sorted(positions)
+    assert "advanced_local_handoff" in markdown
+    assert "docs/ADVANCED_LOCAL_ERP.md" in markdown
+    assert LOCAL_API_DRIVER_COMMANDS.isdisjoint(markdown)
+    assert "mercury credentials" not in markdown
     assert "workspace_id" not in markdown
 
 

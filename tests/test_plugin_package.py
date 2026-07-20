@@ -16,6 +16,7 @@ from mcp.shared.memory import create_connected_server_and_client_session
 
 from mercury_tools.db.product import SKILL_CATALOG_SEED
 from mercury_tools.mcp.local_server import local_mcp
+from mercury_tools.mcp.server import mcp as hosted_mcp
 from mercury_tools.skills.catalog import ACCOUNTING_SKILL_CATALOG
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +44,40 @@ EXPECTED_LOCAL_TOOLS = {
     "list_connector_drivers",
     "credential_status",
 }
+HOSTED_TOOL_REGISTRY = frozenset(tool.name for tool in hosted_mcp._tool_manager.list_tools())
+PUBLIC_SKILL_PROSE_OR_LOCAL_HANDOFF_TERMS = frozenset(
+    {
+        "advanced_local_handoff",
+        "api_driver",
+        "choices",
+        "connected",
+        "connection_mode",
+        "connector_id",
+        "connector_selection_required",
+        "environment",
+        "environment_mismatch",
+        "host_tool_requirements",
+        "inputs",
+        "invoke_provider_capability",
+        "json_object",
+        "local_bridge_required",
+        "native_mcp",
+        "not_ready",
+        "not_validated",
+        "ordered_steps",
+        "output_schema_name",
+        "provider_unavailable",
+        "required=false",
+    }
+)
+BACKTICK_SPAN_RE = re.compile(r"`(?P<value>[^`\n]+)`")
+TOOL_INVOCATION_RE = re.compile(r"(?P<name>[a-z][a-z0-9_]*)(?:\([^`]*\))?$")
+PACKAGE_LOCAL_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_./-])(?P<path>(?:\./)?(?:docs|skills)/[A-Za-z0-9_./-]+\.md)"
+)
+MARKDOWN_LINK_TARGET_RE = re.compile(
+    r"\[[^\]]*\]\((?P<target><[^>]+>|[^)\s]+)(?:\s+\"[^\"]*\")?\)"
+)
 
 SETUP_SKILLS = (
     "connector-setup-guide-th",
@@ -163,7 +198,6 @@ PACKAGE_FORBIDDEN_TERMS = {
     "run_mercury_flow",
     "start_connector_setup",
     "submit_connector_credentials",
-    "validate_connector_connection",
     "workspace_id",
 }
 CREDENTIAL_FIELD_NAMES = {
@@ -215,6 +249,39 @@ def route_branch_bodies(text: str) -> dict[str, str]:
             ].split()
         )
         for index, match in enumerate(matches)
+    }
+
+
+def packaged_skill_local_paths(skill_path: Path) -> dict[str, Path]:
+    text = skill_path.read_text(encoding="utf-8")
+    references = {
+        match.group("path").removeprefix("./"): PLUGIN_ROOT
+        / match.group("path").removeprefix("./")
+        for match in PACKAGE_LOCAL_PATH_RE.finditer(text)
+    }
+    for match in MARKDOWN_LINK_TARGET_RE.finditer(text):
+        target = match.group("target").strip("<>")
+        path = target.split("#", maxsplit=1)[0]
+        if not path or path.startswith("//") or re.match(r"^[a-z][a-z0-9+.-]*:", path, re.I):
+            continue
+        references[target] = (skill_path.parent / path).resolve()
+    return references
+
+
+def public_skill_backtick_tool_terms(text: str) -> set[str]:
+    terms = set()
+    for match in BACKTICK_SPAN_RE.finditer(text):
+        invocation = TOOL_INVOCATION_RE.fullmatch(match.group("value"))
+        if invocation is not None:
+            terms.add(invocation.group("name"))
+    return terms
+
+
+def public_skill_local_cli_commands(text: str) -> set[str]:
+    return {
+        match.group("value")
+        for match in BACKTICK_SPAN_RE.finditer(text)
+        if match.group("value").startswith(("mercury ", "mercury-tools "))
     }
 
 
@@ -326,8 +393,56 @@ def test_marketplace_points_to_plugin_folder() -> None:
     assert mercury["source"]["path"] == "./plugins/mercury-finance"
     assert mercury["source"]["source"] == "local"
     assert mercury["policy"]["installation"] == "AVAILABLE"
-    assert mercury["policy"]["authentication"] == "NONE"
+    assert mercury["policy"] == {"installation": "AVAILABLE"}
     assert mercury["category"] == "Finance"
+
+
+def test_public_skill_backtick_tool_invocations_use_hosted_registry_or_explicit_handoffs() -> None:
+    assert {
+        "list_connectors",
+        "get_connector_setup",
+        "link_connector_profile",
+        "validate_connector_connection",
+        "connector_status",
+    }.issubset(HOSTED_TOOL_REGISTRY)
+
+    invalid_references: dict[str, set[str]] = {}
+    local_commands: dict[str, set[str]] = {}
+    for skill_path in sorted(SKILLS_ROOT.glob("*/SKILL.md")):
+        text = skill_path.read_text(encoding="utf-8")
+        unsupported = public_skill_backtick_tool_terms(text) - (
+            HOSTED_TOOL_REGISTRY | PUBLIC_SKILL_PROSE_OR_LOCAL_HANDOFF_TERMS
+        )
+        if unsupported:
+            invalid_references[skill_path.parent.name] = unsupported
+        commands = public_skill_local_cli_commands(text)
+        if commands:
+            local_commands[skill_path.parent.name] = commands
+
+    assert invalid_references == {}
+    assert local_commands == {}
+
+
+def test_public_skill_package_local_markdown_paths_resolve_after_clean_install() -> None:
+    missing_paths: dict[str, set[str]] = {}
+    for skill_path in sorted(SKILLS_ROOT.glob("*/SKILL.md")):
+        references = packaged_skill_local_paths(skill_path)
+        missing = {
+            reference
+            for reference, path in references.items()
+            if not path.is_relative_to(PLUGIN_ROOT) or not path.is_file()
+        }
+        if missing:
+            missing_paths[skill_path.parent.name] = missing
+
+    assert missing_paths == {}
+
+
+def test_packaged_advanced_local_erp_guide_matches_the_authoritative_repo_guide() -> None:
+    authoritative = ROOT / "docs/ADVANCED_LOCAL_ERP.md"
+    packaged = PLUGIN_ROOT / "docs/ADVANCED_LOCAL_ERP.md"
+
+    assert packaged.read_text(encoding="utf-8") == authoritative.read_text(encoding="utf-8")
 
 
 def test_v022_versions_remain_consistent() -> None:
@@ -388,6 +503,24 @@ def test_public_setup_skills_use_hosted_lifecycle_without_chat_credentials() -> 
         assert "mercury credentials" not in text
         assert "prepare_erp_mutation" not in text
         assert "execute_erp_" not in text
+
+
+def test_connector_setup_guide_uses_the_exact_hosted_lifecycle() -> None:
+    text = skill_text("connector-setup-guide-th")
+
+    assert_terms_in_order(
+        text,
+        (
+            "list_connectors",
+            "get_connector_setup",
+            "link_connector_profile",
+            "validate_connector_connection",
+            "connector_status",
+        ),
+    )
+    assert "credential_status" not in text
+    assert "mercury credentials" not in text
+    assert "Never ask for, accept, or paste credentials in chat." in text
 
 
 def test_read_skills_preserve_evidence_and_compact_thai_output() -> None:
@@ -926,14 +1059,16 @@ def _release_layout(tmp_path: Path, *, local_launcher: bool = False) -> Path:
     release_root = tmp_path / "release"
     for relative_path in (
         ".agents/plugins/marketplace.json",
-        "plugins/mercury-finance/.mcp.json",
-        "plugins/mercury-finance/.codex-plugin/plugin.json",
         "pyproject.toml",
     ):
         source = ROOT / relative_path
         destination = release_root / relative_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
+    shutil.copytree(
+        PLUGIN_ROOT,
+        release_root / "plugins/mercury-finance",
+    )
     (release_root / "plugins/mercury-finance/.mcp.json").write_text(
         json.dumps(
             {
@@ -1061,6 +1196,22 @@ def test_release_validator_rejects_high_confidence_credential_values(
     assert "credential literal values" in result.stdout
 
 
+def test_release_validator_recursively_scans_public_plugin_files(tmp_path: Path) -> None:
+    release_root = _release_layout(tmp_path)
+    fixture = release_root / "plugins/mercury-finance/docs/credential-fixture.md"
+    fixture.write_text(
+        "Authorization: Bearer sk-live-51f89c816a374ad6b62be6a1",
+        encoding="utf-8",
+    )
+
+    result = _run_release_validator(release_root)
+
+    assert result.returncode == 1
+    assert "public plugin recursive scan found a high-confidence credential literal" in (
+        result.stdout
+    )
+
+
 def test_release_validator_allows_documentation_credential_placeholders(tmp_path: Path) -> None:
     release_root = _release_layout(tmp_path)
     _rewrite_plugin(
@@ -1174,11 +1325,26 @@ def test_release_validator_rejects_unsafe_hosted_manifest_mutations(
             "installation policy must be AVAILABLE",
         ),
         (
+            lambda data: data["plugins"][0]["policy"].update({"authentication": "NONE"}),
+            "authentication policy must use only Codex-supported values",
+        ),
+        (
+            lambda data: data["plugins"][0]["policy"].update({"authentication": "ON_INSTALL"}),
+            "no-auth hosted plugin must omit authentication",
+        ),
+        (
             lambda data: data["plugins"][0]["policy"].update({"authentication": "ON_USE"}),
-            "authentication policy must be NONE",
+            "no-auth hosted plugin must omit authentication",
         ),
     ],
-    ids=["multiple", "source-path", "installation", "authentication"],
+    ids=[
+        "multiple",
+        "source-path",
+        "installation",
+        "authentication-none",
+        "authentication-on-install",
+        "authentication-on-use",
+    ],
 )
 def test_release_validator_rejects_invalid_marketplace_contract(
     tmp_path: Path,
@@ -1223,9 +1389,7 @@ def test_task_16_report_uses_dev_extra_for_pytest_commands() -> None:
 def test_plugin_package_has_no_embedded_secret_env_names_or_values() -> None:
     files = [
         ROOT / ".agents/plugins/marketplace.json",
-        PLUGIN_ROOT / ".codex-plugin/plugin.json",
-        PLUGIN_ROOT / ".mcp.json",
-        *sorted(SKILLS_ROOT.glob("*/SKILL.md")),
+        *sorted(path for path in PLUGIN_ROOT.rglob("*") if path.is_file()),
     ]
     serialized = "\n".join(file.read_text(encoding="utf-8") for file in files)
     env_names = set(
