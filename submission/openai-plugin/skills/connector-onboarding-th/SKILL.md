@@ -5,16 +5,21 @@ description: Use when the user wants to select a public Mercury ERP profile or c
 
 # Connector Onboarding TH
 
-Follow this gate in order:
+If the user has no Mercury workspace, request approval before calling
+`create_public_workspace`. Then follow this lifecycle exactly:
 
-1. Call `list_connectors` and ask the user to choose connector and environment.
-2. Call `connector_capabilities` and explain the public hosted capability boundary.
-3. Call `create_public_workspace` only after the user agrees to create a non-secret
-   workspace profile.
-4. Call `start_connector_setup` with connector, environment, and optional company display
-   name. Never pass an API key, client secret, bearer token, tax id, or email.
-5. Call `connector_status` and report the sanitized profile plus the next available step.
+`list_connectors` -> `get_connector_setup` -> `link_connector_profile` -> host/provider OAuth or local handoff -> `validate_connector_connection` -> `connector_status`
 
-The hosted MCP does not validate or store ERP credentials and cannot directly execute a
-production ERP mutation. Do not tell the user that an ERP account is connected merely
-because a public profile exists.
+1. Ask the user to select one connector, connection mode, environment, and company.
+2. Link only sanitized profile metadata. Never pass an API key, client secret, bearer
+   token, tax id, email, or another personal identifier.
+3. For native MCP, let the host/provider own OAuth and the company picker. For an API
+   driver or Local Bridge, hand off to the advanced local setup; no ERP credentials enter
+   the hosted core or chat.
+4. Accept only sanitized host-observed or local evidence when validating the profile.
+5. If status reports multiple profiles or mode_required, ask for an explicit profile;
+   never choose silently.
+
+The hosted core stores sanitized profile and audit metadata but no ERP credentials.
+Advanced local reviewed drivers may execute an ERP action only after host approval. A
+linked profile is not a validated connection.

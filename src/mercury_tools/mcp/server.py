@@ -101,7 +101,42 @@ from mercury_tools.workspaces import (
     public_workspace_token_payload,
 )
 
-mcp = FastMCP("Mercury Tools")
+
+class StrictInputFastMCP(FastMCP):
+    """FastMCP registry whose public argument models reject unknown keys."""
+
+    def add_tool(
+        self,
+        fn: Any,
+        name: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        annotations: ToolAnnotations | None = None,
+        icons: list[Any] | None = None,
+        meta: dict[str, Any] | None = None,
+        structured_output: bool | None = None,
+    ) -> None:
+        super().add_tool(
+            fn,
+            name=name,
+            title=title,
+            description=description,
+            annotations=annotations,
+            icons=icons,
+            meta=meta,
+            structured_output=structured_output,
+        )
+        registered = self._tool_manager.get_tool(name or fn.__name__)
+        if registered is None:  # pragma: no cover - FastMCP just registered it
+            raise RuntimeError("FastMCP did not retain the registered tool")
+        argument_model = registered.fn_metadata.arg_model
+        argument_model.model_config["extra"] = "forbid"
+        argument_model.model_config["hide_input_in_errors"] = True
+        argument_model.model_rebuild(force=True)
+        registered.parameters = argument_model.model_json_schema(by_alias=True)
+
+
+mcp = StrictInputFastMCP("Mercury Tools")
 
 _SEARCH_FILTER_FIELDS = frozenset(SearchFilters.__dataclass_fields__)
 MAX_MCP_FLOW_FILES = 50
@@ -1291,7 +1326,12 @@ def search_knowledge(
     top_k: int = 8,
     mode: SearchMode = "hybrid",
 ) -> dict[str, Any]:
-    """Search Mercury accounting knowledge and return citation-bearing chunks."""
+    """Search Mercury accounting knowledge and return citation-bearing chunks.
+
+    Changes: no knowledge or provider state; Mercury records sanitized audit metadata.
+    External contact: Mercury's configured knowledge store only, never an ERP provider.
+    Omitted options: filters are inferred from the query, top_k is 8, and mode is hybrid.
+    """
     explicit_filters = _model_payload(filters)
     applied_filters, inferred_connector, inferred_domain = apply_knowledge_routing(
         query, explicit_filters
@@ -1327,7 +1367,12 @@ def retrieve_context_pack(
     filters: KnowledgeSearchFilters | None = None,
     max_chunks: int = 12,
 ) -> dict[str, Any]:
-    """Return a context pack with citations for the host agent to answer with."""
+    """Return a cited context pack for the host agent.
+
+    Changes: no knowledge or provider state; Mercury records sanitized audit metadata.
+    External contact: Mercury's configured knowledge store only, never an ERP provider.
+    Omitted options: task stays unset, filters are inferred, and max_chunks is 12.
+    """
     explicit_filters = _model_payload(filters)
     applied_filters, inferred_connector, inferred_domain = apply_knowledge_routing(
         query, explicit_filters
@@ -1364,7 +1409,12 @@ def retrieve_workspace_context_pack(
     task: str | None = None,
     max_chunks: int = 12,
 ) -> dict[str, Any]:
-    """Return a cited context pack filtered to the workspace's ready connector."""
+    """Return cited knowledge routed by one Mercury workspace profile.
+
+    Changes: no workspace or provider state; Mercury records sanitized audit metadata.
+    External contact: Mercury workspace and knowledge stores only, never the selected ERP.
+    Omitted options: task stays unset and max_chunks is 12.
+    """
     audit_input = {
         **_public_workspace_audit_ref(workspace_id),
         "query": query,
@@ -1466,7 +1516,12 @@ def retrieve_workspace_context_pack(
 
 @mcp.tool(annotations=_CLOSED_READ)
 def get_document(document_id: str) -> dict[str, Any]:
-    """Fetch one indexed knowledge document by UUID or document URI."""
+    """Fetch one indexed knowledge document by UUID or document URI.
+
+    Changes: no document or provider state; Mercury records sanitized audit metadata.
+    External contact: Mercury's configured knowledge store only, never an ERP provider.
+    Omitted options: none; document_id is required.
+    """
     document = SupabaseRagStore(load_settings()).get_document(document_id)
     payload = redact_json({"status": "ok" if document else "not_found", "document": document})
     _audit("get_document", {"document_id": document_id}, {"found": bool(document)})
@@ -1475,7 +1530,12 @@ def get_document(document_id: str) -> dict[str, Any]:
 
 @mcp.tool(annotations=_CLOSED_CREATE)
 def create_public_workspace(company_name: str | None = None) -> dict[str, Any]:
-    """Create an opaque, time-limited Mercury plugin workspace."""
+    """Create an opaque, time-limited Mercury plugin workspace.
+
+    Changes: creates private Mercury workspace, member, token, and audit metadata.
+    External contact: Mercury's hosted workspace store only, never an ERP provider.
+    Omitted options: company_name is not attached when it is omitted.
+    """
     try:
         _reject_sensitive_storage_input(company_name=company_name)
         settings = load_settings()
@@ -1499,7 +1559,12 @@ def create_public_workspace(company_name: str | None = None) -> dict[str, Any]:
 
 @mcp.tool(annotations=_CLOSED_READ)
 def get_public_workspace(workspace_id: str) -> dict[str, Any]:
-    """Return sanitized Mercury workspace, connector, and flow state."""
+    """Return sanitized Mercury workspace, connector-profile, and flow state.
+
+    Changes: no workspace or provider state; Mercury records sanitized audit metadata.
+    External contact: Mercury's hosted workspace store only, never an ERP provider.
+    Omitted options: none; workspace_id is required.
+    """
     audit_input = _public_workspace_audit_ref(workspace_id)
     try:
         settings = load_settings()
@@ -1524,7 +1589,12 @@ def get_public_workspace(workspace_id: str) -> dict[str, Any]:
 
 @mcp.tool(annotations=_CLOSED_READ)
 def list_connectors() -> dict[str, Any]:
-    """List Mercury accounting and ERP connector options without secrets."""
+    """List secretless Mercury accounting and ERP connector options.
+
+    Changes: no connector or provider state; Mercury records sanitized audit metadata.
+    External contact: none; the reviewed connector catalog is bundled with Mercury.
+    Omitted options: none; this tool has no arguments.
+    """
     payload = {"status": "ok", "connectors": list_connector_public_summaries()}
     _audit("list_connectors", {}, {"count": len(payload["connectors"])})
     return payload
@@ -1535,7 +1605,12 @@ def get_connector_setup(
     connector_id: ConnectorId,
     connection_mode: ConnectorConnectionMode | None = None,
 ) -> dict[str, Any]:
-    """Return secretless setup guidance for one connector mode or all supported modes."""
+    """Return secretless setup guidance from Mercury's reviewed connector catalog.
+
+    Changes: no profile or provider state; Mercury records sanitized audit metadata.
+    External contact: none; this tool does not start OAuth or contact a provider.
+    Omitted options: connection_mode omitted returns every supported mode.
+    """
     manifest = connector_by_id(connector_id)
     if manifest is None:
         return {"status": "not_found", "connector_id": connector_id}
@@ -1676,7 +1751,12 @@ def link_connector_profile(
     company_name: str | None = None,
     external_server_name: str | None = None,
 ) -> dict[str, Any]:
-    """Store one sanitized connector profile without credentials or provider payloads."""
+    """Store one sanitized connector profile in a Mercury workspace.
+
+    Changes: creates or updates Mercury profile metadata, never ERP credentials.
+    External contact: Mercury's hosted workspace store only; no provider or OAuth call occurs.
+    Omitted options: company_ref, company_name, and external_server_name remain unset.
+    """
     try:
         _validate_safe_profile_input(company_ref, label="company_ref")
         _validate_safe_profile_input(company_name, label="company_name")
@@ -1747,7 +1827,12 @@ def validate_connector_connection(
     environment: ConnectorEnvironment,
     evidence: ConnectorValidationEvidenceInput,
 ) -> dict[str, Any]:
-    """Persist host-observed, sanitized validation evidence for one exact profile."""
+    """Persist sanitized validation evidence for one exact Mercury profile.
+
+    Changes: updates Mercury profile evidence and capability state idempotently.
+    External contact: Mercury's hosted workspace store only; the host or local runtime already contacted the provider.
+    Omitted options: evidence.provider_tool_name remains unset.
+    """
     try:
         evidence_payload = (
             evidence
@@ -1834,7 +1919,12 @@ def connector_capabilities(
     connection_mode: ConnectorConnectionMode,
     environment: ConnectorEnvironment,
 ) -> dict[str, Any]:
-    """Return declared and observed capability states for one exact profile."""
+    """Return declared and observed capability states for one exact profile.
+
+    Changes: no profile or provider state; Mercury records sanitized audit metadata.
+    External contact: Mercury's catalog and hosted workspace store only, never the ERP.
+    Omitted options: none; workspace, connector, mode, and environment are required.
+    """
     manifest = connector_by_id(connector_id)
     mode = manifest.connection_mode(connection_mode) if manifest else None
     if manifest is None or mode is None:
@@ -1917,7 +2007,12 @@ def unlink_connector_profile(
     environment: ConnectorEnvironment,
     confirm: ConnectorUnlinkConfirmation = "unlink",
 ) -> dict[str, Any]:
-    """Delete one Mercury profile without revoking provider-side authorization."""
+    """Delete one Mercury profile without revoking provider authorization.
+
+    Changes: removes only the selected Mercury connector profile and records an audit event.
+    External contact: Mercury's hosted workspace store only; provider OAuth remains active.
+    Omitted options: confirm defaults to the literal unlink value.
+    """
     if confirm != "unlink":
         return {"status": "error", "message": 'confirm must be exactly "unlink"'}
     try:
@@ -2000,7 +2095,12 @@ def connector_status(
     workspace_id: str,
     connector_id: ConnectorId | None = None,
 ) -> dict[str, Any]:
-    """Read connector state without silently choosing between multiple profiles."""
+    """Read sanitized connector state without silently choosing among profiles.
+
+    Changes: no profile or provider state; Mercury records sanitized audit metadata.
+    External contact: Mercury's hosted workspace store only, never the ERP provider.
+    Omitted options: connector_id omitted returns all profiles and reports ambiguity.
+    """
     if not workspace_id:
         payload = {
             **_public_workspace_required_payload(),
@@ -2072,14 +2172,24 @@ def connector_status(
 
 @mcp.tool(annotations=_CLOSED_READ)
 def list_accounting_skills() -> dict[str, Any]:
-    """List canonical accounting Skills without reading workspace state."""
+    """List canonical accounting Skills from the bundled Mercury catalog.
+
+    Changes: none.
+    External contact: none; this tool does not read a workspace or provider.
+    Omitted options: none; this tool has no arguments.
+    """
 
     return {"status": "ok", "skills": runtime_accounting_skill_catalog()}
 
 
 @mcp.tool(annotations=_CLOSED_READ)
 def get_accounting_skill_schema(skill_id: AccountingSkillIdInput) -> dict[str, Any]:
-    """Return one canonical Skill input schema without reading workspace state."""
+    """Return one canonical accounting Skill input schema.
+
+    Changes: none.
+    External contact: none; this tool reads only the bundled Mercury Skill catalog.
+    Omitted options: none; skill_id is required.
+    """
 
     safe_skill_id = _safe_accounting_skill_id(skill_id)
     if safe_skill_id is None:
@@ -2097,7 +2207,12 @@ def run_accounting_skill(
     inputs: AccountingSkillInputsInput,
     evidence_mode: bool = False,
 ) -> dict[str, Any]:
-    """Validate and route an accounting Skill for host-side execution."""
+    """Validate and route an accounting Skill for host-side execution.
+
+    Changes: no ERP state; Mercury reads profiles and records sanitized audit metadata.
+    External contact: Mercury's hosted workspace store only; provider and local execution are handed off.
+    Omitted options: evidence_mode is false and optional input fields keep schema defaults.
+    """
 
     safe_skill_id = _safe_accounting_skill_id(skill_id)
     if safe_skill_id is None:
@@ -2171,7 +2286,12 @@ def run_accounting_skill(
 
 @mcp.tool(annotations=_CLOSED_READ)
 def flow_cheat_sheet() -> dict[str, Any]:
-    """Return Mercury Flow command syntax and examples."""
+    """Return bundled Mercury Flow command syntax and examples.
+
+    Changes: no flow, workspace, or provider state; Mercury records audit metadata.
+    External contact: none; the reference text is bundled with Mercury.
+    Omitted options: none; this tool has no arguments.
+    """
     payload = {"status": "ok", "cheat_sheet": FLOW_CHEAT_SHEET}
     _audit("flow_cheat_sheet", {}, {"status": "ok"})
     return payload
@@ -2179,7 +2299,12 @@ def flow_cheat_sheet() -> dict[str, Any]:
 
 @mcp.tool(annotations=_CLOSED_READ)
 def check_flow_syntax(flow_yaml: str) -> dict[str, Any]:
-    """Validate a Mercury YAML flow without executing it."""
+    """Validate a Mercury YAML flow without executing or saving it.
+
+    Changes: no flow, workspace, or provider state; Mercury records audit metadata.
+    External contact: none; parsing occurs inside the hosted Mercury process.
+    Omitted options: none; flow_yaml is required.
+    """
     try:
         payload = validate_flow_text(flow_yaml)
         _audit(
@@ -2201,7 +2326,12 @@ def inspect_flow_files(
     include_tags: FlowTags = (),
     exclude_tags: FlowTags = (),
 ) -> dict[str, Any]:
-    """Inspect an in-memory Mercury flow workspace for an MCP host agent."""
+    """Inspect an in-memory Mercury flow workspace for an MCP host agent.
+
+    Changes: no persistent flow, workspace, or provider state; audit metadata is recorded.
+    External contact: none; temporary inspection occurs inside hosted Mercury.
+    Omitted options: config_yaml stays absent and both tag filters default to empty.
+    """
     normalized_files: list[dict[str, str]] = []
     try:
         normalized_files = _flow_files_from_payload(flow_files)
@@ -2359,7 +2489,12 @@ def run_inline_flow(
     environment: FlowEnvironmentValues = (),
     dry_run: bool = True,
 ) -> dict[str, Any]:
-    """Run one inline Mercury Flow in a public workspace."""
+    """Plan or run one closed inline Mercury Flow in a public workspace.
+
+    Changes: no ERP state; Mercury may create closed artifacts and sanitized audit metadata.
+    External contact: Mercury workspace state only; hosted flow commands do not call an ERP.
+    Omitted options: environment defaults to an empty list and dry_run defaults to true.
+    """
     try:
         workspace_id = normalize_public_workspace_id(workspace_id)
     except (AttributeError, ValueError):
@@ -2600,7 +2735,12 @@ def run_flow_files(
     continue_on_failure: bool = True,
     dry_run: bool = True,
 ) -> dict[str, Any]:
-    """Run an in-memory Mercury Flow suite in a public workspace."""
+    """Plan or run an in-memory suite of closed Mercury Flows.
+
+    Changes: no ERP state; Mercury may create closed artifacts and sanitized audit metadata.
+    External contact: Mercury workspace state only; hosted flow commands do not call an ERP.
+    Omitted options: config_yaml is absent, lists are empty, continue_on_failure and dry_run are true.
+    """
     try:
         workspace_id = normalize_public_workspace_id(workspace_id)
     except (AttributeError, ValueError):
@@ -2761,7 +2901,12 @@ def run_mercury_flow(
 
 @mcp.tool(annotations=_CLOSED_READ)
 def list_workspace_flows(workspace_id: str) -> dict[str, Any]:
-    """List saved Mercury flows for a public workspace."""
+    """List saved Mercury flows for a public workspace.
+
+    Changes: no flow, workspace, or provider state; Mercury records sanitized audit metadata.
+    External contact: Mercury's hosted workspace store only, never an ERP provider.
+    Omitted options: none; workspace_id is required.
+    """
     try:
         settings = load_settings()
         if not settings.supabase_configured:
@@ -2904,7 +3049,12 @@ def run_workspace_flow_tool(
     environment: FlowEnvironmentValues = (),
     dry_run: bool = True,
 ) -> dict[str, Any]:
-    """Run one saved Mercury Flow in a public workspace."""
+    """Plan or run one saved closed Mercury Flow in a public workspace.
+
+    Changes: no ERP state; Mercury records private run-history and sanitized audit metadata.
+    External contact: Mercury's hosted workspace store only; hosted commands do not call an ERP.
+    Omitted options: environment defaults to an empty list and dry_run defaults to true.
+    """
     try:
         workspace_id = normalize_public_workspace_id(workspace_id)
     except (AttributeError, ValueError):
@@ -2928,7 +3078,12 @@ def save_workspace_flow_tool(
     flow_yaml: str,
     metadata: WorkspaceFlowMetadata | None = None,
 ) -> dict[str, Any]:
-    """Save one Mercury flow into the connected workspace."""
+    """Save one content-addressed Mercury flow version in a public workspace.
+
+    Changes: creates or reuses an immutable Mercury flow version and records audit metadata.
+    External contact: Mercury's hosted workspace store only, never an ERP provider.
+    Omitted options: metadata defaults to source=mcp.
+    """
     try:
         metadata_payload = _model_payload(metadata) or {"source": "mcp"}
         _reject_sensitive_storage_input(
