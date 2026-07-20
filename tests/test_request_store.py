@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import stat
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,7 +23,7 @@ from mercury_tools.execution.models import (
     RequestState,
     canonical_payload_hash,
 )
-from mercury_tools.execution.policy import RiskDecision
+from mercury_tools.execution.policy import ApprovalLevel, MutationClass, RiskDecision
 from mercury_tools.execution.store import LocalRequestStore, RequestStateError
 from mercury_tools.local.repository import RepositoryContext
 
@@ -70,7 +71,8 @@ def binding_payload(
         "final_path": template.final_path,
         "request_inputs": template.request_inputs,
         "risk_tier": int(risk.tier),
-        "required_confirmations": risk.required_confirmations,
+        "approval_level": risk.approval_level.value,
+        "mutation_class": risk.mutation_class.value,
     }
 
 
@@ -84,7 +86,12 @@ def make_prepared_request(
     payload_hash: str | None = None,
 ) -> PreparedRequest:
     selected_template = template or RequestTemplate()
-    selected_risk = risk or RiskDecision(RiskTier.STANDARD_WRITE, 1, ())
+    selected_risk = risk or RiskDecision(
+        RiskTier.STANDARD_WRITE,
+        ApprovalLevel.STANDARD,
+        MutationClass.CREATE,
+        (),
+    )
     payload = binding_payload(
         repository_context,
         action,
@@ -117,11 +124,64 @@ def rebind_request(prepared: PreparedRequest, **updates: Any) -> PreparedRequest
             "final_path",
             "request_inputs",
             "risk_tier",
-            "required_confirmations",
+            "approval_level",
+            "mutation_class",
         )
     }
     payload["payload_hash"] = canonical_payload_hash(binding)
     return PreparedRequest.model_validate(payload)
+
+
+def seed_v1_request_store(
+    repository_context: RepositoryContext,
+    *,
+    state: str = "awaiting_final_confirmation",
+    request_json: str = '{"historical":"[REDACTED]"}',
+) -> tuple[str, str]:
+    request_id = "req_legacy_approval"
+    payload_hash = "b" * 64
+    connection = sqlite3.connect(repository_context.cache_dir / "requests.sqlite")
+    try:
+        connection.execute(
+            """
+            CREATE TABLE requests (
+                request_id TEXT PRIMARY KEY,
+                payload_hash TEXT NOT NULL,
+                connector_id TEXT NOT NULL,
+                environment TEXT NOT NULL,
+                state TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                request_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX requests_replay_blocking_hash
+            ON requests (payload_hash)
+            WHERE state IN ('executing', 'succeeded', 'outcome_unknown')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO requests (
+                request_id, payload_hash, connector_id, environment,
+                state, expires_at, request_json
+            ) VALUES (?, ?, 'flowaccount', 'production', ?, ?, ?)
+            """,
+            (
+                request_id,
+                payload_hash,
+                state,
+                (datetime.now(UTC) + PREVIEW_TTL).isoformat(),
+                request_json,
+            ),
+        )
+        connection.execute("PRAGMA user_version=1")
+        connection.commit()
+    finally:
+        connection.close()
+    return request_id, payload_hash
 
 
 @pytest.fixture
@@ -135,6 +195,91 @@ def prepared_request(
     catalog_action: Any,
 ) -> PreparedRequest:
     return make_prepared_request(repository_context, catalog_action)
+
+
+def test_fresh_request_store_uses_v2_schema(
+    request_store: LocalRequestStore,
+) -> None:
+    connection = sqlite3.connect(request_store.database_path)
+    try:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    finally:
+        connection.close()
+
+    assert version == 2
+    assert "requests" in tables
+    assert "requests_v1_archive" not in tables
+
+
+def test_v1_migration_archives_approvals_without_making_them_executable(
+    repository_context: RepositoryContext,
+) -> None:
+    request_id, payload_hash = seed_v1_request_store(repository_context)
+    audit_path = repository_context.audit_dir / "audit.jsonl"
+    historical_audit = '{"event":"confirmed","state":"ready_to_execute"}\n'
+    audit_path.write_text(historical_audit)
+
+    first = LocalRequestStore(repository_context)
+    second = LocalRequestStore(repository_context)
+
+    with pytest.raises(RequestStateError, match="^request_not_found$"):
+        first.require_ready(request_id)
+    first.assert_replay_allowed(payload_hash)
+    connection = sqlite3.connect(first.database_path)
+    try:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        current_count = connection.execute("SELECT count(*) FROM requests").fetchone()[0]
+        archived = connection.execute(
+            "SELECT request_id, payload_hash, state FROM requests_v1_archive"
+        ).fetchall()
+        live_indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'requests'"
+            )
+        }
+    finally:
+        connection.close()
+
+    assert second.database_path == first.database_path
+    assert version == 2
+    assert current_count == 0
+    assert archived == [(request_id, payload_hash, "awaiting_final_confirmation")]
+    assert "requests_v2_replay_blocking_hash" in live_indexes
+    assert audit_path.read_text() == historical_audit
+
+
+def test_v1_migration_archives_malformed_legacy_state_without_parsing_it(
+    repository_context: RepositoryContext,
+) -> None:
+    request_id, _ = seed_v1_request_store(
+        repository_context,
+        state="malformed_legacy_state",
+        request_json="not-json-but-historical",
+    )
+
+    store = LocalRequestStore(repository_context)
+
+    with pytest.raises(RequestStateError, match="^request_not_found$"):
+        store.get(request_id)
+    connection = sqlite3.connect(store.database_path)
+    try:
+        archived = connection.execute(
+            "SELECT state, request_json FROM requests_v1_archive WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        current_count = connection.execute("SELECT count(*) FROM requests").fetchone()[0]
+    finally:
+        connection.close()
+
+    assert archived == ("malformed_legacy_state", "not-json-but-historical")
+    assert current_count == 0
 
 
 def test_canonical_payload_hash_is_deterministic_json() -> None:
@@ -151,7 +296,9 @@ def test_prepared_request_is_immutable_bound_and_auth_is_not_in_the_hash(
     prepared_request: PreparedRequest,
 ) -> None:
     assert prepared_request.state is RequestState.PREVIEWED
-    assert prepared_request.required_confirmations == 1
+    assert prepared_request.approval_level is ApprovalLevel.STANDARD
+    assert prepared_request.mutation_class is MutationClass.CREATE
+    assert prepared_request.approval_count == 0
     assert prepared_request.expires_at - prepared_request.created_at == PREVIEW_TTL
     assert prepared_request.binding_payload == {
         "repository_id": prepared_request.repository_id,
@@ -163,8 +310,12 @@ def test_prepared_request_is_immutable_bound_and_auth_is_not_in_the_hash(
         "final_path": prepared_request.final_path,
         "request_inputs": prepared_request.request_inputs,
         "risk_tier": int(prepared_request.risk_tier),
-        "required_confirmations": prepared_request.required_confirmations,
+        "approval_level": prepared_request.approval_level.value,
+        "mutation_class": prepared_request.mutation_class.value,
     }
+    serialized = prepared_request.model_dump(mode="json")
+    assert "required_confirmations" not in serialized
+    assert "confirmation_count" not in serialized
     with pytest.raises(TypeError):
         prepared_request.request_inputs["body"]["amount"] = 2000  # type: ignore[index]
     with pytest.raises(ValidationError):
@@ -219,7 +370,12 @@ def test_from_template_requires_request_method_to_match_action(
             repository_context,
             catalog_action,
             template=RequestTemplate(method="DELETE"),
-            risk=RiskDecision(RiskTier.HIGH_RISK, 2, ()),
+            risk=RiskDecision(
+                RiskTier.HIGH_RISK,
+                ApprovalLevel.ELEVATED,
+                MutationClass.SENSITIVE,
+                (),
+            ),
         )
 
 
@@ -233,7 +389,12 @@ def test_from_template_requires_static_action_path_to_match_exactly(
             repository_context,
             catalog_action,
             template,
-            RiskDecision(RiskTier.STANDARD_WRITE, 1, ()),
+            RiskDecision(
+                RiskTier.STANDARD_WRITE,
+                ApprovalLevel.STANDARD,
+                MutationClass.CREATE,
+                (),
+            ),
         )
     )
 
@@ -292,7 +453,12 @@ def test_from_template_rejects_dynamic_final_path_mismatch(
             repository_context,
             action,
             template,
-            RiskDecision(RiskTier.STANDARD_WRITE, 1, ()),
+            RiskDecision(
+                RiskTier.STANDARD_WRITE,
+                ApprovalLevel.STANDARD,
+                MutationClass.CREATE,
+                (),
+            ),
         )
     )
 
@@ -344,7 +510,12 @@ def test_from_template_rejects_invalid_dynamic_action_paths(
             repository_context,
             action,
             template,
-            RiskDecision(RiskTier.STANDARD_WRITE, 1, ()),
+            RiskDecision(
+                RiskTier.STANDARD_WRITE,
+                ApprovalLevel.STANDARD,
+                MutationClass.CREATE,
+                (),
+            ),
         )
     )
 
@@ -367,13 +538,23 @@ def test_from_template_enforces_effective_runtime_risk_floor(
         make_prepared_request(
             repository_context,
             action,
-            risk=RiskDecision(RiskTier.STANDARD_WRITE, 1, ()),
+            risk=RiskDecision(
+                RiskTier.STANDARD_WRITE,
+                ApprovalLevel.STANDARD,
+                MutationClass.CREATE,
+                (),
+            ),
         )
 
     raised = make_prepared_request(
         repository_context,
         action,
-        risk=RiskDecision(RiskTier.HIGH_RISK, 2, ()),
+        risk=RiskDecision(
+            RiskTier.HIGH_RISK,
+            ApprovalLevel.ELEVATED,
+            MutationClass.SENSITIVE,
+            (),
+        ),
     )
     assert raised.risk_tier is RiskTier.HIGH_RISK
 
@@ -390,7 +571,8 @@ def test_from_template_enforces_effective_runtime_risk_floor(
         ("final_path", "/changed", "request_path_mismatch"),
         ("request_inputs", {"body": {"amount": 9999}}, "payload_hash_mismatch"),
         ("risk_tier", RiskTier.HIGH_RISK, "payload_hash_mismatch"),
-        ("required_confirmations", 2, "payload_hash_mismatch"),
+        ("approval_level", ApprovalLevel.ELEVATED, "payload_hash_mismatch"),
+        ("mutation_class", MutationClass.SENSITIVE, "payload_hash_mismatch"),
     ],
 )
 def test_model_validation_rejects_changed_binding_field(
@@ -401,10 +583,10 @@ def test_model_validation_rejects_changed_binding_field(
 ) -> None:
     payload = prepared_request.model_dump(mode="json")
     payload[field] = replacement
-    if field == "risk_tier":
-        payload["required_confirmations"] = 2
-    if field == "required_confirmations":
-        payload["risk_tier"] = 2
+    if field == "approval_level":
+        payload["mutation_class"] = MutationClass.SENSITIVE.value
+    if field == "mutation_class":
+        payload["approval_level"] = ApprovalLevel.ELEVATED.value
 
     with pytest.raises(ValidationError, match=error_code):
         PreparedRequest.model_validate(payload)
@@ -536,29 +718,109 @@ def test_public_summary_uses_fixed_preview_and_response_keys_at_every_depth(
     assert "cus_abcdef" not in str(public)
 
 
-def test_tier_two_needs_two_confirmations(
+def test_first_valid_approval_moves_high_risk_request_to_ready(
     request_store: LocalRequestStore,
     repository_context: RepositoryContext,
     action_factory: Any,
 ) -> None:
     action = action_factory(
+        side_effects=("void_document",),
         risk_tier=RiskTier.HIGH_RISK,
         required_confirmations=2,
     )
     prepared = make_prepared_request(
         repository_context,
         action,
-        risk=RiskDecision(RiskTier.HIGH_RISK, 2, ()),
+        risk=RiskDecision(
+            RiskTier.HIGH_RISK,
+            ApprovalLevel.ELEVATED,
+            MutationClass.SENSITIVE,
+            ("sensitive_side_effect",),
+        ),
     )
     request = request_store.create_preview(prepared, action=action)
 
-    first = request_store.confirm(request.request_id, request.payload_hash)
-    second = request_store.confirm(request.request_id, request.payload_hash)
+    approved = request_store.approve(
+        request.request_id,
+        request.payload_hash,
+        MutationClass.SENSITIVE,
+    )
 
-    assert first.state is RequestState.AWAITING_FINAL_CONFIRMATION
-    assert first.confirmation_count == 1
-    assert second.state is RequestState.READY_TO_EXECUTE
-    assert second.confirmation_count == 2
+    assert approved.state is RequestState.READY_TO_EXECUTE
+    assert approved.approval_count == 1
+    assert "awaiting_final_confirmation" not in {state.value for state in RequestState}
+
+
+def test_approval_rejects_wrong_expected_mutation_class_without_state_change(
+    request_store: LocalRequestStore,
+    prepared_request: PreparedRequest,
+    catalog_action: CatalogAction,
+) -> None:
+    request = request_store.create_preview(prepared_request, action=catalog_action)
+
+    with pytest.raises(RequestStateError, match="^mutation_class_mismatch$"):
+        request_store.approve(
+            request.request_id,
+            request.payload_hash,
+            MutationClass.UPDATE,
+        )
+
+    stored = request_store.get(request.request_id)
+    assert stored.state is RequestState.AWAITING_CONFIRMATION
+    assert stored.approval_count == 0
+
+
+def test_repeated_approval_is_rejected_and_remains_single(
+    request_store: LocalRequestStore,
+    prepared_request: PreparedRequest,
+    catalog_action: CatalogAction,
+) -> None:
+    request = request_store.create_preview(prepared_request, action=catalog_action)
+    request_store.approve(request.request_id, request.payload_hash, request.mutation_class)
+
+    with pytest.raises(RequestStateError, match="^invalid_request_state$"):
+        request_store.approve(request.request_id, request.payload_hash, request.mutation_class)
+
+    stored = request_store.get(request.request_id)
+    assert stored.state is RequestState.READY_TO_EXECUTE
+    assert stored.approval_count == 1
+
+
+def test_concurrent_approval_records_exactly_one_transition(
+    repository_context: RepositoryContext,
+    prepared_request: PreparedRequest,
+    catalog_action: CatalogAction,
+) -> None:
+    creator = LocalRequestStore(repository_context)
+    request = creator.create_preview(prepared_request, action=catalog_action)
+    stores = (LocalRequestStore(repository_context), LocalRequestStore(repository_context))
+
+    def approve(store: LocalRequestStore) -> str:
+        try:
+            store.approve(request.request_id, request.payload_hash, request.mutation_class)
+        except RequestStateError as exc:
+            return str(exc)
+        return "approved"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(approve, stores))
+
+    assert sorted(outcomes) == ["approved", "invalid_request_state"]
+    stored = creator.get(request.request_id)
+    assert stored.state is RequestState.READY_TO_EXECUTE
+    assert stored.approval_count == 1
+
+
+@pytest.mark.parametrize("approval_count", [-1, 2, True])
+def test_prepared_request_rejects_non_literal_approval_count(
+    prepared_request: PreparedRequest,
+    approval_count: object,
+) -> None:
+    payload = prepared_request.model_dump(mode="json")
+    payload["approval_count"] = approval_count
+
+    with pytest.raises(ValidationError, match="invalid_approval_count"):
+        PreparedRequest.model_validate(payload)
 
 
 def test_create_preview_transitions_previewed_to_awaiting_in_transaction(
@@ -594,6 +856,9 @@ def test_create_preview_rejects_self_consistent_forged_catalog_binding(
         method="DELETE",
         path_template="/admin/delete-all",
         final_path="/admin/delete-all",
+        risk_tier=RiskTier.HIGH_RISK,
+        approval_level=ApprovalLevel.ELEVATED,
+        mutation_class=MutationClass.SENSITIVE,
     )
 
     with pytest.raises(RequestStateError, match="^catalog_binding_mismatch$"):
@@ -608,7 +873,6 @@ def test_create_preview_recomputes_exact_effective_catalog_risk(
     forged = rebind_request(
         prepared_request,
         risk_tier=RiskTier.HIGH_RISK,
-        required_confirmations=2,
     )
 
     with pytest.raises(RequestStateError, match="^catalog_risk_mismatch$"):
@@ -619,23 +883,30 @@ def test_prepared_state_graph_rejects_invalid_previewed_fields(
     prepared_request: PreparedRequest,
 ) -> None:
     payload = prepared_request.model_dump(mode="json")
-    payload.update({"confirmation_count": 1, "state": "previewed"})
+    payload.update({"approval_count": 1, "state": "previewed"})
 
     with pytest.raises(ValidationError, match="invalid_request_state"):
         PreparedRequest.model_validate(payload)
 
 
-def test_wrong_hash_fails_without_increasing_confirmation_count(
+def test_payload_change_invalidates_approval(
     request_store: LocalRequestStore,
     prepared_request: PreparedRequest,
     catalog_action: CatalogAction,
 ) -> None:
     request = request_store.create_preview(prepared_request, action=catalog_action)
+    changed_payload = dict(request.binding_payload)
+    changed_payload["request_inputs"] = {"body": {"amount": 9999}}
+    changed_hash = canonical_payload_hash(changed_payload)
 
     with pytest.raises(RequestStateError, match="^payload_hash_mismatch$"):
-        request_store.confirm(request.request_id, "0" * 64)
+        request_store.approve(
+            request.request_id,
+            changed_hash,
+            request.mutation_class,
+        )
 
-    assert request_store.get(request.request_id).confirmation_count == 0
+    assert request_store.get(request.request_id).approval_count == 0
 
 
 def test_expired_request_is_invalidated_before_confirmation(
@@ -650,7 +921,11 @@ def test_expired_request_is_invalidated_before_confirmation(
     request = request_store.create_preview(expired, action=catalog_action)
 
     with pytest.raises(RequestStateError, match="^preview_expired$"):
-        request_store.confirm(request.request_id, request.payload_hash)
+        request_store.approve(
+            request.request_id,
+            request.payload_hash,
+            request.mutation_class,
+        )
 
     stored = request_store.get(request.request_id)
     assert stored.state is RequestState.FAILED
@@ -663,7 +938,11 @@ def test_outcome_unknown_blocks_same_hash(
     catalog_action: CatalogAction,
 ) -> None:
     request = request_store.create_preview(prepared_request, action=catalog_action)
-    request_store.confirm(request.request_id, request.payload_hash)
+    request_store.approve(
+        request.request_id,
+        request.payload_hash,
+        request.mutation_class,
+    )
     request_store.start_execution(request.request_id)
     request_store.complete(
         request.request_id,
@@ -685,8 +964,8 @@ def test_start_execution_rechecks_same_hash_within_write_transaction(
         prepared_request.model_copy(update={"request_id": "req_second_preview"}),
         action=catalog_action,
     )
-    request_store.confirm(first.request_id, first.payload_hash)
-    request_store.confirm(second.request_id, second.payload_hash)
+    request_store.approve(first.request_id, first.payload_hash, first.mutation_class)
+    request_store.approve(second.request_id, second.payload_hash, second.mutation_class)
     request_store.start_execution(first.request_id)
 
     with pytest.raises(RequestStateError, match="^replay_blocked_active_request$"):
@@ -739,7 +1018,8 @@ def test_store_rejects_tampered_json_without_echoing_request_inputs(
         ("final_path", "/changed", None),
         ("request_inputs", {"body": {"amount": 9999}}, None),
         ("risk_tier", 2, None),
-        ("required_confirmations", 2, None),
+        ("approval_level", ApprovalLevel.ELEVATED, None),
+        ("mutation_class", MutationClass.SENSITIVE, None),
     ],
 )
 def test_store_rejects_coordinated_json_and_column_binding_tampering(
@@ -753,10 +1033,10 @@ def test_store_rejects_coordinated_json_and_column_binding_tampering(
     request = request_store.create_preview(prepared_request, action=catalog_action)
     payload = request.model_dump(mode="json")
     payload[field] = replacement
-    if field == "risk_tier":
-        payload["required_confirmations"] = 2
-    if field == "required_confirmations":
-        payload["risk_tier"] = 2
+    if field == "approval_level":
+        payload["mutation_class"] = MutationClass.SENSITIVE.value
+    if field == "mutation_class":
+        payload["approval_level"] = ApprovalLevel.ELEVATED.value
     connection = sqlite3.connect(request_store.database_path)
     try:
         connection.execute(

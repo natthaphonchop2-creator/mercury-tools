@@ -18,14 +18,13 @@ from pydantic import ValidationError
 
 from mercury_tools.catalog.models import CatalogAction, revalidate_catalog_action
 from mercury_tools.execution.models import PreparedRequest, RequestState, render_action_path
-from mercury_tools.execution.policy import effective_risk
+from mercury_tools.execution.policy import MutationClass, effective_risk
 from mercury_tools.local.operation_lock import repository_locked, repository_operation_lock
 from mercury_tools.local.repository import RepositoryContext
 
 _PENDING_STATES = (
     RequestState.PREVIEWED.value,
     RequestState.AWAITING_CONFIRMATION.value,
-    RequestState.AWAITING_FINAL_CONFIRMATION.value,
     RequestState.READY_TO_EXECUTE.value,
 )
 _REPLAY_BLOCKING_STATES = (
@@ -37,6 +36,7 @@ _IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
 _REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _DATABASE_NAME = "requests.sqlite"
 _SIDECAR_NAMES = ("requests.sqlite-wal", "requests.sqlite-shm")
+_SCHEMA_VERSION = 2
 
 
 class RequestStateError(ValueError):
@@ -77,7 +77,7 @@ class LocalRequestStore:
             raise RequestStateError("repository_mismatch")
         if (
             request.state is not RequestState.PREVIEWED
-            or request.confirmation_count != 0
+            or request.approval_count != 0
             or request.failure_reason is not None
             or request.response_summary
         ):
@@ -143,7 +143,8 @@ class LocalRequestStore:
         risk = effective_risk(validated)
         if (
             request.risk_tier != risk.tier
-            or request.required_confirmations != risk.required_confirmations
+            or request.approval_level is not risk.approval_level
+            or request.mutation_class is not risk.mutation_class
         ):
             raise RequestStateError("catalog_risk_mismatch")
 
@@ -154,7 +155,12 @@ class LocalRequestStore:
             return self._expire_if_needed(connection, request)
 
     @repository_locked
-    def confirm(self, request_id: str, payload_hash: str) -> PreparedRequest:
+    def approve(
+        self,
+        request_id: str,
+        payload_hash: str,
+        expected_class: MutationClass,
+    ) -> PreparedRequest:
         with self._immediate_transaction() as connection:
             request = self._fetch(connection, request_id)
             if not isinstance(payload_hash, str) or not secrets.compare_digest(
@@ -163,24 +169,25 @@ class LocalRequestStore:
             ):
                 raise RequestStateError("payload_hash_mismatch")
             request = self._expire_if_needed(connection, request)
-            self._require_state(
-                request,
-                RequestState.AWAITING_CONFIRMATION,
-                RequestState.AWAITING_FINAL_CONFIRMATION,
-            )
-            confirmation_count = request.confirmation_count + 1
-            state = (
-                RequestState.READY_TO_EXECUTE
-                if confirmation_count == request.required_confirmations
-                else RequestState.AWAITING_FINAL_CONFIRMATION
-            )
+            self._require_state(request, RequestState.AWAITING_CONFIRMATION)
+            if (
+                not isinstance(expected_class, MutationClass)
+                or request.mutation_class is not expected_class
+            ):
+                raise RequestStateError("mutation_class_mismatch")
             updated = self._updated(
                 request,
-                state=state,
-                confirmation_count=confirmation_count,
+                state=RequestState.READY_TO_EXECUTE,
+                approval_count=1,
             )
             self._store(connection, updated)
             return updated
+
+    def confirm(self, request_id: str, payload_hash: str) -> PreparedRequest:
+        """Compatibility helper for the v0.2 local tool surface."""
+
+        request = self.get(request_id)
+        return self.approve(request_id, payload_hash, request.mutation_class)
 
     @repository_locked
     def invalidate(self, request_id: str, reason: str) -> PreparedRequest:
@@ -317,7 +324,7 @@ class LocalRequestStore:
             raise RequestStateError("invalid_invalidation_reason")
         with self._immediate_transaction() as connection:
             self._expire_pending(connection)
-            clauses = ["state IN (?, ?, ?, ?)"]
+            clauses = ["state IN (?, ?, ?)"]
             parameters: list[str] = list(_PENDING_STATES)
             if connector_id is not None:
                 clauses.append("connector_id = ?")
@@ -356,30 +363,75 @@ class LocalRequestStore:
         try:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=FULL")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS requests (
-                    request_id TEXT PRIMARY KEY,
-                    payload_hash TEXT NOT NULL,
-                    connector_id TEXT NOT NULL,
-                    environment TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    expires_at TEXT NOT NULL,
-                    request_json TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS requests_replay_blocking_hash
-                ON requests (payload_hash)
-                WHERE state IN ('executing', 'succeeded', 'outcome_unknown')
-                """
-            )
+            connection.execute("BEGIN IMMEDIATE")
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if not isinstance(version, int) or version > _SCHEMA_VERSION:
+                raise RequestStateError("request_store_version_unsupported")
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            }
+            if version < _SCHEMA_VERSION and "requests" in tables:
+                if "requests_v1_archive" in tables:
+                    raise RequestStateError("request_store_migration_invalid")
+                connection.execute("ALTER TABLE requests RENAME TO requests_v1_archive")
+            self._create_v2_schema(connection)
+            self._validate_v2_schema(connection)
+            connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
+            connection.execute("COMMIT")
+        except RequestStateError:
+            self._rollback(connection)
+            raise
         except sqlite3.Error as exc:
+            self._rollback(connection)
             raise RequestStateError("request_store_unavailable") from exc
+        except Exception:
+            self._rollback(connection)
+            raise
         finally:
             self._close_connection(connection)
+
+    @staticmethod
+    def _create_v2_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS requests (
+                request_id TEXT PRIMARY KEY,
+                payload_hash TEXT NOT NULL,
+                connector_id TEXT NOT NULL,
+                environment TEXT NOT NULL,
+                state TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                request_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS requests_v2_replay_blocking_hash
+            ON requests (payload_hash)
+            WHERE state IN ('executing', 'succeeded', 'outcome_unknown')
+            """
+        )
+
+    @staticmethod
+    def _validate_v2_schema(connection: sqlite3.Connection) -> None:
+        columns = tuple(
+            row[1] for row in connection.execute("PRAGMA table_info(requests)").fetchall()
+        )
+        if columns != (
+            "request_id",
+            "payload_hash",
+            "connector_id",
+            "environment",
+            "state",
+            "expires_at",
+            "request_json",
+        ):
+            raise RequestStateError("request_store_schema_invalid")
 
     @contextmanager
     def _immediate_transaction(self) -> Iterator[sqlite3.Connection]:
@@ -660,7 +712,7 @@ class LocalRequestStore:
 
     def _expire_pending(self, connection: sqlite3.Connection) -> None:
         rows = connection.execute(
-            "SELECT * FROM requests WHERE state IN (?, ?, ?, ?)", _PENDING_STATES
+            "SELECT * FROM requests WHERE state IN (?, ?, ?)", _PENDING_STATES
         ).fetchall()
         for row in rows:
             self._expire_if_needed(connection, self._row_to_request(row))

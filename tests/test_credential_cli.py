@@ -15,7 +15,7 @@ from mercury_tools.catalog.models import CatalogAction, RiskTier
 from mercury_tools.cli import main
 from mercury_tools.drivers.models import ConnectionProbe, CredentialField
 from mercury_tools.execution.models import PreparedRequest, canonical_payload_hash
-from mercury_tools.execution.policy import RiskDecision
+from mercury_tools.execution.policy import ApprovalLevel, MutationClass, RiskDecision
 from mercury_tools.execution.store import LocalRequestStore
 from mercury_tools.local.credentials import CredentialStore
 from mercury_tools.local.repository import (
@@ -219,7 +219,8 @@ def test_clear_all_removes_file_and_invalidates_every_pending_preview(
                 "final_path": "/invoices",
                 "request_inputs": request_inputs,
                 "risk_tier": 1,
-                "required_confirmations": 1,
+                "approval_level": "standard",
+                "mutation_class": "create",
             }
         )
         prepared = PreparedRequest.from_template(
@@ -231,7 +232,12 @@ def test_clear_all_removes_file_and_invalidates_every_pending_preview(
                 "final_path": "/invoices",
                 "request_inputs": request_inputs,
             },
-            risk=RiskDecision(RiskTier.STANDARD_WRITE, 1, ()),
+            risk=RiskDecision(
+                RiskTier.STANDARD_WRITE,
+                ApprovalLevel.STANDARD,
+                MutationClass.CREATE,
+                (),
+            ),
             payload_hash=payload_hash,
         )
         created = store.create_preview(prepared, action=catalog_action)
@@ -259,7 +265,12 @@ def test_clear_scoped_invalidates_pending_preview_and_resets_matching_validation
         "sanitized_summary": {"document_type": "invoice"},
         "request_inputs": {"body": {"amount": 1000}},
     }
-    risk = RiskDecision(RiskTier.STANDARD_WRITE, 1, ())
+    risk = RiskDecision(
+        RiskTier.STANDARD_WRITE,
+        ApprovalLevel.STANDARD,
+        MutationClass.CREATE,
+        (),
+    )
     payload_hash = canonical_payload_hash(
         {
             "repository_id": context.repository_id,
@@ -271,7 +282,8 @@ def test_clear_scoped_invalidates_pending_preview_and_resets_matching_validation
             "final_path": "/invoices",
             "request_inputs": {"body": {"amount": 1000}},
             "risk_tier": 1,
-            "required_confirmations": 1,
+            "approval_level": "standard",
+            "mutation_class": "create",
         }
     )
     prepared = PreparedRequest.from_template(
@@ -333,7 +345,12 @@ def _seed_clear_failure_state(
     context = ensure_repository_state(tmp_path)
     seed_flow_credentials(tmp_path)
     request_inputs = {"body": {"amount": 1000}}
-    risk = RiskDecision(RiskTier.STANDARD_WRITE, 1, ())
+    risk = RiskDecision(
+        RiskTier.STANDARD_WRITE,
+        ApprovalLevel.STANDARD,
+        MutationClass.CREATE,
+        (),
+    )
     payload_hash = canonical_payload_hash(
         {
             "repository_id": context.repository_id,
@@ -345,7 +362,8 @@ def _seed_clear_failure_state(
             "final_path": "/invoices",
             "request_inputs": request_inputs,
             "risk_tier": 1,
-            "required_confirmations": 1,
+            "approval_level": "standard",
+            "mutation_class": "create",
         }
     )
     prepared = PreparedRequest.from_template(
@@ -492,7 +510,8 @@ def test_clear_holds_repository_lock_until_credentials_are_deleted(
             "final_path": "/invoices",
             "request_inputs": request_inputs,
             "risk_tier": 1,
-            "required_confirmations": 1,
+            "approval_level": "standard",
+            "mutation_class": "create",
         }
     )
     prepared = PreparedRequest.from_template(
@@ -504,7 +523,12 @@ def test_clear_holds_repository_lock_until_credentials_are_deleted(
             "final_path": "/invoices",
             "request_inputs": request_inputs,
         },
-        risk=RiskDecision(RiskTier.STANDARD_WRITE, 1, ()),
+        risk=RiskDecision(
+            RiskTier.STANDARD_WRITE,
+            ApprovalLevel.STANDARD,
+            MutationClass.CREATE,
+            (),
+        ),
         payload_hash=payload_hash,
     )
     process_context = multiprocessing.get_context("fork")

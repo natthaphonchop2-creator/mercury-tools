@@ -26,7 +26,6 @@ from mercury_tools.cloud.models import (
 )
 from mercury_tools.drivers.registry import DriverRegistry
 from mercury_tools.execution.executor import ERPExecutor, ExecutionPolicyError
-from mercury_tools.execution.policy import effective_risk
 from mercury_tools.execution.store import LocalRequestStore
 from mercury_tools.local.audit import AuditLedger
 from mercury_tools.local.credentials import CredentialStore
@@ -420,7 +419,10 @@ class LocalMercuryRuntime:
         environment: str,
     ) -> dict[str, Any]:
         action = self.catalog.require(action_id)
-        if effective_risk(action).tier is not RiskTier.SAFE_READ:
+        if (
+            action.method is not HttpMethod.GET
+            or action.risk_tier is not RiskTier.SAFE_READ
+        ):
             raise ExecutionPolicyError("erp_read_requires_effective_tier_zero")
         result = await self.executor.run_read(
             repository=self.repository,

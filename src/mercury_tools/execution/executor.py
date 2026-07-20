@@ -17,7 +17,7 @@ from mercury_tools.drivers.flowaccount import FlowAccountDriver
 from mercury_tools.drivers.models import AuthContext, ConnectorResult
 from mercury_tools.drivers.registry import DriverRegistry
 from mercury_tools.execution.models import PreparedRequest, RequestState
-from mercury_tools.execution.policy import effective_risk
+from mercury_tools.execution.policy import MutationClass, effective_risk
 from mercury_tools.execution.request_builder import (
     RequestBuildError,
     RequestTemplate,
@@ -273,13 +273,43 @@ class ERPExecutor:
         return created
 
     def confirm_write(self, request_id: str, payload_hash: str) -> PreparedRequest:
-        confirmed = self.request_store.confirm(request_id, payload_hash)
+        pending = self.request_store.get(request_id)
+        return self._record_approval(
+            request_id,
+            payload_hash,
+            pending.mutation_class,
+            event="confirmation_recorded",
+        )
+
+    async def approve_and_execute(
+        self,
+        request_id: str,
+        payload_hash: str,
+        expected_class: MutationClass,
+    ) -> ConnectorResult:
+        approved = self._record_approval(
+            request_id,
+            payload_hash,
+            expected_class,
+            event="approval_recorded",
+        )
+        return await self.execute_write(approved.request_id)
+
+    def _record_approval(
+        self,
+        request_id: str,
+        payload_hash: str,
+        expected_class: MutationClass,
+        *,
+        event: str,
+    ) -> PreparedRequest:
+        approved = self.request_store.approve(request_id, payload_hash, expected_class)
         try:
-            self._audit_request(confirmed, event="confirmation_recorded")
+            self._audit_request(approved, event=event)
         except Exception:
-            self.request_store.invalidate(confirmed.request_id, "audit_failed")
+            self.request_store.invalidate(approved.request_id, "audit_failed")
             raise
-        return confirmed
+        return approved
 
     async def execute_write(self, request_id: str) -> ConnectorResult:
         prepared = self.request_store.require_ready(request_id)
@@ -843,8 +873,9 @@ class ERPExecutor:
             "method": request.method,
             "payload_hash": request.payload_hash,
             "risk_tier": int(request.risk_tier),
-            "required_confirmations": request.required_confirmations,
-            "confirmation_count": request.confirmation_count,
+            "approval_level": request.approval_level.value,
+            "mutation_class": request.mutation_class.value,
+            "approval_count": request.approval_count,
             "state": request.state.value,
         }
         if response_summary:
@@ -863,23 +894,30 @@ class ERPExecutor:
     ) -> str:
         summary = _response_summary(result)
         summary["latency_ms"] = latency_ms
-        return self.audit_ledger.record(
-            {
-                "event": event,
-                "local_session_id": self.local_session_id,
-                "repository_id": self.context.repository_id,
-                "connector_id": action.connector_id,
-                "environment": environment,
-                "action_id": action.action_id,
-                "version_id": action.version_id,
-                "method": action.method.value,
-                "risk_tier": int(effective_risk(action).tier),
-                "required_confirmations": effective_risk(action).required_confirmations,
-                "state": state if state in {"succeeded", "failed"} else "failed",
-                "latency_ms": latency_ms,
-                "response_summary": summary,
-            }
-        )
+        row: dict[str, Any] = {
+            "event": event,
+            "local_session_id": self.local_session_id,
+            "repository_id": self.context.repository_id,
+            "connector_id": action.connector_id,
+            "environment": environment,
+            "action_id": action.action_id,
+            "version_id": action.version_id,
+            "method": action.method.value,
+            "risk_tier": int(action.risk_tier),
+            "state": state if state in {"succeeded", "failed"} else "failed",
+            "latency_ms": latency_ms,
+            "response_summary": summary,
+        }
+        if action.method is not HttpMethod.GET:
+            risk = effective_risk(action)
+            row.update(
+                {
+                    "risk_tier": int(risk.tier),
+                    "approval_level": risk.approval_level.value,
+                    "mutation_class": risk.mutation_class.value,
+                }
+            )
+        return self.audit_ledger.record(row)
 
 
 def _failed_result(*, dispatched: bool) -> ConnectorResult:

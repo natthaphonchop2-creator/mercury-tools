@@ -18,7 +18,7 @@ from mercury_tools.drivers.models import AuthContext, ConnectorResult, Credentia
 from mercury_tools.drivers.registry import DriverRegistry
 from mercury_tools.execution.executor import ERPExecutor, ExecutionPolicyError
 from mercury_tools.execution.models import PreparedRequest
-from mercury_tools.execution.policy import effective_risk
+from mercury_tools.execution.policy import MutationClass, effective_risk
 from mercury_tools.execution.request_builder import RequestBuildError, build_request
 from mercury_tools.execution.store import LocalRequestStore, RequestStateError
 from mercury_tools.local.audit import AuditLedger
@@ -590,6 +590,110 @@ async def test_preview_does_not_load_credentials(
     assert preview.state.value == "awaiting_confirmation"
     assert executor_parts["credentials"].load_calls == 0
     assert "top-secret-token" not in json.dumps(preview.model_dump(mode="json"))
+
+
+@pytest.mark.asyncio
+async def test_approve_and_execute_records_one_approval_and_dispatches_once(
+    executor_parts: dict[str, Any],
+    catalog_action: CatalogAction,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return response(
+            request,
+            payload={"status": "created", "provider_body": "provider-secret-marker"},
+        )
+
+    executor = make_executor(executor_parts, handler)
+    preview = await executor.preview_write(
+        repository=executor_parts["context"],
+        action=catalog_action,
+        environment="production",
+        inputs={"body": {"amount": 100, "customer": "request-secret-marker"}},
+    )
+
+    result = await executor.approve_and_execute(
+        preview.request_id,
+        preview.payload_hash,
+        MutationClass.CREATE,
+    )
+
+    status = executor.get_request_status(preview.request_id)
+    assert result.status == "succeeded"
+    assert len(requests) == 1
+    assert status["approval_count"] == 1
+    assert status["mutation_class"] == "create"
+    assert status["approval_level"] == "standard"
+    assert "required_confirmations" not in status
+    assert "confirmation_count" not in status
+    audit_rows = [
+        json.loads(line)
+        for line in (executor_parts["context"].audit_dir / "audit.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    request_rows = [row for row in audit_rows if row.get("request_id") == preview.request_id]
+    assert {row["event"] for row in request_rows} == {
+        "approval_recorded",
+        "dispatch_started",
+        "execution_completed",
+        "preview_created",
+    }
+    for row in request_rows:
+        assert row["approval_level"] == "standard"
+        assert row["mutation_class"] == "create"
+        assert row["action_id"] == catalog_action.action_id
+        assert row["version_id"] == catalog_action.version_id
+        assert row["environment"] == "production"
+        assert row["payload_hash"] == preview.payload_hash
+        assert row["state"] in {
+            "awaiting_confirmation",
+            "ready_to_execute",
+            "executing",
+            "succeeded",
+        }
+    rendered_audit = json.dumps(audit_rows)
+    assert "required_confirmations" not in rendered_audit
+    assert "confirmation_count" not in rendered_audit
+    assert "request_inputs" not in rendered_audit
+    assert "request-secret-marker" not in rendered_audit
+    assert "provider-secret-marker" not in rendered_audit
+
+
+@pytest.mark.asyncio
+async def test_approve_and_execute_rejects_class_mismatch_before_credentials_or_network(
+    executor_parts: dict[str, Any],
+    catalog_action: CatalogAction,
+) -> None:
+    sends = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal sends
+        sends += 1
+        return response(request)
+
+    executor = make_executor(executor_parts, handler)
+    preview = await executor.preview_write(
+        repository=executor_parts["context"],
+        action=catalog_action,
+        environment="production",
+        inputs={"body": {"amount": 100}},
+    )
+
+    with pytest.raises(RequestStateError, match="^mutation_class_mismatch$"):
+        await executor.approve_and_execute(
+            preview.request_id,
+            preview.payload_hash,
+            MutationClass.UPDATE,
+        )
+
+    status = executor.get_request_status(preview.request_id)
+    assert status["state"] == "awaiting_confirmation"
+    assert status["approval_count"] == 0
+    assert executor_parts["credentials"].load_calls == 0
+    assert sends == 0
 
 
 @pytest.mark.asyncio
@@ -1671,15 +1775,31 @@ async def test_timeout_after_send_becomes_outcome_unknown_and_is_not_retried(
         raise httpx.ReadTimeout("timed out", request=request)
 
     executor = make_executor(executor_parts, timeout)
-    ready = await confirmed_request(executor, executor_parts["context"], catalog_action)
+    preview = await executor.preview_write(
+        repository=executor_parts["context"],
+        action=catalog_action,
+        environment="production",
+        inputs={"body": {"amount": 100}},
+    )
 
-    result = await executor.execute_write(ready.request_id)
+    result = await executor.approve_and_execute(
+        preview.request_id,
+        preview.payload_hash,
+        MutationClass.CREATE,
+    )
 
     assert result.status == "outcome_unknown"
     assert result.dispatched is True
     assert calls == 1
+    with pytest.raises(RequestStateError, match="^outcome_unknown$"):
+        await executor.approve_and_execute(
+            preview.request_id,
+            preview.payload_hash,
+            MutationClass.CREATE,
+        )
+    assert calls == 1
     with pytest.raises(RequestStateError, match="^replay_blocked_outcome_unknown$"):
-        executor.request_store.assert_replay_allowed(ready.payload_hash)
+        executor.request_store.assert_replay_allowed(preview.payload_hash)
 
 
 @pytest.mark.asyncio

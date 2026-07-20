@@ -18,12 +18,17 @@ from typing import Any, Literal
 from urllib.parse import quote, unquote
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from mercury_tools.catalog.identity import deep_freeze
 from mercury_tools.catalog.models import CatalogAction, RiskTier, revalidate_catalog_action
 from mercury_tools.drivers.models import AuthContext
-from mercury_tools.execution.policy import RiskDecision, effective_risk
+from mercury_tools.execution.policy import (
+    ApprovalLevel,
+    MutationClass,
+    RiskDecision,
+    effective_risk,
+)
 from mercury_tools.local.repository import RepositoryContext
 from mercury_tools.safety.redaction import redact_json
 
@@ -110,7 +115,6 @@ _SENSITIVE_PUBLIC_KEY_PARTS = frozenset(
 class RequestState(StrEnum):
     PREVIEWED = "previewed"
     AWAITING_CONFIRMATION = "awaiting_confirmation"
-    AWAITING_FINAL_CONFIRMATION = "awaiting_final_confirmation"
     READY_TO_EXECUTE = "ready_to_execute"
     EXECUTING = "executing"
     SUCCEEDED = "succeeded"
@@ -145,7 +149,8 @@ def _binding_payload(
     final_path: str,
     request_inputs: Any,
     risk_tier: RiskTier | int,
-    required_confirmations: int,
+    approval_level: ApprovalLevel | str,
+    mutation_class: MutationClass | str,
 ) -> dict[str, Any]:
     return {
         "repository_id": repository_id,
@@ -157,7 +162,8 @@ def _binding_payload(
         "final_path": final_path,
         "request_inputs": request_inputs,
         "risk_tier": int(risk_tier),
-        "required_confirmations": required_confirmations,
+        "approval_level": str(approval_level),
+        "mutation_class": str(mutation_class),
     }
 
 
@@ -184,13 +190,21 @@ class PreparedRequest(BaseModel):
     request_inputs: dict[str, Any]
     payload_hash: str
     risk_tier: RiskTier
-    required_confirmations: int
-    confirmation_count: int = 0
+    approval_level: ApprovalLevel
+    mutation_class: MutationClass
+    approval_count: Literal[0, 1] = 0
     state: RequestState
     failure_reason: str | None = None
     response_summary: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     expires_at: datetime
+
+    @field_validator("approval_count", mode="before")
+    @classmethod
+    def validate_approval_count(cls, value: Any) -> Any:
+        if isinstance(value, bool) or not isinstance(value, int) or value not in (0, 1):
+            raise ValueError("invalid_approval_count")
+        return value
 
     @model_validator(mode="after")
     def validate_preview(self) -> PreparedRequest:
@@ -214,12 +228,8 @@ class PreparedRequest(BaseModel):
             raise ValueError("request_path_mismatch")
         if _PAYLOAD_HASH.fullmatch(self.payload_hash) is None:
             raise ValueError("invalid_payload_hash")
-        if self.required_confirmations not in (1, 2):
-            raise ValueError("invalid_required_confirmations")
-        if self.required_confirmations != int(self.risk_tier):
-            raise ValueError("invalid_required_confirmations")
-        if self.confirmation_count < 0 or self.confirmation_count > self.required_confirmations:
-            raise ValueError("invalid_confirmation_count")
+        if not _valid_approval_binding(self.approval_level, self.mutation_class):
+            raise ValueError("invalid_approval_binding")
         if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
             raise ValueError("preview_created_at_naive")
         if self.expires_at.tzinfo is None or self.expires_at.utcoffset() is None:
@@ -235,6 +245,16 @@ class PreparedRequest(BaseModel):
         expected_hash = canonical_payload_hash(self.binding_payload)
         if not secrets.compare_digest(self.payload_hash, expected_hash):
             raise ValueError("payload_hash_mismatch")
+        if (
+            self.method == "DELETE"
+            and self.mutation_class is not MutationClass.SENSITIVE
+        ) or (
+            self.method == "POST" and self.mutation_class is MutationClass.UPDATE
+        ) or (
+            self.method in {"PUT", "PATCH"}
+            and self.mutation_class is MutationClass.CREATE
+        ):
+            raise ValueError("invalid_mutation_class")
 
         object.__setattr__(self, "created_at", created_at)
         object.__setattr__(self, "expires_at", expires_at)
@@ -275,7 +295,8 @@ class PreparedRequest(BaseModel):
             final_path=self.final_path,
             request_inputs=self.request_inputs,
             risk_tier=self.risk_tier,
-            required_confirmations=self.required_confirmations,
+            approval_level=self.approval_level,
+            mutation_class=self.mutation_class,
         )
 
     @classmethod
@@ -302,13 +323,10 @@ class PreparedRequest(BaseModel):
             raise ValueError("read_action_cannot_be_previewed")
         if not isinstance(risk, RiskDecision):
             raise ValueError("invalid_risk_decision")
-        if risk.required_confirmations != int(risk.tier):
+        if not _valid_approval_binding(risk.approval_level, risk.mutation_class):
             raise ValueError("invalid_risk_decision")
         risk_floor = effective_risk(action)
-        if (
-            risk.tier < risk_floor.tier
-            or risk.required_confirmations < risk_floor.required_confirmations
-        ):
+        if not _risk_covers_floor(risk, risk_floor):
             raise ValueError("risk_below_runtime_floor")
 
         method = _request_field(request, "method", action.method.value)
@@ -341,7 +359,8 @@ class PreparedRequest(BaseModel):
             final_path=final_path,
             request_inputs=inputs,
             risk_tier=risk.tier,
-            required_confirmations=risk.required_confirmations,
+            approval_level=risk.approval_level,
+            mutation_class=risk.mutation_class,
         )
         expected_hash = canonical_payload_hash(binding_payload)
         if not isinstance(payload_hash, str) or not secrets.compare_digest(
@@ -364,7 +383,8 @@ class PreparedRequest(BaseModel):
             request_inputs=inputs,
             payload_hash=payload_hash,
             risk_tier=risk.tier,
-            required_confirmations=risk.required_confirmations,
+            approval_level=risk.approval_level,
+            mutation_class=risk.mutation_class,
             state=RequestState.PREVIEWED,
             created_at=now,
             expires_at=now + PREVIEW_TTL,
@@ -409,8 +429,9 @@ class PreparedRequest(BaseModel):
             ),
             "payload_hash": self.payload_hash,
             "risk_tier": int(self.risk_tier),
-            "required_confirmations": self.required_confirmations,
-            "confirmation_count": self.confirmation_count,
+            "approval_level": self.approval_level.value,
+            "mutation_class": self.mutation_class.value,
+            "approval_count": self.approval_count,
             "state": self.state.value,
             "failure_reason": self.failure_reason,
             "response_summary": _public_summary(
@@ -429,8 +450,9 @@ class PreparedRequest(BaseModel):
             f"action_id={self.action_id!r}, version_id={self.version_id!r}, "
             f"method={self.method!r}, payload_hash={self.payload_hash!r}, "
             f"risk_tier={int(self.risk_tier)!r}, "
-            f"required_confirmations={self.required_confirmations!r}, "
-            f"confirmation_count={self.confirmation_count!r}, state={self.state.value!r}, "
+            f"approval_level={self.approval_level.value!r}, "
+            f"mutation_class={self.mutation_class.value!r}, "
+            f"approval_count={self.approval_count!r}, state={self.state.value!r}, "
             f"failure_reason={self.failure_reason!r}, expires_at={self.expires_at!r})"
         )
 
@@ -520,6 +542,29 @@ def _is_reason(value: str) -> bool:
     return bool(re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value))
 
 
+def _valid_approval_binding(
+    approval_level: ApprovalLevel,
+    mutation_class: MutationClass,
+) -> bool:
+    expected = (
+        ApprovalLevel.ELEVATED
+        if mutation_class is MutationClass.SENSITIVE
+        else ApprovalLevel.STANDARD
+    )
+    return approval_level is expected
+
+
+def _risk_covers_floor(candidate: RiskDecision, floor: RiskDecision) -> bool:
+    if candidate.tier < floor.tier:
+        return False
+    if floor.mutation_class is MutationClass.SENSITIVE:
+        return candidate.mutation_class is MutationClass.SENSITIVE
+    return candidate.mutation_class in {
+        floor.mutation_class,
+        MutationClass.SENSITIVE,
+    }
+
+
 def _validate_static_headers(inputs: Mapping[str, Any]) -> None:
     if not isinstance(inputs, Mapping):
         raise ValueError("invalid_request_inputs")
@@ -535,24 +580,15 @@ def _validate_static_headers(inputs: Mapping[str, Any]) -> None:
 
 def _validate_state_fields(request: PreparedRequest) -> None:
     if request.state in {RequestState.PREVIEWED, RequestState.AWAITING_CONFIRMATION}:
-        valid = request.confirmation_count == 0 and request.failure_reason is None
-    elif request.state is RequestState.AWAITING_FINAL_CONFIRMATION:
-        valid = (
-            request.required_confirmations == 2
-            and request.confirmation_count == 1
-            and request.failure_reason is None
-        )
+        valid = request.approval_count == 0 and request.failure_reason is None
     elif request.state in {RequestState.READY_TO_EXECUTE, RequestState.EXECUTING}:
-        valid = (
-            request.confirmation_count == request.required_confirmations
-            and request.failure_reason is None
-        )
+        valid = request.approval_count == 1 and request.failure_reason is None
     elif request.state in {
         RequestState.SUCCEEDED,
         RequestState.FAILED,
         RequestState.OUTCOME_UNKNOWN,
     }:
-        valid = request.confirmation_count <= request.required_confirmations
+        valid = request.approval_count in (0, 1)
     else:
         valid = False
     if not valid:

@@ -28,7 +28,7 @@ from mercury_tools.local.audit import AuditLedger
 from mercury_tools.local.credentials import CredentialStore
 from mercury_tools.local.repository import RepositoryConfig, ensure_repository_state
 from mercury_tools.mcp import local_server
-from mercury_tools.mcp.local_runtime import LocalMercuryRuntime
+from mercury_tools.mcp.local_runtime import LocalActionCatalog, LocalMercuryRuntime
 from mercury_tools.mcp.local_server import audit_resource, execute_erp_write, local_mcp
 from mercury_tools.qualification.models import (
     EvidenceLevel,
@@ -260,6 +260,53 @@ async def test_local_runtime_rejects_unknown_search_filter_before_cloud() -> Non
 
     assert calls == []
     assert "private-value" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_local_runtime_read_does_not_apply_mutation_policy(action_factory) -> None:
+    action = action_factory(
+        method="GET",
+        risk_tier=0,
+        required_confirmations=0,
+        side_effects=(),
+        capability="documents.invoice.list",
+    )
+    repository = object()
+    calls = []
+
+    class FakeExecutor:
+        async def run_read(self, **kwargs):
+            calls.append(kwargs)
+            return ConnectorResult(
+                status="succeeded",
+                http_status=200,
+                data={"count": 1},
+                summary="ok",
+                dispatched=True,
+            )
+
+    runtime = object.__new__(LocalMercuryRuntime)
+    runtime.catalog = LocalActionCatalog((action,))
+    runtime.repository = repository
+    runtime.executor = FakeExecutor()
+
+    result = await runtime.run_read(action.action_id, {}, "sandbox")
+
+    assert result == {
+        "status": "succeeded",
+        "http_status": 200,
+        "data": {"count": 1},
+        "summary": "ok",
+        "dispatched": True,
+    }
+    assert calls == [
+        {
+            "repository": repository,
+            "action": action,
+            "environment": "sandbox",
+            "inputs": {},
+        }
+    ]
 
 
 @pytest.mark.asyncio

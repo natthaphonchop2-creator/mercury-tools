@@ -20,7 +20,7 @@ from urllib.parse import unquote, urlsplit
 import httpx
 
 from mercury_tools.catalog.identity import deep_freeze
-from mercury_tools.catalog.models import CatalogAction, revalidate_catalog_action
+from mercury_tools.catalog.models import CatalogAction, HttpMethod, revalidate_catalog_action
 from mercury_tools.catalog.schema_contract import validate_required_schema_contract
 from mercury_tools.drivers.models import AuthContext
 from mercury_tools.execution.models import canonical_payload_hash, render_action_path
@@ -105,7 +105,7 @@ class RequestTemplate:
         if not self.repository_id or not self.environment:
             raise RequestBuildError("request_binding_context_required")
         risk = self._request_inputs["_risk"]
-        return {
+        payload = {
             "repository_id": self.repository_id,
             "connector_id": self.connector_id,
             "environment": self.environment,
@@ -115,8 +115,15 @@ class RequestTemplate:
             "final_path": self.final_path,
             "request_inputs": self.request_inputs,
             "risk_tier": risk["tier"],
-            "required_confirmations": risk["required_confirmations"],
         }
+        if self.method != HttpMethod.GET.value:
+            payload.update(
+                {
+                    "approval_level": risk["approval_level"],
+                    "mutation_class": risk["mutation_class"],
+                }
+            )
+        return payload
 
     def payload_hash(self) -> str:
         return canonical_payload_hash(self.binding_payload())
@@ -287,7 +294,16 @@ def build_request(
         }
         for item in bound_files
     }
-    risk = effective_risk(action)
+    risk_binding: dict[str, Any] = {"tier": int(action.risk_tier)}
+    if action.method is not HttpMethod.GET:
+        risk = effective_risk(action)
+        risk_binding.update(
+            {
+                "tier": int(risk.tier),
+                "approval_level": risk.approval_level.value,
+                "mutation_class": risk.mutation_class.value,
+            }
+        )
     normalized_inputs = {
         "path": _json_copy(path),
         "query": _json_copy(query),
@@ -295,10 +311,7 @@ def build_request(
         "body": _json_copy(body),
         "files": normalized_files,
         "_target": {"base_url": normalized_base},
-        "_risk": {
-            "tier": int(risk.tier),
-            "required_confirmations": risk.required_confirmations,
-        },
+        "_risk": risk_binding,
     }
     return RequestTemplate(
         action_id=action.action_id,
