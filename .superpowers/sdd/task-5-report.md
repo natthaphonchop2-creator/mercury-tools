@@ -66,3 +66,58 @@ Test commands and results:
 - `uv run ruff check src/mercury_tools/mcp/server.py tests/test_mcp_contract.py tests/test_connector_mcp_tools.py` -> `All checks passed!`.
 - `git diff --check` -> passed.
 - Full-suite status remains intentionally unverified; the focused runs emitted one existing Starlette `TestClient` deprecation warning.
+
+## Review-fix 2 addendum: security and compatibility boundaries
+
+Files changed by this review fix:
+- `src/mercury_tools/mcp/schemas.py`
+- `src/mercury_tools/mcp/server.py`
+- `tests/test_mcp_contract.py`
+- `.superpowers/sdd/task-5-report.md`
+
+Implementation:
+- Hosted environment arguments retain an explicit array schema with 100-item
+  and 10,000-character value bounds, while FastMCP defers the raw outer value
+  and every item to the sanitized handler. Rejected top-level values, malformed
+  items, oversized arrays, secret-bearing names, and redaction-detected values
+  return one fixed payload without dispatch or audit persistence.
+- Secret-name rejection now covers separator and case variants of `private_key`,
+  `service_role_key`, `credentials`, and `cookie` in addition to the prior
+  token/password/authorization families.
+- Public inline YAML retains a host-visible 1..500,000-character schema while
+  runtime validation occurs inside the sanitized handler. Invalid content does
+  not expose `input_value`, dispatch a plan, or create an audit event.
+- `run_inline_flow`, `run_flow_files`, and `run_workspace_flow` canonicalize the
+  public workspace before environment handling or flow dispatch. Rejected
+  workspace IDs produce no audit event.
+- Plain, undecorated `run_mercury_flow` again validates the retired discriminated
+  source models before dispatch. Inline YAML and optional workspace IDs retain
+  their 1..500,000 and 1..2,048 bounds, while valid legacy workspace IDs are not
+  forced into the canonical public `mw_` pattern.
+- No Task 6 runtime or planning-document behavior changed.
+
+TDD and verification evidence:
+- RED before implementation: focused security/compatibility regressions ->
+  `36 failed, 7 passed, 13 deselected`; failures confirmed raw FastMCP
+  `input_value` reflection, saved-workspace ordering, missing inline bounds, and
+  compatibility dispatch. The exact schema test separately failed on the new
+  host contract before implementation.
+- GREEN focused regressions after implementation -> `43 passed, 13 deselected`;
+  final expanded environment cases are included in the full contract result.
+- `uv run pytest -q tests/test_mcp_contract.py` -> `65 passed`.
+- `uv run pytest -q tests/test_mcp_contract.py tests/test_connector_mcp_tools.py tests/test_plugin_package.py -k flow`
+  -> `71 passed, 86 deselected, 1 warning`.
+- `uv run pytest -q tests/test_http_app.py::test_connect_page_and_status tests/test_mcp_contract.py tests/test_connector_mcp_tools.py tests/test_plugin_package.py -k 'flow or connect_page_and_status'`
+  -> `72 passed, 86 deselected, 1 warning`.
+- Direct real `mcp.call_tool` probes passed for raw string environment, secret
+  environment item, oversized inline YAML, and invalid saved-workspace ID. All
+  returned fixed messages with no marker, `input_value`, or planned result.
+- `uv run ruff check src/mercury_tools/mcp/schemas.py src/mercury_tools/mcp/server.py tests/test_mcp_contract.py`
+  -> passed.
+- `uv run ruff format --check src/mercury_tools/mcp/schemas.py src/mercury_tools/mcp/server.py tests/test_mcp_contract.py`
+  -> passed.
+- `git diff --check` -> passed.
+
+Concerns:
+- Focused HTTP runs still emit the existing Starlette `TestClient` deprecation
+  warning. No new functional concern remains in the verified Task 5 scope.

@@ -348,16 +348,16 @@ def test_mcp_workspace_flow_tools_use_public_workspace_id(monkeypatch) -> None:
             return {
                 "workspace": {"name": "Demo Co", "workspace_key": "demo"},
                 "connector_profiles": [
-                        {
-                            "connector_id": "flowaccount",
-                            "connection_mode": "api_driver",
-                            "environment": "production",
-                            "status": "ready_read_only",
-                            "capability_states": {"company.info.read": "observed"},
-                            "evidence_source": "api_driver_safe_probe",
-                            "validated_at": "2026-07-19T12:00:00+00:00",
-                            "metadata": {
-                                "credential_storage": "encrypted_server_vault",
+                    {
+                        "connector_id": "flowaccount",
+                        "connection_mode": "api_driver",
+                        "environment": "production",
+                        "status": "ready_read_only",
+                        "capability_states": {"company.info.read": "observed"},
+                        "evidence_source": "api_driver_safe_probe",
+                        "validated_at": "2026-07-19T12:00:00+00:00",
+                        "metadata": {
+                            "credential_storage": "encrypted_server_vault",
                             "credential_fields": ["client_id", "client_secret"],
                             "credential_fingerprints": {
                                 "client_id": "client-id-fp",
@@ -559,6 +559,10 @@ async def test_public_mcp_tool_schemas_are_explicit_for_plugin_review() -> None:
         "environment",
         "dry_run",
     }
+    inline_flow_yaml_schema = run_schemas["run_inline_flow"]["properties"]["flow_yaml"]
+    assert inline_flow_yaml_schema["type"] == "string"
+    assert inline_flow_yaml_schema["minLength"] == 1
+    assert inline_flow_yaml_schema["maxLength"] == 500_000
     for run_schema in run_schemas.values():
         assert "env" not in run_schema["properties"]
         environment_schema = run_schema["properties"]["environment"]
@@ -566,6 +570,8 @@ async def test_public_mcp_tool_schemas_are_explicit_for_plugin_review() -> None:
         assert environment_schema["type"] == "array"
         assert environment_schema["maxItems"] == 100
         item_schema = environment_schema["items"]
+        if "$ref" in item_schema:
+            item_schema = run_schema["$defs"][item_schema["$ref"].rsplit("/", 1)[-1]]
         assert item_schema["additionalProperties"] is False
         assert item_schema["required"] == ["name", "value"]
         assert item_schema["type"] == "object"
@@ -667,25 +673,22 @@ async def test_public_connector_lifecycle_contract_is_exact_and_secretless() -> 
         assert tuple(inspect.signature(getattr(server, name)).parameters) == parameters
 
     assert (
-        inspect.signature(server.get_connector_setup).parameters["connection_mode"].default
-        is None
+        inspect.signature(server.get_connector_setup).parameters["connection_mode"].default is None
     )
     assert (
-        inspect.signature(server.unlink_connector_profile).parameters["confirm"].default
-        == "unlink"
+        inspect.signature(server.unlink_connector_profile).parameters["confirm"].default == "unlink"
     )
     confirm_schema = tools["unlink_connector_profile"].inputSchema["properties"]["confirm"]
     assert confirm_schema.get("const") == "unlink" or confirm_schema.get("enum") == ["unlink"]
 
-    evidence_schema = tools["validate_connector_connection"].inputSchema["properties"][
-        "evidence"
-    ]
+    evidence_schema = tools["validate_connector_connection"].inputSchema["properties"]["evidence"]
     expected_evidence_schema = ConnectorValidationEvidence.model_json_schema()
     expected_capability_schemas = expected_evidence_schema.pop("$defs")
     assert evidence_schema == expected_evidence_schema
-    assert tools["validate_connector_connection"].inputSchema["$defs"][
-        "CapabilityObservation"
-    ] == expected_capability_schemas["CapabilityObservation"]
+    assert (
+        tools["validate_connector_connection"].inputSchema["$defs"]["CapabilityObservation"]
+        == expected_capability_schemas["CapabilityObservation"]
+    )
 
     forbidden = {
         "client_id",
@@ -763,6 +766,12 @@ async def test_run_inline_flow_schema_executes_through_fastmcp() -> None:
                 ],
             },
         ),
+        (
+            "run_workspace_flow",
+            {
+                "flow_id": "workspace-invalid-id-boundary",
+            },
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -797,9 +806,11 @@ async def test_hosted_flow_tools_reject_invalid_workspace_ids_before_side_effect
 
     monkeypatch.setattr(server, "_audit", fake_audit)
     monkeypatch.setattr(server, "_hosted_flow_environment_overrides", fail_if_reached)
+    monkeypatch.setattr(server, "_hosted_inline_flow_yaml", fail_if_reached)
     monkeypatch.setattr(server, "_flow_files_from_payload", fail_if_reached)
     monkeypatch.setattr(server, "parse_flow_text", fail_if_reached)
     monkeypatch.setattr(server, "create_default_runner", fail_if_reached)
+    monkeypatch.setattr(server, "_run_workspace_flow", fail_if_reached)
 
     content, structured = await server.mcp.call_tool(
         tool_name,
@@ -858,8 +869,46 @@ async def test_hosted_flow_tools_reject_invalid_workspace_ids_before_side_effect
     ("environment", "marker"),
     [
         (
+            "private_key=hosted_flow_top_level_marker",
+            "hosted_flow_top_level_marker",
+        ),
+        (
             [{"name": "client_secret_marker", "value": "2026-10"}],
             "client_secret_marker",
+        ),
+        (
+            [{"name": "private_key", "value": "hosted_flow_private_key_marker"}],
+            "hosted_flow_private_key_marker",
+        ),
+        (
+            [{"name": "PrivateKey", "value": "hosted_flow_private_key_case_marker"}],
+            "hosted_flow_private_key_case_marker",
+        ),
+        (
+            [
+                {
+                    "name": "service_role_key",
+                    "value": "hosted_flow_service_role_marker",
+                }
+            ],
+            "hosted_flow_service_role_marker",
+        ),
+        (
+            [
+                {
+                    "name": "service-role-key",
+                    "value": "hosted_flow_service_role_separator_marker",
+                }
+            ],
+            "hosted_flow_service_role_separator_marker",
+        ),
+        (
+            [{"name": "credentials", "value": "hosted_flow_credentials_marker"}],
+            "hosted_flow_credentials_marker",
+        ),
+        (
+            [{"name": "COOKIE", "value": "hosted_flow_cookie_marker"}],
+            "hosted_flow_cookie_marker",
         ),
         (
             [{"name": "month", "value": "Bearer hosted_flow_secret_marker_value"}],
@@ -874,6 +923,17 @@ async def test_hosted_flow_tools_reject_invalid_workspace_ids_before_side_effect
                 }
             ],
             "hosted_flow_extra_marker_value",
+        ),
+        (["hosted_flow_non_object_item_marker"], "hosted_flow_non_object_item_marker"),
+        (
+            [
+                {
+                    "name": f"parameter_{index}",
+                    "value": "hosted_flow_oversized_environment_marker",
+                }
+                for index in range(101)
+            ],
+            "hosted_flow_oversized_environment_marker",
         ),
     ],
 )
@@ -906,6 +966,9 @@ async def test_hosted_flow_environment_rejection_is_sanitized_before_parse_and_a
 
     monkeypatch.setattr(server, "_audit", fake_audit)
     monkeypatch.setattr(server, "parse_flow_text", fail_if_parsed)
+    monkeypatch.setattr(server, "_run_flow", fail_if_parsed)
+    monkeypatch.setattr(server, "_run_flow_files", fail_if_parsed)
+    monkeypatch.setattr(server, "_run_workspace_flow", fail_if_parsed)
 
     content, structured = await server.mcp.call_tool(
         tool_name,
@@ -921,25 +984,121 @@ async def test_hosted_flow_environment_rejection_is_sanitized_before_parse_and_a
         "message": "Hosted flow environment is invalid.",
         "dry_run": True,
     }
-    assert len(audit_events) == 1
-    audit_event = audit_events[0]
-    assert audit_event["tool_name"] == tool_name
-    assert audit_event["input_payload"]["workspace_id_prefix"] == "mw_pub"
-    assert set(audit_event["input_payload"]) == {
-        "workspace_id_prefix",
-        "workspace_id_hash",
-        "dry_run",
-        "environment_status",
-    }
-    assert audit_event["input_payload"]["dry_run"] is True
-    assert audit_event["input_payload"]["environment_status"] == "invalid"
-    assert audit_event["output_summary"] == {
+    assert audit_events == []
+    assert marker not in str((content, structured, audit_events))
+    assert "input_value" not in str((content, structured, audit_events))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("flow_yaml", "marker"),
+    [
+        ("", None),
+        (
+            "hosted_flow_oversized_marker" + ("x" * 500_000),
+            "hosted_flow_oversized_marker",
+        ),
+    ],
+)
+async def test_run_inline_flow_rejects_invalid_yaml_bounds_inside_sanitized_handler(
+    monkeypatch,
+    flow_yaml,
+    marker,
+) -> None:
+    from mercury_tools.mcp import server
+
+    audit_events: list[dict[str, object]] = []
+
+    def fail_if_dispatched(*_args, **_kwargs):
+        pytest.fail("invalid inline flow YAML reached flow dispatch")
+
+    monkeypatch.setattr(server, "_audit", lambda *args: audit_events.append(args))
+    monkeypatch.setattr(server, "_run_flow", fail_if_dispatched)
+
+    content, structured = await server.mcp.call_tool(
+        "run_inline_flow",
+        {
+            "workspace_id": "mw_publiccontestworkspace001",
+            "flow_yaml": flow_yaml,
+            "environment": [],
+            "dry_run": True,
+        },
+    )
+
+    assert structured == {
         "status": "error",
-        "reason": "invalid_environment",
+        "message": "Hosted inline flow YAML is invalid.",
         "dry_run": True,
     }
-    assert marker not in str((content, structured, audit_events))
-    assert "input_value" not in str(content)
+    assert audit_events == []
+    assert "input_value" not in str((content, structured, audit_events))
+    if marker:
+        assert marker not in str((content, structured, audit_events))
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"flow_yaml": ""},
+        {
+            "flow_yaml": "name: Compatibility bounds\n---\n- emitReport: {}\n",
+            "workspace_id": "",
+        },
+        {
+            "flow_yaml": "name: Compatibility bounds\n---\n- emitReport: {}\n",
+            "workspace_id": "legacy_workspace_marker" + ("x" * 2_048),
+        },
+        {"flow_yaml": "compatibility_flow_marker" + ("x" * 500_000)},
+    ],
+)
+def test_run_mercury_flow_restores_retired_typed_source_bounds_before_dispatch(
+    monkeypatch,
+    arguments,
+) -> None:
+    from mercury_tools.mcp import server
+
+    def fail_if_dispatched(*_args, **_kwargs):
+        pytest.fail("invalid compatibility source reached flow dispatch")
+
+    monkeypatch.setattr(server, "run_flow", fail_if_dispatched)
+    monkeypatch.setattr(server, "_run_flow_files", fail_if_dispatched)
+    monkeypatch.setattr(server, "_run_workspace_flow", fail_if_dispatched)
+
+    payload = server.run_mercury_flow(**arguments)
+
+    assert payload["status"] == "error"
+    assert payload["message"] == "Invalid Mercury flow source."
+    assert "input_value" not in str(payload)
+    assert "legacy_workspace_marker" not in str(payload)
+    assert "compatibility_flow_marker" not in str(payload)
+
+
+def test_run_mercury_flow_keeps_legacy_optional_workspace_ids(monkeypatch) -> None:
+    from mercury_tools.mcp import server
+
+    captured: dict[str, object] = {}
+
+    def fake_run_flow(flow_yaml, *, dry_run, env, workspace_id):
+        captured.update(
+            {
+                "flow_yaml": flow_yaml,
+                "dry_run": dry_run,
+                "env": env,
+                "workspace_id": workspace_id,
+            }
+        )
+        return {"status": "planned"}
+
+    monkeypatch.setattr(server, "run_flow", fake_run_flow)
+
+    payload = server.run_mercury_flow(
+        flow_yaml="name: Legacy workspace\n---\n- emitReport: {}\n",
+        workspace_id="legacy-workspace-id",
+        dry_run=True,
+    )
+
+    assert payload["status"] == "planned"
+    assert captured["workspace_id"] == "legacy-workspace-id"
 
 
 @pytest.mark.asyncio
@@ -978,9 +1137,7 @@ async def test_validate_connector_connection_sanitizes_invalid_evidence_through_
                 "status": "succeeded",
                 "observed_at": "2026-07-19T12:00:00Z",
                 "evidence_ref": "evidence_fastmcp_input_1234",
-                "capabilities": [
-                    {"capability": "company.info.read", "state": "observed"}
-                ],
+                "capabilities": [{"capability": "company.info.read", "state": "observed"}],
                 "provider_body": marker,
             },
         },

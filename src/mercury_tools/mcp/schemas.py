@@ -228,6 +228,16 @@ class FlowFileInput(StrictMcpInput):
 
 
 FlowFiles = Annotated[list[FlowFileInput], Field(min_length=1, max_length=50)]
+InlineFlowYaml = SkipValidation[
+    Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=500_000,
+            description="Complete inline Mercury Flow YAML.",
+        ),
+    ]
+]
 
 
 class FlowEnvironmentValue(StrictMcpInput):
@@ -235,15 +245,44 @@ class FlowEnvironmentValue(StrictMcpInput):
     value: str = Field(max_length=10_000)
 
 
-# Preserve an explicit item schema while validating hosted environment values
-# inside the tool handler, where invalid inputs can receive a fixed response.
-FlowEnvironmentValueInput = SkipValidation[FlowEnvironmentValue]
-FlowEnvironmentValues = Annotated[
-    list[FlowEnvironmentValueInput],
-    Field(max_length=100),
+# Preserve the bounded array and item schema while validating the entire raw
+# value inside the tool handler, where invalid inputs receive a fixed response.
+FlowEnvironmentValues = SkipValidation[
+    Annotated[
+        list[FlowEnvironmentValue],
+        Field(max_length=100),
+    ]
 ]
 FlowTag = Annotated[str, Field(min_length=1, max_length=100)]
 FlowTags = Annotated[list[FlowTag], Field(max_length=100)]
+
+
+class InlineFlowSource(StrictMcpInput):
+    source_type: Literal["flow_yaml"]
+    flow_yaml: str = Field(min_length=1, max_length=500_000)
+    workspace_id: str | None = Field(default=None, min_length=1, max_length=2_048)
+
+
+class FlowFilesSource(StrictMcpInput):
+    source_type: Literal["flow_files"]
+    flow_files: list[FlowFileInput] = Field(min_length=1, max_length=50)
+    workspace_id: str | None = Field(default=None, min_length=1, max_length=2_048)
+    config_yaml: str | None = Field(default=None, max_length=500_000)
+    include_tags: list[str] = Field(default_factory=list, max_length=100)
+    exclude_tags: list[str] = Field(default_factory=list, max_length=100)
+    continue_on_failure: bool = True
+
+
+class WorkspaceFlowSource(StrictMcpInput):
+    source_type: Literal["workspace_flow"]
+    workspace_id: str = Field(min_length=1, max_length=2_048)
+    workspace_flow_id: str = Field(min_length=1, max_length=500)
+
+
+MercuryFlowSource = Annotated[
+    InlineFlowSource | FlowFilesSource | WorkspaceFlowSource,
+    Field(discriminator="source_type"),
+]
 
 
 class WorkspaceFlowEnvironment(StrictMcpInput):
