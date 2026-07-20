@@ -112,6 +112,10 @@ _V2_REQUEST_TABLE_DDL_CONTRACT = (
 )
 
 
+def _normalized_sqlite_identifier(value: object) -> str | None:
+    return value.casefold() if isinstance(value, str) else None
+
+
 def _matches_v2_request_table_ddl(sql: object) -> bool:
     if not isinstance(sql, str):
         return False
@@ -504,7 +508,14 @@ class LocalRequestStore:
                     "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
                 ).fetchall()
             }
-            if version < _SCHEMA_VERSION and "requests" in tables:
+            has_requests_table = any(
+                _normalized_sqlite_identifier(name) == "requests" for name in tables
+            )
+            if version == 0 and tables:
+                raise RequestStateError("request_store_schema_invalid")
+            if version > 0 and not has_requests_table:
+                raise RequestStateError("request_store_schema_invalid")
+            if version < _SCHEMA_VERSION and has_requests_table:
                 archive_name = self._next_schema_name(connection, _V1_ARCHIVE_NAME)
                 connection.execute(
                     f'ALTER TABLE "requests" RENAME TO "{archive_name}"'
@@ -547,7 +558,7 @@ class LocalRequestStore:
         table_info = tuple(
             (
                 row[0],
-                row[1],
+                _normalized_sqlite_identifier(row[1]),
                 row[2],
                 _sqlite_affinity(row[2]),
                 bool(row[3]),
@@ -559,7 +570,7 @@ class LocalRequestStore:
         table_xinfo = tuple(
             (
                 row[0],
-                row[1],
+                _normalized_sqlite_identifier(row[1]),
                 row[2],
                 _sqlite_affinity(row[2]),
                 bool(row[3]),
@@ -569,19 +580,26 @@ class LocalRequestStore:
             )
             for row in connection.execute('PRAGMA table_xinfo("requests")').fetchall()
         )
-        definitions = connection.execute(
-            "SELECT sql FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'requests' AND tbl_name = 'requests'"
-        ).fetchall()
-        triggers = connection.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type = 'trigger' AND tbl_name = 'requests'"
-        ).fetchall()
+        definitions = [
+            row[2]
+            for row in connection.execute(
+                "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+            if _normalized_sqlite_identifier(row[0]) == "requests"
+            and _normalized_sqlite_identifier(row[1]) == "requests"
+        ]
+        triggers = [
+            row[0]
+            for row in connection.execute(
+                "SELECT name, tbl_name FROM sqlite_master WHERE type = 'trigger'"
+            ).fetchall()
+            if _normalized_sqlite_identifier(row[1]) == "requests"
+        ]
         if (
             table_info != _V2_REQUEST_TABLE_CONTRACT
             or table_xinfo != _V2_REQUEST_TABLE_XINFO_CONTRACT
             or len(definitions) != 1
-            or not _matches_v2_request_table_ddl(definitions[0][0])
+            or not _matches_v2_request_table_ddl(definitions[0])
             or triggers
         ):
             raise RequestStateError("request_store_schema_invalid")
@@ -593,7 +611,7 @@ class LocalRequestStore:
             if (
                 isinstance(name, str)
                 and _SQLITE_SCHEMA_NAME.fullmatch(name) is not None
-                and name.startswith(_REPLAY_INDEX_NAME)
+                and name.casefold().startswith(_REPLAY_INDEX_NAME)
                 and not cls._is_replay_blocking_index(connection, row)
             ):
                 connection.execute(f'DROP INDEX "{name}"')
@@ -613,15 +631,16 @@ class LocalRequestStore:
     @staticmethod
     def _next_schema_name(connection: sqlite3.Connection, base: str) -> str:
         names = {
-            row[0]
+            name
             for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE name IS NOT NULL"
             ).fetchall()
+            if (name := _normalized_sqlite_identifier(row[0])) is not None
         }
-        if base not in names:
+        if base.casefold() not in names:
             return base
         suffix = 2
-        while f"{base}_{suffix}" in names:
+        while f"{base}_{suffix}".casefold() in names:
             suffix += 1
         return f"{base}_{suffix}"
 
@@ -636,17 +655,19 @@ class LocalRequestStore:
         row: sqlite3.Row | tuple[Any, ...],
     ) -> bool:
         name = row[1]
+        normalized_name = _normalized_sqlite_identifier(name)
         if (
             not isinstance(name, str)
             or _SQLITE_SCHEMA_NAME.fullmatch(name) is None
-            or not name.startswith(_REPLAY_INDEX_NAME)
+            or normalized_name is None
+            or not normalized_name.startswith(_REPLAY_INDEX_NAME)
             or row[2] != 1
             or len(row) < 5
             or row[4] != 1
         ):
             return False
         columns = tuple(
-            item[2]
+            _normalized_sqlite_identifier(item[2])
             for item in connection.execute(f'PRAGMA index_info("{name}")').fetchall()
         )
         if columns != ("payload_hash",):
@@ -656,7 +677,10 @@ class LocalRequestStore:
             "WHERE type = 'index' AND name = ?",
             (name,),
         ).fetchone()
-        if definition is None or definition[0] != "requests":
+        if (
+            definition is None
+            or _normalized_sqlite_identifier(definition[0]) != "requests"
+        ):
             return False
         sql = definition[1]
         if not isinstance(sql, str):

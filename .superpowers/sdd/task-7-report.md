@@ -259,3 +259,62 @@ All checks passed!
 git diff --check
 exit 0 (no output)
 ```
+
+## Migration Consistency Follow-Up
+
+### Scope
+
+Fixed only the two Task 7 request-store migration findings. A v2 store missing
+its live `requests` table now fails closed rather than creating an empty table,
+and canonical v2 DDL accepts table and column identifier case differences.
+Brand-new v0 initialization, valid v1 migration, valid v2 reopen, replay-index
+enforcement, and rejection of renamed or otherwise noncanonical columns remain
+intact. Task 8 is not included.
+
+### RED Evidence
+
+The focused temp-DB tests first covered an empty v0 database, a v2 database
+with archived `outcome_unknown` history but no live `requests` table, and
+uppercase/mixed-case canonical v2 identifiers:
+
+```text
+uv run pytest -q tests/test_request_store.py -k 'brand_new_v0_empty_request_store_initializes_normally or missing_requests_table_without_auto_create or semantically_canonical_identifier_case'
+3 failed, 1 passed, 98 deselected in 0.28s
+```
+
+The missing-table case did not raise and silently created `requests`. Both
+positive v2 cases failed the raw PRAGMA/SQLite metadata identifier comparisons.
+The final focused matrix also includes a renamed-column rejection control.
+
+### Fix
+
+- Schema creation is now limited to a user-version-0 database with no user
+  tables. Versioned stores without a live `requests` table fail with the stable
+  `request_store_schema_invalid` error before table/index creation, preserving
+  existing archive history and `PRAGMA user_version`.
+- SQLite identifiers read from PRAGMA and `sqlite_master` are compared with
+  Unicode-aware `casefold()`. The same normalization covers replay-index table,
+  column, prefix, and collision checks, while the exact canonical DDL grammar
+  still rejects renamed columns and semantic changes.
+
+### GREEN Evidence
+
+```text
+uv run pytest -q tests/test_request_store.py -k 'brand_new_v0_empty_request_store_initializes_normally or missing_requests_table_without_auto_create or semantically_canonical_identifier_case or renamed_request_column'
+5 passed, 98 deselected in 0.39s
+
+uv run pytest -q tests/test_request_store.py
+103 passed in 0.83s
+
+uv run pytest -q tests/test_execution_policy.py tests/test_request_store.py tests/test_erp_executor.py tests/test_local_audit.py tests/test_builtin_action_catalog.py
+298 passed in 11.27s
+
+uv run pytest -q tests/test_credential_cli.py tests/test_local_credentials.py tests/test_runtime_skills.py tests/test_plugin_package.py
+172 passed in 4.05s
+
+uv run pytest -q tests/test_local_mcp_contract.py tests/test_local_mcp_roots.py tests/test_connector_driver_contract.py tests/test_generic_drivers.py tests/test_sandbox_execution_manifest.py tests/integration/test_local_erp_mcp.py
+229 passed, 2 skipped in 14.68s
+
+uv run ruff check .
+All checks passed!
+```

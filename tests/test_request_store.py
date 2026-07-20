@@ -268,6 +268,76 @@ def test_fresh_request_store_uses_v2_schema(
     assert "requests_v1_archive" not in tables
 
 
+def test_brand_new_v0_empty_request_store_initializes_normally(
+    repository_context: RepositoryContext,
+) -> None:
+    database = repository_context.cache_dir / "requests.sqlite"
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall() == []
+    finally:
+        connection.close()
+
+    store = LocalRequestStore(repository_context)
+
+    connection = sqlite3.connect(store.database_path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'requests'"
+        ).fetchall() == [("requests",)]
+    finally:
+        connection.close()
+
+
+def test_v2_initialization_rejects_missing_requests_table_without_auto_create(
+    repository_context: RepositoryContext,
+) -> None:
+    database = repository_context.cache_dir / "requests.sqlite"
+    history = ("req_outcome_unknown", "a" * 64, "outcome_unknown")
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE requests_v1_archive (
+                request_id TEXT PRIMARY KEY,
+                payload_hash TEXT NOT NULL,
+                state TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("INSERT INTO requests_v1_archive VALUES (?, ?, ?)", history)
+        connection.execute("PRAGMA user_version=2")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RequestStateError, match="^request_store_schema_invalid$"):
+        LocalRequestStore(repository_context)
+
+    connection = sqlite3.connect(database)
+    try:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        retained = connection.execute(
+            "SELECT request_id, payload_hash, state FROM requests_v1_archive"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert version == 2
+    assert "requests" not in tables
+    assert retained == [history]
+
+
 @pytest.mark.parametrize(
     "columns",
     [
@@ -305,6 +375,18 @@ def test_v2_initialization_rejects_malformed_request_table_contract(
     columns: str,
 ) -> None:
     seed_v2_request_store(repository_context, columns=columns)
+
+    with pytest.raises(RequestStateError, match="^request_store_schema_invalid$"):
+        LocalRequestStore(repository_context)
+
+
+def test_v2_initialization_rejects_renamed_request_column(
+    repository_context: RepositoryContext,
+) -> None:
+    seed_v2_request_store(
+        repository_context,
+        columns=_V2_REQUEST_COLUMNS.replace("payload_hash", "payload_digest", 1),
+    )
 
     with pytest.raises(RequestStateError, match="^request_store_schema_invalid$"):
         LocalRequestStore(repository_context)
@@ -480,22 +562,41 @@ def test_v2_initialization_rejects_trigger_that_can_replace_request_history(
     assert retained == [(history[0], history[1], history[4], history[6])]
 
 
-def test_v2_initialization_accepts_semantically_canonical_formatted_ddl(
+@pytest.mark.parametrize(
+    "ddl",
+    [
+        """
+            CREATE TABLE REQUESTS (
+                REQUEST_ID TEXT PRIMARY KEY,
+                PAYLOAD_HASH TEXT NOT NULL,
+                CONNECTOR_ID TEXT NOT NULL,
+                ENVIRONMENT TEXT NOT NULL,
+                STATE TEXT NOT NULL,
+                EXPIRES_AT TEXT NOT NULL,
+                REQUEST_JSON TEXT NOT NULL
+            )
+        """,
+        """
+            CrEaTe TaBlE [ReQuEsTs](
+                `ReQuEsT_Id` text primary key,
+                [PaYlOaD_hAsH] TeXt not null,
+                "CoNnEcToR_iD" TEXT NOT NULL,
+                EnViRoNmEnT TEXT NOT NULL,
+                StAtE TEXT NOT NULL,
+                ExPiReS_aT TEXT NOT NULL,
+                ReQuEsT_jSoN TEXT NOT NULL
+            )
+        """,
+    ],
+    ids=("uppercase_identifiers", "mixed_case_identifiers"),
+)
+def test_v2_initialization_accepts_semantically_canonical_identifier_case(
     repository_context: RepositoryContext,
+    ddl: str,
 ) -> None:
     database = seed_v2_request_store_ddl(
         repository_context,
-        ddl="""
-            CrEaTe TaBlE [requests](
-                `request_id` text primary key,
-                [payload_hash] TeXt not null,
-                "connector_id" TEXT NOT NULL,
-                environment TEXT NOT NULL,
-                state TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                request_json TEXT NOT NULL
-            )
-        """,
+        ddl=ddl,
     )
 
     first = LocalRequestStore(repository_context)
