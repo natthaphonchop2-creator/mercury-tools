@@ -19,10 +19,10 @@ mode-specific connector manifests. The hosted core provides secretless
 connector discovery, sanitized profile metadata, validation evidence, cited
 accounting knowledge, portable Skills, and capability-based flow planning.
 
-The public plugin installs exactly one hosted Mercury MCP. Provider OAuth stays
-with the host or provider. Reviewed API drivers and Local Bridge integrations
-remain an explicit advanced-local handoff and are not embedded in the hosted
-plugin configuration.
+The public plugin installs exactly one hosted 24-tool Mercury MCP. Provider OAuth
+stays with the host or provider. Reviewed API drivers and Local Bridge integrations
+remain an explicit 20-tool advanced-local handoff and are not embedded in the
+hosted plugin configuration.
 
 ## Release controls
 

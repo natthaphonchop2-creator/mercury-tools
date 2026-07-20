@@ -1102,7 +1102,7 @@ def _release_layout(tmp_path: Path, *, local_launcher: bool = False) -> Path:
                             "command": "uvx",
                             "args": [
                                 "--from",
-                                "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.2",
+                                "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.3.0",
                                 "mercury",
                                 "mcp",
                                 "serve-local",
@@ -1406,12 +1406,19 @@ def test_judge_quickstart_matches_current_public_plugin() -> None:
 
     assert "Mercury Finance" in text
     assert "codex plugin marketplace add" in text
-    assert "v0.2.2" in text
-    assert "repository-local" in text
-    assert "run_erp_read" in text
-    assert "preview_erp_write" in text
+    assert "v0.3.0" in text
+    assert "https://mercury-tools-mcp.onrender.com/mcp" in text
+    assert "24 hosted tools" in text
+    assert "20 advanced-local tools" in text
+    assert "get_connector_setup" in text
+    assert "prepare_erp_mutation" in text
+    assert "execute_erp_create" in text
+    assert "execute_erp_update" in text
+    assert "execute_sensitive_erp_action" in text
     assert "Cross-MCP reconciliation" in text
-    assert "credentials clear" in text
+    assert "preview_erp_write" not in text
+    assert "confirm_erp_write" not in text
+    assert "execute_erp_write" not in text
     assert "client_token" not in text
     assert "Mercury Connect" not in text
     assert "token provided by the Mercury demo owner" not in text

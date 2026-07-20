@@ -18,6 +18,7 @@ from mcp import types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from mercury_tools.mcp.contracts import HOSTED_TOOL_NAMES
 from mercury_tools.release.hosted import (
     HostedAdapterConfig,
     build_hosted_clients,
@@ -25,34 +26,7 @@ from mercury_tools.release.hosted import (
 )
 from mercury_tools.release.models import PINNED_SCANNER_VERSIONS, SecretScanPolicy
 
-EXPECTED_HOSTED_TOOLS = frozenset(
-    {
-        "search_knowledge",
-        "retrieve_context_pack",
-        "retrieve_workspace_context_pack",
-        "get_document",
-        "create_public_workspace",
-        "get_public_workspace",
-        "list_connectors",
-        "get_connector_setup",
-        "link_connector_profile",
-        "validate_connector_connection",
-        "connector_capabilities",
-        "unlink_connector_profile",
-        "connector_status",
-        "list_accounting_skills",
-        "get_accounting_skill_schema",
-        "run_accounting_skill",
-        "flow_cheat_sheet",
-        "check_flow_syntax",
-        "inspect_flow_files",
-        "run_inline_flow",
-        "run_flow_files",
-        "list_workspace_flows",
-        "run_workspace_flow",
-        "save_workspace_flow",
-    }
-)
+EXPECTED_HOSTED_TOOLS = HOSTED_TOOL_NAMES
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 _SAFE_SERVICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")

@@ -25,6 +25,7 @@ from mercury_tools.release.artifacts import (
     load_release_artifact_manifest,
 )
 from scripts.smoke_tagged_marketplace import (
+    EXPECTED_HOSTED_TOOLS,
     TaggedMarketplaceError,
     build_tagged_smoke_plan,
     run_tagged_smoke,
@@ -54,9 +55,14 @@ _ANONYMOUS_ENVIRONMENT_KEYS = frozenset(
 _QUICKSTART_MARKERS = (
     "codex plugin marketplace add",
     "codex plugin add mercury-finance@mercury-tools",
-    "connector-credential-setup-th",
-    "run_erp_read",
-    "preview_erp_write",
+    "https://mercury-tools-mcp.onrender.com/mcp",
+    "24 hosted tools",
+    "20 advanced-local tools",
+    "get_connector_setup",
+    "prepare_erp_mutation",
+    "execute_erp_create",
+    "execute_erp_update",
+    "execute_sensitive_erp_action",
     "Cross-MCP",
     "codex plugin remove mercury-finance@mercury-tools",
 )
@@ -71,7 +77,7 @@ class PublicReleasePlan:
     repo: str
     tag: str
     release: str
-    expected_tools: int
+    expected_hosted_tools: int
     workspace: Path
     clone_url: str
     environment: dict[str, str]
@@ -82,7 +88,7 @@ def build_public_release_plan(
     repo: str,
     tag: str,
     release: str,
-    expected_tools: int,
+    expected_hosted_tools: int,
     workspace: Path,
 ) -> PublicReleasePlan:
     """Build an anonymous verification plan for one exact release ref."""
@@ -93,8 +99,10 @@ def build_public_release_plan(
         raise PublicReleaseError("repository_invalid")
     if _TAG_PATTERN.fullmatch(tag) is None:
         raise PublicReleaseError("tag_invalid")
-    if type(expected_tools) is not int or expected_tools <= 0:
-        raise PublicReleaseError("expected_tools_invalid")
+    if type(expected_hosted_tools) is not int or expected_hosted_tools <= 0:
+        raise PublicReleaseError("expected_hosted_tools_invalid")
+    if expected_hosted_tools != len(EXPECTED_HOSTED_TOOLS):
+        raise PublicReleaseError("hosted_mcp_tool_count_mismatch")
     environment = {
         "CODEX_HOME": str(workspace / "codex-home"),
         "GIT_CONFIG_GLOBAL": "/dev/null",
@@ -105,7 +113,7 @@ def build_public_release_plan(
         repo=repo,
         tag=tag,
         release=release,
-        expected_tools=expected_tools,
+        expected_hosted_tools=expected_hosted_tools,
         workspace=workspace,
         clone_url=f"https://github.com/{repo}.git",
         environment=environment,
@@ -318,6 +326,8 @@ def _verify_quickstart(clone: Path) -> None:
 def verify_public_release(plan: PublicReleasePlan) -> None:
     """Run the anonymous clone, asset, marketplace, MCP, and docs checks."""
 
+    if plan.expected_hosted_tools != len(EXPECTED_HOSTED_TOOLS):
+        raise PublicReleaseError("hosted_mcp_tool_count_mismatch")
     _prepare_workspace(plan.workspace)
     environment = _anonymous_environment(plan)
     clone, commit = _clone_and_verify_tag(plan, environment)
@@ -326,7 +336,7 @@ def verify_public_release(plan: PublicReleasePlan) -> None:
     tagged_plan = build_tagged_smoke_plan(
         repo=plan.repo,
         tag=plan.tag,
-        expected_tools=plan.expected_tools,
+        expected_hosted_tools=plan.expected_hosted_tools,
         codex_home=Path(plan.environment["CODEX_HOME"]),
     )
     try:
@@ -340,7 +350,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--release", required=True)
-    parser.add_argument("--expected-tools", required=True, type=int)
+    parser.add_argument("--expected-hosted-tools", required=True, type=int)
     parser.add_argument("--workspace", type=Path)
     return parser
 
@@ -352,7 +362,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             repo=args.repo,
             tag=args.tag,
             release=args.release,
-            expected_tools=args.expected_tools,
+            expected_hosted_tools=args.expected_hosted_tools,
             workspace=args.workspace,
         )
         verify_public_release(plan)
@@ -362,11 +372,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 repo=args.repo,
                 tag=args.tag,
                 release=args.release,
-                expected_tools=args.expected_tools,
+                expected_hosted_tools=args.expected_hosted_tools,
                 workspace=Path(temporary),
             )
             verify_public_release(plan)
-    print("public release verification passed (anonymous exact-tag surface)")
+    print("public release verification passed (anonymous exact-tag hosted surface, 24 tools)")
     return 0
 
 

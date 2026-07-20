@@ -14,7 +14,7 @@ hosted Mercury MCP and needs no repository clone, Python or uv installation, Sup
 configuration, Mercury Owner Token, or ERP secret.
 
 The installed server is `mercury-finance`, with the note **Mercury Accounting and ERP
-connector platform.**
+connector platform.** It exposes exactly 24 hosted tools.
 
 ### 2. Hosted MCP URL fallback
 
@@ -45,7 +45,8 @@ This development path does not alter the one-click hosted plugin contract.
 
 Reviewed API-driver reads and approval-gated ERP mutations, plus Local Bridge work, use a
 separately connected local Mercury MCP. It is never auto-registered next to the hosted
-server because duplicate Mercury tool names would make routing ambiguous.
+server because duplicate Mercury tool names would make routing ambiguous. The advanced-local
+server exposes exactly 20 tools.
 
 Start the advanced server only after reviewing
 [LOCAL_CREDENTIALS.md](docs/LOCAL_CREDENTIALS.md) and

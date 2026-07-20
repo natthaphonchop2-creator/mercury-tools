@@ -1,7 +1,8 @@
 # Mercury Tools Hosted HTTP Deployment
 
-The Render service is the separate hosted Mercury MCP. It does not replace the
-repository-local Mercury Finance plugin.
+The Render service is the hosted Mercury MCP used by the public Mercury Finance
+plugin. It does not replace the separately connected advanced-local Mercury
+runtime.
 
 Cloud stores catalog, RAG, and audit metadata only. ERP credentials remain repository-local and never enter Render, Supabase, hosted workspace records, MCP arguments, or hosted tool results.
 
@@ -12,10 +13,11 @@ Cloud stores catalog, RAG, and audit metadata only. ERP credentials remain repos
 - Deployment status: `https://mercury-tools-mcp.onrender.com/api/status`
 - Streamable HTTP MCP: `https://mercury-tools-mcp.onrender.com/mcp`
 
-The hosted endpoint exposes 20 tools for catalog, cited knowledge, accounting
-skills, flow validation, and public workspace metadata. It has no ERP
-credential schema and no arbitrary ERP write surface. The local plugin remains
-one `mercury-finance` stdio MCP with 19 tools and owns ERP execution.
+The hosted endpoint exposes 24 tools for catalog, cited knowledge, connector
+lifecycle, accounting skills, flow validation, and public workspace metadata.
+It has no ERP credential schema and no arbitrary ERP write surface. The
+advanced-local Mercury MCP with 20 tools is connected separately and owns
+reviewed ERP execution.
 
 ## Supabase Boundary
 
@@ -97,7 +99,7 @@ export REVIEWED_MAIN_SHA='<40-character-lowercase-reviewed-git-commit>'
 export RENDER_OWNER_ID='<Render workspace owner ID>'
 uv run python scripts/verify_render_release.py \
   --url https://mercury-tools-mcp.onrender.com \
-  --version 0.2.2 \
+  --version 0.3.0 \
   --commit "$REVIEWED_MAIN_SHA"
 ```
 

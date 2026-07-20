@@ -895,5 +895,5 @@ def test_post_public_workflow_is_anonymous_and_exact_release_bound() -> None:
     assert "scripts/verify_public_release.py" in command
     assert f"--tag {ACTIVE_RELEASE_TAG}" in command
     assert f"--release {ACTIVE_RELEASE_TAG}" in command
-    assert "--expected-tools 20" in command
+    assert "--expected-hosted-tools 24" in command
     assert "GH_TOKEN" not in json.dumps(payload["jobs"]["verify-public"].get("env", {}))

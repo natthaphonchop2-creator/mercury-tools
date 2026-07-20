@@ -844,7 +844,9 @@ def test_archive_snapshot_rejects_forbidden_member_instead_of_filtering(
         core._archive_snapshot(archive_path)
 
 
-def test_local_mcp_static_parser_requires_exact_19_tool_names(core: ModuleType) -> None:
+def test_local_mcp_static_parser_requires_exact_v030_advanced_local_tool_names(
+    core: ModuleType,
+) -> None:
     source = (ROOT / "src" / "mercury_tools" / "mcp" / "local_server.py").read_bytes()
 
     assert core._static_mcp_tool_names(source) == (
@@ -860,9 +862,10 @@ def test_local_mcp_static_parser_requires_exact_19_tool_names(core: ModuleType) 
         "search_erp_actions",
         "get_erp_action_schema",
         "run_erp_read",
-        "preview_erp_write",
-        "confirm_erp_write",
-        "execute_erp_write",
+        "prepare_erp_mutation",
+        "execute_erp_create",
+        "execute_erp_update",
+        "execute_sensitive_erp_action",
         "get_erp_request_status",
         "import_erp_spec",
         "list_connector_drivers",

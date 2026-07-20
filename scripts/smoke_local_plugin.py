@@ -17,34 +17,15 @@ from typing import Any
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+from mercury_tools.mcp.contracts import ADVANCED_LOCAL_TOOL_NAMES, HOSTED_MCP_URL
+
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_HOSTED_SERVER = {
     "type": "http",
-    "url": "https://mercury-tools-mcp.onrender.com/mcp",
+    "url": HOSTED_MCP_URL,
     "note": "Mercury Accounting and ERP connector platform.",
 }
-EXPECTED_TOOLS = {
-    "search_knowledge",
-    "retrieve_context_pack",
-    "get_document",
-    "connector_status",
-    "run_accounting_skill",
-    "run_mercury_flow",
-    "list_workspace_flows",
-    "save_workspace_flow",
-    "run_workspace_flow",
-    "search_erp_actions",
-    "get_erp_action_schema",
-    "run_erp_read",
-    "prepare_erp_mutation",
-    "execute_erp_create",
-    "execute_erp_update",
-    "execute_sensitive_erp_action",
-    "get_erp_request_status",
-    "import_erp_spec",
-    "list_connector_drivers",
-    "credential_status",
-}
+EXPECTED_TOOLS = ADVANCED_LOCAL_TOOL_NAMES
 
 
 def _manifest_server() -> dict[str, Any]:

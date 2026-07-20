@@ -31,4 +31,4 @@ jobs:
           uv sync --extra dev --frozen
           uv run python scripts/verify_public_release.py \
             --repo natthaphonchop2-creator/mercury-tools \
-            --tag v0.3.0 --release v0.3.0 --expected-tools 20
+            --tag v0.3.0 --release v0.3.0 --expected-hosted-tools 24
