@@ -11,7 +11,7 @@ import json
 import re
 import secrets
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Literal
@@ -35,6 +35,7 @@ from mercury_tools.safety.redaction import redact_json
 PREVIEW_TTL = timedelta(minutes=15)
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _PAYLOAD_HASH = re.compile(r"^[0-9a-f]{64}$")
+_CREDENTIAL_REVISION = re.compile(r"^[0-9a-f]{64}$")
 _REQUEST_ID = re.compile(r"^req_[0-9a-z_]{8,128}$")
 _IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
 _PATH_PLACEHOLDER = re.compile(r"^\{([A-Za-z][A-Za-z0-9_]*)\}$")
@@ -151,6 +152,8 @@ def _binding_payload(
     risk_tier: RiskTier | int,
     approval_level: ApprovalLevel | str,
     mutation_class: MutationClass | str,
+    credential_revision: str,
+    preflight_actions: Sequence[PreflightActionBinding],
 ) -> dict[str, Any]:
     return {
         "repository_id": repository_id,
@@ -164,7 +167,63 @@ def _binding_payload(
         "risk_tier": int(risk_tier),
         "approval_level": str(approval_level),
         "mutation_class": str(mutation_class),
+        "credential_revision": credential_revision,
+        "preflight_actions": [item.binding_payload for item in preflight_actions],
     }
+
+
+class PreflightActionBinding(BaseModel):
+    """Internal immutable identity for one approval-bound preflight action."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    action_id: str
+    version_id: str
+    connector_id: str
+    method: Literal["GET"]
+    path_template: str
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> PreflightActionBinding:
+        if (
+            not self.action_id
+            or not self.version_id
+            or _IDENTIFIER.fullmatch(self.connector_id) is None
+            or not _valid_final_path(self.path_template)
+        ):
+            raise ValueError("invalid_preflight_binding")
+        return self
+
+    @property
+    def binding_payload(self) -> dict[str, str]:
+        return {
+            "action_id": self.action_id,
+            "version_id": self.version_id,
+            "connector_id": self.connector_id,
+            "method": self.method,
+            "path_template": self.path_template,
+        }
+
+    @classmethod
+    def from_action(cls, action: CatalogAction) -> PreflightActionBinding:
+        try:
+            action = revalidate_catalog_action(action)
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("invalid_preflight_binding") from None
+        if action.method.value != "GET":
+            raise ValueError("invalid_preflight_binding")
+        return cls(
+            action_id=action.action_id,
+            version_id=action.version_id,
+            connector_id=action.connector_id,
+            method="GET",
+            path_template=action.path_template,
+        )
 
 
 class PreparedRequest(BaseModel):
@@ -192,6 +251,8 @@ class PreparedRequest(BaseModel):
     risk_tier: RiskTier
     approval_level: ApprovalLevel
     mutation_class: MutationClass
+    credential_revision: str = Field(repr=False)
+    preflight_actions: tuple[PreflightActionBinding, ...] = ()
     approval_count: Literal[0, 1] = 0
     state: RequestState
     failure_reason: str | None = None
@@ -228,6 +289,11 @@ class PreparedRequest(BaseModel):
             raise ValueError("request_path_mismatch")
         if _PAYLOAD_HASH.fullmatch(self.payload_hash) is None:
             raise ValueError("invalid_payload_hash")
+        if _CREDENTIAL_REVISION.fullmatch(self.credential_revision) is None:
+            raise ValueError("invalid_credential_revision")
+        preflight_ids = tuple(item.action_id for item in self.preflight_actions)
+        if len(preflight_ids) != len(set(preflight_ids)):
+            raise ValueError("invalid_preflight_binding")
         if not _valid_approval_binding(self.approval_level, self.mutation_class):
             raise ValueError("invalid_approval_binding")
         if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
@@ -297,6 +363,8 @@ class PreparedRequest(BaseModel):
             risk_tier=self.risk_tier,
             approval_level=self.approval_level,
             mutation_class=self.mutation_class,
+            credential_revision=self.credential_revision,
+            preflight_actions=self.preflight_actions,
         )
 
     @classmethod
@@ -308,6 +376,8 @@ class PreparedRequest(BaseModel):
         request: Any,
         risk: RiskDecision,
         payload_hash: str,
+        credential_revision: str,
+        preflight_actions: Sequence[PreflightActionBinding],
     ) -> PreparedRequest:
         if not isinstance(repository, RepositoryContext):
             raise ValueError("invalid_repository_context")
@@ -361,6 +431,8 @@ class PreparedRequest(BaseModel):
             risk_tier=risk.tier,
             approval_level=risk.approval_level,
             mutation_class=risk.mutation_class,
+            credential_revision=credential_revision,
+            preflight_actions=preflight_actions,
         )
         expected_hash = canonical_payload_hash(binding_payload)
         if not isinstance(payload_hash, str) or not secrets.compare_digest(
@@ -385,6 +457,8 @@ class PreparedRequest(BaseModel):
             risk_tier=risk.tier,
             approval_level=risk.approval_level,
             mutation_class=risk.mutation_class,
+            credential_revision=credential_revision,
+            preflight_actions=tuple(preflight_actions),
             state=RequestState.PREVIEWED,
             created_at=now,
             expires_at=now + PREVIEW_TTL,

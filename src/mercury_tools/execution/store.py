@@ -33,10 +33,19 @@ _REPLAY_BLOCKING_STATES = (
     RequestState.OUTCOME_UNKNOWN.value,
 )
 _IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
+_SQLITE_SCHEMA_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
 _REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _DATABASE_NAME = "requests.sqlite"
 _SIDECAR_NAMES = ("requests.sqlite-wal", "requests.sqlite-shm")
 _SCHEMA_VERSION = 2
+_V1_ARCHIVE_NAME = "requests_v1_archive"
+_REPLAY_INDEX_NAME = "requests_v2_replay_blocking_hash"
+_REPLAY_INDEX_PATTERN = re.compile(
+    r"^create unique index [a-z0-9_]+ on requests\s*\(\s*payload_hash\s*\)\s*"
+    r"where state in\s*\(\s*'executing'\s*,\s*'succeeded'\s*,\s*"
+    r"'outcome_unknown'\s*\)\s*$",
+    re.IGNORECASE,
+)
 
 
 class RequestStateError(ValueError):
@@ -137,6 +146,13 @@ class LocalRequestStore:
         if request.environment not in validated.environments or any(
             not secrets.compare_digest(actual, expected)
             for actual, expected in expected_bindings
+        ):
+            raise RequestStateError("catalog_binding_mismatch")
+        if tuple(item.action_id for item in request.preflight_actions) != tuple(
+            validated.preflight_action_ids
+        ) or any(
+            item.connector_id != validated.connector_id
+            for item in request.preflight_actions
         ):
             raise RequestStateError("catalog_binding_mismatch")
 
@@ -375,11 +391,13 @@ class LocalRequestStore:
                 ).fetchall()
             }
             if version < _SCHEMA_VERSION and "requests" in tables:
-                if "requests_v1_archive" in tables:
-                    raise RequestStateError("request_store_migration_invalid")
-                connection.execute("ALTER TABLE requests RENAME TO requests_v1_archive")
+                archive_name = self._next_schema_name(connection, _V1_ARCHIVE_NAME)
+                connection.execute(
+                    f'ALTER TABLE "requests" RENAME TO "{archive_name}"'
+                )
             self._create_v2_schema(connection)
             self._validate_v2_schema(connection)
+            self._ensure_replay_blocking_index(connection)
             connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
             connection.execute("COMMIT")
         except RequestStateError:
@@ -409,13 +427,6 @@ class LocalRequestStore:
             )
             """
         )
-        connection.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS requests_v2_replay_blocking_hash
-            ON requests (payload_hash)
-            WHERE state IN ('executing', 'succeeded', 'outcome_unknown')
-            """
-        )
 
     @staticmethod
     def _validate_v2_schema(connection: sqlite3.Connection) -> None:
@@ -432,6 +443,85 @@ class LocalRequestStore:
             "request_json",
         ):
             raise RequestStateError("request_store_schema_invalid")
+
+    @classmethod
+    def _ensure_replay_blocking_index(cls, connection: sqlite3.Connection) -> None:
+        for row in connection.execute('PRAGMA index_list("requests")').fetchall():
+            name = row[1]
+            if (
+                isinstance(name, str)
+                and _SQLITE_SCHEMA_NAME.fullmatch(name) is not None
+                and name.startswith(_REPLAY_INDEX_NAME)
+                and not cls._is_replay_blocking_index(connection, row)
+            ):
+                connection.execute(f'DROP INDEX "{name}"')
+        if cls._has_replay_blocking_index(connection):
+            return
+        index_name = cls._next_schema_name(connection, _REPLAY_INDEX_NAME)
+        connection.execute(
+            f"""
+            CREATE UNIQUE INDEX "{index_name}"
+            ON "requests" ("payload_hash")
+            WHERE "state" IN ('executing', 'succeeded', 'outcome_unknown')
+            """
+        )
+        if not cls._has_replay_blocking_index(connection):
+            raise RequestStateError("request_store_schema_invalid")
+
+    @staticmethod
+    def _next_schema_name(connection: sqlite3.Connection, base: str) -> str:
+        names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE name IS NOT NULL"
+            ).fetchall()
+        }
+        if base not in names:
+            return base
+        suffix = 2
+        while f"{base}_{suffix}" in names:
+            suffix += 1
+        return f"{base}_{suffix}"
+
+    @classmethod
+    def _has_replay_blocking_index(cls, connection: sqlite3.Connection) -> bool:
+        index_rows = connection.execute('PRAGMA index_list("requests")').fetchall()
+        return any(cls._is_replay_blocking_index(connection, row) for row in index_rows)
+
+    @staticmethod
+    def _is_replay_blocking_index(
+        connection: sqlite3.Connection,
+        row: sqlite3.Row | tuple[Any, ...],
+    ) -> bool:
+        name = row[1]
+        if (
+            not isinstance(name, str)
+            or _SQLITE_SCHEMA_NAME.fullmatch(name) is None
+            or not name.startswith(_REPLAY_INDEX_NAME)
+            or row[2] != 1
+            or len(row) < 5
+            or row[4] != 1
+        ):
+            return False
+        columns = tuple(
+            item[2]
+            for item in connection.execute(f'PRAGMA index_info("{name}")').fetchall()
+        )
+        if columns != ("payload_hash",):
+            return False
+        definition = connection.execute(
+            "SELECT tbl_name, sql FROM sqlite_master "
+            "WHERE type = 'index' AND name = ?",
+            (name,),
+        ).fetchone()
+        if definition is None or definition[0] != "requests":
+            return False
+        sql = definition[1]
+        if not isinstance(sql, str):
+            return False
+        normalized = re.sub(r'["`\[\]]', "", sql)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return _REPLAY_INDEX_PATTERN.fullmatch(normalized) is not None
 
     @contextmanager
     def _immediate_transaction(self) -> Iterator[sqlite3.Connection]:

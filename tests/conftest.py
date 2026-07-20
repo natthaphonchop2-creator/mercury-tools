@@ -49,7 +49,7 @@ def action_factory() -> Callable[..., CatalogAction]:
             "source_uri": "https://example.test/openapi.json",
             "source_hash": "a" * 64,
             "confidence": "exact",
-            "observed_state": "untested",
+            "observed_state": "success",
             "description": "Create invoice",
         }
         values.update(overrides)

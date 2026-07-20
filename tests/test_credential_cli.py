@@ -25,6 +25,8 @@ from mercury_tools.local.repository import (
     record_connector_validation,
 )
 
+_CREDENTIAL_REVISION = "d" * 64
+
 _MP_CLEAR_ENTERED: Any = None
 _MP_CLEAR_RELEASE: Any = None
 _MP_ORIGINAL_CLEAR: Any = None
@@ -221,6 +223,8 @@ def test_clear_all_removes_file_and_invalidates_every_pending_preview(
                 "risk_tier": 1,
                 "approval_level": "standard",
                 "mutation_class": "create",
+                "credential_revision": _CREDENTIAL_REVISION,
+                "preflight_actions": [],
             }
         )
         prepared = PreparedRequest.from_template(
@@ -239,6 +243,8 @@ def test_clear_all_removes_file_and_invalidates_every_pending_preview(
                 (),
             ),
             payload_hash=payload_hash,
+            credential_revision=_CREDENTIAL_REVISION,
+            preflight_actions=(),
         )
         created = store.create_preview(prepared, action=catalog_action)
         store.confirm(created.request_id, created.payload_hash)
@@ -284,6 +290,8 @@ def test_clear_scoped_invalidates_pending_preview_and_resets_matching_validation
             "risk_tier": 1,
             "approval_level": "standard",
             "mutation_class": "create",
+            "credential_revision": _CREDENTIAL_REVISION,
+            "preflight_actions": [],
         }
     )
     prepared = PreparedRequest.from_template(
@@ -293,6 +301,8 @@ def test_clear_scoped_invalidates_pending_preview_and_resets_matching_validation
         request=request_template,
         risk=risk,
         payload_hash=payload_hash,
+        credential_revision=_CREDENTIAL_REVISION,
+        preflight_actions=(),
     )
     request = LocalRequestStore(context).create_preview(prepared, action=action)
     LocalRequestStore(context).confirm(request.request_id, request.payload_hash)
@@ -364,6 +374,8 @@ def _seed_clear_failure_state(
             "risk_tier": 1,
             "approval_level": "standard",
             "mutation_class": "create",
+            "credential_revision": _CREDENTIAL_REVISION,
+            "preflight_actions": [],
         }
     )
     prepared = PreparedRequest.from_template(
@@ -377,6 +389,8 @@ def _seed_clear_failure_state(
         },
         risk=risk,
         payload_hash=payload_hash,
+        credential_revision=_CREDENTIAL_REVISION,
+        preflight_actions=(),
     )
     store = LocalRequestStore(context)
     created = store.create_preview(prepared, action=catalog_action)
@@ -512,6 +526,8 @@ def test_clear_holds_repository_lock_until_credentials_are_deleted(
             "risk_tier": 1,
             "approval_level": "standard",
             "mutation_class": "create",
+            "credential_revision": _CREDENTIAL_REVISION,
+            "preflight_actions": [],
         }
     )
     prepared = PreparedRequest.from_template(
@@ -530,6 +546,8 @@ def test_clear_holds_repository_lock_until_credentials_are_deleted(
             (),
         ),
         payload_hash=payload_hash,
+        credential_revision=_CREDENTIAL_REVISION,
+        preflight_actions=(),
     )
     process_context = multiprocessing.get_context("fork")
     clear_entered = process_context.Event()

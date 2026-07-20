@@ -85,19 +85,54 @@ def test_payment_post_void_email_and_share_are_sensitive(
     assert decision.reasons == ("sensitive_side_effect",)
 
 
-def test_inferred_unobserved_mutation_is_sensitive(action_factory) -> None:
+@pytest.mark.parametrize(
+    ("confidence", "observed_state", "expected_class", "expected_reasons"),
+    [
+        (
+            "exact",
+            "untested",
+            MutationClass.SENSITIVE,
+            ("unobserved_mutation",),
+        ),
+        (
+            "inferred",
+            "success",
+            MutationClass.SENSITIVE,
+            ("inferred_mutation",),
+        ),
+        (
+            "inferred",
+            "untested",
+            MutationClass.SENSITIVE,
+            ("inferred_mutation", "unobserved_mutation"),
+        ),
+        ("exact", "success", MutationClass.CREATE, ()),
+    ],
+)
+def test_mutation_confidence_and_observation_matrix(
+    action_factory,
+    confidence: str,
+    observed_state: str,
+    expected_class: MutationClass,
+    expected_reasons: tuple[str, ...],
+) -> None:
     action = action_factory(
-        confidence="inferred",
-        observed_state="untested",
+        confidence=confidence,
+        observed_state=observed_state,
         side_effects=("creates_document",),
     )
 
     decision = effective_risk(action)
 
-    assert decision.approval_level is ApprovalLevel.ELEVATED
-    assert decision.mutation_class is MutationClass.SENSITIVE
-    assert decision.tier is RiskTier.HIGH_RISK
-    assert decision.reasons == ("inferred_unobserved_mutation",)
+    expected_elevated = expected_class is MutationClass.SENSITIVE
+    assert decision.approval_level is (
+        ApprovalLevel.ELEVATED if expected_elevated else ApprovalLevel.STANDARD
+    )
+    assert decision.mutation_class is expected_class
+    assert decision.tier is (
+        RiskTier.HIGH_RISK if expected_elevated else RiskTier.STANDARD_WRITE
+    )
+    assert decision.reasons == expected_reasons
 
 
 def test_catalog_confirmation_count_is_compatibility_data_only(action_factory) -> None:

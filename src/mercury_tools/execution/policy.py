@@ -71,13 +71,14 @@ def effective_risk(action: CatalogAction) -> RiskDecision:
         runtime_tier = RiskTier.HIGH_RISK
         reasons.append("sensitive_side_effect")
 
-    if (
-        action.confidence is ActionConfidence.INFERRED
-        and action.observed_state is ObservedState.UNTESTED
-    ):
+    if action.confidence is ActionConfidence.INFERRED:
         mutation_class = MutationClass.SENSITIVE
         runtime_tier = RiskTier.HIGH_RISK
-        reasons.append("inferred_unobserved_mutation")
+        reasons.append("inferred_mutation")
+    if action.observed_state is ObservedState.UNTESTED:
+        mutation_class = MutationClass.SENSITIVE
+        runtime_tier = RiskTier.HIGH_RISK
+        reasons.append("unobserved_mutation")
 
     tier = max(action.risk_tier, runtime_tier)
     if action.risk_tier > runtime_tier:

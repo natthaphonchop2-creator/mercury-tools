@@ -20,6 +20,7 @@ from mcp.types import ToolAnnotations
 
 from mercury_tools.catalog.models import HttpMethod, RiskTier
 from mercury_tools.execution.executor import ExecutionPolicyError
+from mercury_tools.execution.policy import effective_risk
 from mercury_tools.flows.parser import FlowValidationError, parse_flow_text
 from mercury_tools.flows.runner import MercuryFlowRunner, repository_flow_loader
 from mercury_tools.local.repository import (
@@ -90,7 +91,7 @@ def _error_payload(error: Exception, *, fallback: str = "operation_failed") -> d
 
 
 def _action_summary(action: Any) -> dict[str, Any]:
-    return {
+    summary = {
         "action_id": action.action_id,
         "version_id": action.version_id,
         "connector_id": action.connector_id,
@@ -98,10 +99,11 @@ def _action_summary(action: Any) -> dict[str, Any]:
         "capability": action.capability,
         "description": action.description,
         "risk_tier": int(action.risk_tier),
-        "required_confirmations": action.required_confirmations,
         "confidence": action.confidence.value,
         "observed_state": action.observed_state.value,
     }
+    summary.update(_approval_projection(action))
+    return summary
 
 
 def _public_action_schema(action: Any) -> dict[str, Any]:
@@ -110,9 +112,21 @@ def _public_action_schema(action: Any) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise ValueError("catalog_action_schema_invalid")
     projected = dict(payload)
+    projected.pop("required_confirmations", None)
+    projected.update(_approval_projection(action))
     projected["input_schema"] = _public_executable_schema(projected.get("input_schema"))
     projected["examples"] = []
     return projected
+
+
+def _approval_projection(action: Any) -> dict[str, str]:
+    if action.method is HttpMethod.GET:
+        return {}
+    risk = effective_risk(action)
+    return {
+        "approval_level": risk.approval_level.value,
+        "mutation_class": risk.mutation_class.value,
+    }
 
 
 def _validation_summary(context: Mapping[str, Any]) -> dict[str, Any]:

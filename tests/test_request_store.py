@@ -27,6 +27,8 @@ from mercury_tools.execution.policy import ApprovalLevel, MutationClass, RiskDec
 from mercury_tools.execution.store import LocalRequestStore, RequestStateError
 from mercury_tools.local.repository import RepositoryContext
 
+_CREDENTIAL_REVISION = "d" * 64
+
 
 @dataclass(frozen=True)
 class RequestTemplate:
@@ -73,6 +75,8 @@ def binding_payload(
         "risk_tier": int(risk.tier),
         "approval_level": risk.approval_level.value,
         "mutation_class": risk.mutation_class.value,
+        "credential_revision": _CREDENTIAL_REVISION,
+        "preflight_actions": [],
     }
 
 
@@ -106,6 +110,8 @@ def make_prepared_request(
         request=selected_template,
         risk=selected_risk,
         payload_hash=payload_hash or canonical_payload_hash(payload),
+        credential_revision=_CREDENTIAL_REVISION,
+        preflight_actions=(),
     )
 
 
@@ -126,6 +132,8 @@ def rebind_request(prepared: PreparedRequest, **updates: Any) -> PreparedRequest
             "risk_tier",
             "approval_level",
             "mutation_class",
+            "credential_revision",
+            "preflight_actions",
         )
     }
     payload["payload_hash"] = canonical_payload_hash(binding)
@@ -282,6 +290,177 @@ def test_v1_migration_archives_malformed_legacy_state_without_parsing_it(
     assert current_count == 0
 
 
+def test_v1_migration_preserves_preexisting_malformed_archive_with_new_name(
+    repository_context: RepositoryContext,
+) -> None:
+    request_id, payload_hash = seed_v1_request_store(repository_context)
+    connection = sqlite3.connect(repository_context.cache_dir / "requests.sqlite")
+    try:
+        connection.execute(
+            "CREATE TABLE requests_v1_archive (legacy_marker TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO requests_v1_archive (legacy_marker) VALUES ('older-history')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    first = LocalRequestStore(repository_context)
+    second = LocalRequestStore(repository_context)
+
+    connection = sqlite3.connect(first.database_path)
+    try:
+        older = connection.execute(
+            "SELECT legacy_marker FROM requests_v1_archive"
+        ).fetchall()
+        newer = connection.execute(
+            "SELECT request_id, payload_hash FROM requests_v1_archive_2"
+        ).fetchall()
+        live_count = connection.execute("SELECT count(*) FROM requests").fetchone()[0]
+    finally:
+        connection.close()
+
+    assert second.database_path == first.database_path
+    assert older == [("older-history",)]
+    assert newer == [(request_id, payload_hash)]
+    assert live_count == 0
+
+
+def test_v2_initialization_repairs_colliding_index_name_and_enforces_replay_block(
+    repository_context: RepositoryContext,
+) -> None:
+    database = repository_context.cache_dir / "requests.sqlite"
+    schema = """
+        request_id TEXT PRIMARY KEY,
+        payload_hash TEXT NOT NULL,
+        connector_id TEXT NOT NULL,
+        environment TEXT NOT NULL,
+        state TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        request_json TEXT NOT NULL
+    """
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(f"CREATE TABLE requests ({schema})")
+        connection.execute(f"CREATE TABLE requests_v1_archive ({schema})")
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX requests_v2_replay_blocking_hash
+            ON requests_v1_archive (payload_hash)
+            WHERE state IN ('executing', 'succeeded', 'outcome_unknown')
+            """
+        )
+        connection.execute("PRAGMA user_version=2")
+        connection.commit()
+    finally:
+        connection.close()
+
+    first = LocalRequestStore(repository_context)
+    second = LocalRequestStore(repository_context)
+
+    connection = sqlite3.connect(first.database_path)
+    try:
+        indexes = connection.execute(
+            "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'index'"
+        ).fetchall()
+        expiry = (datetime.now(UTC) + PREVIEW_TTL).isoformat()
+        row = ("flowaccount", "production", "executing", expiry, "{}")
+        connection.execute(
+            """
+            INSERT INTO requests (
+                request_id, payload_hash, connector_id, environment,
+                state, expires_at, request_json
+            ) VALUES ('req_collision_one', ?, ?, ?, ?, ?, ?)
+            """,
+            ("c" * 64, *row),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO requests (
+                    request_id, payload_hash, connector_id, environment,
+                    state, expires_at, request_json
+                ) VALUES ('req_collision_two', ?, ?, ?, ?, ?, ?)
+                """,
+                ("c" * 64, *row),
+            )
+    finally:
+        connection.close()
+
+    assert second.database_path == first.database_path
+    assert any(
+        name.startswith("requests_v2_replay_blocking_hash_")
+        and table == "requests"
+        and "WHERE" in sql
+        and "outcome_unknown" in sql
+        for name, table, sql in indexes
+        if sql is not None
+    )
+    assert any(
+        name == "requests_v2_replay_blocking_hash"
+        and table == "requests_v1_archive"
+        for name, table, _ in indexes
+    )
+
+
+def test_v2_initialization_replaces_malformed_live_replay_index_definition(
+    repository_context: RepositoryContext,
+) -> None:
+    database = repository_context.cache_dir / "requests.sqlite"
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE requests (
+                request_id TEXT PRIMARY KEY,
+                payload_hash TEXT NOT NULL,
+                connector_id TEXT NOT NULL,
+                environment TEXT NOT NULL,
+                state TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                request_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX requests_v2_replay_blocking_hash
+            ON requests (payload_hash)
+            """
+        )
+        connection.execute("PRAGMA user_version=2")
+        connection.commit()
+    finally:
+        connection.close()
+
+    LocalRequestStore(repository_context)
+
+    connection = sqlite3.connect(database)
+    try:
+        expiry = (datetime.now(UTC) + PREVIEW_TTL).isoformat()
+        base = ("d" * 64, "flowaccount", "production", expiry, "{}")
+        connection.execute(
+            "INSERT INTO requests VALUES (?, ?, ?, ?, 'awaiting_confirmation', ?, ?)",
+            ("req_pending_one", *base),
+        )
+        connection.execute(
+            "INSERT INTO requests VALUES (?, ?, ?, ?, 'awaiting_confirmation', ?, ?)",
+            ("req_pending_two", *base),
+        )
+        connection.execute(
+            "INSERT INTO requests VALUES (?, ?, ?, ?, 'executing', ?, ?)",
+            ("req_executing_one", *base),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO requests VALUES (?, ?, ?, ?, 'executing', ?, ?)",
+                ("req_executing_two", *base),
+            )
+    finally:
+        connection.close()
+
+
 def test_canonical_payload_hash_is_deterministic_json() -> None:
     first = canonical_payload_hash({"z": [2, {"b": True, "a": "Thai"}], "a": 1})
     second = canonical_payload_hash({"a": 1, "z": [2, {"a": "Thai", "b": True}]})
@@ -312,6 +491,8 @@ def test_prepared_request_is_immutable_bound_and_auth_is_not_in_the_hash(
         "risk_tier": int(prepared_request.risk_tier),
         "approval_level": prepared_request.approval_level.value,
         "mutation_class": prepared_request.mutation_class.value,
+        "credential_revision": _CREDENTIAL_REVISION,
+        "preflight_actions": [],
     }
     serialized = prepared_request.model_dump(mode="json")
     assert "required_confirmations" not in serialized
@@ -573,6 +754,20 @@ def test_from_template_enforces_effective_runtime_risk_floor(
         ("risk_tier", RiskTier.HIGH_RISK, "payload_hash_mismatch"),
         ("approval_level", ApprovalLevel.ELEVATED, "payload_hash_mismatch"),
         ("mutation_class", MutationClass.SENSITIVE, "payload_hash_mismatch"),
+        ("credential_revision", "e" * 64, "payload_hash_mismatch"),
+        (
+            "preflight_actions",
+            [
+                {
+                    "action_id": "act_preflight",
+                    "version_id": "av_preflight",
+                    "connector_id": "flowaccount",
+                    "method": "GET",
+                    "path_template": "/invoices",
+                }
+            ],
+            "payload_hash_mismatch",
+        ),
     ],
 )
 def test_model_validation_rejects_changed_binding_field(
@@ -643,6 +838,8 @@ def test_public_request_state_exposes_summary_shape_without_business_values(
     assert "customer" in str(public)
     assert public["sanitized_summary"]["document_type"] == "[REDACTED]"
     assert public["response_summary"]["invoice_number"] == "[REDACTED]"
+    assert "credential_revision" not in public
+    assert "preflight_actions" not in public
 
 
 def test_public_summary_drops_sensitive_values_encoded_as_dynamic_keys(
@@ -1020,6 +1217,20 @@ def test_store_rejects_tampered_json_without_echoing_request_inputs(
         ("risk_tier", 2, None),
         ("approval_level", ApprovalLevel.ELEVATED, None),
         ("mutation_class", MutationClass.SENSITIVE, None),
+        ("credential_revision", "e" * 64, None),
+        (
+            "preflight_actions",
+            [
+                {
+                    "action_id": "act_preflight",
+                    "version_id": "av_preflight",
+                    "connector_id": "flowaccount",
+                    "method": "GET",
+                    "path_template": "/invoices",
+                }
+            ],
+            None,
+        ),
     ],
 )
 def test_store_rejects_coordinated_json_and_column_binding_tampering(

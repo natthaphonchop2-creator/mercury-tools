@@ -23,7 +23,11 @@ from mercury_tools.catalog.identity import deep_freeze
 from mercury_tools.catalog.models import CatalogAction, HttpMethod, revalidate_catalog_action
 from mercury_tools.catalog.schema_contract import validate_required_schema_contract
 from mercury_tools.drivers.models import AuthContext
-from mercury_tools.execution.models import canonical_payload_hash, render_action_path
+from mercury_tools.execution.models import (
+    PreflightActionBinding,
+    canonical_payload_hash,
+    render_action_path,
+)
 from mercury_tools.execution.policy import effective_risk
 
 _INPUT_SECTIONS = frozenset({"path", "query", "headers", "body", "files"})
@@ -127,6 +131,38 @@ class RequestTemplate:
 
     def payload_hash(self) -> str:
         return canonical_payload_hash(self.binding_payload())
+
+    def approval_binding_payload(
+        self,
+        *,
+        credential_revision: str,
+        preflight_actions: Sequence[PreflightActionBinding],
+    ) -> dict[str, Any]:
+        if self.method == HttpMethod.GET.value:
+            raise RequestBuildError("read_action_has_no_approval_binding")
+        payload = self.binding_payload()
+        payload.update(
+            {
+                "credential_revision": credential_revision,
+                "preflight_actions": [
+                    item.binding_payload for item in preflight_actions
+                ],
+            }
+        )
+        return payload
+
+    def approval_payload_hash(
+        self,
+        *,
+        credential_revision: str,
+        preflight_actions: Sequence[PreflightActionBinding],
+    ) -> str:
+        return canonical_payload_hash(
+            self.approval_binding_payload(
+                credential_revision=credential_revision,
+                preflight_actions=preflight_actions,
+            )
+        )
 
     def to_httpx_request(self, auth: AuthContext) -> httpx.Request:
         if not isinstance(auth, AuthContext):

@@ -31,24 +31,26 @@ unsafe targets and redirects, and does not accept arbitrary per-request URLs.
 
 1. Call `search_erp_actions` with the requested capability or endpoint intent.
 2. Call `get_erp_action_schema` for the selected action and inspect the input
-   contract, effective risk tier, and confirmation count.
+   contract, mutation class, and approval level.
 3. Use `run_erp_read` only for an effective Tier 0 GET action.
 4. Use the preview and confirmation sequence below for every mutation.
 
 Importing a spec does not authorize a write. It only makes local actions
 available for selection and review.
 
-## Risk Tiers And Confirmation
+## Mutation Classes And One Immutable Approval
 
-| Effective tier | Required sequence |
-| --- | --- |
-| 0 | `run_erp_read` for a safe GET action. |
-| 1 | `preview_erp_write`, one distinct explicit user confirmation, `confirm_erp_write`, then `execute_erp_write` once. |
-| 2 | `preview_erp_write`, first distinct explicit user confirmation and `confirm_erp_write`, then a second distinct explicit confirmation and `confirm_erp_write`, then `execute_erp_write` once. |
+| Mutation class | Approval level | Required sequence |
+| --- | --- | --- |
+| Safe read | None | `run_erp_read` for a safe GET action. |
+| Create or update | Standard | `preview_erp_write`, one distinct explicit user approval, `confirm_erp_write` once, then `execute_erp_write` once. |
+| Sensitive | Elevated | `preview_erp_write`, one distinct explicit user approval, `confirm_erp_write` once, then `execute_erp_write` once. |
 
 The returned `request_id` and `payload_hash` bind the action version, target,
-inputs, and attachments. Do not alter inputs, substitute a hash, reuse a stale
-preview, self-confirm, or execute a request more than once.
+inputs, attachments, credential revision, and preflight action versions. Internal
+credential and dependency revisions are never returned. Do not alter inputs,
+substitute a hash, reuse a stale preview, self-confirm, or execute a request more
+than once.
 
 ## Unknown Outcomes
 

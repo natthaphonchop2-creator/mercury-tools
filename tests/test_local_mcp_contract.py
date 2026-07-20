@@ -1066,6 +1066,20 @@ def _public_read_action(action_factory, **overrides):
     return action_factory(**values)
 
 
+def test_action_projections_expose_v03_approval_fields_not_legacy_prompt_counts(
+    action_factory,
+) -> None:
+    action = action_factory(observed_state="success")
+
+    summary = local_server._action_summary(action)
+    schema = local_server._public_action_schema(action)
+
+    for payload in (summary, schema):
+        assert payload["approval_level"] == "standard"
+        assert payload["mutation_class"] == "create"
+        assert "required_confirmations" not in payload
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["offline", "not_modified", "server_error"])
 async def test_runtime_refresh_uses_global_cache_and_merges_local_overlay_in_memory(

@@ -577,7 +577,7 @@ def test_cross_mcp_catalog_migration_matches_exact_public_seed_metadata() -> Non
     assert actual == expected
 
 
-def test_journal_skill_branches_every_mutation_on_returned_risk_contract() -> None:
+def test_journal_skill_uses_one_immutable_approval_for_every_mutation() -> None:
     text = skill_text("flowaccount-journal-posting-th")
     common_order = (
         "required accounting context",
@@ -585,33 +585,42 @@ def test_journal_skill_branches_every_mutation_on_returned_risk_contract() -> No
         "search_erp_actions",
         "get_erp_action_schema",
         "preview_erp_write",
-        "returned `risk_tier` and `required_confirmations`",
+        "returned `approval_level` and `mutation_class`",
     )
-    tier_one_order = (
-        "Tier 1",
-        "one distinct explicit user confirmation",
+    approval_order = (
+        "standard or elevated",
+        "one distinct explicit user approval",
         "request_id",
         "payload_hash",
-        "confirm_erp_write",
-        "execute_erp_write",
-    )
-    tier_two_order = (
-        "risk_tier >= 2 or `required_confirmations >= 2`",
-        "same fresh bound preview",
-        "first distinct explicit user confirmation",
-        "first `confirm_erp_write`",
-        "second distinct explicit user confirmation",
-        "second `confirm_erp_write`",
-        "execute_erp_write",
+        "`confirm_erp_write` exactly once",
+        "`execute_erp_write` exactly once",
     )
 
     assert_terms_in_order(text, common_order)
-    assert_terms_in_order(text, tier_one_order)
-    assert_terms_in_order(text, tier_two_order)
+    assert_terms_in_order(text, approval_order)
     assert "for every journal mutation, not only approval" in text.lower()
-    assert "Call `execute_erp_write` exactly once" in text
     assert "get_erp_request_status" in text
     assert "never replay or retry" in text
+    assert "required_confirmations" not in text
+    assert "second distinct explicit" not in text
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ROOT / "README.md",
+        ROOT / "docs/ACTION_CATALOG.md",
+        ROOT / "docs/JUDGE_QUICKSTART.md",
+    ],
+)
+def test_current_write_guides_describe_one_immutable_approval(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    lowered = text.casefold()
+
+    assert "one immutable approval" in lowered
+    assert "one or two distinct confirmations" not in lowered
+    assert "second distinct explicit confirmation" not in lowered
+    assert "required confirmation count" not in lowered
 
 
 def test_journal_skill_discards_invalidated_previews_before_restarting() -> None:
@@ -629,7 +638,7 @@ def test_journal_skill_discards_invalidated_previews_before_restarting() -> None
         "redo `search_erp_actions`",
         "get_erp_action_schema",
         "fresh `preview_erp_write`",
-        "collect confirmations again",
+        "collect one new approval",
     )
 
     assert all(cause in text for cause in invalidation_causes)

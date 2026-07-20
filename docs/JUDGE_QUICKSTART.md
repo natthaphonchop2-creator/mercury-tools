@@ -58,11 +58,12 @@ read, and returns no credential value or raw authorization data.
 This command stops at `preview_erp_write`; it must not confirm or execute:
 
 ```bash
-codex exec 'Use only the mercury-finance MCP. Search PEAK actions for POST /invoices, call get_erp_action_schema, ask me for any required demo business fields, then call preview_erp_write exactly once. Show the risk tier, preview hash, expiry, and required confirmation count. Stop before confirm_erp_write or execute_erp_write.'
+codex exec 'Use only the mercury-finance MCP. Search PEAK actions for POST /invoices, call get_erp_action_schema, ask me for any required demo business fields, then call preview_erp_write exactly once. Show the mutation class, approval level, preview hash, and expiry. Stop before confirm_erp_write or execute_erp_write.'
 ```
 
-A preview is not a provider mutation. Do not continue unless a judge explicitly
-requests the separate approval steps and is using a disposable environment.
+A preview is not a provider mutation. Every standard or elevated mutation requires
+one immutable approval. Do not continue unless a judge explicitly supplies that
+approval and is using a disposable environment.
 
 ## 5. Run A Cross-MCP Reconciliation Demo
 

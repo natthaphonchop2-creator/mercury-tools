@@ -89,9 +89,11 @@ uv run mercury credentials clear flowaccount --env sandbox --repo-root .
 
 Use `search_erp_actions` and `get_erp_action_schema` before executing an action.
 Tier 0 safe reads run through `run_erp_read`. Tier 1 and Tier 2 mutations start
-with `preview_erp_write`, then require one or two distinct confirmations before
-`execute_erp_write` can run once. Imported API specifications and trusted-host
-decisions remain repository-local.
+with `preview_erp_write`, then require one immutable approval before
+`confirm_erp_write` and a single `execute_erp_write` call. Standard and elevated
+mutations use the same one-approval count; the level describes approval severity,
+not an extra prompt. Imported API specifications and trusted-host decisions remain
+repository-local.
 
 When a provider outcome is unknown, call `get_erp_request_status` and reconcile
 with an approved safe status action or manually. Do not retry the mutation.

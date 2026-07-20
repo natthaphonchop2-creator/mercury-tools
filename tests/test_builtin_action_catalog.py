@@ -4,6 +4,7 @@ import json
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
+from runpy import run_path
 
 from mercury_tools.catalog.models import (
     CatalogAction,
@@ -12,10 +13,12 @@ from mercury_tools.catalog.models import (
     revalidate_catalog_source,
 )
 from mercury_tools.cloud.models import validate_public_catalog_action
+from mercury_tools.execution.policy import effective_risk
 from mercury_tools.execution.request_builder import build_request
 from mercury_tools.rag.chunking import chunk_document, document_from_markdown
 
 ROOT = Path(__file__).resolve().parents[1]
+_build_actions = run_path(str(ROOT / "scripts/build_builtin_catalog.py"))["_build_actions"]
 
 
 def load_actions(connector: str) -> list[dict[str, object]]:
@@ -53,6 +56,32 @@ def test_peak_catalog_preserves_all_documented_actions() -> None:
     assert Counter(item["method"] for item in actions) == {"GET": 20, "POST": 44}
     identities = {(item["action_id"], item["version_id"]) for item in actions}
     assert len(identities) == 64
+
+
+def test_catalog_builder_applies_mutation_policy_only_to_writes() -> None:
+    source = revalidate_catalog_source(
+        CatalogSource.model_validate(load_source("flowaccount"))
+    )
+    catalog = load_actions("flowaccount")
+    drafts = [
+        next(action for action in catalog if action["method"] == "GET"),
+        next(action for action in catalog if action["method"] == "POST"),
+    ]
+
+    read, write = sorted(
+        _build_actions("flowaccount", drafts, source),
+        key=lambda action: action.method.value,
+    )
+    if read.method.value != "GET":
+        read, write = write, read
+    decision = effective_risk(write)
+
+    assert read.method.value == "GET"
+    assert read.risk_tier.value == 0
+    assert read.required_confirmations == 0
+    assert write.method.value == "POST"
+    assert write.risk_tier is decision.tier
+    assert write.required_confirmations == int(decision.tier)
 
 
 def test_every_action_has_valid_identity_routing_and_safety_metadata() -> None:
