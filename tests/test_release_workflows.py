@@ -26,6 +26,9 @@ ACTIVE_RELEASE_WORKFLOW = "release-v0.3.0.yml"
 ACTIVE_RELEASE_VERSION = "0.3.0"
 ACTIVE_RELEASE_TAG = "v0.3.0"
 ACTIVE_TEST_WAIVERS = "docs/release/v0.3.0-test-waivers.json"
+POST_PUBLIC_SETUP_NODE_SHA = "49933ea5288caeca8642d1e84afbd3f7d6820020"
+POST_PUBLIC_NODE_VERSION = "22.22.0"
+POST_PUBLIC_CODEX_PACKAGE = "@openai/codex@0.144.6"
 
 
 def _workflow(name: str) -> dict[str, Any]:
@@ -897,3 +900,36 @@ def test_post_public_workflow_is_anonymous_and_exact_release_bound() -> None:
     assert f"--release {ACTIVE_RELEASE_TAG}" in command
     assert "--expected-hosted-tools 24" in command
     assert "GH_TOKEN" not in json.dumps(payload["jobs"]["verify-public"].get("env", {}))
+
+
+def test_post_public_workflow_provisions_pinned_codex_before_public_verification() -> None:
+    payload = _workflow("post-public-verify.yml")
+    job = payload["jobs"]["verify-public"]
+    steps = job["steps"]
+
+    setup_node_steps = [
+        step
+        for step in steps
+        if step.get("uses") == f"actions/setup-node@{POST_PUBLIC_SETUP_NODE_SHA}"
+    ]
+    assert len(setup_node_steps) == 1
+    setup_node = setup_node_steps[0]
+    assert setup_node["with"]["node-version"] == POST_PUBLIC_NODE_VERSION
+
+    install_steps = [
+        step
+        for step in steps
+        if step.get("run", "").strip() == f"npm install -g {POST_PUBLIC_CODEX_PACKAGE}"
+    ]
+    assert len(install_steps) == 1
+
+    version_steps = [step for step in steps if step.get("run", "").strip() == "codex --version"]
+    assert len(version_steps) == 1
+
+    verifier_index = next(
+        index
+        for index, step in enumerate(steps)
+        if "scripts/verify_public_release.py" in step.get("run", "")
+    )
+    assert steps.index(setup_node) < steps.index(install_steps[0]) < steps.index(version_steps[0])
+    assert steps.index(version_steps[0]) < verifier_index

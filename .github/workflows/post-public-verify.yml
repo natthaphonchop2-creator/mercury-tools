@@ -25,6 +25,14 @@ jobs:
         with:
           version: 0.11.9
           enable-cache: true
+      - name: Set up Node.js 22.22.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.22.0
+      - name: Install Codex CLI 0.144.6
+        run: npm install -g @openai/codex@0.144.6
+      - name: Verify Codex CLI
+        run: codex --version
       - name: Verify anonymous clone, assets, plugin, MCP, and quickstart
         run: |
           set -euo pipefail
