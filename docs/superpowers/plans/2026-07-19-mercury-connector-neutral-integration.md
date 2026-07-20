@@ -750,10 +750,12 @@ git commit -m "refactor: split public Mercury flow sources"
 - Create: `src/mercury_tools/skills/catalog.py`
 - Create: `src/mercury_tools/skills/routing.py`
 - Create: `tests/test_skill_routing.py`
+- Modify: `src/mercury_tools/connectors/catalog.py`
 - Modify: `src/mercury_tools/db/product.py`
 - Modify: `src/mercury_tools/mercury_runtime.py`
 - Modify: `src/mercury_tools/mcp/server.py`
 - Modify: `src/mercury_tools/mcp/schemas.py`
+- Modify: `tests/test_connector_catalog.py`
 - Modify: `tests/test_connector_mcp_tools.py`
 - Modify: `tests/test_plugin_package.py`
 - Modify: `plugins/mercury-finance/skills/company-health-check-th/SKILL.md`
@@ -864,6 +866,18 @@ but host MCP server identifiers are not. Otherwise select the single ready
 profile satisfying all required capabilities. If multiple profiles qualify, return
 `connector_selection_required` with sanitized choices rather than choosing a
 preferred vendor.
+
+Apply the same ambiguity rule when multiple `local_bridge` profiles remain:
+never select the first sorted environment. A single Local Bridge profile may
+return `local_bridge_required`; multiple profiles return exact tuple choices.
+Treat a native MCP profile without a safe `external_server_name` as
+`not_validated`, even if malformed persistence data marks it ready.
+
+Canonical optional capabilities must resolve through connector manifests, not
+Skill code. At minimum map FlowAccount `tax.vat.summary.read` to
+`tax.vat_summary.read` for its API-driver mode and PEAK `journal.read` to
+`daily_journal.get`; do not claim these capabilities for provider modes that do
+not declare the underlying action.
 
 For native MCP profiles, ordered steps name provider capabilities and tell the host to invoke the already-connected provider tools. For API drivers, return the advanced local Mercury handoff. For Local Bridge, return `local_bridge_required`.
 
