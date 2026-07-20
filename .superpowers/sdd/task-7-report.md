@@ -31,6 +31,16 @@ public MCP action projection without legacy prompt count: 1 failed
 malformed full unique live replay index repair: 1 failed
 ```
 
+The schema-contract follow-up exposed a v2 database with matching column names
+but invalid SQLite metadata. Before implementation, all six initial structural
+cases were accepted or reached index creation instead of failing with the stable
+schema error:
+
+```text
+uv run pytest -q tests/test_request_store.py -k 'malformed_request_table_contract or allows_duplicate_request_ids'
+6 failed, 81 deselected in 0.22s
+```
+
 ## Fixes
 
 - Prepared mutation requests now bind an opaque, process-internal credential
@@ -46,9 +56,12 @@ malformed full unique live replay index repair: 1 failed
   sensitive. Matrix coverage includes exact+untested, inferred+success,
   inferred+untested, and observed exact actions.
 - SQLite v1-to-v2 migration chooses deterministic non-overwriting archive names,
-  validates the live v2 schema, and verifies replay-index ownership, uniqueness,
-  columns, and predicate. Colliding legacy names receive deterministic suffixes;
-  malformed app-owned live indexes are repaired. Repeated initialization is safe.
+  validates the exact live v2 table contract through `PRAGMA table_info` and
+  `PRAGMA table_xinfo` (order, names, declared type/affinity, null/default
+  semantics, primary-key position, and hidden columns), and verifies replay-index
+  ownership, uniqueness, columns, and predicate. Colliding legacy names receive
+  deterministic suffixes; malformed app-owned live indexes are repaired. Repeated
+  initialization is safe.
 - The built-in catalog generator treats GET as read-only and uses v0.3 mutation
   fields. Current runtime action projections, plugin skill, README, catalog docs,
   and judge guide describe one immutable approval with standard/elevated severity,
@@ -79,6 +92,28 @@ git diff --check
 exit 0 (no output)
 ```
 
+Schema-contract follow-up verification:
+
+```text
+uv run pytest -q tests/test_request_store.py -k 'malformed_request_table_contract or allows_duplicate_request_ids or fresh_request_store_uses_v2_schema or v1_migration or v2_initialization'
+14 passed, 75 deselected in 0.27s
+
+uv run pytest -q tests/test_request_store.py
+89 passed in 1.58s
+
+uv run pytest -q tests/test_execution_policy.py tests/test_request_store.py tests/test_erp_executor.py tests/test_local_audit.py
+229 passed in 11.04s
+
+uv run pytest -q tests/test_local_mcp_contract.py tests/test_local_mcp_roots.py tests/test_connector_driver_contract.py tests/test_generic_drivers.py tests/test_sandbox_execution_manifest.py tests/integration/test_local_erp_mcp.py
+229 passed, 2 skipped in 16.19s
+
+uv run ruff check .
+All checks passed!
+
+git diff --check
+exit 0 (no output)
+```
+
 A full suite was started, then intentionally stopped at the user's instruction
 once focused suites were green. At interruption it was at 24% with 1,465 passed,
 13 skipped, one deprecation warning, and no failures. This is partial evidence,
@@ -91,4 +126,6 @@ therefore fails closed after process restart even when credential content is
 unchanged; the user must prepare and approve a new immutable request. The full
 suite was not completed, but all required Task 7 and adjacent credential,
 catalog, skill, plugin, audit, MCP, driver, manifest, and integration suites above
-completed without failures.
+completed without failures. The v2 contract intentionally preserves the shipped
+`request_id TEXT PRIMARY KEY` declaration for migration compatibility; a future
+schema revision would be required to add an explicit `NOT NULL` declaration.

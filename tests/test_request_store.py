@@ -192,6 +192,33 @@ def seed_v1_request_store(
     return request_id, payload_hash
 
 
+def seed_v2_request_store(
+    repository_context: RepositoryContext,
+    *,
+    columns: str,
+) -> Path:
+    database = repository_context.cache_dir / "requests.sqlite"
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(f"CREATE TABLE requests ({columns})")
+        connection.execute("PRAGMA user_version=2")
+        connection.commit()
+    finally:
+        connection.close()
+    return database
+
+
+_V2_REQUEST_COLUMNS = """
+    request_id TEXT PRIMARY KEY,
+    payload_hash TEXT NOT NULL,
+    connector_id TEXT NOT NULL,
+    environment TEXT NOT NULL,
+    state TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    request_json TEXT NOT NULL
+"""
+
+
 @pytest.fixture
 def request_store(repository_context: RepositoryContext) -> LocalRequestStore:
     return LocalRequestStore(repository_context)
@@ -223,6 +250,83 @@ def test_fresh_request_store_uses_v2_schema(
     assert version == 2
     assert "requests" in tables
     assert "requests_v1_archive" not in tables
+
+
+@pytest.mark.parametrize(
+    "columns",
+    [
+        _V2_REQUEST_COLUMNS.replace(
+            "payload_hash TEXT NOT NULL", "payload_hash BLOB NOT NULL"
+        ),
+        _V2_REQUEST_COLUMNS.replace(
+            "payload_hash TEXT NOT NULL", "payload_hash VARCHAR(64) NOT NULL"
+        ),
+        _V2_REQUEST_COLUMNS.replace("expires_at TEXT NOT NULL", "expires_at TEXT"),
+        _V2_REQUEST_COLUMNS.replace(
+            "state TEXT NOT NULL",
+            "state TEXT NOT NULL DEFAULT 'awaiting_confirmation'",
+        ),
+        _V2_REQUEST_COLUMNS.replace("request_id TEXT PRIMARY KEY", "request_id TEXT NOT NULL"),
+        _V2_REQUEST_COLUMNS.replace(
+            "request_id TEXT PRIMARY KEY,\n    payload_hash TEXT NOT NULL",
+            "request_id TEXT NOT NULL,\n    payload_hash TEXT PRIMARY KEY",
+        ),
+        _V2_REQUEST_COLUMNS
+        + ",\n    archived_hash TEXT GENERATED ALWAYS AS (payload_hash) VIRTUAL",
+    ],
+    ids=(
+        "wrong_affinity",
+        "wrong_declared_type",
+        "missing_required_not_null",
+        "unexpected_default",
+        "missing_request_id_primary_key",
+        "request_id_primary_key_position",
+        "hidden_generated_column",
+    ),
+)
+def test_v2_initialization_rejects_malformed_request_table_contract(
+    repository_context: RepositoryContext,
+    columns: str,
+) -> None:
+    seed_v2_request_store(repository_context, columns=columns)
+
+    with pytest.raises(RequestStateError, match="^request_store_schema_invalid$"):
+        LocalRequestStore(repository_context)
+
+
+def test_v2_initialization_rejects_table_that_allows_duplicate_request_ids(
+    repository_context: RepositoryContext,
+) -> None:
+    database = seed_v2_request_store(
+        repository_context,
+        columns=_V2_REQUEST_COLUMNS.replace(
+            "request_id TEXT PRIMARY KEY", "request_id TEXT NOT NULL"
+        ),
+    )
+    connection = sqlite3.connect(database)
+    try:
+        row = (
+            "a" * 64,
+            "flowaccount",
+            "production",
+            "executing",
+            "2026-07-20T00:00:00+00:00",
+            "{}",
+        )
+        connection.execute(
+            "INSERT INTO requests VALUES ('req_duplicate_identity', ?, ?, ?, ?, ?, ?)",
+            row,
+        )
+        connection.execute(
+            "INSERT INTO requests VALUES ('req_duplicate_identity', ?, ?, ?, ?, ?, ?)",
+            row,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RequestStateError, match="^request_store_schema_invalid$"):
+        LocalRequestStore(repository_context)
 
 
 def test_v1_migration_archives_approvals_without_making_them_executable(

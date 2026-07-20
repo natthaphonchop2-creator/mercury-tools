@@ -46,6 +46,18 @@ _REPLAY_INDEX_PATTERN = re.compile(
     r"'outcome_unknown'\s*\)\s*$",
     re.IGNORECASE,
 )
+_V2_REQUEST_TABLE_CONTRACT = (
+    (0, "request_id", "TEXT", "TEXT", False, None, 1),
+    (1, "payload_hash", "TEXT", "TEXT", True, None, 0),
+    (2, "connector_id", "TEXT", "TEXT", True, None, 0),
+    (3, "environment", "TEXT", "TEXT", True, None, 0),
+    (4, "state", "TEXT", "TEXT", True, None, 0),
+    (5, "expires_at", "TEXT", "TEXT", True, None, 0),
+    (6, "request_json", "TEXT", "TEXT", True, None, 0),
+)
+_V2_REQUEST_TABLE_XINFO_CONTRACT = tuple(
+    (*column, 0) for column in _V2_REQUEST_TABLE_CONTRACT
+)
 
 
 class RequestStateError(ValueError):
@@ -430,17 +442,34 @@ class LocalRequestStore:
 
     @staticmethod
     def _validate_v2_schema(connection: sqlite3.Connection) -> None:
-        columns = tuple(
-            row[1] for row in connection.execute("PRAGMA table_info(requests)").fetchall()
+        table_info = tuple(
+            (
+                row[0],
+                row[1],
+                row[2],
+                _sqlite_affinity(row[2]),
+                bool(row[3]),
+                row[4],
+                row[5],
+            )
+            for row in connection.execute('PRAGMA table_info("requests")').fetchall()
         )
-        if columns != (
-            "request_id",
-            "payload_hash",
-            "connector_id",
-            "environment",
-            "state",
-            "expires_at",
-            "request_json",
+        table_xinfo = tuple(
+            (
+                row[0],
+                row[1],
+                row[2],
+                _sqlite_affinity(row[2]),
+                bool(row[3]),
+                row[4],
+                row[5],
+                row[6],
+            )
+            for row in connection.execute('PRAGMA table_xinfo("requests")').fetchall()
+        )
+        if (
+            table_info != _V2_REQUEST_TABLE_CONTRACT
+            or table_xinfo != _V2_REQUEST_TABLE_XINFO_CONTRACT
         ):
             raise RequestStateError("request_store_schema_invalid")
 
@@ -865,6 +894,21 @@ class LocalRequestStore:
     def _rollback(connection: sqlite3.Connection) -> None:
         with suppress(sqlite3.Error):
             connection.execute("ROLLBACK")
+
+
+def _sqlite_affinity(declared_type: object) -> str:
+    if not isinstance(declared_type, str):
+        return "invalid"
+    normalized = declared_type.upper()
+    if "INT" in normalized:
+        return "INTEGER"
+    if any(token in normalized for token in ("CHAR", "CLOB", "TEXT")):
+        return "TEXT"
+    if "BLOB" in normalized or not normalized:
+        return "BLOB"
+    if any(token in normalized for token in ("REAL", "FLOA", "DOUB")):
+        return "REAL"
+    return "NUMERIC"
 
 
 def _payload_hash(value: str) -> bool:
