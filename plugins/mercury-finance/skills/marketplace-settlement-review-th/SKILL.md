@@ -5,6 +5,20 @@ description: Use when the user asks to review marketplace orders, fees, payouts,
 
 # Marketplace Settlement Review TH
 
+## Catalog contract
+
+Call `get_accounting_skill_schema` with
+`skill_id=marketplace-settlement-review-th`, then call `run_accounting_skill` with the same
+Skill ID and validated inputs. Inspect `connector_status` for the workspace first. Ask the user
+to select only when the route returns `connector_selection_required`. Follow returned
+`ordered_steps`: let the host invoke connected provider tools for `native_mcp`, use the
+advanced local handoff for `api_driver`, and stop for setup on `local_bridge`.
+
+Do not duplicate capability or provider mappings in this Skill. Preserve returned citations
+and evidence references, include accountant review points, and shape the final result using
+the returned `output_schema_name`. Mercury does not own provider, Google, ecommerce,
+marketplace, or bank OAuth tokens; the host invokes those connected tools.
+
 Follow these gates in order. Do not skip, reorder, or continue past a stop condition.
 
 1. Call `connector_status`. Stop if the required ERP capability or credentials are unavailable.

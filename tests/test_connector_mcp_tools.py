@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
+import pytest
 from starlette.testclient import TestClient
 
 from mercury_tools.config import Settings
@@ -108,6 +110,141 @@ def test_connector_id_accepts_generic_mcp() -> None:
     payload = AccountingSkillInputs(connector_id="generic_mcp")
 
     assert payload.connector_id == "generic_mcp"
+
+
+def test_accounting_skill_public_tools_have_exact_signatures_and_closed_discovery() -> None:
+    from mercury_tools.mcp.server import (
+        get_accounting_skill_schema,
+        list_accounting_skills,
+        run_accounting_skill,
+    )
+
+    assert list(inspect.signature(list_accounting_skills).parameters) == []
+    assert list(inspect.signature(get_accounting_skill_schema).parameters) == ["skill_id"]
+    run_parameters = inspect.signature(run_accounting_skill).parameters
+    assert list(run_parameters) == [
+        "workspace_id",
+        "skill_id",
+        "inputs",
+        "evidence_mode",
+    ]
+    assert run_parameters["evidence_mode"].default is False
+
+    listed = list_accounting_skills()
+    schema = get_accounting_skill_schema("company-health-check-th")
+
+    assert listed["status"] == "ok"
+    company_health = next(
+        item for item in listed["skills"] if item["skill_id"] == "company-health-check-th"
+    )
+    assert company_health["required_capabilities"] == ["company.read"]
+    assert company_health["optional_capabilities"] == [
+        "documents.invoice.list",
+        "tax.vat.summary.read",
+    ]
+    assert schema["required"] == ["query"]
+    assert "workspace_id" not in schema["properties"]
+
+
+def test_run_accounting_skill_routes_workspace_profile_and_explicit_connector(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    configure_product_env(monkeypatch)
+    audit_events: list[dict[str, Any]] = []
+
+    class FakeStore:
+        def public_dashboard(self, workspace_id: str) -> dict[str, Any]:
+            assert workspace_id == make_workspace_id()
+            return {
+                "connector_profiles": [
+                    {
+                        "connector_id": "flowaccount",
+                        "connection_mode": "api_driver",
+                        "environment": "production",
+                        "status": "ready_read_only",
+                        "capability_states": {"company.info.read": "observed"},
+                        "evidence_source": "api_driver_safe_probe",
+                        "validated_at": "2026-07-19T12:00:00+00:00",
+                    },
+                    {
+                        "connector_id": "peak",
+                        "connection_mode": "api_driver",
+                        "environment": "production",
+                        "status": "ready_read_only",
+                        "capability_states": {"user.info.read": "observed"},
+                        "evidence_source": "api_driver_safe_probe",
+                        "validated_at": "2026-07-19T12:00:00+00:00",
+                    },
+                ]
+            }
+
+    monkeypatch.setattr(server, "_product_store", lambda settings=None: FakeStore())
+    monkeypatch.setattr(server, "_audit", lambda *args: audit_events.append(args))
+
+    payload = server.run_accounting_skill(
+        workspace_id=make_workspace_id(),
+        skill_id="company-health-check-th",
+        inputs={"query": "Review this company", "connector_id": "peak"},
+    )
+
+    assert payload["status"] == "ready"
+    assert payload["selected_profile"] == {
+        "connector_id": "peak",
+        "connection_mode": "api_driver",
+        "environment": "production",
+    }
+    assert payload["validated_inputs"] == {
+        "query": "Review this company",
+        "connector_id": "peak",
+    }
+    assert payload["skill_markdown"]
+    assert len(audit_events) == 1
+    assert make_workspace_id() not in str(audit_events)
+    assert "Review this company" not in str(audit_events)
+
+
+@pytest.mark.parametrize(
+    "inputs",
+    [
+        {},
+        {"query": "Review", "parameters": [{"name": "unknown", "value": "x"}]},
+        {
+            "query": "Review",
+            "parameters": [{"name": "query", "value": "duplicate"}],
+        },
+        {
+            "query": "Review",
+            "parameters": [{"name": "client_secret", "value": "marker"}],
+        },
+    ],
+)
+def test_run_accounting_skill_rejects_invalid_skill_inputs_before_audit(
+    monkeypatch,
+    inputs: dict[str, Any],
+) -> None:
+    from mercury_tools.mcp import server
+
+    audit_events: list[object] = []
+    monkeypatch.setattr(server, "_audit", lambda *args: audit_events.append(args))
+    monkeypatch.setattr(
+        server,
+        "_product_store",
+        lambda settings=None: pytest.fail("invalid Skill input reached workspace storage"),
+    )
+
+    payload = server.run_accounting_skill(
+        workspace_id=make_workspace_id(),
+        skill_id="company-health-check-th",
+        inputs=inputs,
+    )
+
+    assert payload == {
+        "status": "error",
+        "message": "Accounting skill inputs are invalid.",
+    }
+    assert audit_events == []
 
 
 def test_get_connector_setup_exposes_native_mcp_and_secretless_api_driver_guidance() -> None:

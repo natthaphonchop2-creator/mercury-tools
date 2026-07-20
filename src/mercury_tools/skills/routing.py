@@ -1,0 +1,326 @@
+"""Deterministic connector-profile routing for accounting Skills."""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+from mercury_tools.connectors.catalog import CapabilityState, connector_by_id
+from mercury_tools.skills.catalog import AccountingSkillDefinition
+
+_READY_PROFILE_STATUSES = frozenset({"ready_read_only", "ready_read_write"})
+_OBSERVED_CAPABILITY_STATES = frozenset({"observed", "enabled"})
+_SAFE_PROFILE_VALUE_RE = re.compile(r"^[A-Za-z0-9._ -]{1,200}$")
+
+
+def _clean_profile_value(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    clean = value.strip().lower()
+    return clean if _SAFE_PROFILE_VALUE_RE.fullmatch(clean) else None
+
+
+def _public_profile(profile: Mapping[str, Any]) -> dict[str, str] | None:
+    connector_id = _clean_profile_value(profile.get("connector_id"))
+    connection_mode = _clean_profile_value(profile.get("connection_mode"))
+    environment = _clean_profile_value(profile.get("environment"))
+    connector = connector_by_id(connector_id or "")
+    if (
+        connector is None
+        or connector.connection_mode(connection_mode or "") is None
+        or environment is None
+    ):
+        return None
+    return {
+        "connector_id": connector.connector_id,
+        "connection_mode": connection_mode or "",
+        "environment": environment,
+    }
+
+
+def _capability_states(profile: Mapping[str, Any]) -> dict[str, str]:
+    raw = profile.get("capability_states")
+    if not isinstance(raw, Mapping):
+        return {}
+    return {
+        capability: state
+        for key, value in raw.items()
+        if (capability := _clean_profile_value(key)) and (state := _clean_profile_value(value))
+    }
+
+
+def _capability_resolution(
+    profile: Mapping[str, Any],
+    capability: str,
+    *,
+    required: bool,
+) -> dict[str, Any]:
+    public_profile = _public_profile(profile)
+    if public_profile is None:
+        return {
+            "capability": capability,
+            "provider_capabilities": [],
+            "required": required,
+            "state": "not_validated",
+        }
+    connector = connector_by_id(public_profile["connector_id"])
+    assert connector is not None
+    mode = connector.connection_mode(public_profile["connection_mode"])
+    assert mode is not None
+    provider_capabilities = connector.provider_capabilities(
+        mode.mode.value,
+        capability,
+    )
+    observed_states = _capability_states(profile)
+    if (
+        not provider_capabilities
+        and mode.capability_source == "discovered_tools"
+        and capability in observed_states
+    ):
+        provider_capabilities = (capability,)
+    if not provider_capabilities or any(
+        mode.provider_capability_status.get(action) is CapabilityState.PROVIDER_UNAVAILABLE
+        for action in provider_capabilities
+    ):
+        state = "provider_capability_unavailable"
+    else:
+        action_states = [observed_states.get(action) for action in provider_capabilities]
+        if all(item in _OBSERVED_CAPABILITY_STATES for item in action_states):
+            state = "observed"
+        elif "provider_unavailable" in action_states:
+            state = "provider_capability_unavailable"
+        else:
+            state = next(
+                (
+                    item
+                    for item in action_states
+                    if item
+                    in {
+                        "not_authorized",
+                        "validation_failed",
+                        "environment_mismatch",
+                        "policy_confirmation_required",
+                    }
+                ),
+                "not_validated",
+            )
+    return {
+        "capability": capability,
+        "provider_capabilities": list(provider_capabilities),
+        "required": required,
+        "state": state,
+    }
+
+
+def _assess_profile(
+    skill: AccountingSkillDefinition,
+    profile: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    public_profile = _public_profile(profile)
+    if public_profile is None:
+        return None
+    if skill.required_connectors and public_profile["connector_id"] not in (
+        skill.required_connectors
+    ):
+        return {
+            "profile": profile,
+            "public_profile": public_profile,
+            "ready": False,
+            "reason": "connector_not_supported",
+            "capability_resolution": [],
+        }
+    if public_profile["connection_mode"] == "local_bridge":
+        return {
+            "profile": profile,
+            "public_profile": public_profile,
+            "ready": False,
+            "reason": "local_bridge_required",
+            "capability_resolution": [],
+        }
+
+    resolution = [
+        *(
+            _capability_resolution(profile, capability, required=True)
+            for capability in skill.required_capabilities
+        ),
+        *(
+            _capability_resolution(profile, capability, required=False)
+            for capability in skill.optional_capabilities
+        ),
+    ]
+    required_failure = next(
+        (item for item in resolution if item["required"] and item["state"] != "observed"),
+        None,
+    )
+    status = _clean_profile_value(profile.get("status"))
+    reason = required_failure["state"] if required_failure else None
+    if reason is None and status not in _READY_PROFILE_STATUSES:
+        reason = "not_authorized" if status == "requires_authorization" else "not_validated"
+    return {
+        "profile": profile,
+        "public_profile": public_profile,
+        "ready": reason is None,
+        "reason": reason,
+        "capability_resolution": resolution,
+    }
+
+
+def _native_host_plan(
+    assessment: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    profile = assessment["profile"]
+    public_profile = assessment["public_profile"]
+    required = [item for item in assessment["capability_resolution"] if item["required"]]
+    steps = [
+        {
+            "step": index,
+            "action": "invoke_provider_capability",
+            "capability": item["capability"],
+            "provider_capabilities": item["provider_capabilities"],
+        }
+        for index, item in enumerate(required, start=1)
+    ]
+    server_name = _clean_profile_value(profile.get("external_server_name"))
+    requirement = {
+        "connector_id": public_profile["connector_id"],
+        "external_server_name": server_name,
+        "provider_capabilities": sorted(
+            {
+                provider_capability
+                for item in required
+                for provider_capability in item["provider_capabilities"]
+            }
+        ),
+    }
+    return steps, [requirement]
+
+
+def _ready_route(
+    skill: AccountingSkillDefinition,
+    assessment: Mapping[str, Any],
+) -> dict[str, Any]:
+    public_profile = assessment["public_profile"]
+    if public_profile["connection_mode"] == "native_mcp":
+        ordered_steps, host_tool_requirements = _native_host_plan(assessment)
+    else:
+        ordered_steps = [
+            {
+                "step": 1,
+                "action": "advanced_local_handoff",
+                "connector_id": public_profile["connector_id"],
+                "environment": public_profile["environment"],
+                "tools": [
+                    "connector_status",
+                    "search_erp_actions",
+                    "get_erp_action_schema",
+                    "run_erp_read",
+                ],
+            }
+        ]
+        host_tool_requirements = []
+    return {
+        "status": "ready",
+        "skill_id": skill.skill_id,
+        "selected_profile": dict(public_profile),
+        "capability_resolution": assessment["capability_resolution"],
+        "ordered_steps": ordered_steps,
+        "host_tool_requirements": host_tool_requirements,
+    }
+
+
+def _local_bridge_route(
+    skill: AccountingSkillDefinition,
+    assessment: Mapping[str, Any],
+) -> dict[str, Any]:
+    public_profile = assessment["public_profile"]
+    return {
+        "status": "local_bridge_required",
+        "reason": "local_bridge_required",
+        "skill_id": skill.skill_id,
+        "selected_profile": dict(public_profile),
+        "capability_resolution": assessment["capability_resolution"],
+        "ordered_steps": [
+            {
+                "step": 1,
+                "action": "configure_local_bridge",
+                "connector_id": public_profile["connector_id"],
+                "environment": public_profile["environment"],
+            }
+        ],
+        "host_tool_requirements": [],
+    }
+
+
+def resolve_skill_route(
+    skill: AccountingSkillDefinition,
+    profiles: Sequence[Mapping[str, Any]],
+    requested_connector_id: str | None = None,
+) -> dict[str, Any]:
+    """Resolve one Skill without connector preference or external provider calls."""
+
+    selected_connector = _clean_profile_value(requested_connector_id)
+    assessments = [
+        assessment
+        for profile in profiles
+        if isinstance(profile, Mapping)
+        if (assessment := _assess_profile(skill, profile)) is not None
+        and (
+            selected_connector is None
+            or assessment["public_profile"]["connector_id"] == selected_connector
+        )
+    ]
+    assessments.sort(
+        key=lambda item: (
+            item["public_profile"]["connector_id"],
+            item["public_profile"]["connection_mode"],
+            item["public_profile"]["environment"],
+        )
+    )
+    ready = [item for item in assessments if item["ready"]]
+    if len(ready) > 1:
+        return {
+            "status": "connector_selection_required",
+            "skill_id": skill.skill_id,
+            "choices": [dict(item["public_profile"]) for item in ready],
+            "selected_profile": None,
+            "capability_resolution": [],
+            "ordered_steps": [],
+            "host_tool_requirements": [],
+        }
+    if len(ready) == 1:
+        return _ready_route(skill, ready[0])
+
+    local_bridge = next(
+        (item for item in assessments if item["reason"] == "local_bridge_required"),
+        None,
+    )
+    if local_bridge is not None:
+        return _local_bridge_route(skill, local_bridge)
+    if not assessments:
+        reason = (
+            "connector_profile_unavailable" if selected_connector else "connector_profile_required"
+        )
+        return {
+            "status": "unavailable",
+            "reason": reason,
+            "skill_id": skill.skill_id,
+            "selected_profile": None,
+            "capability_resolution": [],
+            "ordered_steps": [],
+            "host_tool_requirements": [],
+        }
+
+    failed = next(
+        (item for item in assessments if item["reason"] == "provider_capability_unavailable"),
+        assessments[0],
+    )
+    return {
+        "status": "unavailable",
+        "reason": failed["reason"],
+        "skill_id": skill.skill_id,
+        "selected_profile": dict(failed["public_profile"]),
+        "capability_resolution": failed["capability_resolution"],
+        "ordered_steps": [],
+        "host_tool_requirements": [],
+    }

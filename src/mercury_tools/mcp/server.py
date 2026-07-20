@@ -48,6 +48,7 @@ from mercury_tools.flows.workspace import discover_workspace_flows, workspace_ma
 from mercury_tools.mcp.schemas import (
     AccountingSkillId,
     AccountingSkillInputs,
+    AccountingSkillInputsInput,
     ConnectorConnectionMode,
     ConnectorEnvironment,
     ConnectorId,
@@ -65,6 +66,12 @@ from mercury_tools.mcp.schemas import (
     MercuryFlowSource,
     SearchMode,
     WorkspaceFlowMetadata,
+)
+from mercury_tools.mercury_runtime import (
+    get_accounting_skill_schema as runtime_accounting_skill_schema,
+)
+from mercury_tools.mercury_runtime import (
+    list_accounting_skills as runtime_accounting_skill_catalog,
 )
 from mercury_tools.mercury_runtime import skill_markdown
 from mercury_tools.product import (
@@ -87,6 +94,8 @@ from mercury_tools.rag.models import (
 from mercury_tools.rag.routing import apply_knowledge_routing, infer_knowledge_domain
 from mercury_tools.rag.service import MIN_RELEVANCE_SCORE, RagService
 from mercury_tools.safety.redaction import redact_json
+from mercury_tools.skills.catalog import accounting_skill_by_id
+from mercury_tools.skills.routing import resolve_skill_route
 from mercury_tools.workspaces import (
     normalize_public_workspace_id,
     public_workspace_token_payload,
@@ -116,6 +125,10 @@ _HOSTED_FLOW_ENVIRONMENT_SECRET_NAME_RE = re.compile(
     r"(?i)(?:secret|token|api[\W_]*key|password|authorization|"
     r"private[\W_]*key|service[\W_]*role[\W_]*key|credentials?|cookies?)"
 )
+_ACCOUNTING_SKILL_SECRET_NAME_RE = re.compile(
+    r"(?i)(?:secret|token|api[\W_]*key|password|authorization|"
+    r"private[\W_]*key|service[\W_]*role[\W_]*key|credentials?|cookies?)"
+)
 _EVIDENCE_SOURCE_BY_CONNECTION_MODE = {
     "native_mcp": "native_mcp_safe_read",
     "api_driver": "api_driver_safe_probe",
@@ -138,6 +151,7 @@ _MUTATION_CAPABILITY_SEGMENTS = frozenset(
         "void",
     }
 )
+_ACCOUNTING_SKILL_INPUTS_ADAPTER = TypeAdapter(AccountingSkillInputs)
 _CLOSED_READ = ToolAnnotations(
     readOnlyHint=True,
     destructiveHint=False,
@@ -325,6 +339,45 @@ def _invalid_hosted_inline_flow_payload(*, dry_run: bool) -> dict[str, Any]:
         "message": "Hosted inline flow YAML is invalid.",
         "dry_run": dry_run,
     }
+
+
+def _invalid_accounting_skill_inputs_payload() -> dict[str, str]:
+    return {
+        "status": "error",
+        "message": "Accounting skill inputs are invalid.",
+    }
+
+
+def _validated_accounting_skill_inputs(skill: Any, raw: Any) -> dict[str, Any]:
+    try:
+        envelope = _ACCOUNTING_SKILL_INPUTS_ADAPTER.validate_python(raw)
+    except ValidationError as exc:
+        raise ValueError("accounting_skill_inputs_invalid") from exc
+
+    envelope_payload = envelope.model_dump(mode="python")
+    if redact_json(envelope_payload) != envelope_payload:
+        raise ValueError("accounting_skill_inputs_invalid")
+
+    values = envelope.model_dump(
+        mode="python",
+        exclude={"parameters"},
+        exclude_none=True,
+        exclude_unset=True,
+    )
+    for parameter in envelope.parameters:
+        if _ACCOUNTING_SKILL_SECRET_NAME_RE.search(parameter.name):
+            raise ValueError("accounting_skill_inputs_invalid")
+        values[parameter.name] = parameter.value
+
+    try:
+        validated = skill.input_schema.model_validate(values)
+    except ValidationError as exc:
+        raise ValueError("accounting_skill_inputs_invalid") from exc
+    return validated.model_dump(
+        mode="json",
+        exclude_none=True,
+        exclude_unset=True,
+    )
 
 
 def _string_list_from_payload(raw: Any, *, label: str) -> list[str]:
@@ -2000,33 +2053,95 @@ def connector_status(
 
 
 @mcp.tool(annotations=_CLOSED_READ)
+def list_accounting_skills() -> dict[str, Any]:
+    """List canonical accounting Skills without reading workspace state."""
+
+    return {"status": "ok", "skills": runtime_accounting_skill_catalog()}
+
+
+@mcp.tool(annotations=_CLOSED_READ)
+def get_accounting_skill_schema(skill_id: AccountingSkillId) -> dict[str, Any]:
+    """Return one canonical Skill input schema without reading workspace state."""
+
+    schema = runtime_accounting_skill_schema(skill_id)
+    if schema is None:
+        return {"status": "not_found", "skill_id": skill_id}
+    return schema
+
+
+@mcp.tool(annotations=_CLOSED_READ)
 def run_accounting_skill(
+    workspace_id: str,
     skill_id: AccountingSkillId,
-    inputs: AccountingSkillInputs,
+    inputs: AccountingSkillInputsInput,
     evidence_mode: bool = False,
 ) -> dict[str, Any]:
-    """Return an accounting skill execution package for the host agent."""
-    input_payload = _model_payload(inputs)
-    markdown = skill_markdown(skill_id)
-    payload = redact_json(
-        {
-            "status": "ok" if markdown else "not_found",
-            "skill_id": skill_id,
-            "inputs": input_payload,
-            "evidence_mode": evidence_mode,
-            "skill_markdown": markdown,
-            "note": (
-                "v1 returns a guided skill package. Endpoint actions are gated by "
-                "connector capability, workflow preview, user approval, and audit policy."
-            ),
+    """Validate and route an accounting Skill for host-side execution."""
+
+    try:
+        normalized_workspace_id = normalize_public_workspace_id(workspace_id)
+    except (AttributeError, ValueError):
+        return {
+            "status": "error",
+            "message": "Invalid Mercury public workspace ID.",
         }
-    )
-    _audit(
-        "run_accounting_skill",
-        {"skill_id": skill_id, "inputs": input_payload},
-        {"status": payload["status"]},
-    )
-    return payload
+
+    skill = accounting_skill_by_id(skill_id)
+    if skill is None:
+        return {"status": "not_found", "skill_id": skill_id}
+    try:
+        validated_inputs = _validated_accounting_skill_inputs(skill, inputs)
+    except ValueError:
+        return _invalid_accounting_skill_inputs_payload()
+
+    audit_input = {
+        **_public_workspace_audit_ref(normalized_workspace_id),
+        "skill_id": skill.skill_id,
+        "input_fields": sorted(validated_inputs),
+        "evidence_mode": evidence_mode,
+    }
+    try:
+        dashboard = _product_store(load_settings()).public_dashboard(normalized_workspace_id)
+        profiles = public_connector_profiles(dashboard.get("connector_profiles") or [])
+        selected_environment = validated_inputs.get("environment")
+        if selected_environment:
+            profiles = [
+                profile
+                for profile in profiles
+                if profile.get("environment") == selected_environment
+            ]
+        route = resolve_skill_route(
+            skill,
+            profiles,
+            requested_connector_id=validated_inputs.get("connector_id"),
+        )
+        payload = redact_json(
+            {
+                **route,
+                "validated_inputs": validated_inputs,
+                "evidence_mode": evidence_mode,
+                "output_schema_name": skill.output_schema_name,
+                "skill_markdown": skill_markdown(skill.skill_id),
+                "note": (
+                    "Mercury returns an ordered host plan. Provider MCP, advanced local "
+                    "API-driver, and Local Bridge execution remain outside this hosted tool."
+                ),
+            }
+        )
+        _audit(
+            "run_accounting_skill",
+            audit_input,
+            {
+                "status": payload["status"],
+                "reason": payload.get("reason"),
+                "selected_connector": (payload.get("selected_profile") or {}).get("connector_id"),
+            },
+        )
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit("run_accounting_skill", audit_input, payload)
+        return payload
 
 
 @mcp.tool(annotations=_CLOSED_READ)

@@ -5,38 +5,21 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SkipValidation
+from pydantic import BaseModel, ConfigDict, Field, SkipValidation, model_validator
 
-ConnectorId = Literal["flowaccount", "peak", "express", "custom", "generic_mcp"]
-ConnectorEnvironment = Literal[
-    "production",
-    "sandbox",
-    "uat",
-    "local",
-    "gateway",
-    "user_supplied",
-]
+from mercury_tools.skills.catalog import (
+    ACCOUNTING_SKILL_IDS,
+    SkillConnectorId,
+    SkillEnvironment,
+)
+
+ConnectorId = SkillConnectorId
+ConnectorEnvironment = SkillEnvironment
 ConnectorConnectionMode = Literal["native_mcp", "api_driver", "local_bridge"]
 ConnectorUnlinkConfirmation = Literal["unlink"]
 SearchMode = Literal["hybrid", "keyword", "vector"]
 CAPABILITY_PATTERN = r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$"
-AccountingSkillId = Literal[
-    "accounts-payable-reconciliation-th",
-    "accounts-receivable-reconciliation-th",
-    "bank-settlement-reconciliation-th",
-    "company-health-check-th",
-    "connector-credential-setup-th",
-    "connector-setup-guide-th",
-    "flowaccount-connector-setup-th",
-    "flowaccount-journal-posting-th",
-    "invoice-review-th",
-    "management-report-th",
-    "marketplace-settlement-review-th",
-    "mercury-flow-runner",
-    "month-end-evidence-gathering-th",
-    "peak-connector-setup-th",
-    "vat-summary-th",
-]
+AccountingSkillId = Literal[*ACCOUNTING_SKILL_IDS]
 
 
 class StrictMcpInput(BaseModel):
@@ -155,14 +138,9 @@ class AccountingSkillInputs(StrictMcpInput):
 
     query: str | None = Field(
         default=None,
+        min_length=1,
         max_length=20_000,
         description="The user's accounting question or requested outcome.",
-    )
-    workspace_id: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=2_048,
-        description="Mercury public workspace id when workspace context is required.",
     )
     connector_id: ConnectorId | None = Field(
         default=None,
@@ -212,6 +190,19 @@ class AccountingSkillInputs(StrictMcpInput):
         max_length=100,
         description="Additional named, non-secret parameters required by a specific skill.",
     )
+
+    @model_validator(mode="after")
+    def validate_unique_parameters(self) -> AccountingSkillInputs:
+        names = [parameter.name for parameter in self.parameters]
+        explicit_fields = set(self.model_fields_set) - {"parameters"}
+        if len(set(names)) != len(names) or set(names) & explicit_fields:
+            raise ValueError("accounting_skill_parameter_duplicate")
+        return self
+
+
+# Keep the host-visible envelope schema explicit while all raw nested values are
+# validated in the sanitized tool handler.
+AccountingSkillInputsInput = SkipValidation[AccountingSkillInputs]
 
 
 class FlowFileInput(StrictMcpInput):

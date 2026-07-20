@@ -5,6 +5,20 @@ description: Use when the user asks to list, save, preview, or run Mercury Flows
 
 # Mercury Flow Runner
 
+## Catalog contract
+
+Call `get_accounting_skill_schema` with `skill_id=mercury-flow-runner`, then call
+`run_accounting_skill` with the same Skill ID and validated inputs. Inspect `connector_status`
+for the workspace first. Ask the user to select only when the route returns
+`connector_selection_required`. Follow returned `ordered_steps`: let the host invoke connected
+provider tools for `native_mcp`, use the advanced local handoff for `api_driver`, and stop for
+setup on `local_bridge`.
+
+Do not duplicate capability or provider mappings in this Skill. Preserve returned citations
+and evidence references, include accountant review points, and shape the final result using
+the returned `output_schema_name`. Mercury does not own provider, Google, ecommerce,
+marketplace, or bank OAuth tokens; the host invokes those connected tools.
+
 Call `credential_status` before a flow that needs ERP data. Stop and route to local
 connector setup unless status is connected.
 

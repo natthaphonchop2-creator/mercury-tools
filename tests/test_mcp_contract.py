@@ -39,6 +39,8 @@ def test_public_mcp_tools_have_submission_annotations() -> None:
         "connector_capabilities": (True, False, None, False),
         "connector_status": (True, False, None, False),
         "unlink_connector_profile": (False, True, True, False),
+        "list_accounting_skills": (True, False, None, False),
+        "get_accounting_skill_schema": (True, False, None, False),
         "run_accounting_skill": (True, False, None, False),
         "flow_cheat_sheet": (True, False, None, False),
         "check_flow_syntax": (True, False, None, False),
@@ -515,12 +517,25 @@ async def test_public_mcp_tool_schemas_are_explicit_for_plugin_review() -> None:
     assert "workspace_id" in status_schema["required"]
 
     skill_schema = tools["run_accounting_skill"].inputSchema
-    skill_input_ref = skill_schema["properties"]["inputs"]["$ref"]
-    skill_input_schema = skill_schema["$defs"][skill_input_ref.rsplit("/", 1)[-1]]
+    assert set(skill_schema["properties"]) == {
+        "workspace_id",
+        "skill_id",
+        "inputs",
+        "evidence_mode",
+    }
+    assert {"workspace_id", "skill_id", "inputs"} <= set(skill_schema["required"])
+    skill_input_schema = skill_schema["properties"]["inputs"]
+    if "$ref" in skill_input_schema:
+        skill_input_schema = skill_schema["$defs"][skill_input_schema["$ref"].rsplit("/", 1)[-1]]
     assert skill_input_schema["additionalProperties"] is False
     assert {"query", "connector_id", "environment", "period_start", "period_end"} <= set(
         skill_input_schema["properties"]
     )
+    assert "workspace_id" not in skill_input_schema["properties"]
+    assert tools["list_accounting_skills"].inputSchema["properties"] == {}
+    discovery_schema = tools["get_accounting_skill_schema"].inputSchema
+    assert set(discovery_schema["properties"]) == {"skill_id"}
+    assert discovery_schema["required"] == ["skill_id"]
 
     for tool_name in {"inspect_flow_files", "run_flow_files"}:
         flow_schema = tools[tool_name].inputSchema
@@ -612,6 +627,49 @@ async def test_public_mcp_tool_schemas_are_explicit_for_plugin_review() -> None:
     assert {"source", "connector_id", "environment", "required_capabilities"} <= set(
         metadata_schema["properties"]
     )
+
+
+@pytest.mark.asyncio
+async def test_accounting_skill_nested_rejection_is_sanitized_before_route_and_audit(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    marker = "accounting_skill_secret_marker_must_not_leak_1234"
+    audit_events: list[object] = []
+
+    monkeypatch.setattr(server, "_audit", lambda *args: audit_events.append(args))
+    monkeypatch.setattr(
+        server,
+        "_product_store",
+        lambda settings=None: pytest.fail("invalid Skill input reached workspace storage"),
+    )
+
+    content, structured = await server.mcp.call_tool(
+        "run_accounting_skill",
+        {
+            "workspace_id": "mw_publiccontestworkspace001",
+            "skill_id": "company-health-check-th",
+            "inputs": {
+                "query": "Review",
+                "parameters": [
+                    {
+                        "name": "client_secret_marker",
+                        "value": marker,
+                    }
+                ],
+            },
+            "evidence_mode": False,
+        },
+    )
+
+    assert structured == {
+        "status": "error",
+        "message": "Accounting skill inputs are invalid.",
+    }
+    assert audit_events == []
+    assert marker not in str((content, structured, audit_events))
+    assert "input_value" not in str((content, structured, audit_events))
 
 
 @pytest.mark.asyncio

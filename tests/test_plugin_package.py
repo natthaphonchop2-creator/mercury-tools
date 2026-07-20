@@ -16,6 +16,7 @@ from mcp.shared.memory import create_connected_server_and_client_session
 
 from mercury_tools.db.product import SKILL_CATALOG_SEED
 from mercury_tools.mcp.local_server import local_mcp
+from mercury_tools.skills.catalog import ACCOUNTING_SKILL_CATALOG
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = ROOT / "plugins/mercury-finance"
@@ -61,6 +62,7 @@ CROSS_MCP_SKILLS = (
     "marketplace-settlement-review-th",
     "month-end-evidence-gathering-th",
 )
+GENERIC_SKILLS = READ_SKILLS + CROSS_MCP_SKILLS + ("mercury-flow-runner",)
 SKILL_CATALOG_PUBLIC_FIELDS = (
     "skill_id",
     "title",
@@ -196,6 +198,59 @@ def test_bundled_plugin_catalog_rows_emit_capability_requirements() -> None:
     for row in SKILL_CATALOG_SEED:
         assert "required_capabilities" in row
         assert isinstance(row["required_capabilities"], list)
+
+
+def test_canonical_skill_catalog_generates_portable_seed_requirements() -> None:
+    definitions = {item.skill_id: item for item in ACCOUNTING_SKILL_CATALOG}
+    seed = {row["skill_id"]: row for row in SKILL_CATALOG_SEED}
+
+    expected = {
+        "company-health-check-th": (
+            ("company.read",),
+            ("documents.invoice.list", "tax.vat.summary.read"),
+        ),
+        "invoice-review-th": (
+            ("documents.invoice.list", "documents.invoice.read"),
+            ("contacts.list",),
+        ),
+        "vat-summary-th": (("documents.invoice.list",), ("tax.vat.summary.read",)),
+        "management-report-th": (
+            ("company.read", "documents.invoice.list"),
+            ("payments.read", "journal.read"),
+        ),
+        "accounts-payable-reconciliation-th": (
+            ("documents.expense.list",),
+            ("payments.read",),
+        ),
+        "accounts-receivable-reconciliation-th": (
+            ("documents.invoice.list",),
+            ("payments.read",),
+        ),
+    }
+    for skill_id, (required, optional) in expected.items():
+        assert definitions[skill_id].required_capabilities == required
+        assert definitions[skill_id].optional_capabilities == optional
+        assert seed[skill_id]["required_capabilities"] == list(required)
+        assert seed[skill_id]["required_connectors"] == []
+
+
+@pytest.mark.parametrize("skill_id", GENERIC_SKILLS)
+def test_generic_skill_markdown_consumes_its_catalog_contract(skill_id: str) -> None:
+    definition = next(item for item in ACCOUNTING_SKILL_CATALOG if item.skill_id == skill_id)
+    text = skill_text(skill_id)
+
+    assert skill_id in text
+    assert "get_accounting_skill_schema" in text
+    assert "run_accounting_skill" in text
+    assert "connector_status" in text
+    assert "connector_selection_required" in text
+    assert all(mode in text for mode in ("native_mcp", "api_driver", "local_bridge"))
+    assert "FlowAccount" not in text
+    assert "PEAK" not in text
+    assert not any(
+        capability in text
+        for capability in definition.required_capabilities + definition.optional_capabilities
+    )
 
 
 def test_marketplace_contains_exactly_one_mercury_plugin() -> None:
