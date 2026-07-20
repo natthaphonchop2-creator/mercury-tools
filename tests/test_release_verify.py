@@ -456,6 +456,20 @@ def test_cli_release_verify_keeps_previous_v022_tree_blocked(
     assert payload == {"status": "error", "error": "release_version_mismatch"}
 
 
+def test_release_verify_parser_accepts_exact_local_release_command() -> None:
+    from mercury_tools.cli import build_parser
+
+    args = build_parser().parse_args(
+        ["release", "verify", "--version", VERSION]
+    )
+
+    assert args.release_command == "verify"
+    assert args.version == VERSION
+    assert args.artifacts == "dist"
+    assert args.repo_root == "."
+    assert callable(args.func)
+
+
 def _write_junit(path: Path, cases: tuple[str, ...]) -> None:
     path.write_text(
         "<testsuites><testsuite>" + "".join(cases) + "</testsuite></testsuites>",

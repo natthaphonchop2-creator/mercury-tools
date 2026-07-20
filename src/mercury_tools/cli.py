@@ -194,6 +194,7 @@ def cmd_catalog_validate(args: argparse.Namespace) -> int:
 def cmd_release_scan_secrets(args: argparse.Namespace) -> int:
     from pydantic import ValidationError
 
+    from mercury_tools.release.artifacts import resolve_local_release_repository
     from mercury_tools.release.models import SecretScanPolicy, SecretScanRequest
     from mercury_tools.release.scanner import (
         ReleaseGateError,
@@ -216,6 +217,11 @@ def cmd_release_scan_secrets(args: argparse.Namespace) -> int:
             return 1
 
     try:
+        repo = args.repo
+        repo_url = None
+        if repo == ".":
+            local_root, repo = resolve_local_release_repository(Path(repo))
+            repo_url = str(local_root)
         manifest = load_public_surface_manifest(Path(args.manifest))
         allowlist = load_secret_scan_allowlist(Path(args.allowlist))
         fingerprints = load_known_secret_digests(
@@ -224,7 +230,8 @@ def cmd_release_scan_secrets(args: argparse.Namespace) -> int:
             repo_root=Path(args.repo_root),
         )
         request = SecretScanRequest(
-            repo=args.repo,
+            repo=repo,
+            repo_url=repo_url,
             artifacts=Path(args.artifacts),
             all_history=bool(args.all_history),
             hosted=bool(args.hosted),
@@ -905,7 +912,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan_secrets.add_argument("--all-history", action="store_true")
     scan_secrets.add_argument("--hosted", action="store_true")
     scan_secrets.add_argument("--artifacts", required=True)
-    scan_secrets.add_argument("--repo", required=True)
+    scan_secrets.add_argument("--repo", default=".")
     scan_secrets.add_argument("--output")
     scan_secrets.add_argument(
         "--manifest",
@@ -944,7 +951,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     release_verify = release_sub.add_parser("verify")
     release_verify.add_argument("--version", required=True)
-    release_verify.add_argument("--artifacts", required=True)
+    release_verify.add_argument("--artifacts", default="dist")
     release_verify.add_argument("--repo-root", default=".")
     release_verify.set_defaults(func=cmd_release_verify)
 

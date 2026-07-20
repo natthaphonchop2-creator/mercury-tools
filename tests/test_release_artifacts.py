@@ -1397,6 +1397,30 @@ def test_release_candidate_accepts_a_physically_bound_linked_worktree(tmp_path: 
     assert candidate.git_metadata.git_dir.parent == candidate.git_metadata.common_dir / "worktrees"
 
 
+def test_release_candidate_accepts_linked_worktree_on_slash_named_branch_with_tracking(
+    tmp_path: Path,
+) -> None:
+    root = make_release_tree(tmp_path)
+    branch = "design/connector-neutral-v0.3"
+    _run(
+        ["git", "remote", "add", "origin", "https://github.com/example/mercury-tools.git"],
+        cwd=root,
+    )
+    _run(["git", "branch", branch], cwd=root)
+    _run(["git", "config", f"branch.{branch}.remote", "origin"], cwd=root)
+    _run(["git", "config", f"branch.{branch}.merge", "refs/heads/main"], cwd=root)
+    linked = tmp_path / "linked-candidate"
+    _run(["git", "worktree", "add", str(linked), branch], cwd=root)
+
+    candidate = release_artifacts.load_release_candidate(
+        linked,
+        version=VERSION,
+        require_clean=True,
+    )
+
+    assert candidate.git_metadata.root == linked.resolve()
+
+
 def test_release_candidate_rejects_git_alternates_without_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
