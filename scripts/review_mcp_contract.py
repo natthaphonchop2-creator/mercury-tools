@@ -94,19 +94,6 @@ _CREDENTIAL_SINGLE_TOKENS = frozenset(
         "secret",
     }
 )
-_CREDENTIAL_COMPACT_TOKENS = frozenset(
-    {
-        "apikey",
-        "apitoken",
-        "accesstoken",
-        "authtoken",
-        "bearertoken",
-        "clientsecret",
-        "privatekey",
-        "refreshtoken",
-        "servicerolekey",
-    }
-)
 _CREDENTIAL_TOKEN_SEQUENCES = frozenset(
     {
         ("access", "key"),
@@ -121,8 +108,12 @@ _CREDENTIAL_TOKEN_SEQUENCES = frozenset(
         ("private", "key"),
         ("refresh", "key"),
         ("refresh", "token"),
+        ("secret", "key"),
         ("service", "role", "key"),
     }
+)
+_CREDENTIAL_COMPACT_TOKENS = frozenset(
+    "".join(sequence) for sequence in _CREDENTIAL_TOKEN_SEQUENCES
 )
 _METADATA_TOKEN_SEQUENCES = frozenset(
     {

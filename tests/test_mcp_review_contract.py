@@ -85,6 +85,58 @@ def _strict_root(properties: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _credential_sequence_field_names(sequence: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+    title_words = tuple(word.capitalize() for word in sequence)
+    return (
+        ("snake", "_".join(sequence)),
+        ("kebab", "-".join(sequence)),
+        ("space", " ".join(sequence)),
+        ("camel", sequence[0] + "".join(title_words[1:])),
+        ("Pascal", "".join(title_words)),
+        ("compact", "".join(sequence)),
+        ("uppercase", "".join(sequence).upper()),
+    )
+
+
+_CREDENTIAL_SEQUENCE_CASES = tuple(
+    (sequence, style, field_name)
+    for sequence in sorted(_review_module()._CREDENTIAL_TOKEN_SEQUENCES)
+    for style, field_name in _credential_sequence_field_names(sequence)
+)
+
+
+@pytest.mark.parametrize(
+    ("sequence", "style", "field_name"),
+    _CREDENTIAL_SEQUENCE_CASES,
+    ids=lambda value: "-".join(value) if isinstance(value, tuple) else str(value),
+)
+def test_review_rejects_every_canonical_credential_sequence_form(
+    sequence: tuple[str, ...],
+    style: str,
+    field_name: str,
+) -> None:
+    del sequence, style
+
+    _assert_issue(
+        _tool(schema=_strict_root({field_name: {"type": "string"}})),
+        field_name,
+        "credential-bearing input field names are prohibited",
+    )
+
+
+_CREDENTIAL_COMPACT_CONTROLS = tuple(
+    f"prefix{''.join(sequence)}suffix"
+    for sequence in sorted(_review_module()._CREDENTIAL_TOKEN_SEQUENCES)
+)
+
+
+@pytest.mark.parametrize("field_name", _CREDENTIAL_COMPACT_CONTROLS)
+def test_review_allows_compact_credential_sequence_inside_longer_word(
+    field_name: str,
+) -> None:
+    assert _issues(_tool(schema=_strict_root({field_name: {"type": "string"}}))) == []
+
+
 def test_hosted_mcp_review_passes_with_exact_success_output() -> None:
     result = subprocess.run(
         [sys.executable, str(SCRIPT)],
@@ -657,6 +709,8 @@ def test_review_reports_the_exact_missing_annotation_path() -> None:
         "api-token",
         "api token",
         "APITOKEN",
+        "secretkey",
+        "SECRETKEY",
         "accessToken",
         "refresh_token",
         "bearer-token",

@@ -234,3 +234,51 @@ no output; exit 0
 - Submission copy, public Skills, hosted server behavior, and Task 9 packaging
   remain unchanged.
 - Task 11 and `pyproject.toml` remain untouched.
+
+## Compact Credential Alias Follow-Up
+
+The compact credential aliases are now derived from
+`_CREDENTIAL_TOKEN_SEQUENCES` by joining each canonical sequence. This keeps
+single-token credentials such as `password`, `passwd`, and `passphrase`
+explicit while ensuring every canonical multi-token sequence rejects its
+snake, kebab, space, camel, Pascal, compact, and uppercase forms. Compact
+matches remain exact normalized tokens, so longer unrelated words are allowed.
+
+### TDD Evidence
+
+After adding parameterized cases generated from the sequence table and compact
+false-positive controls, before the implementation change:
+
+```text
+uv run pytest -q tests/test_mcp_review_contract.py
+2 failed, 194 passed
+```
+
+After deriving compact aliases from the canonical sequence table:
+
+```text
+uv run pytest -q tests/test_mcp_review_contract.py
+204 passed
+
+uv run pytest -q tests/test_mcp_review_contract.py tests/test_openai_plugin_submission.py
+214 passed
+```
+
+### Verification
+
+```text
+uv run python scripts/review_mcp_contract.py
+Mercury MCP review: 0 unclear arguments; annotations verified
+
+uv run --extra dev ruff check .
+All checks passed!
+
+git diff --check
+no output; exit 0
+```
+
+### Scope
+
+- Credential compact detection now has one canonical source of truth.
+- Parameterized sequence-form and longer-word control coverage was added.
+- No hosted tool, schema, annotation, submission, or release behavior changed.
