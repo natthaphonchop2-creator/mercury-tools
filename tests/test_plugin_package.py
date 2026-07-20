@@ -45,33 +45,16 @@ EXPECTED_LOCAL_TOOLS = {
     "credential_status",
 }
 HOSTED_TOOL_REGISTRY = frozenset(tool.name for tool in hosted_mcp._tool_manager.list_tools())
-PUBLIC_SKILL_PROSE_OR_LOCAL_HANDOFF_TERMS = frozenset(
-    {
-        "advanced_local_handoff",
-        "api_driver",
-        "choices",
-        "connected",
-        "connection_mode",
-        "connector_id",
-        "connector_selection_required",
-        "environment",
-        "environment_mismatch",
-        "host_tool_requirements",
-        "inputs",
-        "invoke_provider_capability",
-        "json_object",
-        "local_bridge_required",
-        "native_mcp",
-        "not_ready",
-        "not_validated",
-        "ordered_steps",
-        "output_schema_name",
-        "provider_unavailable",
-        "required=false",
-    }
+LOCAL_ONLY_TOOL_REGISTRY = frozenset(
+    tool.name for tool in local_mcp._tool_manager.list_tools()
+) - HOSTED_TOOL_REGISTRY
+ADVANCED_LOCAL_ERP_PATH = Path("docs/ADVANCED_LOCAL_ERP.md")
+ADVANCED_LOCAL_ERP_COMMAND = "mercury mcp serve-local"
+IMPERATIVE_TOOL_CALL_RE = re.compile(
+    r"(?im)(?:\b(?:call|invoke|run|use|execute)\b|เรียกใช้|เรียก|ใช้|รัน|ดำเนินการ)"
+    r"\s+(?!(?:only|เฉพาะ|เพียง)\s+(?:the\s+)?returned\s+)"
+    r"`(?P<name>[a-z][a-z0-9_]*)(?:\([^`\n]*\))?`"
 )
-BACKTICK_SPAN_RE = re.compile(r"`(?P<value>[^`\n]+)`")
-TOOL_INVOCATION_RE = re.compile(r"(?P<name>[a-z][a-z0-9_]*)(?:\([^`]*\))?$")
 PACKAGE_LOCAL_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_./-])(?P<path>(?:\./)?(?:docs|skills)/[A-Za-z0-9_./-]+\.md)"
 )
@@ -268,21 +251,13 @@ def packaged_skill_local_paths(skill_path: Path) -> dict[str, Path]:
     return references
 
 
-def public_skill_backtick_tool_terms(text: str) -> set[str]:
-    terms = set()
-    for match in BACKTICK_SPAN_RE.finditer(text):
-        invocation = TOOL_INVOCATION_RE.fullmatch(match.group("value"))
-        if invocation is not None:
-            terms.add(invocation.group("name"))
-    return terms
+def public_skill_imperative_tool_calls(text: str) -> set[str]:
+    return {match.group("name") for match in IMPERATIVE_TOOL_CALL_RE.finditer(text)}
 
 
-def public_skill_local_cli_commands(text: str) -> set[str]:
-    return {
-        match.group("value")
-        for match in BACKTICK_SPAN_RE.finditer(text)
-        if match.group("value").startswith(("mercury ", "mercury-tools "))
-    }
+def assert_public_skill_tool_calls_are_hosted(text: str) -> None:
+    unknown = public_skill_imperative_tool_calls(text) - HOSTED_TOOL_REGISTRY
+    assert not unknown, f"public Skill invokes non-hosted tool(s): {sorted(unknown)}"
 
 
 def test_product_catalog_contains_every_bundled_plugin_skill() -> None:
@@ -397,7 +372,7 @@ def test_marketplace_points_to_plugin_folder() -> None:
     assert mercury["category"] == "Finance"
 
 
-def test_public_skill_backtick_tool_invocations_use_hosted_registry_or_explicit_handoffs() -> None:
+def test_public_skill_imperative_tool_calls_use_the_hosted_mcp_registry() -> None:
     assert {
         "list_connectors",
         "get_connector_setup",
@@ -406,21 +381,56 @@ def test_public_skill_backtick_tool_invocations_use_hosted_registry_or_explicit_
         "connector_status",
     }.issubset(HOSTED_TOOL_REGISTRY)
 
-    invalid_references: dict[str, set[str]] = {}
-    local_commands: dict[str, set[str]] = {}
     for skill_path in sorted(SKILLS_ROOT.glob("*/SKILL.md")):
         text = skill_path.read_text(encoding="utf-8")
-        unsupported = public_skill_backtick_tool_terms(text) - (
-            HOSTED_TOOL_REGISTRY | PUBLIC_SKILL_PROSE_OR_LOCAL_HANDOFF_TERMS
-        )
-        if unsupported:
-            invalid_references[skill_path.parent.name] = unsupported
-        commands = public_skill_local_cli_commands(text)
-        if commands:
-            local_commands[skill_path.parent.name] = commands
+        assert_public_skill_tool_calls_are_hosted(text)
 
-    assert invalid_references == {}
-    assert local_commands == {}
+
+def test_public_skill_tool_call_parser_ignores_arguments_statuses_paths_and_handoffs() -> None:
+    text = """
+    `inputs`, `not_validated`, and `docs/ADVANCED_LOCAL_ERP.md` are prose literals.
+    Return `advanced_local_handoff` to the packaged guide.
+    Use only the returned `advanced_local_handoff` step in `ordered_steps`.
+    """
+
+    assert public_skill_imperative_tool_calls(text) == set()
+
+
+def test_public_skill_tool_call_validator_rejects_an_unknown_imperative_inputs_call() -> None:
+    text = f"{skill_text('connector-setup-guide-th')}\n7. Call `inputs` with no arguments.\n"
+
+    with pytest.raises(AssertionError, match=r"\['inputs'\]"):
+        assert_public_skill_tool_calls_are_hosted(text)
+
+
+def test_public_skill_tool_call_validator_rejects_a_local_only_imperative_call() -> None:
+    local_only_tool = "credential_status"
+    assert local_only_tool in LOCAL_ONLY_TOOL_REGISTRY
+    text = f"{skill_text('connector-setup-guide-th')}\n7. Call `{local_only_tool}` now.\n"
+
+    with pytest.raises(AssertionError, match=local_only_tool):
+        assert_public_skill_tool_calls_are_hosted(text)
+
+
+def test_local_commands_and_tools_are_limited_to_the_packaged_advanced_handoff() -> None:
+    advanced_guide = PLUGIN_ROOT / ADVANCED_LOCAL_ERP_PATH
+    assert advanced_guide.is_file()
+    handoff_references = [
+        path
+        for path in sorted(SKILLS_ROOT.glob("*/SKILL.md"))
+        if ADVANCED_LOCAL_ERP_PATH.as_posix() in path.read_text(encoding="utf-8")
+    ]
+    assert handoff_references
+    for skill_path in handoff_references:
+        assert "handoff" in skill_path.read_text(encoding="utf-8").casefold()
+
+    local_terms = {ADVANCED_LOCAL_ERP_COMMAND, *LOCAL_ONLY_TOOL_REGISTRY}
+    for path in sorted(candidate for candidate in PLUGIN_ROOT.rglob("*") if candidate.is_file()):
+        if path == advanced_guide:
+            continue
+        text = path.read_text(encoding="utf-8")
+        leaked = sorted(term for term in local_terms if term in text)
+        assert not leaked, f"local-only terms escaped the advanced handoff in {path}: {leaked}"
 
 
 def test_public_skill_package_local_markdown_paths_resolve_after_clean_install() -> None:
@@ -1108,9 +1118,15 @@ def _release_layout(tmp_path: Path, *, local_launcher: bool = False) -> Path:
     return release_root
 
 
-def _run_release_validator(root: Path) -> subprocess.CompletedProcess[str]:
+def _run_release_validator(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(ROOT / "scripts/validate_release_plugin.py"), "--root", str(root)],
+        [
+            sys.executable,
+            str(ROOT / "scripts/validate_release_plugin.py"),
+            "--root",
+            str(root),
+            *args,
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -1140,7 +1156,16 @@ def test_release_validator_accepts_the_hosted_release_contract(tmp_path: Path) -
     result = _run_release_validator(_release_layout(tmp_path))
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "release plugin validation passed" in result.stdout
+    assert "release plugin static validation passed" in result.stdout
+
+
+@pytest.mark.skipif(shutil.which("codex") is None, reason="Codex CLI is not installed")
+def test_release_validator_codex_cli_gate_installs_the_reconstructed_marketplace() -> None:
+    result = _run_release_validator(ROOT, "--codex-cli")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "release plugin static validation passed" in result.stdout
+    assert "release plugin Codex CLI validation passed" in result.stdout
 
 
 def test_release_validator_rejects_empty_hosted_server_with_every_required_contract(
@@ -1210,6 +1235,22 @@ def test_release_validator_recursively_scans_public_plugin_files(tmp_path: Path)
     assert "public plugin recursive scan found a high-confidence credential literal" in (
         result.stdout
     )
+
+
+def test_release_validator_rejects_a_local_command_outside_the_packaged_handoff(
+    tmp_path: Path,
+) -> None:
+    release_root = _release_layout(tmp_path)
+    skill = release_root / "plugins/mercury-finance/skills/connector-setup-guide-th/SKILL.md"
+    skill.write_text(
+        skill.read_text(encoding="utf-8") + "\nRun `mercury mcp serve-local` here.\n",
+        encoding="utf-8",
+    )
+
+    result = _run_release_validator(release_root)
+
+    assert result.returncode == 1
+    assert "local command or tool name may appear only" in result.stdout
 
 
 def test_release_validator_allows_documentation_credential_placeholders(tmp_path: Path) -> None:

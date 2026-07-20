@@ -5,8 +5,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -16,6 +20,8 @@ MCP_PATH = Path("plugins/mercury-finance/.mcp.json")
 MARKETPLACE_PATH = Path(".agents/plugins/marketplace.json")
 PUBLIC_PLUGIN_DIRECTORY = Path("plugins/mercury-finance")
 PYPROJECT_PATH = Path("pyproject.toml")
+ADVANCED_LOCAL_ERP_PATH = PUBLIC_PLUGIN_DIRECTORY / "docs/ADVANCED_LOCAL_ERP.md"
+ADVANCED_LOCAL_ERP_COMMAND = "mercury mcp serve-local"
 EXPECTED_HOSTED_SERVER = {
     "type": "http",
     "url": "https://mercury-tools-mcp.onrender.com/mcp",
@@ -62,6 +68,22 @@ MAX_SCAN_NODES = 10_000
 MAX_SCAN_STRING_CHARS = 4_096
 LOCAL_LAUNCHER_FIELD_NAMES = frozenset({"command", "args", "cwd", "env"})
 CODEX_MARKETPLACE_AUTHENTICATION_VALUES = frozenset({"ON_INSTALL", "ON_USE"})
+LOCAL_ONLY_TOOL_NAMES = frozenset(
+    {
+        "credential_status",
+        "execute_erp_create",
+        "execute_erp_update",
+        "execute_sensitive_erp_action",
+        "get_erp_action_schema",
+        "get_erp_request_status",
+        "import_erp_spec",
+        "list_connector_drivers",
+        "prepare_erp_mutation",
+        "run_erp_read",
+        "run_mercury_flow",
+        "search_erp_actions",
+    }
+)
 
 
 def _read_json(path: Path, errors: list[str]) -> dict[str, Any]:
@@ -173,6 +195,150 @@ def _scan_public_plugin_files(root: Path, errors: list[str]) -> None:
             )
 
 
+def _validate_advanced_local_handoff_boundary(root: Path, errors: list[str]) -> None:
+    plugin_directory = root / PUBLIC_PLUGIN_DIRECTORY
+    advanced_guide = root / ADVANCED_LOCAL_ERP_PATH
+    if not advanced_guide.is_file():
+        errors.append("public plugin must package docs/ADVANCED_LOCAL_ERP.md")
+        return
+
+    handoff_references: list[Path] = []
+    local_terms = {ADVANCED_LOCAL_ERP_COMMAND, *LOCAL_ONLY_TOOL_NAMES}
+    files = sorted(candidate for candidate in plugin_directory.rglob("*") if candidate.is_file())
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as error:
+            errors.append(
+                f"cannot inspect public plugin boundary file {path.relative_to(root)}: {error}"
+            )
+            continue
+        if path == advanced_guide:
+            continue
+        if path.match("*/skills/*/SKILL.md") and "docs/ADVANCED_LOCAL_ERP.md" in text:
+            handoff_references.append(path)
+            if "handoff" not in text.casefold():
+                errors.append(
+                    "public Skill references docs/ADVANCED_LOCAL_ERP.md "
+                    "without an explicit handoff: "
+                    f"{path.relative_to(root)}"
+                )
+        leaked = sorted(term for term in local_terms if term in text)
+        if leaked:
+            errors.append(
+                "local command or tool name may appear only in "
+                f"plugins/mercury-finance/docs/ADVANCED_LOCAL_ERP.md: "
+                f"{path.relative_to(root)} ({', '.join(leaked)})"
+            )
+    if not handoff_references:
+        errors.append("public plugin must reference docs/ADVANCED_LOCAL_ERP.md as a handoff")
+
+
+def _run_codex_json(
+    command: list[str], environment: dict[str, str], errors: list[str], label: str
+) -> dict[str, Any] | None:
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            input="",
+            text=True,
+            timeout=60,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        errors.append(f"Codex CLI {label} could not complete noninteractively: {error}")
+        return None
+    if result.returncode != 0:
+        output = (result.stdout + result.stderr).strip()
+        errors.append(
+            f"Codex CLI {label} failed with exit {result.returncode}: {output[:2_000]}"
+        )
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        errors.append(f"Codex CLI {label} did not return JSON: {error}")
+        return None
+    if not isinstance(payload, dict):
+        errors.append(f"Codex CLI {label} returned a non-object JSON value")
+        return None
+    return payload
+
+
+def validate_codex_cli_install(root: Path) -> list[str]:
+    """Validate marketplace schema and installation through an isolated local Codex CLI."""
+
+    errors: list[str] = []
+    codex = shutil.which("codex")
+    if codex is None:
+        return ["Codex CLI validation requested but the `codex` executable is unavailable"]
+
+    source_marketplace = root / MARKETPLACE_PATH
+    source_plugin = root / PUBLIC_PLUGIN_DIRECTORY
+    if not source_marketplace.is_file() or not source_plugin.is_dir():
+        return [
+            "Codex CLI validation requires the marketplace manifest and public plugin directory"
+        ]
+
+    with tempfile.TemporaryDirectory(prefix="mercury-codex-cli-") as temporary:
+        temporary_root = Path(temporary)
+        marketplace_root = temporary_root / "marketplace"
+        marketplace_manifest = marketplace_root / MARKETPLACE_PATH
+        marketplace_manifest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_marketplace, marketplace_manifest)
+        shutil.copytree(source_plugin, marketplace_root / PUBLIC_PLUGIN_DIRECTORY)
+
+        home = temporary_root / "home"
+        codex_home = temporary_root / "codex-home"
+        home.mkdir()
+        codex_home.mkdir()
+        environment = dict(os.environ)
+        environment.pop("CODEX_CONFIG", None)
+        environment["HOME"] = str(home)
+        environment["CODEX_HOME"] = str(codex_home)
+
+        marketplace = _run_codex_json(
+            [codex, "plugin", "marketplace", "add", str(marketplace_root), "--json"],
+            environment,
+            errors,
+            "marketplace add",
+        )
+        if marketplace is None:
+            return errors
+        if marketplace.get("marketplaceName") != "mercury-tools":
+            errors.append("Codex CLI marketplace add returned an unexpected marketplace name")
+
+        installed = _run_codex_json(
+            [codex, "plugin", "add", "mercury-finance@mercury-tools", "--json"],
+            environment,
+            errors,
+            "plugin add",
+        )
+        if installed is None:
+            return errors
+        if installed.get("pluginId") != "mercury-finance@mercury-tools":
+            errors.append("Codex CLI plugin add returned an unexpected plugin ID")
+            return errors
+
+        installed_path_value = installed.get("installedPath")
+        if not isinstance(installed_path_value, str):
+            errors.append("Codex CLI plugin add did not report an installedPath")
+            return errors
+        installed_path = Path(installed_path_value)
+        is_isolated_install = installed_path.is_dir() and installed_path.resolve().is_relative_to(
+            codex_home.resolve()
+        )
+        if not is_isolated_install:
+            errors.append("Codex CLI plugin installed outside the isolated CODEX_HOME cache")
+            return errors
+        installed_mcp = _read_json(installed_path / ".mcp.json", errors)
+        if installed_mcp != {"mcpServers": {"mercury-finance": EXPECTED_HOSTED_SERVER}}:
+            errors.append("Codex CLI installed package must expose exactly one hosted MCP")
+    return errors
+
+
 def validate_release(root: Path) -> list[str]:
     """Return static release-contract failures without network or subprocess use."""
 
@@ -206,6 +372,7 @@ def validate_release(root: Path) -> list[str]:
     if _contains_credential_literal(release_manifests):
         errors.append("plugin manifest must not contain credential literal values")
     _scan_public_plugin_files(root, errors)
+    _validate_advanced_local_handoff_boundary(root, errors)
 
     interface = plugin.get("interface") if isinstance(plugin.get("interface"), dict) else {}
     if plugin.get("name") != "mercury-finance":
@@ -269,17 +436,33 @@ def validate_release(root: Path) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument(
+        "--codex-cli",
+        action="store_true",
+        help="run the isolated local Codex marketplace add/install gate after static validation",
+    )
     args = parser.parse_args()
     errors = validate_release(args.root.resolve())
     if errors:
-        print("release plugin validation failed:")
+        print("release plugin static validation failed:")
         for error in errors:
             print(f"- {error}")
         return 1
     print(
-        "release plugin validation passed "
-        "(hosted MCP static checks only; remote smoke is a post-review gate)"
+        "release plugin static validation passed "
+        "(hosted MCP contract and public-package boundary checks only)"
     )
+    if args.codex_cli:
+        cli_errors = validate_codex_cli_install(args.root.resolve())
+        if cli_errors:
+            print("release plugin Codex CLI validation failed:")
+            for error in cli_errors:
+                print(f"- {error}")
+            return 1
+        print(
+            "release plugin Codex CLI validation passed "
+            "(isolated local marketplace add/install; no network)"
+        )
     return 0
 
 

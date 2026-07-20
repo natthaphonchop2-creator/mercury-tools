@@ -1,8 +1,8 @@
-# Task 9 Report: Hosted One-Click Plugin
+# Task 9 Report: Hosted One-Click Plugin Validation Fix
 
 ## Scope
 
-- Task base: `45c6955`
+- Validation-fix base: `ef59a0c` (`fix: validate one-click Mercury packaging`).
 - Public plugin: exactly one hosted HTTP MCP at
   `https://mercury-tools-mcp.onrender.com/mcp`.
 - Advanced local runtime: remains a separately connected path documented at both
@@ -10,25 +10,24 @@
   `plugins/mercury-finance/docs/ADVANCED_LOCAL_ERP.md`.
 - Deliberately unchanged: Task 10 submission bundle and Task 11 version/release files.
 
-## Review Fixes
+## Validation Fixes
 
-1. Removed `policy.authentication: "NONE"` from
-   `.agents/plugins/marketplace.json`. Codex CLI accepts an omitted optional field for
-   this no-auth hosted plugin; `NONE` is not a valid Codex value. The actual enum accepts
-   only `ON_INSTALL` and `ON_USE`, so the validator recognizes those as the only supported
-   explicit values and rejects any explicit authentication policy for this no-auth plugin.
-   The clean CLI install completed without a credential input prompt. Codex reports
-   `authPolicy: "ON_INSTALL"` as its internal default after reading the omitted field; this
-   does not add a provider credential field or prompt.
-2. Replaced the starter guide's local-only `credential_status` and local CLI commands with
-   the hosted lifecycle: `list_connectors` -> `get_connector_setup` ->
-   `link_connector_profile` -> host/provider OAuth or separately connected advanced-local
-   handoff -> `validate_connector_connection` -> `connector_status`.
-3. Added the package-local advanced ERP guide and checked every public Skill's backtick tool
-   reference against the actual hosted MCP registry. Local handoff prose is explicitly
-   allowlisted, and every `docs/` or `skills/` Markdown path must resolve under the installed
-   plugin. The release validator now recursively scans public plugin files for
-   high-confidence credential literals.
+1. Added `scripts/validate_release_plugin.py --codex-cli`. It reconstructs a local-only
+   marketplace from `.agents/plugins/marketplace.json` and the public plugin directory,
+   isolates `HOME` and `CODEX_HOME`, runs `codex plugin marketplace add ... --json` and
+   `codex plugin add mercury-finance@mercury-tools --json` with empty stdin, and verifies
+   the installed cache exposes exactly the one expected hosted MCP. The ordinary unit test
+   skips when `codex` is unavailable; the explicit flag fails with an actionable error in
+   that environment. Static validation and actual CLI validation print separate results.
+2. Replaced the broad backtick allowlist with an imperative-call parser for the English and
+   Thai verbs used by public Skills. Every parsed call name must occur in the actual hosted
+   MCP registry. Prose such as argument names, statuses, package-local paths, code literals,
+   and returned handoff steps is not interpreted as a tool call. Mutation coverage proves
+   that imperative calls to `inputs` and `credential_status` fail.
+3. Added a public-package boundary check. `mercury mcp serve-local` and all local-only tool
+   names may occur only in `plugins/mercury-finance/docs/ADVANCED_LOCAL_ERP.md`; every public
+   Skill reference to that document must call it a handoff. A release-layout mutation placing
+   the command in a hosted Skill is rejected.
 
 ## TDD Evidence
 
@@ -37,50 +36,44 @@
 Command:
 
 ```bash
-uv run --extra dev pytest -q tests/test_plugin_package.py tests/test_plugin_clean_install.py \
-  -k 'marketplace_points or public_skill_backtick or package_local_markdown or packaged_advanced or connector_setup_guide_uses or clean_install_one_click'
+uv run --extra dev pytest -q tests/test_plugin_package.py \
+  -k 'imperative_tool or local_commands_and_tools or codex_cli_gate or release_validator_accepts'
 ```
 
-Result: `6 failed, 66 deselected`. Failures covered the invented `NONE` value,
-the local-only starter guide, and all four unresolved packaged-guide references.
+Result: `1 passed, 3 failed`. The failures showed that static and actual CLI validation were
+not distinct, `--codex-cli` did not exist, and the initial boundary assertion was too narrow
+for existing prose handoffs. The assertion was corrected to the documented handoff contract
+before implementing the validator changes.
 
 ### GREEN
 
-The focused command returned `12 passed, 62 deselected` after the manifest, Skill,
-packaged documentation, and validator were corrected.
+The focused validator, parser, boundary, and mutation suite returned
+`29 passed, 47 deselected`.
 
-## Clean Codex CLI Reconstruction
+## Actual Codex CLI Gate
 
 Command:
 
 ```bash
-tmp_root=$(mktemp -d)
-mkdir -p "$tmp_root/home" "$tmp_root/codex"
-HOME="$tmp_root/home" CODEX_HOME="$tmp_root/codex" \
-  codex plugin marketplace add "$PWD" --json
-HOME="$tmp_root/home" CODEX_HOME="$tmp_root/codex" \
-  codex plugin add mercury-finance@mercury-tools --json
+uv run python scripts/validate_release_plugin.py --root . --codex-cli
 ```
 
 Output:
 
 ```text
-codex=codex-cli 0.145.0-alpha.18
-marketplaceName=mercury-tools
-pluginId=mercury-finance@mercury-tools
-version=0.2.2+codex.20260717
-authPolicy=ON_INSTALL
-installed_plugin_contract=passed
+release plugin static validation passed (hosted MCP contract and public-package boundary checks only)
+release plugin Codex CLI validation passed (isolated local marketplace add/install; no network)
 ```
 
-The installed cache was checked for the package-local ERP guide, the exact one-server
-hosted `.mcp.json`, no local launcher fields, and no `pyproject.toml`.
+The installed cache is checked for the exact one-server hosted `.mcp.json`. The reconstructed
+marketplace contains only the marketplace manifest and public plugin package, so the gate does
+not rely on a clone, Python package source, or network access.
 
 ## Final Verification
 
 ```text
 uv run --extra dev pytest -q tests/test_plugin_package.py tests/test_plugin_clean_install.py
-75 passed
+81 passed in 19.86s
 
 uv run --extra dev pytest -q tests/test_runtime_skills.py tests/test_skill_routing.py \
   tests/test_connector_mcp_tools.py tests/test_local_mcp_contract.py
@@ -89,8 +82,12 @@ uv run --extra dev pytest -q tests/test_runtime_skills.py tests/test_skill_routi
 uv run --extra dev ruff check .
 All checks passed!
 
-uv run python scripts/validate_release_plugin.py
-release plugin validation passed (hosted MCP static checks only; remote smoke is a post-review gate)
+uv run python scripts/validate_release_plugin.py --root .
+release plugin static validation passed (hosted MCP contract and public-package boundary checks only)
+
+uv run python scripts/validate_release_plugin.py --root . --codex-cli
+release plugin static validation passed (hosted MCP contract and public-package boundary checks only)
+release plugin Codex CLI validation passed (isolated local marketplace add/install; no network)
 
 git diff --check
 no output; exit 0
