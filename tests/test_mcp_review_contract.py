@@ -40,24 +40,49 @@ def _annotations(
 def _tool(
     name: str = "search_knowledge",
     *,
-    schema: dict | None = None,
+    schema: object | None = None,
     annotations: SimpleNamespace | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         name=name,
-        inputSchema=schema
-        or {
-            "type": "object",
-            "properties": {"query": {"type": "string"}},
-            "required": ["query"],
-            "additionalProperties": False,
-        },
+        inputSchema=(
+            {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            }
+            if schema is None
+            else schema
+        ),
         annotations=annotations or _annotations(),
     )
 
 
 def _issues(tool: SimpleNamespace) -> list[str]:
     return _review_module().review_tools([tool])
+
+
+def _assert_issue(
+    tool: SimpleNamespace,
+    path: str,
+    message: str | None = None,
+) -> list[str]:
+    issues = _issues(tool)
+    prefix = f"{tool.name}.{path}:"
+    matches = [issue for issue in issues if issue.startswith(prefix)]
+    assert matches, issues
+    if message is not None:
+        assert any(message in issue for issue in matches), matches
+    return issues
+
+
+def _strict_root(properties: dict[str, object]) -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": False,
+    }
 
 
 def test_hosted_mcp_review_passes_with_exact_success_output() -> None:
@@ -72,6 +97,51 @@ def test_hosted_mcp_review_passes_with_exact_success_output() -> None:
     assert result.returncode == 0, result.stderr
     assert result.stdout == f"{SUCCESS}\n"
     assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {},
+        {"title": "Unconstrained input"},
+        {"type": "string"},
+        {
+            "type": ["object", "null"],
+            "properties": {"query": {"type": "string"}},
+            "additionalProperties": False,
+        },
+        [],
+    ],
+)
+def test_review_rejects_empty_nonobject_or_nonexclusive_object_roots(
+    schema: object,
+) -> None:
+    _assert_issue(
+        _tool(schema=schema),
+        "<root>",
+        "root inputSchema must resolve to a strict object",
+    )
+
+
+def test_review_rejects_root_objects_that_allow_extra_keys() -> None:
+    _assert_issue(
+        _tool(
+            schema={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            }
+        ),
+        "<root>",
+        "additionalProperties=false",
+    )
+
+
+def test_review_rejects_empty_nested_property_schemas() -> None:
+    _assert_issue(
+        _tool(schema=_strict_root({"filters": {}})),
+        "filters",
+        "concrete type or enum/const",
+    )
 
 
 @pytest.mark.parametrize(
@@ -134,6 +204,143 @@ def test_review_rejects_an_empty_root_with_phantom_required_arguments() -> None:
     assert any("list_connectors.<root>" in issue for issue in issues), issues
 
 
+@pytest.mark.parametrize("definitions_key", ["$defs", "definitions"])
+def test_review_resolves_strict_root_refs(definitions_key: str) -> None:
+    schema = {
+        "$ref": f"#/{definitions_key}/Input",
+        definitions_key: {
+            "Input": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            }
+        },
+    }
+
+    assert _issues(_tool(schema=schema)) == []
+
+
+@pytest.mark.parametrize("definitions_key", ["$defs", "definitions"])
+def test_review_rejects_unconstrained_nested_refs_at_the_use_path(
+    definitions_key: str,
+) -> None:
+    schema = _strict_root(
+        {"filters": {"$ref": f"#/{definitions_key}/LooseFilter"}}
+    )
+    schema[definitions_key] = {"LooseFilter": {}}
+
+    _assert_issue(
+        _tool(schema=schema),
+        "filters",
+        "concrete type or enum/const",
+    )
+
+
+def test_review_rejects_cyclic_local_refs_with_an_actionable_use_path() -> None:
+    schema = _strict_root({"filters": {"$ref": "#/$defs/First"}})
+    schema["$defs"] = {
+        "First": {"$ref": "#/$defs/Second"},
+        "Second": {"$ref": "#/$defs/First"},
+    }
+
+    _assert_issue(_tool(schema=schema), "filters.$ref", "cyclic local $ref")
+
+
+def test_review_caps_local_ref_depth_with_an_actionable_use_path() -> None:
+    definitions = {
+        f"Level{index}": {"$ref": f"#/$defs/Level{index + 1}"}
+        for index in range(33)
+    }
+    definitions["Level33"] = {"type": "string"}
+    schema = _strict_root({"filters": {"$ref": "#/$defs/Level0"}})
+    schema["$defs"] = definitions
+
+    _assert_issue(_tool(schema=schema), "filters.$ref", "local $ref depth exceeds")
+
+
+@pytest.mark.parametrize("keyword", ["anyOf", "oneOf"])
+def test_review_rejects_unconstrained_root_alternatives(keyword: str) -> None:
+    schema = {
+        keyword: [
+            {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            {},
+        ]
+    }
+
+    _assert_issue(
+        _tool(schema=schema),
+        f"<root>.{keyword}[1]",
+        "root inputSchema must resolve to a strict object",
+    )
+
+
+@pytest.mark.parametrize("keyword", ["anyOf", "oneOf"])
+def test_review_rejects_unconstrained_nested_alternatives(keyword: str) -> None:
+    schema = _strict_root(
+        {
+            "mode": {
+                keyword: [
+                    {"type": "string", "enum": ["safe"]},
+                    {},
+                ]
+            }
+        }
+    )
+
+    _assert_issue(
+        _tool(schema=schema),
+        f"mode.{keyword}[1]",
+        "concrete type or enum/const",
+    )
+
+
+def test_review_accepts_allof_constraints_combined_as_an_intersection() -> None:
+    schema = {
+        "allOf": [
+            {"type": "object"},
+            {
+                "properties": {
+                    "query": {
+                        "allOf": [
+                            {},
+                            {"type": "string"},
+                        ]
+                    }
+                },
+                "required": ["query"],
+            },
+            {"additionalProperties": False},
+        ]
+    }
+
+    assert _issues(_tool(schema=schema)) == []
+
+
+def test_review_does_not_let_allof_wrappers_suppress_nested_review() -> None:
+    schema = _strict_root(
+        {
+            "profile": {
+                "allOf": [
+                    {"type": "object"},
+                    {"properties": {"display_name": {}}},
+                    {"additionalProperties": False},
+                ]
+            }
+        }
+    )
+
+    _assert_issue(
+        _tool(schema=schema),
+        "profile.allOf[1].display_name",
+        "concrete type or enum/const",
+    )
+
+
 def test_review_requires_workspace_id_on_workspace_scoped_tools() -> None:
     issues = _issues(
         _tool(
@@ -169,6 +376,29 @@ def test_review_requires_scalar_environment_enums() -> None:
     assert any("link_connector_profile.environment" in issue for issue in issues), issues
 
 
+@pytest.mark.parametrize("keyword", ["anyOf", "oneOf"])
+def test_review_requires_environment_enum_in_every_scalar_alternative(
+    keyword: str,
+) -> None:
+    schema = _strict_root(
+        {
+            "environment": {
+                keyword: [
+                    {"type": "string", "enum": ["sandbox", "production"]},
+                    {"type": "null"},
+                    {"type": "string"},
+                ]
+            }
+        }
+    )
+
+    _assert_issue(
+        _tool(schema=schema),
+        f"environment.{keyword}[2]",
+        "environment must expose an explicit enum",
+    )
+
+
 @pytest.mark.parametrize(
     "array_schema",
     [
@@ -187,6 +417,51 @@ def test_review_requires_typed_bounded_lists(array_schema: dict) -> None:
     issues = _issues(_tool(schema=schema))
 
     assert any("search_knowledge.tags" in issue for issue in issues), issues
+
+
+def test_review_rejects_unconstrained_array_item_ref_alternatives() -> None:
+    schema = _strict_root({"tags": {"$ref": "#/$defs/Tags"}})
+    schema["$defs"] = {
+        "Tags": {
+            "type": "array",
+            "items": {
+                "anyOf": [
+                    {"type": "string"},
+                    {},
+                ]
+            },
+            "maxItems": 10,
+        }
+    }
+
+    _assert_issue(
+        _tool(schema=schema),
+        "tags.items.anyOf[1]",
+        "concrete type or enum/const",
+    )
+
+
+def test_review_accepts_array_guarantees_combined_through_allof() -> None:
+    schema = _strict_root(
+        {
+            "tags": {
+                "allOf": [
+                    {"type": "array"},
+                    {
+                        "items": {
+                            "allOf": [
+                                {},
+                                {"type": "string"},
+                            ]
+                        }
+                    },
+                    {"maxItems": 10},
+                ]
+            }
+        }
+    )
+
+    assert _issues(_tool(schema=schema)) == []
 
 
 def test_review_rejects_mutually_exclusive_top_level_source_fields() -> None:
@@ -210,6 +485,31 @@ def test_review_rejects_mutually_exclusive_top_level_source_fields() -> None:
     assert any("run_inline_flow.<root>" in issue for issue in issues), issues
 
 
+def test_review_rejects_mutually_exclusive_sources_split_across_allof() -> None:
+    schema = {
+        "allOf": [
+            {"type": "object"},
+            {"properties": {"flow_yaml": {"type": "string"}}},
+            {
+                "properties": {
+                    "flow_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 10,
+                    }
+                }
+            },
+            {"additionalProperties": False},
+        ]
+    }
+
+    _assert_issue(
+        _tool(schema=schema),
+        "<root>",
+        "split mutually exclusive source fields into separate tools",
+    )
+
+
 @pytest.mark.parametrize(
     "annotations",
     [
@@ -230,6 +530,17 @@ def test_review_rejects_missing_or_incorrect_behavior_annotations(
     assert any("search_knowledge.annotations" in issue for issue in issues), issues
 
 
+def test_review_reports_the_exact_missing_annotation_path() -> None:
+    annotations = _annotations()
+    del annotations.openWorldHint
+
+    _assert_issue(
+        _tool(annotations=annotations),
+        "annotations.openWorldHint",
+        "required annotation is missing",
+    )
+
+
 def test_review_rejects_nested_credential_bearing_field_names() -> None:
     schema = {
         "type": "object",
@@ -248,6 +559,64 @@ def test_review_rejects_nested_credential_bearing_field_names() -> None:
     issues = _issues(_tool(schema=schema))
 
     assert any("search_knowledge.profile.client_secret" in issue for issue in issues), issues
+
+
+def test_review_rejects_credential_names_reached_through_definitions_refs() -> None:
+    schema = _strict_root({"profile": {"$ref": "#/definitions/Profile"}})
+    schema["definitions"] = {
+        "Profile": {
+            "type": "object",
+            "properties": {"api_key": {"type": "string"}},
+            "required": ["api_key"],
+            "additionalProperties": False,
+        }
+    }
+
+    _assert_issue(
+        _tool(schema=schema),
+        "profile.api_key",
+        "credential-bearing input field names are prohibited",
+    )
+
+
+def test_behavior_matrix_is_the_only_workspace_scope_registry() -> None:
+    module = _review_module()
+
+    assert not hasattr(module, "_WORKSPACE_SCOPED_TOOLS")
+    assert module.BEHAVIOR_MATRIX
+    for tool_name, behavior in module.BEHAVIOR_MATRIX.items():
+        assert isinstance(behavior.requires_workspace, bool), tool_name
+
+
+def test_future_workspace_matrix_entry_requires_workspace_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _review_module()
+    behavior_type = getattr(module, "ToolBehavior", None)
+    assert behavior_type is not None, "BEHAVIOR_MATRIX needs mandatory workspace metadata"
+    monkeypatch.setitem(
+        module.BEHAVIOR_MATRIX,
+        "future_workspace_tool",
+        behavior_type(
+            read_only=True,
+            destructive=False,
+            idempotent=None,
+            open_world=False,
+            requires_workspace=True,
+        ),
+    )
+    tool = _tool(
+        name="future_workspace_tool",
+        schema=_strict_root({"query": {"type": "string"}}),
+    )
+
+    issues = module.review_tools([tool])
+
+    assert any(
+        issue.startswith("future_workspace_tool.workspace_id:")
+        and "must require workspace_id" in issue
+        for issue in issues
+    ), issues
 
 
 @pytest.mark.asyncio

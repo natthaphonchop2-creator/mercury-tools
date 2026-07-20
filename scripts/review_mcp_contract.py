@@ -6,59 +6,73 @@ import asyncio
 import re
 import sys
 from collections.abc import Iterable, Mapping
-from typing import Any
+from typing import Any, NamedTuple
 
 SUCCESS_MESSAGE = "Mercury MCP review: 0 unclear arguments; annotations verified"
+
+class ToolBehavior(NamedTuple):
+    """Reviewed annotations and workspace scope for one hosted tool."""
+
+    read_only: bool
+    destructive: bool
+    idempotent: bool | None
+    open_world: bool
+    requires_workspace: bool
+
+    @property
+    def annotation_values(self) -> tuple[bool, bool, bool | None, bool]:
+        return (
+            self.read_only,
+            self.destructive,
+            self.idempotent,
+            self.open_world,
+        )
+
 
 _CLOSED_READ = (True, False, None, False)
 _CLOSED_CREATE = (False, False, False, False)
 _CLOSED_IDEMPOTENT_WRITE = (False, False, True, False)
 _CLOSED_DESTRUCTIVE_IDEMPOTENT = (False, True, True, False)
 
-BEHAVIOR_MATRIX: dict[str, tuple[bool, bool, bool | None, bool]] = {
-    "search_knowledge": _CLOSED_READ,
-    "retrieve_context_pack": _CLOSED_READ,
-    "retrieve_workspace_context_pack": _CLOSED_READ,
-    "get_document": _CLOSED_READ,
-    "create_public_workspace": _CLOSED_CREATE,
-    "get_public_workspace": _CLOSED_READ,
-    "list_connectors": _CLOSED_READ,
-    "get_connector_setup": _CLOSED_READ,
-    "link_connector_profile": _CLOSED_CREATE,
-    "validate_connector_connection": _CLOSED_IDEMPOTENT_WRITE,
-    "connector_capabilities": _CLOSED_READ,
-    "unlink_connector_profile": _CLOSED_DESTRUCTIVE_IDEMPOTENT,
-    "connector_status": _CLOSED_READ,
-    "list_accounting_skills": _CLOSED_READ,
-    "get_accounting_skill_schema": _CLOSED_READ,
-    "run_accounting_skill": _CLOSED_READ,
-    "flow_cheat_sheet": _CLOSED_READ,
-    "check_flow_syntax": _CLOSED_READ,
-    "inspect_flow_files": _CLOSED_READ,
-    "run_inline_flow": _CLOSED_READ,
-    "run_flow_files": _CLOSED_READ,
-    "list_workspace_flows": _CLOSED_READ,
-    "run_workspace_flow": _CLOSED_READ,
-    "save_workspace_flow": _CLOSED_IDEMPOTENT_WRITE,
+BEHAVIOR_MATRIX: dict[str, ToolBehavior] = {
+    "search_knowledge": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
+    "retrieve_context_pack": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
+    "retrieve_workspace_context_pack": ToolBehavior(
+        *_CLOSED_READ, requires_workspace=True
+    ),
+    "get_document": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
+    "create_public_workspace": ToolBehavior(
+        *_CLOSED_CREATE, requires_workspace=False
+    ),
+    "get_public_workspace": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
+    "list_connectors": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
+    "get_connector_setup": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
+    "link_connector_profile": ToolBehavior(*_CLOSED_CREATE, requires_workspace=True),
+    "validate_connector_connection": ToolBehavior(
+        *_CLOSED_IDEMPOTENT_WRITE, requires_workspace=True
+    ),
+    "connector_capabilities": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
+    "unlink_connector_profile": ToolBehavior(
+        *_CLOSED_DESTRUCTIVE_IDEMPOTENT, requires_workspace=True
+    ),
+    "connector_status": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
+    "list_accounting_skills": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
+    "get_accounting_skill_schema": ToolBehavior(
+        *_CLOSED_READ, requires_workspace=False
+    ),
+    "run_accounting_skill": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
+    "flow_cheat_sheet": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
+    "check_flow_syntax": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
+    "inspect_flow_files": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
+    "run_inline_flow": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
+    "run_flow_files": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
+    "list_workspace_flows": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
+    "run_workspace_flow": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
+    "save_workspace_flow": ToolBehavior(
+        *_CLOSED_IDEMPOTENT_WRITE, requires_workspace=True
+    ),
 }
 
-_WORKSPACE_SCOPED_TOOLS = frozenset(
-    {
-        "retrieve_workspace_context_pack",
-        "get_public_workspace",
-        "link_connector_profile",
-        "validate_connector_connection",
-        "connector_capabilities",
-        "unlink_connector_profile",
-        "connector_status",
-        "run_accounting_skill",
-        "run_inline_flow",
-        "run_flow_files",
-        "list_workspace_flows",
-        "run_workspace_flow",
-        "save_workspace_flow",
-    }
-)
 _MUTUALLY_EXCLUSIVE_SOURCE_FIELDS = frozenset(
     {"flow_yaml", "flow_files", "workspace_flow_id"}
 )
@@ -74,6 +88,33 @@ _ANNOTATION_FIELDS = (
     "openWorldHint",
 )
 _MISSING = object()
+_COMPOSITION_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf"})
+_NON_CONSTRAINT_KEYS = frozenset({"$defs", "definitions"})
+_JSON_TYPES = frozenset(
+    {"array", "boolean", "integer", "null", "number", "object", "string"}
+)
+_ATOMIC_TYPES = frozenset(
+    {"array", "boolean", "integer", "null", "number", "object", "string"}
+)
+_MAX_REF_DEPTH = 32
+_MAX_SCHEMA_DEPTH = 64
+_MAX_EXPANDED_BRANCHES = 256
+
+
+class _SchemaNode(NamedTuple):
+    schema: object
+    path: tuple[str, ...]
+
+
+class _SchemaFragment(NamedTuple):
+    schema: Mapping[str, Any]
+    path: tuple[str, ...]
+
+
+class _RootBranch(NamedTuple):
+    path: tuple[str, ...]
+    properties: frozenset[str]
+    required: frozenset[str]
 
 
 def _value(source: object, name: str, default: object = _MISSING) -> object:
@@ -83,164 +124,448 @@ def _value(source: object, name: str, default: object = _MISSING) -> object:
 
 
 def _argument_path(tool_name: str, path: tuple[str, ...]) -> str:
-    return f"{tool_name}.{'.'.join(path) if path else '<root>'}"
+    parts = list(path)
+    if not parts:
+        parts.append("<root>")
+    elif parts[0] in _COMPOSITION_KEYWORDS or parts[0] == "$ref":
+        parts.insert(0, "<root>")
+    rendered = tool_name
+    for part in parts:
+        if part.startswith("["):
+            rendered += part
+        else:
+            rendered += f".{part}"
+    return rendered
 
 
-def _resolve_ref(schema: Mapping[str, Any], root: Mapping[str, Any]) -> Mapping[str, Any] | None:
-    reference = schema.get("$ref")
-    if not isinstance(reference, str) or not reference.startswith("#/$defs/"):
-        return None
-    target: object = root
-    for raw_part in reference[2:].split("/"):
-        part = raw_part.replace("~1", "/").replace("~0", "~")
-        if not isinstance(target, Mapping) or part not in target:
-            return None
-        target = target[part]
-    return target if isinstance(target, Mapping) else None
+def _types_for_value(value: object) -> set[str]:
+    if value is None:
+        return {"null"}
+    if isinstance(value, bool):
+        return {"boolean"}
+    if isinstance(value, int):
+        return {"integer"}
+    if isinstance(value, float):
+        return {"number"}
+    if isinstance(value, str):
+        return {"string"}
+    if isinstance(value, list):
+        return {"array"}
+    if isinstance(value, Mapping):
+        return {"object"}
+    return set()
 
 
-def _schema_types(
-    schema: object,
-    root: Mapping[str, Any],
-    seen_refs: frozenset[str] = frozenset(),
-) -> set[str]:
-    if not isinstance(schema, Mapping):
+def _declared_types(value: object) -> set[str]:
+    raw_types = [value] if isinstance(value, str) else value
+    if not isinstance(raw_types, list):
         return set()
-    schema_type = schema.get("type")
-    types = {schema_type} if isinstance(schema_type, str) else set()
-    reference = schema.get("$ref")
-    if isinstance(reference, str) and reference not in seen_refs:
-        resolved = _resolve_ref(schema, root)
-        if resolved is not None:
-            types.update(_schema_types(resolved, root, seen_refs | {reference}))
-    for keyword in ("anyOf", "oneOf", "allOf"):
-        variants = schema.get(keyword)
-        if isinstance(variants, list):
-            for variant in variants:
-                types.update(_schema_types(variant, root, seen_refs))
-    return types
+    declared: set[str] = set()
+    for raw_type in raw_types:
+        if raw_type not in _JSON_TYPES:
+            continue
+        if raw_type == "number":
+            declared.update({"integer", "number"})
+        else:
+            declared.add(raw_type)
+    return declared
 
 
-def _has_explicit_enum(
-    schema: object,
-    root: Mapping[str, Any],
-    seen_refs: frozenset[str] = frozenset(),
-) -> bool:
-    if not isinstance(schema, Mapping):
-        return False
-    enum = schema.get("enum")
-    if isinstance(enum, list) and bool(enum):
-        return True
-    if "const" in schema:
-        return True
-    reference = schema.get("$ref")
-    if isinstance(reference, str) and reference not in seen_refs:
-        resolved = _resolve_ref(schema, root)
-        if resolved is not None and _has_explicit_enum(
-            resolved,
-            root,
-            seen_refs | {reference},
-        ):
-            return True
-    for keyword in ("anyOf", "oneOf", "allOf"):
-        variants = schema.get(keyword)
-        if isinstance(variants, list) and any(
-            _has_explicit_enum(variant, root, seen_refs) for variant in variants
-        ):
-            return True
-    return False
+class _SchemaReviewer:
+    def __init__(self, tool_name: str, root: Mapping[str, Any]) -> None:
+        self.tool_name = tool_name
+        self.root = root
+        self.issues: list[str] = []
+        self._issue_set: set[str] = set()
+        self.root_branches: list[_RootBranch] = []
 
+    def add(self, path: tuple[str, ...], message: str) -> None:
+        issue = f"{_argument_path(self.tool_name, path)}: {message}"
+        if issue not in self._issue_set:
+            self._issue_set.add(issue)
+            self.issues.append(issue)
 
-def _has_typed_items(schema: object, root: Mapping[str, Any]) -> bool:
-    if not isinstance(schema, Mapping) or not schema:
-        return False
-    if _schema_types(schema, root):
-        return True
-    if isinstance(schema.get("enum"), list) and schema["enum"]:
-        return True
-    return "const" in schema
+    def review(self, behavior: ToolBehavior | None) -> list[str]:
+        self._analyze((_SchemaNode(self.root, ()),), (), root=True)
 
-
-def _schema_issues(tool_name: str, schema: Mapping[str, Any]) -> list[str]:
-    issues: list[str] = []
-
-    def add(path: tuple[str, ...], message: str) -> None:
-        issues.append(f"{_argument_path(tool_name, path)}: {message}")
-
-    def visit(node: object, path: tuple[str, ...], *, root: bool = False) -> None:
-        if isinstance(node, list):
-            for index, item in enumerate(node):
-                visit(item, (*path, f"[{index}]"))
-            return
-        if not isinstance(node, Mapping):
-            return
-
-        is_object = node.get("type") == "object" or "properties" in node
-        if is_object:
-            properties = node.get("properties")
-            strict_no_argument_root = root and not properties and not node.get("required")
-            if not isinstance(properties, Mapping) or (
-                not properties and not strict_no_argument_root
-            ):
-                add(path, "object must define named properties")
-            if node.get("additionalProperties") is not False:
-                add(path, "object must set additionalProperties=false")
-
-        if node.get("type") == "array":
-            if not _has_typed_items(node.get("items"), schema):
-                add(path, "array must define a typed items schema")
-            maximum = node.get("maxItems")
-            if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 0:
-                add(path, "array must define a finite maxItems")
-
-        properties = node.get("properties")
-        if isinstance(properties, Mapping):
-            for field_name, field_schema in properties.items():
-                field_path = (*path, str(field_name))
-                if _CREDENTIAL_FIELD_RE.search(str(field_name)):
-                    add(field_path, "credential-bearing input field names are prohibited")
-                if str(field_name) == "environment":
-                    types = _schema_types(field_schema, schema)
-                    if types != {"array"} and not _has_explicit_enum(field_schema, schema):
-                        add(field_path, "environment must expose an explicit enum")
-                visit(field_schema, field_path)
-
-        for keyword, value in node.items():
-            if keyword == "properties":
-                continue
-            if keyword == "$defs" and isinstance(value, Mapping):
-                for definition_name, definition in value.items():
-                    visit(definition, ("$defs", str(definition_name)))
-                continue
-            if keyword in {"anyOf", "oneOf", "allOf", "items"}:
-                visit(value, (*path, keyword))
-
-    visit(schema, (), root=True)
-
-    properties = schema.get("properties")
-    if isinstance(properties, Mapping):
-        source_fields = sorted(set(properties) & _MUTUALLY_EXCLUSIVE_SOURCE_FIELDS)
+        source_fields = sorted(
+            set().union(*(branch.properties for branch in self.root_branches))
+            & _MUTUALLY_EXCLUSIVE_SOURCE_FIELDS
+        )
         if len(source_fields) > 1:
-            add(
+            self.add(
                 (),
                 "split mutually exclusive source fields into separate tools: "
                 + ", ".join(source_fields),
             )
 
-    if tool_name in _WORKSPACE_SCOPED_TOOLS:
-        required = schema.get("required")
-        if not isinstance(properties, Mapping) or "workspace_id" not in properties:
-            add(("workspace_id",), "workspace-scoped tool must define workspace_id")
-        if not isinstance(required, list) or "workspace_id" not in required:
-            add(("workspace_id",), "workspace-scoped tool must require workspace_id")
+        if behavior is not None and behavior.requires_workspace:
+            if not self.root_branches or any(
+                "workspace_id" not in branch.properties
+                for branch in self.root_branches
+            ):
+                self.add(
+                    ("workspace_id",),
+                    "workspace-scoped tool must define workspace_id",
+                )
+            if not self.root_branches or any(
+                "workspace_id" not in branch.required for branch in self.root_branches
+            ):
+                self.add(
+                    ("workspace_id",),
+                    "workspace-scoped tool must require workspace_id",
+                )
+        return self.issues
 
-    return issues
+    def _resolve_local_ref(
+        self,
+        reference: str,
+        path: tuple[str, ...],
+    ) -> Mapping[str, Any] | None:
+        if reference == "#":
+            target: object = self.root
+        elif reference.startswith("#/"):
+            target = self.root
+            for raw_part in reference[2:].split("/"):
+                part = raw_part.replace("~1", "/").replace("~0", "~")
+                if not isinstance(target, Mapping) or part not in target:
+                    self.add(path, f"local $ref {reference!r} does not resolve")
+                    return None
+                target = target[part]
+        else:
+            self.add(path, f"$ref {reference!r} must be a local JSON pointer")
+            return None
+        if not isinstance(target, Mapping):
+            self.add(path, f"local $ref {reference!r} must resolve to a schema object")
+            return None
+        return target
+
+    def _cross(
+        self,
+        left: list[tuple[_SchemaFragment, ...]],
+        right: list[tuple[_SchemaFragment, ...]],
+        path: tuple[str, ...],
+    ) -> list[tuple[_SchemaFragment, ...]]:
+        if not left or not right:
+            return []
+        if len(left) * len(right) > _MAX_EXPANDED_BRANCHES:
+            self.add(
+                path,
+                f"schema composition exceeds {_MAX_EXPANDED_BRANCHES} accepting branches",
+            )
+            return []
+        return [left_branch + right_branch for left_branch in left for right_branch in right]
+
+    def _expand(
+        self,
+        node: _SchemaNode,
+        *,
+        ref_stack: tuple[str, ...] = (),
+        depth: int = 0,
+    ) -> list[tuple[_SchemaFragment, ...]]:
+        if depth > _MAX_SCHEMA_DEPTH:
+            self.add(node.path, f"schema nesting exceeds {_MAX_SCHEMA_DEPTH} levels")
+            return []
+        if not isinstance(node.schema, Mapping):
+            self.add(node.path, "schema must be a JSON object")
+            return []
+
+        direct = {
+            key: value
+            for key, value in node.schema.items()
+            if key not in _COMPOSITION_KEYWORDS
+            and key not in _NON_CONSTRAINT_KEYS
+            and key != "$ref"
+        }
+        branches = [(_SchemaFragment(direct, node.path),)]
+
+        if "$ref" in node.schema:
+            reference = node.schema["$ref"]
+            ref_path = (*node.path, "$ref")
+            if not isinstance(reference, str):
+                self.add(ref_path, "$ref must be a local JSON pointer string")
+                return []
+            if reference in ref_stack:
+                self.add(ref_path, f"cyclic local $ref detected at {reference!r}")
+                return []
+            if len(ref_stack) >= _MAX_REF_DEPTH:
+                self.add(ref_path, f"local $ref depth exceeds {_MAX_REF_DEPTH}")
+                return []
+            target = self._resolve_local_ref(reference, ref_path)
+            if target is None:
+                return []
+            resolved = self._expand(
+                _SchemaNode(target, node.path),
+                ref_stack=(*ref_stack, reference),
+                depth=depth + 1,
+            )
+            branches = self._cross(branches, resolved, node.path)
+
+        variants = node.schema.get("allOf")
+        if variants is not None:
+            if not isinstance(variants, list) or not variants:
+                self.add((*node.path, "allOf"), "allOf must be a non-empty array")
+                return []
+            for index, variant in enumerate(variants):
+                variant_path = (*node.path, "allOf", f"[{index}]")
+                expanded = self._expand(
+                    _SchemaNode(variant, variant_path),
+                    ref_stack=ref_stack,
+                    depth=depth + 1,
+                )
+                branches = self._cross(branches, expanded, node.path)
+
+        for keyword in ("anyOf", "oneOf"):
+            variants = node.schema.get(keyword)
+            if variants is None:
+                continue
+            if not isinstance(variants, list) or not variants:
+                self.add(
+                    (*node.path, keyword),
+                    f"{keyword} must be a non-empty array",
+                )
+                return []
+            alternatives: list[tuple[_SchemaFragment, ...]] = []
+            for index, variant in enumerate(variants):
+                variant_path = (*node.path, keyword, f"[{index}]")
+                alternatives.extend(
+                    self._expand(
+                        _SchemaNode(variant, variant_path),
+                        ref_stack=ref_stack,
+                        depth=depth + 1,
+                    )
+                )
+            branches = self._cross(branches, alternatives, node.path)
+        return branches
+
+    def _expand_nodes(
+        self,
+        nodes: tuple[_SchemaNode, ...],
+        path: tuple[str, ...],
+    ) -> list[tuple[_SchemaFragment, ...]]:
+        branches: list[tuple[_SchemaFragment, ...]] = [()]
+        for node in nodes:
+            branches = self._cross(branches, self._expand(node), path)
+        return branches
+
+    @staticmethod
+    def _possible_types(branch: tuple[_SchemaFragment, ...]) -> set[str]:
+        possible = set(_ATOMIC_TYPES)
+        for fragment in branch:
+            schema = fragment.schema
+            if "type" in schema:
+                possible.intersection_update(_declared_types(schema["type"]))
+            enum = schema.get("enum")
+            if isinstance(enum, list):
+                enum_types: set[str] = set()
+                for value in enum:
+                    enum_types.update(_types_for_value(value))
+                possible.intersection_update(enum_types)
+            if "const" in schema:
+                possible.intersection_update(_types_for_value(schema["const"]))
+        return possible
+
+    @staticmethod
+    def _has_concrete_constraint(branch: tuple[_SchemaFragment, ...]) -> bool:
+        for fragment in branch:
+            schema = fragment.schema
+            if "type" in schema and bool(_declared_types(schema["type"])):
+                return True
+            if isinstance(schema.get("enum"), list) and bool(schema["enum"]):
+                return True
+            if "const" in schema:
+                return True
+        return False
+
+    @staticmethod
+    def _has_explicit_enum(branch: tuple[_SchemaFragment, ...]) -> bool:
+        return any(
+            (
+                isinstance(fragment.schema.get("enum"), list)
+                and bool(fragment.schema["enum"])
+            )
+            or "const" in fragment.schema
+            for fragment in branch
+        )
+
+    @staticmethod
+    def _branch_path(
+        branch: tuple[_SchemaFragment, ...],
+        fallback: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        candidates: list[tuple[str, ...]] = []
+        for fragment in branch:
+            for index, part in enumerate(fragment.path):
+                if (
+                    index >= len(fallback)
+                    and part in {"anyOf", "oneOf"}
+                    and index + 1 < len(fragment.path)
+                ):
+                    candidates.append(fragment.path[: index + 2])
+        return max(candidates, key=len) if candidates else fallback
+
+    def _object_view(
+        self,
+        branch: tuple[_SchemaFragment, ...],
+    ) -> tuple[dict[str, list[_SchemaNode]], set[str], bool]:
+        properties: dict[str, list[_SchemaNode]] = {}
+        required: set[str] = set()
+        closed = False
+        for fragment in branch:
+            schema = fragment.schema
+            raw_properties = schema.get("properties", _MISSING)
+            if raw_properties is not _MISSING:
+                if not isinstance(raw_properties, Mapping):
+                    self.add(fragment.path, "object properties must be a mapping")
+                else:
+                    for raw_name, field_schema in raw_properties.items():
+                        field_name = str(raw_name)
+                        field_path = (*fragment.path, field_name)
+                        if _CREDENTIAL_FIELD_RE.search(field_name):
+                            self.add(
+                                field_path,
+                                "credential-bearing input field names are prohibited",
+                            )
+                        properties.setdefault(field_name, []).append(
+                            _SchemaNode(field_schema, field_path)
+                        )
+            raw_required = schema.get("required", _MISSING)
+            if raw_required is not _MISSING:
+                if not isinstance(raw_required, list) or not all(
+                    isinstance(item, str) for item in raw_required
+                ):
+                    self.add(fragment.path, "object required must be an array of names")
+                else:
+                    required.update(raw_required)
+            if schema.get("additionalProperties") is False:
+                closed = True
+        return properties, required, closed
+
+    def _review_object(
+        self,
+        branch: tuple[_SchemaFragment, ...],
+        path: tuple[str, ...],
+        *,
+        root: bool,
+        properties: dict[str, list[_SchemaNode]],
+        required: set[str],
+        closed: bool,
+    ) -> None:
+        if not properties and (not root or required):
+            self.add(path, "object must define named properties")
+        if not closed:
+            self.add(path, "object must set additionalProperties=false")
+        for field_name, field_nodes in properties.items():
+            self._analyze(
+                tuple(field_nodes),
+                field_nodes[0].path,
+                field_name=field_name,
+            )
+
+    def _review_array(
+        self,
+        branch: tuple[_SchemaFragment, ...],
+        path: tuple[str, ...],
+    ) -> None:
+        item_nodes: list[_SchemaNode] = []
+        finite_max = False
+        for fragment in branch:
+            schema = fragment.schema
+            if "items" in schema:
+                item_nodes.append(
+                    _SchemaNode(schema["items"], (*fragment.path, "items"))
+                )
+            maximum = schema.get("maxItems", _MISSING)
+            if (
+                not isinstance(maximum, bool)
+                and isinstance(maximum, int)
+                and maximum >= 0
+            ):
+                finite_max = True
+        if not item_nodes:
+            self.add(path, "array must define a typed items schema")
+        else:
+            self._analyze(tuple(item_nodes), item_nodes[0].path)
+        if not finite_max:
+            self.add(path, "array must define a finite maxItems")
+
+    def _analyze(
+        self,
+        nodes: tuple[_SchemaNode, ...],
+        path: tuple[str, ...],
+        *,
+        root: bool = False,
+        field_name: str | None = None,
+    ) -> None:
+        issue_count = len(self.issues)
+        branches = self._expand_nodes(nodes, path)
+        accepting = 0
+        for branch in branches:
+            possible_types = self._possible_types(branch)
+            if not possible_types:
+                continue
+            accepting += 1
+            branch_path = self._branch_path(branch, path)
+            properties, required, closed = self._object_view(branch)
+
+            if root:
+                self.root_branches.append(
+                    _RootBranch(
+                        path=branch_path,
+                        properties=frozenset(properties),
+                        required=frozenset(required),
+                    )
+                )
+                if possible_types != {"object"}:
+                    self.add(
+                        branch_path,
+                        "root inputSchema must resolve to a strict object",
+                    )
+            elif not self._has_concrete_constraint(branch):
+                self.add(
+                    branch_path,
+                    "schema branch must define a concrete type or enum/const",
+                )
+                continue
+
+            if field_name == "environment":
+                scalar_types = possible_types - {"array", "null"}
+                if scalar_types and not self._has_explicit_enum(branch):
+                    self.add(
+                        branch_path,
+                        "environment must expose an explicit enum",
+                    )
+
+            if "object" in possible_types:
+                self._review_object(
+                    branch,
+                    branch_path,
+                    root=root,
+                    properties=properties,
+                    required=required,
+                    closed=closed,
+                )
+            if "array" in possible_types:
+                self._review_array(branch, branch_path)
+
+        if accepting == 0 and len(self.issues) == issue_count:
+            self.add(path, "schema has no accepting branch")
 
 
-def _annotation_issues(tool: object) -> list[str]:
+def _schema_issues(
+    tool_name: str,
+    schema: Mapping[str, Any],
+    behavior: ToolBehavior | None,
+) -> list[str]:
+    return _SchemaReviewer(tool_name, schema).review(behavior)
+
+
+def _annotation_issues(
+    tool: object,
+    behavior: ToolBehavior | None,
+) -> list[str]:
     tool_name = str(_value(tool, "name", "<unnamed>"))
-    expected = BEHAVIOR_MATRIX.get(tool_name)
-    if expected is None:
+    if behavior is None:
         return [
             f"{tool_name}.annotations: tool has no reviewed behavior-matrix entry"
         ]
@@ -249,11 +574,16 @@ def _annotation_issues(tool: object) -> list[str]:
     if annotations is None:
         return [
             f"{tool_name}.annotations: required behavior annotations are missing; "
-            f"expected {dict(zip(_ANNOTATION_FIELDS, expected, strict=True))}"
+            "expected "
+            f"{dict(zip(_ANNOTATION_FIELDS, behavior.annotation_values, strict=True))}"
         ]
 
     issues: list[str] = []
-    for field_name, expected_value in zip(_ANNOTATION_FIELDS, expected, strict=True):
+    for field_name, expected_value in zip(
+        _ANNOTATION_FIELDS,
+        behavior.annotation_values,
+        strict=True,
+    ):
         actual = _value(annotations, field_name)
         if actual is _MISSING:
             issues.append(
@@ -272,12 +602,15 @@ def review_tools(tools: Iterable[object]) -> list[str]:
     issues: list[str] = []
     for tool in sorted(tools, key=lambda item: str(_value(item, "name", ""))):
         tool_name = str(_value(tool, "name", "<unnamed>"))
+        behavior = BEHAVIOR_MATRIX.get(tool_name)
         input_schema = _value(tool, "inputSchema", None)
         if not isinstance(input_schema, Mapping):
-            issues.append(f"{tool_name}.<root>: inputSchema must be an object schema")
+            issues.append(
+                f"{tool_name}.<root>: root inputSchema must resolve to a strict object"
+            )
         else:
-            issues.extend(_schema_issues(tool_name, input_schema))
-        issues.extend(_annotation_issues(tool))
+            issues.extend(_schema_issues(tool_name, input_schema, behavior))
+        issues.extend(_annotation_issues(tool, behavior))
     return issues
 
 

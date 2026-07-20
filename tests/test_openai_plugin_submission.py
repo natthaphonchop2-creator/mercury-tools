@@ -5,7 +5,9 @@ import hashlib
 import importlib.util
 import json
 import re
+import stat
 import struct
+import zipfile
 from pathlib import Path
 from types import ModuleType
 from zipfile import ZipFile
@@ -225,5 +227,50 @@ def test_submission_bundle_is_deterministic_and_has_flat_skill_tree(tmp_path) ->
         assert all(
             info.date_time == build_module.ZIP_TIMESTAMP for info in archive.infolist()
         )
+        assert archive.comment == b""
+        for info in archive.infolist():
+            assert info.create_system == 3
+            assert info.create_version == 20
+            assert info.extract_version == 20
+            assert info.flag_bits == 0
+            assert info.volume == 0
+            assert info.internal_attr == 0
+            assert info.external_attr == (stat.S_IFREG | 0o644) << 16
+            assert info.compress_type == zipfile.ZIP_DEFLATED
+            assert info.extra == b""
+            assert info.comment == b""
+            assert info.reserved == 0
         for name in names:
             assert archive.read(name) == (SUBMISSION / "skills" / name).read_bytes()
+
+
+def test_submission_bundle_overrides_platform_zipinfo_defaults(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    build_module = _build_module()
+    unix_output = tmp_path / "unix-defaults.zip"
+    platform_output = tmp_path / "simulated-windows-defaults.zip"
+    build_module.build_bundle(output=unix_output)
+
+    def simulated_platform_zip_info(filename, date_time):
+        info = zipfile.ZipInfo(filename, date_time=date_time)
+        info.create_system = 0
+        info.create_version = 63
+        info.extract_version = 63
+        info.flag_bits = 0x800
+        info.volume = 7
+        info.internal_attr = 1
+        info.external_attr = 0x20
+        info.compress_type = zipfile.ZIP_STORED
+        info.extra = b"platform-extra"
+        info.comment = b"platform-comment"
+        info.reserved = 1
+        info._compresslevel = 1
+        return info
+
+    monkeypatch.setattr(build_module, "ZipInfo", simulated_platform_zip_info)
+
+    build_module.build_bundle(output=platform_output)
+
+    assert platform_output.read_bytes() == unix_output.read_bytes()
