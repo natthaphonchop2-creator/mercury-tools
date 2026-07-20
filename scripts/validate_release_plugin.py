@@ -36,6 +36,8 @@ EXPECTED_DEPENDENCIES = [
     "starlette==1.3.1",
     "uvicorn==0.50.0",
 ]
+EXPECTED_PACKAGE_VERSION = "0.3.0"
+EXPECTED_PLUGIN_VERSION = "0.3.0+codex.20260719"
 PRIVATE_TOKEN_NAME_RE = re.compile(
     r"private(?:[_ -][a-z0-9]+)*[_ -]token",
     flags=re.IGNORECASE,
@@ -377,8 +379,8 @@ def validate_release(root: Path) -> list[str]:
     interface = plugin.get("interface") if isinstance(plugin.get("interface"), dict) else {}
     if plugin.get("name") != "mercury-finance":
         errors.append("plugin name must be mercury-finance")
-    if plugin.get("version") != "0.2.2+codex.20260717":
-        errors.append("plugin version must be 0.2.2+codex.20260717")
+    if plugin.get("version") != EXPECTED_PLUGIN_VERSION:
+        errors.append(f"plugin version must be {EXPECTED_PLUGIN_VERSION}")
     if plugin.get("mcpServers") != "./.mcp.json":
         errors.append("plugin must reference ./.mcp.json")
     if interface.get("capabilities") != ["Interactive", "Read", "Write"]:
@@ -423,10 +425,10 @@ def validate_release(root: Path) -> list[str]:
         if isinstance(project.get("optional-dependencies"), dict)
         else {}
     )
-    if project.get("version") != "0.2.2":
-        errors.append("package version must be 0.2.2")
+    if project.get("version") != EXPECTED_PACKAGE_VERSION:
+        errors.append(f"package version must be {EXPECTED_PACKAGE_VERSION}")
     if project.get("dependencies") != EXPECTED_DEPENDENCIES:
-        errors.append("release runtime dependencies must be exact v0.2.2 pins")
+        errors.append("release runtime dependencies must retain the reviewed exact pins")
     if optional.get("openai") != ["openai==2.44.0"]:
         errors.append("openai must be optional at exactly 2.44.0")
 

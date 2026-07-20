@@ -18,7 +18,7 @@ from test_release_artifacts import (
     _run,
     install_task13_runner,
     make_release_tree,
-    make_v020_release_tree,
+    make_v022_release_tree,
     passing_task13_report,
 )
 
@@ -159,17 +159,15 @@ def test_release_verifier_accepts_version_consistent_candidate(
     assert calls[1][2].name == "expected-artifacts"
 
 
-def test_release_tree_rejects_moving_plugin_ref(tmp_path: Path) -> None:
+def test_release_tree_rejects_noncanonical_hosted_plugin_endpoint(tmp_path: Path) -> None:
     root = make_release_tree(tmp_path)
     path = root / "plugins/mercury-finance/.mcp.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["mcpServers"]["mercury-finance"]["args"][1] = (
-        "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@main"
-    )
+    payload["mcpServers"]["mercury-finance"]["url"] = "https://example.invalid/mcp"
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    _commit_release_tree(root, "moving plugin ref")
+    _commit_release_tree(root, "mutate hosted plugin endpoint")
 
-    with pytest.raises(ReleaseGateError, match="^plugin_ref_not_immutable$"):
+    with pytest.raises(ReleaseGateError, match="^mcp_server_contract_invalid$"):
         verify_release_tree(root, version=VERSION)
 
 
@@ -435,11 +433,11 @@ def test_public_release_apis_reject_namespace_before_any_staging(
     assert not output.exists()
 
 
-def test_cli_release_verify_keeps_current_v020_tree_blocked(
+def test_cli_release_verify_keeps_previous_v022_tree_blocked(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    root = make_v020_release_tree(tmp_path)
+    root = make_v022_release_tree(tmp_path)
     exit_code = cli.main(
         [
             "release",

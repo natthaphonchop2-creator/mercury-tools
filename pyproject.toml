@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mercury-tools"
-version = "0.2.2"
+version = "0.3.0"
 description = "Mercury Tools: MCP server and Supabase-backed RAG for accounting agents"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -60,7 +60,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.mercury.release-build]
 schema_version = 3
-lock_sha256 = "d23bde521bbed06d7c62b9bf5dcf799e844e86875e7f8e0cde983eeb0772e2e4"
+lock_sha256 = "d2d45cb9dd550cd1535bf548c8ab54256c98085f3f0531d8f79020e004eaa525"
 
 [tool.mercury.release-build.platform]
 path = "release-toolchain/platform.json"

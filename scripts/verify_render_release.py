@@ -34,16 +34,20 @@ EXPECTED_HOSTED_TOOLS = frozenset(
         "create_public_workspace",
         "get_public_workspace",
         "list_connectors",
+        "get_connector_setup",
+        "link_connector_profile",
+        "validate_connector_connection",
         "connector_capabilities",
-        "start_connector_setup",
+        "unlink_connector_profile",
         "connector_status",
+        "list_accounting_skills",
+        "get_accounting_skill_schema",
         "run_accounting_skill",
         "flow_cheat_sheet",
         "check_flow_syntax",
         "inspect_flow_files",
-        "run_flow",
+        "run_inline_flow",
         "run_flow_files",
-        "run_mercury_flow",
         "list_workspace_flows",
         "run_workspace_flow",
         "save_workspace_flow",
@@ -203,10 +207,10 @@ def verify_render_release(
         raise RenderReleaseError("mcp_unavailable") from exc
     if not isinstance(mcp, McpReleaseEvidence) or mcp.server_name != "Mercury Tools":
         raise RenderReleaseError("mcp_initialize_invalid")
-    if len(mcp.tools) != 20:
+    if len(mcp.tools) != len(EXPECTED_HOSTED_TOOLS):
         raise RenderReleaseError("hosted_tool_surface_mismatch")
     names = [tool.get("name") for tool in mcp.tools if isinstance(tool, dict)]
-    if len(names) != 20 or set(names) != EXPECTED_HOSTED_TOOLS:
+    if len(names) != len(EXPECTED_HOSTED_TOOLS) or set(names) != EXPECTED_HOSTED_TOOLS:
         raise RenderReleaseError("hosted_tool_surface_mismatch")
     for tool in mcp.tools:
         if _contains_credential_schema(tool.get("inputSchema")):

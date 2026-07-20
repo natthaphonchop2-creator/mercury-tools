@@ -23,7 +23,10 @@ from mercury_tools.release.trusted_attestation_v2 import (
 )
 
 _MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024
-_WORKFLOW_PATH = ".github/workflows/release-v0.2.2.yml"
+_WORKFLOW_PATH_BY_VERSION = {
+    "0.2.2": ".github/workflows/release-v0.2.2.yml",
+    "0.3.0": ".github/workflows/release-v0.3.0.yml",
+}
 
 
 class _HandoffModel(StrictReleaseModel):
@@ -46,7 +49,10 @@ class MercuryWorkflowReceipt(_HandoffModel):
     repository_id: int = Field(gt=0)
     run_attempt: int = Field(gt=0)
     run_id: int = Field(gt=0)
-    workflow_path: Literal[".github/workflows/release-v0.2.2.yml"]
+    workflow_path: Literal[
+        ".github/workflows/release-v0.2.2.yml",
+        ".github/workflows/release-v0.3.0.yml",
+    ]
 
 
 class OriginalControlReceipt(_HandoffModel):
@@ -64,7 +70,7 @@ class ReleaseBundleReceipt(_HandoffModel):
     artifact_id: int = Field(gt=0)
     name: str = Field(
         pattern=(
-            r"^mercury-v0\.2\.2-release-artifacts-"
+            r"^mercury-v0\.(?:2\.2|3\.0)-release-artifacts-"
             r"[1-9][0-9]*-attempt-[1-9][0-9]*$"
         )
     )
@@ -82,20 +88,22 @@ class ReleaseReadyHandoffV3(_HandoffModel):
     release_bundle: ReleaseBundleReceipt
     reviewed_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
     schema_version: Literal[3]
-    staging_ref: str = Field(pattern=r"^v0\.2\.2-rc\.[0-9a-f]{12}$")
-    version: Literal["0.2.2"]
+    staging_ref: str = Field(pattern=r"^v0\.(?:2\.2|3\.0)-rc\.[0-9a-f]{12}$")
+    version: Literal["0.2.2", "0.3.0"]
 
     @model_validator(mode="after")
     def validate_attempt_binding(self) -> ReleaseReadyHandoffV3:
         expected_bundle = (
-            "mercury-v0.2.2-release-artifacts-"
+            f"mercury-v{self.version}-release-artifacts-"
             f"{self.mercury_workflow.run_id}-attempt-"
             f"{self.mercury_workflow.run_attempt}"
         )
         names = tuple(item.name for item in self.artifacts)
         if (
             self.release_bundle.name != expected_bundle
-            or self.staging_ref != f"v0.2.2-rc.{self.reviewed_sha[:12]}"
+            or self.mercury_workflow.workflow_path
+            != _WORKFLOW_PATH_BY_VERSION[self.version]
+            or self.staging_ref != f"v{self.version}-rc.{self.reviewed_sha[:12]}"
             or names != tuple(sorted(set(names)))
         ):
             raise ValueError("release_handoff_identity_invalid")
@@ -120,7 +128,8 @@ def write_release_ready_handoff(
     """Write a new handoff after collecting an exact regular-file inventory."""
 
     created_at = _utc(now or datetime.now(UTC))
-    inventory = _artifact_inventory(artifacts)
+    version = attestation.version
+    inventory = _artifact_inventory(artifacts, version=version)
     handoff = ReleaseReadyHandoffV3(
         artifacts=inventory,
         created_at=created_at,
@@ -129,7 +138,7 @@ def write_release_ready_handoff(
             repository_id=mercury_repository_id,
             run_attempt=mercury_run_attempt,
             run_id=mercury_run_id,
-            workflow_path=_WORKFLOW_PATH,
+            workflow_path=_WORKFLOW_PATH_BY_VERSION[version],
         ),
         original_release_control=OriginalControlReceipt(
             artifact_digest=control_artifact_digest,
@@ -145,14 +154,14 @@ def write_release_ready_handoff(
             artifact_digest=release_bundle_artifact_digest,
             artifact_id=release_bundle_artifact_id,
             name=(
-                "mercury-v0.2.2-release-artifacts-"
+                f"mercury-v{version}-release-artifacts-"
                 f"{mercury_run_id}-attempt-{mercury_run_attempt}"
             ),
         ),
         reviewed_sha=attestation.reviewed_sha,
         schema_version=3,
         staging_ref=attestation.staging.ref,
-        version="0.2.2",
+        version=version,
     )
     encoded = (
         json.dumps(
@@ -166,7 +175,11 @@ def write_release_ready_handoff(
     return handoff
 
 
-def _artifact_inventory(path: Path) -> tuple[ReleaseArtifactReceipt, ...]:
+def _artifact_inventory(
+    path: Path,
+    *,
+    version: Literal["0.2.2", "0.3.0"],
+) -> tuple[ReleaseArtifactReceipt, ...]:
     try:
         root = path.lstat()
         entries = tuple(path.iterdir())
@@ -176,10 +189,10 @@ def _artifact_inventory(path: Path) -> tuple[ReleaseArtifactReceipt, ...]:
         raise ReleaseGateError("release_handoff_artifacts_invalid")
     expected = {
         "SHA256SUMS.json",
-        "mercury-finance-plugin-0.2.2.zip",
-        "mercury-tools-0.2.2-source.tar.gz",
-        "mercury_tools-0.2.2-py3-none-any.whl",
-        "mercury_tools-0.2.2.tar.gz",
+        f"mercury-finance-plugin-{version}.zip",
+        f"mercury-tools-{version}-source.tar.gz",
+        f"mercury_tools-{version}-py3-none-any.whl",
+        f"mercury_tools-{version}.tar.gz",
     }
     if {entry.name for entry in entries} != expected:
         raise ReleaseGateError("release_handoff_artifacts_invalid")

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from test_release_artifacts import (
+    VERSION,
     incomplete_task13_report,
     install_task13_runner,
     make_release_tree,
@@ -35,7 +36,7 @@ def test_public_staging_is_history_free_and_matches_reviewed_archive(
 
     staging = build_public_staging(
         root=root,
-        version="0.2.2",
+        version=VERSION,
         output=output,
     )
 
@@ -79,7 +80,7 @@ def test_public_staging_ignores_caller_git_template_and_global_config(
     monkeypatch.setenv("HOME", str(tmp_path / "poison-home"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "poison-xdg"))
 
-    build_public_staging(root=root, version="0.2.2", output=output)
+    build_public_staging(root=root, version=VERSION, output=output)
 
     assert not marker.exists()
     assert (output / ".git").is_dir()
@@ -92,7 +93,7 @@ def test_public_staging_rejects_untracked_candidate_content(tmp_path: Path) -> N
     with pytest.raises(ReleaseGateError, match="^release_worktree_not_clean$"):
         build_public_staging(
             root=root,
-            version="0.2.2",
+            version=VERSION,
             output=tmp_path / "public-staging",
         )
 
@@ -108,7 +109,7 @@ def test_public_staging_does_not_publish_when_task13_blocks(
     with pytest.raises(ReleaseGateError, match="^release_scanner_gate_blocked$"):
         build_public_staging(
             root=root,
-            version="0.2.2",
+            version=VERSION,
             output=output,
         )
 
@@ -126,7 +127,7 @@ def test_public_staging_rejects_incomplete_task13_report_atomically(
     with pytest.raises(ReleaseGateError, match="^release_scanner_gate_unavailable$"):
         build_public_staging(
             root=root,
-            version="0.2.2",
+            version=VERSION,
             output=output,
         )
 

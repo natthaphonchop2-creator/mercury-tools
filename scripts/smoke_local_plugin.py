@@ -18,6 +18,11 @@ from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 ROOT = Path(__file__).resolve().parents[1]
+EXPECTED_HOSTED_SERVER = {
+    "type": "http",
+    "url": "https://mercury-tools-mcp.onrender.com/mcp",
+    "note": "Mercury Accounting and ERP connector platform.",
+}
 EXPECTED_TOOLS = {
     "search_knowledge",
     "retrieve_context_pack",
@@ -31,9 +36,10 @@ EXPECTED_TOOLS = {
     "search_erp_actions",
     "get_erp_action_schema",
     "run_erp_read",
-    "preview_erp_write",
-    "confirm_erp_write",
-    "execute_erp_write",
+    "prepare_erp_mutation",
+    "execute_erp_create",
+    "execute_erp_update",
+    "execute_sensitive_erp_action",
     "get_erp_request_status",
     "import_erp_spec",
     "list_connector_drivers",
@@ -105,19 +111,19 @@ async def _smoke(wheel: Path, environment: dict[str, str]) -> None:
     names = {tool.name for tool in listed.tools}
     if initialized.serverInfo.name != "Mercury Finance":
         raise RuntimeError("unexpected_local_mcp_server_name")
-    if names != EXPECTED_TOOLS or len(listed.tools) != 19:
+    if names != EXPECTED_TOOLS or len(listed.tools) != len(EXPECTED_TOOLS):
         raise RuntimeError("local_mcp_tool_surface_mismatch")
 
 
 def main() -> int:
     server = _manifest_server()
-    if server.get("command") != "uvx":
-        raise RuntimeError("local_mcp_launcher_must_use_uvx")
+    if server != EXPECTED_HOSTED_SERVER:
+        raise RuntimeError("public_plugin_must_use_exact_hosted_mcp")
 
     wheel = _build_local_wheel()
     with tempfile.TemporaryDirectory(prefix="mercury-local-plugin-cache-") as temporary:
         asyncio.run(_smoke(wheel, _clean_environment(Path(temporary))))
-    print("local packaged Mercury Finance MCP smoke passed (one server, 19 tools)")
+    print("local packaged Mercury Finance MCP smoke passed (advanced runtime, 20 tools)")
     return 0
 
 

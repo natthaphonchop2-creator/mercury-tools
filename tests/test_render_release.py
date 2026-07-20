@@ -19,8 +19,38 @@ from scripts.verify_render_release import (  # noqa: E402
     verify_render_release,
 )
 
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 COMMIT = "a" * 40
+V030_HOSTED_TOOLS = {
+    "check_flow_syntax",
+    "connector_capabilities",
+    "connector_status",
+    "create_public_workspace",
+    "flow_cheat_sheet",
+    "get_accounting_skill_schema",
+    "get_connector_setup",
+    "get_document",
+    "get_public_workspace",
+    "inspect_flow_files",
+    "link_connector_profile",
+    "list_accounting_skills",
+    "list_connectors",
+    "list_workspace_flows",
+    "retrieve_context_pack",
+    "retrieve_workspace_context_pack",
+    "run_accounting_skill",
+    "run_flow_files",
+    "run_inline_flow",
+    "run_workspace_flow",
+    "save_workspace_flow",
+    "search_knowledge",
+    "unlink_connector_profile",
+    "validate_connector_connection",
+}
+
+
+def test_render_release_uses_the_reviewed_v030_hosted_tool_contract() -> None:
+    assert EXPECTED_HOSTED_TOOLS == V030_HOSTED_TOOLS
 
 
 def test_live_render_probe_rejects_unsafe_owner_id() -> None:
@@ -149,7 +179,7 @@ def test_render_release_requires_every_exact_gate() -> None:
     assert report.version == VERSION
     assert report.commit == COMMIT
     assert report.catalog_count == 254
-    assert report.tool_count == 20
+    assert report.tool_count == 24
     assert probe.events == ["healthz", "status", "catalog", "mcp", "logs"]
 
 

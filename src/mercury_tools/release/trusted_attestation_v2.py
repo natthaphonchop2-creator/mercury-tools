@@ -1,4 +1,4 @@
-"""Strict reader for sanitized Mercury v0.2.2 release-control attestations."""
+"""Strict reader for sanitized Mercury release-control attestations."""
 
 from __future__ import annotations
 
@@ -49,6 +49,10 @@ TRUSTED_RELEASE_CONTROL_RUN_ATTEMPT_ENV = (
 _MAX_ATTESTATION_BYTES = 512 * 1024
 _MAX_FUTURE_SKEW = timedelta(minutes=5)
 _MAX_LIFETIME = timedelta(minutes=60)
+_REQUIRED_MIGRATION_BY_VERSION = {
+    "0.2.2": "20260716100000",
+    "0.3.0": "20260719120000",
+}
 
 
 class _TrustedModel(StrictReleaseModel):
@@ -93,12 +97,12 @@ class TrustedRenderEvidence(_TrustedModel):
     hosted_tool_count: int = Field(ge=1, le=1_000)
     logs_scanned: Literal[True]
     status: Literal["live"]
-    version: Literal["0.2.2"]
+    version: Literal["0.2.2", "0.3.0"]
 
 
 class TrustedSupabaseEvidence(_TrustedModel):
     function_count: int = Field(ge=1, le=1_000)
-    migration_id: Literal["20260716100000"]
+    migration_id: Literal["20260716100000", "20260719120000"]
     project_ref_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     rag_identity_count: int = Field(ge=1, le=100_000)
     read_only: Literal[True]
@@ -112,12 +116,12 @@ class TrustedProviderEvidence(_TrustedModel):
     render: TrustedRenderEvidence
     reviewed_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
     supabase: TrustedSupabaseEvidence
-    version: Literal["0.2.2"]
+    version: Literal["0.2.2", "0.3.0"]
 
 
 class TrustedStagingReceipt(_TrustedModel):
     commit_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
-    ref: str = Field(pattern=r"^v0\.2\.2-rc\.[0-9a-f]{12}$")
+    ref: str = Field(pattern=r"^v0\.(?:2\.2|3\.0)-rc\.[0-9a-f]{12}$")
     repository: Literal[
         "natthaphonchop2-creator/mercury-tools-staging"
     ]
@@ -144,7 +148,7 @@ class TrustedAttestationV2(_TrustedModel):
     surface_evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     surface_count: Literal[8]
     surfaces: tuple[SurfaceAttestation, ...] = Field(min_length=8, max_length=8)
-    version: Literal["0.2.2"]
+    version: Literal["0.2.2", "0.3.0"]
     workflow: TrustedWorkflowReceipt
 
     @model_validator(mode="after")
@@ -152,7 +156,11 @@ class TrustedAttestationV2(_TrustedModel):
         if (
             self.reviewed_sha != self.provider_evidence.reviewed_sha
             or self.provider_evidence.render.commit != self.reviewed_sha
-            or self.staging.ref != f"v0.2.2-rc.{self.reviewed_sha[:12]}"
+            or self.provider_evidence.version != self.version
+            or self.provider_evidence.render.version != self.version
+            or self.provider_evidence.supabase.migration_id
+            != _REQUIRED_MIGRATION_BY_VERSION[self.version]
+            or self.staging.ref != f"v{self.version}-rc.{self.reviewed_sha[:12]}"
             or tuple(item.surface for item in self.surfaces)
             != TRUSTED_RELEASE_CONTROL_SURFACES
             or any(item.status is not GateStatus.PASSED for item in self.surfaces)

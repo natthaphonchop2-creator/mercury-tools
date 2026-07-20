@@ -41,9 +41,10 @@ _EXPECTED_LOCAL_TOOLS = frozenset(
         "search_erp_actions",
         "get_erp_action_schema",
         "run_erp_read",
-        "preview_erp_write",
-        "confirm_erp_write",
-        "execute_erp_write",
+        "prepare_erp_mutation",
+        "execute_erp_create",
+        "execute_erp_update",
+        "execute_sensitive_erp_action",
         "get_erp_request_status",
         "import_erp_spec",
         "list_connector_drivers",
@@ -306,7 +307,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 launcher_ref=args.launcher_ref,
             )
             run_tagged_smoke(plan)
-    print("tagged marketplace smoke passed (one local server, 19 tools)")
+    print("tagged marketplace smoke passed (one hosted plugin, 20 advanced local tools)")
     return 0
 
 

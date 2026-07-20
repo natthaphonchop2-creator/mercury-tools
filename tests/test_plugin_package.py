@@ -455,7 +455,7 @@ def test_packaged_advanced_local_erp_guide_matches_the_authoritative_repo_guide(
     assert packaged.read_text(encoding="utf-8") == authoritative.read_text(encoding="utf-8")
 
 
-def test_v022_versions_remain_consistent() -> None:
+def test_v030_versions_remain_consistent() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     package_source = (ROOT / "src/mercury_tools/__init__.py").read_text(
         encoding="utf-8"
@@ -464,9 +464,9 @@ def test_v022_versions_remain_consistent() -> None:
         (PLUGIN_ROOT / ".codex-plugin/plugin.json").read_text(encoding="utf-8")
     )
 
-    assert project["project"]["version"] == "0.2.2"
-    assert package_source.strip().endswith('__version__ = "0.2.2"')
-    assert plugin["version"] == "0.2.2+codex.20260717"
+    assert project["project"]["version"] == "0.3.0"
+    assert package_source.strip().endswith('__version__ = "0.3.0"')
+    assert plugin["version"] == "0.3.0+codex.20260719"
 
 
 def test_sdist_excludes_internal_test_fixtures(tmp_path: Path) -> None:
@@ -901,7 +901,7 @@ def test_plugin_declares_read_and_write_without_embedded_secrets() -> None:
     )
     serialized = json.dumps(manifest)
 
-    assert manifest["version"] == "0.2.2+codex.20260717"
+    assert manifest["version"] == "0.3.0+codex.20260719"
     assert manifest["interface"]["capabilities"] == ["Interactive", "Read", "Write"]
     assert manifest["interface"]["defaultPrompt"] == [
         "Connect an accounting or ERP system",
@@ -928,7 +928,7 @@ def test_release_runtime_dependencies_are_exactly_pinned() -> None:
     data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     dependencies = data["project"]["dependencies"]
 
-    assert data["project"]["version"] == "0.2.2"
+    assert data["project"]["version"] == "0.3.0"
     assert all("==" in dependency for dependency in dependencies)
     assert dependencies == [
         "httpx==0.28.1",
@@ -942,7 +942,7 @@ def test_release_runtime_dependencies_are_exactly_pinned() -> None:
     assert data["project"]["optional-dependencies"]["openai"] == ["openai==2.44.0"]
     assert "openai" not in "\n".join(dependencies)
     assert (ROOT / "src/mercury_tools/__init__.py").read_text(encoding="utf-8").strip().endswith(
-        '__version__ = "0.2.2"'
+        '__version__ = "0.3.0"'
     )
 
 

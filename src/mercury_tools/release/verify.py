@@ -44,17 +44,18 @@ from mercury_tools.release.scanner import (
 
 EXPECTED_LOCAL_MCP_TOOL_NAMES = frozenset(
     {
-        "confirm_erp_write",
         "connector_status",
         "credential_status",
-        "execute_erp_write",
+        "execute_erp_create",
+        "execute_erp_update",
+        "execute_sensitive_erp_action",
         "get_document",
         "get_erp_action_schema",
         "get_erp_request_status",
         "import_erp_spec",
         "list_connector_drivers",
         "list_workspace_flows",
-        "preview_erp_write",
+        "prepare_erp_mutation",
         "retrieve_context_pack",
         "run_accounting_skill",
         "run_erp_read",
@@ -65,6 +66,11 @@ EXPECTED_LOCAL_MCP_TOOL_NAMES = frozenset(
         "search_knowledge",
     }
 )
+EXPECTED_HOSTED_MCP_SERVER = {
+    "type": "http",
+    "url": "https://mercury-tools-mcp.onrender.com/mcp",
+    "note": "Mercury Accounting and ERP connector platform.",
+}
 _MCP_TOOL_LIST_PROGRAM = (
     "import asyncio, json, sys\n"
     "sys.path.insert(0, sys.argv[1])\n"
@@ -221,7 +227,7 @@ def verify_release_tree(root: Path, *, version: str):
 
     candidate = load_release_candidate(root, version=version, require_clean=False)
     with materialize_release_candidate(candidate) as snapshot:
-        _require_immutable_plugin_ref(snapshot, version)
+        _require_plugin_contract(snapshot, version)
         _require_exact_local_mcp_tools(snapshot)
     return candidate
 
@@ -237,7 +243,7 @@ def verify_release(
     candidate = load_release_candidate(root, version=version, require_clean=True)
     try:
         with materialize_release_candidate(candidate) as snapshot:
-            _require_immutable_plugin_ref(snapshot, version)
+            _require_plugin_contract(snapshot, version)
             _require_exact_local_mcp_tools(snapshot)
             with tempfile.TemporaryDirectory(prefix=".mercury-release-verify-") as temporary:
                 expected_artifacts = Path(temporary) / "expected-artifacts"
@@ -293,7 +299,7 @@ def build_public_staging(
         candidate = load_release_candidate(root, version=version, require_clean=True)
         candidate_digest = source_tree_digest(candidate.entries)
         with materialize_release_candidate(candidate) as snapshot:
-            _require_immutable_plugin_ref(snapshot, version)
+            _require_plugin_contract(snapshot, version)
             _require_exact_local_mcp_tools(snapshot)
             with tempfile.TemporaryDirectory(prefix=".mercury-public-staging-") as temporary:
                 temporary_root = Path(temporary)
@@ -345,7 +351,7 @@ def build_public_staging(
         destination.close()
 
 
-def _require_immutable_plugin_ref(root: Path, version: str) -> None:
+def _require_plugin_contract(root: Path, version: str) -> None:
     mcp_path = root / "plugins/mercury-finance/.mcp.json"
     plugin_path = root / "plugins/mercury-finance/.codex-plugin/plugin.json"
     try:
@@ -359,19 +365,7 @@ def _require_immutable_plugin_ref(root: Path, version: str) -> None:
     if not isinstance(servers, dict) or list(servers) != ["mercury-finance"]:
         raise ReleaseGateError("mcp_server_contract_invalid")
     server = servers["mercury-finance"]
-    if not isinstance(server, dict):
-        raise ReleaseGateError("mcp_server_contract_invalid")
-    args = server.get("args")
-    expected_ref = f"git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v{version}"
-    if not isinstance(args, list) or len(args) < 2 or args[1] != expected_ref:
-        raise ReleaseGateError("plugin_ref_not_immutable")
-    if set(server) != {"args", "command", "cwd", "tool_timeout_sec"}:
-        raise ReleaseGateError("mcp_server_contract_invalid")
-    if server.get("command") != "uvx" or server.get("cwd") != ".":
-        raise ReleaseGateError("mcp_server_contract_invalid")
-    if server.get("tool_timeout_sec") != 900:
-        raise ReleaseGateError("mcp_server_contract_invalid")
-    if args != ["--from", expected_ref, "mercury", "mcp", "serve-local"]:
+    if server != EXPECTED_HOSTED_MCP_SERVER:
         raise ReleaseGateError("mcp_server_contract_invalid")
     plugin_version = plugin.get("version")
     if not isinstance(plugin_version, str) or not (
