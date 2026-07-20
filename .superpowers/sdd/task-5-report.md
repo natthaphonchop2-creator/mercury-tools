@@ -1,6 +1,6 @@
 # Task 5 Report
 
-Status: complete with concern
+Status: complete
 
 Files changed:
 - `src/mercury_tools/mcp/schemas.py`
@@ -39,3 +39,30 @@ Additional test evidence:
 - `uv run pytest -q tests/test_http_app.py::test_connect_page_and_status tests/test_mcp_contract.py tests/test_connector_mcp_tools.py tests/test_plugin_package.py -k 'flow or connect_page_and_status'` -> `29 passed, 86 deselected, 1 warning`; focused HTTP status and Task 5 flow tests passed.
 - `uv run ruff check tests/test_http_app.py` -> passed.
 - `git diff --check` -> passed.
+
+## Review-fix addendum: public flow workspace validation
+
+Files changed by this review fix:
+- `src/mercury_tools/mcp/server.py`
+- `tests/test_mcp_contract.py`
+- `tests/test_connector_mcp_tools.py`
+- `.superpowers/sdd/task-5-report.md`
+
+Implementation:
+- `run_inline_flow` and `run_flow_files` now normalize `workspace_id` with the
+  canonical `normalize_public_workspace_id()` before hosted-environment
+  validation, flow parsing, planning/execution, or audit persistence.
+- Blank, whitespace-only, and malformed values return the fixed sanitized
+  response `Invalid Mercury public workspace ID.` and produce no audit event.
+- The public `run_flow_files` connector-readiness test now asserts this earlier
+  boundary. Undecorated `run_flow` and `run_mercury_flow` compatibility helpers
+  are unchanged; Task 6 behavior is unchanged.
+
+Test commands and results:
+- RED before implementation: `uv run pytest -q tests/test_mcp_contract.py -k 'hosted_flow_tools_reject_invalid_workspace_ids_before_side_effects'` -> `6 failed, 22 deselected`; both public tools reached `_hosted_flow_environment_overrides` before workspace validation.
+- GREEN after implementation: `uv run pytest -q tests/test_mcp_contract.py -k 'hosted_flow_tools_reject_invalid_workspace_ids_before_side_effects'` -> `6 passed, 22 deselected`.
+- `uv run pytest -q tests/test_mcp_contract.py tests/test_connector_mcp_tools.py tests/test_plugin_package.py -k flow` -> `34 passed, 86 deselected, 1 warning`.
+- `uv run pytest -q tests/test_http_app.py::test_connect_page_and_status tests/test_mcp_contract.py tests/test_connector_mcp_tools.py tests/test_plugin_package.py -k 'flow or connect_page_and_status'` -> `35 passed, 86 deselected, 1 warning`.
+- `uv run ruff check src/mercury_tools/mcp/server.py tests/test_mcp_contract.py tests/test_connector_mcp_tools.py` -> `All checks passed!`.
+- `git diff --check` -> passed.
+- Full-suite status remains intentionally unverified; the focused runs emitted one existing Starlette `TestClient` deprecation warning.

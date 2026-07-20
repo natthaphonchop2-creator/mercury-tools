@@ -749,6 +749,86 @@ async def test_run_inline_flow_schema_executes_through_fastmcp() -> None:
         (
             "run_inline_flow",
             {
+                "flow_yaml": "name: Invalid workspace\n---\n- emitReport: {}\n",
+            },
+        ),
+        (
+            "run_flow_files",
+            {
+                "flow_files": [
+                    {
+                        "path": "flows/invalid-workspace.yaml",
+                        "flow_yaml": "name: Invalid workspace\n---\n- emitReport: {}\n",
+                    }
+                ],
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "workspace_id",
+    ["", " \t\n ", "not-a-mercury-public-workspace-marker-123"],
+)
+async def test_hosted_flow_tools_reject_invalid_workspace_ids_before_side_effects(
+    monkeypatch,
+    tool_name,
+    tool_arguments,
+    workspace_id,
+) -> None:
+    from mercury_tools.mcp import server
+
+    audit_events: list[dict[str, object]] = []
+
+    def fake_audit(
+        tool_name: str,
+        input_payload: dict[str, object],
+        output_summary: dict[str, object],
+    ) -> None:
+        audit_events.append(
+            {
+                "tool_name": tool_name,
+                "input_payload": input_payload,
+                "output_summary": output_summary,
+            }
+        )
+
+    def fail_if_reached(*_args, **_kwargs):
+        pytest.fail("invalid workspace_id reached hosted flow handling")
+
+    monkeypatch.setattr(server, "_audit", fake_audit)
+    monkeypatch.setattr(server, "_hosted_flow_environment_overrides", fail_if_reached)
+    monkeypatch.setattr(server, "_flow_files_from_payload", fail_if_reached)
+    monkeypatch.setattr(server, "parse_flow_text", fail_if_reached)
+    monkeypatch.setattr(server, "create_default_runner", fail_if_reached)
+
+    content, structured = await server.mcp.call_tool(
+        tool_name,
+        {
+            "workspace_id": workspace_id,
+            **tool_arguments,
+            "environment": [{"name": "month", "value": "2026-10"}],
+            "dry_run": True,
+        },
+    )
+
+    assert structured == {
+        "status": "error",
+        "message": "Invalid Mercury public workspace ID.",
+        "dry_run": True,
+    }
+    assert "planned" not in str((content, structured))
+    assert audit_events == []
+    if workspace_id.strip():
+        assert workspace_id not in str((content, structured, audit_events))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "tool_arguments"),
+    [
+        (
+            "run_inline_flow",
+            {
                 "workspace_id": "mw_publiccontestworkspace001",
                 "flow_yaml": "name: Secret boundary\n---\n- emitReport: {}\n",
             },

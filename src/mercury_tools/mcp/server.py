@@ -311,6 +311,14 @@ def _invalid_hosted_flow_environment_payload(
     return payload
 
 
+def _invalid_hosted_flow_workspace_payload(*, dry_run: bool) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "message": "Invalid Mercury public workspace ID.",
+        "dry_run": dry_run,
+    }
+
+
 def _string_list_from_payload(raw: Any, *, label: str) -> list[str]:
     if raw is None:
         return []
@@ -2195,6 +2203,10 @@ def run_inline_flow(
 ) -> dict[str, Any]:
     """Run one inline Mercury Flow in a public workspace."""
     try:
+        workspace_id = normalize_public_workspace_id(workspace_id)
+    except (AttributeError, ValueError):
+        return _invalid_hosted_flow_workspace_payload(dry_run=dry_run)
+    try:
         env_overrides = _hosted_flow_environment_overrides(environment)
     except ValueError:
         return _invalid_hosted_flow_environment_payload(
@@ -2435,6 +2447,10 @@ def run_flow_files(
     dry_run: bool = True,
 ) -> dict[str, Any]:
     """Run an in-memory Mercury Flow suite in a public workspace."""
+    try:
+        workspace_id = normalize_public_workspace_id(workspace_id)
+    except (AttributeError, ValueError):
+        return _invalid_hosted_flow_workspace_payload(dry_run=dry_run)
     try:
         env_overrides = _hosted_flow_environment_overrides(environment)
     except ValueError:

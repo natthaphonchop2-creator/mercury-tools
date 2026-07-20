@@ -875,7 +875,7 @@ def test_run_flow_blocks_connector_backed_raw_yaml_when_workspace_unready(
     assert payload["reason"] == "not_validated"
 
 
-def test_run_flow_files_requires_workspace_for_connector_backed_raw_yaml() -> None:
+def test_run_flow_files_rejects_invalid_workspace_id_before_connector_readiness() -> None:
     from mercury_tools.mcp import server
 
     payload = server.run_flow_files(
@@ -886,9 +886,11 @@ def test_run_flow_files_requires_workspace_for_connector_backed_raw_yaml() -> No
         dry_run=True,
     )
 
-    assert payload["status"] == "requires_workspace"
-    assert payload["selected_count"] == 1
-    assert payload["next_tool"] == "create_public_workspace"
+    assert payload == {
+        "status": "error",
+        "message": "Invalid Mercury public workspace ID.",
+        "dry_run": True,
+    }
 
 
 def test_run_mercury_flow_requires_workspace_for_connector_backed_flow_yaml() -> None:
