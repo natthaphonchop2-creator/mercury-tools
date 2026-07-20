@@ -82,3 +82,49 @@
 - Verification covers Task 6 plus shared MCP, cloud/runtime Skill, and local advanced Skill
   consumers. The repository-wide full suite was not required or run.
 - No Task 7 implementation was started and no remote push was performed.
+
+## Review Fix 2
+
+### Scope completed
+
+- Local Bridge routing now returns `connector_selection_required` with sorted, sanitized
+  connector/mode/environment tuples when more than one selected bridge profile remains. A
+  single selected bridge profile still returns the exact `local_bridge_required` handoff.
+- Added only declared per-mode aliases: FlowAccount API-driver
+  `tax.vat.summary.read -> tax.vat_summary.read` and PEAK API-driver
+  `journal.read -> daily_journal.get`. FlowAccount native MCP remains without either alias.
+- Native MCP routing treats a profile marked ready but missing or carrying an unsafe
+  `external_server_name` as `not_validated`, preventing a host tool plan from being returned.
+
+### TDD evidence
+
+- RED after adding catalog and routing regressions:
+  `uv run pytest -q tests/test_connector_catalog.py tests/test_skill_routing.py`
+  -> `7 failed, 19 passed`. Failures covered both absent aliases, optional capability
+  resolution, first-bridge selection, and malformed ready native profiles.
+- GREEN after the minimal manifest and routing changes:
+  the same command -> `26 passed`.
+
+### Verification evidence
+
+- Connector catalog plus Task 6 focused suite:
+  `uv run pytest -q tests/test_connector_catalog.py tests/test_skill_routing.py tests/test_connector_mcp_tools.py tests/test_plugin_package.py`
+  -> `137 passed, 1 warning`.
+- Public MCP contract:
+  `uv run pytest -q tests/test_mcp_contract.py` -> `66 passed`.
+- Runtime and cloud Skill consumers:
+  `uv run pytest -q tests/test_runtime_skills.py tests/test_cloud_api.py tests/test_cloud_client.py -k skill`
+  -> `49 passed, 324 deselected`.
+- Existing local advanced Skill runtime:
+  `uv run pytest -q tests/test_local_mcp_contract.py -k run_accounting_skill`
+  -> `1 passed, 36 deselected`.
+- Ruff for the changed Python source and tests:
+  `uv run ruff check src/mercury_tools/connectors/catalog.py src/mercury_tools/skills/routing.py tests/test_connector_catalog.py tests/test_skill_routing.py`
+  -> `All checks passed!`.
+
+### Concerns
+
+- The focused suite retains the pre-existing Starlette `TestClient` deprecation warning about
+  the `httpx` transport.
+- No Task 7 work, Task 9 launcher edits, or remote push was performed. The repository-wide
+  full suite was not required or run.

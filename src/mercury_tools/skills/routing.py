@@ -160,7 +160,13 @@ def _assess_profile(
     )
     status = _clean_profile_value(profile.get("status"))
     reason = required_failure["state"] if required_failure else None
-    if reason is None and status not in _READY_PROFILE_STATUSES:
+    if (
+        reason is None
+        and public_profile["connection_mode"] == "native_mcp"
+        and _sanitize_profile_value(profile.get("external_server_name")) is None
+    ):
+        reason = "not_validated"
+    elif reason is None and status not in _READY_PROFILE_STATUSES:
         reason = "not_authorized" if status == "requires_authorization" else "not_validated"
     return {
         "profile": profile,
@@ -262,6 +268,21 @@ def _local_bridge_route(
     }
 
 
+def _connector_selection_route(
+    skill: AccountingSkillDefinition,
+    assessments: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "status": "connector_selection_required",
+        "skill_id": skill.skill_id,
+        "choices": [dict(item["public_profile"]) for item in assessments],
+        "selected_profile": None,
+        "capability_resolution": [],
+        "ordered_steps": [],
+        "host_tool_requirements": [],
+    }
+
+
 def resolve_skill_route(
     skill: AccountingSkillDefinition,
     profiles: Sequence[Mapping[str, Any]],
@@ -295,24 +316,17 @@ def resolve_skill_route(
     )
     ready = [item for item in assessments if item["ready"]]
     if len(ready) > 1:
-        return {
-            "status": "connector_selection_required",
-            "skill_id": skill.skill_id,
-            "choices": [dict(item["public_profile"]) for item in ready],
-            "selected_profile": None,
-            "capability_resolution": [],
-            "ordered_steps": [],
-            "host_tool_requirements": [],
-        }
+        return _connector_selection_route(skill, ready)
     if len(ready) == 1:
         return _ready_route(skill, ready[0])
 
-    local_bridge = next(
-        (item for item in assessments if item["reason"] == "local_bridge_required"),
-        None,
-    )
-    if local_bridge is not None:
-        return _local_bridge_route(skill, local_bridge)
+    local_bridges = [
+        item for item in assessments if item["reason"] == "local_bridge_required"
+    ]
+    if len(local_bridges) > 1:
+        return _connector_selection_route(skill, local_bridges)
+    if local_bridges:
+        return _local_bridge_route(skill, local_bridges[0])
     if not assessments:
         reason = (
             "connector_profile_unavailable" if selected_connector else "connector_profile_required"

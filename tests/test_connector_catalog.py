@@ -59,6 +59,43 @@ def test_flowaccount_native_mcp_read_only_does_not_block_api_driver_writes() -> 
     )
 
 
+@pytest.mark.parametrize(
+    ("connector_id", "connection_mode", "canonical_capability", "provider_action"),
+    [
+        (
+            "flowaccount",
+            "api_driver",
+            "tax.vat.summary.read",
+            "tax.vat_summary.read",
+        ),
+        ("peak", "api_driver", "journal.read", "daily_journal.get"),
+    ],
+)
+def test_connector_capability_aliases_target_declared_provider_actions(
+    connector_id: str,
+    connection_mode: str,
+    canonical_capability: str,
+    provider_action: str,
+) -> None:
+    connector = connector_by_id(connector_id)
+
+    assert connector is not None
+    mode = connector.connection_mode(connection_mode)
+    assert mode is not None
+    assert connector.provider_capabilities(connection_mode, canonical_capability) == (
+        provider_action,
+    )
+    assert mode.provider_capability_status[provider_action] is CapabilityState.NOT_VALIDATED
+
+
+def test_connector_capability_aliases_are_not_claimed_for_unrelated_native_mode() -> None:
+    flow = connector_by_id("flowaccount")
+
+    assert flow is not None
+    assert flow.provider_capabilities("native_mcp", "tax.vat.summary.read") == ()
+    assert flow.provider_capabilities("native_mcp", "journal.read") == ()
+
+
 def test_flowaccount_native_mcp_uses_official_mcp_url() -> None:
     flow = connector_by_id("flowaccount")
 

@@ -449,7 +449,10 @@ CONNECTOR_CATALOG: list[ConnectorManifest] = [
                 capability_aliases=_aliases(
                     company_action="company.info.read",
                     invoice_action="documents.invoice.get",
-                ),
+                )
+                | {
+                    "tax.vat.summary.read": ("tax.vat_summary.read",),
+                },
                 setup_defaults={
                     "grant_type": "client_credentials",
                     "scope": "flowaccount-api",
@@ -516,7 +519,10 @@ CONNECTOR_CATALOG: list[ConnectorManifest] = [
                 capability_aliases=_aliases(
                     company_action="user.info.read",
                     invoice_action="documents.invoice.get",
-                ),
+                )
+                | {
+                    "journal.read": ("daily_journal.get",),
+                },
                 setup_defaults={
                     "auth_method": "hmac_sha1_client_token",
                     "timestamp_format": "utc_yyyyMMddHHmmss",

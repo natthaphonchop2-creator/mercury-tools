@@ -327,6 +327,69 @@ def test_native_route_preserves_server_case_and_includes_only_observed_optional_
     assert unavailable_optional["state"] == "provider_capability_unavailable"
 
 
+@pytest.mark.parametrize(
+    (
+        "skill_id",
+        "connector_id",
+        "capability_states",
+        "optional_capability",
+        "provider_action",
+    ),
+    [
+        (
+            "vat-summary-th",
+            "flowaccount",
+            {
+                "documents.invoice.list": "observed",
+                "tax.vat_summary.read": "observed",
+            },
+            "tax.vat.summary.read",
+            "tax.vat_summary.read",
+        ),
+        (
+            "management-report-th",
+            "peak",
+            {
+                "user.info.read": "observed",
+                "documents.invoice.list": "observed",
+                "daily_journal.get": "observed",
+            },
+            "journal.read",
+            "daily_journal.get",
+        ),
+    ],
+)
+def test_observed_provider_alias_resolves_observed_optional_canonical_capability(
+    skill_id: str,
+    connector_id: str,
+    capability_states: dict[str, str],
+    optional_capability: str,
+    provider_action: str,
+) -> None:
+    from mercury_tools.skills.catalog import accounting_skill_by_id
+    from mercury_tools.skills.routing import resolve_skill_route
+
+    skill = accounting_skill_by_id(skill_id)
+    assert skill is not None
+    route = resolve_skill_route(
+        skill,
+        [ready_profile(connector_id, capability_states=capability_states)],
+    )
+
+    assert route["status"] == "ready"
+    optional_resolution = next(
+        item
+        for item in route["capability_resolution"]
+        if item["capability"] == optional_capability
+    )
+    assert optional_resolution == {
+        "capability": optional_capability,
+        "provider_capabilities": [provider_action],
+        "required": False,
+        "state": "observed",
+    }
+
+
 def test_local_bridge_skill_route_returns_exact_setup_handoff() -> None:
     from mercury_tools.skills.catalog import accounting_skill_by_id
     from mercury_tools.skills.routing import resolve_skill_route
@@ -356,6 +419,83 @@ def test_local_bridge_skill_route_returns_exact_setup_handoff() -> None:
             "environment": "local",
         }
     ]
+
+
+def test_multiple_local_bridge_profiles_require_sorted_sanitized_tuple_selection() -> None:
+    from mercury_tools.skills.catalog import accounting_skill_by_id
+    from mercury_tools.skills.routing import resolve_skill_route
+
+    skill = accounting_skill_by_id("company-health-check-th")
+    assert skill is not None
+    profiles = [
+        ready_profile(
+            "express",
+            connection_mode="local_bridge",
+            environment=environment,
+            capability_states={},
+        )
+        for environment in ("local", "gateway")
+    ]
+    for profile in profiles:
+        profile["status"] = "requires_local_setup"
+        profile["external_server_name"] = "should-not-leak"
+
+    route = resolve_skill_route(
+        skill,
+        profiles,
+        requested_connector_id=" EXPRESS ",
+        requested_connection_mode=" LOCAL_BRIDGE ",
+    )
+
+    assert route == {
+        "status": "connector_selection_required",
+        "skill_id": "company-health-check-th",
+        "choices": [
+            {
+                "connector_id": "express",
+                "connection_mode": "local_bridge",
+                "environment": "gateway",
+            },
+            {
+                "connector_id": "express",
+                "connection_mode": "local_bridge",
+                "environment": "local",
+            },
+        ],
+        "selected_profile": None,
+        "capability_resolution": [],
+        "ordered_steps": [],
+        "host_tool_requirements": [],
+    }
+
+
+@pytest.mark.parametrize("external_server_name", [None, "https://flowaccount-mcp"])
+def test_malformed_ready_native_profile_is_not_validated(
+    external_server_name: str | None,
+) -> None:
+    from mercury_tools.skills.catalog import accounting_skill_by_id
+    from mercury_tools.skills.routing import resolve_skill_route
+
+    skill = accounting_skill_by_id("company-health-check-th")
+    assert skill is not None
+    profile = ready_profile(
+        "flowaccount",
+        connection_mode="native_mcp",
+        capability_states={"company.info.read": "observed"},
+    )
+    profile["external_server_name"] = external_server_name
+
+    route = resolve_skill_route(skill, [profile])
+
+    assert route["status"] == "unavailable"
+    assert route["reason"] == "not_validated"
+    assert route["selected_profile"] == {
+        "connector_id": "flowaccount",
+        "connection_mode": "native_mcp",
+        "environment": "production",
+    }
+    assert route["ordered_steps"] == []
+    assert route["host_tool_requirements"] == []
 
 
 def test_discovered_mcp_profile_uses_observed_normalized_capability() -> None:
