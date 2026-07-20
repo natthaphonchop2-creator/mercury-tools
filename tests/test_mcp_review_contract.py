@@ -136,6 +136,67 @@ def test_review_rejects_root_objects_that_allow_extra_keys() -> None:
     )
 
 
+@pytest.mark.parametrize("pattern_schema", [{}, {"type": "string"}])
+def test_review_rejects_root_pattern_properties_that_expand_input_keys(
+    pattern_schema: dict,
+) -> None:
+    schema = _strict_root({"query": {"type": "string"}})
+    schema["patternProperties"] = {".*": pattern_schema}
+
+    _assert_issue(
+        _tool(schema=schema),
+        "patternProperties",
+        "patternProperties may introduce undeclared input keys",
+    )
+
+
+@pytest.mark.parametrize("pattern_schema", [{}, {"type": "string"}])
+def test_review_rejects_nested_pattern_properties_that_expand_input_keys(
+    pattern_schema: dict,
+) -> None:
+    schema = _strict_root(
+        {
+            "profile": {
+                "type": "object",
+                "properties": {"display_name": {"type": "string"}},
+                "required": ["display_name"],
+                "additionalProperties": False,
+                "patternProperties": {".*": pattern_schema},
+            }
+        }
+    )
+
+    _assert_issue(
+        _tool(schema=schema),
+        "profile.patternProperties",
+        "patternProperties may introduce undeclared input keys",
+    )
+
+
+def test_review_does_not_let_property_name_or_unevaluated_constraints_hide_patterns() -> None:
+    schema = _strict_root({"query": {"type": "string"}})
+    schema.update(
+        {
+            "propertyNames": {"pattern": "^[a-z_]+$"},
+            "unevaluatedProperties": False,
+            "patternProperties": {".*": {"type": "string"}},
+        }
+    )
+
+    _assert_issue(
+        _tool(schema=schema),
+        "patternProperties",
+        "patternProperties may introduce undeclared input keys",
+    )
+
+
+def test_review_allows_an_empty_pattern_properties_mapping() -> None:
+    schema = _strict_root({"query": {"type": "string"}})
+    schema["patternProperties"] = {}
+
+    assert _issues(_tool(schema=schema)) == []
+
+
 def test_review_rejects_empty_nested_property_schemas() -> None:
     _assert_issue(
         _tool(schema=_strict_root({"filters": {}})),
@@ -245,6 +306,45 @@ def test_review_rejects_cyclic_local_refs_with_an_actionable_use_path() -> None:
     }
 
     _assert_issue(_tool(schema=schema), "filters.$ref", "cyclic local $ref")
+
+
+def test_review_resolves_local_pointer_through_array_indexes() -> None:
+    schema = _strict_root({"choice": {"$ref": "#/$defs/Choice/anyOf/0"}})
+    schema["$defs"] = {
+        "Choice": {"anyOf": [{"type": "string"}, {"type": "integer"}]}
+    }
+
+    assert _issues(_tool(schema=schema)) == []
+
+
+def test_review_decodes_escaped_local_pointer_components() -> None:
+    schema = _strict_root({"choice": {"$ref": "#/$defs/Path~1With~0Tilde"}})
+    schema["$defs"] = {"Path/With~Tilde": {"type": "string"}}
+
+    assert _issues(_tool(schema=schema)) == []
+
+
+@pytest.mark.parametrize(
+    ("reference", "message"),
+    [
+        ("#/$defs/Choice/anyOf/-", "array index '-' is not valid"),
+        ("#/$defs/Choice/anyOf/-1", "array index '-1' is not valid"),
+        ("#/$defs/Choice/anyOf/one", "array index 'one' is not valid"),
+        ("#/$defs/Choice/anyOf/2", "array index 2 is out of range"),
+        ("#/$defs/Path~2Bad", "invalid JSON Pointer escape"),
+        ("https://example.test/schema.json#/Choice", "must be a local JSON pointer"),
+    ],
+)
+def test_review_rejects_invalid_or_external_local_pointer_references(
+    reference: str,
+    message: str,
+) -> None:
+    schema = _strict_root({"choice": {"$ref": reference}})
+    schema["$defs"] = {
+        "Choice": {"anyOf": [{"type": "string"}, {"type": "integer"}]}
+    }
+
+    _assert_issue(_tool(schema=schema), "choice.$ref", message)
 
 
 def test_review_caps_local_ref_depth_with_an_actionable_use_path() -> None:
@@ -541,14 +641,60 @@ def test_review_reports_the_exact_missing_annotation_path() -> None:
     )
 
 
-def test_review_rejects_nested_credential_bearing_field_names() -> None:
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "password",
+        "passwd",
+        "passphrase",
+        "secret",
+        "apiKey",
+        "api_key",
+        "api-key",
+        "api key",
+        "accessToken",
+        "refresh_token",
+        "bearer-token",
+        "private key",
+        "clientSecret",
+        "service_role_key",
+        "authorization",
+        "credentials",
+    ],
+)
+def test_review_rejects_normalized_credential_field_name_matrix(field_name: str) -> None:
+    _assert_issue(
+        _tool(schema=_strict_root({field_name: {"type": "string"}})),
+        field_name,
+        "credential-bearing input field names are prohibited",
+    )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "secretary_name",
+        "secretariat",
+        "token_count",
+        "token_budget",
+        "key_count",
+        "monkey",
+        "password_policy",
+        "passwordPolicy",
+    ],
+)
+def test_review_allows_normalized_noncredential_field_name_matrix(field_name: str) -> None:
+    assert _issues(_tool(schema=_strict_root({field_name: {"type": "string"}}))) == []
+
+
+def test_review_rejects_nested_normalized_credential_field_names() -> None:
     schema = {
         "type": "object",
         "properties": {
             "profile": {
                 "type": "object",
-                "properties": {"client_secret": {"type": "string"}},
-                "required": ["client_secret"],
+                "properties": {"clientSecret": {"type": "string"}},
+                "required": ["clientSecret"],
                 "additionalProperties": False,
             }
         },
@@ -558,7 +704,7 @@ def test_review_rejects_nested_credential_bearing_field_names() -> None:
 
     issues = _issues(_tool(schema=schema))
 
-    assert any("search_knowledge.profile.client_secret" in issue for issue in issues), issues
+    assert any("search_knowledge.profile.clientSecret" in issue for issue in issues), issues
 
 
 def test_review_rejects_credential_names_reached_through_definitions_refs() -> None:

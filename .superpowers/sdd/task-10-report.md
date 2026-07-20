@@ -1,12 +1,11 @@
-# Task 10 Report: MCP Review Linter Hardening
+# Task 10 Report: MCP Review Linter Edge-Case Fix
 
 ## Status
 
-Complete from hardening base `6fc10bd`. The hosted MCP review linter now fails
-closed on unconstrained JSON Schema branches, resolves local references with
-bounded traversal, owns workspace scope in the behavior matrix, and produces a
-cross-platform deterministic OpenAI Skill bundle. Task 11 version and release
-identity files remain unchanged.
+Edge-case follow-up from `447fe0d`. The hosted MCP review linter now rejects
+non-empty `patternProperties`, uses exact normalized credential-name tokens,
+and traverses RFC 6901 local pointers through mappings and sequences. Task 11
+version and release identity files remain unchanged.
 
 The current 24 hosted tools still report exactly:
 
@@ -53,15 +52,46 @@ uv run pytest -q tests/test_mcp_contract.py
 69 passed
 ```
 
+### Edge-Case Follow-Up TDD
+
+The mutation tests were added before changing the linter:
+
+```text
+uv run pytest -q tests/test_mcp_review_contract.py
+22 failed, 60 passed
+```
+
+The failures showed ignored root and nested `patternProperties`, unsupported
+array-index JSON pointers, imprecise pointer findings, and both false-negative
+and false-positive credential name handling.
+
+After the linter change:
+
+```text
+uv run pytest -q tests/test_mcp_review_contract.py
+83 passed
+
+uv run pytest -q tests/test_mcp_review_contract.py tests/test_openai_plugin_submission.py
+93 passed
+```
+
 ## Linter Hardening
 
 - Root `inputSchema` must resolve to an object-only accepting branch with
   `additionalProperties=false`. Strict no-argument object roots remain valid.
 - Every nested property and array item branch must resolve to a concrete type,
   enum, or const. Empty schemas no longer pass silently.
-- Local JSON pointers resolve through both `$defs` and `definitions`, including
-  escaped pointer components. Invalid, unresolved, cyclic, over-depth, and
-  over-expanded references fail with the tool name and use-site schema path.
+- Non-empty `patternProperties` fail closed at the root and nested objects,
+  regardless of `propertyNames`, `unevaluatedProperties`, or the matched value
+  schema. An empty mapping remains valid because it cannot introduce a key.
+- Credential names use normalized identifier tokens, splitting camelCase,
+  snake_case, kebab-case, and spaces. Exact credential tokens and compounds are
+  rejected while names such as `secretariat`, `token_budget`, and
+  `password_policy` remain valid metadata.
+- Local JSON pointers resolve through mappings and sequences, including escaped
+  `~0` and `~1` components and nonnegative array indexes. Invalid, unresolved,
+  out-of-range, cyclic, over-depth, external, and over-expanded references fail
+  with the tool name and use-site schema path.
 - `anyOf` and `oneOf` are reviewed per accepting branch. A strict branch cannot
   hide an unconstrained or open branch.
 - `allOf` is treated as an intersection. Type, property, required,
@@ -90,11 +120,17 @@ Committed tests cover:
 - empty, descriptive-only, non-object, nullable-object, and non-schema roots;
 - empty nested schemas and open or unnamed nested objects;
 - `$defs`, `definitions`, unresolved constraints, cyclic refs, and ref depth;
+- root and nested `patternProperties` with empty and constrained `.*` schemas,
+  plus `propertyNames` and `unevaluatedProperties` interactions;
+- RFC 6901 sequence traversal through `#/$defs/Choice/anyOf/0`, escaped
+  components, invalid and out-of-range indexes, and external references;
 - `anyOf`, `oneOf`, and intersection-correct `allOf` behavior;
 - scalar environment enums in every accepting alternative;
 - typed array items, finite `maxItems`, refs, and split `allOf` guarantees;
 - root extra keys and mutually exclusive source fields across compositions;
-- direct and referenced credential-bearing names;
+- credential token matrices covering password/passwd/passphrase, secret,
+  API key, access/refresh/bearer token, private key, client secret, safe
+  metadata names, and direct or referenced field paths;
 - missing and incorrect annotations; and
 - current and future workspace metadata.
 
@@ -132,12 +168,14 @@ second sha256 7350346eee6d636467006be4fc67045387e3f08811cf0b603150f309acbee64f
 byte-identical true
 ```
 
-## Additional Verification
+## Edge-Case Follow-Up Verification
 
 ```text
-uv run python scripts/validate_release_plugin.py --root . --codex-cli
-release plugin static validation passed
-release plugin Codex CLI validation passed
+uv run python scripts/review_mcp_contract.py
+Mercury MCP review: 0 unclear arguments; annotations verified
+
+uv run --extra dev pytest -q tests/test_plugin_package.py tests/test_plugin_clean_install.py
+81 passed
 
 uv run --extra dev ruff check .
 All checks passed!
@@ -145,7 +183,7 @@ All checks passed!
 git diff --check
 no output; exit 0
 
-Gitleaks 8.24.3, checksum-verified Darwin arm64 binary, Task 10 diff
+Gitleaks 8.24.3, checksum-verified Darwin arm64 binary, Task 10 working-tree diff
 no leaks found
 ```
 
@@ -153,6 +191,6 @@ no leaks found
 
 - No hosted-tool exception or schema allowlist was added.
 - No existing check was weakened.
-- Submission copy, public Skills, test cases, and hosted server behavior from
-  Task 10 remain unchanged.
+- Submission copy, public Skills, hosted server behavior, and Task 9 packaging
+  remain unchanged.
 - Task 11 and `pyproject.toml` remain untouched.

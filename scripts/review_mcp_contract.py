@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 import sys
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, NamedTuple
 
 SUCCESS_MESSAGE = "Mercury MCP review: 0 unclear arguments; annotations verified"
@@ -76,10 +76,61 @@ BEHAVIOR_MATRIX: dict[str, ToolBehavior] = {
 _MUTUALLY_EXCLUSIVE_SOURCE_FIELDS = frozenset(
     {"flow_yaml", "flow_files", "workspace_flow_id"}
 )
-_CREDENTIAL_FIELD_RE = re.compile(
-    r"(?:api_?key|authorization|bearer|client_?secret|cookies?|credentials?|"
-    r"password|private_?key|secret|service_?role_?key|tokens?)",
-    re.IGNORECASE,
+_CAMEL_CASE_BOUNDARY_RE = re.compile(
+    r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])"
+)
+_NON_ALPHANUMERIC_RE = re.compile(r"[^A-Za-z0-9]+")
+_POINTER_ARRAY_INDEX_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+_CREDENTIAL_SINGLE_TOKENS = frozenset(
+    {
+        "authorization",
+        "cookie",
+        "cookies",
+        "credential",
+        "credentials",
+        "passphrase",
+        "passwd",
+        "password",
+        "secret",
+    }
+)
+_CREDENTIAL_COMPACT_TOKENS = frozenset(
+    {
+        "apikey",
+        "accesstoken",
+        "authtoken",
+        "bearertoken",
+        "clientsecret",
+        "privatekey",
+        "refreshtoken",
+        "servicerolekey",
+    }
+)
+_CREDENTIAL_TOKEN_SEQUENCES = frozenset(
+    {
+        ("access", "key"),
+        ("access", "token"),
+        ("api", "key"),
+        ("auth", "token"),
+        ("bearer", "token"),
+        ("client", "secret"),
+        ("id", "token"),
+        ("oauth", "token"),
+        ("private", "key"),
+        ("refresh", "key"),
+        ("refresh", "token"),
+        ("service", "role", "key"),
+    }
+)
+_PASSWORD_POLICY_METADATA = frozenset(
+    {
+        ("password", "policy"),
+        ("policy", "password"),
+        ("passwd", "policy"),
+        ("policy", "passwd"),
+        ("passphrase", "policy"),
+        ("policy", "passphrase"),
+    }
 )
 _ANNOTATION_FIELDS = (
     "readOnlyHint",
@@ -171,6 +222,39 @@ def _declared_types(value: object) -> set[str]:
     return declared
 
 
+def _normalized_field_name_tokens(field_name: str) -> tuple[str, ...]:
+    """Split public field names into exact lowercase identifier tokens."""
+    with_boundaries = _CAMEL_CASE_BOUNDARY_RE.sub(" ", field_name)
+    return tuple(
+        part.lower()
+        for part in _NON_ALPHANUMERIC_RE.split(with_boundaries)
+        if part
+    )
+
+
+def _contains_token_sequence(
+    tokens: tuple[str, ...],
+    sequence: tuple[str, ...],
+) -> bool:
+    width = len(sequence)
+    return any(tokens[index : index + width] == sequence for index in range(len(tokens)))
+
+
+def _is_credential_field_name(field_name: str) -> bool:
+    """Reject credential payload names while allowing clearly named metadata."""
+    tokens = _normalized_field_name_tokens(field_name)
+    if not tokens or tokens in _PASSWORD_POLICY_METADATA:
+        return False
+    if any(token in _CREDENTIAL_SINGLE_TOKENS for token in tokens):
+        return True
+    if any(token in _CREDENTIAL_COMPACT_TOKENS for token in tokens):
+        return True
+    return any(
+        _contains_token_sequence(tokens, sequence)
+        for sequence in _CREDENTIAL_TOKEN_SEQUENCES
+    )
+
+
 class _SchemaReviewer:
     def __init__(self, tool_name: str, root: Mapping[str, Any]) -> None:
         self.tool_name = tool_name
@@ -222,23 +306,74 @@ class _SchemaReviewer:
         reference: str,
         path: tuple[str, ...],
     ) -> Mapping[str, Any] | None:
-        if reference == "#":
-            target: object = self.root
-        elif reference.startswith("#/"):
-            target = self.root
-            for raw_part in reference[2:].split("/"):
-                part = raw_part.replace("~1", "/").replace("~0", "~")
-                if not isinstance(target, Mapping) or part not in target:
-                    self.add(path, f"local $ref {reference!r} does not resolve")
-                    return None
-                target = target[part]
-        else:
+        if reference != "#" and not reference.startswith("#/"):
             self.add(path, f"$ref {reference!r} must be a local JSON pointer")
             return None
+        target: object = self.root
+        if reference.startswith("#/"):
+            for raw_part in reference[2:].split("/"):
+                part = self._decode_pointer_part(reference, raw_part, path)
+                if part is None:
+                    return None
+                if isinstance(target, Mapping):
+                    if part not in target:
+                        self.add(path, f"local $ref {reference!r} does not resolve")
+                        return None
+                    target = target[part]
+                    continue
+                if isinstance(target, Sequence) and not isinstance(
+                    target, (str, bytes, bytearray)
+                ):
+                    if not _POINTER_ARRAY_INDEX_RE.fullmatch(part):
+                        self.add(
+                            path,
+                            f"local $ref {reference!r} array index {part!r} is not valid; "
+                            "expected a nonnegative integer",
+                        )
+                        return None
+                    index = int(part)
+                    if index >= len(target):
+                        self.add(
+                            path,
+                            f"local $ref {reference!r} array index {index} is out of range",
+                        )
+                        return None
+                    target = target[index]
+                    continue
+                self.add(
+                    path,
+                    f"local $ref {reference!r} cannot traverse {part!r} through a scalar value",
+                )
+                return None
         if not isinstance(target, Mapping):
             self.add(path, f"local $ref {reference!r} must resolve to a schema object")
             return None
         return target
+
+    def _decode_pointer_part(
+        self,
+        reference: str,
+        raw_part: str,
+        path: tuple[str, ...],
+    ) -> str | None:
+        decoded: list[str] = []
+        index = 0
+        while index < len(raw_part):
+            character = raw_part[index]
+            if character != "~":
+                decoded.append(character)
+                index += 1
+                continue
+            if index + 1 >= len(raw_part) or raw_part[index + 1] not in {"0", "1"}:
+                self.add(
+                    path,
+                    f"local $ref {reference!r} has invalid JSON Pointer escape "
+                    f"in component {raw_part!r}",
+                )
+                return None
+            decoded.append("~" if raw_part[index + 1] == "0" else "/")
+            index += 2
+        return "".join(decoded)
 
     def _cross(
         self,
@@ -421,7 +556,7 @@ class _SchemaReviewer:
                     for raw_name, field_schema in raw_properties.items():
                         field_name = str(raw_name)
                         field_path = (*fragment.path, field_name)
-                        if _CREDENTIAL_FIELD_RE.search(field_name):
+                        if _is_credential_field_name(field_name):
                             self.add(
                                 field_path,
                                 "credential-bearing input field names are prohibited",
@@ -429,6 +564,16 @@ class _SchemaReviewer:
                         properties.setdefault(field_name, []).append(
                             _SchemaNode(field_schema, field_path)
                         )
+            raw_pattern_properties = schema.get("patternProperties", _MISSING)
+            if raw_pattern_properties is not _MISSING:
+                pattern_path = (*fragment.path, "patternProperties")
+                if not isinstance(raw_pattern_properties, Mapping):
+                    self.add(pattern_path, "patternProperties must be an empty mapping")
+                elif raw_pattern_properties:
+                    self.add(
+                        pattern_path,
+                        "patternProperties may introduce undeclared input keys",
+                    )
             raw_required = schema.get("required", _MISSING)
             if raw_required is not _MISSING:
                 if not isinstance(raw_required, list) or not all(
