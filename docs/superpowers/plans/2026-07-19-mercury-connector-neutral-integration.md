@@ -659,9 +659,13 @@ Assert `flow_files` is always `list[FlowFileInput]`, tags are bounded string arr
 
 Hosted flow environment values are non-secret runtime parameters only. Reject
 secret-bearing names such as `api_key`, `token`, `password`, `authorization`,
-or `client_secret`, and reject values detected by the shared redaction boundary
-before audit persistence or flow parsing. ERP and provider credentials remain
-local-only and never enter the hosted MCP arguments.
+`client_secret`, `private_key`, `service_role_key`, `credentials`, or `cookie`,
+and reject values detected by the shared redaction boundary before audit
+persistence or flow parsing. Preserve an explicit bounded array schema for the
+host while deferring both outer-container and item validation to the sanitized
+handler boundary so invalid top-level payloads cannot expose Pydantic
+`input_value`. ERP and provider credentials remain local-only and never enter
+the hosted MCP arguments.
 
 - [ ] **Step 2: Run the schema tests and confirm the old generic source fails**
 
@@ -695,15 +699,26 @@ run_flow_files(
 )
 ```
 
+Expose `flow_yaml` as a bounded string with `min_length=1` and
+`max_length=500_000`; enforce the same bound at runtime inside the sanitized
+handler boundary.
+
 Use `Field(default_factory=list)` in Pydantic models rather than mutable Python defaults in implementation. Require `workspace_id` even for non-connector hosted runs so workspace audit and saved-flow behavior are never implicit.
 Reject blank, whitespace-only, and malformed workspace identifiers at the real
 FastMCP boundary before environment handling or flow parsing. Add
 `mcp.call_tool` regressions for both inline and file-based run tools and verify
 that no plan or audit event is produced for rejected identifiers.
+Apply the same validation ordering to `run_workspace_flow`: canonicalize the
+workspace before environment processing, settings access, persistence reads,
+or audit. Invalid workspace identifiers must return the same fixed error with
+no side effects.
 
 - [ ] **Step 4: Preserve compatibility outside the MCP registry**
 
 Keep plain Python functions `run_flow(...)` and `run_mercury_flow(...)` for v0.3.x unit/API callers. Route them to the explicit implementations after normalizing their legacy payload. Do not decorate or advertise them as public MCP tools.
+Preserve the retired typed-source bounds for the compatibility wrapper,
+including rejecting empty or over-2,048-character optional workspace IDs and
+empty or over-500,000-character inline YAML before dispatch.
 
 - [ ] **Step 5: Apply closed-read annotations to planning tools**
 
