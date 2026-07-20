@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the static Mercury Finance v0.2.2 release package offline."""
+"""Validate the static hosted Mercury Finance plugin package offline."""
 
 from __future__ import annotations
 
@@ -15,13 +15,11 @@ PLUGIN_PATH = Path("plugins/mercury-finance/.codex-plugin/plugin.json")
 MCP_PATH = Path("plugins/mercury-finance/.mcp.json")
 MARKETPLACE_PATH = Path(".agents/plugins/marketplace.json")
 PYPROJECT_PATH = Path("pyproject.toml")
-EXPECTED_ARGS = [
-    "--from",
-    "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.2",
-    "mercury",
-    "mcp",
-    "serve-local",
-]
+EXPECTED_HOSTED_SERVER = {
+    "type": "http",
+    "url": "https://mercury-tools-mcp.onrender.com/mcp",
+    "note": "Mercury Accounting and ERP connector platform.",
+}
 EXPECTED_DEPENDENCIES = [
     "httpx==0.28.1",
     "mcp==1.26.0",
@@ -61,6 +59,7 @@ CREDENTIAL_KEY_RE = re.compile(
 CREDENTIAL_LITERAL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~+/=-]{11,511}")
 MAX_SCAN_NODES = 10_000
 MAX_SCAN_STRING_CHARS = 4_096
+LOCAL_LAUNCHER_FIELD_NAMES = frozenset({"command", "args", "cwd", "env"})
 
 
 def _read_json(path: Path, errors: list[str]) -> dict[str, Any]:
@@ -125,6 +124,26 @@ def _contains_credential_literal(payload: Any) -> bool:
     return bool(pending)
 
 
+def _contains_public_mcp_forbidden_field(payload: Any) -> bool:
+    pending: list[Any] = [payload]
+    for _ in range(MAX_SCAN_NODES):
+        if not pending:
+            return False
+        value = pending.pop()
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized_key = str(key).casefold()
+                if (
+                    normalized_key in LOCAL_LAUNCHER_FIELD_NAMES
+                    or CREDENTIAL_KEY_RE.search(normalized_key) is not None
+                ):
+                    return True
+                pending.append(child)
+        elif isinstance(value, list):
+            pending.extend(value)
+    return bool(pending)
+
+
 def validate_release(root: Path) -> list[str]:
     """Return static release-contract failures without network or subprocess use."""
 
@@ -146,22 +165,10 @@ def validate_release(root: Path) -> list[str]:
         else:
             server = candidate
 
-    if "url" in server or server.get("type") in {"http", "streamable-http"}:
-        errors.append("mcp launcher must not declare an HTTP URL")
-    if "env" in server or any(
-        key in server for key in ("headers", "bearer_token_env_var", "token", "credential")
-    ):
-        errors.append("mcp launcher must not declare environment or credential values")
-    if server.get("command") != "uvx":
-        errors.append("mcp launcher command must be uvx")
-    if server.get("args") != EXPECTED_ARGS:
-        errors.append("mcp launcher must use the immutable v0.2.2 Git tag")
-    if server.get("cwd") != ".":
-        errors.append("mcp launcher cwd must be .")
-    if server.get("tool_timeout_sec") != 900:
-        errors.append("mcp launcher tool_timeout_sec must be 900")
-    if set(server) != {"command", "args", "cwd", "tool_timeout_sec"}:
-        errors.append("mcp launcher must not include additional transport or credential settings")
+    if _contains_public_mcp_forbidden_field(mcp):
+        errors.append("mcp manifest must not declare local launcher or credential fields")
+    if server != EXPECTED_HOSTED_SERVER:
+        errors.append("mercury-finance server must be exactly the hosted HTTPS Render /mcp entry")
 
     release_manifests = {"plugin": plugin, "mcp": mcp, "marketplace": marketplace}
     serialized_manifest = json.dumps(release_manifests, sort_keys=True)
@@ -204,8 +211,8 @@ def validate_release(root: Path) -> list[str]:
         marketplace_policy = {}
     if marketplace_policy.get("installation") != "AVAILABLE":
         errors.append("marketplace mercury-finance installation policy must be AVAILABLE")
-    if marketplace_policy.get("authentication") != "ON_INSTALL":
-        errors.append("marketplace mercury-finance authentication policy must be ON_INSTALL")
+    if marketplace_policy.get("authentication") != "NONE":
+        errors.append("marketplace mercury-finance authentication policy must be NONE")
 
     project = pyproject.get("project") if isinstance(pyproject.get("project"), dict) else {}
     optional = (
@@ -235,7 +242,7 @@ def main() -> int:
         return 1
     print(
         "release plugin validation passed "
-        "(v0.2.2 static checks only; remote tag smoke is a post-review gate)"
+        "(hosted MCP static checks only; remote smoke is a post-review gate)"
     )
     return 0
 

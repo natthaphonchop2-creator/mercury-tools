@@ -157,7 +157,6 @@ PACKAGE_FORBIDDEN_TERMS = {
     "approve_flowaccount_journal",
     "create_flowaccount_journal_draft",
     "create_public_workspace",
-    "list_connectors",
     "preview_flowaccount_journal",
     "required_secret_fields",
     "retrieve_workspace_context_pack",
@@ -327,11 +326,11 @@ def test_marketplace_points_to_plugin_folder() -> None:
     assert mercury["source"]["path"] == "./plugins/mercury-finance"
     assert mercury["source"]["source"] == "local"
     assert mercury["policy"]["installation"] == "AVAILABLE"
-    assert mercury["policy"]["authentication"] == "ON_INSTALL"
+    assert mercury["policy"]["authentication"] == "NONE"
     assert mercury["category"] == "Finance"
 
 
-def test_v022_versions_and_launcher_are_consistent() -> None:
+def test_v022_versions_remain_consistent() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     package_source = (ROOT / "src/mercury_tools/__init__.py").read_text(
         encoding="utf-8"
@@ -339,14 +338,10 @@ def test_v022_versions_and_launcher_are_consistent() -> None:
     plugin = json.loads(
         (PLUGIN_ROOT / ".codex-plugin/plugin.json").read_text(encoding="utf-8")
     )
-    mcp = json.loads((PLUGIN_ROOT / ".mcp.json").read_text(encoding="utf-8"))
 
     assert project["project"]["version"] == "0.2.2"
     assert package_source.strip().endswith('__version__ = "0.2.2"')
     assert plugin["version"] == "0.2.2+codex.20260717"
-    assert mcp["mcpServers"]["mercury-finance"]["args"][1] == (
-        "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.2"
-    )
 
 
 def test_sdist_excludes_internal_test_fixtures(tmp_path: Path) -> None:
@@ -371,22 +366,28 @@ def test_skill_frontmatter_descriptions_are_trigger_only() -> None:
         assert frontmatter_description(skill_text(skill_name)) == expected
 
 
-def test_setup_skills_use_the_exact_local_credential_gate() -> None:
+def test_public_setup_skills_use_hosted_lifecycle_without_chat_credentials() -> None:
+    hosted_setup_skills = (
+        "connector-credential-setup-th",
+        "flowaccount-connector-setup-th",
+        "peak-connector-setup-th",
+    )
     required_order = (
-        "credential_status",
-        "If required credentials are missing, stop",
-        "mercury credentials setup",
-        "After the user confirms setup is complete",
-        "credential_status",
-        "If it is still missing or not configured, stop and return to local setup",
-        "mercury credentials test",
-        "Continue only when the test reports `connected`",
+        "list_connectors",
+        "get_connector_setup",
+        "link_connector_profile",
+        "connector_status",
+        "connector_capabilities",
     )
 
-    for skill_name in SETUP_SKILLS:
+    for skill_name in hosted_setup_skills:
         text = skill_text(skill_name)
         assert_terms_in_order(text, required_order)
         assert "Never ask for, accept, or paste credentials in chat." in text
+        assert "credential_status" not in text
+        assert "mercury credentials" not in text
+        assert "prepare_erp_mutation" not in text
+        assert "execute_erp_" not in text
 
 
 def test_read_skills_preserve_evidence_and_compact_thai_output() -> None:
@@ -584,6 +585,15 @@ def test_cross_mcp_catalog_migration_matches_exact_public_seed_metadata() -> Non
 
 def test_journal_skill_returns_advanced_local_handoff_for_writes() -> None:
     text = skill_text("flowaccount-journal-posting-th")
+    assert_terms_in_order(
+        text,
+        (
+            "get_connector_setup",
+            "connector_status",
+            "connector_capabilities",
+            "advanced_local_handoff",
+        ),
+    )
     assert "advanced_local_handoff" in text
     assert "docs/ADVANCED_LOCAL_ERP.md" in text
     assert "separately connected local Mercury MCP" in text
@@ -685,25 +695,31 @@ def test_skill_package_has_no_secret_fields_or_credential_chat_flow() -> None:
         assert unsafe_phrase not in combined
 
 
-def test_plugin_registers_one_pinned_local_stdio_server() -> None:
+def test_plugin_registers_one_hosted_one_click_server() -> None:
     data = json.loads((PLUGIN_ROOT / ".mcp.json").read_text(encoding="utf-8"))
 
-    assert list(data["mcpServers"]) == ["mercury-finance"]
-    server = data["mcpServers"]["mercury-finance"]
-    assert server["command"] == "uvx"
-    assert server["args"] == [
-        "--from",
-        "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@v0.2.2",
-        "mercury",
-        "mcp",
-        "serve-local",
-    ]
-    assert server["cwd"] == "."
-    assert server["tool_timeout_sec"] == 900
-    assert "type" not in server
-    assert "url" not in server
-    assert "env" not in server
-    assert "bearer_token_env_var" not in server
+    assert data == {
+        "mcpServers": {
+            "mercury-finance": {
+                "type": "http",
+                "url": "https://mercury-tools-mcp.onrender.com/mcp",
+                "note": "Mercury Accounting and ERP connector platform.",
+            }
+        }
+    }
+    serialized = json.dumps(data).casefold()
+    for forbidden in (
+        "command",
+        "args",
+        "cwd",
+        "uvx",
+        "bearer",
+        "token",
+        "env",
+        "flowaccount",
+        "peak",
+    ):
+        assert forbidden not in serialized
 
 
 @pytest.mark.asyncio
@@ -745,10 +761,22 @@ def test_plugin_declares_read_and_write_without_embedded_secrets() -> None:
     assert manifest["version"] == "0.2.2+codex.20260717"
     assert manifest["interface"]["capabilities"] == ["Interactive", "Read", "Write"]
     assert manifest["interface"]["defaultPrompt"] == [
-        "Set up local FlowAccount access for this repository and verify it.",
-        "Search the local ERP action catalog and run a safe read action.",
-        "Preview an approval-gated PEAK write for this repository without executing it.",
+        "Connect an accounting or ERP system",
+        "Check which accounting capabilities are ready for this workspace",
+        "Prepare an evidence-backed company health review",
+        "Plan a reconciliation using my connected ERP and spreadsheet tools",
     ]
+    primary_copy = " ".join(
+        str(manifest["interface"][field])
+        for field in ("displayName", "shortDescription", "longDescription")
+    )
+    assert "Accounting and ERP connector platform" in primary_copy
+    assert "FlowAccount" not in primary_copy
+    assert "PEAK" not in primary_copy
+    assert not any(
+        prompt.startswith(("FlowAccount", "PEAK"))
+        for prompt in manifest["interface"]["defaultPrompt"]
+    )
     assert "MERCURY_PRIVATE_MCP_TOKEN" not in serialized
     assert "client_secret" not in serialized
 
@@ -894,7 +922,7 @@ def test_openai_embedding_provider_preserves_nested_dependency_errors(
     assert error.value.name == "jiter"
 
 
-def _release_layout(tmp_path: Path, *, pinned_launcher: bool = False) -> Path:
+def _release_layout(tmp_path: Path, *, local_launcher: bool = False) -> Path:
     release_root = tmp_path / "release"
     for relative_path in (
         ".agents/plugins/marketplace.json",
@@ -906,7 +934,21 @@ def _release_layout(tmp_path: Path, *, pinned_launcher: bool = False) -> Path:
         destination = release_root / relative_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
-    if pinned_launcher:
+    (release_root / "plugins/mercury-finance/.mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "mercury-finance": {
+                        "type": "http",
+                        "url": "https://mercury-tools-mcp.onrender.com/mcp",
+                        "note": "Mercury Accounting and ERP connector platform.",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    if local_launcher:
         (release_root / "plugins/mercury-finance/.mcp.json").write_text(
             json.dumps(
                 {
@@ -959,17 +1001,17 @@ def _rewrite_marketplace(root: Path, mutate) -> None:
     _rewrite_release_json(root, ".agents/plugins/marketplace.json", mutate)
 
 
-def test_release_validator_accepts_the_offline_release_contract(tmp_path: Path) -> None:
+def test_release_validator_accepts_the_hosted_release_contract(tmp_path: Path) -> None:
     result = _run_release_validator(_release_layout(tmp_path))
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "release plugin validation passed" in result.stdout
 
 
-def test_release_validator_rejects_empty_server_with_every_required_contract(
+def test_release_validator_rejects_empty_hosted_server_with_every_required_contract(
     tmp_path: Path,
 ) -> None:
-    release_root = _release_layout(tmp_path, pinned_launcher=True)
+    release_root = _release_layout(tmp_path)
     _rewrite_mcp(
         release_root,
         lambda data: data["mcpServers"].__setitem__("mercury-finance", {}),
@@ -978,13 +1020,15 @@ def test_release_validator_rejects_empty_server_with_every_required_contract(
     result = _run_release_validator(release_root)
 
     assert result.returncode == 1
-    for expected_error in (
-        "command must be uvx",
-        "immutable v0.2.2 Git tag",
-        "cwd must be .",
-        "tool_timeout_sec must be 900",
-    ):
-        assert expected_error in result.stdout
+    assert "hosted HTTPS Render /mcp entry" in result.stdout
+
+
+def test_release_validator_rejects_local_launcher(tmp_path: Path) -> None:
+    result = _run_release_validator(_release_layout(tmp_path, local_launcher=True))
+
+    assert result.returncode == 1
+    assert "hosted HTTPS Render /mcp entry" in result.stdout
+    assert "local launcher or credential fields" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -1005,7 +1049,7 @@ def test_release_validator_rejects_high_confidence_credential_values(
     key: str,
     value: str,
 ) -> None:
-    release_root = _release_layout(tmp_path, pinned_launcher=True)
+    release_root = _release_layout(tmp_path)
     _rewrite_plugin(
         release_root,
         lambda data: data.update({"review_fixture": {key: value}}),
@@ -1018,7 +1062,7 @@ def test_release_validator_rejects_high_confidence_credential_values(
 
 
 def test_release_validator_allows_documentation_credential_placeholders(tmp_path: Path) -> None:
-    release_root = _release_layout(tmp_path, pinned_launcher=True)
+    release_root = _release_layout(tmp_path)
     _rewrite_plugin(
         release_root,
         lambda data: data.update(
@@ -1050,7 +1094,7 @@ def test_release_validator_fails_closed_when_credential_scan_budget_is_exceeded(
     tmp_path: Path,
     review_fixture: dict[str, object],
 ) -> None:
-    release_root = _release_layout(tmp_path, pinned_launcher=True)
+    release_root = _release_layout(tmp_path)
     _rewrite_plugin(
         release_root,
         lambda data: data.update({"review_fixture": review_fixture}),
@@ -1069,21 +1113,13 @@ def test_release_validator_fails_closed_when_credential_scan_budget_is_exceeded(
             lambda data: data["mcpServers"]["mercury-finance"].update(
                 {"url": "https://example.invalid/mcp"}
             ),
-            "must not declare an HTTP URL",
+            "hosted HTTPS Render /mcp entry",
         ),
         (
             lambda data: data["mcpServers"]["mercury-finance"].update(
-                {
-                    "args": [
-                        "--from",
-                        "git+https://github.com/natthaphonchop2-creator/mercury-tools.git@main",
-                        "mercury",
-                        "mcp",
-                        "serve-local",
-                    ]
-                }
+                {"command": "uvx"}
             ),
-            "immutable v0.2.2 Git tag",
+            "local launcher or credential fields",
         ),
         (
             lambda data: data["mcpServers"].update(
@@ -1095,7 +1131,7 @@ def test_release_validator_fails_closed_when_credential_scan_budget_is_exceeded(
             lambda data: data["mcpServers"]["mercury-finance"].update(
                 {"env": {"FLOWACCOUNT_CLIENT_SECRET": "should-not-ship"}}
             ),
-            "must not declare environment or credential values",
+            "local launcher or credential fields",
         ),
         (
             lambda data: data["mcpServers"]["mercury-finance"].update(
@@ -1104,14 +1140,14 @@ def test_release_validator_fails_closed_when_credential_scan_budget_is_exceeded(
             "private token names",
         ),
     ],
-    ids=["http-url", "moving-ref", "second-server", "credential-env", "private-token-name"],
+    ids=["wrong-url", "local-command", "second-server", "credential-env", "private-token-name"],
 )
-def test_release_validator_rejects_mutated_unsafe_launchers(
+def test_release_validator_rejects_unsafe_hosted_manifest_mutations(
     tmp_path: Path,
     mutate,
     expected_error: str,
 ) -> None:
-    release_root = _release_layout(tmp_path, pinned_launcher=True)
+    release_root = _release_layout(tmp_path)
     _rewrite_mcp(release_root, mutate)
 
     result = _run_release_validator(release_root)
@@ -1139,7 +1175,7 @@ def test_release_validator_rejects_mutated_unsafe_launchers(
         ),
         (
             lambda data: data["plugins"][0]["policy"].update({"authentication": "ON_USE"}),
-            "authentication policy must be ON_INSTALL",
+            "authentication policy must be NONE",
         ),
     ],
     ids=["multiple", "source-path", "installation", "authentication"],
@@ -1149,7 +1185,7 @@ def test_release_validator_rejects_invalid_marketplace_contract(
     mutate,
     expected_error: str,
 ) -> None:
-    release_root = _release_layout(tmp_path, pinned_launcher=True)
+    release_root = _release_layout(tmp_path)
     _rewrite_marketplace(release_root, mutate)
 
     result = _run_release_validator(release_root)

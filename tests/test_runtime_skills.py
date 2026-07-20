@@ -87,20 +87,31 @@ def test_bundled_skill_is_available_to_mcp_runtime(skill_name: str) -> None:
     assert f"name: {skill_name}" in markdown
 
 
-def test_bundled_setup_skills_use_local_credential_commands() -> None:
+def test_bundled_provider_setup_skills_use_hosted_connector_lifecycle() -> None:
     for skill_name in (
         "connector-credential-setup-th",
-        "connector-setup-guide-th",
         "flowaccount-connector-setup-th",
         "peak-connector-setup-th",
     ):
         markdown = skill_markdown(skill_name)
 
         assert markdown is not None
-        assert "credential_status" in markdown
-        assert "mercury credentials setup" in markdown
-        assert "mercury credentials test" in markdown
-        assert "workspace_id" not in markdown
+        assert "list_connectors" in markdown
+        assert "get_connector_setup" in markdown
+        assert "link_connector_profile" in markdown
+        assert "connector_status" in markdown
+        assert "connector_capabilities" in markdown
+        assert LOCAL_API_DRIVER_COMMANDS.isdisjoint(markdown)
+
+
+def test_generic_advanced_setup_guide_keeps_local_credential_commands() -> None:
+    markdown = skill_markdown("connector-setup-guide-th")
+
+    assert markdown is not None
+    assert "credential_status" in markdown
+    assert "mercury credentials setup" in markdown
+    assert "mercury credentials test" in markdown
+    assert "workspace_id" not in markdown
 
 
 def test_bundled_journal_skill_returns_advanced_local_handoff_for_writes() -> None:
