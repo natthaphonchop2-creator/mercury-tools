@@ -34,9 +34,10 @@ EXPECTED_LOCAL_TOOLS = {
     "search_erp_actions",
     "get_erp_action_schema",
     "run_erp_read",
-    "preview_erp_write",
-    "confirm_erp_write",
-    "execute_erp_write",
+    "prepare_erp_mutation",
+    "execute_erp_create",
+    "execute_erp_update",
+    "execute_sensitive_erp_action",
     "get_erp_request_status",
     "import_erp_spec",
     "list_connector_drivers",
@@ -72,6 +73,10 @@ LEGACY_UNCONDITIONAL_LOCAL_COMMANDS = {
     "preview_erp_write",
     "confirm_erp_write",
     "execute_erp_write",
+    "prepare_erp_mutation",
+    "execute_erp_create",
+    "execute_erp_update",
+    "execute_sensitive_erp_action",
     "get_erp_request_status",
 }
 SKILL_CATALOG_PUBLIC_FIELDS = (
@@ -577,32 +582,12 @@ def test_cross_mcp_catalog_migration_matches_exact_public_seed_metadata() -> Non
     assert actual == expected
 
 
-def test_journal_skill_uses_one_immutable_approval_for_every_mutation() -> None:
+def test_journal_skill_returns_advanced_local_handoff_for_writes() -> None:
     text = skill_text("flowaccount-journal-posting-th")
-    common_order = (
-        "required accounting context",
-        "total debit equals total credit",
-        "search_erp_actions",
-        "get_erp_action_schema",
-        "preview_erp_write",
-        "returned `approval_level` and `mutation_class`",
-    )
-    approval_order = (
-        "standard or elevated",
-        "one distinct explicit user approval",
-        "request_id",
-        "payload_hash",
-        "`confirm_erp_write` exactly once",
-        "`execute_erp_write` exactly once",
-    )
-
-    assert_terms_in_order(text, common_order)
-    assert_terms_in_order(text, approval_order)
-    assert "for every journal mutation, not only approval" in text.lower()
-    assert "get_erp_request_status" in text
-    assert "never replay or retry" in text
-    assert "required_confirmations" not in text
-    assert "second distinct explicit" not in text
+    assert "advanced_local_handoff" in text
+    assert "docs/ADVANCED_LOCAL_ERP.md" in text
+    assert "separately connected local Mercury MCP" in text
+    assert LEGACY_UNCONDITIONAL_LOCAL_COMMANDS.isdisjoint(text)
 
 
 @pytest.mark.parametrize(
@@ -623,39 +608,20 @@ def test_current_write_guides_describe_one_immutable_approval(path: Path) -> Non
     assert "required confirmation count" not in lowered
 
 
-def test_journal_skill_discards_invalidated_previews_before_restarting() -> None:
-    text = skill_text("flowaccount-journal-posting-th")
-    invalidation_causes = (
-        "stale or expired preview",
-        "payload hash mismatch",
-        "action-version or binding mismatch",
-        "state mismatch",
-        "changed inputs",
-    )
-    recovery_order = (
-        "Stop; discard the old request",
-        "Never reuse its `request_id` or `payload_hash`",
-        "redo `search_erp_actions`",
-        "get_erp_action_schema",
-        "fresh `preview_erp_write`",
-        "collect one new approval",
-    )
+def test_advanced_local_erp_guide_keeps_write_and_credential_boundaries_explicit() -> None:
+    guide = ROOT / "docs/ADVANCED_LOCAL_ERP.md"
+    assert guide.exists()
+    text = guide.read_text(encoding="utf-8")
 
-    assert all(cause in text for cause in invalidation_causes)
-    assert_terms_in_order(text, recovery_order)
-
-
-def test_journal_skill_restarts_approval_with_a_new_bound_request() -> None:
-    text = skill_text("flowaccount-journal-posting-th")
-    approval_order = (
-        "Approval is a separate action",
-        "new `search_erp_actions`",
-        "get_erp_action_schema",
-        "fresh `preview_erp_write`",
-        "new `request_id`",
-    )
-
-    assert_terms_in_order(text, approval_order)
+    assert "mercury mcp serve-local" in text
+    assert "repository-local" in text
+    assert "prepare_erp_mutation" in text
+    assert "execute_erp_create" in text
+    assert "execute_erp_update" in text
+    assert "execute_sensitive_erp_action" in text
+    assert "official FlowAccount MCP" in text
+    assert "read-only" in text
+    assert "separately reviewed FlowAccount API-driver" in text
 
 
 def test_flow_runner_runs_only_read_only_or_dry_run_flows() -> None:
@@ -741,7 +707,7 @@ async def test_plugin_stdio_target_keeps_exact_task_11_tool_contract() -> None:
     async with create_connected_server_and_client_session(local_mcp) as session:
         tools = {tool.name: tool for tool in (await session.list_tools()).tools}
 
-    assert len(tools) == 19
+    assert len(tools) == 20
     assert set(tools) == EXPECTED_LOCAL_TOOLS
     for tool_name in ("search_erp_actions", "get_erp_action_schema"):
         schema = tools[tool_name].inputSchema

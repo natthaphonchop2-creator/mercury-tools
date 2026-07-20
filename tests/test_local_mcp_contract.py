@@ -23,13 +23,17 @@ from mercury_tools.cloud.models import (
 )
 from mercury_tools.drivers.models import ConnectorResult
 from mercury_tools.execution.executor import ExecutionPolicyError
+from mercury_tools.execution.policy import MutationClass
 from mercury_tools.execution.store import RequestStateError
 from mercury_tools.local.audit import AuditLedger
 from mercury_tools.local.credentials import CredentialStore
 from mercury_tools.local.repository import RepositoryConfig, ensure_repository_state
 from mercury_tools.mcp import local_server
 from mercury_tools.mcp.local_runtime import LocalActionCatalog, LocalMercuryRuntime
-from mercury_tools.mcp.local_server import audit_resource, execute_erp_write, local_mcp
+from mercury_tools.mcp.local_server import (
+    audit_resource,
+    local_mcp,
+)
 from mercury_tools.qualification.models import (
     EvidenceLevel,
     ExecutionEligibility,
@@ -50,9 +54,10 @@ EXPECTED_TOOLS = {
     "search_erp_actions",
     "get_erp_action_schema",
     "run_erp_read",
-    "preview_erp_write",
-    "confirm_erp_write",
-    "execute_erp_write",
+    "prepare_erp_mutation",
+    "execute_erp_create",
+    "execute_erp_update",
+    "execute_sensitive_erp_action",
     "get_erp_request_status",
     "import_erp_spec",
     "list_connector_drivers",
@@ -666,9 +671,21 @@ NON_DESTRUCTIVE_WRITE_TOOLS = {
     "run_mercury_flow",
     "save_workspace_flow",
     "run_workspace_flow",
-    "preview_erp_write",
-    "confirm_erp_write",
     "import_erp_spec",
+}
+
+ERP_TOOL_ANNOTATIONS = {
+    "run_erp_read": (True, False, True),
+    "prepare_erp_mutation": (False, False, False),
+    "execute_erp_create": (False, False, True),
+    "execute_erp_update": (False, True, True),
+    "execute_sensitive_erp_action": (False, True, True),
+    "import_erp_spec": (False, False, True),
+}
+ERP_EXECUTE_TOOLS = {
+    "execute_erp_create",
+    "execute_erp_update",
+    "execute_sensitive_erp_action",
 }
 
 
@@ -702,8 +719,32 @@ async def test_local_mcp_has_exact_server_contract_and_hidden_context_schema() -
     for name in NON_DESTRUCTIVE_WRITE_TOOLS:
         assert by_name[name].annotations.readOnlyHint is False
         assert by_name[name].annotations.destructiveHint is False
-    assert by_name["execute_erp_write"].annotations.readOnlyHint is False
-    assert by_name["execute_erp_write"].annotations.destructiveHint is True
+    for name, expected in ERP_TOOL_ANNOTATIONS.items():
+        annotations = by_name[name].annotations
+        assert (
+            annotations.readOnlyHint,
+            annotations.destructiveHint,
+            annotations.openWorldHint,
+        ) == expected
+    for name in ERP_EXECUTE_TOOLS:
+        assert by_name[name].annotations.idempotentHint is False
+    assert {
+        "preview_erp_write",
+        "confirm_erp_write",
+        "execute_erp_write",
+    }.isdisjoint(by_name)
+    assert set(by_name["prepare_erp_mutation"].inputSchema["required"]) == {
+        "action_id",
+        "inputs",
+    }
+    assert "environment" not in by_name["prepare_erp_mutation"].inputSchema.get(
+        "required", []
+    )
+    for name in ERP_EXECUTE_TOOLS:
+        assert set(by_name[name].inputSchema["required"]) == {
+            "request_id",
+            "payload_hash",
+        }
     assert {
         "preview_flowaccount_journal",
         "create_flowaccount_journal_draft",
@@ -1024,7 +1065,7 @@ async def test_existing_mcp_input_schemas_add_only_optional_task_11_fields() -> 
     async with create_connected_server_and_client_session(local_mcp) as session:
         tools = {tool.name: tool for tool in (await session.list_tools()).tools}
 
-    assert len(tools) == 19
+    assert len(tools) == 20
     assert set(tools) == EXPECTED_TOOLS
     assert "environment" in tools["search_erp_actions"].inputSchema["properties"]
     assert "environment" not in tools["search_erp_actions"].inputSchema.get("required", [])
@@ -1187,7 +1228,41 @@ async def test_runtime_erp_read_enforces_effective_tier_zero_before_executor(
 
 
 @pytest.mark.asyncio
-async def test_preview_hash_confirmation_and_request_status_use_existing_store(
+async def test_prepare_mutation_returns_immutable_summary_and_exact_next_tool(
+    repository_context,
+    catalog_action,
+) -> None:
+    runtime = LocalMercuryRuntime.for_repository(repository_context)
+    runtime.catalog.replace([catalog_action])
+    try:
+        prepared = await runtime.prepare_mutation(catalog_action.action_id, {}, "production")
+        with pytest.raises(RequestStateError, match="payload_hash_mismatch"):
+            runtime.executor.confirm_write(prepared["request_id"], "0" * 64)
+        confirmed = runtime.executor.confirm_write(
+            prepared["request_id"],
+            prepared["payload_hash"],
+        )
+        status = runtime.executor.get_request_status(prepared["request_id"])
+    finally:
+        await runtime.aclose()
+
+    assert {
+        "sanitized_summary",
+        "payload_hash",
+        "mutation_class",
+        "approval_level",
+        "expires_at",
+        "next_tool",
+    }.issubset(prepared)
+    assert prepared["next_tool"] == "execute_erp_create"
+    assert "request_inputs" not in prepared
+    assert confirmed.state.value == "ready_to_execute"
+    assert status["state"] == "ready_to_execute"
+    assert "request_inputs" not in status
+
+
+@pytest.mark.asyncio
+async def test_preview_write_python_compatibility_keeps_confirmation_required(
     repository_context,
     catalog_action,
 ) -> None:
@@ -1195,32 +1270,130 @@ async def test_preview_hash_confirmation_and_request_status_use_existing_store(
     runtime.catalog.replace([catalog_action])
     try:
         preview = await runtime.preview_write(catalog_action.action_id, {}, "production")
-        with pytest.raises(RequestStateError, match="payload_hash_mismatch"):
-            runtime.executor.confirm_write(preview["request_id"], "0" * 64)
-        confirmed = runtime.executor.confirm_write(
-            preview["request_id"],
-            preview["payload_hash"],
-        )
-        status = runtime.executor.get_request_status(preview["request_id"])
     finally:
         await runtime.aclose()
 
     assert preview["status"] == "confirmation_required"
-    assert confirmed.state.value == "ready_to_execute"
-    assert status["state"] == "ready_to_execute"
-    assert "request_inputs" not in status
+    assert preview["next_tool"] == "execute_erp_create"
 
 
 @pytest.mark.asyncio
-async def test_execute_tool_refreshes_catalog_before_executor_action_check(
+async def test_preview_erp_write_python_helper_keeps_legacy_preview_behavior(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
 
+    class FakeRuntime:
+        async def refresh_catalog(self) -> None:
+            events.append("refresh")
+
+        async def preview_write(
+            self,
+            action_id: str,
+            inputs: dict[str, object],
+            environment: str,
+        ) -> dict[str, object]:
+            events.append(f"preview:{action_id}:{environment}")
+            return {"status": "confirmation_required", "payload_hash": "a" * 64}
+
+        async def aclose(self) -> None:
+            events.append("close")
+
+    monkeypatch.setattr(
+        local_server.LocalMercuryRuntime,
+        "for_repository",
+        classmethod(lambda cls, context: FakeRuntime()),
+    )
+
+    preview = await local_server.preview_erp_write(
+        action_id="erp.invoice.create",
+        inputs={"body": {"reference": "COMPAT-001"}},
+        ctx=_direct_context(tmp_path),
+    )
+
+    assert preview["status"] == "confirmation_required"
+    assert events == ["refresh", "preview:erp.invoice.create:production", "close"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_tool_uses_default_environment_and_preparation_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, object]] = []
+
+    class FakeRuntime:
+        async def refresh_catalog(self) -> None:
+            events.append(("refresh", None))
+
+        async def prepare_mutation(
+            self,
+            action_id: str,
+            inputs: dict[str, object],
+            environment: str,
+        ) -> dict[str, object]:
+            events.append(("prepare", (action_id, inputs, environment)))
+            return {
+                "sanitized_summary": {"fields": ["reference"]},
+                "payload_hash": "a" * 64,
+                "mutation_class": "create",
+                "approval_level": "standard",
+                "expires_at": "2026-07-20T00:15:00+00:00",
+                "next_tool": "execute_erp_create",
+            }
+
+        async def aclose(self) -> None:
+            events.append(("close", None))
+
+    monkeypatch.setattr(
+        local_server.LocalMercuryRuntime,
+        "for_repository",
+        classmethod(lambda cls, context: FakeRuntime()),
+    )
+
+    result = await local_server.prepare_erp_mutation(
+        action_id="erp.invoice.create",
+        inputs={"body": {"reference": "PREPARE-001"}},
+        ctx=_direct_context(tmp_path),
+    )
+
+    assert result["next_tool"] == "execute_erp_create"
+    assert events == [
+        ("refresh", None),
+        (
+            "prepare",
+            ("erp.invoice.create", {"body": {"reference": "PREPARE-001"}}, "production"),
+        ),
+        ("close", None),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "expected_class"),
+    [
+        ("execute_erp_create", MutationClass.CREATE),
+        ("execute_erp_update", MutationClass.UPDATE),
+        ("execute_sensitive_erp_action", MutationClass.SENSITIVE),
+    ],
+)
+@pytest.mark.asyncio
+async def test_class_specific_execute_tools_refresh_catalog_and_bind_expected_class(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    expected_class: MutationClass,
+) -> None:
+    events: list[str] = []
+
     class FakeExecutor:
-        async def execute_write(self, request_id: str) -> ConnectorResult:
-            events.append(f"execute:{request_id}")
+        async def approve_and_execute(
+            self,
+            request_id: str,
+            payload_hash: str,
+            expected: MutationClass,
+        ) -> ConnectorResult:
+            events.append(f"execute:{request_id}:{payload_hash}:{expected.value}")
             return ConnectorResult(
                 status="succeeded",
                 http_status=200,
@@ -1243,13 +1416,19 @@ async def test_execute_tool_refreshes_catalog_before_executor_action_check(
         "for_repository",
         classmethod(lambda cls, context: FakeRuntime()),
     )
-    result = await execute_erp_write(
+    tool = getattr(local_server, tool_name)
+    result = await tool(
         request_id="req_test",
+        payload_hash="a" * 64,
         ctx=_direct_context(tmp_path),
     )
 
     assert result["status"] == "succeeded"
-    assert events == ["refresh", "execute:req_test", "close"]
+    assert events == [
+        "refresh",
+        f"execute:req_test:{'a' * 64}:{expected_class.value}",
+        "close",
+    ]
 
 
 @pytest.mark.asyncio

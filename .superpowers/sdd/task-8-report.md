@@ -1,69 +1,65 @@
-# Task 8 Report: FlowAccount and PEAK Connector Drivers
+# Task 8 Report: Split Local ERP Mutation Tools by Risk
 
 ## Scope
 
-Ported the FlowAccount and PEAK setup authentication and read-only healthcheck
-behavior into provider-specific async drivers. The synchronous setup function
-now delegates to the async path only when no event loop is active. The existing
-private FlowAccount journal client was not changed.
+- Replaced the local MCP preview/confirm/generic-execute ceremony with
+  `prepare_erp_mutation`, `execute_erp_create`, `execute_erp_update`, and
+  `execute_sensitive_erp_action`.
+- Kept the old names as unregistered Python compatibility helpers through v0.3.x.
+- Added `docs/ADVANCED_LOCAL_ERP.md` and changed the public journal Skill to return
+  an advanced-local handoff rather than invoke local-only tools.
+- Did not change the Task 9 hosted launcher, marketplace metadata, release scripts,
+  or public installation path.
 
 ## RED Evidence
 
-Provider contract tests were added before the provider modules existed:
+Tests were changed before the implementation.
 
 ```text
-uv run pytest tests/test_flowaccount_driver.py tests/test_peak_driver.py -q
-ModuleNotFoundError: No module named 'mercury_tools.drivers.flowaccount'
-ModuleNotFoundError: No module named 'mercury_tools.drivers.peak'
+uv run pytest -q tests/test_local_mcp_contract.py tests/test_plugin_package.py \
+  -k 'tool_contract or annotations or write'
+3 failed, 5 passed, 96 deselected
 ```
 
-The repository-config validation test was then added before its guard:
+The failures showed the missing public handoff, missing guide, and unchanged local MCP
+tool registry. Focused preparation and class-specific execution coverage then failed
+before implementation:
 
 ```text
-uv run pytest \
-  tests/test_flowaccount_driver.py::test_registry_for_repository_rejects_untrusted_mixed_and_malformed_records -q
-1 failed, 3 passed
-Failed: DID NOT RAISE DriverConfigurationError
+5 failed
+```
+
+The final compatibility cycle caught the incorrect status merge in the retained Python
+preview helper and its server wrapper:
+
+```text
+2 failed
 ```
 
 ## Implementation
 
-- Added `FlowAccountDriver` for exact production `/v1/token` and sandbox
-  `/test/token` OAuth client-credentials flows, with fixed grant and scope,
-  expiry handling, company-info probes, provider body failure handling, and
-  credential-aware company-name redaction.
-- Added `PeakDriver` for HMAC-SHA1 ClientToken authentication, all manifest
-  environments, required application/user/client-token headers, `GET /user`
-  probes, and `resCode == "200"` response semantics.
-- Added `DriverRegistry.for_repository(config)` with lazy provider imports,
-  built-in FlowAccount and PEAK drivers, five generic factories, trusted-host
-  enforcement, and stable rejection of malformed or mixed repository records.
-- Replaced provider logic in `connectors/setup.py` with async driver delegation.
-  The sync wrapper raises `connector_healthcheck_async_required` rather than
-  nesting `asyncio.run` inside an active event loop.
-- Migrated setup and MCP regression seams to `httpx.MockTransport`; no provider
-  test uses live credentials or a provider network call.
+- `prepare_erp_mutation` creates the mandatory internal immutable preview and returns a
+  redacted summary, hash, mutation class, approval level, expiry, and exact next tool.
+- The class-specific execution tools refresh the catalog and call
+  `approve_and_execute` with `create`, `update`, or `sensitive` respectively. Existing
+  request-store validation rejects a class mismatch before credential loading or ERP
+  network activity.
+- Tool annotations now distinguish closed preparation from open-world reads/imports and
+  class-specific external mutations. Every execute tool has `idempotentHint=False`.
+- The retained `preview_erp_write`, `confirm_erp_write`, and `execute_erp_write` helper
+  functions are not registered with FastMCP. The legacy preview result still reports
+  `confirmation_required`.
+- The public journal Skill now points to the advanced-local guide and does not name any
+  local-only ERP tool. The guide keeps the official FlowAccount MCP read-only boundary
+  separate from a reviewed local FlowAccount API-driver mutation.
 
-## Security Coverage
-
-- Credential bundles are exact; unknown, missing, and blank fields fail closed.
-- Credentials and provider tokens are not retained on drivers or exposed in
-  reprs, error codes, probes, compatibility output, or public result data.
-- Literal and reversibly URL-encoded values are redacted from FlowAccount company
-  display names. Provider response bodies are not returned by setup validation.
-- Registry summaries remain immutable and use an explicit JSON boundary.
-- `build_generic_registry()` retains provider-import isolation; provider modules
-  are loaded only by `for_repository()`.
-
-## Verification
+## GREEN Verification
 
 ```text
-uv run pytest tests/test_flowaccount_driver.py tests/test_peak_driver.py \
-  tests/test_connector_setup.py tests/test_flowaccount_journal_client.py -q
-56 passed
-
-uv run pytest -m "not integration" -q
-805 passed, 1 deselected, 1 warning
+uv run pytest -q tests/test_local_mcp_contract.py tests/test_plugin_package.py \
+  tests/test_runtime_skills.py tests/test_execution_policy.py \
+  tests/test_request_store.py tests/test_erp_executor.py
+380 passed
 
 uv run ruff check .
 All checks passed!
@@ -72,18 +68,6 @@ git diff --check
 exit 0
 ```
 
-The remaining warning is the pre-existing Starlette/httpx deprecation warning
-from `tests/test_connector_mcp_tools.py`.
+## Commit
 
-## Commits
-
-- `8f55ea9 feat: port FlowAccount and PEAK connector drivers`
-## Review fix 3
-
-- Added failing tests for PEAK HTTP-200 responses with empty objects, missing provider codes, list payloads, and malformed JSON. All four previously returned `succeeded`.
-- PEAK action responses now fail closed unless traversal finds at least one relevant `resCode` node and every relevant node is successful.
-- PEAK probe failures with an actual HTTP response now expose a sanitized generic `http_status` for the compatibility wrapper.
-- RED: 5 focused assertions failed before the fix.
-- GREEN: 6 focused assertions passed after the fix.
-- Regression: 353 Task 8 tests passed; 903 non-integration tests passed with 1 pre-existing Starlette deprecation warning and 1 deselected test.
-- Static verification: `uv run ruff check .` and `git diff --check` passed.
+- `feat: split local ERP mutation tools by risk`

@@ -39,6 +39,10 @@ LOCAL_API_DRIVER_COMMANDS = {
     "preview_erp_write",
     "confirm_erp_write",
     "execute_erp_write",
+    "prepare_erp_mutation",
+    "execute_erp_create",
+    "execute_erp_update",
+    "execute_sensitive_erp_action",
     "get_erp_request_status",
 }
 
@@ -99,38 +103,15 @@ def test_bundled_setup_skills_use_local_credential_commands() -> None:
         assert "workspace_id" not in markdown
 
 
-def test_bundled_journal_skill_uses_generic_local_write_tools() -> None:
+def test_bundled_journal_skill_returns_advanced_local_handoff_for_writes() -> None:
     markdown = skill_markdown("flowaccount-journal-posting-th")
 
     assert markdown is not None
-    assert "preview_erp_write" in markdown
-    assert "confirm_erp_write" in markdown
-    assert "execute_erp_write" in markdown
+    assert "advanced_local_handoff" in markdown
+    assert "docs/ADVANCED_LOCAL_ERP.md" in markdown
+    assert "separately connected local Mercury MCP" in markdown
+    assert LOCAL_API_DRIVER_COMMANDS.isdisjoint(markdown)
     assert "create_flowaccount_journal_draft" not in markdown
-
-
-def test_bundled_journal_skill_uses_one_immutable_approval_contract() -> None:
-    markdown = skill_markdown("flowaccount-journal-posting-th")
-
-    assert markdown is not None
-    required_order = (
-        "returned `approval_level` and `mutation_class`",
-        "standard or elevated",
-        "one distinct explicit user approval",
-        "`confirm_erp_write` exactly once",
-        "`execute_erp_write` exactly once",
-        "Never reuse its `request_id` or `payload_hash`",
-        "get_erp_request_status",
-        "never replay or retry",
-    )
-    markdown = " ".join(markdown.split())
-    cursor = 0
-    for term in required_order:
-        position = markdown.find(term, cursor)
-        assert position >= 0, f"missing {term!r} after offset {cursor}"
-        cursor = position + len(term)
-    assert "required_confirmations" not in markdown
-    assert "second distinct explicit" not in markdown
 
 
 @pytest.mark.parametrize("skill_name", CROSS_MCP_SKILLS)
