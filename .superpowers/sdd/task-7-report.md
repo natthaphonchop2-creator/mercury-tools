@@ -182,3 +182,80 @@ uv run pytest -q tests/test_execution_policy.py -k 'sensitive_effect_aliases_are
 uv run pytest -q tests/test_execution_policy.py tests/test_request_store.py tests/test_erp_executor.py tests/test_local_audit.py tests/test_builtin_action_catalog.py
 275 passed in 9.06s
 ```
+
+## Security Edge-Case Fix
+
+### Scope
+
+Fixed only the two requested Task 7 security findings: mixed-case and
+Unicode-affixed sensitive side effects, and noncanonical SQLite v2 table
+semantics that can replace immutable replay history. Task 8 is not included.
+
+### RED Evidence
+
+The policy cases covered mixed-case singular/plural aliases, mixed-case
+underscore/hyphen/space compounds, and all required Unicode-affixed negative
+controls:
+
+```text
+uv run pytest -q tests/test_execution_policy.py -k 'sensitive_effect_aliases_are_elevated or non_sensitive_effects_with_sensitive_substrings_remain_standard'
+9 failed, 41 passed, 11 deselected in 0.22s
+```
+
+The request-store cases covered `PRIMARY KEY ON CONFLICT REPLACE` with retained
+`outcome_unknown` history, other explicit conflict clauses, extra constraints,
+table options, collation, a history-replacing trigger, and a semantically
+canonical formatting/reopen control:
+
+```text
+uv run pytest -q tests/test_request_store.py -k 'on_conflict_replace_before_use or noncanonical_table_ddl or trigger_that_can_replace_request_history or semantically_canonical_formatted_ddl'
+7 failed, 3 passed, 89 deselected in 0.47s
+```
+
+The three passing controls were table options already rejected by the PRAGMA
+contract and the valid formatted DDL reopen case. The seven failures reproduced
+the metadata-blind conflict, constraint, collation, and trigger findings.
+
+### Fix
+
+- Sensitive effects are casefolded before separator tokenization. Only complete
+  ASCII alias tokens separated by accepted underscore, hyphen, or whitespace
+  boundaries are eligible; Unicode letters or marks attached on either side
+  invalidate the alias. Explicit compounds, collapsed camel-case compatibility,
+  and singular/plural aliases remain allowlisted.
+- The v2 store now validates `sqlite_master.sql` in addition to `table_info` and
+  `table_xinfo`. A narrow tokenizer accepts keyword case, whitespace, comments,
+  terminal semicolons, and standard identifier quoting, then requires the exact
+  canonical column grammar. Extra clauses, conflict policies, constraints,
+  collations, and table options fail with `request_store_schema_invalid`.
+- Any trigger attached to the live `requests` table fails initialization before
+  replay/index use. The adversarial tests verify the existing `outcome_unknown`
+  row remains unchanged.
+
+### GREEN Evidence
+
+```text
+uv run pytest -q tests/test_execution_policy.py -k 'sensitive_effect_aliases_are_elevated or non_sensitive_effects_with_sensitive_substrings_remain_standard'
+50 passed, 11 deselected in 0.18s
+
+uv run pytest -q tests/test_request_store.py -k 'on_conflict_replace_before_use or noncanonical_table_ddl or trigger_that_can_replace_request_history or semantically_canonical_formatted_ddl'
+10 passed, 89 deselected in 0.37s
+
+uv run pytest -q tests/test_execution_policy.py tests/test_request_store.py
+160 passed in 1.13s
+
+uv run pytest -q tests/test_erp_executor.py tests/test_local_audit.py tests/test_builtin_action_catalog.py
+134 passed in 12.96s
+
+uv run pytest -q tests/test_credential_cli.py tests/test_local_credentials.py tests/test_runtime_skills.py tests/test_plugin_package.py
+172 passed in 5.34s
+
+uv run pytest -q tests/test_local_mcp_contract.py tests/test_local_mcp_roots.py tests/test_connector_driver_contract.py tests/test_generic_drivers.py tests/test_sandbox_execution_manifest.py tests/integration/test_local_erp_mcp.py
+229 passed, 2 skipped in 17.33s
+
+uv run ruff check .
+All checks passed!
+
+git diff --check
+exit 0 (no output)
+```

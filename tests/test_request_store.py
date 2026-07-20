@@ -219,6 +219,22 @@ _V2_REQUEST_COLUMNS = """
 """
 
 
+def seed_v2_request_store_ddl(
+    repository_context: RepositoryContext,
+    *,
+    ddl: str,
+) -> Path:
+    database = repository_context.cache_dir / "requests.sqlite"
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(ddl)
+        connection.execute("PRAGMA user_version=2")
+        connection.commit()
+    finally:
+        connection.close()
+    return database
+
+
 @pytest.fixture
 def request_store(repository_context: RepositoryContext) -> LocalRequestStore:
     return LocalRequestStore(repository_context)
@@ -327,6 +343,166 @@ def test_v2_initialization_rejects_table_that_allows_duplicate_request_ids(
 
     with pytest.raises(RequestStateError, match="^request_store_schema_invalid$"):
         LocalRequestStore(repository_context)
+
+
+def test_v2_initialization_rejects_request_id_on_conflict_replace_before_use(
+    repository_context: RepositoryContext,
+) -> None:
+    ddl = "CREATE TABLE requests (" + _V2_REQUEST_COLUMNS.replace(
+        "request_id TEXT PRIMARY KEY",
+        "request_id TEXT PRIMARY KEY ON CONFLICT REPLACE",
+    ) + ")"
+    database = seed_v2_request_store_ddl(repository_context, ddl=ddl)
+    history = (
+        "req_outcome_unknown",
+        "f" * 64,
+        "flowaccount",
+        "production",
+        "outcome_unknown",
+        "2026-07-20T00:00:00+00:00",
+        '{"state":"outcome_unknown"}',
+    )
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("INSERT INTO requests VALUES (?, ?, ?, ?, ?, ?, ?)", history)
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RequestStateError, match="^request_store_schema_invalid$"):
+        LocalRequestStore(repository_context)
+
+    connection = sqlite3.connect(database)
+    try:
+        retained = connection.execute(
+            "SELECT request_id, payload_hash, state, request_json FROM requests"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert retained == [(history[0], history[1], history[4], history[6])]
+
+
+@pytest.mark.parametrize(
+    "ddl",
+    [
+        "CREATE TABLE requests ("
+        + _V2_REQUEST_COLUMNS.replace(
+            "request_id TEXT PRIMARY KEY",
+            "request_id TEXT PRIMARY KEY ON CONFLICT IGNORE",
+        )
+        + ")",
+        "CREATE TABLE requests ("
+        + _V2_REQUEST_COLUMNS.replace(
+            "request_json TEXT NOT NULL",
+            "request_json TEXT NOT NULL ON CONFLICT REPLACE",
+        )
+        + ")",
+        "CREATE TABLE requests ("
+        + _V2_REQUEST_COLUMNS
+        + ", UNIQUE (payload_hash) ON CONFLICT REPLACE)",
+        "CREATE TABLE requests ("
+        + _V2_REQUEST_COLUMNS
+        + ", CHECK (length(request_id) > 0))",
+        "CREATE TABLE requests (" + _V2_REQUEST_COLUMNS + ") STRICT",
+        "CREATE TABLE requests (" + _V2_REQUEST_COLUMNS + ") WITHOUT ROWID",
+        "CREATE TABLE requests ("
+        + _V2_REQUEST_COLUMNS.replace(
+            "request_json TEXT NOT NULL",
+            "request_json TEXT COLLATE NOCASE NOT NULL",
+        )
+        + ")",
+    ],
+    ids=(
+        "primary_key_conflict_ignore",
+        "not_null_conflict_replace",
+        "extra_unique_constraint",
+        "extra_check_constraint",
+        "strict_table_option",
+        "without_rowid_table_option",
+        "unexpected_collation",
+    ),
+)
+def test_v2_initialization_rejects_noncanonical_table_ddl(
+    repository_context: RepositoryContext,
+    ddl: str,
+) -> None:
+    seed_v2_request_store_ddl(repository_context, ddl=ddl)
+
+    with pytest.raises(RequestStateError, match="^request_store_schema_invalid$"):
+        LocalRequestStore(repository_context)
+
+
+def test_v2_initialization_rejects_trigger_that_can_replace_request_history(
+    repository_context: RepositoryContext,
+) -> None:
+    database = seed_v2_request_store_ddl(
+        repository_context,
+        ddl="CREATE TABLE requests (" + _V2_REQUEST_COLUMNS + ")",
+    )
+    history = (
+        "req_outcome_unknown",
+        "e" * 64,
+        "flowaccount",
+        "production",
+        "outcome_unknown",
+        "2026-07-20T00:00:00+00:00",
+        '{"state":"outcome_unknown"}',
+    )
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("INSERT INTO requests VALUES (?, ?, ?, ?, ?, ?, ?)", history)
+        connection.execute(
+            """
+            CREATE TRIGGER requests_replace_identity
+            BEFORE INSERT ON requests
+            WHEN EXISTS (
+                SELECT 1 FROM requests WHERE request_id = NEW.request_id
+            )
+            BEGIN
+                DELETE FROM requests WHERE request_id = NEW.request_id;
+            END
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RequestStateError, match="^request_store_schema_invalid$"):
+        LocalRequestStore(repository_context)
+
+    connection = sqlite3.connect(database)
+    try:
+        retained = connection.execute(
+            "SELECT request_id, payload_hash, state, request_json FROM requests"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert retained == [(history[0], history[1], history[4], history[6])]
+
+
+def test_v2_initialization_accepts_semantically_canonical_formatted_ddl(
+    repository_context: RepositoryContext,
+) -> None:
+    database = seed_v2_request_store_ddl(
+        repository_context,
+        ddl="""
+            CrEaTe TaBlE [requests](
+                `request_id` text primary key,
+                [payload_hash] TeXt not null,
+                "connector_id" TEXT NOT NULL,
+                environment TEXT NOT NULL,
+                state TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                request_json TEXT NOT NULL
+            )
+        """,
+    )
+
+    first = LocalRequestStore(repository_context)
+    second = LocalRequestStore(repository_context)
+
+    assert first.database_path == database
+    assert second.database_path == database
 
 
 def test_v1_migration_archives_approvals_without_making_them_executable(

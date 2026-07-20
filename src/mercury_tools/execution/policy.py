@@ -54,7 +54,13 @@ SENSITIVE_EFFECT_ALIASES = {
     "delete_document": "delete",
     "deletes_document": "delete",
 }
-_EFFECT_TOKEN_PATTERN = re.compile(r"[A-Z]+(?=[A-Z][a-z]|[^A-Za-z]|$)|[A-Z]?[a-z]+|\d+")
+_COLLAPSED_SENSITIVE_EFFECT_ALIASES = {
+    alias.replace("_", ""): canonical
+    for alias, canonical in SENSITIVE_EFFECT_ALIASES.items()
+    if "_" in alias
+}
+_EFFECT_SEPARATOR_PATTERN = re.compile(r"[-_\s]+")
+_EFFECT_ASCII_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 
 
 class ApprovalLevel(StrEnum):
@@ -128,7 +134,14 @@ def _has_sensitive_effect(action: CatalogAction) -> bool:
 
 
 def _canonical_sensitive_effect(effect: str) -> str | None:
-    normalized_effect = "_".join(
-        token.casefold() for token in _EFFECT_TOKEN_PATTERN.findall(effect)
+    casefolded_effect = effect.casefold().strip()
+    tokens = _EFFECT_SEPARATOR_PATTERN.split(casefolded_effect)
+    if not tokens or any(
+        _EFFECT_ASCII_TOKEN_PATTERN.fullmatch(token) is None for token in tokens
+    ):
+        return None
+    normalized_effect = "_".join(tokens)
+    return SENSITIVE_EFFECT_ALIASES.get(
+        normalized_effect,
+        _COLLAPSED_SENSITIVE_EFFECT_ALIASES.get(normalized_effect),
     )
-    return SENSITIVE_EFFECT_ALIASES.get(normalized_effect)

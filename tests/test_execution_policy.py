@@ -62,6 +62,8 @@ def test_delete_requires_one_elevated_approval(action_factory) -> None:
     [
         "payment",
         "payments",
+        "pAyMeNt",
+        "pAyMeNtS",
         "PaymentProcessed",
         "payments-processed",
         "approve",
@@ -83,6 +85,9 @@ def test_delete_requires_one_elevated_approval(action_factory) -> None:
         "email",
         "emails",
         "SendEmail",
+        "sEnD_eMaIl",
+        "sEnD-eMaIl",
+        "sEnD eMaIl",
         "send-emails",
         "EmailCustomer",
         "emails-customer",
@@ -116,7 +121,15 @@ def test_sensitive_effect_aliases_are_elevated(
 
 @pytest.mark.parametrize(
     "side_effect",
-    ["postpone", "shared_cache", "delete_preview"],
+    [
+        "postpone",
+        "shared_cache",
+        "delete_preview",
+        "paymentบัญชี",
+        "บัญชีpayment",
+        "email通知",
+        "通知email",
+    ],
 )
 def test_non_sensitive_effects_with_sensitive_substrings_remain_standard(
     action_factory,

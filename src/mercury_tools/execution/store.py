@@ -46,6 +46,17 @@ _REPLAY_INDEX_PATTERN = re.compile(
     r"'outcome_unknown'\s*\)\s*$",
     re.IGNORECASE,
 )
+_SQLITE_DDL_TOKEN_PATTERN = re.compile(
+    r"""
+    (?P<whitespace>\s+)
+    |(?P<line_comment>--[^\r\n]*(?:\r\n|\r|\n|$))
+    |(?P<block_comment>/\*.*?\*/)
+    |(?P<quoted_identifier>"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\])
+    |(?P<word>[A-Za-z_][A-Za-z0-9_]*)
+    |(?P<punctuation>[(),;])
+    """,
+    re.DOTALL | re.VERBOSE,
+)
 _V2_REQUEST_TABLE_CONTRACT = (
     (0, "request_id", "TEXT", "TEXT", False, None, 1),
     (1, "payload_hash", "TEXT", "TEXT", True, None, 0),
@@ -58,6 +69,97 @@ _V2_REQUEST_TABLE_CONTRACT = (
 _V2_REQUEST_TABLE_XINFO_CONTRACT = tuple(
     (*column, 0) for column in _V2_REQUEST_TABLE_CONTRACT
 )
+_V2_REQUEST_TABLE_DDL_CONTRACT = (
+    ("keyword", "create"),
+    ("keyword", "table"),
+    ("identifier", "requests"),
+    ("punctuation", "("),
+    ("identifier", "request_id"),
+    ("keyword", "text"),
+    ("keyword", "primary"),
+    ("keyword", "key"),
+    ("punctuation", ","),
+    ("identifier", "payload_hash"),
+    ("keyword", "text"),
+    ("keyword", "not"),
+    ("keyword", "null"),
+    ("punctuation", ","),
+    ("identifier", "connector_id"),
+    ("keyword", "text"),
+    ("keyword", "not"),
+    ("keyword", "null"),
+    ("punctuation", ","),
+    ("identifier", "environment"),
+    ("keyword", "text"),
+    ("keyword", "not"),
+    ("keyword", "null"),
+    ("punctuation", ","),
+    ("identifier", "state"),
+    ("keyword", "text"),
+    ("keyword", "not"),
+    ("keyword", "null"),
+    ("punctuation", ","),
+    ("identifier", "expires_at"),
+    ("keyword", "text"),
+    ("keyword", "not"),
+    ("keyword", "null"),
+    ("punctuation", ","),
+    ("identifier", "request_json"),
+    ("keyword", "text"),
+    ("keyword", "not"),
+    ("keyword", "null"),
+    ("punctuation", ")"),
+)
+
+
+def _matches_v2_request_table_ddl(sql: object) -> bool:
+    if not isinstance(sql, str):
+        return False
+    tokens: list[tuple[str, str]] = []
+    position = 0
+    while position < len(sql):
+        match = _SQLITE_DDL_TOKEN_PATTERN.match(sql, position)
+        if match is None:
+            return False
+        position = match.end()
+        kind = match.lastgroup
+        if kind in {"whitespace", "line_comment", "block_comment"}:
+            continue
+        value = match.group()
+        if kind == "quoted_identifier":
+            if value[0] == "[":
+                value = value[1:-1]
+            else:
+                quote = value[0]
+                value = value[1:-1].replace(quote * 2, quote)
+            if _SQLITE_SCHEMA_NAME.fullmatch(value) is None:
+                return False
+            tokens.append(("identifier", value.casefold()))
+        elif kind == "word":
+            tokens.append(("word", value.casefold()))
+        elif kind == "punctuation":
+            tokens.append(("punctuation", value))
+        else:
+            return False
+
+    if tokens and tokens[-1] == ("punctuation", ";"):
+        tokens.pop()
+    if len(tokens) != len(_V2_REQUEST_TABLE_DDL_CONTRACT):
+        return False
+    for actual, expected in zip(tokens, _V2_REQUEST_TABLE_DDL_CONTRACT, strict=True):
+        expected_kind, expected_value = expected
+        actual_kind, actual_value = actual
+        if actual_value != expected_value:
+            return False
+        if expected_kind == "identifier":
+            if actual_kind not in {"identifier", "word"}:
+                return False
+        elif expected_kind == "keyword":
+            if actual_kind != "word":
+                return False
+        elif actual_kind != expected_kind:
+            return False
+    return True
 
 
 class RequestStateError(ValueError):
@@ -467,9 +569,20 @@ class LocalRequestStore:
             )
             for row in connection.execute('PRAGMA table_xinfo("requests")').fetchall()
         )
+        definitions = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'requests' AND tbl_name = 'requests'"
+        ).fetchall()
+        triggers = connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'trigger' AND tbl_name = 'requests'"
+        ).fetchall()
         if (
             table_info != _V2_REQUEST_TABLE_CONTRACT
             or table_xinfo != _V2_REQUEST_TABLE_XINFO_CONTRACT
+            or len(definitions) != 1
+            or not _matches_v2_request_table_ddl(definitions[0][0])
+            or triggers
         ):
             raise RequestStateError("request_store_schema_invalid")
 
