@@ -13,6 +13,10 @@ The current 24 hosted tools still report exactly:
 Mercury MCP review: 0 unclear arguments; annotations verified
 ```
 
+This follow-up adds `api token` to the credential-field grammar in both
+normalized sequence and compact `apitoken` form. Exact metadata semantics keep
+`api_token_count`, `token_budget`, and `api_latency` allowed.
+
 ## TDD Evidence
 
 ### Baseline
@@ -75,6 +79,26 @@ uv run pytest -q tests/test_mcp_review_contract.py tests/test_openai_plugin_subm
 93 passed
 ```
 
+### API Token Follow-Up TDD
+
+The API-token rejection and metadata-control cases were added before changing
+the grammar:
+
+```text
+uv run pytest -q tests/test_mcp_review_contract.py
+5 failed, 85 passed
+```
+
+The failures were the five requested spellings: `apiToken`, `api_token`,
+`api-token`, `api token`, and `APITOKEN`.
+
+After adding the compact token, token sequence, and exact metadata exception:
+
+```text
+uv run pytest -q tests/test_mcp_review_contract.py
+90 passed
+```
+
 ## Linter Hardening
 
 - Root `inputSchema` must resolve to an object-only accepting branch with
@@ -86,8 +110,8 @@ uv run pytest -q tests/test_mcp_review_contract.py tests/test_openai_plugin_subm
   schema. An empty mapping remains valid because it cannot introduce a key.
 - Credential names use normalized identifier tokens, splitting camelCase,
   snake_case, kebab-case, and spaces. Exact credential tokens and compounds are
-  rejected while names such as `secretariat`, `token_budget`, and
-  `password_policy` remain valid metadata.
+  rejected while names such as `secretariat`, `token_budget`, `api_latency`,
+  `api_token_count`, and `password_policy` remain valid metadata.
 - Local JSON pointers resolve through mappings and sequences, including escaped
   `~0` and `~1` components and nonnegative array indexes. Invalid, unresolved,
   out-of-range, cyclic, over-depth, external, and over-expanded references fail
@@ -185,6 +209,22 @@ no output; exit 0
 
 Gitleaks 8.24.3, checksum-verified Darwin arm64 binary, Task 10 working-tree diff
 no leaks found
+```
+
+## API Token Follow-Up Verification
+
+```text
+uv run pytest -q tests/test_mcp_review_contract.py tests/test_openai_plugin_submission.py
+100 passed
+
+uv run python scripts/review_mcp_contract.py
+Mercury MCP review: 0 unclear arguments; annotations verified
+
+uv run --extra dev ruff check .
+All checks passed!
+
+git diff --check
+no output; exit 0
 ```
 
 ## Scope

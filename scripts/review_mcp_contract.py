@@ -97,6 +97,7 @@ _CREDENTIAL_SINGLE_TOKENS = frozenset(
 _CREDENTIAL_COMPACT_TOKENS = frozenset(
     {
         "apikey",
+        "apitoken",
         "accesstoken",
         "authtoken",
         "bearertoken",
@@ -111,6 +112,7 @@ _CREDENTIAL_TOKEN_SEQUENCES = frozenset(
         ("access", "key"),
         ("access", "token"),
         ("api", "key"),
+        ("api", "token"),
         ("auth", "token"),
         ("bearer", "token"),
         ("client", "secret"),
@@ -122,8 +124,9 @@ _CREDENTIAL_TOKEN_SEQUENCES = frozenset(
         ("service", "role", "key"),
     }
 )
-_PASSWORD_POLICY_METADATA = frozenset(
+_METADATA_TOKEN_SEQUENCES = frozenset(
     {
+        ("api", "token", "count"),
         ("password", "policy"),
         ("policy", "password"),
         ("passwd", "policy"),
@@ -243,7 +246,7 @@ def _contains_token_sequence(
 def _is_credential_field_name(field_name: str) -> bool:
     """Reject credential payload names while allowing clearly named metadata."""
     tokens = _normalized_field_name_tokens(field_name)
-    if not tokens or tokens in _PASSWORD_POLICY_METADATA:
+    if not tokens or tokens in _METADATA_TOKEN_SEQUENCES:
         return False
     if any(token in _CREDENTIAL_SINGLE_TOKENS for token in tokens):
         return True
