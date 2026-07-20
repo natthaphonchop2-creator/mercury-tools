@@ -26,6 +26,12 @@ def _clean_profile_value(value: Any) -> str | None:
     return clean.lower() if clean is not None else None
 
 
+def _safe_external_server_name(value: Any) -> str | None:
+    from mercury_tools.db.product import safe_external_server_name
+
+    return safe_external_server_name(value)
+
+
 def _public_profile(profile: Mapping[str, Any]) -> dict[str, str] | None:
     connector_id = _clean_profile_value(profile.get("connector_id"))
     connection_mode = _clean_profile_value(profile.get("connection_mode"))
@@ -163,7 +169,7 @@ def _assess_profile(
     if (
         reason is None
         and public_profile["connection_mode"] == "native_mcp"
-        and _sanitize_profile_value(profile.get("external_server_name")) is None
+        and _safe_external_server_name(profile.get("external_server_name")) is None
     ):
         reason = "not_validated"
     elif reason is None and status not in _READY_PROFILE_STATUSES:
@@ -197,7 +203,7 @@ def _native_host_plan(
         }
         for index, item in enumerate(actionable, start=1)
     ]
-    server_name = _sanitize_profile_value(profile.get("external_server_name"))
+    server_name = _safe_external_server_name(profile.get("external_server_name"))
     requirement = {
         "connector_id": public_profile["connector_id"],
         "external_server_name": server_name,

@@ -21,6 +21,9 @@ ConnectorUnlinkConfirmation = Literal["unlink"]
 SearchMode = Literal["hybrid", "keyword", "vector"]
 CAPABILITY_PATTERN = r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$"
 AccountingSkillId = Literal[*ACCOUNTING_SKILL_IDS]
+# Keep the catalog enum visible to MCP clients while the hosted tool handler
+# sanitizes rejected raw values before FastMCP can expose them.
+AccountingSkillIdInput = SkipValidation[AccountingSkillId]
 
 
 class StrictMcpInput(BaseModel):

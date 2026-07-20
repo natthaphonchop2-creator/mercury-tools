@@ -541,6 +541,7 @@ async def test_public_mcp_tool_schemas_are_explicit_for_plugin_review() -> None:
     discovery_schema = tools["get_accounting_skill_schema"].inputSchema
     assert set(discovery_schema["properties"]) == {"skill_id"}
     assert discovery_schema["required"] == ["skill_id"]
+    assert "company-health-check-th" in discovery_schema["properties"]["skill_id"]["enum"]
 
     for tool_name in {"inspect_flow_files", "run_flow_files"}:
         flow_schema = tools[tool_name].inputSchema
@@ -672,6 +673,64 @@ async def test_accounting_skill_nested_rejection_is_sanitized_before_route_and_a
         "status": "error",
         "message": "Accounting skill inputs are invalid.",
     }
+    assert audit_events == []
+    assert marker not in str((content, structured, audit_events))
+    assert "input_value" not in str((content, structured, audit_events))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "expected"),
+    [
+        (
+            "get_accounting_skill_schema",
+            {"skill_id": "sk-accounting-skill-secret-marker-must-not-leak-1234"},
+            {
+                "status": "error",
+                "message": "Accounting skill ID is invalid.",
+            },
+        ),
+        (
+            "run_accounting_skill",
+            {
+                "workspace_id": "mw_publiccontestworkspace001",
+                "skill_id": "sk-accounting-skill-secret-marker-must-not-leak-1234",
+                "inputs": {"query": "Review"},
+                "evidence_mode": False,
+            },
+            {
+                "status": "error",
+                "message": "Accounting skill ID is invalid.",
+            },
+        ),
+        (
+            "get_accounting_skill_schema",
+            {"skill_id": "unknown-accounting-skill"},
+            {"status": "not_found", "skill_id": "unknown-accounting-skill"},
+        ),
+    ],
+)
+async def test_accounting_skill_id_rejection_is_sanitized_through_fastmcp(
+    monkeypatch,
+    tool_name: str,
+    arguments: dict[str, object],
+    expected: dict[str, str],
+) -> None:
+    from mercury_tools.mcp import server
+
+    marker = "sk-accounting-skill-secret-marker-must-not-leak-1234"
+    audit_events: list[object] = []
+
+    monkeypatch.setattr(server, "_audit", lambda *args: audit_events.append(args))
+    monkeypatch.setattr(
+        server,
+        "_product_store",
+        lambda settings=None: pytest.fail("invalid Skill ID reached workspace storage"),
+    )
+
+    content, structured = await server.mcp.call_tool(tool_name, arguments)
+
+    assert structured == expected
     assert audit_events == []
     assert marker not in str((content, structured, audit_events))
     assert "input_value" not in str((content, structured, audit_events))

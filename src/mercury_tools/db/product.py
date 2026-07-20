@@ -255,6 +255,13 @@ def _safe_profile_text(
     return clean
 
 
+def safe_external_server_name(value: Any) -> str | None:
+    """Return the canonical public native MCP server name, if valid."""
+
+    clean = _safe_profile_text(value, pattern=SAFE_SERVER_NAME_RE)
+    return clean if clean and not _is_ip_address(clean) else None
+
+
 def _safe_connector_metadata(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         return {}

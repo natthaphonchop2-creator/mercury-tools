@@ -46,7 +46,7 @@ from mercury_tools.flows.runner import create_default_runner
 from mercury_tools.flows.templates import FLOW_CHEAT_SHEET
 from mercury_tools.flows.workspace import discover_workspace_flows, workspace_manifest
 from mercury_tools.mcp.schemas import (
-    AccountingSkillId,
+    AccountingSkillIdInput,
     AccountingSkillInputs,
     AccountingSkillInputsInput,
     ConnectorConnectionMode,
@@ -121,6 +121,7 @@ CONNECTOR_TAGS = {
 _LOWER_HEX = frozenset("0123456789abcdef")
 _SAFE_PUBLIC_PROFILE_TEXT_RE = re.compile(r"^[A-Za-z0-9._ -]{1,200}$")
 _SAFE_EXTERNAL_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
+_SAFE_ACCOUNTING_SKILL_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,100}$")
 _HOSTED_FLOW_ENVIRONMENT_SECRET_NAME_RE = re.compile(
     r"(?i)(?:secret|token|api[\W_]*key|password|authorization|"
     r"private[\W_]*key|service[\W_]*role[\W_]*key|credentials?|cookies?)"
@@ -346,6 +347,23 @@ def _invalid_accounting_skill_inputs_payload() -> dict[str, str]:
         "status": "error",
         "message": "Accounting skill inputs are invalid.",
     }
+
+
+def _invalid_accounting_skill_id_payload() -> dict[str, str]:
+    return {
+        "status": "error",
+        "message": "Accounting skill ID is invalid.",
+    }
+
+
+def _safe_accounting_skill_id(value: Any) -> str | None:
+    if (
+        not isinstance(value, str)
+        or not _SAFE_ACCOUNTING_SKILL_ID_RE.fullmatch(value)
+        or redact_json(value) != value
+    ):
+        return None
+    return value
 
 
 def _validated_accounting_skill_inputs(skill: Any, raw: Any) -> dict[str, Any]:
@@ -2060,24 +2078,30 @@ def list_accounting_skills() -> dict[str, Any]:
 
 
 @mcp.tool(annotations=_CLOSED_READ)
-def get_accounting_skill_schema(skill_id: AccountingSkillId) -> dict[str, Any]:
+def get_accounting_skill_schema(skill_id: AccountingSkillIdInput) -> dict[str, Any]:
     """Return one canonical Skill input schema without reading workspace state."""
 
-    schema = runtime_accounting_skill_schema(skill_id)
+    safe_skill_id = _safe_accounting_skill_id(skill_id)
+    if safe_skill_id is None:
+        return _invalid_accounting_skill_id_payload()
+    schema = runtime_accounting_skill_schema(safe_skill_id)
     if schema is None:
-        return {"status": "not_found", "skill_id": skill_id}
+        return {"status": "not_found", "skill_id": safe_skill_id}
     return schema
 
 
 @mcp.tool(annotations=_CLOSED_READ)
 def run_accounting_skill(
     workspace_id: str,
-    skill_id: AccountingSkillId,
+    skill_id: AccountingSkillIdInput,
     inputs: AccountingSkillInputsInput,
     evidence_mode: bool = False,
 ) -> dict[str, Any]:
     """Validate and route an accounting Skill for host-side execution."""
 
+    safe_skill_id = _safe_accounting_skill_id(skill_id)
+    if safe_skill_id is None:
+        return _invalid_accounting_skill_id_payload()
     try:
         normalized_workspace_id = normalize_public_workspace_id(workspace_id)
     except (AttributeError, ValueError):
@@ -2086,9 +2110,9 @@ def run_accounting_skill(
             "message": "Invalid Mercury public workspace ID.",
         }
 
-    skill = accounting_skill_by_id(skill_id)
+    skill = accounting_skill_by_id(safe_skill_id)
     if skill is None:
-        return {"status": "not_found", "skill_id": skill_id}
+        return {"status": "not_found", "skill_id": safe_skill_id}
     try:
         validated_inputs = _validated_accounting_skill_inputs(skill, inputs)
     except ValueError:

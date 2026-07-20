@@ -469,7 +469,10 @@ def test_multiple_local_bridge_profiles_require_sorted_sanitized_tuple_selection
     }
 
 
-@pytest.mark.parametrize("external_server_name", [None, "https://flowaccount-mcp"])
+@pytest.mark.parametrize(
+    "external_server_name",
+    [None, "https://flowaccount-mcp", "bad server"],
+)
 def test_malformed_ready_native_profile_is_not_validated(
     external_server_name: str | None,
 ) -> None:
