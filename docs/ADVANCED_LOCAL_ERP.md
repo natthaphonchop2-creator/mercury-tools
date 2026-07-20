@@ -15,7 +15,8 @@ business payloads to the hosted Mercury MCP or in chat.
 ## Mutation Sequence
 
 1. Use `search_erp_actions` and `get_erp_action_schema` to select one reviewed
-   action, then call `prepare_erp_mutation` with the action ID and required inputs.
+   action, then call `prepare_erp_mutation` with the action ID and the explicit
+   input envelope below.
 2. The prepared response contains a sanitized immutable summary, `payload_hash`,
    `mutation_class`, `approval_level`, expiry, and the exact `next_tool`.
 3. Obtain one explicit approval for that unchanged summary. Call only the returned
@@ -31,6 +32,29 @@ The internal preview, payload binding, credential revision checks, preflight che
 redaction, append-only audit records, and fail-closed restart behavior remain
 mandatory. The selected execute tool records the single host-visible approval; there
 is no public confirmation tool.
+
+## Input Envelope
+
+`run_erp_read` and `prepare_erp_mutation` accept an `inputs` object with exactly one
+required property: `json_object`. Its value is a UTF-8 JSON object containing the ERP
+request inputs. Do not include credentials. The JSON must be a single object with no
+duplicate keys, be at most 65,536 characters and bytes, and remain within the local
+depth and key limits.
+
+Use this exact call shape, replacing only the reviewed action ID and JSON values:
+
+```json
+{
+  "action_id": "reviewed-action-id",
+  "inputs": {
+    "json_object": "{\"body\":{\"reference\":\"EXAMPLE-001\"}}"
+  }
+}
+```
+
+The same `inputs.json_object` envelope is required for a read and a mutation
+preparation. Invalid input returns `erp_inputs_invalid` without reflecting the
+submitted payload.
 
 ## FlowAccount Boundary
 

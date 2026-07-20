@@ -296,19 +296,12 @@ class LocalRequestStore:
         expected_class: MutationClass,
     ) -> PreparedRequest:
         with self._immediate_transaction() as connection:
-            request = self._fetch(connection, request_id)
-            if not isinstance(payload_hash, str) or not secrets.compare_digest(
+            request = self._approval_candidate(
+                connection,
+                request_id,
                 payload_hash,
-                request.payload_hash,
-            ):
-                raise RequestStateError("payload_hash_mismatch")
-            request = self._expire_if_needed(connection, request)
-            self._require_state(request, RequestState.AWAITING_CONFIRMATION)
-            if (
-                not isinstance(expected_class, MutationClass)
-                or request.mutation_class is not expected_class
-            ):
-                raise RequestStateError("mutation_class_mismatch")
+                expected_class,
+            )
             updated = self._updated(
                 request,
                 state=RequestState.READY_TO_EXECUTE,
@@ -316,6 +309,23 @@ class LocalRequestStore:
             )
             self._store(connection, updated)
             return updated
+
+    @repository_locked
+    def precheck_approval(
+        self,
+        request_id: str,
+        payload_hash: str,
+        expected_class: MutationClass,
+    ) -> PreparedRequest:
+        """Validate a pending approval locally without recording it."""
+
+        with self._immediate_transaction() as connection:
+            return self._approval_candidate(
+                connection,
+                request_id,
+                payload_hash,
+                expected_class,
+            )
 
     def confirm(self, request_id: str, payload_hash: str) -> PreparedRequest:
         """Compatibility helper for the v0.2 local tool surface."""
@@ -890,6 +900,28 @@ class LocalRequestStore:
         if row is None:
             raise RequestStateError("request_not_found")
         return self._row_to_request(row)
+
+    def _approval_candidate(
+        self,
+        connection: sqlite3.Connection,
+        request_id: str,
+        payload_hash: str,
+        expected_class: MutationClass,
+    ) -> PreparedRequest:
+        request = self._fetch(connection, request_id)
+        if not isinstance(payload_hash, str) or not secrets.compare_digest(
+            payload_hash,
+            request.payload_hash,
+        ):
+            raise RequestStateError("payload_hash_mismatch")
+        request = self._expire_if_needed(connection, request)
+        self._require_state(request, RequestState.AWAITING_CONFIRMATION)
+        if (
+            not isinstance(expected_class, MutationClass)
+            or request.mutation_class is not expected_class
+        ):
+            raise RequestStateError("mutation_class_mismatch")
+        return request
 
     def _row_to_request(self, row: sqlite3.Row) -> PreparedRequest:
         try:

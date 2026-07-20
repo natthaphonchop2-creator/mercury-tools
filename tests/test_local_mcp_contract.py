@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from datetime import UTC, datetime, timedelta
@@ -740,6 +741,19 @@ async def test_local_mcp_has_exact_server_contract_and_hidden_context_schema() -
     assert "environment" not in by_name["prepare_erp_mutation"].inputSchema.get(
         "required", []
     )
+    for name in ("run_erp_read", "prepare_erp_mutation"):
+        inputs_schema = by_name[name].inputSchema["properties"]["inputs"]
+        assert inputs_schema["type"] == "object"
+        assert inputs_schema["additionalProperties"] is False
+        assert inputs_schema["required"] == ["json_object"]
+        json_object = inputs_schema["properties"]["json_object"]
+        assert json_object["type"] == "string"
+        assert json_object["description"] == (
+            "UTF-8 JSON object containing the ERP request inputs. "
+            "Do not include credentials."
+        )
+        assert json_object["minLength"] == 2
+        assert json_object["maxLength"] == 65_536
     for name in ERP_EXECUTE_TOOLS:
         assert set(by_name[name].inputSchema["required"]) == {
             "request_id",
@@ -1354,7 +1368,7 @@ async def test_prepare_tool_uses_default_environment_and_preparation_runtime(
 
     result = await local_server.prepare_erp_mutation(
         action_id="erp.invoice.create",
-        inputs={"body": {"reference": "PREPARE-001"}},
+        inputs={"json_object": '{"body":{"reference":"PREPARE-001"}}'},
         ctx=_direct_context(tmp_path),
     )
 
@@ -1367,6 +1381,104 @@ async def test_prepare_tool_uses_default_environment_and_preparation_runtime(
         ),
         ("close", None),
     ]
+
+
+@pytest.mark.asyncio
+async def test_run_erp_read_decodes_the_explicit_json_input_envelope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, object]] = []
+
+    class FakeRuntime:
+        async def refresh_catalog(self) -> None:
+            events.append(("refresh", None))
+
+        async def run_read(
+            self,
+            action_id: str,
+            inputs: dict[str, object],
+            environment: str,
+        ) -> dict[str, object]:
+            events.append(("read", (action_id, inputs, environment)))
+            return {"status": "ok"}
+
+        async def aclose(self) -> None:
+            events.append(("close", None))
+
+    monkeypatch.setattr(
+        local_server.LocalMercuryRuntime,
+        "for_repository",
+        classmethod(lambda cls, context: FakeRuntime()),
+    )
+
+    result = await local_server.run_erp_read(
+        action_id="erp.invoice.list",
+        inputs={"json_object": '{"query":{"limit":25}}'},
+        ctx=_direct_context(tmp_path),
+    )
+
+    assert result == {"status": "ok"}
+    assert events == [
+        ("refresh", None),
+        ("read", ("erp.invoice.list", {"query": {"limit": 25}}, "production")),
+        ("close", None),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["run_erp_read", "prepare_erp_mutation"])
+async def test_erp_input_envelope_rejects_invalid_json_without_opening_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+) -> None:
+    events: list[str] = []
+    nested: dict[str, object] = {}
+    for _ in range(13):
+        nested = {"next": nested}
+    invalid_inputs = (
+        {"json_object": '{"body":{"amount":1,"amount":2}}'},
+        {"json_object": "[]"},
+        {"json_object": '{"body":NaN}'},
+        {"json_object": json.dumps(nested)},
+        {"json_object": json.dumps({f"key_{index}": index for index in range(257)})},
+        {"json_object": '{"body":"' + "\u0e01" * 22_000 + '"}'},
+        {"unexpected": "private-input-that-must-not-echo"},
+    )
+
+    class FakeRuntime:
+        async def refresh_catalog(self) -> None:
+            events.append("refresh")
+
+        async def run_read(self, *args: object) -> dict[str, str]:
+            events.append("read")
+            return {"status": "unexpected"}
+
+        async def prepare_mutation(self, *args: object) -> dict[str, str]:
+            events.append("prepare")
+            return {"status": "unexpected"}
+
+        async def aclose(self) -> None:
+            events.append("close")
+
+    monkeypatch.setattr(
+        local_server.LocalMercuryRuntime,
+        "for_repository",
+        classmethod(lambda cls, context: FakeRuntime()),
+    )
+    tool = getattr(local_server, tool_name)
+
+    for inputs in invalid_inputs:
+        result = await tool(
+            action_id="erp.invoice.list",
+            inputs=inputs,
+            ctx=_direct_context(tmp_path),
+        )
+        assert result == {"status": "erp_inputs_invalid"}
+        assert "private-input-that-must-not-echo" not in str(result)
+
+    assert events == []
 
 
 @pytest.mark.parametrize(
@@ -1386,6 +1498,15 @@ async def test_class_specific_execute_tools_refresh_catalog_and_bind_expected_cl
 ) -> None:
     events: list[str] = []
 
+    class FakeRequestStore:
+        def precheck_approval(
+            self,
+            request_id: str,
+            payload_hash: str,
+            expected: MutationClass,
+        ) -> None:
+            events.append(f"precheck:{request_id}:{payload_hash}:{expected.value}")
+
     class FakeExecutor:
         async def approve_and_execute(
             self,
@@ -1404,6 +1525,7 @@ async def test_class_specific_execute_tools_refresh_catalog_and_bind_expected_cl
 
     class FakeRuntime:
         executor = FakeExecutor()
+        request_store = FakeRequestStore()
 
         async def refresh_catalog(self) -> None:
             events.append("refresh")
@@ -1425,10 +1547,124 @@ async def test_class_specific_execute_tools_refresh_catalog_and_bind_expected_cl
 
     assert result["status"] == "succeeded"
     assert events == [
+        f"precheck:req_test:{'a' * 64}:{expected_class.value}",
         "refresh",
         f"execute:req_test:{'a' * 64}:{expected_class.value}",
         "close",
     ]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "expected_class", "stored_class"),
+    [
+        ("execute_erp_create", MutationClass.CREATE, MutationClass.UPDATE),
+        ("execute_erp_update", MutationClass.UPDATE, MutationClass.SENSITIVE),
+        (
+            "execute_sensitive_erp_action",
+            MutationClass.SENSITIVE,
+            MutationClass.CREATE,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_class_specific_execute_tool_rejects_persisted_class_mismatch_before_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    expected_class: MutationClass,
+    stored_class: MutationClass,
+) -> None:
+    events: list[str] = []
+
+    class FakeRequestStore:
+        def precheck_approval(
+            self,
+            request_id: str,
+            payload_hash: str,
+            expected: MutationClass,
+        ) -> None:
+            events.append(f"precheck:{request_id}:{payload_hash}:{expected.value}")
+            if expected is not stored_class:
+                raise RequestStateError("mutation_class_mismatch")
+
+    class FakeExecutor:
+        async def approve_and_execute(self, *args: object) -> ConnectorResult:
+            events.append("execute")
+            raise AssertionError("class mismatch must not reach execution")
+
+    class FakeRuntime:
+        request_store = FakeRequestStore()
+        executor = FakeExecutor()
+
+        async def refresh_catalog(self) -> None:
+            events.append("refresh")
+
+        async def aclose(self) -> None:
+            events.append("close")
+
+    monkeypatch.setattr(
+        local_server.LocalMercuryRuntime,
+        "for_repository",
+        classmethod(lambda cls, context: FakeRuntime()),
+    )
+    tool = getattr(local_server, tool_name)
+    result = await tool(
+        request_id="req_private",
+        payload_hash="b" * 64,
+        ctx=_direct_context(tmp_path),
+    )
+
+    assert result == {"status": "mutation_class_mismatch"}
+    assert "req_private" not in str(result)
+    assert "b" * 64 not in str(result)
+    assert events == [
+        f"precheck:req_private:{'b' * 64}:{expected_class.value}",
+        "close",
+    ]
+
+
+@pytest.mark.parametrize(
+    "failure_code",
+    ["request_not_found", "payload_hash_mismatch", "mutation_class_mismatch"],
+)
+@pytest.mark.asyncio
+async def test_execute_precheck_returns_sanitized_request_errors_without_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_code: str,
+) -> None:
+    events: list[str] = []
+
+    class FakeRequestStore:
+        def precheck_approval(self, *args: object) -> None:
+            events.append("precheck")
+            raise RequestStateError(failure_code)
+
+    class FakeRuntime:
+        request_store = FakeRequestStore()
+
+        async def refresh_catalog(self) -> None:
+            events.append("refresh")
+
+        async def aclose(self) -> None:
+            events.append("close")
+
+    monkeypatch.setattr(
+        local_server.LocalMercuryRuntime,
+        "for_repository",
+        classmethod(lambda cls, context: FakeRuntime()),
+    )
+
+    result = await local_server.execute_erp_create(
+        request_id="req_private",
+        payload_hash="b" * 64,
+        ctx=_direct_context(tmp_path),
+    )
+
+    assert result == {"status": failure_code}
+    assert "req_private" not in str(result)
+    assert "b" * 64 not in str(result)
+    assert events == ["precheck", "close"]
 
 
 @pytest.mark.asyncio

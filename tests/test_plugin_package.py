@@ -587,6 +587,8 @@ def test_journal_skill_returns_advanced_local_handoff_for_writes() -> None:
     assert "advanced_local_handoff" in text
     assert "docs/ADVANCED_LOCAL_ERP.md" in text
     assert "separately connected local Mercury MCP" in text
+    assert "json_object" in text
+    assert '"body"' in text
     assert LEGACY_UNCONDITIONAL_LOCAL_COMMANDS.isdisjoint(text)
 
 
@@ -619,6 +621,8 @@ def test_advanced_local_erp_guide_keeps_write_and_credential_boundaries_explicit
     assert "execute_erp_create" in text
     assert "execute_erp_update" in text
     assert "execute_sensitive_erp_action" in text
+    assert "json_object" in text
+    assert "UTF-8 JSON object" in text
     assert "official FlowAccount MCP" in text
     assert "read-only" in text
     assert "separately reviewed FlowAccount API-driver" in text

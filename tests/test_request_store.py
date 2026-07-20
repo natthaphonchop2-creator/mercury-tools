@@ -1348,6 +1348,27 @@ def test_approval_rejects_wrong_expected_mutation_class_without_state_change(
     assert stored.approval_count == 0
 
 
+def test_precheck_approval_uses_persisted_state_without_recording_approval(
+    request_store: LocalRequestStore,
+    prepared_request: PreparedRequest,
+    catalog_action: CatalogAction,
+) -> None:
+    request = request_store.create_preview(prepared_request, action=catalog_action)
+
+    checked = request_store.precheck_approval(
+        request.request_id,
+        request.payload_hash,
+        MutationClass.CREATE,
+    )
+
+    assert checked.request_id == request.request_id
+    assert checked.state is RequestState.AWAITING_CONFIRMATION
+    assert checked.approval_count == 0
+    stored = request_store.get(request.request_id)
+    assert stored.state is RequestState.AWAITING_CONFIRMATION
+    assert stored.approval_count == 0
+
+
 def test_repeated_approval_is_rejected_and_remains_single(
     request_store: LocalRequestStore,
     prepared_request: PreparedRequest,
