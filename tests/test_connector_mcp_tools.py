@@ -107,9 +107,13 @@ def test_list_connectors_exposes_setup_targets_without_secrets() -> None:
 def test_connector_id_accepts_generic_mcp() -> None:
     from mercury_tools.mcp.schemas import AccountingSkillInputs
 
-    payload = AccountingSkillInputs(connector_id="generic_mcp")
+    payload = AccountingSkillInputs(
+        connector_id="generic_mcp",
+        connection_mode="native_mcp",
+    )
 
     assert payload.connector_id == "generic_mcp"
+    assert payload.connection_mode == "native_mcp"
 
 
 def test_accounting_skill_public_tools_have_exact_signatures_and_closed_discovery() -> None:
@@ -203,6 +207,65 @@ def test_run_accounting_skill_routes_workspace_profile_and_explicit_connector(
     assert len(audit_events) == 1
     assert make_workspace_id() not in str(audit_events)
     assert "Review this company" not in str(audit_events)
+
+
+def test_run_accounting_skill_hands_connection_mode_to_same_connector_route(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    configure_product_env(monkeypatch)
+
+    class FakeStore:
+        def public_dashboard(self, workspace_id: str) -> dict[str, Any]:
+            assert workspace_id == make_workspace_id()
+            return {
+                "connector_profiles": [
+                    {
+                        "connector_id": "flowaccount",
+                        "connection_mode": "api_driver",
+                        "environment": "production",
+                        "status": "ready_read_only",
+                        "capability_states": {"company.info.read": "observed"},
+                        "evidence_source": "api_driver_safe_probe",
+                        "validated_at": "2026-07-19T12:00:00+00:00",
+                    },
+                    {
+                        "connector_id": "flowaccount",
+                        "connection_mode": "native_mcp",
+                        "environment": "production",
+                        "status": "ready_read_only",
+                        "capability_states": {"company.info.read": "observed"},
+                        "evidence_source": "native_mcp_safe_read",
+                        "validated_at": "2026-07-19T12:00:00+00:00",
+                        "external_server_name": "FlowAccount-Prod-MCP",
+                    },
+                ]
+            }
+
+    monkeypatch.setattr(server, "_product_store", lambda settings=None: FakeStore())
+    monkeypatch.setattr(server, "_audit", lambda *_args: None)
+
+    payload = server.run_accounting_skill(
+        workspace_id=make_workspace_id(),
+        skill_id="company-health-check-th",
+        inputs={
+            "query": "Review this company",
+            "connector_id": "flowaccount",
+            "connection_mode": "native_mcp",
+        },
+    )
+
+    assert payload["status"] == "ready"
+    assert payload["selected_profile"] == {
+        "connector_id": "flowaccount",
+        "connection_mode": "native_mcp",
+        "environment": "production",
+    }
+    assert payload["validated_inputs"]["connection_mode"] == "native_mcp"
+    assert payload["host_tool_requirements"][0]["external_server_name"] == (
+        "FlowAccount-Prod-MCP"
+    )
 
 
 @pytest.mark.parametrize(

@@ -2114,6 +2114,7 @@ def run_accounting_skill(
             skill,
             profiles,
             requested_connector_id=validated_inputs.get("connector_id"),
+            requested_connection_mode=validated_inputs.get("connection_mode"),
         )
         payload = redact_json(
             {

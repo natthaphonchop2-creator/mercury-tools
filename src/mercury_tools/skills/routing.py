@@ -14,11 +14,16 @@ _OBSERVED_CAPABILITY_STATES = frozenset({"observed", "enabled"})
 _SAFE_PROFILE_VALUE_RE = re.compile(r"^[A-Za-z0-9._ -]{1,200}$")
 
 
-def _clean_profile_value(value: Any) -> str | None:
+def _sanitize_profile_value(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
-    clean = value.strip().lower()
+    clean = value.strip()
     return clean if _SAFE_PROFILE_VALUE_RE.fullmatch(clean) else None
+
+
+def _clean_profile_value(value: Any) -> str | None:
+    clean = _sanitize_profile_value(value)
+    return clean.lower() if clean is not None else None
 
 
 def _public_profile(profile: Mapping[str, Any]) -> dict[str, str] | None:
@@ -171,24 +176,29 @@ def _native_host_plan(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     profile = assessment["profile"]
     public_profile = assessment["public_profile"]
-    required = [item for item in assessment["capability_resolution"] if item["required"]]
+    actionable = [
+        item
+        for item in assessment["capability_resolution"]
+        if item["required"] or item["state"] == "observed"
+    ]
     steps = [
         {
             "step": index,
             "action": "invoke_provider_capability",
             "capability": item["capability"],
             "provider_capabilities": item["provider_capabilities"],
+            "required": item["required"],
         }
-        for index, item in enumerate(required, start=1)
+        for index, item in enumerate(actionable, start=1)
     ]
-    server_name = _clean_profile_value(profile.get("external_server_name"))
+    server_name = _sanitize_profile_value(profile.get("external_server_name"))
     requirement = {
         "connector_id": public_profile["connector_id"],
         "external_server_name": server_name,
         "provider_capabilities": sorted(
             {
                 provider_capability
-                for item in required
+                for item in actionable
                 for provider_capability in item["provider_capabilities"]
             }
         ),
@@ -256,10 +266,12 @@ def resolve_skill_route(
     skill: AccountingSkillDefinition,
     profiles: Sequence[Mapping[str, Any]],
     requested_connector_id: str | None = None,
+    requested_connection_mode: str | None = None,
 ) -> dict[str, Any]:
     """Resolve one Skill without connector preference or external provider calls."""
 
     selected_connector = _clean_profile_value(requested_connector_id)
+    selected_mode = _clean_profile_value(requested_connection_mode)
     assessments = [
         assessment
         for profile in profiles
@@ -268,6 +280,10 @@ def resolve_skill_route(
         and (
             selected_connector is None
             or assessment["public_profile"]["connector_id"] == selected_connector
+        )
+        and (
+            selected_mode is None
+            or assessment["public_profile"]["connection_mode"] == selected_mode
         )
     ]
     assessments.sort(

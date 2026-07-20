@@ -9,13 +9,14 @@ from pydantic import BaseModel, ConfigDict, Field, SkipValidation, model_validat
 
 from mercury_tools.skills.catalog import (
     ACCOUNTING_SKILL_IDS,
+    SkillConnectionMode,
     SkillConnectorId,
     SkillEnvironment,
 )
 
 ConnectorId = SkillConnectorId
 ConnectorEnvironment = SkillEnvironment
-ConnectorConnectionMode = Literal["native_mcp", "api_driver", "local_bridge"]
+ConnectorConnectionMode = SkillConnectionMode
 ConnectorUnlinkConfirmation = Literal["unlink"]
 SearchMode = Literal["hybrid", "keyword", "vector"]
 CAPABILITY_PATTERN = r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$"
@@ -145,6 +146,10 @@ class AccountingSkillInputs(StrictMcpInput):
     connector_id: ConnectorId | None = Field(
         default=None,
         description="ERP connector relevant to the skill.",
+    )
+    connection_mode: ConnectorConnectionMode | None = Field(
+        default=None,
+        description="Connection mode used to disambiguate profiles for the same connector.",
     )
     environment: ConnectorEnvironment | None = Field(
         default=None,

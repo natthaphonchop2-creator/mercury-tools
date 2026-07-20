@@ -528,9 +528,14 @@ async def test_public_mcp_tool_schemas_are_explicit_for_plugin_review() -> None:
     if "$ref" in skill_input_schema:
         skill_input_schema = skill_schema["$defs"][skill_input_schema["$ref"].rsplit("/", 1)[-1]]
     assert skill_input_schema["additionalProperties"] is False
-    assert {"query", "connector_id", "environment", "period_start", "period_end"} <= set(
-        skill_input_schema["properties"]
-    )
+    assert {
+        "query",
+        "connector_id",
+        "connection_mode",
+        "environment",
+        "period_start",
+        "period_end",
+    } <= set(skill_input_schema["properties"])
     assert "workspace_id" not in skill_input_schema["properties"]
     assert tools["list_accounting_skills"].inputSchema["properties"] == {}
     discovery_schema = tools["get_accounting_skill_schema"].inputSchema

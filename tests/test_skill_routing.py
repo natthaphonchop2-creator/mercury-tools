@@ -11,6 +11,7 @@ def ready_profile(
     connection_mode: str = "api_driver",
     environment: str = "production",
     capability_states: dict[str, str],
+    external_server_name: str | None = None,
 ) -> dict[str, object]:
     return {
         "connector_id": connector_id,
@@ -24,7 +25,7 @@ def ready_profile(
             "local_bridge": "local_bridge_safe_probe",
         }[connection_mode],
         "validated_at": "2026-07-19T12:00:00+00:00",
-        "external_server_name": f"{connector_id}-accounting-mcp",
+        "external_server_name": external_server_name or f"{connector_id}-accounting-mcp",
         "metadata": {"client_secret": "must-not-leak"},
     }
 
@@ -55,6 +56,14 @@ def test_accounting_skill_catalog_is_the_immutable_source_for_seed_and_schema() 
     assert accounting_skill_input_schema(company_health.skill_id) == (
         company_health.input_schema.model_json_schema()
     )
+    for definition in ACCOUNTING_SKILL_CATALOG:
+        schema = accounting_skill_input_schema(definition.skill_id)
+        assert schema is not None
+        assert "connection_mode" in schema["properties"]
+        validated = definition.input_schema.model_validate(
+            {"query": "Review", "connection_mode": "native_mcp"}
+        )
+        assert validated.connection_mode == "native_mcp"
     with pytest.raises(FrozenInstanceError):
         company_health.title = "mutable"  # type: ignore[misc]
 
@@ -143,6 +152,87 @@ def test_skill_route_honors_explicit_connector_then_requires_selection_when_ambi
     assert selected["selected_profile"]["connector_id"] == "peak"
 
 
+def test_skill_route_selects_connection_mode_for_same_connector_profiles() -> None:
+    from mercury_tools.skills.catalog import accounting_skill_by_id
+    from mercury_tools.skills.routing import resolve_skill_route
+
+    skill = accounting_skill_by_id("company-health-check-th")
+    assert skill is not None
+    profiles = [
+        ready_profile(
+            "flowaccount",
+            connection_mode="native_mcp",
+            capability_states={"company.info.read": "observed"},
+        ),
+        ready_profile(
+            "flowaccount",
+            connection_mode="api_driver",
+            capability_states={"company.info.read": "observed"},
+        ),
+    ]
+
+    ambiguous = resolve_skill_route(
+        skill,
+        profiles,
+        requested_connector_id="flowaccount",
+    )
+    selected = resolve_skill_route(
+        skill,
+        profiles,
+        requested_connector_id=" FLOWACCOUNT ",
+        requested_connection_mode=" NATIVE_MCP ",
+    )
+
+    assert ambiguous["status"] == "connector_selection_required"
+    assert ambiguous["choices"] == [
+        {
+            "connector_id": "flowaccount",
+            "connection_mode": "api_driver",
+            "environment": "production",
+        },
+        {
+            "connector_id": "flowaccount",
+            "connection_mode": "native_mcp",
+            "environment": "production",
+        },
+    ]
+    assert selected["status"] == "ready"
+    assert selected["selected_profile"] == {
+        "connector_id": "flowaccount",
+        "connection_mode": "native_mcp",
+        "environment": "production",
+    }
+
+
+def test_skill_route_keeps_environment_ambiguity_after_mode_selection() -> None:
+    from mercury_tools.skills.catalog import accounting_skill_by_id
+    from mercury_tools.skills.routing import resolve_skill_route
+
+    skill = accounting_skill_by_id("company-health-check-th")
+    assert skill is not None
+    profiles = [
+        ready_profile(
+            "flowaccount",
+            environment=environment,
+            capability_states={"company.info.read": "observed"},
+        )
+        for environment in ("production", "sandbox")
+    ]
+
+    route = resolve_skill_route(
+        skill,
+        profiles,
+        requested_connector_id="flowaccount",
+        requested_connection_mode="api_driver",
+    )
+
+    assert route["status"] == "connector_selection_required"
+    assert [choice["environment"] for choice in route["choices"]] == [
+        "production",
+        "sandbox",
+    ]
+
+
 def test_native_provider_unavailable_write_does_not_block_unrelated_read_skill() -> None:
     from mercury_tools.skills.catalog import accounting_skill_by_id
     from mercury_tools.skills.routing import resolve_skill_route
@@ -178,6 +268,63 @@ def test_native_provider_unavailable_write_does_not_block_unrelated_read_skill()
             "provider_capabilities": ["company.info.read"],
         }
     ]
+
+
+def test_native_route_preserves_server_case_and_includes_only_observed_optional_steps() -> None:
+    from mercury_tools.skills.catalog import accounting_skill_by_id
+    from mercury_tools.skills.routing import resolve_skill_route
+
+    skill = accounting_skill_by_id("company-health-check-th")
+    assert skill is not None
+    route = resolve_skill_route(
+        skill,
+        [
+            ready_profile(
+                "flowaccount",
+                connection_mode="native_mcp",
+                capability_states={
+                    "company.info.read": "observed",
+                    "documents.invoice.list": "observed",
+                },
+                external_server_name=" FlowAccount-Prod-MCP ",
+            )
+        ],
+    )
+
+    assert route["status"] == "ready"
+    assert route["ordered_steps"] == [
+        {
+            "step": 1,
+            "action": "invoke_provider_capability",
+            "capability": "company.read",
+            "provider_capabilities": ["company.info.read"],
+            "required": True,
+        },
+        {
+            "step": 2,
+            "action": "invoke_provider_capability",
+            "capability": "documents.invoice.list",
+            "provider_capabilities": ["documents.invoice.list"],
+            "required": False,
+        },
+    ]
+    assert route["host_tool_requirements"] == [
+        {
+            "connector_id": "flowaccount",
+            "external_server_name": "FlowAccount-Prod-MCP",
+            "provider_capabilities": [
+                "company.info.read",
+                "documents.invoice.list",
+            ],
+        }
+    ]
+    unavailable_optional = next(
+        item
+        for item in route["capability_resolution"]
+        if item["capability"] == "tax.vat.summary.read"
+    )
+    assert unavailable_optional["required"] is False
+    assert unavailable_optional["state"] == "provider_capability_unavailable"
 
 
 def test_local_bridge_skill_route_returns_exact_setup_handoff() -> None:

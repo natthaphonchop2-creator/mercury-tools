@@ -10,6 +10,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SkillConnectorId = Literal["flowaccount", "peak", "express", "custom", "generic_mcp"]
+SkillConnectionMode = Literal["native_mcp", "api_driver", "local_bridge"]
 SkillEnvironment = Literal[
     "production",
     "sandbox",
@@ -25,6 +26,7 @@ class _StrictSkillInput(BaseModel):
 
     query: str = Field(min_length=1, max_length=20_000)
     connector_id: SkillConnectorId | None = None
+    connection_mode: SkillConnectionMode | None = None
     environment: SkillEnvironment | None = None
     company_name: str | None = Field(default=None, max_length=500)
     notes: str | None = Field(default=None, max_length=10_000)
