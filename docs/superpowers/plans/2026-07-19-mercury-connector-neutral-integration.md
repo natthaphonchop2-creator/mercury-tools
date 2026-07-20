@@ -784,6 +784,10 @@ Catalog listing and schema discovery are workspace-independent closed reads.
 explicit top-level MCP argument; do not hide it as an optional field inside the
 skill-specific input payload. Add the two discovery tools and the revised run
 tool to Task 4's exact annotation matrix as closed reads.
+The common and Skill-specific envelopes must also expose `connection_mode` so a
+user can resolve two ready profiles for the same connector. `connector_id`,
+`connection_mode`, and `environment` together form the explicit routing
+selector; omitted dimensions may still produce `connector_selection_required`.
 
 - [ ] **Step 2: Run the routing tests and confirm generic Skills are FlowAccount-bound**
 
@@ -836,7 +840,8 @@ Provider-specific setup Skills may retain connector requirements. Normalized cap
 
 - [ ] **Step 4: Implement deterministic profile resolution**
 
-`resolve_skill_route(skill, profiles, requested_connector_id=None)` returns:
+`resolve_skill_route(skill, profiles, requested_connector_id=None,
+requested_connection_mode=None)` returns:
 
 ```json
 {
@@ -852,9 +857,11 @@ Provider-specific setup Skills may retain connector requirements. Normalized cap
 }
 ```
 
-Pass explicit `inputs.connector_id` into `requested_connector_id` and resolve it
-first. Otherwise select the single ready profile satisfying all required
-capabilities. If multiple profiles qualify, return
+Pass explicit `inputs.connector_id` and `inputs.connection_mode` into the
+matching routing selectors and resolve them first. Preserve the exact case of
+`external_server_name`; connector IDs, modes, and environments are normalized,
+but host MCP server identifiers are not. Otherwise select the single ready
+profile satisfying all required capabilities. If multiple profiles qualify, return
 `connector_selection_required` with sanitized choices rather than choosing a
 preferred vendor.
 
@@ -879,6 +886,19 @@ Each generic Skill must:
 - return an ordered host plan for provider MCP/API-driver/Local Bridge mode;
 - preserve citations, evidence requirements, accountant review points, and result schema; and
 - never claim Mercury owns Google, ecommerce, bank, or provider OAuth tokens.
+
+Branch exclusively on the returned route. A `native_mcp` branch invokes only
+the named provider tools, an `api_driver` branch follows only the advanced local
+handoff, and `local_bridge_required` stops for bridge setup. Do not place local
+credential or API-driver commands after the branch as unconditional steps.
+Include observed optional capabilities in native host steps, marked optional,
+so richer evidence can be gathered without turning them into hard requirements.
+
+The generic Skills target the hosted public MCP. The checked-in plugin launcher
+remains pinned to the prior local release until Task 9 deliberately switches it
+to the hosted HTTP MCP. Do not duplicate the hosted workspace contract into the
+advanced local server merely to make this intermediate branch installable;
+Task 9 must complete before plugin acceptance or release.
 
 - [ ] **Step 7: Run Skill tests**
 
