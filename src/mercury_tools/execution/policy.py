@@ -14,19 +14,46 @@ from mercury_tools.catalog.models import (
     RiskTier,
 )
 
-SENSITIVE_EFFECTS = frozenset(
-    {
-        "payment",
-        "approve",
-        "void",
-        "post",
-        "finalize",
-        "email",
-        "share",
-        "invite",
-        "delete",
-    }
-)
+SENSITIVE_EFFECT_ALIASES = {
+    "payment": "payment",
+    "payments": "payment",
+    "payment_processed": "payment",
+    "payments_processed": "payment",
+    "approve": "approve",
+    "approves": "approve",
+    "approve_document": "approve",
+    "approves_document": "approve",
+    "void": "void",
+    "voids": "void",
+    "void_document": "void",
+    "voids_document": "void",
+    "post": "post",
+    "posts": "post",
+    "post_journal": "post",
+    "posts_journal": "post",
+    "finalize": "finalize",
+    "finalizes": "finalize",
+    "finalize_document": "finalize",
+    "finalizes_document": "finalize",
+    "email": "email",
+    "emails": "email",
+    "send_email": "email",
+    "send_emails": "email",
+    "email_customer": "email",
+    "emails_customer": "email",
+    "share": "share",
+    "shares": "share",
+    "share_document": "share",
+    "shares_document": "share",
+    "invite": "invite",
+    "invites": "invite",
+    "invite_user": "invite",
+    "invites_user": "invite",
+    "delete": "delete",
+    "deletes": "delete",
+    "delete_document": "delete",
+    "deletes_document": "delete",
+}
 _EFFECT_TOKEN_PATTERN = re.compile(r"[A-Z]+(?=[A-Z][a-z]|[^A-Za-z]|$)|[A-Z]?[a-z]+|\d+")
 
 
@@ -97,8 +124,11 @@ def effective_risk(action: CatalogAction) -> RiskDecision:
 
 
 def _has_sensitive_effect(action: CatalogAction) -> bool:
-    return any(SENSITIVE_EFFECTS & _effect_tokens(effect) for effect in action.side_effects)
+    return any(_canonical_sensitive_effect(effect) is not None for effect in action.side_effects)
 
 
-def _effect_tokens(effect: str) -> frozenset[str]:
-    return frozenset(token.casefold() for token in _EFFECT_TOKEN_PATTERN.findall(effect))
+def _canonical_sensitive_effect(effect: str) -> str | None:
+    normalized_effect = "_".join(
+        token.casefold() for token in _EFFECT_TOKEN_PATTERN.findall(effect)
+    )
+    return SENSITIVE_EFFECT_ALIASES.get(normalized_effect)

@@ -60,18 +60,47 @@ def test_delete_requires_one_elevated_approval(action_factory) -> None:
 @pytest.mark.parametrize(
     "side_effect",
     [
-        "payment_processed",
-        "approve_document",
-        "void_document",
-        "post_journal",
-        "finalize_document",
-        "send_email",
-        "share_document",
-        "invite_user",
-        "delete_document",
+        "payment",
+        "payments",
+        "PaymentProcessed",
+        "payments-processed",
+        "approve",
+        "approves",
+        "ApproveDocument",
+        "approves-document",
+        "void",
+        "voids",
+        "VoidDocument",
+        "voids-document",
+        "post",
+        "posts",
+        "PostJournal",
+        "posts-journal",
+        "finalize",
+        "finalizes",
+        "FinalizeDocument",
+        "finalizes-document",
+        "email",
+        "emails",
+        "SendEmail",
+        "send-emails",
+        "EmailCustomer",
+        "emails-customer",
+        "share",
+        "shares",
+        "ShareDocument",
+        "shares-document",
+        "invite",
+        "invites",
+        "InviteUser",
+        "invites-user",
+        "delete",
+        "deletes",
+        "DeleteDocument",
+        "deletes-document",
     ],
 )
-def test_payment_post_void_email_and_share_are_sensitive(
+def test_sensitive_effect_aliases_are_elevated(
     action_factory,
     side_effect: str,
 ) -> None:
@@ -83,6 +112,26 @@ def test_payment_post_void_email_and_share_are_sensitive(
     assert decision.mutation_class is MutationClass.SENSITIVE
     assert decision.tier is RiskTier.HIGH_RISK
     assert decision.reasons == ("sensitive_side_effect",)
+
+
+@pytest.mark.parametrize(
+    "side_effect",
+    ["postpone", "shared_cache", "delete_preview"],
+)
+def test_non_sensitive_effects_with_sensitive_substrings_remain_standard(
+    action_factory,
+    side_effect: str,
+) -> None:
+    action = action_factory(side_effects=(side_effect,))
+
+    decision = effective_risk(action)
+
+    assert decision == RiskDecision(
+        tier=RiskTier.STANDARD_WRITE,
+        approval_level=ApprovalLevel.STANDARD,
+        mutation_class=MutationClass.CREATE,
+        reasons=(),
+    )
 
 
 @pytest.mark.parametrize(

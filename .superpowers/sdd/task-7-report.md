@@ -129,3 +129,56 @@ catalog, skill, plugin, audit, MCP, driver, manifest, and integration suites abo
 completed without failures. The v2 contract intentionally preserves the shipped
 `request_id TEXT PRIMARY KEY` declaration for migration compatibility; a future
 schema revision would be required to add an explicit `NOT NULL` declaration.
+
+## Sensitive Side-Effect Normalization Follow-Up
+
+### Scope
+
+Fixed the Task 7 policy edge case where the valid `CatalogAction` side effect
+`payments` was classified as a standard create because the policy recognized
+only the exact singular `payment`. Task 8 is not included.
+
+The checked-in FlowAccount and PEAK catalogs use `payment`, `approve`, `void`,
+`email`, `share`, `invite`, `delete`, and `writes_remote_data`. The existing
+Task 7 tests also establish `post` and `finalize` as elevated effects.
+
+### RED Evidence
+
+The initial matrix covered singular/plural effects plus case, camel-case, and
+separator-normalized spellings for payment, approve, void, post, finalize,
+email, share, invite, and delete. It also covered near matches that must remain
+standard:
+
+```text
+uv run pytest -q tests/test_execution_policy.py -k 'sensitive_effect_aliases_are_elevated or non_sensitive_effects_with_sensitive_substrings_remain_standard'
+19 failed, 20 passed, 11 deselected in 0.18s
+```
+
+Failures included all plural aliases such as `payments`, while
+`delete_preview` was incorrectly elevated by the previous token-intersection
+implementation. The adjacent request-store suite then exposed the established
+`email_customer` sensitive alias. Its camel-case and plural/separator variants
+were added test-first and failed as expected:
+
+```text
+uv run pytest -q tests/test_execution_policy.py -k 'sensitive_effect_aliases_are_elevated'
+2 failed, 36 passed, 14 deselected in 0.14s
+```
+
+### Fix
+
+`execution/policy.py` now canonicalizes each entire effect name to lowercase
+snake case, splitting camel-case and accepted separators. It then performs an
+explicit allowlist lookup from singular/plural aliases to canonical sensitive
+effects. This keeps intended aliases elevated without broad substring matching;
+`postpone`, `shared_cache`, and `delete_preview` remain standard creates.
+
+### GREEN Evidence
+
+```text
+uv run pytest -q tests/test_execution_policy.py -k 'sensitive_effect_aliases_are_elevated or non_sensitive_effects_with_sensitive_substrings_remain_standard'
+41 passed, 11 deselected in 0.12s
+
+uv run pytest -q tests/test_execution_policy.py tests/test_request_store.py tests/test_erp_executor.py tests/test_local_audit.py tests/test_builtin_action_catalog.py
+275 passed in 9.06s
+```
