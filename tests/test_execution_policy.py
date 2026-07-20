@@ -122,6 +122,33 @@ def test_sensitive_effect_aliases_are_elevated(
 @pytest.mark.parametrize(
     "side_effect",
     [
+        "ſhare",
+        "ſHARE",
+        "ſhares",
+        "ſhare_document",
+        "ſend_email",
+        "ſend-emails",
+    ],
+)
+def test_casefold_confusables_do_not_elevate_sensitive_aliases(
+    action_factory,
+    side_effect: str,
+) -> None:
+    action = action_factory(side_effects=(side_effect,))
+
+    decision = effective_risk(action)
+
+    assert decision == RiskDecision(
+        tier=RiskTier.STANDARD_WRITE,
+        approval_level=ApprovalLevel.STANDARD,
+        mutation_class=MutationClass.CREATE,
+        reasons=(),
+    )
+
+
+@pytest.mark.parametrize(
+    "side_effect",
+    [
         "postpone",
         "shared_cache",
         "delete_preview",

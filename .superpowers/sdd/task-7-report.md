@@ -318,3 +318,49 @@ uv run pytest -q tests/test_local_mcp_contract.py tests/test_local_mcp_roots.py 
 uv run ruff check .
 All checks passed!
 ```
+
+## Casefold Confusable Follow-Up
+
+### Scope
+
+Fixed only the Task 7 policy finding where a non-ASCII source effect such as
+`ſhare` casefolded into the ASCII sensitive alias `share`. Sensitive aliases
+remain ASCII-only at the source boundary, while mixed-case ASCII aliases and
+existing Unicode-affix negative controls remain unchanged. Task 8 is not
+included.
+
+### RED Evidence
+
+The new matrix covered the long-s casefold confusable across singular, plural,
+compound, and email aliases:
+
+```text
+uv run pytest -q tests/test_execution_policy.py -k 'casefold_confusables_do_not_elevate_sensitive_aliases'
+6 failed, 61 deselected in 0.15s
+```
+
+Every failure was an incorrect `HIGH_RISK` / `sensitive_side_effect`
+classification rather than a test error.
+
+### Fix
+
+`_canonical_sensitive_effect()` now rejects any non-ASCII source code point
+before casefolding. ASCII mixed-case aliases, supported separators, and the
+explicit sensitive alias allowlist continue through the existing normalization
+path.
+
+### GREEN Evidence
+
+```text
+uv run pytest -q tests/test_execution_policy.py
+67 passed in 0.16s
+
+uv run pytest -q tests/test_execution_policy.py tests/test_request_store.py tests/test_erp_executor.py tests/test_local_audit.py
+290 passed in 8.29s
+
+uv run ruff check .
+All checks passed!
+
+git diff --check
+exit 0 (no output)
+```

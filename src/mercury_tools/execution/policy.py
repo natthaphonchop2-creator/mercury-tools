@@ -134,6 +134,8 @@ def _has_sensitive_effect(action: CatalogAction) -> bool:
 
 
 def _canonical_sensitive_effect(effect: str) -> str | None:
+    if not effect.isascii():
+        return None
     casefolded_effect = effect.casefold().strip()
     tokens = _EFFECT_SEPARATOR_PATTERN.split(casefolded_effect)
     if not tokens or any(
