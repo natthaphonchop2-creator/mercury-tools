@@ -12,6 +12,7 @@ from mercury_tools.connectors.catalog import CONNECTOR_CATALOG
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_PLUGIN_VERSION = "0.3.0+codex.20260719"
 EXPECTED_RELEASE_TAG = "v0.3.0"
+EXPECTED_RELEASE_CONTROL_PIN = "eb73f0b0bf5754e29fec336958ed338985ea84e8"
 EXPECTED_VERSION = "0.3.0"
 EXPECTED_MIGRATION = "20260719120000"
 EXPECTED_HOSTED_TOOLS = {
@@ -104,12 +105,14 @@ def test_v030_release_identity_is_exact() -> None:
     package_version = _package_version()
     plugin_version = plugin.get("version")
     release_workflow_tag = workflow.get("env", {}).get("RELEASE_TAG")
+    release_control_pin = workflow.get("env", {}).get("RELEASE_CONTROL_PIN")
     latest_required_migration = _latest_required_migration()
 
     assert project_version == EXPECTED_VERSION
     assert package_version == EXPECTED_VERSION
     assert plugin_version == EXPECTED_PLUGIN_VERSION
     assert release_workflow_tag == EXPECTED_RELEASE_TAG
+    assert release_control_pin == EXPECTED_RELEASE_CONTROL_PIN
     assert latest_required_migration == EXPECTED_MIGRATION
 
 
