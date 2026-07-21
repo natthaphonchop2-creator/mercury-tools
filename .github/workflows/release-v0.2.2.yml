@@ -125,9 +125,17 @@ jobs:
         uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
         with:
           version: 0.11.9
-          enable-cache: true
+          enable-cache: false
+      - name: Set up Node.js 22.22.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.22.0
       - name: Install locked dependencies
         run: uv sync --extra dev --frozen
+      - name: Install Codex CLI 0.144.6
+        run: npm install -g @openai/codex@0.144.6 --no-audit --no-fund
+      - name: Verify Codex CLI
+        run: codex --version
       - name: Install pinned secret scanners
         env:
           GITLEAKS_URL: https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz
@@ -181,10 +189,14 @@ jobs:
           fi
           rm -f "$TRUFFLEHOG_REPORT"
           trap - EXIT
-      - name: Install Supabase CLI 2.109.1
-        uses: supabase/setup-cli@46f7f98c7f948ad727d22c1e67fab04c223a0520
-        with:
-          version: 2.109.1
+      - name: Install Supabase CLI 2.109.1 without persistent cache
+        run: |
+          set -euo pipefail
+          CLI_ROOT="$RUNNER_TEMP/mercury-supabase-cli"
+          npm install --prefix "$CLI_ROOT" --no-audit --no-fund --save-exact supabase@2.109.1
+          printf '%s\n' "$CLI_ROOT/node_modules/.bin" >>"$GITHUB_PATH"
+          INSTALLED_VERSION="$("$CLI_ROOT/node_modules/.bin/supabase" --version)"
+          test "$INSTALLED_VERSION" = "2.109.1"
       - name: Start ephemeral local Supabase
         run: bash scripts/start_ephemeral_supabase.sh
       - name: Run all quality and release tests
@@ -224,11 +236,19 @@ jobs:
         uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
         with:
           version: 0.11.9
-          enable-cache: true
-      - name: Install Supabase CLI 2.109.1
-        uses: supabase/setup-cli@46f7f98c7f948ad727d22c1e67fab04c223a0520
+          enable-cache: false
+      - name: Set up Node.js 22.22.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          version: 2.109.1
+          node-version: 22.22.0
+      - name: Install Supabase CLI 2.109.1 without persistent cache
+        run: |
+          set -euo pipefail
+          CLI_ROOT="$RUNNER_TEMP/mercury-supabase-cli"
+          npm install --prefix "$CLI_ROOT" --no-audit --no-fund --save-exact supabase@2.109.1
+          printf '%s\n' "$CLI_ROOT/node_modules/.bin" >>"$GITHUB_PATH"
+          INSTALLED_VERSION="$("$CLI_ROOT/node_modules/.bin/supabase" --version)"
+          test "$INSTALLED_VERSION" = "2.109.1"
       - name: Start ephemeral local Supabase
         run: bash scripts/start_ephemeral_supabase.sh
       - name: Verify migration on ephemeral local store
@@ -266,7 +286,7 @@ jobs:
         uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
         with:
           version: 0.11.9
-          enable-cache: true
+          enable-cache: false
       - name: Create exact PEAK contract report
         run: |
           set -euo pipefail
@@ -325,7 +345,7 @@ jobs:
         uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
         with:
           version: 0.11.9
-          enable-cache: true
+          enable-cache: false
       - name: Install locked release verifier
         run: uv sync --frozen --no-dev
       - name: Decode untrusted sanitized attestation transport
