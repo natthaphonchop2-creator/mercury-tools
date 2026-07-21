@@ -17,8 +17,8 @@ TRUFFLEHOG_SHA256 = "cddd1f602da61a130580883f4dd96b3d206efaf55a22068321cc11237fb
 PSYCOPG_VERSION = "3.2.10"
 PSYCOPG_SHA256 = "ab5caf09a9ec42e314a21f5216dbcceac528e0e05142e42eea83a3b28b320ac3"
 PSYCOPG_BINARY_SHA256 = "14bcbcac0cab465d88b2581e43ec01af4b01c9833e663f1352e05cb41be19e44"
-SUPABASE_SETUP_CLI_SHA = "46f7f98c7f948ad727d22c1e67fab04c223a0520"
 SUPABASE_CLI_VERSION = "2.109.1"
+SUPABASE_CLI_PACKAGE = f"supabase@{SUPABASE_CLI_VERSION}"
 LOCAL_SUPABASE_SCRIPT = ROOT / "scripts" / "start_ephemeral_supabase.sh"
 INSPECTOR_REQUIREMENTS = ROOT / "release-control" / "scaffold" / "requirements-inspector.txt"
 RELEASE_CONTROL_REQUIRED_CONTEXT = "Mercury release-control CI / required"
@@ -111,13 +111,26 @@ def _assert_ephemeral_local_supabase(job: dict[str, Any]) -> None:
     assert "secrets.SUPABASE_" not in serialized
     assert "MERCURY_SUPABASE_TEST_GUARD" not in serialized
 
+    assert "supabase/setup-cli@" not in serialized
     setup_steps = [
-        step
-        for step in job["steps"]
-        if step.get("uses") == f"supabase/setup-cli@{SUPABASE_SETUP_CLI_SHA}"
+        step for step in job["steps"] if SUPABASE_CLI_PACKAGE in step.get("run", "")
     ]
     assert len(setup_steps) == 1
-    assert setup_steps[0]["with"]["version"] == SUPABASE_CLI_VERSION
+    setup_command = setup_steps[0]["run"]
+    assert 'CLI_ROOT="$RUNNER_TEMP/mercury-supabase-cli"' in setup_command
+    assert 'npm install --prefix "$CLI_ROOT"' in setup_command
+    assert "--no-audit --no-fund --save-exact" in setup_command
+    assert '>>"$GITHUB_PATH"' in setup_command
+    assert f'test "$INSTALLED_VERSION" = "{SUPABASE_CLI_VERSION}"' in setup_command
+
+    node_steps = [
+        step
+        for step in job["steps"]
+        if step.get("uses") == f"actions/setup-node@{POST_PUBLIC_SETUP_NODE_SHA}"
+    ]
+    assert len(node_steps) == 1
+    assert node_steps[0]["with"]["node-version"] == POST_PUBLIC_NODE_VERSION
+    assert job["steps"].index(node_steps[0]) < job["steps"].index(setup_steps[0])
 
     assert "bash scripts/start_ephemeral_supabase.sh" in command
     assert "supabase stop --no-backup" in command
@@ -127,6 +140,31 @@ def _assert_ephemeral_local_supabase(job: dict[str, Any]) -> None:
     ]
     assert len(cleanup_steps) == 1
     assert cleanup_steps[0]["if"] == "always()"
+
+
+def _assert_pinned_codex_cli_before_tests(job: dict[str, Any]) -> None:
+    steps = job["steps"]
+    setup_node_steps = [
+        step
+        for step in steps
+        if step.get("uses") == f"actions/setup-node@{POST_PUBLIC_SETUP_NODE_SHA}"
+    ]
+    assert len(setup_node_steps) == 1
+    assert setup_node_steps[0]["with"]["node-version"] == POST_PUBLIC_NODE_VERSION
+
+    install_steps = [
+        step for step in steps if POST_PUBLIC_CODEX_PACKAGE in step.get("run", "")
+    ]
+    assert len(install_steps) == 1
+    assert "--no-audit --no-fund" in install_steps[0]["run"]
+
+    version_steps = [step for step in steps if step.get("run", "").strip() == "codex --version"]
+    assert len(version_steps) == 1
+    test_index = next(
+        index for index, step in enumerate(steps) if "uv run pytest" in step.get("run", "")
+    )
+    assert steps.index(setup_node_steps[0]) < steps.index(install_steps[0])
+    assert steps.index(install_steps[0]) < steps.index(version_steps[0]) < test_index
 
 
 def test_local_supabase_bootstrap_is_loopback_bound_and_exports_test_auth() -> None:
@@ -258,6 +296,7 @@ def test_ci_is_full_history_fail_closed_and_emits_exact_skip_junit() -> None:
     assert "uv build --wheel --sdist" in command
     assert "gitleaks dir" in command
     assert "trufflehog filesystem" in command
+    _assert_pinned_codex_cli_before_tests(test)
 
     public = payload["jobs"]["public"]
     assert public["if"] == "github.event_name == 'pull_request' || github.ref != 'refs/heads/main'"
@@ -266,6 +305,7 @@ def test_ci_is_full_history_fail_closed_and_emits_exact_skip_junit() -> None:
     assert "uv run pytest -q --ignore=tests/integration" in public_command
     assert "gitleaks git" in public_command
     assert "trufflehog git" in public_command
+    _assert_pinned_codex_cli_before_tests(public)
 
 
 def test_trusted_attestation_bootstraps_checksum_verified_inspector_dependencies() -> None:
@@ -501,6 +541,7 @@ def test_release_is_manual_sha_bound_and_handoff_depends_on_every_gate() -> None
     assert ACTIVE_TEST_WAIVERS in quality
     assert "test_flowaccount_sandbox_qualification.py" in quality
     assert "FLOWACCOUNT_SANDBOX_CLIENT_ID" not in json.dumps(jobs["quality-security"])
+    _assert_pinned_codex_cli_before_tests(jobs["quality-security"])
 
     _assert_ephemeral_local_supabase(jobs["supabase-migration"])
     migration = _run_text(jobs["supabase-migration"])

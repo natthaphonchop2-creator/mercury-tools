@@ -33,8 +33,19 @@ jobs:
           version: 0.11.9
           enable-cache: false
 
+      - name: Set up Node.js 22.22.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.22.0
+
       - name: Install locked dependencies
         run: uv sync --extra dev --frozen
+
+      - name: Install Codex CLI 0.144.6
+        run: npm install -g @openai/codex@0.144.6 --no-audit --no-fund
+
+      - name: Verify Codex CLI
+        run: codex --version
 
       - name: Install pinned secret scanners
         env:
@@ -91,10 +102,14 @@ jobs:
           rm -f "$TRUFFLEHOG_REPORT"
           trap - EXIT
 
-      - name: Install Supabase CLI 2.109.1
-        uses: supabase/setup-cli@46f7f98c7f948ad727d22c1e67fab04c223a0520
-        with:
-          version: 2.109.1
+      - name: Install Supabase CLI 2.109.1 without persistent cache
+        run: |
+          set -euo pipefail
+          CLI_ROOT="$RUNNER_TEMP/mercury-supabase-cli"
+          npm install --prefix "$CLI_ROOT" --no-audit --no-fund --save-exact supabase@2.109.1
+          printf '%s\n' "$CLI_ROOT/node_modules/.bin" >>"$GITHUB_PATH"
+          INSTALLED_VERSION="$("$CLI_ROOT/node_modules/.bin/supabase" --version)"
+          test "$INSTALLED_VERSION" = "2.109.1"
 
       - name: Start ephemeral local Supabase
         run: bash scripts/start_ephemeral_supabase.sh
@@ -167,8 +182,19 @@ jobs:
           version: 0.11.9
           enable-cache: false
 
+      - name: Set up Node.js 22.22.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.22.0
+
       - name: Install locked dependencies
         run: uv sync --extra dev --frozen
+
+      - name: Install Codex CLI 0.144.6
+        run: npm install -g @openai/codex@0.144.6 --no-audit --no-fund
+
+      - name: Verify Codex CLI
+        run: codex --version
 
       - name: Install pinned secret scanners
         env:

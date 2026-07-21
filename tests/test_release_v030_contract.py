@@ -159,3 +159,4 @@ def test_github_workflows_do_not_create_uninspectable_dependency_caches() -> Non
     for workflow_path in (ROOT / ".github/workflows").glob("*.yml"):
         source = workflow_path.read_text(encoding="utf-8")
         assert "enable-cache: true" not in source, workflow_path.name
+        assert "supabase/setup-cli@" not in source, workflow_path.name
