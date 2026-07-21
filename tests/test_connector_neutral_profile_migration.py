@@ -82,6 +82,11 @@ def test_capability_state_validator_has_explicit_function_security() -> None:
         in normalized
     )
     assert (
+        "revoke execute on function public.mercury_capability_states_are_safe(jsonb) "
+        "from anon, authenticated"
+        in normalized
+    )
+    assert (
         "grant execute on function public.mercury_capability_states_are_safe(jsonb) to service_role"
         in normalized
     )

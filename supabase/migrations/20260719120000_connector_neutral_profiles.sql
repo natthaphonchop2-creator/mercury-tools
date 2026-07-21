@@ -69,6 +69,7 @@ as $$
 $$;
 
 revoke execute on function public.mercury_capability_states_are_safe(jsonb) from public;
+revoke execute on function public.mercury_capability_states_are_safe(jsonb) from anon, authenticated;
 grant execute on function public.mercury_capability_states_are_safe(jsonb) to service_role;
 
 alter table public.mercury_connector_profiles
