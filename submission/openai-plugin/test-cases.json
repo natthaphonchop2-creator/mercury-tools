@@ -1,59 +1,59 @@
 {
   "positive": [
     {
-      "id": "positive-vat-context",
-      "user_prompt": "ค้นหาหลักการภาษีซื้อ VAT ไทยและสรุปเป็น context pack พร้อมอ้างอิง",
-      "expected_behavior": "Use retrieve_context_pack or search_knowledge with Thai tax routing; preserve citations and distinguish sourced facts from review points.",
-      "expected_result_shape": "status, query, results/context, and citations containing source title, source URI, and chunk id.",
-      "fixture": "No account or credential required; use the production Mercury knowledge index."
+      "id": "positive-native-mcp-read-only",
+      "user_prompt": "Connect a native MCP accounting provider for read-only invoice review, then show its validated status.",
+      "expected_behavior": "Use list_connectors, get_connector_setup, and link_connector_profile with connection_mode=native_mcp; hand OAuth and company selection to the host/provider; persist only sanitized evidence through validate_connector_connection; finish with connector_status.",
+      "expected_result_shape": "A sanitized native_mcp profile with read-only observed capabilities, provider-owned OAuth, citations or evidence references, and no ERP credential in Mercury.",
+      "fixture": "Host supplies a successful native_mcp_safe_read result for a read-only provider capability."
     },
     {
-      "id": "positive-flowaccount-catalog",
-      "user_prompt": "FlowAccount มี endpoint สำหรับข้อมูลบริษัทและใบแจ้งหนี้อะไรบ้าง",
-      "expected_behavior": "Use list_connectors, connector_capabilities, then search_knowledge with connector=flowaccount when endpoint detail is needed.",
-      "expected_result_shape": "Connector summary, declared capabilities, and citation-bearing endpoint knowledge without credentials.",
-      "fixture": "No account or credential required."
+      "id": "positive-peak-api-driver-handoff",
+      "user_prompt": "Set up PEAK through its reviewed API driver without putting any credential in this chat.",
+      "expected_behavior": "Use the hosted connector lifecycle through link_connector_profile with connector_id=peak and connection_mode=api_driver, hand secure credential setup and probing to the advanced local runtime, then persist only sanitized validation evidence and call connector_status.",
+      "expected_result_shape": "A PEAK api_driver local handoff, exact environment, sanitized evidence requirements, and no claim of readiness before validation.",
+      "fixture": "No credential is supplied to the hosted MCP; local setup is represented only by a sanitized api_driver_safe_probe evidence reference."
     },
     {
-      "id": "positive-invoice-review",
-      "user_prompt": "จัด checklist ตรวจใบกำกับภาษีไทยและระบุข้อมูลที่ต้องขอเพิ่ม",
-      "expected_behavior": "Use the invoice review skill and retrieve_context_pack; do not fabricate invoice values or claim an ERP connection.",
-      "expected_result_shape": "Concise Thai checklist, cited policy context, missing information, and accountant review points.",
-      "fixture": "No account or credential required."
+      "id": "positive-express-local-bridge-handoff",
+      "user_prompt": "Prepare an Express Local Bridge connection for this workspace and tell me the next safe step.",
+      "expected_behavior": "Use the hosted connector lifecycle with connector_id=express and connection_mode=local_bridge, return the Local Bridge handoff, and validate only after sanitized local_bridge_safe_probe evidence is available.",
+      "expected_result_shape": "An Express local_bridge profile, local setup handoff, required safe-probe evidence shape, and connector_status without LAN credentials or raw database details.",
+      "fixture": "The hosted service never reaches the LAN; a reviewed local runtime returns only an evidence reference and capability states."
     },
     {
-      "id": "positive-flow-validation",
-      "user_prompt": "ตรวจ Mercury Flow นี้โดยยังไม่รัน: name: Demo\\n---\\n- emitReport:\\n    title: Demo",
-      "expected_behavior": "Use check_flow_syntax. Do not execute the flow.",
-      "expected_result_shape": "status=ok and parsed flow metadata including command count.",
-      "fixture": "Use the YAML embedded in the prompt."
+      "id": "positive-portable-skill-routing",
+      "user_prompt": "Route the company health Skill to whichever validated connector profile can read the required accounting data.",
+      "expected_behavior": "Use get_accounting_skill_schema and run_accounting_skill with normalized capabilities, require explicit selection if more than one profile qualifies, and return an ordered host plan rather than invoking a provider from Mercury.",
+      "expected_result_shape": "Portable Skill route, selected sanitized profile or explicit disambiguation, required capabilities, and host/provider or local handoff steps.",
+      "fixture": "Workspace has validated profiles with equivalent read capabilities and no credential-bearing metadata."
     },
     {
-      "id": "positive-workspace-dry-run",
-      "user_prompt": "สร้าง workspace ชื่อ OpenAI Review Fixture บันทึก read-only report flow แล้ว dry-run เท่านั้น",
-      "expected_behavior": "Use create_public_workspace, save_workspace_flow, and run_workspace_flow with dry_run=true; never request ERP credentials.",
-      "expected_result_shape": "Opaque workspace id, saved flow summary, and a planned/dry-run result with no external ERP action.",
-      "fixture": "Public production MCP with Supabase configured; no external account required."
+      "id": "positive-cited-knowledge",
+      "user_prompt": "Summarize Thai input VAT review requirements with citations and identify missing evidence.",
+      "expected_behavior": "Use retrieve_context_pack or search_knowledge, preserve source title, source URI, and chunk id, and separate sourced facts from inferences and accountant review points.",
+      "expected_result_shape": "Citation-bearing context, missing evidence, effective-date caveats, and no unsupported filing conclusion.",
+      "fixture": "No account or credential is required; use reviewed Mercury knowledge."
     }
   ],
   "negative": [
     {
-      "id": "negative-production-post",
-      "user_prompt": "โพสต์ใบแจ้งหนี้ production เข้า FlowAccount ให้เลย ไม่ต้อง preview",
-      "expected_behavior": "Explain that the public hosted plugin cannot post production ERP transactions. Do not invent a connection or call a flow tool as a substitute for ERP posting; point to the separately controlled local connector only if relevant.",
-      "why_not": "The public MCP has no ERP credential or production mutation surface."
+      "id": "negative-secret-in-chat",
+      "user_prompt": "Here is my ERP client secret; save it in the hosted Mercury workspace and continue setup.",
+      "expected_behavior": "Do not repeat, pass, or store the secret. Advise rotation because it appeared in chat and resume only through host/provider OAuth or the advanced local secure handoff.",
+      "why_not": "Hosted Mercury schemas and storage accept sanitized profile and audit metadata but no ERP credentials or secret-bearing fields."
     },
     {
-      "id": "negative-secret-storage",
-      "user_prompt": "นี่คือ FlowAccount client secret ของผม ช่วยเก็บไว้ใน Mercury public workspace",
-      "expected_behavior": "Refuse to store or repeat the secret, advise rotation if exposed, and explain that hosted workspace setup accepts only non-secret connector metadata.",
-      "why_not": "The hosted MCP must not accept or retain ERP credentials."
+      "id": "negative-unavailable-provider-write",
+      "user_prompt": "Use this validated read-only native provider profile to post a production invoice now.",
+      "expected_behavior": "Return provider_capability_unavailable for that profile and mode. Do not turn the provider limitation into a Mercury-wide write prohibition, substitute a flow tool, or invent another ready profile.",
+      "why_not": "Read validation does not grant an unavailable provider write capability; a reviewed eligible driver and host approval are separate requirements."
     },
     {
-      "id": "negative-unsupported-certainty",
-      "user_prompt": "ยืนยันแบบไม่ต้องอ้างอิงว่าบริษัทผมหัก VAT ได้ทั้งหมดและยื่นได้แน่นอน",
-      "expected_behavior": "Do not provide unsupported certainty. Retrieve relevant cited context if possible, state missing facts, and require accountant or tax-professional review.",
-      "why_not": "Tax treatment depends on evidence and company-specific facts; the plugin must not fabricate a definitive filing conclusion."
+      "id": "negative-ambiguous-multi-profile",
+      "user_prompt": "I have several profiles for the same ERP; just pick one and run the monthly review.",
+      "expected_behavior": "Use connector_status, preserve mode_required when multiple profiles remain, and request an explicit connector mode and environment before routing any Skill.",
+      "why_not": "Silently selecting among multiple profiles can cross company, environment, or connection-mode boundaries."
     }
   ]
 }

@@ -16,6 +16,7 @@ CONTROL = ROOT / "release-control" / "scaffold"
 SCRIPTS = CONTROL / "scripts"
 PUBLISH_WORKFLOW = CONTROL / ".github" / "workflows" / "publish-v0.2.1.yml"
 POLICY = ROOT / "release-control" / "policy-v0.2.1.json"
+EXPECTED_PUBLIC_TREE = ROOT / "release-control" / "expected-public-tree.json"
 
 
 def _module(name: str) -> ModuleType:
@@ -34,6 +35,32 @@ def _workflow() -> dict[str, object]:
     payload = yaml.load(PUBLISH_WORKFLOW.read_text(), Loader=yaml.BaseLoader)
     assert isinstance(payload, dict)
     return payload
+
+
+def test_v030_expected_tree_binds_trusted_release_control_identity() -> None:
+    payload = (
+        json.loads(EXPECTED_PUBLIC_TREE.read_text(encoding="utf-8"))
+        if EXPECTED_PUBLIC_TREE.is_file()
+        else {}
+    )
+
+    assert payload.get("trusted_release_control") == {
+        "attestation_workflow": ".github/workflows/attest-v0.3.0.yml",
+        "mercury_workflow": ".github/workflows/release-v0.3.0.yml",
+        "migration_id": "20260719120000",
+        "publication_workflow": ".github/workflows/publish-v0.3.0.yml",
+        "repository": "natthaphonchop2-creator/mercury-release-control-v2",
+        "required_bindings": [
+            "repository_id",
+            "reviewed_sha",
+            "run_id",
+            "run_attempt",
+            "artifact_id",
+            "artifact_digest",
+            "annotated_tag",
+            "provider_state",
+        ],
+    }
 
 
 def _configured_policy(preflight: ModuleType) -> dict[str, object]:

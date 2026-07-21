@@ -1,205 +1,284 @@
-# Task 10 Report: Preview State Store and Local Audit Ledger
+# Task 10 Report: MCP Review Linter Edge-Case Fix
 
 ## Status
 
-Complete. Task 10 adds repository-local write preview state, replay protection,
-and an append-only local audit ledger without adding network execution.
+Edge-case follow-up from `447fe0d`. The hosted MCP review linter now rejects
+non-empty `patternProperties`, uses exact normalized credential-name tokens,
+and traverses RFC 6901 local pointers through mappings and sequences. Task 11
+version and release identity files remain unchanged.
+
+The current 24 hosted tools still report exactly:
+
+```text
+Mercury MCP review: 0 unclear arguments; annotations verified
+```
+
+This follow-up adds `api token` to the credential-field grammar in both
+normalized sequence and compact `apitoken` form. Exact metadata semantics keep
+`api_token_count`, `token_budget`, and `api_latency` allowed.
 
 ## TDD Evidence
 
-1. Initial RED: `uv run pytest tests/test_request_store.py tests/test_local_audit.py -q`
-   failed during collection because `mercury_tools.execution.models` and
-   `mercury_tools.local.audit` did not exist.
-2. Security RED: public summary and audit response tests failed before their
-   business-value redaction boundaries were added.
-3. Permission RED: an existing JSONL audit file retained mode `0644` before
-   constructor-side no-follow `fchmod(0600)` enforcement was added.
+### Baseline
 
-## Delivered
+Before adding the hardening mutations:
 
-- Immutable `PreparedRequest` previews with deterministic canonical hashes,
-  exact 15-minute UTC TTLs, safe public summaries, and auth attachment only at
-  HTTPX rendering time.
-- SQLite request state machine using WAL, `BEGIN IMMEDIATE` for every state
-  transition, explicit allowed states, durable expiry invalidation, and a
-  replay-blocking partial unique index for executing/succeeded/outcome-unknown
-  hashes.
-- Append-only audit JSONL with opaque IDs, canonical redaction plus personal
-  data/provider-record filtering, no request inputs, no-follow path handling,
-  mode `0600`, and `fsync` per event.
-- Credential clear now invalidates matching/all pending previews and removes
-  matching/all non-secret validation metadata while preserving connector config
-  and existing safe CLI output.
+```text
+uv run pytest -q tests/test_mcp_review_contract.py
+17 passed
+```
 
-## Self Review
+### RED
 
-- Transactions roll back on all raised state errors; no transition retries.
-- `BEGIN IMMEDIATE`, application replay checks, and the partial unique index
-  serialize competing process transitions and agree on replay-blocking states.
-- SQLite cache paths reject symlink/non-directory components; audit accesses
-  use parent directory descriptors with `O_NOFOLLOW`.
-- Stored JSON tampering returns payload-free errors; audit JSON tampering is
-  re-sanitized on read. All timestamps are timezone-aware UTC.
-- Repr, public summaries, validation errors, audit rows, and CLI clear output
-  exclude raw request inputs, credentials, and personal/provider values.
+The adversarial tests were added before the linter and ZIP implementation
+changes:
 
-## Verification
+```text
+uv run pytest -q tests/test_mcp_review_contract.py tests/test_openai_plugin_submission.py
+24 failed, 30 passed
+```
 
-- `uv run pytest tests/test_request_store.py tests/test_local_audit.py tests/test_redaction.py tests/test_credential_cli.py -q` -> `55 passed`
-- `uv run pytest -q -m 'not integration'` -> `962 passed, 1 deselected, 1 warning`
-- `uv run ruff check .` -> passed
-- `git diff --check` -> passed
+The failures reproduced empty and non-object roots, unconstrained nested
+schemas and alternatives, incomplete local reference traversal, cycles,
+incorrect composition guarantees, drifting workspace scope, and platform
+dependent `ZipInfo` defaults.
 
-## Review Fix Wave
+### GREEN
 
-### RED Evidence
+```text
+uv run pytest -q tests/test_mcp_review_contract.py tests/test_openai_plugin_submission.py
+55 passed
 
-1. `uv run pytest tests/test_request_store.py tests/test_local_audit.py tests/test_credential_cli.py tests/test_redaction.py tests/test_local_repository.py -q`
-   -> `42 failed, 191 passed`. Failures reproduced missing canonical binding and
-   revalidation, exact TTL enforcement, PREVIEWED transition, credential-clear
-   ordering, strict dynamic-key handling, SQLite path hardening, and bounded
-   audit scans.
-2. `uv run pytest tests/test_local_audit.py::test_audit_ledger_strict_allowlists_drop_dynamic_keys -q`
-   -> `1 failed`, proving an allowlisted field could still carry a sensitive
-   nested JSON key before scalar enforcement.
-3. `uv run pytest tests/test_request_store.py::test_public_summary_drops_sensitive_values_encoded_as_dynamic_keys -q`
-   -> `1 failed`, proving camel-cased personal values and opaque provider IDs
-   could remain visible as summary keys.
+uv run --extra dev pytest -q tests/test_plugin_package.py tests/test_plugin_clean_install.py
+81 passed
 
-### GREEN Evidence
+uv run pytest -q tests/test_mcp_contract.py
+69 passed
+```
 
-- Focused: `uv run pytest tests/test_request_store.py tests/test_local_audit.py tests/test_audit.py tests/test_credential_cli.py tests/test_redaction.py tests/test_local_repository.py -q`
-  -> `236 passed in 0.87s`.
-- Full non-integration: `uv run pytest -q -m 'not integration'`
-  -> `1007 passed, 1 deselected, 1 warning in 2.41s`.
-- Ruff: `uv run ruff check .` -> `All checks passed!`.
-- Diff check: `git diff --check` -> passed with no output.
+### Edge-Case Follow-Up TDD
 
-### Review Fixes Delivered
+The mutation tests were added before changing the linter:
 
-- Canonical ten-field request bindings are recomputed and constant-time checked
-  at template creation and every model/SQLite validation, after catalog identity,
-  method, and effective-risk-floor validation.
-- Exact normalized 15-minute TTLs and the explicit transactional
-  `previewed -> awaiting_confirmation` transition are enforced.
-- Credential clearing now invalidates previews, clears validation metadata, and
-  deletes secrets in that order, with injected-failure coverage for every step.
-- Public summaries and audit rows drop sensitive/dynamic keys; audit top-level
-  and response fields are strict allowlists with scalar-only retained values.
-- SQLite cache/database/sidecars enforce owner, mode, type, link-count, no-follow,
-  and retained-descriptor identity checks around WAL connections.
-- Audit lookup streams with 64 KiB line, 8 MiB byte, and 100,000-line scan caps
-  and does not return an early match from a ledger that later exceeds a bound.
+```text
+uv run pytest -q tests/test_mcp_review_contract.py
+22 failed, 60 passed
+```
 
-## Final Hardening Wave
+The failures showed ignored root and nested `patternProperties`, unsupported
+array-index JSON pointers, imprecise pointer findings, and both false-negative
+and false-positive credential name handling.
 
-### RED Evidence
+After the linter change:
 
-1. `uv run pytest tests/test_request_store.py -q` -> `11 failed, 48 passed`.
-   Static and dynamic action paths were trusted, unsafe path parameters were not
-   rejected, no safe target was exposed, and heuristic public-summary keys
-   remained visible.
-2. `uv run pytest tests/test_operation_lock.py tests/test_credential_cli.py -q`
-   failed during collection because the repository operation-lock module did not
-   exist. The added forked-process interleaving tests exercise clear versus
-   preview readiness and credential save versus clear.
-3. `uv run pytest tests/test_local_audit.py -q` -> `15 failed, 5 passed`.
-   Known-field cycles recursed, field values were weakly typed, duplicate IDs
-   used last-row-wins behavior, no event index existed, and ledgers beyond 8 MiB
-   were unavailable.
-4. The response-list allowlist regression test failed once before nested lists
-   retained the response-summary allowlist instead of falling back to preview
-   keys.
+```text
+uv run pytest -q tests/test_mcp_review_contract.py
+83 passed
 
-### GREEN Evidence
+uv run pytest -q tests/test_mcp_review_contract.py tests/test_openai_plugin_submission.py
+93 passed
+```
 
-- Focused request/audit/credential/lock/repository/redaction suite:
-  `uv run pytest tests/test_request_store.py tests/test_local_audit.py tests/test_audit.py tests/test_local_credentials.py tests/test_credential_cli.py tests/test_connector_setup.py tests/test_operation_lock.py tests/test_local_repository.py tests/test_redaction.py -q`
-  -> `344 passed`.
-- Full non-integration: `uv run pytest -q -m 'not integration'`
-  -> `1035 passed, 1 deselected, 1 warning`.
-- Ruff: `uv run ruff check .` -> `All checks passed!`.
-- Diff check: `git diff --check` -> passed with no output.
+### API Token Follow-Up TDD
 
-### Final Hardening Delivered
+The API-token rejection and metadata-control cases were added before changing
+the grammar:
 
-- Structured segment renderer binds the verified final path to the catalog
-  template and exact path-parameter set, rejects encoded traversal and path
-  ambiguity, and exposes only the action template as the public target.
-- Fixed preview and response structural allowlists replace runtime key
-  heuristics at every depth.
-- One owner-only, no-follow repository operation lock serializes request-store
-  mutations and credential setup/clear operations with process/thread
-  reentrancy and a portable fallback.
-- Audit fields now have bounded field-specific validation before scalar
-  redaction; unknown values are never traversed and artifact paths retain only
-  opaque Mercury references.
-- The append-only JSONL ledger now has an owner-only SQLite event index with
-  row hashes, byte offsets, ledger fingerprints, streaming stale-index rebuild,
-  duplicate detection, and exact bounded lookup beyond the former 8 MiB cap.
+```text
+uv run pytest -q tests/test_mcp_review_contract.py
+5 failed, 85 passed
+```
 
-## External Review Final Correction
+The failures were the five requested spellings: `apiToken`, `api_token`,
+`api-token`, `api token`, and `APITOKEN`.
 
-### Changed Files
+After adding the compact token, token sequence, and exact metadata exception:
 
-- `src/mercury_tools/execution/store.py`
-- `src/mercury_tools/local/audit.py`
-- `src/mercury_tools/local/credential_cli.py`
-- `src/mercury_tools/local/credentials.py`
-- `tests/test_request_store.py`
-- `tests/test_local_audit.py`
-- `tests/test_credential_cli.py`
-- `.superpowers/sdd/task-10-report.md`
+```text
+uv run pytest -q tests/test_mcp_review_contract.py
+90 passed
+```
 
-### RED Evidence
+## Linter Hardening
 
-1. Adversarial review suite:
-   `uv run pytest tests/test_request_store.py::test_create_preview_requires_catalog_action_provenance tests/test_request_store.py::test_create_preview_rejects_self_consistent_forged_catalog_binding tests/test_request_store.py::test_create_preview_recomputes_exact_effective_catalog_risk tests/test_local_audit.py::test_audit_ledger_redacts_unknown_semantic_values_in_allowlisted_fields tests/test_local_audit.py::test_repeated_get_keeps_ledger_fingerprint_and_does_not_rebuild tests/test_local_audit.py::test_audit_ledger_recovers_malformed_sqlite_index_from_jsonl tests/test_local_audit.py::test_audit_index_miss_for_present_event_forces_one_rebuild tests/test_local_audit.py::test_audit_ledger_recovers_malicious_index_coordinates_and_hashes tests/test_local_audit.py::test_audit_ledger_non_fcntl_fallback_serializes_cross_process_writers tests/test_credential_cli.py::test_credentials_test_does_not_restore_validation_after_concurrent_clear -q`
-   -> `8 failed, 4 passed in 0.71s`. Failures proved that a bare/forged
-   `PreparedRequest` was accepted, unknown allowlisted values leaked, repeated
-   `get` changed ctime, malformed SQLite was fatal, the non-`fcntl` path did not
-   serialize writers, and a completed probe restored validation after clear.
-2. Isolated current-metadata index checks with same-mode chmod neutralized:
-   `uv run pytest tests/test_local_audit.py::test_audit_index_miss_for_present_event_forces_one_rebuild tests/test_local_audit.py::test_audit_ledger_recovers_malicious_index_coordinates_and_hashes -q`
-   -> `4 failed in 0.22s`. The miss returned `None`; malicious offsets, lengths,
-   and hashes raised `audit_index_corrupt` instead of rebuilding from JSONL.
+- Root `inputSchema` must resolve to an object-only accepting branch with
+  `additionalProperties=false`. Strict no-argument object roots remain valid.
+- Every nested property and array item branch must resolve to a concrete type,
+  enum, or const. Empty schemas no longer pass silently.
+- Non-empty `patternProperties` fail closed at the root and nested objects,
+  regardless of `propertyNames`, `unevaluatedProperties`, or the matched value
+  schema. An empty mapping remains valid because it cannot introduce a key.
+- Credential names use normalized identifier tokens, splitting camelCase,
+  snake_case, kebab-case, and spaces. Exact credential tokens and compounds are
+  rejected while names such as `secretariat`, `token_budget`, `api_latency`,
+  `api_token_count`, and `password_policy` remain valid metadata.
+- Local JSON pointers resolve through mappings and sequences, including escaped
+  `~0` and `~1` components and nonnegative array indexes. Invalid, unresolved,
+  out-of-range, cyclic, over-depth, external, and over-expanded references fail
+  with the tool name and use-site schema path.
+- `anyOf` and `oneOf` are reviewed per accepting branch. A strict branch cannot
+  hide an unconstrained or open branch.
+- `allOf` is treated as an intersection. Type, property, required,
+  `additionalProperties`, item, maximum, and enum guarantees can be supplied by
+  separate members while nested schemas remain reviewable.
+- Objects and arrays are traversed through references and compositions.
+  Environment enums, bounded typed arrays, root source conflicts, and
+  credential-bearing field names retain their existing checks.
+- Findings are stable and actionable, for example
+  `tool.profile.anyOf[1].field` and `tool.filters.$ref`.
 
-### Final Correction Delivered
+## Behavior Matrix
 
-- `LocalRequestStore.create_preview` now requires a revalidated `CatalogAction`
-  and verifies action/version/connector/environment/method/template/rendered
-  path plus the exact recomputed effective risk before SQLite insertion.
-- Audit hardening only calls `fchmod` when mode differs and fingerprints the
-  post-hardening descriptor state. The versioned derivative index validates
-  completeness metadata, event count, byte coverage, row boundaries, hashes,
-  and event identity; it performs one bounded JSONL rebuild on misses or bad
-  coordinates and securely recreates malformed/legacy SQLite under the ledger
-  lock. Duplicate JSONL event IDs remain stable ledger corruption, with no
-  total-ledger scan ceiling.
-- Audit event, failure, state, status, error, outcome, and provider strings now
-  use fixed operational classifications and redact unknown values.
-- The audit ledger uses an owner-only atomic guard-directory process lock when
-  `fcntl` is unavailable.
-- Credential probes capture a keyed, in-memory credential generation snapshot
-  before network I/O, then re-read and compare it under the repository lock
-  before persisting validation. Cleared or changed credentials make the probe
-  result stale; generation material is neither persisted nor printed.
+`BEHAVIOR_MATRIX` now stores one mandatory `ToolBehavior` record per hosted
+tool. Each record contains the four annotation expectations and
+`requires_workspace`. The separate workspace-scoped tool registry was removed.
 
-### Final Verification
+Mutation coverage adds a future matrix entry with `requires_workspace=true`
+and proves that a schema without required `workspace_id` fails. Annotation and
+workspace schema checks therefore consume the same metadata entry.
 
-- Focused Task-10 suite:
-  `uv run pytest tests/test_request_store.py tests/test_local_audit.py tests/test_audit.py tests/test_credential_cli.py tests/test_local_credentials.py tests/test_operation_lock.py tests/test_redaction.py tests/test_local_repository.py -q`
-  -> `329 passed in 2.96s`.
-- Full non-integration: `uv run pytest -q -m 'not integration'`
-  -> `1047 passed, 1 deselected, 1 warning in 4.49s`.
-- Ruff: `uv run ruff check .` -> `All checks passed!`.
-- Diff check: `git diff --check` -> passed with no output.
-- Scope review: only Task-10-owned source/tests and this report changed; no
-  Task 11 executor or network-dispatch implementation was added.
+## Mutation Coverage
 
-### Commit And Concerns
+Committed tests cover:
 
-- Implementation commit: `cacc681` (`fix: complete Task 10 boundary hardening`).
-- Concern: the full suite retains the pre-existing Starlette `httpx`
-  deprecation warning in `tests/test_connector_mcp_tools.py`; no Task-10 test or
-  lint failures remain.
+- empty, descriptive-only, non-object, nullable-object, and non-schema roots;
+- empty nested schemas and open or unnamed nested objects;
+- `$defs`, `definitions`, unresolved constraints, cyclic refs, and ref depth;
+- root and nested `patternProperties` with empty and constrained `.*` schemas,
+  plus `propertyNames` and `unevaluatedProperties` interactions;
+- RFC 6901 sequence traversal through `#/$defs/Choice/anyOf/0`, escaped
+  components, invalid and out-of-range indexes, and external references;
+- `anyOf`, `oneOf`, and intersection-correct `allOf` behavior;
+- scalar environment enums in every accepting alternative;
+- typed array items, finite `maxItems`, refs, and split `allOf` guarantees;
+- root extra keys and mutually exclusive source fields across compositions;
+- credential token matrices covering password/passwd/passphrase, secret,
+  API key, access/refresh/bearer token, private key, client secret, safe
+  metadata names, and direct or referenced field paths;
+- missing and incorrect annotations; and
+- current and future workspace metadata.
+
+Every negative assertion requires a finding prefixed by the tool name and exact
+schema path.
+
+## Deterministic Bundle
+
+The builder now sets all cross-platform ZIP metadata that can affect bytes:
+
+```text
+timestamp       (2026, 7, 17, 0, 0, 0)
+create_system   3 (Unix)
+create_version  20
+extract_version 20
+flag_bits       0
+volume          0
+internal_attr   0
+mode            0100644
+compression     deflate, level 9
+archive comment empty
+entry extra/comment/reserved empty/empty/0
+```
+
+Tests monkeypatch `ZipInfo` with simulated Windows/platform defaults, old/new
+version fields, alternate attributes, comments, extras, and compression level.
+The rebuilt archive remains byte-identical to the normal build. Entry order,
+content, timestamp, mode, comments, and extras are inspected directly.
+
+Two fresh independent bundles produced:
+
+```text
+first  sha256 7350346eee6d636467006be4fc67045387e3f08811cf0b603150f309acbee64f
+second sha256 7350346eee6d636467006be4fc67045387e3f08811cf0b603150f309acbee64f
+byte-identical true
+```
+
+## Edge-Case Follow-Up Verification
+
+```text
+uv run python scripts/review_mcp_contract.py
+Mercury MCP review: 0 unclear arguments; annotations verified
+
+uv run --extra dev pytest -q tests/test_plugin_package.py tests/test_plugin_clean_install.py
+81 passed
+
+uv run --extra dev ruff check .
+All checks passed!
+
+git diff --check
+no output; exit 0
+
+Gitleaks 8.24.3, checksum-verified Darwin arm64 binary, Task 10 working-tree diff
+no leaks found
+```
+
+## API Token Follow-Up Verification
+
+```text
+uv run pytest -q tests/test_mcp_review_contract.py tests/test_openai_plugin_submission.py
+100 passed
+
+uv run python scripts/review_mcp_contract.py
+Mercury MCP review: 0 unclear arguments; annotations verified
+
+uv run --extra dev ruff check .
+All checks passed!
+
+git diff --check
+no output; exit 0
+```
+
+## Scope
+
+- No hosted-tool exception or schema allowlist was added.
+- No existing check was weakened.
+- Submission copy, public Skills, hosted server behavior, and Task 9 packaging
+  remain unchanged.
+- Task 11 and `pyproject.toml` remain untouched.
+
+## Compact Credential Alias Follow-Up
+
+The compact credential aliases are now derived from
+`_CREDENTIAL_TOKEN_SEQUENCES` by joining each canonical sequence. This keeps
+single-token credentials such as `password`, `passwd`, and `passphrase`
+explicit while ensuring every canonical multi-token sequence rejects its
+snake, kebab, space, camel, Pascal, compact, and uppercase forms. Compact
+matches remain exact normalized tokens, so longer unrelated words are allowed.
+
+### TDD Evidence
+
+After adding parameterized cases generated from the sequence table and compact
+false-positive controls, before the implementation change:
+
+```text
+uv run pytest -q tests/test_mcp_review_contract.py
+2 failed, 194 passed
+```
+
+After deriving compact aliases from the canonical sequence table:
+
+```text
+uv run pytest -q tests/test_mcp_review_contract.py
+204 passed
+
+uv run pytest -q tests/test_mcp_review_contract.py tests/test_openai_plugin_submission.py
+214 passed
+```
+
+### Verification
+
+```text
+uv run python scripts/review_mcp_contract.py
+Mercury MCP review: 0 unclear arguments; annotations verified
+
+uv run --extra dev ruff check .
+All checks passed!
+
+git diff --check
+no output; exit 0
+```
+
+### Scope
+
+- Credential compact detection now has one canonical source of truth.
+- Parameterized sequence-form and longer-word control coverage was added.
+- No hosted tool, schema, annotation, submission, or release behavior changed.

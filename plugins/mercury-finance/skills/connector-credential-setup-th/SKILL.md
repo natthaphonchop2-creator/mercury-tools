@@ -5,18 +5,21 @@ description: Use when an accounting or ERP task is blocked because local connect
 
 # Connector Credential Setup TH
 
-Use this gate without skipping or reordering:
+Use the hosted connector lifecycle without skipping or reordering:
 
-1. Call `credential_status` for the active repository, connector, and environment.
-2. If required credentials are missing, stop. Instruct the user to run locally:
-   `mercury credentials setup <connector> --env <environment> --repo-root "<repo>"`
-3. After the user confirms setup is complete, call `credential_status` again.
-4. If it is still missing or not configured, stop and return to local setup. Do not run
-   the connection test.
-5. Only when the second status is configured, ask the user to run locally:
-   `mercury credentials test <connector> --env <environment> --repo-root "<repo>"`
-6. Continue only when the test reports `connected`.
+1. Call `list_connectors` and ask the user to select one exact connector, connection
+   mode, and environment. Do not choose a provider or environment implicitly.
+2. Call `get_connector_setup` for that exact connector and connection mode. Follow only
+   the returned non-secret setup guidance and provider authorization ownership.
+3. After the user has completed the provider or host authorization outside Mercury,
+   call `link_connector_profile` with only the sanitized connector selection and profile
+   details required by the hosted tool.
+4. Call `connector_status` for the workspace. Stop on `not_ready`,
+   `environment_mismatch`, or a setup requirement.
+5. Call `connector_capabilities` for the selected connector, mode, and environment.
+   Report only the returned capability states and evidence reference.
 
-Never ask for, accept, or paste credentials in chat. Do not proceed while setup is
-missing, unconfirmed, or untested. On failure, report only the sanitized status and the
-next local command. Respond in concise Thai.
+For an API-driver or Local Bridge requirement, return the advanced-local handoff to the
+local credential guide and `docs/ADVANCED_LOCAL_ERP.md`. The hosted plugin does not
+receive, store, or test ERP credentials and it must never invoke local execution tools.
+Never ask for, accept, or paste credentials in chat. Respond in concise Thai.

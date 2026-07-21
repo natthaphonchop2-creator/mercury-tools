@@ -18,14 +18,13 @@ from pydantic import ValidationError
 
 from mercury_tools.catalog.models import CatalogAction, revalidate_catalog_action
 from mercury_tools.execution.models import PreparedRequest, RequestState, render_action_path
-from mercury_tools.execution.policy import effective_risk
+from mercury_tools.execution.policy import MutationClass, effective_risk
 from mercury_tools.local.operation_lock import repository_locked, repository_operation_lock
 from mercury_tools.local.repository import RepositoryContext
 
 _PENDING_STATES = (
     RequestState.PREVIEWED.value,
     RequestState.AWAITING_CONFIRMATION.value,
-    RequestState.AWAITING_FINAL_CONFIRMATION.value,
     RequestState.READY_TO_EXECUTE.value,
 )
 _REPLAY_BLOCKING_STATES = (
@@ -34,9 +33,137 @@ _REPLAY_BLOCKING_STATES = (
     RequestState.OUTCOME_UNKNOWN.value,
 )
 _IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
+_SQLITE_SCHEMA_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
 _REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _DATABASE_NAME = "requests.sqlite"
 _SIDECAR_NAMES = ("requests.sqlite-wal", "requests.sqlite-shm")
+_SCHEMA_VERSION = 2
+_V1_ARCHIVE_NAME = "requests_v1_archive"
+_REPLAY_INDEX_NAME = "requests_v2_replay_blocking_hash"
+_REPLAY_INDEX_PATTERN = re.compile(
+    r"^create unique index [a-z0-9_]+ on requests\s*\(\s*payload_hash\s*\)\s*"
+    r"where state in\s*\(\s*'executing'\s*,\s*'succeeded'\s*,\s*"
+    r"'outcome_unknown'\s*\)\s*$",
+    re.IGNORECASE,
+)
+_SQLITE_DDL_TOKEN_PATTERN = re.compile(
+    r"""
+    (?P<whitespace>\s+)
+    |(?P<line_comment>--[^\r\n]*(?:\r\n|\r|\n|$))
+    |(?P<block_comment>/\*.*?\*/)
+    |(?P<quoted_identifier>"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\])
+    |(?P<word>[A-Za-z_][A-Za-z0-9_]*)
+    |(?P<punctuation>[(),;])
+    """,
+    re.DOTALL | re.VERBOSE,
+)
+_V2_REQUEST_TABLE_CONTRACT = (
+    (0, "request_id", "TEXT", "TEXT", False, None, 1),
+    (1, "payload_hash", "TEXT", "TEXT", True, None, 0),
+    (2, "connector_id", "TEXT", "TEXT", True, None, 0),
+    (3, "environment", "TEXT", "TEXT", True, None, 0),
+    (4, "state", "TEXT", "TEXT", True, None, 0),
+    (5, "expires_at", "TEXT", "TEXT", True, None, 0),
+    (6, "request_json", "TEXT", "TEXT", True, None, 0),
+)
+_V2_REQUEST_TABLE_XINFO_CONTRACT = tuple(
+    (*column, 0) for column in _V2_REQUEST_TABLE_CONTRACT
+)
+_V2_REQUEST_TABLE_DDL_CONTRACT = (
+    ("keyword", "create"),
+    ("keyword", "table"),
+    ("identifier", "requests"),
+    ("punctuation", "("),
+    ("identifier", "request_id"),
+    ("keyword", "text"),
+    ("keyword", "primary"),
+    ("keyword", "key"),
+    ("punctuation", ","),
+    ("identifier", "payload_hash"),
+    ("keyword", "text"),
+    ("keyword", "not"),
+    ("keyword", "null"),
+    ("punctuation", ","),
+    ("identifier", "connector_id"),
+    ("keyword", "text"),
+    ("keyword", "not"),
+    ("keyword", "null"),
+    ("punctuation", ","),
+    ("identifier", "environment"),
+    ("keyword", "text"),
+    ("keyword", "not"),
+    ("keyword", "null"),
+    ("punctuation", ","),
+    ("identifier", "state"),
+    ("keyword", "text"),
+    ("keyword", "not"),
+    ("keyword", "null"),
+    ("punctuation", ","),
+    ("identifier", "expires_at"),
+    ("keyword", "text"),
+    ("keyword", "not"),
+    ("keyword", "null"),
+    ("punctuation", ","),
+    ("identifier", "request_json"),
+    ("keyword", "text"),
+    ("keyword", "not"),
+    ("keyword", "null"),
+    ("punctuation", ")"),
+)
+
+
+def _normalized_sqlite_identifier(value: object) -> str | None:
+    return value.casefold() if isinstance(value, str) else None
+
+
+def _matches_v2_request_table_ddl(sql: object) -> bool:
+    if not isinstance(sql, str):
+        return False
+    tokens: list[tuple[str, str]] = []
+    position = 0
+    while position < len(sql):
+        match = _SQLITE_DDL_TOKEN_PATTERN.match(sql, position)
+        if match is None:
+            return False
+        position = match.end()
+        kind = match.lastgroup
+        if kind in {"whitespace", "line_comment", "block_comment"}:
+            continue
+        value = match.group()
+        if kind == "quoted_identifier":
+            if value[0] == "[":
+                value = value[1:-1]
+            else:
+                quote = value[0]
+                value = value[1:-1].replace(quote * 2, quote)
+            if _SQLITE_SCHEMA_NAME.fullmatch(value) is None:
+                return False
+            tokens.append(("identifier", value.casefold()))
+        elif kind == "word":
+            tokens.append(("word", value.casefold()))
+        elif kind == "punctuation":
+            tokens.append(("punctuation", value))
+        else:
+            return False
+
+    if tokens and tokens[-1] == ("punctuation", ";"):
+        tokens.pop()
+    if len(tokens) != len(_V2_REQUEST_TABLE_DDL_CONTRACT):
+        return False
+    for actual, expected in zip(tokens, _V2_REQUEST_TABLE_DDL_CONTRACT, strict=True):
+        expected_kind, expected_value = expected
+        actual_kind, actual_value = actual
+        if actual_value != expected_value:
+            return False
+        if expected_kind == "identifier":
+            if actual_kind not in {"identifier", "word"}:
+                return False
+        elif expected_kind == "keyword":
+            if actual_kind != "word":
+                return False
+        elif actual_kind != expected_kind:
+            return False
+    return True
 
 
 class RequestStateError(ValueError):
@@ -77,7 +204,7 @@ class LocalRequestStore:
             raise RequestStateError("repository_mismatch")
         if (
             request.state is not RequestState.PREVIEWED
-            or request.confirmation_count != 0
+            or request.approval_count != 0
             or request.failure_reason is not None
             or request.response_summary
         ):
@@ -139,11 +266,19 @@ class LocalRequestStore:
             for actual, expected in expected_bindings
         ):
             raise RequestStateError("catalog_binding_mismatch")
+        if tuple(item.action_id for item in request.preflight_actions) != tuple(
+            validated.preflight_action_ids
+        ) or any(
+            item.connector_id != validated.connector_id
+            for item in request.preflight_actions
+        ):
+            raise RequestStateError("catalog_binding_mismatch")
 
         risk = effective_risk(validated)
         if (
             request.risk_tier != risk.tier
-            or request.required_confirmations != risk.required_confirmations
+            or request.approval_level is not risk.approval_level
+            or request.mutation_class is not risk.mutation_class
         ):
             raise RequestStateError("catalog_risk_mismatch")
 
@@ -154,33 +289,49 @@ class LocalRequestStore:
             return self._expire_if_needed(connection, request)
 
     @repository_locked
-    def confirm(self, request_id: str, payload_hash: str) -> PreparedRequest:
+    def approve(
+        self,
+        request_id: str,
+        payload_hash: str,
+        expected_class: MutationClass,
+    ) -> PreparedRequest:
         with self._immediate_transaction() as connection:
-            request = self._fetch(connection, request_id)
-            if not isinstance(payload_hash, str) or not secrets.compare_digest(
+            request = self._approval_candidate(
+                connection,
+                request_id,
                 payload_hash,
-                request.payload_hash,
-            ):
-                raise RequestStateError("payload_hash_mismatch")
-            request = self._expire_if_needed(connection, request)
-            self._require_state(
-                request,
-                RequestState.AWAITING_CONFIRMATION,
-                RequestState.AWAITING_FINAL_CONFIRMATION,
-            )
-            confirmation_count = request.confirmation_count + 1
-            state = (
-                RequestState.READY_TO_EXECUTE
-                if confirmation_count == request.required_confirmations
-                else RequestState.AWAITING_FINAL_CONFIRMATION
+                expected_class,
             )
             updated = self._updated(
                 request,
-                state=state,
-                confirmation_count=confirmation_count,
+                state=RequestState.READY_TO_EXECUTE,
+                approval_count=1,
             )
             self._store(connection, updated)
             return updated
+
+    @repository_locked
+    def precheck_approval(
+        self,
+        request_id: str,
+        payload_hash: str,
+        expected_class: MutationClass,
+    ) -> PreparedRequest:
+        """Validate a pending approval locally without recording it."""
+
+        with self._immediate_transaction() as connection:
+            return self._approval_candidate(
+                connection,
+                request_id,
+                payload_hash,
+                expected_class,
+            )
+
+    def confirm(self, request_id: str, payload_hash: str) -> PreparedRequest:
+        """Compatibility helper for the v0.2 local tool surface."""
+
+        request = self.get(request_id)
+        return self.approve(request_id, payload_hash, request.mutation_class)
 
     @repository_locked
     def invalidate(self, request_id: str, reason: str) -> PreparedRequest:
@@ -317,7 +468,7 @@ class LocalRequestStore:
             raise RequestStateError("invalid_invalidation_reason")
         with self._immediate_transaction() as connection:
             self._expire_pending(connection)
-            clauses = ["state IN (?, ?, ?, ?)"]
+            clauses = ["state IN (?, ?, ?)"]
             parameters: list[str] = list(_PENDING_STATES)
             if connector_id is not None:
                 clauses.append("connector_id = ?")
@@ -356,30 +507,197 @@ class LocalRequestStore:
         try:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=FULL")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS requests (
-                    request_id TEXT PRIMARY KEY,
-                    payload_hash TEXT NOT NULL,
-                    connector_id TEXT NOT NULL,
-                    environment TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    expires_at TEXT NOT NULL,
-                    request_json TEXT NOT NULL
+            connection.execute("BEGIN IMMEDIATE")
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if not isinstance(version, int) or version > _SCHEMA_VERSION:
+                raise RequestStateError("request_store_version_unsupported")
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            }
+            has_requests_table = any(
+                _normalized_sqlite_identifier(name) == "requests" for name in tables
+            )
+            if version == 0 and tables:
+                raise RequestStateError("request_store_schema_invalid")
+            if version > 0 and not has_requests_table:
+                raise RequestStateError("request_store_schema_invalid")
+            if version < _SCHEMA_VERSION and has_requests_table:
+                archive_name = self._next_schema_name(connection, _V1_ARCHIVE_NAME)
+                connection.execute(
+                    f'ALTER TABLE "requests" RENAME TO "{archive_name}"'
                 )
-                """
-            )
-            connection.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS requests_replay_blocking_hash
-                ON requests (payload_hash)
-                WHERE state IN ('executing', 'succeeded', 'outcome_unknown')
-                """
-            )
+            self._create_v2_schema(connection)
+            self._validate_v2_schema(connection)
+            self._ensure_replay_blocking_index(connection)
+            connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
+            connection.execute("COMMIT")
+        except RequestStateError:
+            self._rollback(connection)
+            raise
         except sqlite3.Error as exc:
+            self._rollback(connection)
             raise RequestStateError("request_store_unavailable") from exc
+        except Exception:
+            self._rollback(connection)
+            raise
         finally:
             self._close_connection(connection)
+
+    @staticmethod
+    def _create_v2_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS requests (
+                request_id TEXT PRIMARY KEY,
+                payload_hash TEXT NOT NULL,
+                connector_id TEXT NOT NULL,
+                environment TEXT NOT NULL,
+                state TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                request_json TEXT NOT NULL
+            )
+            """
+        )
+
+    @staticmethod
+    def _validate_v2_schema(connection: sqlite3.Connection) -> None:
+        table_info = tuple(
+            (
+                row[0],
+                _normalized_sqlite_identifier(row[1]),
+                row[2],
+                _sqlite_affinity(row[2]),
+                bool(row[3]),
+                row[4],
+                row[5],
+            )
+            for row in connection.execute('PRAGMA table_info("requests")').fetchall()
+        )
+        table_xinfo = tuple(
+            (
+                row[0],
+                _normalized_sqlite_identifier(row[1]),
+                row[2],
+                _sqlite_affinity(row[2]),
+                bool(row[3]),
+                row[4],
+                row[5],
+                row[6],
+            )
+            for row in connection.execute('PRAGMA table_xinfo("requests")').fetchall()
+        )
+        definitions = [
+            row[2]
+            for row in connection.execute(
+                "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+            if _normalized_sqlite_identifier(row[0]) == "requests"
+            and _normalized_sqlite_identifier(row[1]) == "requests"
+        ]
+        triggers = [
+            row[0]
+            for row in connection.execute(
+                "SELECT name, tbl_name FROM sqlite_master WHERE type = 'trigger'"
+            ).fetchall()
+            if _normalized_sqlite_identifier(row[1]) == "requests"
+        ]
+        if (
+            table_info != _V2_REQUEST_TABLE_CONTRACT
+            or table_xinfo != _V2_REQUEST_TABLE_XINFO_CONTRACT
+            or len(definitions) != 1
+            or not _matches_v2_request_table_ddl(definitions[0])
+            or triggers
+        ):
+            raise RequestStateError("request_store_schema_invalid")
+
+    @classmethod
+    def _ensure_replay_blocking_index(cls, connection: sqlite3.Connection) -> None:
+        for row in connection.execute('PRAGMA index_list("requests")').fetchall():
+            name = row[1]
+            if (
+                isinstance(name, str)
+                and _SQLITE_SCHEMA_NAME.fullmatch(name) is not None
+                and name.casefold().startswith(_REPLAY_INDEX_NAME)
+                and not cls._is_replay_blocking_index(connection, row)
+            ):
+                connection.execute(f'DROP INDEX "{name}"')
+        if cls._has_replay_blocking_index(connection):
+            return
+        index_name = cls._next_schema_name(connection, _REPLAY_INDEX_NAME)
+        connection.execute(
+            f"""
+            CREATE UNIQUE INDEX "{index_name}"
+            ON "requests" ("payload_hash")
+            WHERE "state" IN ('executing', 'succeeded', 'outcome_unknown')
+            """
+        )
+        if not cls._has_replay_blocking_index(connection):
+            raise RequestStateError("request_store_schema_invalid")
+
+    @staticmethod
+    def _next_schema_name(connection: sqlite3.Connection, base: str) -> str:
+        names = {
+            name
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE name IS NOT NULL"
+            ).fetchall()
+            if (name := _normalized_sqlite_identifier(row[0])) is not None
+        }
+        if base.casefold() not in names:
+            return base
+        suffix = 2
+        while f"{base}_{suffix}".casefold() in names:
+            suffix += 1
+        return f"{base}_{suffix}"
+
+    @classmethod
+    def _has_replay_blocking_index(cls, connection: sqlite3.Connection) -> bool:
+        index_rows = connection.execute('PRAGMA index_list("requests")').fetchall()
+        return any(cls._is_replay_blocking_index(connection, row) for row in index_rows)
+
+    @staticmethod
+    def _is_replay_blocking_index(
+        connection: sqlite3.Connection,
+        row: sqlite3.Row | tuple[Any, ...],
+    ) -> bool:
+        name = row[1]
+        normalized_name = _normalized_sqlite_identifier(name)
+        if (
+            not isinstance(name, str)
+            or _SQLITE_SCHEMA_NAME.fullmatch(name) is None
+            or normalized_name is None
+            or not normalized_name.startswith(_REPLAY_INDEX_NAME)
+            or row[2] != 1
+            or len(row) < 5
+            or row[4] != 1
+        ):
+            return False
+        columns = tuple(
+            _normalized_sqlite_identifier(item[2])
+            for item in connection.execute(f'PRAGMA index_info("{name}")').fetchall()
+        )
+        if columns != ("payload_hash",):
+            return False
+        definition = connection.execute(
+            "SELECT tbl_name, sql FROM sqlite_master "
+            "WHERE type = 'index' AND name = ?",
+            (name,),
+        ).fetchone()
+        if (
+            definition is None
+            or _normalized_sqlite_identifier(definition[0]) != "requests"
+        ):
+            return False
+        sql = definition[1]
+        if not isinstance(sql, str):
+            return False
+        normalized = re.sub(r'["`\[\]]', "", sql)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return _REPLAY_INDEX_PATTERN.fullmatch(normalized) is not None
 
     @contextmanager
     def _immediate_transaction(self) -> Iterator[sqlite3.Connection]:
@@ -583,6 +901,28 @@ class LocalRequestStore:
             raise RequestStateError("request_not_found")
         return self._row_to_request(row)
 
+    def _approval_candidate(
+        self,
+        connection: sqlite3.Connection,
+        request_id: str,
+        payload_hash: str,
+        expected_class: MutationClass,
+    ) -> PreparedRequest:
+        request = self._fetch(connection, request_id)
+        if not isinstance(payload_hash, str) or not secrets.compare_digest(
+            payload_hash,
+            request.payload_hash,
+        ):
+            raise RequestStateError("payload_hash_mismatch")
+        request = self._expire_if_needed(connection, request)
+        self._require_state(request, RequestState.AWAITING_CONFIRMATION)
+        if (
+            not isinstance(expected_class, MutationClass)
+            or request.mutation_class is not expected_class
+        ):
+            raise RequestStateError("mutation_class_mismatch")
+        return request
+
     def _row_to_request(self, row: sqlite3.Row) -> PreparedRequest:
         try:
             payload = json.loads(row["request_json"])
@@ -660,7 +1000,7 @@ class LocalRequestStore:
 
     def _expire_pending(self, connection: sqlite3.Connection) -> None:
         rows = connection.execute(
-            "SELECT * FROM requests WHERE state IN (?, ?, ?, ?)", _PENDING_STATES
+            "SELECT * FROM requests WHERE state IN (?, ?, ?)", _PENDING_STATES
         ).fetchall()
         for row in rows:
             self._expire_if_needed(connection, self._row_to_request(row))
@@ -723,6 +1063,21 @@ class LocalRequestStore:
     def _rollback(connection: sqlite3.Connection) -> None:
         with suppress(sqlite3.Error):
             connection.execute("ROLLBACK")
+
+
+def _sqlite_affinity(declared_type: object) -> str:
+    if not isinstance(declared_type, str):
+        return "invalid"
+    normalized = declared_type.upper()
+    if "INT" in normalized:
+        return "INTEGER"
+    if any(token in normalized for token in ("CHAR", "CLOB", "TEXT")):
+        return "TEXT"
+    if "BLOB" in normalized or not normalized:
+        return "BLOB"
+    if any(token in normalized for token in ("REAL", "FLOA", "DOUB")):
+        return "REAL"
+    return "NUMERIC"
 
 
 def _payload_hash(value: str) -> bool:

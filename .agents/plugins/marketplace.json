@@ -11,8 +11,7 @@
         "path": "./plugins/mercury-finance"
       },
       "policy": {
-        "installation": "AVAILABLE",
-        "authentication": "ON_INSTALL"
+        "installation": "AVAILABLE"
       },
       "category": "Finance"
     }

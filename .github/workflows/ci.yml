@@ -109,7 +109,7 @@ jobs:
             --junitxml=release-evidence/pytest.xml
           uv run python scripts/verify_test_skips.py \
             --junit release-evidence/pytest.xml \
-            --waivers docs/release/v0.2.2-test-waivers.json
+            --waivers docs/release/v0.3.0-test-waivers.json
           uv run mercury doctor --repo-root .
           uv run python scripts/validate_release_plugin.py --root .
           uv run python scripts/smoke_local_plugin.py

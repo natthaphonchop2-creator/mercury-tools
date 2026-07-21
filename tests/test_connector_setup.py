@@ -15,6 +15,7 @@ from mercury_tools.connectors.setup import (
     validate_connector_connection_healthcheck_async,
 )
 from mercury_tools.db.product import SupabaseProductStore
+from mercury_tools.mcp.schemas import ConnectorValidationEvidence
 
 
 def assert_values_absent(payload: dict, values: list[str]) -> None:
@@ -89,6 +90,28 @@ def test_required_missing_fields_uses_manifest() -> None:
         manifest,
         {"client_id": "abc", "client_secret": "def"},
     ) == []
+
+
+def test_connector_validation_evidence_is_strict_and_value_free() -> None:
+    evidence = ConnectorValidationEvidence.model_validate(
+        {
+            "source": "native_mcp_safe_read",
+            "status": "succeeded",
+            "observed_at": "2026-07-19T12:00:00Z",
+            "evidence_ref": "evidence_native_read_1234",
+            "provider_tool_name": "company.read",
+            "capabilities": [{"capability": "company.info.read", "state": "observed"}],
+        }
+    )
+
+    assert evidence.capabilities[0].capability == "company.info.read"
+    with pytest.raises(ValueError):
+        ConnectorValidationEvidence.model_validate(
+            {
+                **evidence.model_dump(mode="json"),
+                "response_body": {"email": "owner@example.com"},
+            }
+        )
 
 
 def test_validate_flowaccount_uses_token_and_company_info(monkeypatch) -> None:
@@ -665,7 +688,7 @@ class StoreForSetup(SupabaseProductStore):
             )
         )
         self.rows: list[dict] = []
-        self.profiles: dict[tuple[str, str, str], dict] = {}
+        self.profiles: dict[tuple[str, str, str, str], dict] = {}
         self.profile_payloads: list[dict] = []
         self.profile_patches: list[dict] = []
         self.audit_events: list[dict] = []
@@ -715,6 +738,7 @@ class StoreForSetup(SupabaseProductStore):
             key = (
                 payload["workspace_id"],
                 payload["connector_id"],
+                payload["connection_mode"],
                 payload["environment"],
             )
             existing = self.profiles.get(key)
@@ -733,11 +757,12 @@ class StoreForSetup(SupabaseProductStore):
             params = kwargs.get("params") or {}
             workspace_id = str(params.get("workspace_id") or "").removeprefix("eq.")
             connector_id = str(params.get("connector_id") or "").removeprefix("eq.")
+            connection_mode = str(params.get("connection_mode") or "").removeprefix("eq.")
             environment = str(params.get("environment") or "").removeprefix("eq.")
             return [
                 profile
                 for key, profile in self.profiles.items()
-                if key == (workspace_id, connector_id, environment)
+                if key == (workspace_id, connector_id, connection_mode, environment)
             ]
         if path == "mercury_connector_profiles" and method == "PATCH":
             params = kwargs.get("params") or {}
@@ -790,7 +815,7 @@ def test_start_connector_setup_stores_setup_metadata() -> None:
     )
     assert profile["connector_id"] == "flowaccount"
     assert profile["environment"] == "production"
-    assert profile["status"] == "requires_credentials"
+    assert profile["status"] == "needs_validation"
     assert profile["metadata"]["setup_state"] == "awaiting_credentials"
     assert profile["metadata"]["required_secret_fields"] == ["client_id", "client_secret"]
     assert profile["metadata"]["preset"]["grant_type"] == "client_credentials"
@@ -800,9 +825,7 @@ def test_start_connector_setup_stores_setup_metadata() -> None:
     assert profile["metadata"]["preset"]["token_url"] == (
         "https://openapi.flowaccount.com/v1/token"
     )
-    assert profile["metadata"]["capabilities"] == connector_by_id("flowaccount").capabilities
-    assert "documents.invoice.create" in profile["metadata"]["capabilities"]
-    assert "documents.expense.create" in profile["metadata"]["capabilities"]
+    assert "capabilities" not in profile["metadata"]
 
 
 def test_start_connector_setup_stores_environment_specific_preset() -> None:
@@ -848,13 +871,13 @@ def test_start_connector_setup_supports_custom_erp_setup_target() -> None:
     assert profile["environment"] == "gateway"
     assert profile["display_name"] == "Custom ERP"
     assert profile["company_name"] == "Demo Co ERP"
-    assert profile["status"] == "requires_credentials"
+    assert profile["status"] == "needs_validation"
     assert profile["metadata"]["setup_state"] == "awaiting_credentials"
     assert profile["metadata"]["required_secret_fields"] == ["base_url", "api_key"]
-    assert profile["metadata"]["capabilities"] == []
+    assert "capabilities" not in profile["metadata"]
 
 
-def test_ready_connector_profile_metadata_stays_requires_credentials() -> None:
+def test_ready_connector_profile_metadata_without_evidence_needs_validation() -> None:
     store = StoreForSetup()
     profile = store.set_connector_profile(
         token_payload={
@@ -873,8 +896,8 @@ def test_ready_connector_profile_metadata_stays_requires_credentials() -> None:
         },
     )
 
-    assert profile["status"] == "requires_credentials"
-    assert store.profile_payloads[-1]["status"] == "requires_credentials"
+    assert profile["status"] == "needs_validation"
+    assert store.profile_payloads[-1]["status"] == "needs_validation"
 
 
 def test_start_connector_setup_resume_without_company_name_preserves_label() -> None:

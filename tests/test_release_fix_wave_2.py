@@ -651,9 +651,9 @@ def test_supabase_duplicate_storage_objects_block_before_download() -> None:
     )
 
 
-def test_public_mcp_exact_inventory_is_compiled_from_20_public_tools() -> None:
+def test_public_mcp_exact_inventory_is_compiled_from_24_hosted_tools() -> None:
     tools = _public_tool_records()
-    assert len(tools) == len({record["name"] for record in tools}) == 20
+    assert len(tools) == len({record["name"] for record in tools}) == 24
     transport = _mcp_transport(tools)
     client = PublicMcpHostedClient(
         endpoint="https://public.example/mcp",
@@ -672,8 +672,8 @@ def test_public_and_local_mcp_inventories_remain_separate_and_exact() -> None:
     public_names = [record["name"] for record in _public_tool_records()]
     local_names = [tool.name for tool in local_mcp._tool_manager.list_tools()]
 
-    assert len(public_names) == len(set(public_names)) == 20
-    assert len(local_names) == len(set(local_names)) == 19
+    assert len(public_names) == len(set(public_names)) == 24
+    assert len(local_names) == len(set(local_names)) == 20
     assert set(public_names) != set(local_names)
 
 

@@ -326,6 +326,7 @@ def cloud_dependencies(action_factory):
                 "summary": "VAT summary",
                 "status": "available",
                 "version": "0.1.0",
+                "required_capabilities": ["documents.invoice.list"],
                 "required_connectors": ["flowaccount"],
                 "tags": ["vat"],
                 "repository_path": "/Users/operator/private/skill",
@@ -1056,6 +1057,7 @@ async def test_cloud_responses_use_exact_public_projection_keys(
         "summary",
         "status",
         "version",
+        "required_capabilities",
         "required_connectors",
         "tags",
     }

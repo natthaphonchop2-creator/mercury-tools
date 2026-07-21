@@ -18,6 +18,7 @@ from mcp import types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from mercury_tools.mcp.contracts import HOSTED_TOOL_NAMES
 from mercury_tools.release.hosted import (
     HostedAdapterConfig,
     build_hosted_clients,
@@ -25,30 +26,7 @@ from mercury_tools.release.hosted import (
 )
 from mercury_tools.release.models import PINNED_SCANNER_VERSIONS, SecretScanPolicy
 
-EXPECTED_HOSTED_TOOLS = frozenset(
-    {
-        "search_knowledge",
-        "retrieve_context_pack",
-        "retrieve_workspace_context_pack",
-        "get_document",
-        "create_public_workspace",
-        "get_public_workspace",
-        "list_connectors",
-        "connector_capabilities",
-        "start_connector_setup",
-        "connector_status",
-        "run_accounting_skill",
-        "flow_cheat_sheet",
-        "check_flow_syntax",
-        "inspect_flow_files",
-        "run_flow",
-        "run_flow_files",
-        "run_mercury_flow",
-        "list_workspace_flows",
-        "run_workspace_flow",
-        "save_workspace_flow",
-    }
-)
+EXPECTED_HOSTED_TOOLS = HOSTED_TOOL_NAMES
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 _SAFE_SERVICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -203,10 +181,10 @@ def verify_render_release(
         raise RenderReleaseError("mcp_unavailable") from exc
     if not isinstance(mcp, McpReleaseEvidence) or mcp.server_name != "Mercury Tools":
         raise RenderReleaseError("mcp_initialize_invalid")
-    if len(mcp.tools) != 20:
+    if len(mcp.tools) != len(EXPECTED_HOSTED_TOOLS):
         raise RenderReleaseError("hosted_tool_surface_mismatch")
     names = [tool.get("name") for tool in mcp.tools if isinstance(tool, dict)]
-    if len(names) != 20 or set(names) != EXPECTED_HOSTED_TOOLS:
+    if len(names) != len(EXPECTED_HOSTED_TOOLS) or set(names) != EXPECTED_HOSTED_TOOLS:
         raise RenderReleaseError("hosted_tool_surface_mismatch")
     for tool in mcp.tools:
         if _contains_credential_schema(tool.get("inputSchema")):

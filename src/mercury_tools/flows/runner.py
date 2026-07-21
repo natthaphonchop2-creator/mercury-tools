@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 
 from mercury_tools.config import load_settings
-from mercury_tools.connectors.catalog import public_capability_gate
 from mercury_tools.flows.models import (
     FlowCommand,
     FlowRunResult,
@@ -650,7 +649,7 @@ class MercuryFlowRunner:
         erp_write_preview_callback: ErpWritePreviewCallback | None = None,
         flow_path_resolver: FlowPathResolver | None = None,
         flow_loader: FlowLoader | None = None,
-        capability_gate: CapabilityGate | None = public_capability_gate,
+        capability_gate: CapabilityGate | None = None,
     ) -> None:
         self.dry_run = dry_run
         self.rag_service_factory = rag_service_factory

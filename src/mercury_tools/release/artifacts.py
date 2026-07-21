@@ -1784,7 +1784,10 @@ def _parse_git_config_entries(payload: bytes) -> tuple[tuple[str, str], ...]:
             raise ReleaseGateError("release_repository_invalid") from exc
         if (
             key != key.casefold()
-            or _GIT_CONFIG_KEY_PATTERN.fullmatch(key) is None
+            or (
+                _GIT_CONFIG_KEY_PATTERN.fullmatch(key) is None
+                and _GIT_CONFIG_BRANCH_KEY_PATTERN.fullmatch(key) is None
+            )
             or "\0" in value
             or "\r" in value
             or "\n" in value
@@ -2126,6 +2129,16 @@ def load_release_candidate(
         require_clean_worktree(root, git_runner=git_runner)
         _ensure_candidate_unchanged(candidate)
     return candidate
+
+
+def resolve_local_release_repository(root: Path) -> tuple[Path, str]:
+    """Validate a local release repository and return its GitHub identity."""
+
+    git_runner = _ReleaseGitRunner.for_repository(root)
+    origin_url = _origin_url(git_runner.root, git_runner=git_runner)
+    if origin_url is None:
+        raise ReleaseGateError("release_scanner_context_unavailable")
+    return git_runner.root, _repository_name_from_origin_url(origin_url)
 
 
 @contextmanager

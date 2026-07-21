@@ -73,8 +73,9 @@ _ROW_HASH = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_EVENT_FIELDS = frozenset(
     {
         "action_id",
+        "approval_count",
+        "approval_level",
         "artifact_path",
-        "confirmation_count",
         "connector_id",
         "environment",
         "event",
@@ -83,11 +84,11 @@ _SAFE_EVENT_FIELDS = frozenset(
         "latency_ms",
         "local_session_id",
         "method",
+        "mutation_class",
         "payload_hash",
         "recorded_at",
         "repository_id",
         "request_id",
-        "required_confirmations",
         "response_summary",
         "risk_tier",
         "state",
@@ -108,8 +109,11 @@ _SAFE_RESPONSE_FIELDS = frozenset(
     }
 )
 _METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
+_APPROVAL_LEVELS = frozenset({"standard", "elevated"})
+_MUTATION_CLASSES = frozenset({"create", "update", "sensitive"})
 _EVENT_VALUES = frozenset(
     {
+        "approval_recorded",
         "completed",
         "confirmation_recorded",
         "confirmed",
@@ -790,7 +794,13 @@ def _sanitize_event_field(name: str, value: Any) -> Any:
         _require_pattern(scalar, _PAYLOAD_HASH)
     elif name == "recorded_at":
         scalar = _validated_timestamp(scalar)
-    elif name in {"confirmation_count", "required_confirmations", "risk_tier"}:
+    elif name == "approval_count":
+        scalar = _bounded_integer(scalar, maximum=1)
+    elif name == "approval_level":
+        scalar = _semantic_value(scalar, _APPROVAL_LEVELS, _CODE)
+    elif name == "mutation_class":
+        scalar = _semantic_value(scalar, _MUTATION_CLASSES, _CODE)
+    elif name == "risk_tier":
         scalar = _bounded_integer(scalar, maximum=2)
     elif name == "latency_ms":
         scalar = _bounded_number(scalar, maximum=86_400_000)

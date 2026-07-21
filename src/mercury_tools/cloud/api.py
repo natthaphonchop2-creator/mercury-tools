@@ -87,6 +87,7 @@ _PUBLIC_SKILL_FIELDS = (
     "summary",
     "status",
     "version",
+    "required_capabilities",
     "required_connectors",
     "tags",
 )

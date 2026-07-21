@@ -74,6 +74,7 @@ def _public_skill(*, markdown: bool = False) -> dict:
         "summary": "Reviewed VAT guidance",
         "status": "available",
         "version": "0.1.0",
+        "required_capabilities": ["documents.invoice.list"],
         "required_connectors": ["flowaccount"],
         "tags": ["vat", "thai"],
     }
@@ -1168,6 +1169,39 @@ async def test_client_accepts_exact_strict_public_200_schemas(repository_context
         assert (await client.get_skill("vat-summary-th"))["skill_id"] == "vat-summary-th"
         assert len(await client.search_knowledge("VAT")) == 1
         assert (await client.get_document(document_id))["id"] == document_id
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_client_defaults_missing_capabilities_from_an_older_cloud_server(
+    repository_context,
+) -> None:
+    legacy_skill = {
+        key: value
+        for key, value in _public_skill(markdown=True).items()
+        if key != "required_capabilities"
+    }
+    responses = {
+        "/api/cloud/v1/skills": {
+            "skills": [
+                {key: value for key, value in legacy_skill.items() if key != "markdown"}
+            ]
+        },
+        "/api/cloud/v1/skills/vat-summary-th": legacy_skill,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=responses[request.url.path])
+
+    client = CloudBrainClient(
+        base_url="https://cloud.example.test",
+        cache=CatalogCache(repository_context),
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert (await client.list_skills())[0]["required_capabilities"] == []
+        assert (await client.get_skill("vat-summary-th"))["required_capabilities"] == []
     finally:
         await client.aclose()
 

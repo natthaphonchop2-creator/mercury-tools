@@ -111,7 +111,9 @@ without changing accounting capability names or connector manifests.
 - `get_document(document_id)`
 - `list_connectors()`
 - `connector_capabilities(connector_id)`
-- `run_accounting_skill(skill_id, inputs, evidence_mode=False)`
+- `list_accounting_skills()`
+- `get_accounting_skill_schema(skill_id)`
+- `run_accounting_skill(workspace_id, skill_id, inputs, evidence_mode=False)`
 - `flow_cheat_sheet()`
 - `check_flow_syntax(flow_yaml)`
 - `inspect_flow_files(flow_files, config_yaml=None)`

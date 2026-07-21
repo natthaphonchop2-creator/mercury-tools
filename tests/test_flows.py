@@ -305,7 +305,7 @@ name: Invalid Context Metadata
     assert unsafe_value not in str(raised.value)
 
 
-def test_flow_runner_blocks_mutation_capability_before_connector_dispatch() -> None:
+def test_flow_runner_does_not_apply_the_legacy_global_capability_gate_by_default() -> None:
     calls: list[str] = []
     runner = MercuryFlowRunner(
         connector_status_getter=lambda: calls.append("connector") or {"status": "ok"},
@@ -320,11 +320,9 @@ name: Blocked Mutation
 """
     ).as_dict()
 
-    assert payload["status"] == "blocked"
-    assert payload["reason"] == "public_preview_read_only"
-    assert payload["capability"] == "documents.invoice.create"
-    assert payload["steps"][0]["status"] == "blocked"
-    assert calls == []
+    assert payload["status"] == "ok"
+    assert payload["steps"][0]["status"] == "ok"
+    assert calls == ["connector"]
 
 
 def test_flow_runner_allows_declared_read_capability() -> None:
@@ -347,10 +345,14 @@ name: Allowed Read
     assert calls == ["connector"]
 
 
-def test_flow_runner_can_disable_hosted_capability_gate() -> None:
+def test_flow_runner_honors_an_explicitly_injected_capability_callback() -> None:
     calls: list[str] = []
     runner = MercuryFlowRunner(
-        capability_gate=None,
+        capability_gate=lambda capability: {
+            "status": "blocked",
+            "reason": "test_policy",
+            "capability": capability,
+        },
         connector_status_getter=lambda: calls.append("connector") or {"status": "ok"},
     )
 
@@ -363,9 +365,17 @@ name: Local Preview Policy
 """
     ).as_dict()
 
-    assert payload["status"] == "ok"
-    assert payload["steps"][0]["status"] == "ok"
-    assert calls == ["connector"]
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "test_policy"
+    assert calls == []
+
+
+def test_flow_runner_source_does_not_import_or_default_to_the_legacy_gate() -> None:
+    import inspect
+
+    source = inspect.getsource(flow_runner)
+
+    assert "public_capability_gate" not in source
 
 
 @pytest.mark.parametrize(

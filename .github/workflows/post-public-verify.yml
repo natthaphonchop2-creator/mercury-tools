@@ -17,7 +17,7 @@ jobs:
       - name: Checkout immutable release tag
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: v0.2.2
+          ref: v0.3.0
           fetch-depth: 0
           persist-credentials: false
       - name: Install uv 0.11.9
@@ -25,10 +25,18 @@ jobs:
         with:
           version: 0.11.9
           enable-cache: true
+      - name: Set up Node.js 22.22.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.22.0
+      - name: Install Codex CLI 0.144.6
+        run: npm install -g @openai/codex@0.144.6
+      - name: Verify Codex CLI
+        run: codex --version
       - name: Verify anonymous clone, assets, plugin, MCP, and quickstart
         run: |
           set -euo pipefail
           uv sync --extra dev --frozen
           uv run python scripts/verify_public_release.py \
             --repo natthaphonchop2-creator/mercury-tools \
-            --tag v0.2.2 --release v0.2.2 --expected-tools 19
+            --tag v0.3.0 --release v0.3.0 --expected-hosted-tools 24

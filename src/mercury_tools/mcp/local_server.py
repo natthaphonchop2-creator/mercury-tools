@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import secrets
@@ -12,14 +13,16 @@ from collections.abc import Coroutine, Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
+from pydantic import BaseModel, ConfigDict, Field, SkipValidation, TypeAdapter, ValidationError
 
 from mercury_tools.catalog.models import HttpMethod, RiskTier
 from mercury_tools.execution.executor import ExecutionPolicyError
+from mercury_tools.execution.policy import MutationClass, effective_risk
 from mercury_tools.flows.parser import FlowValidationError, parse_flow_text
 from mercury_tools.flows.runner import MercuryFlowRunner, repository_flow_loader
 from mercury_tools.local.repository import (
@@ -41,11 +44,70 @@ local_mcp = FastMCP("Mercury Finance")
 
 _READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False)
 _NON_DESTRUCTIVE_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
-_DESTRUCTIVE_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
+_ERP_READ = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    openWorldHint=True,
+)
+_ERP_PREPARE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    openWorldHint=False,
+)
+_ERP_CREATE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+)
+_ERP_UPDATE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=True,
+)
+_ERP_SENSITIVE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=True,
+)
+_ERP_IMPORT = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    openWorldHint=True,
+)
 _STATUS_CODE = re.compile(r"^[a-z][a-z0-9_]{1,127}$")
 _FLOW_SUFFIXES = {".yaml", ".yml"}
 _MAX_FLOW_CHARS = 500_000
 _SCHEMA_VALUE_KEYS = frozenset({"const", "default", "enum", "example", "examples"})
+_MAX_ERP_INPUT_JSON_CHARS = 65_536
+_MAX_ERP_INPUT_JSON_BYTES = 65_536
+_MAX_ERP_INPUT_DEPTH = 12
+_MAX_ERP_INPUT_KEYS = 256
+_MAX_ERP_INPUT_ARRAY_ITEMS = 1_024
+
+
+class ErpInputEnvelope(BaseModel):
+    """One bounded JSON object passed to a local ERP action."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    json_object: Annotated[
+        str,
+        Field(
+            min_length=2,
+            max_length=_MAX_ERP_INPUT_JSON_CHARS,
+            description=(
+                "UTF-8 JSON object containing the ERP request inputs. "
+                "Do not include credentials."
+            ),
+        ),
+    ]
+
+
+ErpInputEnvelopeInput = SkipValidation[ErpInputEnvelope]
+_ERP_INPUT_ENVELOPE_ADAPTER = TypeAdapter(ErpInputEnvelope)
 
 
 async def active_root_paths(ctx: Context) -> tuple[Path, ...]:
@@ -89,8 +151,67 @@ def _error_payload(error: Exception, *, fallback: str = "operation_failed") -> d
     return {"status": fallback}
 
 
+def _erp_input_mapping(raw: Any) -> dict[str, Any]:
+    """Decode the explicit local MCP envelope without exposing invalid input."""
+
+    try:
+        envelope = _ERP_INPUT_ENVELOPE_ADAPTER.validate_python(raw)
+        encoded = envelope.json_object.encode("utf-8")
+        if len(encoded) > _MAX_ERP_INPUT_JSON_BYTES:
+            raise ValueError("erp_inputs_invalid")
+        payload = json.loads(
+            envelope.json_object,
+            object_pairs_hook=_unique_erp_input_object,
+            parse_constant=_reject_erp_json_constant,
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("erp_inputs_invalid")
+        _validate_erp_input_structure(payload)
+    except (UnicodeError, ValidationError, ValueError, json.JSONDecodeError):
+        raise ValueError("erp_inputs_invalid") from None
+    return payload
+
+
+def _unique_erp_input_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("erp_inputs_invalid")
+        value[key] = item
+    return value
+
+
+def _reject_erp_json_constant(value: str) -> None:
+    del value
+    raise ValueError("erp_inputs_invalid")
+
+
+def _validate_erp_input_structure(payload: dict[str, Any]) -> None:
+    key_count = 0
+
+    def visit(value: Any, depth: int) -> None:
+        nonlocal key_count
+        if depth > _MAX_ERP_INPUT_DEPTH:
+            raise ValueError("erp_inputs_invalid")
+        if isinstance(value, dict):
+            key_count += len(value)
+            if key_count > _MAX_ERP_INPUT_KEYS:
+                raise ValueError("erp_inputs_invalid")
+            for item in value.values():
+                visit(item, depth + 1)
+        elif isinstance(value, list):
+            if len(value) > _MAX_ERP_INPUT_ARRAY_ITEMS:
+                raise ValueError("erp_inputs_invalid")
+            for item in value:
+                visit(item, depth + 1)
+        elif isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("erp_inputs_invalid")
+
+    visit(payload, 0)
+
+
 def _action_summary(action: Any) -> dict[str, Any]:
-    return {
+    summary = {
         "action_id": action.action_id,
         "version_id": action.version_id,
         "connector_id": action.connector_id,
@@ -98,10 +219,11 @@ def _action_summary(action: Any) -> dict[str, Any]:
         "capability": action.capability,
         "description": action.description,
         "risk_tier": int(action.risk_tier),
-        "required_confirmations": action.required_confirmations,
         "confidence": action.confidence.value,
         "observed_state": action.observed_state.value,
     }
+    summary.update(_approval_projection(action))
+    return summary
 
 
 def _public_action_schema(action: Any) -> dict[str, Any]:
@@ -110,9 +232,21 @@ def _public_action_schema(action: Any) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise ValueError("catalog_action_schema_invalid")
     projected = dict(payload)
+    projected.pop("required_confirmations", None)
+    projected.update(_approval_projection(action))
     projected["input_schema"] = _public_executable_schema(projected.get("input_schema"))
     projected["examples"] = []
     return projected
+
+
+def _approval_projection(action: Any) -> dict[str, str]:
+    if action.method is HttpMethod.GET:
+        return {}
+    risk = effective_risk(action)
+    return {
+        "approval_level": risk.approval_level.value,
+        "mutation_class": risk.mutation_class.value,
+    }
 
 
 def _validation_summary(context: Mapping[str, Any]) -> dict[str, Any]:
@@ -556,10 +690,10 @@ async def get_erp_action_schema(
         return _error_payload(error)
 
 
-@local_mcp.tool(annotations=_READ_ONLY)
+@local_mcp.tool(annotations=_ERP_READ)
 async def run_erp_read(
     action_id: str,
-    inputs: dict[str, Any],
+    inputs: ErpInputEnvelopeInput,
     ctx: Context,
     environment: str = "production",
     repo_root: str | None = None,
@@ -567,9 +701,13 @@ async def run_erp_read(
     """Execute only an effective Tier 0 action through the local executor."""
 
     try:
+        parsed_inputs = _erp_input_mapping(inputs)
+    except ValueError:
+        return {"status": "erp_inputs_invalid"}
+    try:
         async with _request_runtime(ctx, repo_root) as runtime:
             await runtime.refresh_catalog()
-            return await runtime.run_read(action_id, inputs, environment)
+            return await runtime.run_read(action_id, parsed_inputs, environment)
     except (
         ExecutionPolicyError,
         httpx.HTTPError,
@@ -581,7 +719,126 @@ async def run_erp_read(
         return _error_payload(error)
 
 
-@local_mcp.tool(annotations=_NON_DESTRUCTIVE_WRITE)
+@local_mcp.tool(annotations=_ERP_PREPARE)
+async def prepare_erp_mutation(
+    action_id: str,
+    inputs: ErpInputEnvelopeInput,
+    ctx: Context,
+    environment: str | None = None,
+    repo_root: str | None = None,
+) -> dict[str, Any]:
+    """Bind one immutable mutation and return its exact approval tool."""
+
+    try:
+        parsed_inputs = _erp_input_mapping(inputs)
+    except ValueError:
+        return {"status": "erp_inputs_invalid"}
+    try:
+        async with _request_runtime(ctx, repo_root) as runtime:
+            await runtime.refresh_catalog()
+            return await runtime.prepare_mutation(
+                action_id,
+                parsed_inputs,
+                environment or "production",
+            )
+    except (
+        ExecutionPolicyError,
+        httpx.HTTPError,
+        LookupError,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ) as error:
+        return _error_payload(error)
+
+
+async def _approve_and_execute(
+    request_id: str,
+    payload_hash: str,
+    ctx: Context,
+    *,
+    repo_root: str | None,
+    expected_class: MutationClass,
+) -> dict[str, Any]:
+    try:
+        async with _request_runtime(ctx, repo_root) as runtime:
+            runtime.request_store.precheck_approval(
+                request_id,
+                payload_hash,
+                expected_class,
+            )
+            await runtime.refresh_catalog()
+            result = await runtime.executor.approve_and_execute(
+                request_id,
+                payload_hash,
+                expected_class,
+            )
+        return redact_json(result.public_dict())
+    except (
+        ExecutionPolicyError,
+        httpx.HTTPError,
+        LookupError,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ) as error:
+        return _error_payload(error)
+
+
+@local_mcp.tool(annotations=_ERP_CREATE)
+async def execute_erp_create(
+    request_id: str,
+    payload_hash: str,
+    ctx: Context,
+    repo_root: str | None = None,
+) -> dict[str, Any]:
+    """Approve and execute only an immutable create mutation."""
+
+    return await _approve_and_execute(
+        request_id,
+        payload_hash,
+        ctx,
+        repo_root=repo_root,
+        expected_class=MutationClass.CREATE,
+    )
+
+
+@local_mcp.tool(annotations=_ERP_UPDATE)
+async def execute_erp_update(
+    request_id: str,
+    payload_hash: str,
+    ctx: Context,
+    repo_root: str | None = None,
+) -> dict[str, Any]:
+    """Approve and execute only an immutable update mutation."""
+
+    return await _approve_and_execute(
+        request_id,
+        payload_hash,
+        ctx,
+        repo_root=repo_root,
+        expected_class=MutationClass.UPDATE,
+    )
+
+
+@local_mcp.tool(annotations=_ERP_SENSITIVE)
+async def execute_sensitive_erp_action(
+    request_id: str,
+    payload_hash: str,
+    ctx: Context,
+    repo_root: str | None = None,
+) -> dict[str, Any]:
+    """Approve and execute only an immutable sensitive mutation."""
+
+    return await _approve_and_execute(
+        request_id,
+        payload_hash,
+        ctx,
+        repo_root=repo_root,
+        expected_class=MutationClass.SENSITIVE,
+    )
+
+
 async def preview_erp_write(
     action_id: str,
     inputs: dict[str, Any],
@@ -589,7 +846,7 @@ async def preview_erp_write(
     environment: str = "production",
     repo_root: str | None = None,
 ) -> dict[str, Any]:
-    """Bind one write preview in the existing local request store."""
+    """Compatibility helper for the v0.2 local Python API; not an MCP tool."""
 
     try:
         async with _request_runtime(ctx, repo_root) as runtime:
@@ -606,14 +863,13 @@ async def preview_erp_write(
         return _error_payload(error)
 
 
-@local_mcp.tool(annotations=_NON_DESTRUCTIVE_WRITE)
 async def confirm_erp_write(
     request_id: str,
     payload_hash: str,
     ctx: Context,
     repo_root: str | None = None,
 ) -> dict[str, Any]:
-    """Confirm an immutable preview without accepting replacement payload data."""
+    """Compatibility helper for the v0.2 local Python API; not an MCP tool."""
 
     try:
         async with _request_runtime(ctx, repo_root) as runtime:
@@ -623,13 +879,12 @@ async def confirm_erp_write(
         return _error_payload(error)
 
 
-@local_mcp.tool(annotations=_DESTRUCTIVE_WRITE)
 async def execute_erp_write(
     request_id: str,
     ctx: Context,
     repo_root: str | None = None,
 ) -> dict[str, Any]:
-    """Refresh action versions and execute one confirmed local request."""
+    """Compatibility helper for the v0.2 local Python API; not an MCP tool."""
 
     try:
         async with _request_runtime(ctx, repo_root) as runtime:
@@ -662,7 +917,7 @@ async def get_erp_request_status(
         return _error_payload(error)
 
 
-@local_mcp.tool(annotations=_NON_DESTRUCTIVE_WRITE)
+@local_mcp.tool(annotations=_ERP_IMPORT)
 async def import_erp_spec(
     connector_id: str,
     ctx: Context,

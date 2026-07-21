@@ -109,6 +109,35 @@ def test_audit_ledger_keeps_response_classification_without_provider_record_valu
     assert "Ada Lovelace" not in str(row)
 
 
+def test_audit_ledger_keeps_one_approval_fields_and_drops_legacy_prompt_counts(
+    tmp_path: Path,
+) -> None:
+    ledger = AuditLedger(tmp_path / "audit.jsonl")
+
+    event_id = ledger.record(
+        {
+            "event": "approval_recorded",
+            "approval_level": "elevated",
+            "mutation_class": "sensitive",
+            "approval_count": 1,
+            "required_confirmations": 2,
+            "confirmation_count": 2,
+            "request_inputs": {"body": {"customer": "Ada Lovelace"}},
+        }
+    )
+
+    row = ledger.get(event_id)
+
+    assert row is not None
+    assert row["approval_level"] == "elevated"
+    assert row["mutation_class"] == "sensitive"
+    assert row["approval_count"] == 1
+    assert "required_confirmations" not in row
+    assert "confirmation_count" not in row
+    assert "request_inputs" not in row
+    assert "Ada Lovelace" not in str(row)
+
+
 def test_audit_ledger_redacts_unknown_semantic_values_in_allowlisted_fields(
     tmp_path: Path,
 ) -> None:
@@ -208,7 +237,7 @@ def test_audit_ledger_drops_unknown_cyclic_values_without_inspecting_them(
         {"event": "Ada Lovelace"},
         {"method": "post"},
         {"payload_hash": "not-a-hash"},
-        {"confirmation_count": -1},
+        {"approval_count": -1},
         {"request_id": "invoice-customer-Ada"},
         {"response_summary": {"http_status": 999}},
     ],

@@ -26,7 +26,7 @@ from mercury_tools.cloud.models import (
 )
 from mercury_tools.drivers.registry import DriverRegistry
 from mercury_tools.execution.executor import ERPExecutor, ExecutionPolicyError
-from mercury_tools.execution.policy import effective_risk
+from mercury_tools.execution.policy import MutationClass
 from mercury_tools.execution.store import LocalRequestStore
 from mercury_tools.local.audit import AuditLedger
 from mercury_tools.local.credentials import CredentialStore
@@ -54,6 +54,11 @@ _BUILTIN_SEMANTIC_COUNTS = {"flowaccount": 190, "peak": 64}
 _SEMANTIC_ACTION_ID_RE = re.compile(r"^act_[0-9a-f]{24}$")
 _SEMANTIC_VERSION_ID_RE = re.compile(r"^av_[0-9a-f]{64}$")
 _ActionContextKey = tuple[str, str, str | None]
+_NEXT_EXECUTE_TOOL = {
+    MutationClass.CREATE: "execute_erp_create",
+    MutationClass.UPDATE: "execute_erp_update",
+    MutationClass.SENSITIVE: "execute_sensitive_erp_action",
+}
 
 
 class LocalActionCatalog:
@@ -404,9 +409,10 @@ class LocalMercuryRuntime:
                     "search_erp_actions",
                     "get_erp_action_schema",
                     "run_erp_read",
-                    "preview_erp_write",
-                    "confirm_erp_write",
-                    "execute_erp_write",
+                    "prepare_erp_mutation",
+                    "execute_erp_create",
+                    "execute_erp_update",
+                    "execute_sensitive_erp_action",
                     "get_erp_request_status",
                 ],
                 "llm_called": False,
@@ -420,7 +426,10 @@ class LocalMercuryRuntime:
         environment: str,
     ) -> dict[str, Any]:
         action = self.catalog.require(action_id)
-        if effective_risk(action).tier is not RiskTier.SAFE_READ:
+        if (
+            action.method is not HttpMethod.GET
+            or action.risk_tier is not RiskTier.SAFE_READ
+        ):
             raise ExecutionPolicyError("erp_read_requires_effective_tier_zero")
         result = await self.executor.run_read(
             repository=self.repository,
@@ -430,7 +439,7 @@ class LocalMercuryRuntime:
         )
         return redact_json(result.public_dict())
 
-    async def preview_write(
+    async def prepare_mutation(
         self,
         action_id: str,
         inputs: Mapping[str, Any],
@@ -443,7 +452,28 @@ class LocalMercuryRuntime:
             environment=environment,
             inputs=inputs,
         )
-        return redact_json({"status": "confirmation_required", **prepared.public_dict()})
+        try:
+            next_tool = _NEXT_EXECUTE_TOOL[prepared.mutation_class]
+        except KeyError:
+            raise ExecutionPolicyError("invalid_mutation_class") from None
+        return redact_json(
+            {
+                "status": "prepared",
+                **prepared.public_dict(),
+                "next_tool": next_tool,
+            }
+        )
+
+    async def preview_write(
+        self,
+        action_id: str,
+        inputs: Mapping[str, Any],
+        environment: str,
+    ) -> dict[str, Any]:
+        """Compatibility helper for the v0.2 local Python API."""
+
+        prepared = await self.prepare_mutation(action_id, inputs, environment)
+        return {**prepared, "status": "confirmation_required"}
 
     async def import_catalog_spec(
         self,

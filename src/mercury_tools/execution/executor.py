@@ -16,8 +16,12 @@ from mercury_tools.drivers.base import ConnectorAuthError, ConnectorDriver
 from mercury_tools.drivers.flowaccount import FlowAccountDriver
 from mercury_tools.drivers.models import AuthContext, ConnectorResult
 from mercury_tools.drivers.registry import DriverRegistry
-from mercury_tools.execution.models import PreparedRequest, RequestState
-from mercury_tools.execution.policy import effective_risk
+from mercury_tools.execution.models import (
+    PreflightActionBinding,
+    PreparedRequest,
+    RequestState,
+)
+from mercury_tools.execution.policy import MutationClass, effective_risk
 from mercury_tools.execution.request_builder import (
     RequestBuildError,
     RequestTemplate,
@@ -26,7 +30,7 @@ from mercury_tools.execution.request_builder import (
 )
 from mercury_tools.execution.store import LocalRequestStore, RequestStateError
 from mercury_tools.local.audit import AuditLedger
-from mercury_tools.local.credentials import CredentialStore
+from mercury_tools.local.credentials import CredentialSnapshot, CredentialStore
 from mercury_tools.local.repository import RepositoryConfig, RepositoryContext
 from mercury_tools.qualification.manifest import (
     SandboxActionPolicy,
@@ -58,6 +62,20 @@ class CredentialLoader(Protocol):
         environment: str,
         fields: Sequence[Any],
     ) -> dict[str, str]: ...
+
+    def revision(
+        self,
+        connector_id: str,
+        environment: str,
+        fields: Sequence[Any],
+    ) -> bytes: ...
+
+    def snapshot(
+        self,
+        connector_id: str,
+        environment: str,
+        fields: Sequence[Any],
+    ) -> CredentialSnapshot: ...
 
 
 ClientFactory = Callable[..., httpx.AsyncClient]
@@ -247,14 +265,24 @@ class ERPExecutor:
         action = self._require_active_action(action)
         if action.method is HttpMethod.GET:
             raise ExecutionPolicyError("read_action_cannot_be_previewed")
-        _, template, _, _ = self._prepare_template(
+        driver, template, _, _ = self._prepare_template(
             repository,
             action,
             environment,
             inputs,
         )
         risk = effective_risk(action)
-        payload_hash = template.payload_hash()
+        preflight_actions = self._capture_preflight_actions(action, environment)
+        fields = driver.credential_fields(environment)
+        credential_revision = self._credential_revision(
+            action.connector_id,
+            environment,
+            fields,
+        )
+        payload_hash = template.approval_payload_hash(
+            credential_revision=credential_revision,
+            preflight_actions=preflight_actions,
+        )
         self.request_store.assert_replay_allowed(payload_hash)
         prepared = PreparedRequest.from_template(
             repository=repository,
@@ -263,6 +291,8 @@ class ERPExecutor:
             request=template,
             risk=risk,
             payload_hash=payload_hash,
+            credential_revision=credential_revision,
+            preflight_actions=preflight_actions,
         )
         created = self.request_store.create_preview(prepared, action=action)
         try:
@@ -273,18 +303,49 @@ class ERPExecutor:
         return created
 
     def confirm_write(self, request_id: str, payload_hash: str) -> PreparedRequest:
-        confirmed = self.request_store.confirm(request_id, payload_hash)
+        pending = self.request_store.get(request_id)
+        return self._record_approval(
+            request_id,
+            payload_hash,
+            pending.mutation_class,
+            event="confirmation_recorded",
+        )
+
+    async def approve_and_execute(
+        self,
+        request_id: str,
+        payload_hash: str,
+        expected_class: MutationClass,
+    ) -> ConnectorResult:
+        approved = self._record_approval(
+            request_id,
+            payload_hash,
+            expected_class,
+            event="approval_recorded",
+        )
+        return await self.execute_write(approved.request_id)
+
+    def _record_approval(
+        self,
+        request_id: str,
+        payload_hash: str,
+        expected_class: MutationClass,
+        *,
+        event: str,
+    ) -> PreparedRequest:
+        approved = self.request_store.approve(request_id, payload_hash, expected_class)
         try:
-            self._audit_request(confirmed, event="confirmation_recorded")
+            self._audit_request(approved, event=event)
         except Exception:
-            self.request_store.invalidate(confirmed.request_id, "audit_failed")
+            self.request_store.invalidate(approved.request_id, "audit_failed")
             raise
-        return confirmed
+        return approved
 
     async def execute_write(self, request_id: str) -> ConnectorResult:
         prepared = self.request_store.require_ready(request_id)
         action = self._active_for_prepared(prepared)
         driver = self.drivers.get(prepared.connector_id)
+        self._active_preflight_actions(prepared)
         base_url = driver.resolve_base_url(prepared.environment)
         allow_private = self._allow_private(
             prepared.connector_id,
@@ -314,16 +375,19 @@ class ERPExecutor:
         except NetworkPolicyError:
             self.request_store.invalidate(prepared.request_id, "preview_invalidated_target")
             raise RequestStateError("preview_invalidated_target") from None
-        if not secrets.compare_digest(template.payload_hash(), prepared.payload_hash):
+        if not secrets.compare_digest(
+            template.approval_payload_hash(
+                credential_revision=prepared.credential_revision,
+                preflight_actions=prepared.preflight_actions,
+            ),
+            prepared.payload_hash,
+        ):
             self.request_store.invalidate(prepared.request_id, "preview_binding_changed")
             raise RequestStateError("preview_binding_changed")
 
         fields = driver.credential_fields(prepared.environment)
-        credentials = self.credentials.load(
-            prepared.connector_id,
-            prepared.environment,
-            fields,
-        )
+        snapshot = self._credential_snapshot(prepared, fields)
+        credentials = snapshot.credentials
         allowed_hosts = self._allowed_hosts(prepared.connector_id, prepared.environment, base_url)
         started = time.monotonic()
         try:
@@ -349,6 +413,7 @@ class ERPExecutor:
                     auth=auth,
                     client=client,
                     allow_private=allow_private,
+                    credential_fields=fields,
                 )
                 if preflight is not None:
                     return self._fail_before_dispatch(
@@ -368,6 +433,8 @@ class ERPExecutor:
                         error_code="validation_failed",
                     )
                 self._active_for_prepared(prepared)
+                self._active_preflight_actions(prepared)
+                self._require_credential_revision(prepared, fields)
                 if driver.resolve_base_url(prepared.environment) != base_url:
                     self.request_store.invalidate(
                         prepared.request_id,
@@ -480,6 +547,130 @@ class ERPExecutor:
             response_summary=_response_summary(final),
         )
         return final
+
+    def _credential_revision(
+        self,
+        connector_id: str,
+        environment: str,
+        fields: Sequence[Any],
+    ) -> str:
+        try:
+            generation = self.credentials.revision(connector_id, environment, fields)
+        except Exception:
+            raise ExecutionPolicyError("credential_revision_unavailable") from None
+        return _credential_generation_token(generation)
+
+    def _credential_snapshot(
+        self,
+        prepared: PreparedRequest,
+        fields: Sequence[Any],
+    ) -> CredentialSnapshot:
+        try:
+            snapshot = self.credentials.snapshot(
+                prepared.connector_id,
+                prepared.environment,
+                fields,
+            )
+            revision = _credential_generation_token(snapshot.generation)
+        except Exception:
+            self.request_store.invalidate(
+                prepared.request_id,
+                "preview_invalidated_credentials",
+            )
+            raise RequestStateError("preview_invalidated_credentials") from None
+        if not secrets.compare_digest(revision, prepared.credential_revision):
+            snapshot.credentials.clear()
+            self.request_store.invalidate(
+                prepared.request_id,
+                "preview_invalidated_credentials",
+            )
+            raise RequestStateError("preview_invalidated_credentials")
+        return snapshot
+
+    def _require_credential_revision(
+        self,
+        prepared: PreparedRequest,
+        fields: Sequence[Any],
+    ) -> None:
+        try:
+            revision = self._credential_revision(
+                prepared.connector_id,
+                prepared.environment,
+                fields,
+            )
+        except ExecutionPolicyError:
+            self.request_store.invalidate(
+                prepared.request_id,
+                "preview_invalidated_credentials",
+            )
+            raise RequestStateError("preview_invalidated_credentials") from None
+        if not secrets.compare_digest(revision, prepared.credential_revision):
+            self.request_store.invalidate(
+                prepared.request_id,
+                "preview_invalidated_credentials",
+            )
+            raise RequestStateError("preview_invalidated_credentials")
+
+    def _capture_preflight_actions(
+        self,
+        action: CatalogAction,
+        environment: str,
+    ) -> tuple[PreflightActionBinding, ...]:
+        if len(action.preflight_action_ids) != len(set(action.preflight_action_ids)):
+            raise ExecutionPolicyError("preflight_action_not_active")
+        bindings: list[PreflightActionBinding] = []
+        for action_id in action.preflight_action_ids:
+            try:
+                active = revalidate_catalog_action(self.catalog.require(action_id))
+                version = revalidate_catalog_action(
+                    self.catalog.require_version(action_id, active.version_id)
+                )
+                binding = PreflightActionBinding.from_action(active)
+            except (AttributeError, LookupError, TypeError, ValueError):
+                raise ExecutionPolicyError("preflight_action_not_active") from None
+            if (
+                version != active
+                or active.connector_id != action.connector_id
+                or environment not in active.environments
+            ):
+                raise ExecutionPolicyError("preflight_action_not_active")
+            bindings.append(binding)
+        return tuple(bindings)
+
+    def _active_preflight_actions(
+        self,
+        prepared: PreparedRequest,
+    ) -> tuple[CatalogAction, ...]:
+        actions: list[CatalogAction] = []
+        for binding in prepared.preflight_actions:
+            try:
+                active = revalidate_catalog_action(self.catalog.require(binding.action_id))
+                version = revalidate_catalog_action(
+                    self.catalog.require_version(binding.action_id, binding.version_id)
+                )
+                active_binding = PreflightActionBinding.from_action(active)
+                version_binding = PreflightActionBinding.from_action(version)
+            except (AttributeError, LookupError, TypeError, ValueError):
+                self.request_store.invalidate(
+                    prepared.request_id,
+                    "preview_invalidated_preflight_version",
+                )
+                raise RequestStateError(
+                    "preview_invalidated_preflight_version"
+                ) from None
+            if (
+                active_binding != binding
+                or version_binding != binding
+                or active.connector_id != prepared.connector_id
+                or prepared.environment not in active.environments
+            ):
+                self.request_store.invalidate(
+                    prepared.request_id,
+                    "preview_invalidated_preflight_version",
+                )
+                raise RequestStateError("preview_invalidated_preflight_version")
+            actions.append(version)
+        return tuple(actions)
 
     def _prepare_template(
         self,
@@ -630,20 +821,21 @@ class ERPExecutor:
         auth: Any,
         client: httpx.AsyncClient,
         allow_private: bool,
+        credential_fields: Sequence[Any],
     ) -> str | None:
-        if not action.preflight_action_ids:
+        if not prepared.preflight_actions:
             return None
         configured = action.idempotency.get("preflight_inputs", {})
         if not isinstance(configured, Mapping):
             return "validation_failed"
         duplicate_action = action.idempotency.get("duplicate_action_id")
-        for action_id in action.preflight_action_ids:
-            try:
-                preflight = revalidate_catalog_action(self.catalog.require(action_id))
-            except (AttributeError, LookupError, TypeError, ValueError):
-                return "validation_failed"
-            if preflight.method is not HttpMethod.GET:
-                return "validation_failed"
+        for binding in prepared.preflight_actions:
+            active = {
+                item.action_id: item
+                for item in self._active_preflight_actions(prepared)
+            }
+            preflight = active[binding.action_id]
+            action_id = binding.action_id
             values = configured.get(action_id, {})
             if not isinstance(values, Mapping):
                 return "validation_failed"
@@ -664,6 +856,16 @@ class ERPExecutor:
                     repository_id=prepared.repository_id,
                     environment=prepared.environment,
                 )
+                approved_target = prepared.request_inputs.get("_target", {}).get(
+                    "base_url"
+                )
+                if template.base_url != approved_target:
+                    self.request_store.invalidate(
+                        prepared.request_id,
+                        "preview_invalidated_target",
+                    )
+                    raise RequestStateError("preview_invalidated_target")
+                self._require_credential_revision(prepared, credential_fields)
                 response = await client.send(template.to_httpx_request(auth))
                 result = preflight_driver.interpret_response(
                     action=preflight,
@@ -843,8 +1045,9 @@ class ERPExecutor:
             "method": request.method,
             "payload_hash": request.payload_hash,
             "risk_tier": int(request.risk_tier),
-            "required_confirmations": request.required_confirmations,
-            "confirmation_count": request.confirmation_count,
+            "approval_level": request.approval_level.value,
+            "mutation_class": request.mutation_class.value,
+            "approval_count": request.approval_count,
             "state": request.state.value,
         }
         if response_summary:
@@ -863,23 +1066,36 @@ class ERPExecutor:
     ) -> str:
         summary = _response_summary(result)
         summary["latency_ms"] = latency_ms
-        return self.audit_ledger.record(
-            {
-                "event": event,
-                "local_session_id": self.local_session_id,
-                "repository_id": self.context.repository_id,
-                "connector_id": action.connector_id,
-                "environment": environment,
-                "action_id": action.action_id,
-                "version_id": action.version_id,
-                "method": action.method.value,
-                "risk_tier": int(effective_risk(action).tier),
-                "required_confirmations": effective_risk(action).required_confirmations,
-                "state": state if state in {"succeeded", "failed"} else "failed",
-                "latency_ms": latency_ms,
-                "response_summary": summary,
-            }
-        )
+        row: dict[str, Any] = {
+            "event": event,
+            "local_session_id": self.local_session_id,
+            "repository_id": self.context.repository_id,
+            "connector_id": action.connector_id,
+            "environment": environment,
+            "action_id": action.action_id,
+            "version_id": action.version_id,
+            "method": action.method.value,
+            "risk_tier": int(action.risk_tier),
+            "state": state if state in {"succeeded", "failed"} else "failed",
+            "latency_ms": latency_ms,
+            "response_summary": summary,
+        }
+        if action.method is not HttpMethod.GET:
+            risk = effective_risk(action)
+            row.update(
+                {
+                    "risk_tier": int(risk.tier),
+                    "approval_level": risk.approval_level.value,
+                    "mutation_class": risk.mutation_class.value,
+                }
+            )
+        return self.audit_ledger.record(row)
+
+
+def _credential_generation_token(generation: bytes) -> str:
+    if not isinstance(generation, bytes) or len(generation) != 32:
+        raise ExecutionPolicyError("credential_revision_unavailable")
+    return generation.hex()
 
 
 def _failed_result(*, dispatched: bool) -> ConnectorResult:

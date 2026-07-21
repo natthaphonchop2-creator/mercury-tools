@@ -3,106 +3,228 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from mercury_tools.catalog.models import HttpMethod, RiskTier
-from mercury_tools.execution.policy import RiskDecision, effective_risk
-
-
-@pytest.mark.parametrize(
-    ("method", "side_effects", "confidence", "observed", "declared", "expected"),
-    [
-        (HttpMethod.GET, (), "exact", "success", RiskTier.SAFE_READ, RiskTier.SAFE_READ),
-        (
-            HttpMethod.POST,
-            ("creates_document",),
-            "exact",
-            "success",
-            RiskTier.STANDARD_WRITE,
-            RiskTier.STANDARD_WRITE,
-        ),
-        (
-            HttpMethod.PUT,
-            ("updates_document",),
-            "exact",
-            "success",
-            RiskTier.STANDARD_WRITE,
-            RiskTier.STANDARD_WRITE,
-        ),
-        (
-            HttpMethod.PATCH,
-            ("updates_document",),
-            "exact",
-            "success",
-            RiskTier.STANDARD_WRITE,
-            RiskTier.STANDARD_WRITE,
-        ),
-        (
-            HttpMethod.DELETE,
-            ("deletes_document",),
-            "exact",
-            "success",
-            RiskTier.HIGH_RISK,
-            RiskTier.HIGH_RISK,
-        ),
-        (
-            HttpMethod.POST,
-            ("payment_processed",),
-            "exact",
-            "success",
-            RiskTier.STANDARD_WRITE,
-            RiskTier.HIGH_RISK,
-        ),
-        (
-            HttpMethod.POST,
-            ("APPROVE_DOCUMENT",),
-            "exact",
-            "success",
-            RiskTier.STANDARD_WRITE,
-            RiskTier.HIGH_RISK,
-        ),
-        (
-            HttpMethod.POST,
-            ("creates_document",),
-            "inferred",
-            "untested",
-            RiskTier.STANDARD_WRITE,
-            RiskTier.HIGH_RISK,
-        ),
-        (
-            HttpMethod.PATCH,
-            ("updates_document",),
-            "inferred",
-            "success",
-            RiskTier.STANDARD_WRITE,
-            RiskTier.STANDARD_WRITE,
-        ),
-    ],
+from mercury_tools.execution.policy import (
+    ApprovalLevel,
+    MutationClass,
+    RiskDecision,
+    effective_risk,
 )
-def test_effective_risk_enforces_method_effect_and_observation_floors(
-    action_factory,
-    method: HttpMethod,
-    side_effects: tuple[str, ...],
-    confidence: str,
-    observed: str,
-    declared: RiskTier,
-    expected: RiskTier,
-) -> None:
+
+
+def test_standard_create_requires_one_standard_approval(action_factory) -> None:
     action = action_factory(
-        method=method,
-        side_effects=side_effects,
-        confidence=confidence,
-        observed_state=observed,
-        risk_tier=declared,
-        required_confirmations=int(declared),
+        method=HttpMethod.POST,
+        side_effects=("creates_document",),
     )
 
     decision = effective_risk(action)
 
-    assert decision.tier is expected
-    assert decision.required_confirmations == int(expected)
-    assert decision.tier >= action.risk_tier
-    assert decision.required_confirmations >= action.required_confirmations
+    assert decision == RiskDecision(
+        tier=RiskTier.STANDARD_WRITE,
+        approval_level=ApprovalLevel.STANDARD,
+        mutation_class=MutationClass.CREATE,
+        reasons=(),
+    )
 
 
-def test_effective_risk_preserves_declared_high_risk_floor(action_factory) -> None:
+@pytest.mark.parametrize("method", [HttpMethod.PUT, HttpMethod.PATCH])
+def test_update_requires_one_standard_approval(action_factory, method: HttpMethod) -> None:
+    action = action_factory(
+        method=method,
+        side_effects=("updates_document",),
+    )
+
+    decision = effective_risk(action)
+
+    assert decision.approval_level is ApprovalLevel.STANDARD
+    assert decision.mutation_class is MutationClass.UPDATE
+    assert decision.tier is RiskTier.STANDARD_WRITE
+
+
+def test_delete_requires_one_elevated_approval(action_factory) -> None:
+    action = action_factory(
+        method=HttpMethod.DELETE,
+        side_effects=("removes_document",),
+        risk_tier=RiskTier.HIGH_RISK,
+        required_confirmations=2,
+    )
+
+    decision = effective_risk(action)
+
+    assert decision.approval_level is ApprovalLevel.ELEVATED
+    assert decision.mutation_class is MutationClass.SENSITIVE
+    assert decision.tier is RiskTier.HIGH_RISK
+    assert decision.reasons == ("delete_method",)
+
+
+@pytest.mark.parametrize(
+    "side_effect",
+    [
+        "payment",
+        "payments",
+        "pAyMeNt",
+        "pAyMeNtS",
+        "PaymentProcessed",
+        "payments-processed",
+        "approve",
+        "approves",
+        "ApproveDocument",
+        "approves-document",
+        "void",
+        "voids",
+        "VoidDocument",
+        "voids-document",
+        "post",
+        "posts",
+        "PostJournal",
+        "posts-journal",
+        "finalize",
+        "finalizes",
+        "FinalizeDocument",
+        "finalizes-document",
+        "email",
+        "emails",
+        "SendEmail",
+        "sEnD_eMaIl",
+        "sEnD-eMaIl",
+        "sEnD eMaIl",
+        "send-emails",
+        "EmailCustomer",
+        "emails-customer",
+        "share",
+        "shares",
+        "ShareDocument",
+        "shares-document",
+        "invite",
+        "invites",
+        "InviteUser",
+        "invites-user",
+        "delete",
+        "deletes",
+        "DeleteDocument",
+        "deletes-document",
+    ],
+)
+def test_sensitive_effect_aliases_are_elevated(
+    action_factory,
+    side_effect: str,
+) -> None:
+    action = action_factory(side_effects=(side_effect,))
+
+    decision = effective_risk(action)
+
+    assert decision.approval_level is ApprovalLevel.ELEVATED
+    assert decision.mutation_class is MutationClass.SENSITIVE
+    assert decision.tier is RiskTier.HIGH_RISK
+    assert decision.reasons == ("sensitive_side_effect",)
+
+
+@pytest.mark.parametrize(
+    "side_effect",
+    [
+        "ſhare",
+        "ſHARE",
+        "ſhares",
+        "ſhare_document",
+        "ſend_email",
+        "ſend-emails",
+    ],
+)
+def test_casefold_confusables_do_not_elevate_sensitive_aliases(
+    action_factory,
+    side_effect: str,
+) -> None:
+    action = action_factory(side_effects=(side_effect,))
+
+    decision = effective_risk(action)
+
+    assert decision == RiskDecision(
+        tier=RiskTier.STANDARD_WRITE,
+        approval_level=ApprovalLevel.STANDARD,
+        mutation_class=MutationClass.CREATE,
+        reasons=(),
+    )
+
+
+@pytest.mark.parametrize(
+    "side_effect",
+    [
+        "postpone",
+        "shared_cache",
+        "delete_preview",
+        "paymentบัญชี",
+        "บัญชีpayment",
+        "email通知",
+        "通知email",
+    ],
+)
+def test_non_sensitive_effects_with_sensitive_substrings_remain_standard(
+    action_factory,
+    side_effect: str,
+) -> None:
+    action = action_factory(side_effects=(side_effect,))
+
+    decision = effective_risk(action)
+
+    assert decision == RiskDecision(
+        tier=RiskTier.STANDARD_WRITE,
+        approval_level=ApprovalLevel.STANDARD,
+        mutation_class=MutationClass.CREATE,
+        reasons=(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("confidence", "observed_state", "expected_class", "expected_reasons"),
+    [
+        (
+            "exact",
+            "untested",
+            MutationClass.SENSITIVE,
+            ("unobserved_mutation",),
+        ),
+        (
+            "inferred",
+            "success",
+            MutationClass.SENSITIVE,
+            ("inferred_mutation",),
+        ),
+        (
+            "inferred",
+            "untested",
+            MutationClass.SENSITIVE,
+            ("inferred_mutation", "unobserved_mutation"),
+        ),
+        ("exact", "success", MutationClass.CREATE, ()),
+    ],
+)
+def test_mutation_confidence_and_observation_matrix(
+    action_factory,
+    confidence: str,
+    observed_state: str,
+    expected_class: MutationClass,
+    expected_reasons: tuple[str, ...],
+) -> None:
+    action = action_factory(
+        confidence=confidence,
+        observed_state=observed_state,
+        side_effects=("creates_document",),
+    )
+
+    decision = effective_risk(action)
+
+    expected_elevated = expected_class is MutationClass.SENSITIVE
+    assert decision.approval_level is (
+        ApprovalLevel.ELEVATED if expected_elevated else ApprovalLevel.STANDARD
+    )
+    assert decision.mutation_class is expected_class
+    assert decision.tier is (
+        RiskTier.HIGH_RISK if expected_elevated else RiskTier.STANDARD_WRITE
+    )
+    assert decision.reasons == expected_reasons
+
+
+def test_catalog_confirmation_count_is_compatibility_data_only(action_factory) -> None:
     action = action_factory(
         method=HttpMethod.POST,
         side_effects=("creates_document",),
@@ -114,37 +236,24 @@ def test_effective_risk_preserves_declared_high_risk_floor(action_factory) -> No
 
     assert decision == RiskDecision(
         tier=RiskTier.HIGH_RISK,
-        required_confirmations=2,
+        approval_level=ApprovalLevel.STANDARD,
+        mutation_class=MutationClass.CREATE,
         reasons=("declared_risk_floor",),
     )
 
 
-def test_effective_risk_uses_stable_reason_identifiers(action_factory) -> None:
+def test_effective_risk_rejects_read_action_without_a_mutation_class(
+    action_factory,
+) -> None:
     action = action_factory(
-        method=HttpMethod.POST,
-        side_effects=("send_email", "payment_processed"),
-        confidence="inferred",
-        observed_state="untested",
+        method=HttpMethod.GET,
+        risk_tier=RiskTier.SAFE_READ,
+        required_confirmations=0,
+        side_effects=(),
     )
 
-    decision = effective_risk(action)
-
-    assert decision.reasons == (
-        "high_risk_side_effect",
-        "inferred_unobserved_mutation",
-    )
-    assert all("send_email" not in reason for reason in decision.reasons)
-
-
-def test_delete_reason_is_stable_even_without_matching_effect_name(action_factory) -> None:
-    action = action_factory(
-        method=HttpMethod.DELETE,
-        side_effects=("removes_document",),
-        risk_tier=RiskTier.HIGH_RISK,
-        required_confirmations=2,
-    )
-
-    assert effective_risk(action).reasons == ("delete_method",)
+    with pytest.raises(ValueError, match="^read_action_has_no_mutation_class$"):
+        effective_risk(action)
 
 
 def test_risk_decision_is_frozen(action_factory) -> None:

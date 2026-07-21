@@ -2,8 +2,8 @@
   "schema_version": 1,
   "submission_type": "app-plus-skills",
   "plugin_name": "Mercury Finance",
-  "short_description": "Cited accounting knowledge, ERP API catalogs, and finance workflows for AI agents.",
-  "long_description": "Mercury Finance helps AI agents research Thai and international accounting topics, retrieve citation-bearing context, discover supported ERP connectors and endpoint capabilities, and plan or run controlled Mercury Flows. The public hosted MCP never asks for or stores ERP API secrets and does not directly post production ERP transactions. A separate repository-local connector is available for organizations that need locally controlled ERP execution.",
+  "short_description": "Connector-neutral accounting knowledge, profiles, Skills, and finance workflow plans.",
+  "long_description": "Mercury Finance is a connector-neutral hosted core for cited accounting knowledge, sanitized connector profiles, portable Skills, capability routing, and controlled Mercury Flow plans. The hosted core stores sanitized connector profile and audit metadata but no ERP credentials, and it never claims to invoke another provider MCP through the host. Native provider OAuth remains owned by the host/provider. Advanced local reviewed drivers can perform eligible ERP reads or approval-gated actions only after host approval and explicit local validation.",
   "category": "Finance",
   "logo_file": "assets/mercury-finance-logo.png",
   "developer_identity_instruction": "Select the verified individual or business identity from the publishing OpenAI organization.",
@@ -27,6 +27,6 @@
   "recommended_availability": [
     "TH"
   ],
-  "data_handling_summary": "Stores optional public-workspace display metadata, connector selection, saved Mercury Flow definitions, hashed tool-input fingerprints, and sanitized audit summaries. Does not accept or store ERP credentials in the hosted MCP.",
+  "data_handling_summary": "The hosted core stores sanitized connector profile and audit metadata, optional non-sensitive workspace display metadata, immutable Mercury Flow versions, and evidence references. It stores no ERP credentials, OAuth tokens, API keys, personal identifiers, raw provider payloads, or LAN access details. Advanced local reviewed drivers keep credentials in repository-local secure state and may execute only after host approval.",
   "independence_notice": "Mercury Finance is an independent open-source project and is not affiliated with Mercury Technologies, Inc."
 }

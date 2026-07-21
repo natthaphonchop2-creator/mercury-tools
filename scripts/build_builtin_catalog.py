@@ -26,6 +26,7 @@ from mercury_tools.catalog.importers.sanitize import SanitizationReport, sanitiz
 from mercury_tools.catalog.models import (
     CatalogAction,
     CatalogSource,
+    HttpMethod,
     revalidate_catalog_action,
     revalidate_catalog_source,
 )
@@ -308,9 +309,10 @@ def _build_actions(
             }
         )
         provisional = CatalogAction.model_validate(values)
-        decision = effective_risk(provisional)
-        values["risk_tier"] = decision.tier
-        values["required_confirmations"] = decision.required_confirmations
+        if provisional.method is not HttpMethod.GET:
+            decision = effective_risk(provisional)
+            values["risk_tier"] = decision.tier
+            values["required_confirmations"] = int(decision.tier)
         action = CatalogAction.model_validate(values)
         action = action.model_copy(update={"action_id": build_action_id(action)})
         action = action.model_copy(update={"version_id": build_version_id(action)})

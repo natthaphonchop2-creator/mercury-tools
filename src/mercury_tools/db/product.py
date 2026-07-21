@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import re
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -15,171 +17,13 @@ from mercury_tools.connectors.catalog import connector_by_id, list_connector_sum
 from mercury_tools.connectors.setup import required_missing_fields, resolve_setup_state
 from mercury_tools.flows.parser import parse_flow_text
 from mercury_tools.product import ConnectRequest, normalize_host_app
-from mercury_tools.safety.redaction import redact_json
+from mercury_tools.safety.redaction import redact_json, redact_text
+from mercury_tools.skills.catalog import SKILL_CATALOG_SEED
 from mercury_tools.workspaces.public import (
     new_public_workspace_id,
     public_workspace_connect_request,
     public_workspace_token_payload,
 )
-
-SKILL_CATALOG_SEED: list[dict[str, Any]] = [
-    {
-        "skill_id": "company-health-check-th",
-        "title": "Company Health Check TH",
-        "category": "audit",
-        "summary": "ตรวจสุขภาพบริษัทจากข้อมูลบัญชีและหลักฐานที่มี พร้อมจุดที่ควรให้บัญชีตรวจทาน",
-        "status": "available",
-        "version": "0.1.0",
-        "required_connectors": ["flowaccount"],
-        "tags": ["audit", "thai", "management"],
-    },
-    {
-        "skill_id": "vat-summary-th",
-        "title": "VAT Summary TH",
-        "category": "tax",
-        "summary": "ช่วยสรุป VAT และบริบทภาษีซื้อ/ภาษีขายพร้อม citation จาก Mercury Wiki",
-        "status": "available",
-        "version": "0.1.0",
-        "required_connectors": ["flowaccount"],
-        "tags": ["vat", "thai", "tax"],
-    },
-    {
-        "skill_id": "invoice-review-th",
-        "title": "Invoice Review TH",
-        "category": "audit",
-        "summary": "ตรวจใบแจ้งหนี้/ใบกำกับภาษีและจัดเตรียมงานตาม endpoint capability ที่เชื่อมอยู่",
-        "status": "available",
-        "version": "0.1.0",
-        "required_connectors": ["flowaccount"],
-        "tags": ["invoice", "audit", "thai"],
-    },
-    {
-        "skill_id": "management-report-th",
-        "title": "Management Report TH",
-        "category": "reporting",
-        "summary": "เตรียม context pack สำหรับรายงานผู้บริหาร: รายได้, VAT, cash flow, margin",
-        "status": "available",
-        "version": "0.1.0",
-        "required_connectors": ["flowaccount"],
-        "tags": ["report", "thai", "finance"],
-    },
-    {
-        "skill_id": "connector-setup-guide-th",
-        "title": "Connector Setup Guide TH",
-        "category": "setup",
-        "summary": "แนะนำขั้นตอนเชื่อมโปรแกรมบัญชี โดยแยกข้อมูลที่ต้องถามผู้ใช้กับค่าที่ตั้งล่วงหน้าได้",
-        "status": "available",
-        "version": "0.1.0",
-        "required_connectors": [],
-        "tags": ["setup", "connector", "thai"],
-    },
-    {
-        "skill_id": "connector-credential-setup-th",
-        "title": "Connector Credential Setup TH",
-        "category": "setup",
-        "summary": "นำผู้ใช้เชื่อม ERP ทีละขั้นและหยุดรอจนแต่ละขั้นตรวจสอบสำเร็จ",
-        "status": "available",
-        "version": "0.1.0",
-        "required_connectors": [],
-        "tags": ["setup", "credentials", "connector", "thai"],
-    },
-    {
-        "skill_id": "flowaccount-connector-setup-th",
-        "title": "FlowAccount Connector Setup TH",
-        "category": "setup",
-        "summary": "เชื่อมและตรวจสอบ FlowAccount แบบ guided setup โดยไม่เปิดเผย credential",
-        "status": "available",
-        "version": "0.1.0",
-        "required_connectors": ["flowaccount"],
-        "tags": ["setup", "connector", "flowaccount", "thai"],
-    },
-    {
-        "skill_id": "peak-connector-setup-th",
-        "title": "PEAK Connector Setup TH",
-        "category": "setup",
-        "summary": (
-            "แนะนำการเชื่อม PEAK Open API, credential ที่ต้องใช้, "
-            "เอกสารอ้างอิง, และ setup validation ก่อนใช้งาน GET/POST endpoint"
-        ),
-        "status": "available",
-        "version": "0.1.0",
-        "required_connectors": ["peak"],
-        "tags": ["setup", "connector", "peak", "thai"],
-    },
-    {
-        "skill_id": "mercury-flow-runner",
-        "title": "Mercury Flow Runner",
-        "category": "automation",
-        "summary": "วางแผน บันทึก และรัน workflow บัญชีแบบ read-only พร้อม capability gate",
-        "status": "available",
-        "version": "0.1.0",
-        "required_connectors": [],
-        "tags": ["flow", "workflow", "automation", "read-only"],
-    },
-    {
-        "skill_id": "flowaccount-journal-posting-th",
-        "title": "FlowAccount Journal Posting TH",
-        "category": "accounting",
-        "summary": (
-            "เตรียม ตรวจสมดุล สร้างร่าง และอนุมัติรายการสมุดรายวัน "
-            "FlowAccount โดยแยกการยืนยันแต่ละขั้น"
-        ),
-        "status": "available",
-        "version": "0.1.0",
-        "required_connectors": ["flowaccount"],
-        "tags": ["flowaccount", "journal", "write", "thai"],
-    },
-    {
-        "skill_id": "accounts-receivable-reconciliation-th",
-        "title": "Accounts Receivable Reconciliation TH",
-        "category": "reconciliation",
-        "summary": "กระทบยอดลูกหนี้ ใบแจ้งหนี้ ใบเสร็จ และหลักฐานรับชำระ พร้อมแสดงผลต่างอย่างชัดเจน",
-        "status": "available",
-        "version": "0.1.0",
-        "required_connectors": [],
-        "tags": ["reconciliation", "receivables", "cross-mcp", "thai"],
-    },
-    {
-        "skill_id": "accounts-payable-reconciliation-th",
-        "title": "Accounts Payable Reconciliation TH",
-        "category": "reconciliation",
-        "summary": "กระทบยอดเจ้าหนี้ บิล ค่าใช้จ่าย และหลักฐานจ่ายเงิน พร้อมรายการที่ต้องตรวจทาน",
-        "status": "available",
-        "version": "0.1.0",
-        "required_connectors": [],
-        "tags": ["reconciliation", "payables", "cross-mcp", "thai"],
-    },
-    {
-        "skill_id": "bank-settlement-reconciliation-th",
-        "title": "Bank Settlement Reconciliation TH",
-        "category": "reconciliation",
-        "summary": "กระทบยอดรายการ ERP กับ statement หรือ settlement โดยไม่อนุมานข้อมูลธนาคารที่ขาด",
-        "status": "available",
-        "version": "0.1.0",
-        "required_connectors": [],
-        "tags": ["reconciliation", "bank", "settlement", "cross-mcp", "thai"],
-    },
-    {
-        "skill_id": "marketplace-settlement-review-th",
-        "title": "Marketplace Settlement Review TH",
-        "category": "reconciliation",
-        "summary": "ตรวจ orders, fees, refunds และ payouts จาก marketplace เทียบหลักฐานบัญชีที่เชื่อมได้",
-        "status": "available",
-        "version": "0.1.0",
-        "required_connectors": [],
-        "tags": ["marketplace", "settlement", "reconciliation", "cross-mcp", "thai"],
-    },
-    {
-        "skill_id": "month-end-evidence-gathering-th",
-        "title": "Month-End Evidence Gathering TH",
-        "category": "accounting",
-        "summary": "รวบรวมและจัดกลุ่มหลักฐานปิดเดือนจากแหล่งที่เชื่อม โดยระบุรายการขาดและข้อขัดแย้ง",
-        "status": "available",
-        "version": "0.1.0",
-        "required_connectors": [],
-        "tags": ["month-end", "evidence", "accounting", "cross-mcp", "thai"],
-    },
-]
 
 PRODUCT_STATE_TOOL = "mercury_product_state"
 PRODUCT_FALLBACK_LIMIT = 500
@@ -188,10 +32,89 @@ PUBLIC_CONNECTOR_METADATA_KEYS = frozenset(
         "setup_state",
         "required_secret_fields",
         "preset",
-        "capabilities",
-        "enabled_capabilities",
-        "validation",
         "source",
+        "driver_identity",
+        "evidence_ref",
+    }
+)
+PUBLIC_CONNECTOR_PROFILE_COLUMNS = frozenset(
+    {
+        "id",
+        "workspace_id",
+        "connector_id",
+        "connection_mode",
+        "environment",
+        "display_name",
+        "company_name",
+        "company_ref",
+        "external_server_name",
+        "capability_states",
+        "evidence_source",
+        "validated_at",
+        "status",
+        "created_at",
+        "updated_at",
+    }
+)
+CONNECTION_MODES = frozenset({"native_mcp", "api_driver", "local_bridge"})
+CAPABILITY_STATES = frozenset(
+    {
+        "observed",
+        "provider_unavailable",
+        "not_authorized",
+        "validation_failed",
+        "environment_mismatch",
+    }
+)
+EVIDENCE_SOURCES = frozenset(
+    {
+        "native_mcp_safe_read",
+        "api_driver_safe_probe",
+        "local_bridge_safe_probe",
+    }
+)
+EVIDENCE_SOURCE_BY_CONNECTION_MODE = {
+    "native_mcp": "native_mcp_safe_read",
+    "api_driver": "api_driver_safe_probe",
+    "local_bridge": "local_bridge_safe_probe",
+}
+CAPABILITY_RE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$")
+SENSITIVE_CAPABILITY_KEY_RE = re.compile(
+    r"(?:api[_-]?key|access[_-]?token|auth|bearer|credential|email|password|"
+    r"secret|tax[_-]?id|taxid|token|(?:response|request)[_-]?body|payload)",
+    re.IGNORECASE,
+)
+SAFE_PROFILE_TEXT_RE = re.compile(r"^[A-Za-z0-9._ -]{1,200}$")
+SAFE_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
+SAFE_EVIDENCE_REF_RE = re.compile(r"^evidence_[0-9a-z_-]{8,128}$")
+SAFE_PRESET_KEYS = frozenset(
+    {
+        "api_base_url",
+        "auth_method",
+        "client_token_ttl_hours",
+        "docs_url",
+        "grant_type",
+        "scope",
+        "timestamp_format",
+        "token_path",
+        "token_url",
+    }
+)
+MUTATION_CAPABILITY_SEGMENTS = frozenset(
+    {
+        "approve",
+        "attach",
+        "create",
+        "delete",
+        "invite",
+        "payment",
+        "post",
+        "remove",
+        "send",
+        "share",
+        "update",
+        "upload",
+        "void",
     }
 )
 LEGACY_VAULT_KEYS = frozenset(
@@ -319,21 +242,185 @@ def email_domain(email: str) -> str:
     return parts[1] if len(parts) == 2 else ""
 
 
+def _safe_profile_text(
+    value: Any,
+    *,
+    pattern: re.Pattern[str] = SAFE_PROFILE_TEXT_RE,
+) -> str | None:
+    if not isinstance(value, str):
+        return None
+    clean = redact_text(value).strip()
+    if "[REDACTED" in clean or not pattern.fullmatch(clean):
+        return None
+    return clean
+
+
+def safe_external_server_name(value: Any) -> str | None:
+    """Return the canonical public native MCP server name, if valid."""
+
+    clean = _safe_profile_text(value, pattern=SAFE_SERVER_NAME_RE)
+    return clean if clean and not _is_ip_address(clean) else None
+
+
+def _safe_connector_metadata(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    metadata: dict[str, Any] = {}
+    setup_state = _safe_profile_text(value.get("setup_state"))
+    if setup_state:
+        metadata["setup_state"] = setup_state
+    source = _safe_profile_text(value.get("source"))
+    if source:
+        metadata["source"] = source
+    driver_identity = _safe_profile_text(value.get("driver_identity"))
+    if driver_identity:
+        metadata["driver_identity"] = driver_identity
+    evidence_ref = _safe_profile_text(
+        value.get("evidence_ref"),
+        pattern=SAFE_EVIDENCE_REF_RE,
+    )
+    if evidence_ref:
+        metadata["evidence_ref"] = evidence_ref
+    required_secret_fields = value.get("required_secret_fields")
+    if isinstance(required_secret_fields, list):
+        fields = [
+            item
+            for item in (
+                _safe_profile_text(field, pattern=SAFE_SERVER_NAME_RE)
+                for field in required_secret_fields[:50]
+            )
+            if item
+        ]
+        if fields:
+            metadata["required_secret_fields"] = fields
+    preset = value.get("preset")
+    if isinstance(preset, Mapping):
+        safe_preset = {
+            key: clean
+            for key, item in preset.items()
+            if isinstance(key, str)
+            and key in SAFE_PRESET_KEYS
+            and (clean := _safe_profile_text(item, pattern=re.compile(r"^.{1,500}$")))
+        }
+        if safe_preset:
+            metadata["preset"] = safe_preset
+    return metadata
+
+
 def _public_connector_metadata(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
+    return _safe_connector_metadata(value)
+
+
+def _safe_capability_states(value: Any) -> dict[str, str]:
+    if not isinstance(value, Mapping):
         return {}
     return {
-        str(key): item
-        for key, item in value.items()
-        if str(key) in PUBLIC_CONNECTOR_METADATA_KEYS
+        capability: state
+        for key, value_state in value.items()
+        if isinstance(key, str)
+        and isinstance(value_state, str)
+        and len(key) <= 200
+        and CAPABILITY_RE.fullmatch(key)
+        and not SENSITIVE_CAPABILITY_KEY_RE.search(key)
+        and value_state in CAPABILITY_STATES
+        and (capability := key)
+        and (state := value_state)
     }
 
 
+def _safe_evidence_source(value: Any) -> str | None:
+    return value if isinstance(value, str) and value in EVIDENCE_SOURCES else None
+
+
+def _safe_validated_at(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(UTC).isoformat() if parsed.tzinfo else None
+
+
+def _is_ip_address(value: str | None) -> bool:
+    if not value:
+        return False
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_observed_mutation(capability: str) -> bool:
+    return bool(set(capability.split(".")) & MUTATION_CAPABILITY_SEGMENTS)
+
+
+def _has_reviewed_api_driver_mutation(
+    connector_id: str,
+    connection_mode: str,
+    capability_states: Mapping[str, str],
+) -> bool:
+    connector = connector_by_id(connector_id)
+    mode = connector.connection_mode(connection_mode) if connector else None
+    if (
+        connector is None
+        or connector.status != "available"
+        or mode is None
+        or mode.mode.value != "api_driver"
+        or mode.status != "reviewed"
+        or mode.capability_source != "reviewed_api_catalog"
+    ):
+        return False
+    return any(
+        state == "observed"
+        and _is_observed_mutation(capability)
+        and bool(connector.provider_capabilities(connection_mode, capability))
+        for capability, state in capability_states.items()
+    )
+
+
+def _all_observed_capabilities_are_catalog_bound(
+    connector_id: str,
+    connection_mode: str,
+    capability_states: Mapping[str, str],
+) -> bool:
+    connector = connector_by_id(connector_id)
+    mode = connector.connection_mode(connection_mode) if connector else None
+    if connector is None or mode is None:
+        return False
+    if mode.capability_source == "discovered_tools":
+        return True
+    return all(
+        bool(connector.provider_capabilities(connection_mode, capability))
+        for capability, state in capability_states.items()
+        if state == "observed"
+    )
+
+
 def public_connector_profile(profile: dict[str, Any]) -> dict[str, Any]:
-    public = dict(profile)
-    public["metadata"] = _public_connector_metadata(public.get("metadata"))
-    if str(public.get("status") or "").strip().lower() == "connected_read_only":
-        public["status"] = "connected"
+    metadata = profile.get("metadata")
+    public = {
+        key: profile[key]
+        for key in PUBLIC_CONNECTOR_PROFILE_COLUMNS
+        if key in profile
+    }
+    public["connection_mode"] = str(public.get("connection_mode") or "api_driver")
+    public["capability_states"] = _safe_capability_states(public.get("capability_states"))
+    public["evidence_source"] = _safe_evidence_source(public.get("evidence_source"))
+    public["validated_at"] = _safe_validated_at(public.get("validated_at"))
+    for field in ("company_name", "company_ref", "external_server_name", "display_name"):
+        if field in public:
+            pattern = (
+                SAFE_SERVER_NAME_RE
+                if field == "external_server_name"
+                else SAFE_PROFILE_TEXT_RE
+            )
+            public[field] = _safe_profile_text(
+                public[field],
+                pattern=pattern,
+            )
+    public["metadata"] = _public_connector_metadata(metadata)
     return redact_json(public)
 
 
@@ -368,8 +455,44 @@ def public_product_event(row: dict[str, Any]) -> dict[str, Any]:
     return public_product_value(dict(row))
 
 
-def connector_profile_status_from_metadata(metadata: dict[str, Any] | None) -> str:
-    return "requires_credentials"
+def connector_profile_status(
+    connector_id: str,
+    connection_mode: str,
+    capability_states: Mapping[str, str],
+    *,
+    evidence_source: str | None,
+    validated_at: str | None,
+) -> str:
+    mode = str(connection_mode).strip().lower()
+    states = _safe_capability_states(capability_states)
+    connector = connector_by_id(connector_id)
+    catalog_mode = connector.connection_mode(mode) if connector else None
+    expected_evidence_source = EVIDENCE_SOURCE_BY_CONNECTION_MODE.get(mode)
+    if mode not in CONNECTION_MODES or catalog_mode is None:
+        return "needs_validation"
+    if (
+        _safe_evidence_source(evidence_source) != expected_evidence_source
+        or not _safe_validated_at(validated_at)
+        or not states
+    ):
+        return "requires_local_setup" if mode == "local_bridge" else "needs_validation"
+    if "not_authorized" in states.values():
+        return "requires_authorization"
+    if any(state != "observed" for state in states.values()):
+        return "needs_validation"
+    if not _all_observed_capabilities_are_catalog_bound(connector_id, mode, states):
+        return "needs_validation"
+    if mode == "native_mcp" and catalog_mode.capability_source == "discovered_tools":
+        return "ready_read_only"
+    if mode == "native_mcp":
+        return (
+            "ready_read_only"
+            if any(not _is_observed_mutation(capability) for capability in states)
+            else "needs_validation"
+        )
+    if _has_reviewed_api_driver_mutation(connector_id, mode, states):
+        return "ready_read_write"
+    return "ready_read_only"
 
 
 def is_product_schema_error(exc: RuntimeError) -> bool:
@@ -517,19 +640,29 @@ class SupabaseProductStore:
         return context
 
     def _fallback_state_events(self, workspace_key_value: str) -> list[dict[str, Any]]:
-        rows = self._request(
-            "GET",
-            "mcp_audit_events",
-            params={
-                "tool_name": f"eq.{PRODUCT_STATE_TOOL}",
-                "select": "id,created_at,tool_name,output_summary,status,metadata",
-                "order": "created_at.asc",
-                "limit": str(PRODUCT_FALLBACK_LIMIT),
-            },
-        )
+        rows: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            page = self._request(
+                "GET",
+                "mcp_audit_events",
+                params={
+                    "tool_name": f"eq.{PRODUCT_STATE_TOOL}",
+                    "metadata->>workspace_key": f"eq.{workspace_key_value}",
+                    "select": "id,created_at,tool_name,output_summary,status,metadata",
+                    "order": "created_at.asc,id.asc",
+                    "limit": str(PRODUCT_FALLBACK_LIMIT),
+                    "offset": str(offset),
+                },
+            )
+            page_rows = page or []
+            rows.extend(page_rows)
+            if len(page_rows) < PRODUCT_FALLBACK_LIMIT:
+                break
+            offset += len(page_rows)
         return [
             row
-            for row in rows or []
+            for row in rows
             if (row.get("metadata") or {}).get("workspace_key") == workspace_key_value
         ]
 
@@ -537,7 +670,7 @@ class SupabaseProductStore:
         context = self._fallback_workspace_for_token(token_payload)
         key = context["workspace"]["workspace_key"]
         skills = {skill["skill_id"]: skill for skill in skill_catalog_rows()}
-        connector_profiles: dict[str, dict[str, Any]] = {}
+        connector_profiles = self._fallback_current_connector_profiles(key)
         members: dict[str, dict[str, Any]] = {
             context["member"]["id"]: context["member"],
         }
@@ -559,10 +692,6 @@ class SupabaseProductStore:
                             if field in saved_workspace
                         },
                     }
-            elif event_type == "connector.profile_configured":
-                profile = summary.get("profile") or {}
-                profile_key = f"{profile.get('connector_id')}:{profile.get('environment')}"
-                connector_profiles[profile_key] = public_connector_profile(profile)
             elif event_type in {"skill.enabled", "skill.disabled"}:
                 skill_id = str(summary.get("skill_id") or "")
                 if skill_id in skills:
@@ -620,6 +749,37 @@ class SupabaseProductStore:
             )[:12],
             "events": [public_product_event(event) for event in reversed(events[-12:])],
         }
+
+    @staticmethod
+    def _fallback_connector_profile_key(
+        connector_id: str | None,
+        connection_mode: str | None,
+        environment: str | None,
+    ) -> str:
+        return f"{connector_id}:{connection_mode}:{environment}"
+
+    def _fallback_current_connector_profiles(self, workspace_key: str) -> dict[str, dict[str, Any]]:
+        profiles: dict[str, dict[str, Any]] = {}
+        for row in self._fallback_state_events(workspace_key):
+            summary = row.get("output_summary") or {}
+            event_type = str(summary.get("event_type") or "")
+            if event_type == "connector.profile_configured":
+                profile = summary.get("profile") or {}
+                profile_key = self._fallback_connector_profile_key(
+                    profile.get("connector_id"),
+                    profile.get("connection_mode", "api_driver"),
+                    profile.get("environment"),
+                )
+                profiles[profile_key] = public_connector_profile(profile)
+            elif event_type == "connector.profile_unlinked":
+                event_summary = summary.get("event_summary") or {}
+                profile_key = self._fallback_connector_profile_key(
+                    event_summary.get("connector_id"),
+                    event_summary.get("connection_mode"),
+                    event_summary.get("environment"),
+                )
+                profiles.pop(profile_key, None)
+        return profiles
 
     def _fallback_flows_for_workspace_key(self, workspace_key_value: str) -> list[dict[str, Any]]:
         flows: dict[str, dict[str, Any]] = {}
@@ -807,56 +967,121 @@ class SupabaseProductStore:
         connector_id: str,
         environment: str,
         company_name: str | None,
+        connection_mode: str = "api_driver",
         display_name: str | None = None,
         metadata: dict[str, Any] | None = None,
+        company_ref: str | None = None,
+        external_server_name: str | None = None,
+        capability_states: Mapping[str, str] | None = None,
+        evidence_source: str | None = None,
+        validated_at: str | None = None,
+        reset_validation: bool = False,
     ) -> dict[str, Any]:
         context = self._fallback_workspace_for_token(token_payload)
         connector = connector_by_id(connector_id)
         if not connector:
             raise ValueError(f"Unknown connector: {connector_id}")
         canonical_connector_id = connector.connector_id
-        if environment not in connector.environments:
+        mode = connector.connection_mode(connection_mode)
+        if not mode:
             raise ValueError(
-                f"Unsupported environment for {canonical_connector_id}: {environment}"
+                f"Unsupported connection mode for {canonical_connector_id}: {connection_mode}"
+            )
+        if environment not in mode.supported_environments:
+            raise ValueError(
+                f"Unsupported environment for {canonical_connector_id}/"
+                f"{mode.mode.value}: {environment}"
             )
         profile_id = stable_id(
             "connector",
             context["workspace"]["workspace_key"],
             canonical_connector_id,
+            mode.mode.value,
             environment,
         )
-        existing_profile: dict[str, Any] | None = None
-        for row in self._fallback_state_events(context["workspace"]["workspace_key"]):
-            summary = row.get("output_summary") or {}
-            if summary.get("event_type") != "connector.profile_configured":
-                continue
-            profile = summary.get("profile") or {}
-            if (
-                profile.get("connector_id") == canonical_connector_id
-                and profile.get("environment") == environment
-            ):
-                existing_profile = profile
+        profile_key = self._fallback_connector_profile_key(
+            canonical_connector_id,
+            mode.mode.value,
+            environment,
+        )
+        existing_profile = self._fallback_current_connector_profiles(
+            context["workspace"]["workspace_key"]
+        ).get(profile_key)
         existing_metadata = _public_connector_metadata(
             (existing_profile or {}).get("metadata")
         )
+        if reset_validation:
+            existing_metadata.pop("evidence_ref", None)
         merged_metadata = {
             **existing_metadata,
             "required_secret_fields": connector.required_secret_fields,
             "preset": connector.preset_for_environment(environment),
             **_public_connector_metadata(metadata),
         }
+        resolved_capability_states = (
+            {}
+            if reset_validation
+            else _safe_capability_states(
+                capability_states
+                if capability_states is not None
+                else (existing_profile or {}).get("capability_states")
+            )
+        )
+        resolved_validated_at = (
+            None
+            if reset_validation
+            else _safe_validated_at(
+                validated_at
+                if validated_at is not None
+                else (existing_profile or {}).get("validated_at")
+            )
+        )
+        resolved_evidence_source = (
+            None
+            if reset_validation
+            else _safe_evidence_source(
+                evidence_source
+                if evidence_source is not None
+                else (existing_profile or {}).get("evidence_source")
+            )
+        )
         profile = {
             "id": profile_id,
             "workspace_id": context["workspace"]["id"],
             "connector_id": canonical_connector_id,
+            "connection_mode": mode.mode.value,
             "environment": environment,
-            "display_name": display_name or connector.name,
-            "company_name": (
-                company_name
-                if company_name is not None
-                else (existing_profile or {}).get("company_name")
+            "display_name": (
+                _safe_profile_text(display_name)
+                or _safe_profile_text((existing_profile or {}).get("display_name"))
+                or connector.name
             ),
-            "status": connector_profile_status_from_metadata(merged_metadata),
+            "company_name": (
+                _safe_profile_text(company_name)
+                if company_name is not None
+                else _safe_profile_text((existing_profile or {}).get("company_name"))
+            ),
+            "company_ref": _safe_profile_text(
+                company_ref
+                if company_ref is not None
+                else (existing_profile or {}).get("company_ref")
+            ),
+            "external_server_name": _safe_profile_text(
+                external_server_name
+                if external_server_name is not None
+                else (existing_profile or {}).get("external_server_name"),
+                pattern=SAFE_SERVER_NAME_RE,
+            ),
+            "capability_states": resolved_capability_states,
+            "evidence_source": resolved_evidence_source,
+            "validated_at": resolved_validated_at,
+            "status": connector_profile_status(
+                canonical_connector_id,
+                mode.mode.value,
+                resolved_capability_states,
+                evidence_source=resolved_evidence_source,
+                validated_at=resolved_validated_at,
+            ),
             "metadata": merged_metadata,
             "created_at": now_utc(),
             "updated_at": now_utc(),
@@ -868,12 +1093,14 @@ class SupabaseProductStore:
             event_type="connector.profile_configured",
             input_payload={
                 "connector_id": canonical_connector_id,
+                "connection_mode": mode.mode.value,
                 "environment": environment,
             },
             summary={
                 "profile": public_profile,
                 "event_summary": {
                     "connector_id": canonical_connector_id,
+                    "connection_mode": mode.mode.value,
                     "environment": environment,
                     "status": profile["status"],
                 },
@@ -912,6 +1139,309 @@ class SupabaseProductStore:
             },
         )
 
+    def link_connector_profile(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        connection_mode: str,
+        environment: str,
+        company_ref: str | None = None,
+        company_name: str | None = None,
+        external_server_name: str | None = None,
+    ) -> dict[str, Any]:
+        connector = connector_by_id(connector_id)
+        if connector is None:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        mode = connector.connection_mode(connection_mode)
+        if mode is None:
+            raise ValueError(
+                f"Unsupported connection mode for {connector.connector_id}: {connection_mode}"
+            )
+        if environment not in mode.supported_environments:
+            raise ValueError(
+                "Unsupported environment for "
+                f"{connector.connector_id}/{mode.mode.value}: {environment}"
+            )
+        native_server_name = _safe_profile_text(
+            external_server_name,
+            pattern=SAFE_SERVER_NAME_RE,
+        )
+        if mode.mode.value == "native_mcp" and not native_server_name:
+            raise ValueError("external_server_name is required for native_mcp profiles")
+        if mode.mode.value == "native_mcp" and _is_ip_address(native_server_name):
+            raise ValueError("external_server_name must be a server name, not a LAN address")
+        if mode.mode.value == "local_bridge" and external_server_name is not None:
+            raise ValueError("local_bridge profiles do not store external_server_name")
+
+        metadata = {
+            "source": mode.mode.value,
+            **(
+                {"driver_identity": "mercury_api_driver"}
+                if mode.mode.value == "api_driver"
+                else {}
+            ),
+        }
+        return self.set_connector_profile(
+            token_payload=token_payload,
+            connector_id=connector.connector_id,
+            connection_mode=mode.mode.value,
+            environment=environment,
+            company_ref=company_ref,
+            company_name=company_name,
+            external_server_name=external_server_name,
+            metadata=metadata,
+            reset_validation=True,
+        )
+
+    def validate_connector_profile(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        connection_mode: str,
+        environment: str,
+        capability_states: Mapping[str, str],
+        evidence_source: str,
+        evidence_ref: str,
+        validated_at: str,
+    ) -> dict[str, Any]:
+        connector = connector_by_id(connector_id)
+        if connector is None:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        mode = connector.connection_mode(connection_mode)
+        if mode is None:
+            raise ValueError(
+                f"Unsupported connection mode for {connector.connector_id}: {connection_mode}"
+            )
+        if environment not in mode.supported_environments:
+            raise ValueError(
+                "Unsupported environment for "
+                f"{connector.connector_id}/{mode.mode.value}: {environment}"
+            )
+        expected_source = EVIDENCE_SOURCE_BY_CONNECTION_MODE[mode.mode.value]
+        if evidence_source != expected_source:
+            raise ValueError("evidence_source does not match connection_mode")
+        if not _safe_profile_text(evidence_ref, pattern=SAFE_EVIDENCE_REF_RE):
+            raise ValueError("evidence_ref is invalid")
+        states = _safe_capability_states(capability_states)
+        if not states or len(states) != len(capability_states):
+            raise ValueError("capability_states are invalid")
+        for capability, _state in states.items():
+            catalog_bound = connector.provider_capabilities(
+                mode.mode.value,
+                capability,
+            )
+            discovered_capability = mode.capability_source == "discovered_tools"
+            if not (catalog_bound or discovered_capability):
+                raise ValueError("capability is not declared for connection mode")
+        if not _safe_validated_at(validated_at):
+            raise ValueError("validated_at is invalid")
+        try:
+            return self._validate_connector_profile_product_tables(
+                token_payload=token_payload,
+                connector_id=connector.connector_id,
+                connection_mode=mode.mode.value,
+                environment=environment,
+                capability_states=states,
+                evidence_source=evidence_source,
+                evidence_ref=evidence_ref,
+                validated_at=validated_at,
+            )
+        except RuntimeError as exc:
+            if is_product_schema_error(exc):
+                return self._fallback_validate_connector_profile(
+                    token_payload=token_payload,
+                    connector_id=connector.connector_id,
+                    connection_mode=mode.mode.value,
+                    environment=environment,
+                    capability_states=states,
+                    evidence_source=evidence_source,
+                    evidence_ref=evidence_ref,
+                    validated_at=validated_at,
+                )
+            raise
+
+    def _fallback_validate_connector_profile(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        connection_mode: str,
+        environment: str,
+        capability_states: Mapping[str, str],
+        evidence_source: str,
+        evidence_ref: str,
+        validated_at: str,
+    ) -> dict[str, Any]:
+        context = self._fallback_workspace_for_token(token_payload)
+        profile_key = self._fallback_connector_profile_key(
+            connector_id,
+            connection_mode,
+            environment,
+        )
+        profiles = self._fallback_current_connector_profiles(context["workspace"]["workspace_key"])
+        if profile_key not in profiles:
+            raise ValueError("A linked connector profile is required before validation.")
+        return self._fallback_set_connector_profile(
+            token_payload=token_payload,
+            connector_id=connector_id,
+            connection_mode=connection_mode,
+            environment=environment,
+            company_name=None,
+            capability_states=capability_states,
+            evidence_source=evidence_source,
+            validated_at=validated_at,
+            metadata={"evidence_ref": evidence_ref},
+        )
+
+    def _validate_connector_profile_product_tables(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        connection_mode: str,
+        environment: str,
+        capability_states: Mapping[str, str],
+        evidence_source: str,
+        evidence_ref: str,
+        validated_at: str,
+    ) -> dict[str, Any]:
+        context = self.workspace_for_token(token_payload)
+        if not context:
+            raise ValueError("Workspace is not registered for this client token.")
+        existing_rows = self._request(
+            "GET",
+            "mercury_connector_profiles",
+            params={
+                "workspace_id": f"eq.{context['workspace']['id']}",
+                "connector_id": f"eq.{connector_id}",
+                "connection_mode": f"eq.{connection_mode}",
+                "environment": f"eq.{environment}",
+                "select": "id",
+                "limit": "1",
+            },
+        )
+        if not existing_rows:
+            raise ValueError("A linked connector profile is required before validation.")
+        return self._set_connector_profile_product_tables(
+            token_payload=token_payload,
+            connector_id=connector_id,
+            connection_mode=connection_mode,
+            environment=environment,
+            company_name=None,
+            capability_states=capability_states,
+            evidence_source=evidence_source,
+            validated_at=validated_at,
+            metadata={"evidence_ref": evidence_ref},
+        )
+
+    def unlink_connector_profile(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        connection_mode: str,
+        environment: str,
+    ) -> dict[str, Any]:
+        connector = connector_by_id(connector_id)
+        if connector is None:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        mode = connector.connection_mode(connection_mode)
+        if mode is None:
+            raise ValueError(
+                f"Unsupported connection mode for {connector.connector_id}: {connection_mode}"
+            )
+        if environment not in mode.supported_environments:
+            raise ValueError(
+                "Unsupported environment for "
+                f"{connector.connector_id}/{mode.mode.value}: {environment}"
+            )
+        try:
+            return self._unlink_connector_profile_product_tables(
+                token_payload=token_payload,
+                connector_id=connector.connector_id,
+                connection_mode=mode.mode.value,
+                environment=environment,
+            )
+        except RuntimeError as exc:
+            if is_product_schema_error(exc):
+                return self._fallback_unlink_connector_profile(
+                    token_payload=token_payload,
+                    connector_id=connector.connector_id,
+                    connection_mode=mode.mode.value,
+                    environment=environment,
+                )
+            raise
+
+    def _fallback_unlink_connector_profile(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        connection_mode: str,
+        environment: str,
+    ) -> dict[str, Any]:
+        context = self._fallback_workspace_for_token(token_payload)
+        self._fallback_record_state_event(
+            workspace_key=context["workspace"]["workspace_key"],
+            client_jti=str(token_payload.get("jti") or ""),
+            event_type="connector.profile_unlinked",
+            input_payload={
+                "connector_id": connector_id,
+                "connection_mode": connection_mode,
+                "environment": environment,
+            },
+            summary={
+                "event_summary": {
+                    "connector_id": connector_id,
+                    "connection_mode": connection_mode,
+                    "environment": environment,
+                    "deleted": True,
+                },
+            },
+        )
+        return {"deleted": True}
+
+    def _unlink_connector_profile_product_tables(
+        self,
+        *,
+        token_payload: dict[str, Any],
+        connector_id: str,
+        connection_mode: str,
+        environment: str,
+    ) -> dict[str, Any]:
+        context = self.workspace_for_token(token_payload)
+        if not context:
+            raise ValueError("Workspace is not registered for this client token.")
+        self._request(
+            "DELETE",
+            "mercury_connector_profiles",
+            params={
+                "workspace_id": f"eq.{context['workspace']['id']}",
+                "connector_id": f"eq.{connector_id}",
+                "connection_mode": f"eq.{connection_mode}",
+                "environment": f"eq.{environment}",
+            },
+        )
+        self.record_event(
+            workspace_id=context["workspace"]["id"],
+            member_id=context["member"]["id"],
+            event_type="connector.profile_unlinked",
+            input_payload={
+                "connector_id": connector_id,
+                "connection_mode": connection_mode,
+                "environment": environment,
+            },
+            summary={
+                "connector_id": connector_id,
+                "connection_mode": connection_mode,
+                "environment": environment,
+                "deleted": True,
+            },
+        )
+        return {"deleted": True}
+
     def _fallback_record_uploaded_skill(
         self,
         *,
@@ -928,6 +1458,7 @@ class SupabaseProductStore:
             "summary": str(metadata.get("summary") or "Uploaded workspace skill."),
             "status": "uploaded",
             "version": "0.1.0",
+            "required_capabilities": metadata.get("required_capabilities") or [],
             "required_connectors": metadata.get("required_connectors") or [],
             "tags": metadata.get("tags") or ["uploaded"],
             "metadata": {
@@ -1224,7 +1755,7 @@ class SupabaseProductStore:
             params={
                 "select": (
                     "skill_id,title,category,summary,status,version,"
-                    "required_connectors,tags,metadata,updated_at"
+                    "required_capabilities,required_connectors,tags,metadata,updated_at"
                 ),
                 "order": "category.asc,title.asc",
             },
@@ -1244,8 +1775,9 @@ class SupabaseProductStore:
             params={
                 "workspace_id": f"eq.{workspace_id}",
                 "select": (
-                    "id,connector_id,environment,display_name,status,company_name,"
-                    "metadata,created_at,updated_at"
+                    "id,connector_id,connection_mode,environment,display_name,status,"
+                    "company_name,company_ref,external_server_name,capability_states,"
+                    "evidence_source,validated_at,metadata,created_at,updated_at"
                 ),
                 "order": "updated_at.desc",
             },
@@ -1434,8 +1966,15 @@ class SupabaseProductStore:
         connector_id: str,
         environment: str,
         company_name: str | None = None,
+        connection_mode: str = "api_driver",
         display_name: str | None = None,
         metadata: dict[str, Any] | None = None,
+        company_ref: str | None = None,
+        external_server_name: str | None = None,
+        capability_states: Mapping[str, str] | None = None,
+        evidence_source: str | None = None,
+        validated_at: str | None = None,
+        reset_validation: bool = False,
     ) -> dict[str, Any]:
         connector = connector_by_id(connector_id)
         if not connector:
@@ -1447,8 +1986,15 @@ class SupabaseProductStore:
                 connector_id=canonical_connector_id,
                 environment=environment,
                 company_name=company_name,
+                connection_mode=connection_mode,
                 display_name=display_name,
                 metadata=metadata,
+                company_ref=company_ref,
+                external_server_name=external_server_name,
+                capability_states=capability_states,
+                evidence_source=evidence_source,
+                validated_at=validated_at,
+                reset_validation=reset_validation,
             )
         except RuntimeError as exc:
             if is_product_schema_error(exc):
@@ -1457,8 +2003,15 @@ class SupabaseProductStore:
                     connector_id=canonical_connector_id,
                     environment=environment,
                     company_name=company_name,
+                    connection_mode=connection_mode,
                     display_name=display_name,
                     metadata=metadata,
+                    company_ref=company_ref,
+                    external_server_name=external_server_name,
+                    capability_states=capability_states,
+                    evidence_source=evidence_source,
+                    validated_at=validated_at,
+                    reset_validation=reset_validation,
                 )
             raise
 
@@ -1469,8 +2022,15 @@ class SupabaseProductStore:
         connector_id: str,
         environment: str,
         company_name: str | None,
+        connection_mode: str = "api_driver",
         display_name: str | None = None,
         metadata: dict[str, Any] | None = None,
+        company_ref: str | None = None,
+        external_server_name: str | None = None,
+        capability_states: Mapping[str, str] | None = None,
+        evidence_source: str | None = None,
+        validated_at: str | None = None,
+        reset_validation: bool = False,
     ) -> dict[str, Any]:
         context = self.workspace_for_token(token_payload)
         if not context:
@@ -1479,9 +2039,15 @@ class SupabaseProductStore:
         if not connector:
             raise ValueError(f"Unknown connector: {connector_id}")
         canonical_connector_id = connector.connector_id
-        if environment not in connector.environments:
+        mode = connector.connection_mode(connection_mode)
+        if not mode:
             raise ValueError(
-                f"Unsupported environment for {canonical_connector_id}: {environment}"
+                f"Unsupported connection mode for {canonical_connector_id}: {connection_mode}"
+            )
+        if environment not in mode.supported_environments:
+            raise ValueError(
+                f"Unsupported environment for {canonical_connector_id}/"
+                f"{mode.mode.value}: {environment}"
             )
         existing_rows = self._request(
             "GET",
@@ -1489,8 +2055,12 @@ class SupabaseProductStore:
             params={
                 "workspace_id": f"eq.{context['workspace']['id']}",
                 "connector_id": f"eq.{canonical_connector_id}",
+                "connection_mode": f"eq.{mode.mode.value}",
                 "environment": f"eq.{environment}",
-                "select": "id,metadata,display_name,company_name",
+                "select": (
+                    "id,metadata,display_name,company_name,company_ref,"
+                    "external_server_name,capability_states,evidence_source,validated_at"
+                ),
                 "limit": "1",
             },
         )
@@ -1498,6 +2068,8 @@ class SupabaseProductStore:
         existing_metadata = _public_connector_metadata(
             (existing_profile or {}).get("metadata")
         )
+        if reset_validation:
+            existing_metadata.pop("evidence_ref", None)
         merged_metadata = {
             **existing_metadata,
             "required_secret_fields": connector.required_secret_fields,
@@ -1507,21 +2079,67 @@ class SupabaseProductStore:
         payload = {
             "workspace_id": context["workspace"]["id"],
             "connector_id": canonical_connector_id,
+            "connection_mode": mode.mode.value,
             "environment": environment,
             "display_name": (
-                display_name
+                _safe_profile_text(display_name)
                 if display_name is not None
-                else (existing_profile or {}).get("display_name") or connector.name
+                else _safe_profile_text((existing_profile or {}).get("display_name"))
+                or connector.name
             ),
-            "status": connector_profile_status_from_metadata(merged_metadata),
+            "company_ref": _safe_profile_text(
+                company_ref
+                if company_ref is not None
+                else (existing_profile or {}).get("company_ref")
+            ),
+            "external_server_name": _safe_profile_text(
+                external_server_name
+                if external_server_name is not None
+                else (existing_profile or {}).get("external_server_name"),
+                pattern=SAFE_SERVER_NAME_RE,
+            ),
+            "capability_states": (
+                {}
+                if reset_validation
+                else _safe_capability_states(
+                    capability_states
+                    if capability_states is not None
+                    else (existing_profile or {}).get("capability_states")
+                )
+            ),
+            "evidence_source": (
+                None
+                if reset_validation
+                else _safe_evidence_source(
+                    evidence_source
+                    if evidence_source is not None
+                    else (existing_profile or {}).get("evidence_source")
+                )
+            ),
+            "validated_at": (
+                None
+                if reset_validation
+                else _safe_validated_at(
+                    validated_at
+                    if validated_at is not None
+                    else (existing_profile or {}).get("validated_at")
+                )
+            ),
             "metadata": merged_metadata,
         }
+        payload["status"] = connector_profile_status(
+            canonical_connector_id,
+            mode.mode.value,
+            payload["capability_states"],
+            evidence_source=payload["evidence_source"],
+            validated_at=payload["validated_at"],
+        )
         if company_name is not None:
-            payload["company_name"] = company_name
+            payload["company_name"] = _safe_profile_text(company_name)
         row = self._upsert_one(
             "mercury_connector_profiles",
             payload,
-            on_conflict="workspace_id,connector_id,environment",
+            on_conflict="workspace_id,connector_id,connection_mode,environment",
         )
         self.record_event(
             workspace_id=context["workspace"]["id"],
@@ -1529,10 +2147,12 @@ class SupabaseProductStore:
             event_type="connector.profile_configured",
             input_payload={
                 "connector_id": canonical_connector_id,
+                "connection_mode": mode.mode.value,
                 "environment": environment,
             },
             summary={
                 "connector_id": canonical_connector_id,
+                "connection_mode": mode.mode.value,
                 "environment": environment,
                 "status": row["status"],
             },
@@ -1587,6 +2207,7 @@ class SupabaseProductStore:
                 "summary": str(metadata.get("summary") or "Uploaded workspace skill."),
                 "status": "uploaded",
                 "version": "0.1.0",
+                "required_capabilities": metadata.get("required_capabilities") or [],
                 "required_connectors": metadata.get("required_connectors") or [],
                 "tags": metadata.get("tags") or ["uploaded"],
                 "metadata": {

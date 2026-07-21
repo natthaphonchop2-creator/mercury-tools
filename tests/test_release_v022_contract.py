@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import tomllib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -36,7 +35,12 @@ def _canonical_digest(payload: dict[str, object]) -> str:
     ).hexdigest()
 
 
-def _attestation_payload() -> dict[str, object]:
+def _attestation_payload(
+    *,
+    version: str = "0.2.2",
+    migration_id: str = "20260716100000",
+    hosted_tool_count: int = 20,
+) -> dict[str, object]:
     issued_at = NOW.isoformat().replace("+00:00", "Z")
     started_at = (NOW - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
     expires_at = (NOW + timedelta(minutes=60)).isoformat().replace("+00:00", "Z")
@@ -78,7 +82,7 @@ def _attestation_payload() -> dict[str, object]:
             "public_mcp": {
                 "catalog_action_count": 254,
                 "flowaccount_citations": 1,
-                "hosted_tool_count": 20,
+                "hosted_tool_count": hosted_tool_count,
                 "peak_citations": 1,
                 "status": 200,
                 "write_tools_exposed": False,
@@ -86,36 +90,36 @@ def _attestation_payload() -> dict[str, object]:
             "render": {
                 "catalog_action_count": 254,
                 "commit": REVIEWED_SHA,
-                "hosted_tool_count": 20,
+                "hosted_tool_count": hosted_tool_count,
                 "logs_scanned": True,
                 "status": "live",
-                "version": "0.2.2",
+                "version": version,
             },
             "reviewed_sha": REVIEWED_SHA,
             "supabase": {
                 "function_count": 10,
-                "migration_id": "20260716100000",
+                "migration_id": migration_id,
                 "project_ref_sha256": "6" * 64,
                 "rag_identity_count": 254,
                 "read_only": True,
                 "schema_sha256": "7" * 64,
                 "table_count": 17,
             },
-            "version": "0.2.2",
+            "version": version,
         },
         "public_tree_digest": PUBLIC_TREE_DIGEST,
         "reviewed_sha": REVIEWED_SHA,
         "schema_version": 2,
         "staging": {
             "commit_sha": "8" * 40,
-            "ref": f"v0.2.2-rc.{REVIEWED_SHA[:12]}",
+            "ref": f"v{version}-rc.{REVIEWED_SHA[:12]}",
             "repository": "natthaphonchop2-creator/mercury-tools-staging",
             "tag_object_sha": "9" * 40,
         },
         "surface_count": 8,
         "surface_evidence_sha256": "a" * 64,
         "surfaces": surfaces,
-        "version": "0.2.2",
+        "version": version,
         "workflow": {
             "attempt": 2,
             "control_commit": CONTROL_SHA,
@@ -269,6 +273,56 @@ def test_v022_handoff_rejects_symlinks_and_existing_output(tmp_path) -> None:
             now=NOW,
         )
 
+
+def test_v030_attestation_and_handoff_bind_new_release_identity(tmp_path) -> None:
+    from mercury_tools.release.handoff_v3 import write_release_ready_handoff
+
+    attestation_path = tmp_path / "trusted-hosted-attestation.json"
+    digest = _write_attestation(
+        attestation_path,
+        _attestation_payload(
+            version="0.3.0",
+            migration_id="20260719120000",
+            hosted_tool_count=24,
+        ),
+    )
+    attestation = _load(attestation_path, digest)
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    names = (
+        "SHA256SUMS.json",
+        "mercury-finance-plugin-0.3.0.zip",
+        "mercury-tools-0.3.0-source.tar.gz",
+        "mercury_tools-0.3.0-py3-none-any.whl",
+        "mercury_tools-0.3.0.tar.gz",
+    )
+    for index, name in enumerate(names, start=1):
+        (artifacts / name).write_bytes(f"artifact-{index}".encode())
+
+    handoff = write_release_ready_handoff(
+        artifacts=artifacts,
+        attestation=attestation,
+        control_artifact_id=101,
+        control_artifact_digest="b" * 64,
+        control_payload_sha256=digest,
+        mercury_repository_id=MERCURY_REPOSITORY_ID,
+        mercury_run_id=2002,
+        mercury_run_attempt=3,
+        release_bundle_artifact_id=303,
+        release_bundle_artifact_digest="c" * 64,
+        output=tmp_path / "mercury-v0.3.0-release-ready.json",
+        now=NOW + timedelta(minutes=5),
+    )
+
+    assert handoff.version == "0.3.0"
+    assert handoff.mercury_workflow.workflow_path == (
+        ".github/workflows/release-v0.3.0.yml"
+    )
+    assert handoff.release_bundle.name == (
+        "mercury-v0.3.0-release-artifacts-2002-attempt-3"
+    )
+    assert handoff.staging_ref == f"v0.3.0-rc.{REVIEWED_SHA[:12]}"
+
 def test_v022_release_workflow_is_secretless_read_only_and_attempt_bound() -> None:
     workflow_path = (
         Path(__file__).resolve().parents[1] / ".github/workflows/release-v0.2.2.yml"
@@ -293,29 +347,14 @@ def test_v022_release_workflow_is_secretless_read_only_and_attempt_bound() -> No
     assert "schema_version" in serialized
 
 
-def test_all_active_public_version_surfaces_are_v022() -> None:
+def test_v022_historical_release_surfaces_remain_available() -> None:
     root = Path(__file__).resolve().parents[1]
-    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-    plugin = json.loads(
-        (root / "plugins/mercury-finance/.codex-plugin/plugin.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    mcp = json.loads(
-        (root / "plugins/mercury-finance/.mcp.json").read_text(encoding="utf-8")
-    )
-    package_source = (root / "src/mercury_tools/__init__.py").read_text(
-        encoding="utf-8"
-    )
-    ci = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-    post_public = (root / ".github/workflows/post-public-verify.yml").read_text(
-        encoding="utf-8"
+    workflow = yaml.load(
+        (root / ".github/workflows/release-v0.2.2.yml").read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
     )
 
-    assert project["project"]["version"] == "0.2.2"
-    assert plugin["version"] == "0.2.2+codex.20260717"
-    assert package_source.strip().endswith('__version__ = "0.2.2"')
-    assert mcp["mcpServers"]["mercury-finance"]["args"][1].endswith("@v0.2.2")
-    assert "docs/release/v0.2.2-test-waivers.json" in ci
-    assert "ref: v0.2.2" in post_public
-    assert "--tag v0.2.2 --release v0.2.2" in post_public
+    assert workflow["env"]["RELEASE_TAG"] == "v0.2.2"
+    assert workflow["env"]["RELEASE_VERSION"] == "0.2.2"
+    assert (root / "docs/RELEASE_V0.2.2.md").is_file()
+    assert (root / "docs/release/v0.2.2-test-waivers.json").is_file()

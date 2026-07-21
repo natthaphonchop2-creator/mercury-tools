@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
+import re
 from collections.abc import Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -26,7 +28,6 @@ from mercury_tools.config import load_settings
 from mercury_tools.connectors.catalog import (
     connector_by_id,
     list_connector_public_summaries,
-    public_capability_gate,
 )
 from mercury_tools.db.product import (
     SupabaseProductStore,
@@ -45,15 +46,32 @@ from mercury_tools.flows.runner import create_default_runner
 from mercury_tools.flows.templates import FLOW_CHEAT_SHEET
 from mercury_tools.flows.workspace import discover_workspace_flows, workspace_manifest
 from mercury_tools.mcp.schemas import (
-    AccountingSkillId,
+    AccountingSkillIdInput,
     AccountingSkillInputs,
+    AccountingSkillInputsInput,
+    ConnectorConnectionMode,
     ConnectorEnvironment,
     ConnectorId,
+    ConnectorUnlinkConfirmation,
+    ConnectorValidationEvidence,
+    ConnectorValidationEvidenceInput,
+    FlowEnvironmentValue,
+    FlowEnvironmentValues,
     FlowFileInput,
+    FlowFiles,
+    FlowTags,
+    InlineFlowYaml,
     KnowledgeSearchFilters,
+    LegacyConnectorSetupRequest,
     MercuryFlowSource,
     SearchMode,
     WorkspaceFlowMetadata,
+)
+from mercury_tools.mercury_runtime import (
+    get_accounting_skill_schema as runtime_accounting_skill_schema,
+)
+from mercury_tools.mercury_runtime import (
+    list_accounting_skills as runtime_accounting_skill_catalog,
 )
 from mercury_tools.mercury_runtime import skill_markdown
 from mercury_tools.product import (
@@ -76,27 +94,122 @@ from mercury_tools.rag.models import (
 from mercury_tools.rag.routing import apply_knowledge_routing, infer_knowledge_domain
 from mercury_tools.rag.service import MIN_RELEVANCE_SCORE, RagService
 from mercury_tools.safety.redaction import redact_json
+from mercury_tools.skills.catalog import accounting_skill_by_id
+from mercury_tools.skills.routing import resolve_skill_route
 from mercury_tools.workspaces import (
     normalize_public_workspace_id,
     public_workspace_token_payload,
 )
 
-mcp = FastMCP("Mercury Tools")
+
+class StrictInputFastMCP(FastMCP):
+    """FastMCP registry whose public argument models reject unknown keys."""
+
+    def add_tool(
+        self,
+        fn: Any,
+        name: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        annotations: ToolAnnotations | None = None,
+        icons: list[Any] | None = None,
+        meta: dict[str, Any] | None = None,
+        structured_output: bool | None = None,
+    ) -> None:
+        super().add_tool(
+            fn,
+            name=name,
+            title=title,
+            description=description,
+            annotations=annotations,
+            icons=icons,
+            meta=meta,
+            structured_output=structured_output,
+        )
+        registered = self._tool_manager.get_tool(name or fn.__name__)
+        if registered is None:  # pragma: no cover - FastMCP just registered it
+            raise RuntimeError("FastMCP did not retain the registered tool")
+        argument_model = registered.fn_metadata.arg_model
+        argument_model.model_config["extra"] = "forbid"
+        argument_model.model_config["hide_input_in_errors"] = True
+        argument_model.model_rebuild(force=True)
+        registered.parameters = argument_model.model_json_schema(by_alias=True)
+
+
+mcp = StrictInputFastMCP("Mercury Tools")
 
 _SEARCH_FILTER_FIELDS = frozenset(SearchFilters.__dataclass_fields__)
 MAX_MCP_FLOW_FILES = 50
 MAX_MCP_FLOW_FILE_CHARS = 500_000
 CONNECTOR_ENV_KEYS = ("connector", "connector_id", "accounting_connector", "erp_connector")
 ENVIRONMENT_ENV_KEYS = ("environment", "connector_environment", "connector_env")
+CONNECTION_MODE_ENV_KEYS = ("connection_mode", "connector_connection_mode")
 CAPABILITY_KEYS = ("required_capabilities", "requiredCapabilities", "capabilities")
 CONNECTOR_BACKED_COMMANDS = {"connectorStatus"}
-CONNECTOR_TAGS = {"connector", "connectors", "connector-backed", "accounting-connector", "erp-connector"}
+CONNECTOR_TAGS = {
+    "connector",
+    "connectors",
+    "connector-backed",
+    "accounting-connector",
+    "erp-connector",
+}
 _LOWER_HEX = frozenset("0123456789abcdef")
-_AUDITED_PRIVATE = ToolAnnotations(
-    readOnlyHint=False,
+_SAFE_PUBLIC_PROFILE_TEXT_RE = re.compile(r"^[A-Za-z0-9._ -]{1,200}$")
+_SAFE_EXTERNAL_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
+_SAFE_ACCOUNTING_SKILL_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,100}$")
+_HOSTED_FLOW_ENVIRONMENT_SECRET_NAME_RE = re.compile(
+    r"(?i)(?:secret|token|api[\W_]*key|password|authorization|"
+    r"private[\W_]*key|service[\W_]*role[\W_]*key|credentials?|cookies?)"
+)
+_ACCOUNTING_SKILL_SECRET_NAME_RE = re.compile(
+    r"(?i)(?:secret|token|api[\W_]*key|password|authorization|"
+    r"private[\W_]*key|service[\W_]*role[\W_]*key|credentials?|cookies?)"
+)
+_EVIDENCE_SOURCE_BY_CONNECTION_MODE = {
+    "native_mcp": "native_mcp_safe_read",
+    "api_driver": "api_driver_safe_probe",
+    "local_bridge": "local_bridge_safe_probe",
+}
+_MUTATION_CAPABILITY_SEGMENTS = frozenset(
+    {
+        "approve",
+        "attach",
+        "create",
+        "delete",
+        "invite",
+        "payment",
+        "post",
+        "remove",
+        "send",
+        "share",
+        "update",
+        "upload",
+        "void",
+    }
+)
+_ACCOUNTING_SKILL_INPUTS_ADAPTER = TypeAdapter(AccountingSkillInputs)
+_CLOSED_READ = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
     openWorldHint=False,
+)
+_CLOSED_CREATE = ToolAnnotations(
+    readOnlyHint=False,
     destructiveHint=False,
     idempotentHint=False,
+    openWorldHint=False,
+)
+_CLOSED_IDEMPOTENT_WRITE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+_CLOSED_DESTRUCTIVE_IDEMPOTENT = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=True,
+    openWorldHint=False,
 )
 _MERCURY_FLOW_SOURCE_ADAPTER = TypeAdapter(MercuryFlowSource)
 
@@ -180,9 +293,7 @@ def _merge_search_results(
             current = by_chunk.get(result.chunk_id)
             if current is None or result.score > current.score:
                 by_chunk[result.chunk_id] = result
-    return sorted(by_chunk.values(), key=lambda result: result.score, reverse=True)[
-        :max_chunks
-    ]
+    return sorted(by_chunk.values(), key=lambda result: result.score, reverse=True)[:max_chunks]
 
 
 def _env_overrides_from_payload(raw: Any) -> dict[str, str]:
@@ -202,6 +313,124 @@ def _env_overrides_from_payload(raw: Any) -> dict[str, str]:
 
 def _env_keys(env: dict[str, str]) -> list[str]:
     return sorted(env)
+
+
+def _hosted_flow_environment_overrides(raw: Any) -> dict[str, str]:
+    values = [] if raw == () else raw
+    if not isinstance(values, list) or len(values) > 100:
+        raise ValueError("hosted_flow_environment_invalid")
+
+    environment: dict[str, str] = {}
+    for item in values:
+        if isinstance(item, FlowEnvironmentValue):
+            item = item.model_dump(mode="python")
+        if not isinstance(item, Mapping) or set(item) != {"name", "value"}:
+            raise ValueError("hosted_flow_environment_invalid")
+
+        name = item["name"]
+        value = item["value"]
+        if (
+            not isinstance(name, str)
+            or not isinstance(value, str)
+            or _HOSTED_FLOW_ENVIRONMENT_SECRET_NAME_RE.search(name)
+            or redact_json(value) != value
+        ):
+            raise ValueError("hosted_flow_environment_invalid")
+        try:
+            normalized = FlowEnvironmentValue.model_validate(item)
+        except ValidationError as exc:
+            raise ValueError("hosted_flow_environment_invalid") from exc
+        environment[normalized.name] = normalized.value
+    return environment
+
+
+def _invalid_hosted_flow_environment_payload(
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "message": "Hosted flow environment is invalid.",
+        "dry_run": dry_run,
+    }
+
+
+def _invalid_hosted_flow_workspace_payload(*, dry_run: bool) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "message": "Invalid Mercury public workspace ID.",
+        "dry_run": dry_run,
+    }
+
+
+def _hosted_inline_flow_yaml(raw: Any) -> str:
+    if not isinstance(raw, str) or not 1 <= len(raw) <= MAX_MCP_FLOW_FILE_CHARS:
+        raise ValueError("hosted_inline_flow_yaml_invalid")
+    return raw
+
+
+def _invalid_hosted_inline_flow_payload(*, dry_run: bool) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "message": "Hosted inline flow YAML is invalid.",
+        "dry_run": dry_run,
+    }
+
+
+def _invalid_accounting_skill_inputs_payload() -> dict[str, str]:
+    return {
+        "status": "error",
+        "message": "Accounting skill inputs are invalid.",
+    }
+
+
+def _invalid_accounting_skill_id_payload() -> dict[str, str]:
+    return {
+        "status": "error",
+        "message": "Accounting skill ID is invalid.",
+    }
+
+
+def _safe_accounting_skill_id(value: Any) -> str | None:
+    if (
+        not isinstance(value, str)
+        or not _SAFE_ACCOUNTING_SKILL_ID_RE.fullmatch(value)
+        or redact_json(value) != value
+    ):
+        return None
+    return value
+
+
+def _validated_accounting_skill_inputs(skill: Any, raw: Any) -> dict[str, Any]:
+    try:
+        envelope = _ACCOUNTING_SKILL_INPUTS_ADAPTER.validate_python(raw)
+    except ValidationError as exc:
+        raise ValueError("accounting_skill_inputs_invalid") from exc
+
+    envelope_payload = envelope.model_dump(mode="python")
+    if redact_json(envelope_payload) != envelope_payload:
+        raise ValueError("accounting_skill_inputs_invalid")
+
+    values = envelope.model_dump(
+        mode="python",
+        exclude={"parameters"},
+        exclude_none=True,
+        exclude_unset=True,
+    )
+    for parameter in envelope.parameters:
+        if _ACCOUNTING_SKILL_SECRET_NAME_RE.search(parameter.name):
+            raise ValueError("accounting_skill_inputs_invalid")
+        values[parameter.name] = parameter.value
+
+    try:
+        validated = skill.input_schema.model_validate(values)
+    except ValidationError as exc:
+        raise ValueError("accounting_skill_inputs_invalid") from exc
+    return validated.model_dump(
+        mode="json",
+        exclude_none=True,
+        exclude_unset=True,
+    )
 
 
 def _string_list_from_payload(raw: Any, *, label: str) -> list[str]:
@@ -468,10 +697,7 @@ def _manifest_has_connection_healthcheck_adapter(manifest: Any) -> bool:
         or ""
     ).strip()
     return bool(
-        (
-            getattr(validation, "safe_probe", False)
-            or getattr(validation, "read_only", False)
-        )
+        (getattr(validation, "safe_probe", False) or getattr(validation, "read_only", False))
         and method
         and method != "manual"
         and endpoint
@@ -618,6 +844,7 @@ def _raw_flow_readiness_selection(
     return {
         "connector_backed": connector_backed,
         "connector_id": connector_id,
+        "connection_mode": _first_mapping_value(effective_env, CONNECTION_MODE_ENV_KEYS),
         "environment": _first_mapping_value(effective_env, ENVIRONMENT_ENV_KEYS),
         "required_capabilities": _required_capabilities_from_sources(
             metadata={},
@@ -639,11 +866,6 @@ def _raw_mcp_connector_setup_block(
     if not readiness_selection["connector_backed"]:
         return None, readiness_selection
 
-    for capability in readiness_selection["required_capabilities"]:
-        blocked = public_capability_gate(capability)
-        if blocked is not None:
-            return blocked, readiness_selection
-
     if not isinstance(workspace_id, str) or not workspace_id.strip():
         return _public_workspace_required_payload(), readiness_selection
 
@@ -652,13 +874,15 @@ def _raw_mcp_connector_setup_block(
         return _connector_setup_block_payload(), readiness_selection
 
     dashboard_payload = _product_store(settings).public_dashboard(workspace_id)
-    if not readiness_selection["connector_id"] or not workspace_connector_ready(
+    resolution = _workspace_connector_resolution(
         dashboard_payload,
         connector_id=readiness_selection["connector_id"],
+        connection_mode=readiness_selection["connection_mode"],
         environment=readiness_selection["environment"],
         required_capabilities=readiness_selection["required_capabilities"],
-    ):
-        return _connector_setup_block_payload(), readiness_selection
+    )
+    if not resolution["ready"]:
+        return _connector_setup_block_payload(resolution), readiness_selection
     return None, readiness_selection
 
 
@@ -692,6 +916,10 @@ def _workspace_flow_readiness_selection(
             or _first_mapping_value(metadata, CONNECTOR_ENV_KEYS)
             or _connector_from_flow_tags(flow)
         ),
+        "connection_mode": (
+            _first_mapping_value(effective_env, CONNECTION_MODE_ENV_KEYS)
+            or _first_mapping_value(metadata, CONNECTION_MODE_ENV_KEYS)
+        ),
         "environment": (
             _first_mapping_value(effective_env, ENVIRONMENT_ENV_KEYS)
             or _first_mapping_value(metadata, ENVIRONMENT_ENV_KEYS)
@@ -707,12 +935,10 @@ def _workspace_connector_ready(
     dashboard_payload: dict[str, Any],
     *,
     connector_id: str | None = None,
+    connection_mode: str | None = None,
     environment: str | None = None,
     required_capabilities: list[str] | None = None,
 ) -> bool:
-    profiles = dashboard_payload.get("connector_profiles")
-    if not isinstance(profiles, list) or not profiles:
-        return False
     selected_connector = _clean_selector(connector_id)
     selected_environment = _clean_selector(environment)
     if not selected_connector or not selected_environment:
@@ -720,65 +946,261 @@ def _workspace_connector_ready(
     manifest = connector_by_id(selected_connector)
     if not manifest:
         return False
-    if _clean_selector(manifest.status) != "available":
-        return False
-    manifest_environments = {
-        str(item).strip().lower()
-        for item in manifest.environments
-        if str(item).strip()
-    }
-    if selected_environment not in manifest_environments:
-        return False
-    if not _manifest_has_connection_healthcheck_adapter(manifest):
-        return False
-    manifest_capabilities = {
-        str(capability).strip()
-        for capability in manifest.capabilities
-        if str(capability).strip()
-    }
-    if not manifest_capabilities:
-        return False
-    required = {str(capability).strip() for capability in required_capabilities or [] if str(capability).strip()}
-    if required and not required.issubset(manifest_capabilities):
-        return False
-    for profile in profiles:
-        if not isinstance(profile, dict):
-            continue
-        profile_connector = _clean_selector(profile.get("connector_id"))
-        profile_environment = _clean_selector(profile.get("environment"))
-        if selected_connector and profile_connector != selected_connector:
-            continue
-        if selected_environment and profile_environment != selected_environment:
-            continue
-        if _clean_selector(profile.get("status")) not in {"connected", "connected_read_only"}:
-            continue
-        metadata = profile.get("metadata") or {}
-        setup_state = _clean_selector(metadata.get("setup_state")) if isinstance(metadata, dict) else None
-        if setup_state != "ready":
-            continue
-        enabled_capabilities = {str(item).strip() for item in _profile_enabled_capabilities(profile)}
-        if not enabled_capabilities:
-            continue
-        if not enabled_capabilities.issubset(manifest_capabilities):
-            continue
-        if required and not required.issubset(enabled_capabilities):
-            continue
-        return True
-    return False
+    return _workspace_connector_resolution(
+        dashboard_payload,
+        connector_id=selected_connector,
+        connection_mode=connection_mode,
+        environment=selected_environment,
+        required_capabilities=required_capabilities,
+    )["ready"]
 
 
 def workspace_connector_ready(
     dashboard_payload: dict[str, Any],
     *,
     connector_id: str | None = None,
+    connection_mode: str | None = None,
     environment: str | None = None,
     required_capabilities: list[str] | None = None,
 ) -> bool:
     return _workspace_connector_ready(
         dashboard_payload,
         connector_id=connector_id,
+        connection_mode=connection_mode,
         environment=environment,
         required_capabilities=required_capabilities,
+    )
+
+
+def _profile_capability_states(profile: dict[str, Any]) -> dict[str, str]:
+    raw_states = profile.get("capability_states")
+    if not isinstance(raw_states, dict):
+        return {}
+    return {
+        str(capability).strip(): str(state).strip()
+        for capability, state in raw_states.items()
+        if str(capability).strip() and str(state).strip()
+    }
+
+
+def _profile_provider_actions(
+    manifest: Any,
+    mode: Any,
+    capability: str,
+) -> tuple[str, ...]:
+    normalized = str(capability).strip().lower()
+    provider_actions = manifest.provider_capabilities(mode.mode.value, normalized)
+    if provider_actions:
+        return provider_actions
+    if mode.capability_source == "discovered_tools" and normalized:
+        return (normalized,)
+    return ()
+
+
+def _connector_resolution(
+    *,
+    ready: bool,
+    reason: str | None,
+    connector_id: str | None,
+    connection_mode: str | None,
+    environment: str | None,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "ready": ready,
+        "reason": reason,
+        "connector_id": connector_id,
+        "connection_mode": connection_mode,
+        "environment": environment,
+        "profile": profile,
+    }
+
+
+def _workspace_connector_resolution(
+    dashboard_payload: dict[str, Any],
+    *,
+    connector_id: str | None,
+    connection_mode: str | None,
+    environment: str | None,
+    required_capabilities: list[str] | None = None,
+) -> dict[str, Any]:
+    selected_connector = _clean_selector(connector_id)
+    selected_environment = _clean_selector(environment)
+    selected_mode = _clean_selector(connection_mode)
+    if not selected_connector:
+        return _connector_resolution(
+            ready=False,
+            reason="connector_required",
+            connector_id=None,
+            connection_mode=selected_mode,
+            environment=selected_environment,
+        )
+    if not selected_environment:
+        return _connector_resolution(
+            ready=False,
+            reason="environment_mismatch",
+            connector_id=selected_connector,
+            connection_mode=selected_mode,
+            environment=None,
+        )
+    manifest = connector_by_id(selected_connector)
+    if manifest is None:
+        return _connector_resolution(
+            ready=False,
+            reason="not_validated",
+            connector_id=selected_connector,
+            connection_mode=selected_mode,
+            environment=selected_environment,
+        )
+    profiles = [
+        profile
+        for profile in dashboard_payload.get("connector_profiles") or []
+        if isinstance(profile, dict)
+        and _clean_selector(profile.get("connector_id")) == manifest.connector_id
+        and _clean_selector(profile.get("environment")) == selected_environment
+    ]
+    if not selected_mode:
+        if len(profiles) != 1:
+            return _connector_resolution(
+                ready=False,
+                reason="connection_mode_required",
+                connector_id=manifest.connector_id,
+                connection_mode=None,
+                environment=selected_environment,
+            )
+        selected_mode = _clean_selector(profiles[0].get("connection_mode"))
+    mode = manifest.connection_mode(selected_mode)
+    if mode is None:
+        return _connector_resolution(
+            ready=False,
+            reason="not_validated",
+            connector_id=manifest.connector_id,
+            connection_mode=selected_mode,
+            environment=selected_environment,
+        )
+    if selected_environment not in mode.supported_environments:
+        return _connector_resolution(
+            ready=False,
+            reason="environment_mismatch",
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=selected_environment,
+        )
+    profiles = [
+        profile
+        for profile in profiles
+        if _clean_selector(profile.get("connection_mode")) == mode.mode.value
+    ]
+    if len(profiles) > 1:
+        return _connector_resolution(
+            ready=False,
+            reason="connection_mode_required",
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=selected_environment,
+        )
+    if not profiles:
+        reason = "local_bridge_required" if mode.mode.value == "local_bridge" else "not_validated"
+        return _connector_resolution(
+            ready=False,
+            reason=reason,
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=selected_environment,
+        )
+    profile = public_connector_profile(profiles[0])
+    states = _profile_capability_states(profile)
+    expected_source = _EVIDENCE_SOURCE_BY_CONNECTION_MODE[mode.mode.value]
+    if _clean_selector(profile.get("evidence_source")) != expected_source:
+        return _connector_resolution(
+            ready=False,
+            reason="local_bridge_required"
+            if mode.mode.value == "local_bridge"
+            else "not_validated",
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=selected_environment,
+            profile=profile,
+        )
+    if not profile.get("validated_at") or not states:
+        return _connector_resolution(
+            ready=False,
+            reason="not_validated",
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=selected_environment,
+            profile=profile,
+        )
+    if any(
+        state == "observed" and not _profile_provider_actions(manifest, mode, capability)
+        for capability, state in states.items()
+    ):
+        return _connector_resolution(
+            ready=False,
+            reason="not_validated",
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=selected_environment,
+            profile=profile,
+        )
+    for state in states.values():
+        if state != "observed":
+            return _connector_resolution(
+                ready=False,
+                reason=state,
+                connector_id=manifest.connector_id,
+                connection_mode=mode.mode.value,
+                environment=selected_environment,
+                profile=profile,
+            )
+    if _clean_selector(profile.get("status")) not in {"ready_read_only", "ready_read_write"}:
+        return _connector_resolution(
+            ready=False,
+            reason="not_validated",
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=selected_environment,
+            profile=profile,
+        )
+    for capability in required_capabilities or []:
+        actions = _profile_provider_actions(manifest, mode, str(capability))
+        if not actions:
+            return _connector_resolution(
+                ready=False,
+                reason="not_validated",
+                connector_id=manifest.connector_id,
+                connection_mode=mode.mode.value,
+                environment=selected_environment,
+                profile=profile,
+            )
+        for action in actions:
+            declared_state = mode.provider_capability_status.get(action)
+            if declared_state is not None and declared_state.value == "provider_unavailable":
+                return _connector_resolution(
+                    ready=False,
+                    reason="provider_unavailable",
+                    connector_id=manifest.connector_id,
+                    connection_mode=mode.mode.value,
+                    environment=selected_environment,
+                    profile=profile,
+                )
+            observed_state = states.get(action)
+            if observed_state != "observed":
+                return _connector_resolution(
+                    ready=False,
+                    reason=observed_state or "not_validated",
+                    connector_id=manifest.connector_id,
+                    connection_mode=mode.mode.value,
+                    environment=selected_environment,
+                    profile=profile,
+                )
+    return _connector_resolution(
+        ready=True,
+        reason=None,
+        connector_id=manifest.connector_id,
+        connection_mode=mode.mode.value,
+        environment=selected_environment,
+        profile=profile,
     )
 
 
@@ -786,35 +1208,28 @@ def _active_workspace_connector_profile(dashboard_payload: dict[str, Any]) -> di
     profiles = dashboard_payload.get("connector_profiles")
     if not isinstance(profiles, list):
         return None
-    for profile in profiles:
-        if not isinstance(profile, dict):
-            continue
-        connector_id = _clean_selector(profile.get("connector_id"))
-        environment = _clean_selector(profile.get("environment"))
-        if not connector_id or not environment:
-            continue
-        if _workspace_connector_ready(
-            {"connector_profiles": [profile]},
-            connector_id=connector_id,
-            environment=environment,
-        ):
-            return profile
-    return None
+    if len(profiles) != 1 or not isinstance(profiles[0], dict):
+        return None
+    profile = profiles[0]
+    resolution = _workspace_connector_resolution(
+        {"connector_profiles": [profile]},
+        connector_id=_clean_selector(profile.get("connector_id")),
+        connection_mode=_clean_selector(profile.get("connection_mode")),
+        environment=_clean_selector(profile.get("environment")),
+    )
+    return profile if resolution["ready"] else None
 
 
 def _connector_context_from_profile(profile: dict[str, Any]) -> dict[str, Any]:
-    metadata = _mapping(profile.get("metadata"))
     context = {
         "connector_id": str(profile.get("connector_id") or "").strip().lower(),
+        "connection_mode": str(profile.get("connection_mode") or "").strip().lower(),
         "environment": str(profile.get("environment") or "").strip().lower(),
-        "status": str(profile.get("status") or metadata.get("setup_state") or "ready"),
-        "enabled_capabilities": sorted(
-            str(item).strip() for item in _profile_enabled_capabilities(profile)
-        ),
+        "status": str(profile.get("status") or "needs_validation"),
+        "capability_states": _profile_capability_states(profile),
+        "evidence_source": profile.get("evidence_source"),
+        "validated_at": profile.get("validated_at"),
     }
-    setup_state = metadata.get("setup_state")
-    if setup_state:
-        context["setup_state"] = str(setup_state)
     return context
 
 
@@ -825,7 +1240,7 @@ def _workspace_context_setup_required_payload() -> dict[str, Any]:
             "connector credential setup is required before retrieving workspace-specific "
             "accounting context."
         ),
-        "next_tool": "start_connector_setup",
+        "next_tool": "link_connector_profile",
         "next_skill": "connector-credential-setup-th",
     }
 
@@ -838,20 +1253,61 @@ def _public_workspace_required_payload() -> dict[str, Any]:
     }
 
 
-def _connector_setup_block_payload() -> dict[str, Any]:
+def _connector_setup_block_payload(
+    resolution: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    reason = (resolution or {}).get("reason") or "not_validated"
+    if reason == "connection_mode_required":
+        message = (
+            "connection_mode is required because multiple connector profiles match this "
+            "workspace selection."
+        )
+    elif reason == "provider_unavailable":
+        message = "The selected connector profile declares this provider action unavailable."
+    else:
+        message = (
+            "A validated connector profile is required before this connector-backed flow can run."
+        )
     return {
-        "status": "blocked",
-        "message": (
-            "connector credential setup is required before running connector-backed "
-            "accounting workflows."
-        ),
-        "next_tool": "start_connector_setup",
+        "status": "mode_required" if reason == "connection_mode_required" else "not_ready",
+        "reason": reason,
+        "message": message,
+        "next_tool": "get_connector_setup"
+        if reason == "connection_mode_required"
+        else "link_connector_profile",
         "next_skill": "connector-credential-setup-th",
     }
 
 
 def _json_error(error: str, message: str, *, status_code: int) -> JSONResponse:
     return JSONResponse({"error": error, "message": message}, status_code=status_code)
+
+
+def _legacy_connector_setup_response(
+    payload: Mapping[str, Any],
+    *,
+    status_code: int = 200,
+) -> JSONResponse:
+    return JSONResponse(
+        {
+            **payload,
+            "deprecated_tool": "start_connector_setup",
+            "replacement_tool": "link_connector_profile",
+        },
+        status_code=status_code,
+    )
+
+
+def _legacy_connector_setup_error(
+    error: str,
+    message: str,
+    *,
+    status_code: int,
+) -> JSONResponse:
+    return _legacy_connector_setup_response(
+        {"error": error, "message": message},
+        status_code=status_code,
+    )
 
 
 def _reject_sensitive_storage_input(**values: Any) -> None:
@@ -863,14 +1319,19 @@ def _reject_sensitive_storage_input(**values: Any) -> None:
             )
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def search_knowledge(
     query: str,
     filters: KnowledgeSearchFilters | None = None,
     top_k: int = 8,
     mode: SearchMode = "hybrid",
 ) -> dict[str, Any]:
-    """Search Mercury accounting knowledge and return citation-bearing chunks."""
+    """Search Mercury accounting knowledge and return citation-bearing chunks.
+
+    Changes: no knowledge or provider state; Mercury records sanitized audit metadata.
+    External contact: Mercury's configured knowledge store only, never an ERP provider.
+    Omitted options: filters are inferred from the query, top_k is 8, and mode is hybrid.
+    """
     explicit_filters = _model_payload(filters)
     applied_filters, inferred_connector, inferred_domain = apply_knowledge_routing(
         query, explicit_filters
@@ -899,14 +1360,19 @@ def search_knowledge(
     return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def retrieve_context_pack(
     query: str,
     task: str | None = None,
     filters: KnowledgeSearchFilters | None = None,
     max_chunks: int = 12,
 ) -> dict[str, Any]:
-    """Return a context pack with citations for the host agent to answer with."""
+    """Return a cited context pack for the host agent.
+
+    Changes: no knowledge or provider state; Mercury records sanitized audit metadata.
+    External contact: Mercury's configured knowledge store only, never an ERP provider.
+    Omitted options: task stays unset, filters are inferred, and max_chunks is 12.
+    """
     explicit_filters = _model_payload(filters)
     applied_filters, inferred_connector, inferred_domain = apply_knowledge_routing(
         query, explicit_filters
@@ -936,14 +1402,19 @@ def retrieve_context_pack(
     return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def retrieve_workspace_context_pack(
     workspace_id: str,
     query: str,
     task: str | None = None,
     max_chunks: int = 12,
 ) -> dict[str, Any]:
-    """Return a cited context pack filtered to the workspace's ready connector."""
+    """Return cited knowledge routed by one Mercury workspace profile.
+
+    Changes: no workspace or provider state; Mercury records sanitized audit metadata.
+    External contact: Mercury workspace and knowledge stores only, never the selected ERP.
+    Omitted options: task stays unset and max_chunks is 12.
+    """
     audit_input = {
         **_public_workspace_audit_ref(workspace_id),
         "query": query,
@@ -1043,26 +1514,34 @@ def retrieve_workspace_context_pack(
         return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def get_document(document_id: str) -> dict[str, Any]:
-    """Fetch one indexed knowledge document by UUID or document URI."""
+    """Fetch one indexed knowledge document by UUID or document URI.
+
+    Changes: no document or provider state; Mercury records sanitized audit metadata.
+    External contact: Mercury's configured knowledge store only, never an ERP provider.
+    Omitted options: none; document_id is required.
+    """
     document = SupabaseRagStore(load_settings()).get_document(document_id)
     payload = redact_json({"status": "ok" if document else "not_found", "document": document})
     _audit("get_document", {"document_id": document_id}, {"found": bool(document)})
     return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_CREATE)
 def create_public_workspace(company_name: str | None = None) -> dict[str, Any]:
-    """Create an opaque, time-limited Mercury plugin workspace."""
+    """Create an opaque, time-limited Mercury plugin workspace.
+
+    Changes: creates private Mercury workspace, member, token, and audit metadata.
+    External contact: Mercury's hosted workspace store only, never an ERP provider.
+    Omitted options: company_name is not attached when it is omitted.
+    """
     try:
         _reject_sensitive_storage_input(company_name=company_name)
         settings = load_settings()
         if not settings.supabase_configured:
             raise RuntimeError("Supabase is required to create a public workspace.")
-        payload = redact_json(
-            _product_store(settings).create_public_workspace(company_name)
-        )
+        payload = redact_json(_product_store(settings).create_public_workspace(company_name))
         _audit(
             "create_public_workspace",
             {"company_name_present": bool((company_name or "").strip())},
@@ -1078,17 +1557,20 @@ def create_public_workspace(company_name: str | None = None) -> dict[str, Any]:
         return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def get_public_workspace(workspace_id: str) -> dict[str, Any]:
-    """Return sanitized Mercury workspace, connector, and flow state."""
+    """Return sanitized Mercury workspace, connector-profile, and flow state.
+
+    Changes: no workspace or provider state; Mercury records sanitized audit metadata.
+    External contact: Mercury's hosted workspace store only, never an ERP provider.
+    Omitted options: none; workspace_id is required.
+    """
     audit_input = _public_workspace_audit_ref(workspace_id)
     try:
         settings = load_settings()
         if not settings.supabase_configured:
             raise RuntimeError("Supabase is required to load a public workspace.")
-        payload = redact_json(
-            _product_store(settings).public_dashboard(workspace_id)
-        )
+        payload = redact_json(_product_store(settings).public_dashboard(workspace_id))
         _audit(
             "get_public_workspace",
             audit_input,
@@ -1105,83 +1587,520 @@ def get_public_workspace(workspace_id: str) -> dict[str, Any]:
         return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def list_connectors() -> dict[str, Any]:
-    """List Mercury accounting and ERP connector options without secrets."""
+    """List secretless Mercury accounting and ERP connector options.
+
+    Changes: no connector or provider state; Mercury records sanitized audit metadata.
+    External contact: none; the reviewed connector catalog is bundled with Mercury.
+    Omitted options: none; this tool has no arguments.
+    """
     payload = {"status": "ok", "connectors": list_connector_public_summaries()}
     _audit("list_connectors", {}, {"count": len(payload["connectors"])})
     return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
-def connector_capabilities(connector_id: str) -> dict[str, Any]:
-    """List declared capabilities for one Mercury connector."""
+@mcp.tool(annotations=_CLOSED_READ)
+def get_connector_setup(
+    connector_id: ConnectorId,
+    connection_mode: ConnectorConnectionMode | None = None,
+) -> dict[str, Any]:
+    """Return secretless setup guidance from Mercury's reviewed connector catalog.
+
+    Changes: no profile or provider state; Mercury records sanitized audit metadata.
+    External contact: none; this tool does not start OAuth or contact a provider.
+    Omitted options: connection_mode omitted returns every supported mode.
+    """
     manifest = connector_by_id(connector_id)
     if manifest is None:
-        payload = {"status": "not_found", "connector_id": connector_id}
-        _audit("connector_capabilities", {"connector_id": connector_id}, payload)
-        return payload
+        return {"status": "not_found", "connector_id": connector_id}
+    modes = list(manifest.connection_modes)
+    if connection_mode is not None:
+        selected = manifest.connection_mode(connection_mode)
+        if selected is None:
+            return {
+                "status": "not_found",
+                "connector_id": manifest.connector_id,
+                "connection_mode": connection_mode,
+            }
+        modes = [selected]
+
+    payload_modes: list[dict[str, Any]] = []
+    for mode in modes:
+        declared = mode.provider_capability_status
+        read_states = [
+            state.value
+            for capability, state in declared.items()
+            if not (set(capability.split(".")) & _MUTATION_CAPABILITY_SEGMENTS)
+        ]
+        write_states = [
+            state.value
+            for capability, state in declared.items()
+            if set(capability.split(".")) & _MUTATION_CAPABILITY_SEGMENTS
+        ]
+        item: dict[str, Any] = {
+            "mode": mode.mode.value,
+            "next_action": "link_connector_profile",
+            "provider_setup_url": mode.provider_setup_url,
+            "required_user_values": [],
+            "setup_defaults": dict(mode.setup_defaults),
+            "capability_summary": {
+                "read": read_states[0] if read_states else "not_validated",
+                "write": write_states[0] if write_states else "not_validated",
+            },
+        }
+        if mode.mode.value == "native_mcp":
+            item["next_action"] = "connect_provider_mcp"
+            item["official_mcp_url"] = mode.official_mcp_url
+        elif mode.mode.value == "api_driver":
+            item["next_action"] = "configure_local_api_driver"
+            item["required_user_values"] = manifest.required_secret_fields
+            item["local_command"] = (
+                f"mercury-tools credentials configure --connector {manifest.connector_id} "
+                "--mode api_driver --environment <environment>"
+            )
+        else:
+            item["next_action"] = "local_bridge_required"
+            item["local_command"] = (
+                f"mercury-tools local-bridge discover --connector {manifest.connector_id}"
+            )
+            item["local_bridge_requirement"] = mode.local_bridge_requirement
+        payload_modes.append(item)
     payload = {
         "status": "ok",
         "connector_id": manifest.connector_id,
-        "capabilities": list(manifest.capabilities),
-        "read_capabilities": manifest.read_capabilities,
-        "blocked_capabilities": manifest.blocked_capabilities,
-        "public_policy": "read_only_validation",
+        "connection_modes": payload_modes,
     }
-    _audit(
-        "connector_capabilities",
-        {"connector_id": manifest.connector_id},
-        {"status": "ok", "capability_count": len(manifest.capabilities)},
-    )
+    _audit("get_connector_setup", {"connector_id": manifest.connector_id}, {"status": "ok"})
     return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+def _validate_safe_profile_input(
+    value: str | None,
+    *,
+    label: str,
+    pattern: re.Pattern[str] = _SAFE_PUBLIC_PROFILE_TEXT_RE,
+) -> None:
+    if value is None:
+        return
+    _reject_sensitive_storage_input(**{label: value})
+    if not pattern.fullmatch(value.strip()):
+        raise ValueError(f"{label} is invalid")
+
+
+def _validate_external_server_name(value: str | None) -> None:
+    if value is None:
+        return
+    _validate_safe_profile_input(
+        value,
+        label="external_server_name",
+        pattern=_SAFE_EXTERNAL_SERVER_NAME_RE,
+    )
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return
+    raise ValueError("external_server_name must be a server name, not a LAN address")
+
+
+def _link_connector_profile_for_token(
+    *,
+    token_payload: dict[str, Any],
+    connector_id: ConnectorId,
+    connection_mode: ConnectorConnectionMode,
+    environment: ConnectorEnvironment,
+    company_ref: str | None = None,
+    company_name: str | None = None,
+    external_server_name: str | None = None,
+    store: Any | None = None,
+) -> tuple[str, str, dict[str, Any]]:
+    _validate_safe_profile_input(company_ref, label="company_ref")
+    _validate_safe_profile_input(company_name, label="company_name")
+    _validate_external_server_name(external_server_name)
+    manifest = connector_by_id(connector_id)
+    mode = manifest.connection_mode(connection_mode) if manifest else None
+    if manifest is None:
+        raise ValueError(f"Unknown connector: {connector_id}")
+    if mode is None:
+        raise ValueError(
+            f"Unsupported connection mode for {manifest.connector_id}: {connection_mode}"
+        )
+    if mode.mode.value == "native_mcp" and external_server_name is None:
+        raise ValueError("external_server_name is required for native_mcp profiles")
+    if mode.mode.value == "local_bridge" and external_server_name is not None:
+        raise ValueError("local_bridge profiles do not store external_server_name")
+    profile = (store or _product_store(load_settings())).link_connector_profile(
+        token_payload=token_payload,
+        connector_id=manifest.connector_id,
+        connection_mode=mode.mode.value,
+        environment=environment,
+        company_ref=company_ref,
+        company_name=company_name,
+        external_server_name=external_server_name,
+    )
+    return manifest.connector_id, mode.mode.value, profile
+
+
+@mcp.tool(annotations=_CLOSED_CREATE)
+def link_connector_profile(
+    workspace_id: str,
+    connector_id: ConnectorId,
+    connection_mode: ConnectorConnectionMode,
+    environment: ConnectorEnvironment,
+    company_ref: str | None = None,
+    company_name: str | None = None,
+    external_server_name: str | None = None,
+) -> dict[str, Any]:
+    """Store one sanitized connector profile in a Mercury workspace.
+
+    Changes: creates or updates Mercury profile metadata, never ERP credentials.
+    External contact: Mercury's hosted workspace store only; no provider or OAuth call occurs.
+    Omitted options: company_ref, company_name, and external_server_name remain unset.
+    """
+    try:
+        _validate_safe_profile_input(company_ref, label="company_ref")
+        _validate_safe_profile_input(company_name, label="company_name")
+        _validate_external_server_name(external_server_name)
+        canonical_connector_id, canonical_mode, profile = _link_connector_profile_for_token(
+            token_payload=_public_workspace_payload_from_value(workspace_id),
+            connector_id=connector_id,
+            connection_mode=connection_mode,
+            environment=environment,
+            company_ref=company_ref,
+            company_name=company_name,
+            external_server_name=external_server_name,
+        )
+        payload = redact_json({"status": "ok", "profile": profile})
+        _audit(
+            "link_connector_profile",
+            {
+                **_public_workspace_audit_ref(workspace_id),
+                "connector_id": canonical_connector_id,
+                "connection_mode": canonical_mode,
+                "environment": environment,
+            },
+            {"status": "ok", "profile_status": profile.get("status")},
+        )
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit(
+            "link_connector_profile", _public_workspace_audit_ref_optional(workspace_id), payload
+        )
+        return payload
+
+
+def _canonical_evidence_capability_states(
+    *,
+    manifest: Any,
+    connection_mode: str,
+    evidence: ConnectorValidationEvidence,
+) -> dict[str, str]:
+    """Expand accepted evidence aliases into their declared provider-action keys."""
+    mode = manifest.connection_mode(connection_mode)
+    capability_states: dict[str, str] = {}
+    for observation in evidence.capabilities:
+        provider_actions = _profile_provider_actions(
+            manifest,
+            mode,
+            observation.capability,
+        )
+        if not provider_actions:
+            raise ValueError("evidence capability is not declared for the selected mode")
+        for provider_action in provider_actions:
+            existing_state = capability_states.get(provider_action)
+            if existing_state is not None:
+                if existing_state != observation.state:
+                    raise ValueError(
+                        "evidence contains conflicting capability observations after alias expansion"
+                    )
+                raise ValueError("evidence contains duplicate capabilities after alias expansion")
+            capability_states[provider_action] = observation.state
+    return capability_states
+
+
+@mcp.tool(annotations=_CLOSED_IDEMPOTENT_WRITE)
+def validate_connector_connection(
+    workspace_id: str,
+    connector_id: ConnectorId,
+    connection_mode: ConnectorConnectionMode,
+    environment: ConnectorEnvironment,
+    evidence: ConnectorValidationEvidenceInput,
+) -> dict[str, Any]:
+    """Persist sanitized validation evidence for one exact Mercury profile.
+
+    Changes: updates Mercury profile evidence and capability state idempotently.
+    External contact: Mercury's hosted workspace store only; the host or local runtime already contacted the provider.
+    Omitted options: evidence.provider_tool_name remains unset.
+    """
+    try:
+        evidence_payload = (
+            evidence
+            if isinstance(evidence, ConnectorValidationEvidence)
+            else ConnectorValidationEvidence.model_validate(evidence)
+        )
+        manifest = connector_by_id(connector_id)
+        mode = manifest.connection_mode(connection_mode) if manifest else None
+        if manifest is None:
+            raise ValueError(f"Unknown connector: {connector_id}")
+        if mode is None or environment not in mode.supported_environments:
+            raise ValueError("connector mode or environment is not supported")
+        expected_source = _EVIDENCE_SOURCE_BY_CONNECTION_MODE[mode.mode.value]
+        if evidence_payload.source != expected_source:
+            raise ValueError("evidence source does not match connection mode")
+        if evidence_payload.status == "failed" and any(
+            item.state == "observed" for item in evidence_payload.capabilities
+        ):
+            raise ValueError("failed evidence cannot contain observed capabilities")
+        capability_states = _canonical_evidence_capability_states(
+            manifest=manifest,
+            connection_mode=mode.mode.value,
+            evidence=evidence_payload,
+        )
+        profile = _product_store(load_settings()).validate_connector_profile(
+            token_payload=_public_workspace_payload_from_value(workspace_id),
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=environment,
+            capability_states=capability_states,
+            evidence_source=evidence_payload.source,
+            evidence_ref=evidence_payload.evidence_ref,
+            validated_at=evidence_payload.observed_at.isoformat(),
+        )
+        payload = redact_json(
+            {
+                "status": "ok",
+                "profile": profile,
+                "validation_scope": (
+                    "host_observed_provider_result"
+                    if mode.mode.value == "native_mcp"
+                    else "local_validation_evidence"
+                ),
+                "provider_called_by_mercury": False,
+            }
+        )
+        _audit(
+            "validate_connector_connection",
+            {
+                **_public_workspace_audit_ref(workspace_id),
+                "connector_id": manifest.connector_id,
+                "connection_mode": mode.mode.value,
+                "environment": environment,
+                "evidence_ref": evidence_payload.evidence_ref,
+            },
+            {"status": "ok", "profile_status": profile.get("status")},
+        )
+        return payload
+    except ValidationError:
+        payload = {
+            "status": "error",
+            "message": "Connector validation evidence is invalid.",
+        }
+        _audit(
+            "validate_connector_connection",
+            _public_workspace_audit_ref_optional(workspace_id),
+            payload,
+        )
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit(
+            "validate_connector_connection",
+            _public_workspace_audit_ref_optional(workspace_id),
+            payload,
+        )
+        return payload
+
+
+@mcp.tool(annotations=_CLOSED_READ)
+def connector_capabilities(
+    workspace_id: str,
+    connector_id: ConnectorId,
+    connection_mode: ConnectorConnectionMode,
+    environment: ConnectorEnvironment,
+) -> dict[str, Any]:
+    """Return declared and observed capability states for one exact profile.
+
+    Changes: no profile or provider state; Mercury records sanitized audit metadata.
+    External contact: Mercury's catalog and hosted workspace store only, never the ERP.
+    Omitted options: none; workspace, connector, mode, and environment are required.
+    """
+    manifest = connector_by_id(connector_id)
+    mode = manifest.connection_mode(connection_mode) if manifest else None
+    if manifest is None or mode is None:
+        return {
+            "status": "not_found",
+            "connector_id": connector_id,
+            "connection_mode": connection_mode,
+            "environment": environment,
+        }
+    if environment not in mode.supported_environments:
+        return {
+            "status": "not_ready",
+            "reason": "environment_mismatch",
+            "connector_id": manifest.connector_id,
+            "connection_mode": mode.mode.value,
+            "environment": environment,
+        }
+    try:
+        dashboard_payload = _product_store(load_settings()).public_dashboard(workspace_id)
+        resolution = _workspace_connector_resolution(
+            dashboard_payload,
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=environment,
+        )
+        profile = resolution.get("profile")
+        observed = _profile_capability_states(profile) if isinstance(profile, dict) else {}
+        declared = {
+            capability: state.value for capability, state in mode.provider_capability_status.items()
+        }
+        capability_states = (
+            dict(observed)
+            if mode.capability_source == "discovered_tools"
+            else {
+                capability: (
+                    "provider_unavailable"
+                    if declared_state == "provider_unavailable"
+                    else observed.get(capability, "not_validated")
+                )
+                for capability, declared_state in declared.items()
+            }
+        )
+        payload = redact_json(
+            {
+                "status": "ok" if resolution["ready"] else "not_ready",
+                "reason": resolution["reason"],
+                "connector_id": manifest.connector_id,
+                "connection_mode": mode.mode.value,
+                "environment": environment,
+                "profile": profile,
+                "declared_capability_states": declared,
+                "observed_capability_states": observed,
+                "capability_states": capability_states,
+            }
+        )
+        _audit(
+            "connector_capabilities",
+            {
+                **_public_workspace_audit_ref(workspace_id),
+                "connector_id": manifest.connector_id,
+                "connection_mode": mode.mode.value,
+                "environment": environment,
+            },
+            {"status": payload["status"], "reason": payload.get("reason")},
+        )
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit(
+            "connector_capabilities", _public_workspace_audit_ref_optional(workspace_id), payload
+        )
+        return payload
+
+
+@mcp.tool(annotations=_CLOSED_DESTRUCTIVE_IDEMPOTENT)
+def unlink_connector_profile(
+    workspace_id: str,
+    connector_id: ConnectorId,
+    connection_mode: ConnectorConnectionMode,
+    environment: ConnectorEnvironment,
+    confirm: ConnectorUnlinkConfirmation = "unlink",
+) -> dict[str, Any]:
+    """Delete one Mercury profile without revoking provider authorization.
+
+    Changes: removes only the selected Mercury connector profile and records an audit event.
+    External contact: Mercury's hosted workspace store only; provider OAuth remains active.
+    Omitted options: confirm defaults to the literal unlink value.
+    """
+    if confirm != "unlink":
+        return {"status": "error", "message": 'confirm must be exactly "unlink"'}
+    try:
+        manifest = connector_by_id(connector_id)
+        mode = manifest.connection_mode(connection_mode) if manifest else None
+        if manifest is None or mode is None or environment not in mode.supported_environments:
+            raise ValueError("connector mode or environment is not supported")
+        result = _product_store(load_settings()).unlink_connector_profile(
+            token_payload=_public_workspace_payload_from_value(workspace_id),
+            connector_id=manifest.connector_id,
+            connection_mode=mode.mode.value,
+            environment=environment,
+        )
+        payload = {
+            "status": "ok",
+            "connector_id": manifest.connector_id,
+            "connection_mode": mode.mode.value,
+            "environment": environment,
+            "deleted": bool(result.get("deleted")),
+            "provider_disconnect_required": mode.mode.value == "native_mcp",
+        }
+        _audit(
+            "unlink_connector_profile",
+            {
+                **_public_workspace_audit_ref(workspace_id),
+                "connector_id": manifest.connector_id,
+                "connection_mode": mode.mode.value,
+                "environment": environment,
+            },
+            {"status": "ok", "deleted": payload["deleted"]},
+        )
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit(
+            "unlink_connector_profile", _public_workspace_audit_ref_optional(workspace_id), payload
+        )
+        return payload
+
+
 def start_connector_setup(
     workspace_id: str,
     connector_id: ConnectorId,
     environment: ConnectorEnvironment,
     company_name: str | None = None,
 ) -> dict[str, Any]:
-    """Start gated connector setup for one workspace."""
-    try:
-        _reject_sensitive_storage_input(company_name=company_name)
-        settings = load_settings()
-        token_payload = _public_workspace_payload_from_value(workspace_id)
-        profile = _product_store(settings).start_connector_setup(
-            token_payload=token_payload,
-            connector_id=connector_id,
-            environment=environment,
-            company_name=company_name,
-        )
-        payload = redact_json({"status": "ok", "profile": profile})
-        _audit(
-            "start_connector_setup",
-            {**_public_workspace_audit_ref(workspace_id), "connector_id": connector_id},
-            {
-                "status": "ok",
-                "connector_id": connector_id,
-                "environment": environment,
-            },
-        )
-        return payload
-    except (PermissionError, RuntimeError, ValueError) as exc:
-        payload = {"status": "error", "message": str(exc)}
-        _audit(
-            "start_connector_setup",
-            {
-                **_public_workspace_audit_ref_optional(workspace_id),
-                "connector_id": connector_id,
-            },
-            payload,
-        )
-        return payload
+    """Deprecated Python compatibility wrapper for link_connector_profile."""
+    manifest = connector_by_id(connector_id)
+    if manifest is None or not manifest.connection_modes:
+        return {
+            "status": "error",
+            "message": f"Unknown connector: {connector_id}",
+            "deprecated_tool": "start_connector_setup",
+            "replacement_tool": "link_connector_profile",
+        }
+    mode = manifest.connection_modes[0]
+    if mode.mode.value == "native_mcp":
+        return {
+            "status": "error",
+            "message": "external_server_name is required for native_mcp profiles",
+            "deprecated_tool": "start_connector_setup",
+            "replacement_tool": "link_connector_profile",
+        }
+    payload = link_connector_profile(
+        workspace_id=workspace_id,
+        connector_id=manifest.connector_id,
+        connection_mode=mode.mode.value,
+        environment=environment,
+        company_name=company_name,
+    )
+    return {
+        **payload,
+        "deprecated_tool": "start_connector_setup",
+        "replacement_tool": "link_connector_profile",
+    }
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
-def connector_status(workspace_id: str) -> dict[str, Any]:
-    """Read sanitized connector status for a Mercury public workspace."""
+@mcp.tool(annotations=_CLOSED_READ)
+def connector_status(
+    workspace_id: str,
+    connector_id: ConnectorId | None = None,
+) -> dict[str, Any]:
+    """Read sanitized connector state without silently choosing among profiles.
+
+    Changes: no profile or provider state; Mercury records sanitized audit metadata.
+    External contact: Mercury's hosted workspace store only, never the ERP provider.
+    Omitted options: connector_id omitted returns all profiles and reports ambiguity.
+    """
     if not workspace_id:
         payload = {
             **_public_workspace_required_payload(),
@@ -1189,45 +2108,60 @@ def connector_status(workspace_id: str) -> dict[str, Any]:
         }
         _audit("connector_status", {}, {"status": payload["status"]})
         return payload
-
     audit_input = _public_workspace_audit_ref_optional(workspace_id)
     try:
-        settings = load_settings()
-        dashboard_payload = _product_store(settings).public_dashboard(workspace_id)
+        dashboard_payload = _product_store(load_settings()).public_dashboard(workspace_id)
         public_profiles = public_connector_profiles(
             dashboard_payload.get("connector_profiles") or []
         )
-        active_profile = _active_workspace_connector_profile(dashboard_payload)
-        active_context = (
-            _connector_context_from_profile(active_profile)
-            if active_profile is not None
-            else None
+        if connector_id is not None:
+            public_profiles = [
+                profile
+                for profile in public_profiles
+                if profile.get("connector_id") == connector_id
+            ]
+        active_context = None
+        resolution: dict[str, Any] | None = None
+        if len(public_profiles) == 1:
+            selected_profile = public_profiles[0]
+            resolution = _workspace_connector_resolution(
+                {"connector_profiles": public_profiles},
+                connector_id=_clean_selector(selected_profile.get("connector_id")),
+                connection_mode=_clean_selector(selected_profile.get("connection_mode")),
+                environment=_clean_selector(selected_profile.get("environment")),
+            )
+            if resolution["ready"]:
+                active_context = _connector_context_from_profile(selected_profile)
+        status = (
+            "ok"
+            if active_context
+            else ("mode_required" if len(public_profiles) > 1 else "requires_setup")
         )
-        payload: dict[str, Any] = {
-            "status": "ok" if active_context else "requires_setup",
-            "workspace": {
-                "name": (dashboard_payload.get("workspace") or {}).get("name"),
-                "host_app": "generic",
-            },
-            "connector_profiles": public_profiles,
-            "active_connector": active_context,
-            "setup_required": active_context is None,
-            "next_tool": "start_connector_setup" if active_context is None else None,
-            "next_skill": (
-                "connector-credential-setup-th" if active_context is None else None
-            ),
-        }
-        payload = redact_json(payload)
+        payload = redact_json(
+            {
+                "status": status,
+                "reason": (
+                    "connection_mode_required"
+                    if status == "mode_required"
+                    else (resolution or {}).get("reason")
+                ),
+                "workspace": {
+                    "name": (dashboard_payload.get("workspace") or {}).get("name"),
+                    "host_app": "generic",
+                },
+                "connector_profiles": public_profiles,
+                "active_connector": active_context,
+                "setup_required": not bool(active_context),
+                "next_tool": "get_connector_setup"
+                if status == "mode_required"
+                else ("link_connector_profile" if not active_context else None),
+                "next_skill": "connector-credential-setup-th" if not active_context else None,
+            }
+        )
         _audit(
             "connector_status",
             audit_input,
-            {
-                "status": payload["status"],
-                "profile_count": len(public_profiles),
-                "active_connector": (
-                    active_context.get("connector_id") if active_context else None
-                ),
-            },
+            {"status": payload["status"], "profile_count": len(public_profiles)},
         )
         return payload
     except (PermissionError, RuntimeError, ValueError) as exc:
@@ -1236,47 +2170,141 @@ def connector_status(workspace_id: str) -> dict[str, Any]:
         return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
+def list_accounting_skills() -> dict[str, Any]:
+    """List canonical accounting Skills from the bundled Mercury catalog.
+
+    Changes: none.
+    External contact: none; this tool does not read a workspace or provider.
+    Omitted options: none; this tool has no arguments.
+    """
+
+    return {"status": "ok", "skills": runtime_accounting_skill_catalog()}
+
+
+@mcp.tool(annotations=_CLOSED_READ)
+def get_accounting_skill_schema(skill_id: AccountingSkillIdInput) -> dict[str, Any]:
+    """Return one canonical accounting Skill input schema.
+
+    Changes: none.
+    External contact: none; this tool reads only the bundled Mercury Skill catalog.
+    Omitted options: none; skill_id is required.
+    """
+
+    safe_skill_id = _safe_accounting_skill_id(skill_id)
+    if safe_skill_id is None:
+        return _invalid_accounting_skill_id_payload()
+    schema = runtime_accounting_skill_schema(safe_skill_id)
+    if schema is None:
+        return {"status": "not_found", "skill_id": safe_skill_id}
+    return schema
+
+
+@mcp.tool(annotations=_CLOSED_READ)
 def run_accounting_skill(
-    skill_id: AccountingSkillId,
-    inputs: AccountingSkillInputs,
+    workspace_id: str,
+    skill_id: AccountingSkillIdInput,
+    inputs: AccountingSkillInputsInput,
     evidence_mode: bool = False,
 ) -> dict[str, Any]:
-    """Return an accounting skill execution package for the host agent."""
-    input_payload = _model_payload(inputs)
-    markdown = skill_markdown(skill_id)
-    payload = redact_json(
-        {
-            "status": "ok" if markdown else "not_found",
-            "skill_id": skill_id,
-            "inputs": input_payload,
-            "evidence_mode": evidence_mode,
-            "skill_markdown": markdown,
-            "note": (
-                "v1 returns a guided skill package. Endpoint actions are gated by "
-                "connector capability, workflow preview, user approval, and audit policy."
-            ),
+    """Validate and route an accounting Skill for host-side execution.
+
+    Changes: no ERP state; Mercury reads profiles and records sanitized audit metadata.
+    External contact: Mercury's hosted workspace store only; provider and local execution are handed off.
+    Omitted options: evidence_mode is false and optional input fields keep schema defaults.
+    """
+
+    safe_skill_id = _safe_accounting_skill_id(skill_id)
+    if safe_skill_id is None:
+        return _invalid_accounting_skill_id_payload()
+    try:
+        normalized_workspace_id = normalize_public_workspace_id(workspace_id)
+    except (AttributeError, ValueError):
+        return {
+            "status": "error",
+            "message": "Invalid Mercury public workspace ID.",
         }
-    )
-    _audit(
-        "run_accounting_skill",
-        {"skill_id": skill_id, "inputs": input_payload},
-        {"status": payload["status"]},
-    )
-    return payload
+
+    skill = accounting_skill_by_id(safe_skill_id)
+    if skill is None:
+        return {"status": "not_found", "skill_id": safe_skill_id}
+    try:
+        validated_inputs = _validated_accounting_skill_inputs(skill, inputs)
+    except ValueError:
+        return _invalid_accounting_skill_inputs_payload()
+
+    audit_input = {
+        **_public_workspace_audit_ref(normalized_workspace_id),
+        "skill_id": skill.skill_id,
+        "input_fields": sorted(validated_inputs),
+        "evidence_mode": evidence_mode,
+    }
+    try:
+        dashboard = _product_store(load_settings()).public_dashboard(normalized_workspace_id)
+        profiles = public_connector_profiles(dashboard.get("connector_profiles") or [])
+        selected_environment = validated_inputs.get("environment")
+        if selected_environment:
+            profiles = [
+                profile
+                for profile in profiles
+                if profile.get("environment") == selected_environment
+            ]
+        route = resolve_skill_route(
+            skill,
+            profiles,
+            requested_connector_id=validated_inputs.get("connector_id"),
+            requested_connection_mode=validated_inputs.get("connection_mode"),
+        )
+        payload = redact_json(
+            {
+                **route,
+                "validated_inputs": validated_inputs,
+                "evidence_mode": evidence_mode,
+                "output_schema_name": skill.output_schema_name,
+                "skill_markdown": skill_markdown(skill.skill_id),
+                "note": (
+                    "Mercury returns an ordered host plan. Provider MCP, advanced local "
+                    "API-driver, and Local Bridge execution remain outside this hosted tool."
+                ),
+            }
+        )
+        _audit(
+            "run_accounting_skill",
+            audit_input,
+            {
+                "status": payload["status"],
+                "reason": payload.get("reason"),
+                "selected_connector": (payload.get("selected_profile") or {}).get("connector_id"),
+            },
+        )
+        return payload
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        payload = {"status": "error", "message": str(exc)}
+        _audit("run_accounting_skill", audit_input, payload)
+        return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def flow_cheat_sheet() -> dict[str, Any]:
-    """Return Mercury Flow command syntax and examples."""
+    """Return bundled Mercury Flow command syntax and examples.
+
+    Changes: no flow, workspace, or provider state; Mercury records audit metadata.
+    External contact: none; the reference text is bundled with Mercury.
+    Omitted options: none; this tool has no arguments.
+    """
     payload = {"status": "ok", "cheat_sheet": FLOW_CHEAT_SHEET}
     _audit("flow_cheat_sheet", {}, {"status": "ok"})
     return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def check_flow_syntax(flow_yaml: str) -> dict[str, Any]:
-    """Validate a Mercury YAML flow without executing it."""
+    """Validate a Mercury YAML flow without executing or saving it.
+
+    Changes: no flow, workspace, or provider state; Mercury records audit metadata.
+    External contact: none; parsing occurs inside the hosted Mercury process.
+    Omitted options: none; flow_yaml is required.
+    """
     try:
         payload = validate_flow_text(flow_yaml)
         _audit(
@@ -1291,20 +2319,31 @@ def check_flow_syntax(flow_yaml: str) -> dict[str, Any]:
         return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def inspect_flow_files(
-    flow_files: list[FlowFileInput],
+    flow_files: FlowFiles,
     config_yaml: str | None = None,
-    include_tags: list[str] | None = None,
-    exclude_tags: list[str] | None = None,
+    include_tags: FlowTags = (),
+    exclude_tags: FlowTags = (),
 ) -> dict[str, Any]:
-    """Inspect an in-memory Mercury flow workspace for an MCP host agent."""
+    """Inspect an in-memory Mercury flow workspace for an MCP host agent.
+
+    Changes: no persistent flow, workspace, or provider state; audit metadata is recorded.
+    External contact: none; temporary inspection occurs inside hosted Mercury.
+    Omitted options: config_yaml stays absent and both tag filters default to empty.
+    """
     normalized_files: list[dict[str, str]] = []
     try:
         normalized_files = _flow_files_from_payload(flow_files)
         config_yaml = _validate_config_yaml(config_yaml)
-        include = _string_list_from_payload(include_tags, label="include_tags")
-        exclude = _string_list_from_payload(exclude_tags, label="exclude_tags")
+        include = _string_list_from_payload(
+            [] if include_tags == () else include_tags,
+            label="include_tags",
+        )
+        exclude = _string_list_from_payload(
+            [] if exclude_tags == () else exclude_tags,
+            label="exclude_tags",
+        )
 
         with TemporaryDirectory(prefix="mercury-flow-inspect-") as temp_dir:
             root = Path(temp_dir).resolve()
@@ -1356,12 +2395,13 @@ def inspect_flow_files(
         return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
-def run_flow(
+def _run_flow(
     flow_yaml: str,
-    dry_run: bool = False,
-    env: dict[str, Any] | None = None,
-    workspace_id: str | None = None,
+    *,
+    dry_run: bool,
+    env: dict[str, Any] | None,
+    workspace_id: str | None,
+    audit_tool_name: str,
 ) -> dict[str, Any]:
     """Run a Mercury YAML flow or return an execution plan when dry_run is true."""
     try:
@@ -1375,7 +2415,7 @@ def run_flow(
         if block_payload:
             payload = redact_json(block_payload)
             _audit(
-                "run_flow",
+                audit_tool_name,
                 {
                     **_public_workspace_audit_ref_optional(workspace_id),
                     "flow_yaml_length": len(flow_yaml),
@@ -1396,7 +2436,7 @@ def run_flow(
         )
         payload = redact_json(result.as_dict())
         _audit(
-            "run_flow",
+            audit_tool_name,
             {
                 **_public_workspace_audit_ref_optional(workspace_id),
                 "flow_yaml_length": len(flow_yaml),
@@ -1414,7 +2454,7 @@ def run_flow(
         payload = {"status": "error", "message": str(exc), "dry_run": dry_run}
         safe_env_keys = _env_keys(env) if isinstance(env, dict) else []
         _audit(
-            "run_flow",
+            audit_tool_name,
             {
                 **_public_workspace_audit_ref_optional(workspace_id),
                 "flow_yaml_length": len(flow_yaml),
@@ -1426,8 +2466,57 @@ def run_flow(
         return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
-def run_flow_files(
+def run_flow(
+    flow_yaml: str,
+    dry_run: bool = False,
+    env: dict[str, Any] | None = None,
+    workspace_id: str | None = None,
+) -> dict[str, Any]:
+    """Backward-compatible Python helper for a single inline Mercury Flow."""
+    return _run_flow(
+        flow_yaml,
+        dry_run=dry_run,
+        env=env,
+        workspace_id=workspace_id,
+        audit_tool_name="run_flow",
+    )
+
+
+@mcp.tool(name="run_inline_flow", annotations=_CLOSED_READ)
+def run_inline_flow(
+    workspace_id: str,
+    flow_yaml: InlineFlowYaml,
+    environment: FlowEnvironmentValues = (),
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Plan or run one closed inline Mercury Flow in a public workspace.
+
+    Changes: no ERP state; Mercury may create closed artifacts and sanitized audit metadata.
+    External contact: Mercury workspace state only; hosted flow commands do not call an ERP.
+    Omitted options: environment defaults to an empty list and dry_run defaults to true.
+    """
+    try:
+        workspace_id = normalize_public_workspace_id(workspace_id)
+    except (AttributeError, ValueError):
+        return _invalid_hosted_flow_workspace_payload(dry_run=dry_run)
+    try:
+        flow_yaml = _hosted_inline_flow_yaml(flow_yaml)
+    except ValueError:
+        return _invalid_hosted_inline_flow_payload(dry_run=dry_run)
+    try:
+        env_overrides = _hosted_flow_environment_overrides(environment)
+    except ValueError:
+        return _invalid_hosted_flow_environment_payload(dry_run=dry_run)
+    return _run_flow(
+        flow_yaml,
+        dry_run=dry_run,
+        env=env_overrides,
+        workspace_id=workspace_id,
+        audit_tool_name="run_inline_flow",
+    )
+
+
+def _run_flow_files(
     flow_files: list[FlowFileInput],
     config_yaml: str | None = None,
     dry_run: bool = False,
@@ -1436,6 +2525,7 @@ def run_flow_files(
     include_tags: list[str] | None = None,
     exclude_tags: list[str] | None = None,
     continue_on_failure: bool = True,
+    audit_tool_name: str = "run_flow_files",
 ) -> dict[str, Any]:
     """Run multiple Mercury YAML flow files as an in-memory suite."""
     normalized_files: list[dict[str, str]] = []
@@ -1538,11 +2628,7 @@ def run_flow_files(
                             "flow_count": len(normalized_files),
                             "selected_count": len(selected_paths),
                             "skipped_count": len(
-                                [
-                                    item
-                                    for item in file_records
-                                    if not item.get("selected")
-                                ]
+                                [item for item in file_records if not item.get("selected")]
                             ),
                             "env_keys": _env_keys(env_overrides),
                             "include_tags": sorted(include),
@@ -1552,7 +2638,7 @@ def run_flow_files(
                         }
                     )
                     _audit(
-                        "run_flow_files",
+                        audit_tool_name,
                         {
                             **_public_workspace_audit_ref_optional(workspace_id),
                             "flow_count": len(normalized_files),
@@ -1603,7 +2689,7 @@ def run_flow_files(
             }
         )
         _audit(
-            "run_flow_files",
+            audit_tool_name,
             {
                 **_public_workspace_audit_ref_optional(workspace_id),
                 "flow_count": len(normalized_files),
@@ -1625,7 +2711,7 @@ def run_flow_files(
     except (PermissionError, FlowValidationError, RuntimeError, ValueError) as exc:
         payload = {"status": "error", "message": str(exc), "dry_run": dry_run}
         _audit(
-            "run_flow_files",
+            audit_tool_name,
             {
                 **_public_workspace_audit_ref_optional(workspace_id),
                 "flow_count": len(normalized_files),
@@ -1638,66 +2724,62 @@ def run_flow_files(
         return payload
 
 
-@mcp.tool(name="run_mercury_flow", annotations=_AUDITED_PRIVATE)
-def _run_mercury_flow_tool(
-    source: MercuryFlowSource,
+@mcp.tool(annotations=_CLOSED_READ)
+def run_flow_files(
+    workspace_id: str,
+    flow_files: FlowFiles,
+    config_yaml: str | None = None,
+    environment: FlowEnvironmentValues = (),
+    include_tags: FlowTags = (),
+    exclude_tags: FlowTags = (),
+    continue_on_failure: bool = True,
     dry_run: bool = True,
-    env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Run exactly one typed Mercury source: inline YAML, files, or a saved flow."""
+    """Plan or run an in-memory suite of closed Mercury Flows.
+
+    Changes: no ERP state; Mercury may create closed artifacts and sanitized audit metadata.
+    External contact: Mercury workspace state only; hosted flow commands do not call an ERP.
+    Omitted options: config_yaml is absent, lists are empty, continue_on_failure and dry_run are true.
+    """
     try:
-        selected = _MERCURY_FLOW_SOURCE_ADAPTER.validate_python(source)
-    except ValidationError as exc:
-        payload = {
-            "status": "error",
-            "message": "Invalid Mercury flow source.",
-            "details": [
-                {
-                    "location": ".".join(str(item) for item in error["loc"]),
-                    "message": error["msg"],
-                }
-                for error in exc.errors(include_input=False, include_url=False)
-            ],
-        }
-        _audit("run_mercury_flow", {"source_type": "invalid", "dry_run": dry_run}, payload)
-        return payload
-
-    source_payload = selected.model_dump(mode="python", exclude_none=True)
-    source_type = source_payload["source_type"]
-    if source_type == "flow_yaml":
-        payload = run_flow(
-            source_payload["flow_yaml"],
-            dry_run=dry_run,
-            env=env,
-            workspace_id=source_payload.get("workspace_id"),
-        )
-        payload["entrypoint"] = "run_mercury_flow"
-        payload["input_mode"] = "flow_yaml"
-        return payload
-
-    if source_type == "flow_files":
-        payload = run_flow_files(
-            source_payload["flow_files"],
-            config_yaml=source_payload.get("config_yaml"),
-            dry_run=dry_run,
-            env=env,
-            workspace_id=source_payload.get("workspace_id"),
-            include_tags=source_payload.get("include_tags"),
-            exclude_tags=source_payload.get("exclude_tags"),
-            continue_on_failure=source_payload.get("continue_on_failure", True),
-        )
-        payload["entrypoint"] = "run_mercury_flow"
-        payload["input_mode"] = "flow_files"
-        return payload
-
-    payload = run_workspace_flow_tool(
-        workspace_id=source_payload["workspace_id"],
-        flow_id=source_payload["workspace_flow_id"],
+        workspace_id = normalize_public_workspace_id(workspace_id)
+    except (AttributeError, ValueError):
+        return _invalid_hosted_flow_workspace_payload(dry_run=dry_run)
+    try:
+        env_overrides = _hosted_flow_environment_overrides(environment)
+    except ValueError:
+        return _invalid_hosted_flow_environment_payload(dry_run=dry_run)
+    return _run_flow_files(
+        flow_files,
+        config_yaml=config_yaml,
         dry_run=dry_run,
-        env=env,
+        env=env_overrides,
+        workspace_id=workspace_id,
+        include_tags=[] if include_tags == () else include_tags,
+        exclude_tags=[] if exclude_tags == () else exclude_tags,
+        continue_on_failure=continue_on_failure,
+        audit_tool_name="run_flow_files",
     )
-    payload["entrypoint"] = "run_mercury_flow"
-    payload["input_mode"] = "workspace_flow_id"
+
+
+def _invalid_mercury_flow_source_payload(
+    *,
+    dry_run: bool,
+    validation_error: ValidationError | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "status": "error",
+        "message": "Invalid Mercury flow source.",
+    }
+    if validation_error is not None:
+        payload["details"] = [
+            {
+                "location": ".".join(str(item) for item in error["loc"]),
+                "message": error["msg"],
+            }
+            for error in validation_error.errors(include_input=False, include_url=False)
+        ]
+    _audit("run_mercury_flow", {"source_type": "invalid", "dry_run": dry_run}, payload)
     return payload
 
 
@@ -1713,7 +2795,7 @@ def run_mercury_flow(
     exclude_tags: list[str] | str | None = None,
     continue_on_failure: bool = True,
 ) -> dict[str, Any]:
-    """Backward-compatible Python wrapper around the typed public MCP tool."""
+    """Backward-compatible Python wrapper for the former multi-source flow tool."""
     modes = _selected_flow_input_modes(
         flow_yaml=flow_yaml,
         flow_files=flow_files,
@@ -1728,43 +2810,103 @@ def run_mercury_flow(
         _audit("run_mercury_flow", {"selected_modes": modes, "dry_run": dry_run}, payload)
         return payload
 
-    if modes[0] == "flow_yaml":
-        source: dict[str, Any] = {
-            "source_type": "flow_yaml",
-            "flow_yaml": flow_yaml,
-            "workspace_id": workspace_id,
-        }
-    elif modes[0] == "flow_files":
-        source = {
-            "source_type": "flow_files",
-            "flow_files": _flow_files_from_payload(flow_files),
-            "workspace_id": workspace_id,
-            "config_yaml": config_yaml,
-            "include_tags": _string_list_from_payload(include_tags, label="include_tags"),
-            "exclude_tags": _string_list_from_payload(exclude_tags, label="exclude_tags"),
-            "continue_on_failure": continue_on_failure,
-        }
-    else:
-        if not workspace_id:
-            payload = {
-                **_public_workspace_required_payload(),
-                "message": "workspace_id is required with workspace_flow_id.",
-                "selected_modes": modes,
+    try:
+        if modes[0] == "flow_yaml":
+            source: dict[str, Any] = {
+                "source_type": "flow_yaml",
+                "flow_yaml": flow_yaml,
+                "workspace_id": workspace_id,
             }
-            _audit("run_mercury_flow", {"selected_modes": modes, "dry_run": dry_run}, payload)
-            return payload
-        source = {
-            "source_type": "workspace_flow",
-            "workspace_id": workspace_id,
-            "workspace_flow_id": workspace_flow_id,
-        }
+        elif modes[0] == "flow_files":
+            source = {
+                "source_type": "flow_files",
+                "flow_files": _flow_files_from_payload(flow_files),
+                "workspace_id": workspace_id,
+                "config_yaml": config_yaml,
+                "include_tags": _string_list_from_payload(
+                    include_tags,
+                    label="include_tags",
+                ),
+                "exclude_tags": _string_list_from_payload(
+                    exclude_tags,
+                    label="exclude_tags",
+                ),
+                "continue_on_failure": continue_on_failure,
+            }
+        else:
+            if not workspace_id:
+                payload = {
+                    **_public_workspace_required_payload(),
+                    "message": "workspace_id is required with workspace_flow_id.",
+                    "selected_modes": modes,
+                }
+                _audit(
+                    "run_mercury_flow",
+                    {"selected_modes": modes, "dry_run": dry_run},
+                    payload,
+                )
+                return payload
+            source = {
+                "source_type": "workspace_flow",
+                "workspace_id": workspace_id,
+                "workspace_flow_id": workspace_flow_id,
+            }
+        selected = _MERCURY_FLOW_SOURCE_ADAPTER.validate_python(source)
+    except ValidationError as exc:
+        return _invalid_mercury_flow_source_payload(
+            dry_run=dry_run,
+            validation_error=exc,
+        )
+    except (TypeError, ValueError):
+        return _invalid_mercury_flow_source_payload(dry_run=dry_run)
 
-    return _run_mercury_flow_tool(source, dry_run=dry_run, env=env)
+    source_payload = selected.model_dump(mode="python", exclude_none=True)
+    source_type = source_payload["source_type"]
+    if source_type == "flow_yaml":
+        payload = run_flow(
+            source_payload["flow_yaml"],
+            dry_run=dry_run,
+            env=env,
+            workspace_id=source_payload.get("workspace_id"),
+        )
+        payload["entrypoint"] = "run_mercury_flow"
+        payload["input_mode"] = "flow_yaml"
+        return payload
+
+    if source_type == "flow_files":
+        payload = _run_flow_files(
+            source_payload["flow_files"],
+            config_yaml=source_payload.get("config_yaml"),
+            dry_run=dry_run,
+            env=env,
+            workspace_id=source_payload.get("workspace_id"),
+            include_tags=source_payload.get("include_tags"),
+            exclude_tags=source_payload.get("exclude_tags"),
+            continue_on_failure=source_payload.get("continue_on_failure", True),
+        )
+        payload["entrypoint"] = "run_mercury_flow"
+        payload["input_mode"] = "flow_files"
+        return payload
+
+    payload = _run_workspace_flow(
+        workspace_id=source_payload["workspace_id"],
+        flow_id=source_payload["workspace_flow_id"],
+        dry_run=dry_run,
+        env=env,
+    )
+    payload["entrypoint"] = "run_mercury_flow"
+    payload["input_mode"] = "workspace_flow_id"
+    return payload
 
 
-@mcp.tool(annotations=_AUDITED_PRIVATE)
+@mcp.tool(annotations=_CLOSED_READ)
 def list_workspace_flows(workspace_id: str) -> dict[str, Any]:
-    """List saved Mercury flows for a public workspace."""
+    """List saved Mercury flows for a public workspace.
+
+    Changes: no flow, workspace, or provider state; Mercury records sanitized audit metadata.
+    External contact: Mercury's hosted workspace store only, never an ERP provider.
+    Omitted options: none; workspace_id is required.
+    """
     try:
         settings = load_settings()
         if not settings.supabase_configured:
@@ -1795,8 +2937,7 @@ def list_workspace_flows(workspace_id: str) -> dict[str, Any]:
         return payload
 
 
-@mcp.tool(name="run_workspace_flow", annotations=_AUDITED_PRIVATE)
-def run_workspace_flow_tool(
+def _run_workspace_flow(
     workspace_id: str,
     flow_id: str,
     dry_run: bool = True,
@@ -1816,27 +2957,15 @@ def run_workspace_flow_tool(
             flow_id=flow_id,
             env_overrides=env_overrides,
         )
-        for capability in readiness_selection["required_capabilities"]:
-            blocked = public_capability_gate(capability)
-            if blocked is not None:
-                _audit(
-                    "run_workspace_flow",
-                    {
-                        **_public_workspace_audit_ref(workspace_id),
-                        "flow_id": flow_id,
-                        "dry_run": dry_run,
-                        "capability": capability,
-                    },
-                    blocked,
-                )
-                return blocked
-        if not readiness_selection["connector_id"] or not workspace_connector_ready(
+        resolution = _workspace_connector_resolution(
             dashboard_payload,
             connector_id=readiness_selection["connector_id"],
+            connection_mode=readiness_selection["connection_mode"],
             environment=readiness_selection["environment"],
             required_capabilities=readiness_selection["required_capabilities"],
-        ):
-            payload = _connector_setup_block_payload()
+        )
+        if not resolution["ready"]:
+            payload = _connector_setup_block_payload(resolution)
             _audit(
                 "run_workspace_flow",
                 {
@@ -1845,6 +2974,7 @@ def run_workspace_flow_tool(
                     "dry_run": dry_run,
                     "env_keys": _env_keys(env_overrides),
                     "connector_id": readiness_selection["connector_id"],
+                    "connection_mode": readiness_selection["connection_mode"],
                     "environment": readiness_selection["environment"],
                 },
                 payload,
@@ -1855,7 +2985,10 @@ def run_workspace_flow_tool(
             return {"status": "not_found", "message": f"Workspace flow not found: {flow_id}"}
         result = create_default_runner(
             dry_run=dry_run,
-            connector_status_getter=lambda: connector_status(workspace_id),
+            connector_status_getter=lambda: connector_status(
+                workspace_id,
+                connector_id=readiness_selection["connector_id"],
+            ),
         ).run_text(
             str(flow.get("yaml") or ""),
             env=env_overrides,
@@ -1909,14 +3042,48 @@ def run_workspace_flow_tool(
         return payload
 
 
-@mcp.tool(name="save_workspace_flow", annotations=_AUDITED_PRIVATE)
+@mcp.tool(name="run_workspace_flow", annotations=_CLOSED_READ)
+def run_workspace_flow_tool(
+    workspace_id: str,
+    flow_id: str,
+    environment: FlowEnvironmentValues = (),
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Plan or run one saved closed Mercury Flow in a public workspace.
+
+    Changes: no ERP state; Mercury records private run-history and sanitized audit metadata.
+    External contact: Mercury's hosted workspace store only; hosted commands do not call an ERP.
+    Omitted options: environment defaults to an empty list and dry_run defaults to true.
+    """
+    try:
+        workspace_id = normalize_public_workspace_id(workspace_id)
+    except (AttributeError, ValueError):
+        return _invalid_hosted_flow_workspace_payload(dry_run=dry_run)
+    try:
+        env_overrides = _hosted_flow_environment_overrides(environment)
+    except ValueError:
+        return _invalid_hosted_flow_environment_payload(dry_run=dry_run)
+    return _run_workspace_flow(
+        workspace_id=workspace_id,
+        flow_id=flow_id,
+        dry_run=dry_run,
+        env=env_overrides,
+    )
+
+
+@mcp.tool(name="save_workspace_flow", annotations=_CLOSED_IDEMPOTENT_WRITE)
 def save_workspace_flow_tool(
     workspace_id: str,
     title: str,
     flow_yaml: str,
     metadata: WorkspaceFlowMetadata | None = None,
 ) -> dict[str, Any]:
-    """Save one Mercury flow into the connected workspace."""
+    """Save one content-addressed Mercury flow version in a public workspace.
+
+    Changes: creates or reuses an immutable Mercury flow version and records audit metadata.
+    External contact: Mercury's hosted workspace store only, never an ERP provider.
+    Omitted options: metadata defaults to source=mcp.
+    """
     try:
         metadata_payload = _model_payload(metadata) or {"source": "mcp"}
         _reject_sensitive_storage_input(
@@ -2169,16 +3336,13 @@ async def status(_: Request) -> Response:
         "support": "/support",
         "surface": "mcp-plugin-first",
         "browser_ui": "disabled",
-        "legacy_http_api": (
-            "enabled" if settings.enable_legacy_http_api else "disabled"
-        ),
+        "legacy_http_api": ("enabled" if settings.enable_legacy_http_api else "disabled"),
         "note": "Mercury is not a web app. Host AI clients call the MCP endpoint.",
         "flow_tools": [
             "flow_cheat_sheet",
             "check_flow_syntax",
             "inspect_flow_files",
-            "run_mercury_flow",
-            "run_flow",
+            "run_inline_flow",
             "run_flow_files",
             "save_workspace_flow",
             "list_workspace_flows",
@@ -2223,7 +3387,9 @@ async def connect(request: Request) -> Response:
         payload["dashboard"] = {"api": "/api/dashboard", "url": str(request.base_url).rstrip("/")}
         if settings.supabase_configured:
             try:
-                persisted = _product_store(settings).upsert_connection(connect_request, token_payload)
+                persisted = _product_store(settings).upsert_connection(
+                    connect_request, token_payload
+                )
                 payload["persistence"] = {
                     "status": "ok",
                     "workspace_id": persisted["workspace"]["id"],
@@ -2357,7 +3523,9 @@ async def import_workspace_flows(request: Request) -> Response:
                 {
                     "status": "ok",
                     "imported_count": len(saved),
-                    "workspace": data.get("workspace") if isinstance(data.get("workspace"), dict) else {},
+                    "workspace": data.get("workspace")
+                    if isinstance(data.get("workspace"), dict)
+                    else {},
                     "flows": [_public_flow_summary(flow) for flow in saved],
                 }
             )
@@ -2399,16 +3567,20 @@ async def run_workspace_flow(request: Request) -> Response:
                 flow_id=flow_id,
                 env_overrides=env_overrides,
             )
-            if not readiness_selection["connector_id"] or not workspace_connector_ready(
+            resolution = _workspace_connector_resolution(
                 dashboard_payload,
                 connector_id=readiness_selection["connector_id"],
+                connection_mode=readiness_selection["connection_mode"],
                 environment=readiness_selection["environment"],
                 required_capabilities=readiness_selection["required_capabilities"],
-            ):
-                return JSONResponse(redact_json(_connector_setup_block_payload()))
+            )
+            if not resolution["ready"]:
+                return JSONResponse(redact_json(_connector_setup_block_payload(resolution)))
             flow = store.get_flow(token_payload=token_payload, flow_id=flow_id)
             if not flow:
-                return _json_error("not_found", f"Workspace flow not found: {flow_id}", status_code=404)
+                return _json_error(
+                    "not_found", f"Workspace flow not found: {flow_id}", status_code=404
+                )
             flow_yaml = str(flow.get("yaml") or "")
             flow_title = str(flow.get("title") or flow.get("name") or flow_title)
         elif flow_yaml:
@@ -2422,13 +3594,15 @@ async def run_workspace_flow(request: Request) -> Response:
                     return JSONResponse(redact_json(_connector_setup_block_payload()))
                 store = store or _product_store(settings)
                 dashboard_payload = store.dashboard(token_payload)
-                if not readiness_selection["connector_id"] or not workspace_connector_ready(
+                resolution = _workspace_connector_resolution(
                     dashboard_payload,
                     connector_id=readiness_selection["connector_id"],
+                    connection_mode=readiness_selection["connection_mode"],
                     environment=readiness_selection["environment"],
                     required_capabilities=readiness_selection["required_capabilities"],
-                ):
-                    return JSONResponse(redact_json(_connector_setup_block_payload()))
+                )
+                if not resolution["ready"]:
+                    return JSONResponse(redact_json(_connector_setup_block_payload(resolution)))
         runner = create_default_runner(dry_run=dry_run)
         result = (
             runner.run_flow(parsed_raw_flow, env=env_overrides)
@@ -2462,28 +3636,41 @@ async def setup_connector(request: Request) -> Response:
     try:
         token_payload = _client_token_payload(request)
         if not settings.supabase_configured:
-            return _json_error(
+            return _legacy_connector_setup_error(
                 "service_unavailable",
                 "Supabase is required to save connector profiles.",
                 status_code=503,
             )
-        data = await request.json()
-        profile = _product_store(settings).set_connector_profile(
+        setup_request = LegacyConnectorSetupRequest.model_validate(await request.json())
+        _connector_id, _connection_mode, profile = _link_connector_profile_for_token(
             token_payload=token_payload,
-            connector_id=str(data.get("connector_id") or "").strip().lower(),
-            environment=str(data.get("environment") or "").strip().lower(),
-            company_name=str(data.get("company_name") or "").strip(),
-            metadata={"source": "connect-ui"},
+            connector_id=setup_request.connector_id,
+            connection_mode=setup_request.connection_mode,
+            environment=setup_request.environment,
+            company_ref=setup_request.company_ref,
+            company_name=setup_request.company_name,
+            external_server_name=setup_request.external_server_name,
+            store=_product_store(settings),
         )
-        return JSONResponse(
+        return _legacy_connector_setup_response(
             redact_json({"status": "ok", "profile": public_connector_profile(profile)})
         )
     except PermissionError as exc:
-        return _json_error("unauthorized", str(exc), status_code=401)
+        return _legacy_connector_setup_error("unauthorized", str(exc), status_code=401)
+    except ValidationError:
+        return _legacy_connector_setup_error(
+            "bad_request",
+            "Connector setup request validation failed.",
+            status_code=400,
+        )
     except ValueError as exc:
-        return _json_error("bad_request", str(exc), status_code=400)
+        return _legacy_connector_setup_error("bad_request", str(exc), status_code=400)
     except RuntimeError as exc:
-        return _json_error("service_unavailable", str(exc), status_code=503)
+        return _legacy_connector_setup_error(
+            "service_unavailable",
+            str(exc),
+            status_code=503,
+        )
 
 
 async def enable_skill(request: Request) -> Response:
@@ -2578,7 +3765,9 @@ async def upload_skill(request: Request) -> Response:
             },
         )
         chunks = chunk_document(document)
-        embeddings = create_embedding_provider(settings).embed_texts([chunk.text for chunk in chunks])
+        embeddings = create_embedding_provider(settings).embed_texts(
+            [chunk.text for chunk in chunks]
+        )
         SupabaseRagStore(settings).upsert_document_with_chunks(document, chunks, embeddings)
         upload = _product_store(settings).record_uploaded_skill(
             token_payload=token_payload,
@@ -2627,9 +3816,7 @@ async def healthz(request: Request) -> Response:
             "mcp_path": settings.mcp_path,
             "http_auth_required": http_auth_required,
             "http_auth_configured": settings.http_auth_configured,
-            "legacy_http_api": (
-                "enabled" if settings.enable_legacy_http_api else "disabled"
-            ),
+            "legacy_http_api": ("enabled" if settings.enable_legacy_http_api else "disabled"),
         }
     )
 

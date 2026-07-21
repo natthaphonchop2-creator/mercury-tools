@@ -1,29 +1,14 @@
 # Repository-Local Credentials
 
-Mercury Finance stores ERP credentials per repository. The local executor reads
-them only when it prepares a request; it does not upload them to Mercury Cloud.
+This is the sole guide for entering API-driver credentials. It applies only to the
+separately connected advanced local Mercury MCP; the hosted one-click plugin never asks
+for, receives, stores, or tests ERP credentials.
 
-## Location And Boundary
+## Terminal-only input
 
-Running a credential command initializes `.mercury/` in the selected repository:
-
-- `.mercury/credentials.env` contains the repository-local credential profiles.
-- `.mercury/audit/audit.jsonl` contains redacted, append-only audit events.
-- `.mercury/cache/requests.sqlite` keeps local immutable preview and outcome state.
-
-On POSIX systems the credential and audit files use owner-only permissions. Do
-not commit `.mercury/credentials.env`, paste values into MCP prompts, or add
-them to the plugin manifest.
-
-`.env` is not the trust boundary for local ERP credentials. It can configure
-developer process settings, but the local executor obtains connector values
-from `.mercury/credentials.env` through `mercury credentials`. This avoids
-accidental use of shell or dotenv values from another repository.
-
-## Setup And Status
-
-Run all commands from the repository that owns the ERP connection, or pass its
-path with `--repo-root`.
+Run setup from the repository that owns the ERP connection, or pass its path with
+`--repo-root`. The CLI prompts for every credential through hidden terminal input (echo
+disabled). Do not put values on a command line, in a file, in an MCP argument, or in chat.
 
 ```bash
 uv run mercury credentials setup flowaccount --env production --repo-root .
@@ -31,23 +16,34 @@ uv run mercury credentials setup peak --env uat --repo-root .
 uv run mercury credentials status --repo-root .
 ```
 
-The setup command prompts locally. Status returns required, present, and
-missing field names without printing credential values.
+The status command reports only required, present, and missing field names. It never
+prints credential values.
 
-## Safe Connection Probes
+## Location and boundary
 
-Credential tests validate authentication then make a safe GET request only:
+Credential commands initialize `.mercury/` in the selected repository:
+
+- `.mercury/credentials.env` contains repository-local credential profiles.
+- `.mercury/audit/audit.jsonl` contains redacted, append-only audit events.
+- `.mercury/cache/requests.sqlite` keeps immutable local preview and outcome state.
+
+On POSIX systems the credential and audit files use owner-only permissions. Do not commit
+`.mercury/credentials.env`. `.env` is not the local ERP trust boundary; the local runtime
+reads connector values only through the `mercury credentials` command family.
+
+## Safe connection probes
+
+After hidden-input setup is complete, validate authentication with a safe read-only probe:
 
 ```bash
 uv run mercury credentials test flowaccount --env production --repo-root .
 uv run mercury credentials test peak --env uat --repo-root .
 ```
 
-FlowAccount probes `GET /company/info`. PEAK probes `GET /user`. A successful
-result records non-secret validation metadata locally. These commands do not
-create, update, approve, or delete provider records.
+These probes make safe GET requests, record only non-secret validation metadata locally,
+and never create, update, approve, or delete provider records.
 
-## Clear Semantics
+## Clear local state
 
 Remove one configured profile:
 
@@ -61,20 +57,17 @@ Remove every profile from the active repository:
 uv run mercury credentials clear --all --repo-root .
 ```
 
-`clear --all` unlinks the local credential file, invalidates pending local
-requests, and removes local validation records. It does not promise a forensic
-secure erase from operating-system caches, backups, snapshots, or storage
-media. Rotate provider credentials when a compromise is suspected.
+`clear --all` unlinks the local credential file, invalidates pending local requests, and
+removes local validation records. It does not guarantee forensic erasure from operating
+system caches, backups, snapshots, or storage media. Rotate credentials after a suspected
+compromise.
 
-## Live Test Guard
+## Live test guard
 
-The repository's default integration test uses fake Cloud and fake ERP
-transports. Live credential checks are intentionally opt-in:
+The default integration suite uses fake Cloud and ERP transports. Live credential checks
+are opt-in and use the same safe probes above; they never execute ERP writes.
 
 ```bash
 MERCURY_LIVE_FLOWACCOUNT=1 uv run pytest tests/integration/test_local_erp_mcp.py -q
 MERCURY_LIVE_PEAK=1 uv run pytest tests/integration/test_local_erp_mcp.py -q
 ```
-
-Those optional tests only execute the same credential validation and safe GET
-probes above. They never execute ERP writes.

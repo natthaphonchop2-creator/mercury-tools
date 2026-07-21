@@ -2,8 +2,10 @@ import pytest
 from starlette.testclient import TestClient
 
 from mercury_tools import __version__
+from mercury_tools.config import Settings
 from mercury_tools.flows.templates import COMPANY_HEALTH_TEMPLATE
 from mercury_tools.mcp.server import create_http_app
+from mercury_tools.product import ConnectRequest, create_client_token
 
 
 @pytest.fixture(autouse=True)
@@ -29,13 +31,30 @@ def _clear_live_env(monkeypatch) -> None:
 def ready_connector_profile(connector_id: str = "flowaccount") -> dict:
     return {
         "connector_id": connector_id,
+        "connection_mode": "api_driver",
         "environment": "production",
-        "status": "connected",
-        "metadata": {
-            "setup_state": "ready",
-            "enabled_capabilities": ["company.info.read"],
-        },
+        "status": "ready_read_only",
+        "capability_states": {"company.info.read": "observed"},
+        "evidence_source": "api_driver_safe_probe",
+        "validated_at": "2026-07-19T12:00:00+00:00",
     }
+
+
+def make_client_token() -> str:
+    return create_client_token(
+        Settings(
+            supabase_url="https://example.supabase.co",
+            supabase_service_role_key="service-role",
+            openai_api_key="",
+            connect_signing_secret="signing-secret",
+        ),
+        ConnectRequest(
+            email="owner@example.com",
+            company="Demo Co",
+            host_app="codex",
+            invite_code="invite",
+        ),
+    )
 
 
 def test_remote_http_app_exposes_healthz(monkeypatch) -> None:
@@ -58,7 +77,7 @@ def test_status_exposes_exact_package_version_and_deployment_commit(monkeypatch)
 
     payload = TestClient(create_http_app(require_auth=False)).get("/api/status").json()
 
-    assert payload["version"] == __version__ == "0.2.2"
+    assert payload["version"] == __version__ == "0.3.0"
     assert payload["deployment_commit"] == commit
 
 
@@ -231,11 +250,19 @@ def test_connect_page_and_status(monkeypatch) -> None:
     assert status.json()["browser_ui"] == "disabled"
     assert "pages" not in status.json()
     assert "console" not in status.json()
-    assert "run_flow" in status.json()["flow_tools"]
-    assert "run_flow_files" in status.json()["flow_tools"]
-    assert "save_workspace_flow" in status.json()["flow_tools"]
-    assert "list_workspace_flows" in status.json()["flow_tools"]
-    assert "run_workspace_flow" in status.json()["flow_tools"]
+    flow_tools = status.json()["flow_tools"]
+    assert flow_tools == [
+        "flow_cheat_sheet",
+        "check_flow_syntax",
+        "inspect_flow_files",
+        "run_inline_flow",
+        "run_flow_files",
+        "save_workspace_flow",
+        "list_workspace_flows",
+        "run_workspace_flow",
+    ]
+    assert "run_flow" not in flow_tools
+    assert "run_mercury_flow" not in flow_tools
     assert status.json()["dashboard"] == "/api/dashboard"
     assert "connector_credentials" not in status.json()
     assert client.post("/api/connectors/credentials", json={}).status_code == 404
@@ -436,6 +463,159 @@ def test_product_mutation_requires_supabase(monkeypatch) -> None:
     )
 
     assert response.status_code == 503
+    assert response.json()["deprecated_tool"] == "start_connector_setup"
+    assert response.json()["replacement_tool"] == "link_connector_profile"
+
+
+def test_legacy_connector_setup_rejects_missing_mode_and_unsafe_fields(monkeypatch) -> None:
+    from mercury_tools.mcp import server
+
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
+    monkeypatch.setenv("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
+    calls: list[dict] = []
+
+    class FakeStore:
+        def set_connector_profile(self, **kwargs):
+            calls.append({"method": "set", **kwargs})
+            return ready_connector_profile()
+
+        def link_connector_profile(self, **kwargs):
+            calls.append({"method": "link", **kwargs})
+            return ready_connector_profile()
+
+    monkeypatch.setattr(server, "_product_store", lambda _settings=None: FakeStore())
+    client = TestClient(create_http_app(require_auth=True), raise_server_exceptions=False)
+    headers = {"Authorization": f"Bearer {make_client_token()}"}
+    rejected_secret = "arbitrary-extra-field-secret-7f89c2"
+    unsafe_bodies = [
+        {"connector_id": "flowaccount", "environment": "production"},
+        {
+            "connector_id": "flowaccount",
+            "connection_mode": "api_driver",
+            "environment": "production",
+            "arbitrary_unknown_field": rejected_secret,
+        },
+        {
+            "connector_id": "flowaccount",
+            "connection_mode": "api_driver",
+            "environment": "production",
+            "provider_body": {"result": "provider response"},
+        },
+        {
+            "connector_id": "flowaccount",
+            "connection_mode": "native_mcp",
+            "environment": "production",
+            "external_server_name": "192.168.1.10",
+        },
+    ]
+
+    responses = [
+        client.post("/api/connectors/setup", headers=headers, json=body)
+        for body in unsafe_bodies
+    ]
+
+    assert all(400 <= response.status_code < 500 for response in responses)
+    assert all(
+        response.json()["deprecated_tool"] == "start_connector_setup"
+        and response.json()["replacement_tool"] == "link_connector_profile"
+        for response in responses
+    )
+    assert responses[1].json()["message"] == "Connector setup request validation failed."
+    assert rejected_secret not in responses[1].text
+    assert calls == []
+
+    safe_response = client.post(
+        "/api/connectors/setup",
+        headers=headers,
+        json={
+            "connector_id": "flowaccount",
+            "connection_mode": "api_driver",
+            "environment": "production",
+            "company_name": "Demo Co",
+        },
+    )
+
+    assert safe_response.status_code == 200
+    assert safe_response.json()["deprecated_tool"] == "start_connector_setup"
+    assert safe_response.json()["replacement_tool"] == "link_connector_profile"
+    assert len(calls) == 1
+    assert calls[0]["method"] == "link"
+    assert {key: calls[0][key] for key in calls[0] if key != "token_payload"} == {
+        "method": "link",
+        "connector_id": "flowaccount",
+        "connection_mode": "api_driver",
+        "environment": "production",
+        "company_ref": None,
+        "company_name": "Demo Co",
+        "external_server_name": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("store_error", "expected_status"),
+    [
+        (ValueError("safe profile validation failed"), 400),
+        (RuntimeError("profile storage unavailable"), 503),
+    ],
+)
+def test_legacy_connector_setup_runtime_errors_include_migration_fields(
+    monkeypatch,
+    store_error: Exception,
+    expected_status: int,
+) -> None:
+    from mercury_tools.mcp import server
+
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
+    monkeypatch.setenv("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
+
+    class FakeStore:
+        def link_connector_profile(self, **kwargs):
+            raise store_error
+
+    monkeypatch.setattr(server, "_product_store", lambda _settings=None: FakeStore())
+    client = TestClient(create_http_app(require_auth=True), raise_server_exceptions=False)
+    response = client.post(
+        "/api/connectors/setup",
+        headers={"Authorization": f"Bearer {make_client_token()}"},
+        json={
+            "connector_id": "flowaccount",
+            "connection_mode": "api_driver",
+            "environment": "production",
+        },
+    )
+
+    assert response.status_code == expected_status
+    assert response.json()["deprecated_tool"] == "start_connector_setup"
+    assert response.json()["replacement_tool"] == "link_connector_profile"
+
+
+def test_legacy_connector_setup_unauthorized_error_includes_migration_fields(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service-role")
+    monkeypatch.setenv("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("MERCURY_CONNECT_SIGNING_SECRET", "signing-secret")
+
+    response = TestClient(
+        create_http_app(require_auth=True),
+        raise_server_exceptions=False,
+    ).post(
+        "/api/connectors/setup",
+        json={
+            "connector_id": "flowaccount",
+            "connection_mode": "api_driver",
+            "environment": "production",
+        },
+    )
+
+    assert response.status_code == 401
+    assert response.json()["deprecated_tool"] == "start_connector_setup"
+    assert response.json()["replacement_tool"] == "link_connector_profile"
 
 
 def test_workspace_flow_validate_and_dry_run_use_client_token(monkeypatch) -> None:
@@ -540,8 +720,8 @@ def test_workspace_flow_run_blocks_connector_backed_raw_yaml_when_unready(monkey
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "blocked"
-    assert "connector credential setup" in payload["message"]
+    assert payload["status"] == "not_ready"
+    assert payload["reason"] == "not_validated"
 
 
 def test_workspace_flow_run_blocks_raw_yaml_with_connector_missing_environment(monkeypatch) -> None:
@@ -605,8 +785,8 @@ def test_workspace_flow_run_blocks_raw_yaml_with_connector_missing_environment(m
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "blocked"
-    assert "connector credential setup" in payload["message"]
+    assert payload["status"] == "not_ready"
+    assert payload["reason"] == "environment_mismatch"
 
 
 def test_workspace_flow_run_allows_non_connector_raw_yaml_without_readiness(monkeypatch) -> None:

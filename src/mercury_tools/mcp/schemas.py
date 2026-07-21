@@ -2,34 +2,70 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SkipValidation, model_validator
 
-ConnectorId = Literal["flowaccount", "peak", "express", "custom"]
-ConnectorEnvironment = Literal["production", "sandbox", "uat", "local", "gateway"]
+from mercury_tools.skills.catalog import (
+    ACCOUNTING_SKILL_IDS,
+    SkillConnectionMode,
+    SkillConnectorId,
+    SkillEnvironment,
+)
+
+ConnectorId = SkillConnectorId
+ConnectorEnvironment = SkillEnvironment
+ConnectorConnectionMode = SkillConnectionMode
+ConnectorUnlinkConfirmation = Literal["unlink"]
 SearchMode = Literal["hybrid", "keyword", "vector"]
-AccountingSkillId = Literal[
-    "accounts-payable-reconciliation-th",
-    "accounts-receivable-reconciliation-th",
-    "bank-settlement-reconciliation-th",
-    "company-health-check-th",
-    "connector-credential-setup-th",
-    "connector-setup-guide-th",
-    "flowaccount-connector-setup-th",
-    "flowaccount-journal-posting-th",
-    "invoice-review-th",
-    "management-report-th",
-    "marketplace-settlement-review-th",
-    "mercury-flow-runner",
-    "month-end-evidence-gathering-th",
-    "peak-connector-setup-th",
-    "vat-summary-th",
-]
+CAPABILITY_PATTERN = r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$"
+AccountingSkillId = Literal[*ACCOUNTING_SKILL_IDS]
+# Keep the catalog enum visible to MCP clients while the hosted tool handler
+# sanitizes rejected raw values before FastMCP can expose them.
+AccountingSkillIdInput = SkipValidation[AccountingSkillId]
 
 
 class StrictMcpInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class CapabilityObservation(StrictMcpInput):
+    capability: str = Field(pattern=CAPABILITY_PATTERN, max_length=200)
+    state: Literal[
+        "observed",
+        "provider_unavailable",
+        "not_authorized",
+        "validation_failed",
+        "environment_mismatch",
+    ]
+
+
+class ConnectorValidationEvidence(StrictMcpInput):
+    source: Literal[
+        "native_mcp_safe_read",
+        "api_driver_safe_probe",
+        "local_bridge_safe_probe",
+    ]
+    status: Literal["succeeded", "failed"]
+    observed_at: datetime
+    evidence_ref: str = Field(pattern=r"^evidence_[0-9a-z_-]{8,128}$")
+    provider_tool_name: str | None = Field(default=None, max_length=200)
+    capabilities: list[CapabilityObservation] = Field(min_length=1, max_length=500)
+
+
+ConnectorValidationEvidenceInput = SkipValidation[ConnectorValidationEvidence]
+
+
+class LegacyConnectorSetupRequest(StrictMcpInput):
+    """Strict compatibility body for the opt-in legacy setup route."""
+
+    connector_id: ConnectorId
+    connection_mode: ConnectorConnectionMode
+    environment: ConnectorEnvironment
+    company_ref: str | None = Field(default=None, max_length=200)
+    company_name: str | None = Field(default=None, max_length=200)
+    external_server_name: str | None = Field(default=None, max_length=200)
 
 
 class KnowledgeSearchFilters(StrictMcpInput):
@@ -78,12 +114,12 @@ class KnowledgeSearchFilters(StrictMcpInput):
     )
     capability: str | None = Field(
         default=None,
-        pattern=r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$",
+        pattern=CAPABILITY_PATTERN,
         description="Dotted ERP capability such as documents.invoice.list.",
     )
     accounting_use: str | None = Field(
         default=None,
-        pattern=r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$",
+        pattern=CAPABILITY_PATTERN,
         description="Dotted accounting use case represented by the evidence.",
     )
 
@@ -106,18 +142,17 @@ class AccountingSkillInputs(StrictMcpInput):
 
     query: str | None = Field(
         default=None,
+        min_length=1,
         max_length=20_000,
         description="The user's accounting question or requested outcome.",
-    )
-    workspace_id: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=2_048,
-        description="Mercury public workspace id when workspace context is required.",
     )
     connector_id: ConnectorId | None = Field(
         default=None,
         description="ERP connector relevant to the skill.",
+    )
+    connection_mode: ConnectorConnectionMode | None = Field(
+        default=None,
+        description="Connection mode used to disambiguate profiles for the same connector.",
     )
     environment: ConnectorEnvironment | None = Field(
         default=None,
@@ -164,6 +199,19 @@ class AccountingSkillInputs(StrictMcpInput):
         description="Additional named, non-secret parameters required by a specific skill.",
     )
 
+    @model_validator(mode="after")
+    def validate_unique_parameters(self) -> AccountingSkillInputs:
+        names = [parameter.name for parameter in self.parameters]
+        explicit_fields = set(self.model_fields_set) - {"parameters"}
+        if len(set(names)) != len(names) or set(names) & explicit_fields:
+            raise ValueError("accounting_skill_parameter_duplicate")
+        return self
+
+
+# Keep the host-visible envelope schema explicit while all raw nested values are
+# validated in the sanitized tool handler.
+AccountingSkillInputsInput = SkipValidation[AccountingSkillInputs]
+
 
 class FlowFileInput(StrictMcpInput):
     path: str = Field(
@@ -178,67 +226,56 @@ class FlowFileInput(StrictMcpInput):
     )
 
 
+FlowFiles = Annotated[list[FlowFileInput], Field(min_length=1, max_length=50)]
+InlineFlowYaml = SkipValidation[
+    Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=500_000,
+            description="Complete inline Mercury Flow YAML.",
+        ),
+    ]
+]
+
+
+class FlowEnvironmentValue(StrictMcpInput):
+    name: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_]{0,99}$")
+    value: str = Field(max_length=10_000)
+
+
+# Preserve the bounded array and item schema while validating the entire raw
+# value inside the tool handler, where invalid inputs receive a fixed response.
+FlowEnvironmentValues = SkipValidation[
+    Annotated[
+        list[FlowEnvironmentValue],
+        Field(max_length=100),
+    ]
+]
+FlowTag = Annotated[str, Field(min_length=1, max_length=100)]
+FlowTags = Annotated[list[FlowTag], Field(max_length=100)]
+
+
 class InlineFlowSource(StrictMcpInput):
-    source_type: Literal["flow_yaml"] = Field(description="Run one inline Mercury Flow.")
-    flow_yaml: str = Field(
-        min_length=1,
-        max_length=500_000,
-        description="Complete inline Mercury Flow YAML.",
-    )
-    workspace_id: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=2_048,
-        description="Workspace id required when the flow uses an ERP connector.",
-    )
+    source_type: Literal["flow_yaml"]
+    flow_yaml: str = Field(min_length=1, max_length=500_000)
+    workspace_id: str | None = Field(default=None, min_length=1, max_length=2_048)
 
 
 class FlowFilesSource(StrictMcpInput):
-    source_type: Literal["flow_files"] = Field(description="Run an in-memory flow suite.")
-    flow_files: list[FlowFileInput] = Field(
-        min_length=1,
-        max_length=50,
-        description="Mercury Flow files, each with a relative path and YAML content.",
-    )
-    workspace_id: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=2_048,
-        description="Workspace id required when a selected flow uses an ERP connector.",
-    )
-    config_yaml: str | None = Field(
-        default=None,
-        max_length=500_000,
-        description="Optional Mercury workspace config YAML for discovery and order.",
-    )
-    include_tags: list[str] = Field(
-        default_factory=list,
-        max_length=100,
-        description="Select flows containing at least one exact tag in this list.",
-    )
-    exclude_tags: list[str] = Field(
-        default_factory=list,
-        max_length=100,
-        description="Skip flows containing any exact tag in this list.",
-    )
-    continue_on_failure: bool = Field(
-        default=True,
-        description="Continue with later selected files after one flow fails.",
-    )
+    source_type: Literal["flow_files"]
+    flow_files: list[FlowFileInput] = Field(min_length=1, max_length=50)
+    workspace_id: str | None = Field(default=None, min_length=1, max_length=2_048)
+    config_yaml: str | None = Field(default=None, max_length=500_000)
+    include_tags: list[str] = Field(default_factory=list, max_length=100)
+    exclude_tags: list[str] = Field(default_factory=list, max_length=100)
+    continue_on_failure: bool = True
 
 
 class WorkspaceFlowSource(StrictMcpInput):
-    source_type: Literal["workspace_flow"] = Field(description="Run one saved workspace flow.")
-    workspace_id: str = Field(
-        min_length=1,
-        max_length=2_048,
-        description="Mercury public workspace id that owns the saved flow.",
-    )
-    workspace_flow_id: str = Field(
-        min_length=1,
-        max_length=500,
-        description="Saved Mercury flow id returned by list_workspace_flows.",
-    )
+    source_type: Literal["workspace_flow"]
+    workspace_id: str = Field(min_length=1, max_length=2_048)
+    workspace_flow_id: str = Field(min_length=1, max_length=500)
 
 
 MercuryFlowSource = Annotated[
@@ -256,6 +293,10 @@ class WorkspaceFlowEnvironment(StrictMcpInput):
         default=None,
         description="Connector environment selected for this saved flow.",
     )
+    connection_mode: ConnectorConnectionMode | None = Field(
+        default=None,
+        description="Connector connection mode selected for this saved flow.",
+    )
 
 
 class WorkspaceFlowMetadata(StrictMcpInput):
@@ -270,6 +311,10 @@ class WorkspaceFlowMetadata(StrictMcpInput):
     environment: ConnectorEnvironment | None = Field(
         default=None,
         description="Connector environment required by the saved flow.",
+    )
+    connection_mode: ConnectorConnectionMode | None = Field(
+        default=None,
+        description="Connector connection mode required by the saved flow.",
     )
     required_capabilities: list[str] = Field(
         default_factory=list,
@@ -290,7 +335,7 @@ class WorkspaceFlowMetadata(StrictMcpInput):
         max_length=2_000,
         description="Short, non-secret description of the flow.",
     )
-    tags: list[str] = Field(
+    tags: list[FlowTag] = Field(
         default_factory=list,
         max_length=100,
         description="Search and organization tags for the saved flow.",

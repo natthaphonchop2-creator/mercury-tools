@@ -1482,6 +1482,64 @@ def test_release_scan_parser_exposes_exact_fail_closed_command() -> None:
     assert callable(args.func)
 
 
+def test_release_scan_parser_accepts_exact_local_release_command() -> None:
+    from mercury_tools.cli import build_parser
+
+    args = build_parser().parse_args(
+        ["release", "scan-secrets", "--all-history", "--artifacts", "dist"]
+    )
+
+    assert args.release_command == "scan-secrets"
+    assert args.all_history is True
+    assert args.hosted is False
+    assert args.artifacts == "dist"
+    assert args.repo == "."
+    assert callable(args.func)
+
+
+def test_cli_exact_local_release_command_fails_closed_when_scanners_are_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from mercury_tools import cli
+
+    source_root = Path(__file__).resolve().parents[1]
+    root = tmp_path / "current-repository"
+    root.mkdir()
+    _git("init", "-b", "main", cwd=root)
+    _git(
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/example/mercury-tools.git",
+        cwd=root,
+    )
+    release_docs = root / "docs/release"
+    release_docs.mkdir(parents=True)
+    for name in ("public-surface-manifest.json", "secret-scan-allowlist.json"):
+        shutil.copy2(source_root / "docs/release" / name, release_docs / name)
+    _git("add", ".", cwd=root)
+    _git("commit", "-m", "release scan fixture", cwd=root)
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        scanner_module,
+        "scan_git_repository",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("git_scanned")),
+    )
+
+    exit_code = cli.main(
+        ["release", "scan-secrets", "--all-history", "--artifacts", "dist"]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert "scanner_missing:gitleaks" in payload["blockers"]
+    assert "scanner_missing:trufflehog" in payload["blockers"]
+    assert "scan_request_malformed" not in payload["blockers"]
+
+
 def test_cli_missing_scanners_fails_closed_and_writes_same_safe_json(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

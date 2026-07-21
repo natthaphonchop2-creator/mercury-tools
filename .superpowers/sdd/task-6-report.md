@@ -1,91 +1,180 @@
-# Task 6 RED/GREEN Report
+# Task 6 Report: Capability-routed accounting Skills
 
-## Scope
+## Scope completed
 
-- `src/mercury_tools/catalog/search.py`
-- `src/mercury_tools/execution/__init__.py`
-- `src/mercury_tools/execution/policy.py`
-- `tests/test_catalog_search.py`
-- `tests/test_execution_policy.py`
+- Added `connection_mode` to the canonical Skill input base and the explicit hosted MCP
+  common envelope. Every generated Skill schema now exposes the same selector.
+- Extended `resolve_skill_route` with `requested_connection_mode`. Explicit connector and
+  mode selectors resolve same-connector profiles while an omitted environment still returns
+  sorted `connector_selection_required` choices when multiple environments qualify.
+- Passed the validated `inputs.connection_mode` from hosted `run_accounting_skill` into the
+  route resolver.
+- Split normalized profile values from sanitized host identifiers. Connector ID, connection
+  mode, and environment remain lowercase-normalized; `external_server_name` is trimmed and
+  validated without changing case.
+- Native host plans now include every required capability plus observed optional
+  capabilities. Each ordered step carries `required: true|false`; unavailable optional
+  actions remain in capability resolution but are absent from ordered steps and host tool
+  requirements.
+- Rewrote all ten generic Markdown Skills with exactly one `native_mcp`, `api_driver`, or
+  `local_bridge_required` branch. Native mode uses only returned provider steps, API-driver
+  mode uses only the returned advanced local handoff, and Local Bridge stops for setup.
+  Unconditional local credential, read, and write commands were removed.
+- Replaced keyword-only Markdown assertions and stale nine-step runtime assertions with
+  semantic branch parsing, route exclusivity, hard-stop, evidence, read-only, and
+  no-unconditional-local-command checks.
+- Updated the older public product-design document to the current three-tool Skill contract:
+  `list_accounting_skills`, `get_accounting_skill_schema`, and workspace-scoped
+  `run_accounting_skill`.
+- Left `plugins/mercury-finance/.mcp.json` and
+  `src/mercury_tools/mcp/local_server.py` unchanged. No hosted workspace tools were copied
+  into the advanced local server.
 
-No Task 5 files, plan files, or progress ledger files were modified.
+## TDD evidence
 
-## RED
+- Clean baseline before edits:
+  `uv run pytest -q tests/test_skill_routing.py tests/test_connector_mcp_tools.py tests/test_plugin_package.py`
+  -> `116 passed, 1 warning`.
+- Route/schema/server/Markdown/spec RED:
+  `uv run pytest -q tests/test_skill_routing.py tests/test_connector_mcp_tools.py tests/test_mcp_contract.py tests/test_plugin_package.py -k 'skill or accounting_skill_tool_contract'`
+  -> `16 failed, 25 passed, 146 deselected, 1 warning` for the missing canonical selector,
+  resolver argument, optional native steps, case preservation, route branches, and current
+  spec signature.
+- Explicit common-envelope and FastMCP-schema RED:
+  `uv run pytest -q tests/test_connector_mcp_tools.py::test_connector_id_accepts_generic_mcp tests/test_mcp_contract.py::test_public_mcp_tool_schemas_are_explicit_for_plugin_review`
+  -> `2 failed, 1 warning` because `connection_mode` was rejected/absent.
+- Python contract GREEN after the minimal implementation:
+  `uv run pytest -q tests/test_skill_routing.py tests/test_connector_mcp_tools.py::test_connector_id_accepts_generic_mcp tests/test_connector_mcp_tools.py::test_run_accounting_skill_hands_connection_mode_to_same_connector_route tests/test_mcp_contract.py::test_public_mcp_tool_schemas_are_explicit_for_plugin_review`
+  -> `13 passed, 1 warning`.
+- Strengthened Markdown/runtime contract RED before rewriting the Skills:
+  `uv run pytest -q tests/test_plugin_package.py -k 'generic_skill_markdown or read_skills or cross_mcp_skills or flow_runner or public_product_design'`
+  -> `14 failed, 1 passed, 45 deselected`.
+- Semantic Markdown/spec GREEN:
+  the same command -> `15 passed, 45 deselected`.
+- The first cloud/runtime regression exposed five stale tests that still required the retired
+  unconditional nine-step local write sequence. Those tests were rewritten around the new
+  exclusive route contract; the rerun is recorded below.
 
-After writing the ranking/filter/ambiguity, risk-floor, and immutable result
-model tests, the focused command failed during collection as expected because
-the production modules did not exist:
+## Verification evidence
 
-```text
-uv run pytest tests/test_catalog_search.py tests/test_execution_policy.py -q
-ModuleNotFoundError: No module named 'mercury_tools.catalog.search'
-ModuleNotFoundError: No module named 'mercury_tools.execution'
-```
+- Task 6 focused suite:
+  `uv run pytest -q tests/test_skill_routing.py tests/test_connector_mcp_tools.py tests/test_plugin_package.py`
+  -> `121 passed, 1 warning`.
+- Public MCP contract:
+  `uv run pytest -q tests/test_mcp_contract.py` -> `66 passed`.
+- Runtime and cloud Skill consumers:
+  `uv run pytest -q tests/test_runtime_skills.py tests/test_cloud_api.py tests/test_cloud_client.py -k skill`
+  -> `49 passed, 324 deselected`.
+- Existing local advanced Skill runtime:
+  `uv run pytest -q tests/test_local_mcp_contract.py -k run_accounting_skill`
+  -> `1 passed, 36 deselected`.
+- Ruff for every changed Python source and test file:
+  `uv run ruff check src/mercury_tools/skills src/mercury_tools/mcp/schemas.py src/mercury_tools/mcp/server.py tests/test_skill_routing.py tests/test_connector_mcp_tools.py tests/test_mcp_contract.py tests/test_plugin_package.py tests/test_runtime_skills.py`
+  -> `All checks passed!`.
+- `git diff --check` -> passed.
 
-## GREEN
+## Concerns
 
-Implemented deterministic local search with these guarantees:
+- The focused connector suite still emits the pre-existing Starlette `TestClient`
+  deprecation warning about the `httpx` transport.
+- This intermediate branch is intentionally not releasable: the public plugin remains pinned
+  to v0.2.2 `serve-local`, and Task 9 owns the atomic hosted HTTP switch.
+- Verification covers Task 6 plus shared MCP, cloud/runtime Skill, and local advanced Skill
+  consumers. The repository-wide full suite was not required or run.
+- No Task 7 implementation was started and no remote push was performed.
 
-- Exact action ID/capability, exact Thai/English alias, connector/capability
-  keyword, and normalized token-overlap buckets.
-- Finite bounded semantic scores only break ties within a bucket; final ties
-  use `action_id` order.
-- Connector, `HttpMethod`, and `RiskTier` filters validate deterministically.
-- Empty/no-match searches return no candidate, and ambiguity is explicit.
-- Frozen result models prevent an ambiguous response from being silently
-  mutated into a selected action.
+## Review Fix 2
 
-Implemented non-decreasing execution policy floors:
+### Scope completed
 
-- `GET` is safe read and mutations default to standard write.
-- `DELETE`, high-risk effect tokens, and inferred untested mutations require
-  high risk and two confirmations.
-- Catalog-declared risk and confirmations are never lowered.
-- Reasons are stable identifiers only.
+- Local Bridge routing now returns `connector_selection_required` with sorted, sanitized
+  connector/mode/environment tuples when more than one selected bridge profile remains. A
+  single selected bridge profile still returns the exact `local_bridge_required` handoff.
+- Added only declared per-mode aliases: FlowAccount API-driver
+  `tax.vat.summary.read -> tax.vat_summary.read` and PEAK API-driver
+  `journal.read -> daily_journal.get`. FlowAccount native MCP remains without either alias.
+- Native MCP routing treats a profile marked ready but missing or carrying an unsafe
+  `external_server_name` as `not_validated`, preventing a host tool plan from being returned.
 
-Focused verification:
+### TDD evidence
 
-```text
-uv run pytest tests/test_catalog_search.py tests/test_execution_policy.py -q
-36 passed in 0.05s
+- RED after adding catalog and routing regressions:
+  `uv run pytest -q tests/test_connector_catalog.py tests/test_skill_routing.py`
+  -> `7 failed, 19 passed`. Failures covered both absent aliases, optional capability
+  resolution, first-bridge selection, and malformed ready native profiles.
+- GREEN after the minimal manifest and routing changes:
+  the same command -> `26 passed`.
 
-uv run ruff check .
-All checks passed!
-```
+### Verification evidence
 
-Full verification:
+- Connector catalog plus Task 6 focused suite:
+  `uv run pytest -q tests/test_connector_catalog.py tests/test_skill_routing.py tests/test_connector_mcp_tools.py tests/test_plugin_package.py`
+  -> `137 passed, 1 warning`.
+- Public MCP contract:
+  `uv run pytest -q tests/test_mcp_contract.py` -> `66 passed`.
+- Runtime and cloud Skill consumers:
+  `uv run pytest -q tests/test_runtime_skills.py tests/test_cloud_api.py tests/test_cloud_client.py -k skill`
+  -> `49 passed, 324 deselected`.
+- Existing local advanced Skill runtime:
+  `uv run pytest -q tests/test_local_mcp_contract.py -k run_accounting_skill`
+  -> `1 passed, 36 deselected`.
+- Ruff for the changed Python source and tests:
+  `uv run ruff check src/mercury_tools/connectors/catalog.py src/mercury_tools/skills/routing.py tests/test_connector_catalog.py tests/test_skill_routing.py`
+  -> `All checks passed!`.
 
-```text
-uv run pytest -m "not integration" -q
-663 passed, 1 deselected, 1 warning in 2.04s
+### Concerns
 
-uv run ruff check .
-All checks passed!
+- The focused suite retains the pre-existing Starlette `TestClient` deprecation warning about
+  the `httpx` transport.
+- No Task 7 work, Task 9 launcher edits, or remote push was performed. The repository-wide
+  full suite was not required or run.
 
-git diff --check
-passed
-```
+## Review Fix 3
 
-The one warning is the existing Starlette/httpx `TestClient` deprecation warning
-from `tests/test_connector_mcp_tools.py`.
+### Scope completed
 
-## Self-review
+- Hosted `get_accounting_skill_schema` and `run_accounting_skill` retain the canonical Skill
+  enum in their MCP schemas while accepting raw values inside a sanitized handler boundary.
+  Invalid or secret-bearing Skill IDs return the fixed `Accounting skill ID is invalid.` payload
+  before workspace access or audit persistence; safe, ordinary unknown IDs still return
+  `not_found`.
+- Native MCP routing now calls the canonical `safe_external_server_name` validator from product
+  persistence. A ready profile with an invalid server name, including `bad server`, is
+  unavailable with reason `not_validated` and no host plan.
 
-- No network, Supabase, or LLM dependency is used by ranking or policy.
-- `HttpMethod` and `RiskTier` comparisons use their model enums, not string or
-  integer equality.
-- NaN, infinity, bools, out-of-range scores, invalid enum filters, and invalid
-  `top_k` values fail with stable identifiers before sorting.
-- Semantic scores cannot move a match across rank buckets, and ambiguous
-  responses expose no auto-selected action field.
+### TDD evidence
 
-## Commit
+- RED after adding FastMCP and native-profile regressions:
+  `uv run pytest -q tests/test_mcp_contract.py::test_accounting_skill_id_rejection_is_sanitized_through_fastmcp tests/test_skill_routing.py::test_malformed_ready_native_profile_is_not_validated`
+  -> `3 failed, 2 passed`. Both public Skill tools exposed FastMCP validation text containing
+  `input_value`; the spaced native server name routed ready.
+- Targeted GREEN after the minimal implementation and schema-preservation assertion:
+  `uv run pytest -q tests/test_mcp_contract.py::test_accounting_skill_id_rejection_is_sanitized_through_fastmcp tests/test_mcp_contract.py::test_public_mcp_tool_schemas_are_explicit_for_plugin_review tests/test_skill_routing.py::test_malformed_ready_native_profile_is_not_validated`
+  -> `7 passed`.
 
-`969e8cd8794ae175d206f049f1f373d4e8610c59` - `feat: rank catalog actions and enforce risk tiers`
+### Verification evidence
 
-## Residual risk
+- Task 6 focused suite:
+  `uv run pytest -q tests/test_skill_routing.py tests/test_connector_mcp_tools.py tests/test_plugin_package.py`
+  -> `127 passed, 1 warning`.
+- Public MCP contract:
+  `uv run pytest -q tests/test_mcp_contract.py` -> `69 passed`.
+- Runtime and cloud Skill consumers:
+  `uv run pytest -q tests/test_runtime_skills.py tests/test_cloud_api.py tests/test_cloud_client.py -k skill`
+  -> `49 passed, 324 deselected`.
+- Existing local advanced Skill runtime:
+  `uv run pytest -q tests/test_local_mcp_contract.py -k run_accounting_skill`
+  -> `1 passed, 36 deselected`.
+- Connector catalog regression:
+  `uv run pytest -q tests/test_connector_catalog.py` -> `11 passed`.
+- Ruff:
+  `uv run ruff check src/mercury_tools/db/product.py src/mercury_tools/mcp/schemas.py src/mercury_tools/mcp/server.py src/mercury_tools/skills/routing.py tests/test_mcp_contract.py tests/test_skill_routing.py`
+  -> `All checks passed!`.
+- `git diff --check` -> passed.
 
-The runtime invocation/confirmation state machine and connector dispatch are
-intentionally outside Task 6. Their later integration must preserve the
-`CatalogSearchResponse.ambiguous` gate and consume `RiskDecision` rather than
-reclassifying catalog actions ad hoc.
+### Concerns
+
+- The focused connector suite retains the pre-existing Starlette `TestClient` deprecation
+  warning about the `httpx` transport.
+- No Task 7 implementation, Task 9 launcher edit, remote push, or repository-wide full suite
+  was performed.

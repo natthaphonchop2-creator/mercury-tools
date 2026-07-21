@@ -1,73 +1,103 @@
-# Task 9 Report: Interactive Credential and Trusted-Host CLI
+# Task 9 Report: Hosted One-Click Plugin Validation Fix
 
-## Delivered
+## Scope
 
-- Added repository-local `credentials` commands for setup, status, test, and clear.
-- Added `connector configure` with exact host confirmation and supported nonsecret OAuth metadata.
-- Added the `mercury` console-script alias while retaining `mercury-tools`.
-- Extended `doctor` with repository, permission, catalog, cloud URL, connector, and missing-field diagnostics.
-- Added the lazy `mcp serve-local` parser boundary without importing the cloud MCP server.
-- Added validated, atomic nonsecret safe-probe metadata persistence under the optional `validations` config section.
+- Validation-fix base: `ef59a0c` (`fix: validate one-click Mercury packaging`).
+- Public plugin: exactly one hosted HTTP MCP at
+  `https://mercury-tools-mcp.onrender.com/mcp`.
+- Advanced local runtime: remains a separately connected path documented at both
+  `docs/ADVANCED_LOCAL_ERP.md` and the identical packaged path
+  `plugins/mercury-finance/docs/ADVANCED_LOCAL_ERP.md`.
+- Deliberately unchanged: Task 10 submission bundle and Task 11 version/release files.
+
+## Validation Fixes
+
+1. Added `scripts/validate_release_plugin.py --codex-cli`. It reconstructs a local-only
+   marketplace from `.agents/plugins/marketplace.json` and the public plugin directory,
+   isolates `HOME` and `CODEX_HOME`, runs `codex plugin marketplace add ... --json` and
+   `codex plugin add mercury-finance@mercury-tools --json` with empty stdin, and verifies
+   the installed cache exposes exactly the one expected hosted MCP. The ordinary unit test
+   skips when `codex` is unavailable; the explicit flag fails with an actionable error in
+   that environment. Static validation and actual CLI validation print separate results.
+2. Replaced the broad backtick allowlist with an imperative-call parser for the English and
+   Thai verbs used by public Skills. Every parsed call name must occur in the actual hosted
+   MCP registry. Prose such as argument names, statuses, package-local paths, code literals,
+   and returned handoff steps is not interpreted as a tool call. Mutation coverage proves
+   that imperative calls to `inputs` and `credential_status` fail.
+3. Added a public-package boundary check. `mercury mcp serve-local` and all local-only tool
+   names may occur only in `plugins/mercury-finance/docs/ADVANCED_LOCAL_ERP.md`; every public
+   Skill reference to that document must call it a handoff. A release-layout mutation placing
+   the command in a hosted Skill is rejected.
 
 ## TDD Evidence
 
-- RED: `uv run pytest tests/test_credential_cli.py -q` failed because `credentials` and `connector` parsers did not exist.
-- RED: the unexpected-driver-error regression test failed by raising the injected secret-bearing exception.
-- GREEN: focused tests passed after parser and handler implementation.
+### RED
 
-## Verification
+Command:
 
-- `uv run pytest tests/test_credential_cli.py tests/test_cli_search.py -q`: 12 passed.
-- `uv run mercury --help`: lists `credentials`, `connector`, `mcp`, `flow`, `search`, and `doctor`.
-- `uv run pytest -m 'not integration' -q`: 914 passed, 1 deselected, with one existing Starlette/httpx deprecation warning.
-- `uv run ruff check .`: passed.
-- `git diff --check`: passed.
+```bash
+uv run --extra dev pytest -q tests/test_plugin_package.py \
+  -k 'imperative_tool or local_commands_and_tools or codex_cli_gate or release_validator_accepts'
+```
 
-## Security Review
+Result: `1 passed, 3 failed`. The failures showed that static and actual CLI validation were
+not distinct, `--codex-cli` did not exist, and the initial boundary assertion was too narrow
+for existing prose handoffs. The assertion was corrected to the documented handoff contract
+before implementing the validator changes.
 
-- CLI status, doctor, setup output, test metadata, and failures emit field names and sanitized state only.
-- Successful probes persist only connector and environment identity, sanitized company display name, connected state, probe action, and timestamp. Existing config schema, trusted hosts, and connector records are retained through atomic writes.
-- Interactive setup and trusted-host configuration return nonzero safe errors when stdin is unavailable. Credential testing refuses to call `asyncio.run` from an active event loop.
+### GREEN
 
-## Review Fix TDD Evidence
+The focused validator, parser, boundary, and mutation suite returned
+`29 passed, 47 deselected`.
 
-- RED: `uv run pytest tests/test_redaction.py tests/test_credential_cli.py tests/test_cli_search.py -q`
-  - Result: failed during collection with `ImportError: cannot import name 'redact_credential_text' from mercury_tools.safety.redaction`.
-- RED: `uv run pytest tests/test_redaction.py::test_credential_redaction_handles_basic_pairs_with_repeated_values -q`
-  - Result: `1 failed`; the Basic encoding of a repeated credential pair was not redacted.
-- GREEN: `uv run pytest tests/test_redaction.py::test_credential_redaction_handles_basic_pairs_with_repeated_values tests/test_redaction.py tests/test_credential_cli.py tests/test_cli_search.py -q`
-  - Result: `41 passed in 0.41s`.
-- GREEN: `uv run pytest tests/test_local_repository.py tests/test_credential_cli.py tests/test_redaction.py tests/test_cli_search.py -q`
-  - Result: `176 passed in 0.74s`.
-- GREEN: `uv run pytest -m 'not integration' -q`
-  - Result: `940 passed, 1 deselected, 1 warning in 2.22s`; the existing Starlette/httpx deprecation warning remains.
-- GREEN: `uv run ruff check .`
-  - Result: `All checks passed!`.
+## Actual Codex CLI Gate
 
-## Critical Review Fix: Reversible Credential Transform Closure
+Command:
 
-### RED/GREEN Evidence
+```bash
+uv run python scripts/validate_release_plugin.py --root . --codex-cli
+```
 
-- RED: `uv run pytest tests/test_redaction.py::test_credential_redaction_handles_repeated_mixed_reversible_transformations tests/test_redaction.py::test_credential_redaction_fails_closed_when_sensitive_bounds_are_exceeded tests/test_flowaccount_driver.py::test_flowaccount_probe_redacts_base64_encoded_derived_access_token tests/test_generic_drivers.py::test_probe_redacts_base64_encoded_generic_auth_representations -q`
-  - Result: `7 failed in 0.10s`; nested transformations, bounded fail-closed handling, and provider probe boundaries returned unredacted output.
-- GREEN: the same focused command
-  - Result: `7 passed in 0.08s`.
-- RED: `uv run pytest tests/test_redaction.py tests/test_flowaccount_driver.py tests/test_generic_drivers.py tests/test_credential_cli.py -q`
-  - Result: `3 failed, 205 passed in 0.94s`; lowercase URL escape forms were not normalized after the initial closure implementation.
-- GREEN: the same focused command
-  - Result: `208 passed in 0.76s`.
+Output:
 
-### Security Closure
+```text
+release plugin static validation passed (hosted MCP contract and public-package boundary checks only)
+release plugin Codex CLI validation passed (isolated local marketplace add/install; no network)
+```
 
-- `redact_credential_text` now enumerates a bounded closure of URL quote/unquote and standard or URL-safe Base64 representations, including padded and unpadded forms. It limits transform depth to 8, representations to 512, and each UTF-8 representation to 4096 bytes; any bound exhaustion returns `[REDACTED]`.
-- FlowAccount company-name probes pass stored credential values together with the derived authorization header and split access token to the central sanitizer. Generic probes pass stored credential values plus header and query auth values, including split Bearer and Basic values. PEAK company-name behavior remains `None`.
-- Token-collision validation logic was left unchanged. New mock-transport coverage confirms public probe data and repr omit the derived values and their Base64 representations without recording sensitive fixture values in this report.
+The installed cache is checked for the exact one-server hosted `.mcp.json`. The reconstructed
+marketplace contains only the marketplace manifest and public plugin package, so the gate does
+not rely on a clone, Python package source, or network access.
 
-### Verification
+## Final Verification
 
-- `uv run pytest -m 'not integration' -q`
-  - Result: `947 passed, 1 deselected, 1 warning in 2.78s`; the existing Starlette/httpx deprecation warning remains.
-- `uv run ruff check .`
-  - Result: `All checks passed!`.
-- `git diff --check`
-  - Result: passed.
+```text
+uv run --extra dev pytest -q tests/test_plugin_package.py tests/test_plugin_clean_install.py
+81 passed in 19.86s
+
+uv run --extra dev pytest -q tests/test_runtime_skills.py tests/test_skill_routing.py \
+  tests/test_connector_mcp_tools.py tests/test_local_mcp_contract.py
+144 passed, 1 existing Starlette/httpx deprecation warning
+
+uv run --extra dev ruff check .
+All checks passed!
+
+uv run python scripts/validate_release_plugin.py --root .
+release plugin static validation passed (hosted MCP contract and public-package boundary checks only)
+
+uv run python scripts/validate_release_plugin.py --root . --codex-cli
+release plugin static validation passed (hosted MCP contract and public-package boundary checks only)
+release plugin Codex CLI validation passed (isolated local marketplace add/install; no network)
+
+git diff --check
+no output; exit 0
+```
+
+The validator's recursive public-plugin credential scan is clean. The manifest, Skills,
+and packaged guide contain no credential literals, provider secrets, or local runtime
+configuration.
+
+## Residual Risks
+
+- The hosted Render endpoint was not contacted during this packaging verification; remote
+  deployment and public MCP smoke checks remain outside Task 9.

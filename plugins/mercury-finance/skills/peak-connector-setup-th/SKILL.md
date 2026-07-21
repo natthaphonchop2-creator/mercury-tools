@@ -5,18 +5,21 @@ description: Use when a PEAK task needs local connector setup or connection trou
 
 # PEAK Connector Setup TH
 
-Use the selected PEAK environment and this gate without skipping or reordering:
+Use the hosted lifecycle for the user-selected PEAK environment:
 
-1. Call `credential_status` for the active repository, connector, and environment.
-2. If required credentials are missing, stop. Instruct the user to run locally:
-   `mercury credentials setup <connector> --env <environment> --repo-root "<repo>"`
-3. After the user confirms setup is complete, call `credential_status` again.
-4. If it is still missing or not configured, stop and return to local setup. Do not run
-   the connection test.
-5. Only when the second status is configured, ask the user to run locally:
-   `mercury credentials test <connector> --env <environment> --repo-root "<repo>"`
-6. Continue only when the test reports `connected`.
+1. Call `list_connectors` and confirm PEAK, its API-driver mode, and one exact
+   environment selected by the user.
+2. Call `get_connector_setup` for that selection. Return the non-secret setup result
+   and the advanced-local handoff; do not collect any API-driver values in chat.
+3. Call `link_connector_profile` only with the sanitized profile selection after the
+   required local setup is complete outside Mercury.
+4. Call `connector_status` for the workspace. Stop when the profile remains unready or
+   the environment differs from the selected mode.
+5. Call `connector_capabilities` for PEAK and report the returned evidence-backed
+   readiness state before planning any action.
 
-Never ask for, accept, or paste credentials in chat. Never change environments
-implicitly. Treat a provider-level failure as disconnected even when transport succeeds.
-Report only sanitized status and the next local command in concise Thai.
+Reviewed API-driver writes require a separately connected local Mercury MCP. Return
+`advanced_local_handoff` with the local credential guide and
+`docs/ADVANCED_LOCAL_ERP.md`; never invoke local execution tools from this public Skill.
+Never ask for, accept, or paste credentials in chat. Never change environments implicitly.
+Respond in concise Thai.

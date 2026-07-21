@@ -215,10 +215,14 @@ async def test_local_mcp_acceptance_uses_only_fake_cloud_and_fake_erp(
         assert {
             "import_erp_spec",
             "run_erp_read",
+            "prepare_erp_mutation",
+            "execute_sensitive_erp_action",
+        } <= tools
+        assert {
             "preview_erp_write",
             "confirm_erp_write",
             "execute_erp_write",
-        } <= tools
+        }.isdisjoint(tools)
 
         imported = await _call_tool(
             client,
@@ -237,38 +241,35 @@ async def test_local_mcp_acceptance_uses_only_fake_cloud_and_fake_erp(
             "run_erp_read",
             {
                 "action_id": actions["GET"],
-                "inputs": {},
+                "inputs": {"json_object": "{}"},
                 "repo_root": str(repo),
             },
         )
         assert read["status"] == "succeeded"
 
-        preview = await _call_tool(
+        prepared = await _call_tool(
             client,
-            "preview_erp_write",
+            "prepare_erp_mutation",
             {
                 "action_id": actions["POST"],
-                "inputs": {"body": {"reference": "DEMO-001", "amount": 100}},
+                "inputs": {
+                    "json_object": '{"body":{"reference":"DEMO-001","amount":100}}'
+                },
                 "repo_root": str(repo),
             },
         )
-        assert preview["state"] == "awaiting_confirmation"
-
-        confirmed = await _call_tool(
-            client,
-            "confirm_erp_write",
-            {
-                "request_id": preview["request_id"],
-                "payload_hash": preview["payload_hash"],
-                "repo_root": str(repo),
-            },
-        )
-        assert confirmed["state"] == "ready_to_execute"
+        assert prepared["status"] == "prepared"
+        assert prepared["mutation_class"] == "sensitive"
+        assert prepared["next_tool"] == "execute_sensitive_erp_action"
 
         executed = await _call_tool(
             client,
-            "execute_erp_write",
-            {"request_id": preview["request_id"], "repo_root": str(repo)},
+            "execute_sensitive_erp_action",
+            {
+                "request_id": prepared["request_id"],
+                "payload_hash": prepared["payload_hash"],
+                "repo_root": str(repo),
+            },
         )
         assert executed["status"] == "succeeded"
 

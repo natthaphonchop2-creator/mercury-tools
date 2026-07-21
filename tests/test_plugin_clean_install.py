@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import time
 import tomllib
@@ -38,9 +39,10 @@ EXPECTED_LOCAL_TOOLS = {
     "search_erp_actions",
     "get_erp_action_schema",
     "run_erp_read",
-    "preview_erp_write",
-    "confirm_erp_write",
-    "execute_erp_write",
+    "prepare_erp_mutation",
+    "execute_erp_create",
+    "execute_erp_update",
+    "execute_sensitive_erp_action",
     "get_erp_request_status",
     "import_erp_spec",
     "list_connector_drivers",
@@ -163,6 +165,27 @@ def test_source_runtime_semantics_equal_all_254_authoritative_contracts() -> Non
     assert packaged == authoritative
 
 
+def test_clean_install_one_click_plugin_requires_no_local_runtime(tmp_path: Path) -> None:
+    installed_plugin = tmp_path / "mercury-finance"
+    shutil.copytree(ROOT / "plugins/mercury-finance", installed_plugin)
+
+    manifest = json.loads((installed_plugin / ".mcp.json").read_text(encoding="utf-8"))
+
+    assert manifest == {
+        "mcpServers": {
+            "mercury-finance": {
+                "type": "http",
+                "url": "https://mercury-tools-mcp.onrender.com/mcp",
+                "note": "Mercury Accounting and ERP connector platform.",
+            }
+        }
+    }
+    assert not any((installed_plugin / path).exists() for path in ("src", "dist", "pyproject.toml"))
+    assert (installed_plugin / "docs/ADVANCED_LOCAL_ERP.md").read_text(encoding="utf-8") == (
+        ROOT / "docs/ADVANCED_LOCAL_ERP.md"
+    ).read_text(encoding="utf-8")
+
+
 @pytest.mark.asyncio
 async def test_clean_wheel_uvx_cli_and_stdio_expose_all_local_tools(tmp_path: Path) -> None:
     wheel = _build_wheel()
@@ -247,7 +270,7 @@ async def test_clean_wheel_uvx_cli_and_stdio_expose_all_local_tools(tmp_path: Pa
 
     assert initialized.serverInfo.name == "Mercury Finance"
     assert {tool.name for tool in listed.tools} == EXPECTED_LOCAL_TOOLS
-    assert len(listed.tools) == 19
+    assert len(listed.tools) == 20
     assert search["candidates"][0]["accounting_uses"] == list(semantic.accounting_uses)
     assert schema["status"] == "ok"
     assert schema["action"]["semantic_contract"] == semantic.model_dump(mode="json")

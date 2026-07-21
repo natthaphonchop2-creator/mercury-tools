@@ -1,7 +1,7 @@
 {
   "name": "mercury-finance",
-  "version": "0.2.2+codex.20260717",
-  "description": "Local ERP accounting tools for repository-scoped FlowAccount and PEAK work.",
+  "version": "0.3.0+codex.20260719",
+  "description": "Mercury Accounting and ERP connector platform.",
   "author": {
     "name": "Mercury Agent",
     "url": "https://github.com/natthaphonchop2-creator/mercury-tools"
@@ -20,8 +20,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Mercury Finance",
-    "shortDescription": "Repository-local ERP tools for FlowAccount and PEAK workflows.",
-    "longDescription": "Mercury Finance runs one local stdio MCP for repository-scoped FlowAccount and PEAK setup, endpoint search, safe read actions, and approval-gated ERP writes. Credentials and execution audit data stay in the selected repository. Mercury Tools is an independent open-source project and is not affiliated with Mercury Technologies, Inc.",
+    "shortDescription": "Mercury Accounting and ERP connector platform.",
+    "longDescription": "Mercury Accounting and ERP connector platform provides hosted connector discovery, workspace readiness, cited accounting knowledge, and portable accounting Skills. Advanced API-driver and Local Bridge execution stays separately connected. Mercury Tools is an independent open-source project and is not affiliated with Mercury Technologies, Inc.",
     "developerName": "Mercury Agent",
     "category": "Finance",
     "capabilities": [
@@ -31,9 +31,10 @@
     ],
     "websiteURL": "https://github.com/natthaphonchop2-creator/mercury-tools",
     "defaultPrompt": [
-      "Set up local FlowAccount access for this repository and verify it.",
-      "Search the local ERP action catalog and run a safe read action.",
-      "Preview an approval-gated PEAK write for this repository without executing it."
+      "Connect an accounting or ERP system",
+      "Check which accounting capabilities are ready for this workspace",
+      "Prepare an evidence-backed company health review",
+      "Plan a reconciliation using my connected ERP and spreadsheet tools"
     ],
     "brandColor": "#42C6BB"
   }

@@ -14,14 +14,20 @@ from mercury_tools.catalog.importers.service import import_spec
 from mercury_tools.catalog.models import CatalogAction, RiskTier
 from mercury_tools.drivers.base import ConnectorAuthError
 from mercury_tools.drivers.flowaccount import FlowAccountDriver
-from mercury_tools.drivers.models import AuthContext, ConnectorResult, CredentialField
+from mercury_tools.drivers.models import (
+    AuthContext,
+    ConnectorResult,
+    CredentialField,
+    CredentialStatus,
+)
 from mercury_tools.drivers.registry import DriverRegistry
 from mercury_tools.execution.executor import ERPExecutor, ExecutionPolicyError
 from mercury_tools.execution.models import PreparedRequest
-from mercury_tools.execution.policy import effective_risk
+from mercury_tools.execution.policy import MutationClass, effective_risk
 from mercury_tools.execution.request_builder import RequestBuildError, build_request
 from mercury_tools.execution.store import LocalRequestStore, RequestStateError
 from mercury_tools.local.audit import AuditLedger
+from mercury_tools.local.credentials import CredentialSnapshot, CredentialStore
 from mercury_tools.local.repository import RepositoryConfig, RepositoryContext
 from mercury_tools.qualification.manifest import (
     LIVE_READS,
@@ -66,6 +72,7 @@ class CredentialStoreSpy:
     def __init__(self) -> None:
         self.load_calls = 0
         self.values = {"token": "top-secret-token"}
+        self.generation = b"g" * 32
 
     def load(
         self,
@@ -78,6 +85,37 @@ class CredentialStoreSpy:
         assert environment == "production"
         assert fields == self.fields
         return dict(self.values)
+
+    def revision(
+        self,
+        connector_id: str,
+        environment: str,
+        fields: tuple[CredentialField, ...],
+    ) -> bytes:
+        assert connector_id == "flowaccount"
+        assert environment == "production"
+        assert fields == self.fields
+        return self.generation
+
+    def snapshot(
+        self,
+        connector_id: str,
+        environment: str,
+        fields: tuple[CredentialField, ...],
+    ) -> CredentialSnapshot:
+        credentials = self.load(connector_id, environment, fields)
+        return CredentialSnapshot(
+            credentials=credentials,
+            status=CredentialStatus(
+                connector_id=connector_id,
+                environment=environment,
+                required_fields=("token",),
+                present_fields=("token",),
+                missing_fields=(),
+                configured=True,
+            ),
+            generation=self.generation,
+        )
 
 
 class SandboxCredentialStoreSpy:
@@ -117,6 +155,7 @@ class FakeDriver:
         self.auth_calls = 0
         self.raise_auth = False
         self.on_auth: Callable[[], None] | None = None
+        self.expected_credentials = {"token": "top-secret-token"}
 
     def credential_fields(self, environment: str) -> tuple[CredentialField, ...]:
         assert environment == "production"
@@ -150,7 +189,7 @@ class FakeDriver:
             raise ConnectorAuthError("authentication_failed")
         if self.on_auth is not None:
             self.on_auth()
-        assert credentials == {"token": "top-secret-token"}
+        assert credentials == self.expected_credentials
         return AuthContext(
             headers={"Authorization": "Bearer top-secret-token"},
             query={},
@@ -590,6 +629,255 @@ async def test_preview_does_not_load_credentials(
     assert preview.state.value == "awaiting_confirmation"
     assert executor_parts["credentials"].load_calls == 0
     assert "top-secret-token" not in json.dumps(preview.model_dump(mode="json"))
+
+
+@pytest.mark.asyncio
+async def test_credential_save_after_preview_blocks_before_network(
+    executor_parts: dict[str, Any],
+    catalog_action: CatalogAction,
+) -> None:
+    context = executor_parts["context"]
+    credential_store = CredentialStore(context)
+    credential_store.save(
+        "flowaccount",
+        "production",
+        {"token": "credential-a"},
+        CredentialStoreSpy.fields,
+    )
+    executor_parts["credentials"] = credential_store
+    executor_parts["driver"].expected_credentials = {"token": "credential-a"}
+    sends = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal sends
+        sends += 1
+        return response(request)
+
+    executor = make_executor(executor_parts, handler)
+    preview = await executor.preview_write(
+        repository=context,
+        action=catalog_action,
+        environment="production",
+        inputs={"body": {"amount": 100}},
+    )
+    credential_store.save(
+        "flowaccount",
+        "production",
+        {"token": "credential-b"},
+        CredentialStoreSpy.fields,
+    )
+
+    with pytest.raises(RequestStateError, match="^preview_invalidated_credentials$"):
+        await executor.approve_and_execute(
+            preview.request_id,
+            preview.payload_hash,
+            MutationClass.CREATE,
+        )
+
+    assert sends == 0
+    assert executor.get_request_status(preview.request_id)["failure_reason"] == (
+        "preview_invalidated_credentials"
+    )
+
+
+@pytest.mark.asyncio
+async def test_credential_save_during_auth_is_rechecked_before_mutation_dispatch(
+    executor_parts: dict[str, Any],
+    catalog_action: CatalogAction,
+) -> None:
+    context = executor_parts["context"]
+    credential_store = CredentialStore(context)
+    credential_store.save(
+        "flowaccount",
+        "production",
+        {"token": "credential-a"},
+        CredentialStoreSpy.fields,
+    )
+    executor_parts["credentials"] = credential_store
+    executor_parts["driver"].expected_credentials = {"token": "credential-a"}
+    executor_parts["driver"].on_auth = lambda: credential_store.save(
+        "flowaccount",
+        "production",
+        {"token": "credential-b"},
+        CredentialStoreSpy.fields,
+    )
+    sends = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal sends
+        sends += 1
+        return response(request)
+
+    executor = make_executor(executor_parts, handler)
+    preview = await executor.preview_write(
+        repository=context,
+        action=catalog_action,
+        environment="production",
+        inputs={"body": {"amount": 100}},
+    )
+
+    with pytest.raises(RequestStateError, match="^preview_invalidated_credentials$"):
+        await executor.approve_and_execute(
+            preview.request_id,
+            preview.payload_hash,
+            MutationClass.CREATE,
+        )
+
+    assert sends == 0
+    assert executor.get_request_status(preview.request_id)["failure_reason"] == (
+        "preview_invalidated_credentials"
+    )
+
+
+@pytest.mark.asyncio
+async def test_credential_revision_changes_hash_but_is_not_public_or_audited(
+    executor_parts: dict[str, Any],
+    catalog_action: CatalogAction,
+) -> None:
+    context = executor_parts["context"]
+    credential_store = CredentialStore(context)
+    credential_store.save(
+        "flowaccount",
+        "production",
+        {"token": "credential-a"},
+        CredentialStoreSpy.fields,
+    )
+    executor_parts["credentials"] = credential_store
+    executor = make_executor(executor_parts, lambda request: response(request))
+
+    first = await executor.preview_write(
+        repository=context,
+        action=catalog_action,
+        environment="production",
+        inputs={"body": {"amount": 100}},
+    )
+    credential_store.save(
+        "flowaccount",
+        "production",
+        {"token": "credential-b"},
+        CredentialStoreSpy.fields,
+    )
+    second = await executor.preview_write(
+        repository=context,
+        action=catalog_action,
+        environment="production",
+        inputs={"body": {"amount": 100}},
+    )
+
+    revision = first.model_dump(mode="json")["credential_revision"]
+    public = json.dumps(first.public_dict(), sort_keys=True)
+    audit = (context.audit_dir / "audit.jsonl").read_text(encoding="utf-8")
+    assert first.payload_hash != second.payload_hash
+    assert "credential_revision" not in public
+    assert revision not in public
+    assert "credential_revision" not in audit
+    assert revision not in audit
+    assert "credential-a" not in first.model_dump_json()
+    assert "credential-b" not in second.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_approve_and_execute_records_one_approval_and_dispatches_once(
+    executor_parts: dict[str, Any],
+    catalog_action: CatalogAction,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return response(
+            request,
+            payload={"status": "created", "provider_body": "provider-secret-marker"},
+        )
+
+    executor = make_executor(executor_parts, handler)
+    preview = await executor.preview_write(
+        repository=executor_parts["context"],
+        action=catalog_action,
+        environment="production",
+        inputs={"body": {"amount": 100, "customer": "request-secret-marker"}},
+    )
+
+    result = await executor.approve_and_execute(
+        preview.request_id,
+        preview.payload_hash,
+        MutationClass.CREATE,
+    )
+
+    status = executor.get_request_status(preview.request_id)
+    assert result.status == "succeeded"
+    assert len(requests) == 1
+    assert status["approval_count"] == 1
+    assert status["mutation_class"] == "create"
+    assert status["approval_level"] == "standard"
+    assert "required_confirmations" not in status
+    assert "confirmation_count" not in status
+    audit_rows = [
+        json.loads(line)
+        for line in (executor_parts["context"].audit_dir / "audit.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    request_rows = [row for row in audit_rows if row.get("request_id") == preview.request_id]
+    assert {row["event"] for row in request_rows} == {
+        "approval_recorded",
+        "dispatch_started",
+        "execution_completed",
+        "preview_created",
+    }
+    for row in request_rows:
+        assert row["approval_level"] == "standard"
+        assert row["mutation_class"] == "create"
+        assert row["action_id"] == catalog_action.action_id
+        assert row["version_id"] == catalog_action.version_id
+        assert row["environment"] == "production"
+        assert row["payload_hash"] == preview.payload_hash
+        assert row["state"] in {
+            "awaiting_confirmation",
+            "ready_to_execute",
+            "executing",
+            "succeeded",
+        }
+    rendered_audit = json.dumps(audit_rows)
+    assert "required_confirmations" not in rendered_audit
+    assert "confirmation_count" not in rendered_audit
+    assert "request_inputs" not in rendered_audit
+    assert "request-secret-marker" not in rendered_audit
+    assert "provider-secret-marker" not in rendered_audit
+
+
+@pytest.mark.asyncio
+async def test_approve_and_execute_rejects_class_mismatch_before_credentials_or_network(
+    executor_parts: dict[str, Any],
+    catalog_action: CatalogAction,
+) -> None:
+    sends = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal sends
+        sends += 1
+        return response(request)
+
+    executor = make_executor(executor_parts, handler)
+    preview = await executor.preview_write(
+        repository=executor_parts["context"],
+        action=catalog_action,
+        environment="production",
+        inputs={"body": {"amount": 100}},
+    )
+
+    with pytest.raises(RequestStateError, match="^mutation_class_mismatch$"):
+        await executor.approve_and_execute(
+            preview.request_id,
+            preview.payload_hash,
+            MutationClass.UPDATE,
+        )
+
+    status = executor.get_request_status(preview.request_id)
+    assert status["state"] == "awaiting_confirmation"
+    assert status["approval_count"] == 0
+    assert executor_parts["credentials"].load_calls == 0
+    assert sends == 0
 
 
 @pytest.mark.asyncio
@@ -1671,15 +1959,31 @@ async def test_timeout_after_send_becomes_outcome_unknown_and_is_not_retried(
         raise httpx.ReadTimeout("timed out", request=request)
 
     executor = make_executor(executor_parts, timeout)
-    ready = await confirmed_request(executor, executor_parts["context"], catalog_action)
+    preview = await executor.preview_write(
+        repository=executor_parts["context"],
+        action=catalog_action,
+        environment="production",
+        inputs={"body": {"amount": 100}},
+    )
 
-    result = await executor.execute_write(ready.request_id)
+    result = await executor.approve_and_execute(
+        preview.request_id,
+        preview.payload_hash,
+        MutationClass.CREATE,
+    )
 
     assert result.status == "outcome_unknown"
     assert result.dispatched is True
     assert calls == 1
+    with pytest.raises(RequestStateError, match="^outcome_unknown$"):
+        await executor.approve_and_execute(
+            preview.request_id,
+            preview.payload_hash,
+            MutationClass.CREATE,
+        )
+    assert calls == 1
     with pytest.raises(RequestStateError, match="^replay_blocked_outcome_unknown$"):
-        executor.request_store.assert_replay_allowed(ready.payload_hash)
+        executor.request_store.assert_replay_allowed(preview.payload_hash)
 
 
 @pytest.mark.asyncio
@@ -1980,6 +2284,156 @@ async def test_peer_mismatch_after_write_response_is_outcome_unknown(
     assert executor.get_request_status(ready.request_id)["state"] == "outcome_unknown"
 
 
+def _versioned_preflight(
+    action_factory: Callable[..., CatalogAction],
+    *,
+    description: str,
+    source_hash: str,
+) -> CatalogAction:
+    return action_factory(
+        method="GET",
+        path_template="/invoices",
+        operation_id="findInvoiceByReference",
+        capability="documents.invoice.search",
+        input_schema={
+            "path": {},
+            "query": {"reference": {"type": "string"}},
+            "headers": {},
+            "body": {},
+            "files": {},
+        },
+        risk_tier=RiskTier.SAFE_READ,
+        required_confirmations=0,
+        side_effects=(),
+        description=description,
+        source_hash=source_hash,
+    )
+
+
+@pytest.mark.asyncio
+async def test_approved_preflight_version_drift_blocks_before_any_network(
+    executor_parts: dict[str, Any],
+    action_factory: Callable[..., CatalogAction],
+) -> None:
+    preflight_v1 = _versioned_preflight(
+        action_factory,
+        description="Version one",
+        source_hash="a" * 64,
+    )
+    write_action = action_factory(
+        preflight_action_ids=(preflight_v1.action_id,),
+        idempotency={
+            "preflight_inputs": {
+                preflight_v1.action_id: {"query": {"reference": "INV-001"}}
+            }
+        },
+    )
+    executor_parts["catalog"] = MutableCatalog((write_action, preflight_v1))
+    sends = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal sends
+        sends += 1
+        return response(request)
+
+    executor = make_executor(executor_parts, handler)
+    preview = await executor.preview_write(
+        repository=executor_parts["context"],
+        action=write_action,
+        environment="production",
+        inputs={"body": {"amount": 100}},
+    )
+    assert preview.binding_payload["preflight_actions"] == [
+        {
+            "action_id": preflight_v1.action_id,
+            "version_id": preflight_v1.version_id,
+            "connector_id": preflight_v1.connector_id,
+            "method": "GET",
+            "path_template": preflight_v1.path_template,
+        }
+    ]
+    preflight_v2 = _versioned_preflight(
+        action_factory,
+        description="Version two",
+        source_hash="b" * 64,
+    )
+    assert preflight_v2.action_id == preflight_v1.action_id
+    assert preflight_v2.version_id != preflight_v1.version_id
+    executor_parts["catalog"].activate(preflight_v2)
+
+    with pytest.raises(
+        RequestStateError,
+        match="^preview_invalidated_preflight_version$",
+    ):
+        await executor.approve_and_execute(
+            preview.request_id,
+            preview.payload_hash,
+            MutationClass.CREATE,
+        )
+
+    assert sends == 0
+    assert executor_parts["credentials"].load_calls == 0
+    assert executor.get_request_status(preview.request_id)["failure_reason"] == (
+        "preview_invalidated_preflight_version"
+    )
+
+
+@pytest.mark.asyncio
+async def test_preflight_version_drift_after_preflight_blocks_mutation_dispatch(
+    executor_parts: dict[str, Any],
+    action_factory: Callable[..., CatalogAction],
+) -> None:
+    preflight_v1 = _versioned_preflight(
+        action_factory,
+        description="Version one",
+        source_hash="a" * 64,
+    )
+    preflight_v2 = _versioned_preflight(
+        action_factory,
+        description="Version two",
+        source_hash="b" * 64,
+    )
+    write_action = action_factory(
+        preflight_action_ids=(preflight_v1.action_id,),
+        idempotency={
+            "preflight_inputs": {
+                preflight_v1.action_id: {"query": {"reference": "INV-001"}}
+            }
+        },
+    )
+    executor_parts["catalog"] = MutableCatalog((write_action, preflight_v1))
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        if request.method == "GET":
+            executor_parts["catalog"].activate(preflight_v2)
+        return response(request, payload={})
+
+    executor = make_executor(executor_parts, handler)
+    preview = await executor.preview_write(
+        repository=executor_parts["context"],
+        action=write_action,
+        environment="production",
+        inputs={"body": {"amount": 100}},
+    )
+
+    with pytest.raises(
+        RequestStateError,
+        match="^preview_invalidated_preflight_version$",
+    ):
+        await executor.approve_and_execute(
+            preview.request_id,
+            preview.payload_hash,
+            MutationClass.CREATE,
+        )
+
+    assert methods == ["GET"]
+    assert executor.get_request_status(preview.request_id)["failure_reason"] == (
+        "preview_invalidated_preflight_version"
+    )
+
+
 @pytest.mark.asyncio
 async def test_cataloged_duplicate_preflight_blocks_mutation_before_post(
     executor_parts: dict[str, Any],
@@ -2193,13 +2647,19 @@ def test_confirmation_audit_failure_invalidates_preview(
         repository_id=executor_parts["context"].repository_id,
         environment="production",
     )
+    credential_revision = executor_parts["credentials"].generation.hex()
     prepared = PreparedRequest.from_template(
         repository=executor_parts["context"],
         action=catalog_action,
         environment="production",
         request=template,
         risk=effective_risk(catalog_action),
-        payload_hash=template.payload_hash(),
+        payload_hash=template.approval_payload_hash(
+            credential_revision=credential_revision,
+            preflight_actions=(),
+        ),
+        credential_revision=credential_revision,
+        preflight_actions=(),
     )
     preview = executor.request_store.create_preview(prepared, action=catalog_action)
 

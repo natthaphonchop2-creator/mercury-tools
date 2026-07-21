@@ -2,7 +2,8 @@
 
 The local action catalog merges a cached global knowledge/catalog snapshot with
 the active repository's imported actions. Action execution always runs in the
-local MCP process with repository-local credentials and audit state.
+advanced-local 20-tool MCP process with repository-local credentials and audit
+state. It is separate from the public hosted 24-tool Mercury MCP.
 
 ## Import And Trust
 
@@ -31,24 +32,28 @@ unsafe targets and redirects, and does not accept arbitrary per-request URLs.
 
 1. Call `search_erp_actions` with the requested capability or endpoint intent.
 2. Call `get_erp_action_schema` for the selected action and inspect the input
-   contract, effective risk tier, and confirmation count.
+   contract, mutation class, and approval level.
 3. Use `run_erp_read` only for an effective Tier 0 GET action.
-4. Use the preview and confirmation sequence below for every mutation.
+4. Use the preparation and class-specific execution sequence below for every
+   mutation.
 
 Importing a spec does not authorize a write. It only makes local actions
 available for selection and review.
 
-## Risk Tiers And Confirmation
+## Mutation Classes And One Immutable Approval
 
-| Effective tier | Required sequence |
-| --- | --- |
-| 0 | `run_erp_read` for a safe GET action. |
-| 1 | `preview_erp_write`, one distinct explicit user confirmation, `confirm_erp_write`, then `execute_erp_write` once. |
-| 2 | `preview_erp_write`, first distinct explicit user confirmation and `confirm_erp_write`, then a second distinct explicit confirmation and `confirm_erp_write`, then `execute_erp_write` once. |
+| Mutation class | Approval level | Required sequence |
+| --- | --- | --- |
+| Safe read | None | `run_erp_read` for a safe GET action. |
+| Create | Standard | `prepare_erp_mutation`, one distinct explicit user approval, then `execute_erp_create` once. |
+| Update | Standard | `prepare_erp_mutation`, one distinct explicit user approval, then `execute_erp_update` once. |
+| Sensitive | Elevated | `prepare_erp_mutation`, one distinct explicit user approval, then `execute_sensitive_erp_action` once. |
 
 The returned `request_id` and `payload_hash` bind the action version, target,
-inputs, and attachments. Do not alter inputs, substitute a hash, reuse a stale
-preview, self-confirm, or execute a request more than once.
+inputs, attachments, credential revision, and preflight action versions. Internal
+credential and dependency revisions are never returned. Do not alter inputs,
+substitute a hash, reuse a stale preview, self-confirm, or execute a request more
+than once.
 
 ## Unknown Outcomes
 
@@ -58,8 +63,8 @@ Network uncertainty or a provider 5xx after dispatch produces
 1. Call `get_erp_request_status` and preserve the request ID in the case record.
 2. Reconcile through an approved safe provider status action when one is in the
    catalog, or reconcile manually in the provider using the request evidence.
-3. Never retry or re-preview the same mutation while its outcome is unknown.
-4. Create a fresh preview only after the previous provider outcome is definite.
+3. Never retry or re-prepare the same mutation while its outcome is unknown.
+4. Create a fresh preparation only after the previous provider outcome is definite.
 
 The local audit ledger records redacted lifecycle metadata, not provider record
 values or credential material.

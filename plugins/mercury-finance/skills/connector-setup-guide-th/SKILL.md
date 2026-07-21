@@ -5,19 +5,26 @@ description: Use when the user needs to choose or configure an accounting or ERP
 
 # Connector Setup Guide TH
 
-Confirm the active repository, connector, and environment. Explain connector choices in
-neutral terms. Once the user chooses them, use this gate without skipping or reordering:
+Confirm the user-selected connector, connection mode, and environment. Explain choices in
+neutral terms. Use this hosted lifecycle without skipping or reordering:
 
-1. Call `credential_status` for the active repository, connector, and environment.
-2. If required credentials are missing, stop. Instruct the user to run locally:
-   `mercury credentials setup <connector> --env <environment> --repo-root "<repo>"`
-3. After the user confirms setup is complete, call `credential_status` again.
-4. If it is still missing or not configured, stop and return to local setup. Do not run
-   the connection test.
-5. Only when the second status is configured, ask the user to run locally:
-   `mercury credentials test <connector> --env <environment> --repo-root "<repo>"`
-6. Continue only when the test reports `connected`.
+1. Call `list_connectors`, then ask the user to select one exact connector, connection
+   mode, and environment. Do not choose any of them implicitly.
+2. Call `get_connector_setup` for that exact selection. Follow only its non-secret setup
+   guidance.
+3. Call `link_connector_profile` with the selected workspace and sanitized profile details.
+   Do not send credentials, OAuth values, provider payloads, or local paths.
+4. For native MCP, have the host or provider complete OAuth outside Mercury. For an
+   API-driver or Local Bridge requirement, return `advanced_local_handoff` to
+   `docs/ADVANCED_LOCAL_ERP.md` and stop the hosted branch until a separately connected
+   local MCP supplies sanitized validation evidence. Do not invoke a local CLI or local
+   tool from this public Skill.
+5. When host/provider OAuth or the separately connected advanced-local branch has returned
+   sanitized evidence, call `validate_connector_connection` for the same workspace,
+   connector, mode, and environment.
+6. Call `connector_status` for that same selection. Stop on a setup requirement,
+   validation failure, or environment mismatch; otherwise report only the returned status
+   and next hosted action.
 
-Never ask for, accept, or paste credentials in chat. Do not proceed while setup is
-missing, unconfirmed, or untested. Respond in concise Thai with connector, environment,
-connection status, and the next local command.
+Never ask for, accept, or paste credentials in chat. Respond in concise Thai with the
+connector, mode, environment, status, and next hosted action.

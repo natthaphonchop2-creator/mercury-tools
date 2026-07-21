@@ -5,18 +5,23 @@ description: Use when a FlowAccount task needs local connector setup or connecti
 
 # FlowAccount Connector Setup TH
 
-Use the selected FlowAccount environment and this gate without skipping or reordering:
+Use the hosted lifecycle for the user-selected FlowAccount mode and environment:
 
-1. Call `credential_status` for the active repository, connector, and environment.
-2. If required credentials are missing, stop. Instruct the user to run locally:
-   `mercury credentials setup <connector> --env <environment> --repo-root "<repo>"`
-3. After the user confirms setup is complete, call `credential_status` again.
-4. If it is still missing or not configured, stop and return to local setup. Do not run
-   the connection test.
-5. Only when the second status is configured, ask the user to run locally:
-   `mercury credentials test <connector> --env <environment> --repo-root "<repo>"`
-6. Continue only when the test reports `connected`.
+1. Call `list_connectors` and confirm the exact FlowAccount connection mode and
+   environment selected by the user.
+2. Call `get_connector_setup` for FlowAccount and the selected mode. For native MCP,
+   direct provider authorization to the host; for API-driver setup, return only the
+   advanced-local handoff documented by the response.
+3. Call `link_connector_profile` only after the user completes provider or host
+   authorization outside Mercury. Store only the sanitized profile selection.
+4. Call `connector_status` for the workspace and stop when it reports setup or
+   readiness is incomplete.
+5. Call `connector_capabilities` for the exact mode and environment before describing
+   any available action. Treat `provider_unavailable` and `not_validated` as distinct
+   outcomes.
 
-Never ask for, accept, or paste credentials in chat. Never change environments
-implicitly. On failure, report only the sanitized status and the next local command.
+An API-driver write requires a separately connected local Mercury MCP. Return
+`advanced_local_handoff` and link to the local credential guide and
+`docs/ADVANCED_LOCAL_ERP.md`; do not invoke local execution tools from this public Skill.
+Never ask for, accept, or paste credentials in chat. Never change environments implicitly.
 Respond in concise Thai.

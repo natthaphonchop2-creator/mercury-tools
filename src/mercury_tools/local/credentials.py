@@ -166,6 +166,25 @@ class CredentialStore:
         }
 
     @_credential_locked
+    def revision(
+        self,
+        connector_id: str,
+        environment: str,
+        fields: Sequence[CredentialField],
+    ) -> bytes:
+        """Return a process-opaque revision without returning credential values."""
+
+        field_names = _field_environment_names(connector_id, environment, fields)
+        with _validated_parent_fd(self._root, self._parent) as parent_fd:
+            document = self._read(parent_fd)
+        return _credential_generation(
+            connector_id,
+            environment,
+            field_names,
+            document,
+        )
+
+    @_credential_locked
     def snapshot(
         self,
         connector_id: str,
@@ -180,23 +199,6 @@ class CredentialStore:
             for field_name, environment_name in field_names.items()
             if document.values.get(environment_name, "") != ""
         }
-        generation_payload = json.dumps(
-            {
-                "connector_id": connector_id,
-                "environment": environment,
-                "fields": sorted(credentials.items()),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-        generation = hashlib.blake2b(
-            generation_payload,
-            digest_size=32,
-            key=_GENERATION_KEY,
-            person=b"mercury-cred-v1",
-        ).digest()
         return CredentialSnapshot(
             credentials=credentials,
             status=_status_from_document(
@@ -205,7 +207,12 @@ class CredentialStore:
                 field_names,
                 document,
             ),
-            generation=generation,
+            generation=_credential_generation(
+                connector_id,
+                environment,
+                field_names,
+                document,
+            ),
         )
 
     @_credential_locked
@@ -265,6 +272,37 @@ class CredentialStore:
         if _parse_dotenv_text(text) != document:
             raise ValueError("invalid_credential_file")
         _atomic_write(parent_fd, text)
+
+
+def _credential_generation(
+    connector_id: str,
+    environment: str,
+    field_names: Mapping[str, str],
+    document: _CredentialDocument,
+) -> bytes:
+    profile = (connector_id, environment)
+    generation_payload = json.dumps(
+        {
+            "connector_id": connector_id,
+            "environment": environment,
+            "declared_fields": sorted(field_names.items()),
+            "profile_fields": sorted(document.profiles.get(profile, {}).items()),
+            "credentials": sorted(
+                (field_name, document.values.get(environment_name, ""))
+                for field_name, environment_name in field_names.items()
+            ),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.blake2b(
+        generation_payload,
+        digest_size=32,
+        key=_GENERATION_KEY,
+        person=b"mercury-cred-v1",
+    ).digest()
 
 
 def _status_from_document(

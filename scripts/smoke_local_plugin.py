@@ -17,28 +17,15 @@ from typing import Any
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+from mercury_tools.mcp.contracts import ADVANCED_LOCAL_TOOL_NAMES, HOSTED_MCP_URL
+
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_TOOLS = {
-    "search_knowledge",
-    "retrieve_context_pack",
-    "get_document",
-    "connector_status",
-    "run_accounting_skill",
-    "run_mercury_flow",
-    "list_workspace_flows",
-    "save_workspace_flow",
-    "run_workspace_flow",
-    "search_erp_actions",
-    "get_erp_action_schema",
-    "run_erp_read",
-    "preview_erp_write",
-    "confirm_erp_write",
-    "execute_erp_write",
-    "get_erp_request_status",
-    "import_erp_spec",
-    "list_connector_drivers",
-    "credential_status",
+EXPECTED_HOSTED_SERVER = {
+    "type": "http",
+    "url": HOSTED_MCP_URL,
+    "note": "Mercury Accounting and ERP connector platform.",
 }
+EXPECTED_TOOLS = ADVANCED_LOCAL_TOOL_NAMES
 
 
 def _manifest_server() -> dict[str, Any]:
@@ -105,19 +92,19 @@ async def _smoke(wheel: Path, environment: dict[str, str]) -> None:
     names = {tool.name for tool in listed.tools}
     if initialized.serverInfo.name != "Mercury Finance":
         raise RuntimeError("unexpected_local_mcp_server_name")
-    if names != EXPECTED_TOOLS or len(listed.tools) != 19:
+    if names != EXPECTED_TOOLS or len(listed.tools) != len(EXPECTED_TOOLS):
         raise RuntimeError("local_mcp_tool_surface_mismatch")
 
 
 def main() -> int:
     server = _manifest_server()
-    if server.get("command") != "uvx":
-        raise RuntimeError("local_mcp_launcher_must_use_uvx")
+    if server != EXPECTED_HOSTED_SERVER:
+        raise RuntimeError("public_plugin_must_use_exact_hosted_mcp")
 
     wheel = _build_local_wheel()
     with tempfile.TemporaryDirectory(prefix="mercury-local-plugin-cache-") as temporary:
         asyncio.run(_smoke(wheel, _clean_environment(Path(temporary))))
-    print("local packaged Mercury Finance MCP smoke passed (one server, 19 tools)")
+    print("local packaged Mercury Finance MCP smoke passed (advanced runtime, 20 tools)")
     return 0
 
 

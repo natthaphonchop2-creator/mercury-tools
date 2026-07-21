@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from enum import StrEnum
 
 from mercury_tools.catalog.models import (
     ActionConfidence,
@@ -13,49 +14,136 @@ from mercury_tools.catalog.models import (
     RiskTier,
 )
 
-HIGH_RISK_EFFECTS = frozenset({"payment", "approve", "void", "delete", "email", "share", "invite"})
-_EFFECT_TOKEN_PATTERN = re.compile(r"[A-Z]+(?=[A-Z][a-z]|[^A-Za-z]|$)|[A-Z]?[a-z]+|\d+")
+SENSITIVE_EFFECT_ALIASES = {
+    "payment": "payment",
+    "payments": "payment",
+    "payment_processed": "payment",
+    "payments_processed": "payment",
+    "approve": "approve",
+    "approves": "approve",
+    "approve_document": "approve",
+    "approves_document": "approve",
+    "void": "void",
+    "voids": "void",
+    "void_document": "void",
+    "voids_document": "void",
+    "post": "post",
+    "posts": "post",
+    "post_journal": "post",
+    "posts_journal": "post",
+    "finalize": "finalize",
+    "finalizes": "finalize",
+    "finalize_document": "finalize",
+    "finalizes_document": "finalize",
+    "email": "email",
+    "emails": "email",
+    "send_email": "email",
+    "send_emails": "email",
+    "email_customer": "email",
+    "emails_customer": "email",
+    "share": "share",
+    "shares": "share",
+    "share_document": "share",
+    "shares_document": "share",
+    "invite": "invite",
+    "invites": "invite",
+    "invite_user": "invite",
+    "invites_user": "invite",
+    "delete": "delete",
+    "deletes": "delete",
+    "delete_document": "delete",
+    "deletes_document": "delete",
+}
+_COLLAPSED_SENSITIVE_EFFECT_ALIASES = {
+    alias.replace("_", ""): canonical
+    for alias, canonical in SENSITIVE_EFFECT_ALIASES.items()
+    if "_" in alias
+}
+_EFFECT_SEPARATOR_PATTERN = re.compile(r"[-_\s]+")
+_EFFECT_ASCII_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
+
+
+class ApprovalLevel(StrEnum):
+    STANDARD = "standard"
+    ELEVATED = "elevated"
+
+
+class MutationClass(StrEnum):
+    CREATE = "create"
+    UPDATE = "update"
+    SENSITIVE = "sensitive"
 
 
 @dataclass(frozen=True, slots=True)
 class RiskDecision:
     tier: RiskTier
-    required_confirmations: int
+    approval_level: ApprovalLevel
+    mutation_class: MutationClass
     reasons: tuple[str, ...]
 
 
 def effective_risk(action: CatalogAction) -> RiskDecision:
-    """Apply non-decreasing runtime risk and confirmation requirements."""
-    runtime_tier = (
-        RiskTier.SAFE_READ if action.method is HttpMethod.GET else RiskTier.STANDARD_WRITE
+    """Classify one mutation without treating legacy prompt counts as policy."""
+    if action.method is HttpMethod.GET:
+        raise ValueError("read_action_has_no_mutation_class")
+
+    mutation_class = (
+        MutationClass.UPDATE
+        if action.method in {HttpMethod.PUT, HttpMethod.PATCH}
+        else MutationClass.CREATE
     )
+    runtime_tier = RiskTier.STANDARD_WRITE
     reasons: list[str] = []
 
     if action.method is HttpMethod.DELETE:
+        mutation_class = MutationClass.SENSITIVE
         runtime_tier = RiskTier.HIGH_RISK
         reasons.append("delete_method")
-    elif _has_high_risk_effect(action):
+    elif _has_sensitive_effect(action):
+        mutation_class = MutationClass.SENSITIVE
         runtime_tier = RiskTier.HIGH_RISK
-        reasons.append("high_risk_side_effect")
+        reasons.append("sensitive_side_effect")
 
-    if (
-        action.method is not HttpMethod.GET
-        and action.confidence is ActionConfidence.INFERRED
-        and action.observed_state is ObservedState.UNTESTED
-    ):
+    if action.confidence is ActionConfidence.INFERRED:
+        mutation_class = MutationClass.SENSITIVE
         runtime_tier = RiskTier.HIGH_RISK
-        reasons.append("inferred_unobserved_mutation")
+        reasons.append("inferred_mutation")
+    if action.observed_state is ObservedState.UNTESTED:
+        mutation_class = MutationClass.SENSITIVE
+        runtime_tier = RiskTier.HIGH_RISK
+        reasons.append("unobserved_mutation")
 
     tier = max(action.risk_tier, runtime_tier)
     if action.risk_tier > runtime_tier:
         reasons.insert(0, "declared_risk_floor")
-    confirmations = max(action.required_confirmations, int(tier))
-    return RiskDecision(tier=tier, required_confirmations=confirmations, reasons=tuple(reasons))
+    approval_level = (
+        ApprovalLevel.ELEVATED
+        if mutation_class is MutationClass.SENSITIVE
+        else ApprovalLevel.STANDARD
+    )
+    return RiskDecision(
+        tier=tier,
+        approval_level=approval_level,
+        mutation_class=mutation_class,
+        reasons=tuple(reasons),
+    )
 
 
-def _has_high_risk_effect(action: CatalogAction) -> bool:
-    return any(HIGH_RISK_EFFECTS & _effect_tokens(effect) for effect in action.side_effects)
+def _has_sensitive_effect(action: CatalogAction) -> bool:
+    return any(_canonical_sensitive_effect(effect) is not None for effect in action.side_effects)
 
 
-def _effect_tokens(effect: str) -> frozenset[str]:
-    return frozenset(token.casefold() for token in _EFFECT_TOKEN_PATTERN.findall(effect))
+def _canonical_sensitive_effect(effect: str) -> str | None:
+    if not effect.isascii():
+        return None
+    casefolded_effect = effect.casefold().strip()
+    tokens = _EFFECT_SEPARATOR_PATTERN.split(casefolded_effect)
+    if not tokens or any(
+        _EFFECT_ASCII_TOKEN_PATTERN.fullmatch(token) is None for token in tokens
+    ):
+        return None
+    normalized_effect = "_".join(tokens)
+    return SENSITIVE_EFFECT_ALIASES.get(
+        normalized_effect,
+        _COLLAPSED_SENSITIVE_EFFECT_ALIASES.get(normalized_effect),
+    )

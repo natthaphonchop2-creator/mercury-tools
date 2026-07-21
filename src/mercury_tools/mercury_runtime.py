@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Any
 
 from mercury_tools.safety.redaction import redact_json
+from mercury_tools.skills.catalog import (
+    accounting_skill_input_schema,
+    accounting_skill_summaries,
+)
 
 
 def mercury_home() -> Path:
@@ -39,6 +43,18 @@ def connector_status() -> dict[str, Any]:
             "connectors": data.get("connectors") or {},
         }
     )
+
+
+def list_accounting_skills() -> list[dict[str, Any]]:
+    """Return generated catalog metadata without workspace or provider state."""
+
+    return accounting_skill_summaries()
+
+
+def get_accounting_skill_schema(skill_id: str) -> dict[str, Any] | None:
+    """Return the canonical Pydantic JSON Schema for one Skill."""
+
+    return accounting_skill_input_schema(skill_id)
 
 
 def _runtime_roots() -> list[Path]:

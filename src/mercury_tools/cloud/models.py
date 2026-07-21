@@ -36,6 +36,7 @@ PUBLIC_RESPONSE_VALIDATION_ERROR = "cloud_public_response_invalid"
 _SKILL_ID_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,198}[A-Za-z0-9])?$")
 _PUBLIC_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 _PUBLIC_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+_CAPABILITY_RE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$")
 _CATALOG_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _ACTION_ID_RE = re.compile(r"^act_[0-9a-f]{24}$")
 _ACTION_VERSION_ID_RE = re.compile(r"^av_[0-9a-f]{64}$")
@@ -784,6 +785,7 @@ class PublicSkill(StrictPublicModel):
     summary: str
     status: str
     version: str
+    required_capabilities: list[str]
     required_connectors: list[str]
     tags: list[str]
 
@@ -794,6 +796,10 @@ class PublicSkill(StrictPublicModel):
             or not _PUBLIC_NAME_RE.fullmatch(self.category)
             or not _PUBLIC_NAME_RE.fullmatch(self.status)
             or not _VERSION_RE.fullmatch(self.version)
+            or any(
+                not _CAPABILITY_RE.fullmatch(item) or len(item) > 200
+                for item in self.required_capabilities
+            )
             or any(not _PUBLIC_NAME_RE.fullmatch(item) for item in self.required_connectors)
             or any(not _PUBLIC_NAME_RE.fullmatch(item) for item in self.tags)
         ):
