@@ -125,7 +125,7 @@ jobs:
         uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
         with:
           version: 0.11.9
-          enable-cache: true
+          enable-cache: false
       - name: Install locked dependencies
         run: uv sync --extra dev --frozen
       - name: Install pinned secret scanners
@@ -224,7 +224,7 @@ jobs:
         uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
         with:
           version: 0.11.9
-          enable-cache: true
+          enable-cache: false
       - name: Install Supabase CLI 2.109.1
         uses: supabase/setup-cli@46f7f98c7f948ad727d22c1e67fab04c223a0520
         with:
@@ -267,7 +267,7 @@ jobs:
         uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
         with:
           version: 0.11.9
-          enable-cache: true
+          enable-cache: false
       - name: Create exact PEAK contract report
         run: |
           set -euo pipefail
@@ -326,7 +326,7 @@ jobs:
         uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
         with:
           version: 0.11.9
-          enable-cache: true
+          enable-cache: false
       - name: Install locked release verifier
         run: uv sync --frozen --no-dev
       - name: Decode untrusted sanitized attestation transport

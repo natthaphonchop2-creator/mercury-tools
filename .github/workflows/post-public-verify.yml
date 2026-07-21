@@ -24,7 +24,7 @@ jobs:
         uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
         with:
           version: 0.11.9
-          enable-cache: true
+          enable-cache: false
       - name: Set up Node.js 22.22.0
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:

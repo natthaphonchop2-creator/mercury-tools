@@ -153,3 +153,9 @@ def test_v030_release_artifacts_are_hosted_connector_neutral_and_secretless() ->
         if (ROOT / relative_path).suffix != ".png"
     )
     assert not any(pattern.search(release_text) for pattern in USABLE_SECRET_PATTERNS)
+
+
+def test_github_workflows_do_not_create_uninspectable_dependency_caches() -> None:
+    for workflow_path in (ROOT / ".github/workflows").glob("*.yml"):
+        source = workflow_path.read_text(encoding="utf-8")
+        assert "enable-cache: true" not in source, workflow_path.name
