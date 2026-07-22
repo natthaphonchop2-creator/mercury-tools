@@ -44,7 +44,7 @@ permissions:
   contents: read
 
 env:
-  RELEASE_CONTROL_PIN: 9013eeee914e40ccb93150e2f9ee1c005786b0ab
+  RELEASE_CONTROL_PIN: b9c7d95eb804cd7c94fe5bed0f4940815178f3d8
   RELEASE_CONTROL_REPOSITORY: natthaphonchop2-creator/mercury-release-control-v2
   RELEASE_TAG: v0.3.0
   RELEASE_VERSION: 0.3.0
