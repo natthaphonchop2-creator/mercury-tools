@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,13 @@ from pathlib import Path
 _GIT = Path("/usr/bin/git")
 _TIMEOUT_SECONDS = 10
 _ERROR = "release_checkout_config_invalid\n"
+_CHECKOUT_WORKTREE_CONFIG = (
+    b"[core]\n"
+    b"\tsparseCheckout = false\n"
+    b"\tsparseCheckoutCone = false\n"
+    b"[index]\n"
+    b"\tsparse = false\n"
+)
 
 
 def _git(root: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
@@ -34,6 +42,25 @@ def _is_clean(result: subprocess.CompletedProcess[bytes], *, returncode: int) ->
     return result.returncode == returncode and result.stderr == b""
 
 
+def _checkout_worktree_config(root: Path) -> Path | None:
+    git_dir = _git(root, "rev-parse", "--absolute-git-dir")
+    expected_git_dir = root / ".git"
+    if (
+        not _is_clean(git_dir, returncode=0)
+        or git_dir.stdout != os.fsencode(expected_git_dir) + b"\n"
+    ):
+        raise ValueError
+
+    path = expected_git_dir / "config.worktree"
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode) or path.read_bytes() != _CHECKOUT_WORKTREE_CONFIG:
+        raise ValueError
+    return path
+
+
 def main() -> int:
     root = Path.cwd().resolve()
     try:
@@ -51,6 +78,8 @@ def main() -> int:
         ):
             raise ValueError
 
+        worktree_config = _checkout_worktree_config(root)
+
         removed = _git(
             root,
             "config",
@@ -66,6 +95,11 @@ def main() -> int:
         remaining = _git(root, "config", "--null", "--local", "--get-all", "gc.auto")
         if not _is_clean(remaining, returncode=1) or remaining.stdout:
             raise ValueError
+
+        if worktree_config is not None:
+            worktree_config.unlink()
+            if worktree_config.exists() or worktree_config.is_symlink():
+                raise ValueError
     except (OSError, subprocess.TimeoutExpired, ValueError):
         sys.stderr.write(_ERROR)
         return 1
