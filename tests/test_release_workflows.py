@@ -585,7 +585,17 @@ def test_release_is_manual_sha_bound_and_handoff_depends_on_every_gate() -> None
     assert '"$RELEASE_IMAGE" sh -ceu' in build
     assert f"scripts/build_release_artifacts.py --version {ACTIVE_RELEASE_VERSION}" in build
     assert f"scripts/verify_release.py --version {ACTIVE_RELEASE_VERSION}" in build
-    assert "--offline --frozen --no-dev" in build
+    assert (
+        "release-toolchain/uv-linux-x86_64 sync "
+        "--offline --frozen --no-dev --no-install-project --no-build"
+    ) in " ".join(build.replace("\\\n", " ").split())
+    assert build.count("PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/workspace/src") == 2
+    assert build.count("/tmp/mercury-venv/bin/python") == 2
+    assert "uv-linux-x86_64 run --offline" not in build
+    offline_sync = build.index("release-toolchain/uv-linux-x86_64 sync")
+    build_script = build.index("scripts/build_release_artifacts.py")
+    verify_script = build.index("scripts/verify_release.py")
+    assert offline_sync < build_script < verify_script
     assert "mercury-build-output" in build
 
     handoff = _run_text(jobs["release-ready"])
@@ -631,7 +641,10 @@ def test_release_dependency_prefetch_is_pinned_secretless_and_container_only() -
             command = step.get("run", "")
             flattened = " ".join(command.replace("\\\n", " ").split())
             assert "uv sync --frozen --no-dev --no-install-project" not in flattened
-            if "release-toolchain/uv-linux-x86_64 sync" in flattened:
+            if (
+                "release-toolchain/uv-linux-x86_64 sync" in flattened
+                and "--offline" not in flattened
+            ):
                 prefetch_locations.append((job_name, step.get("name", "")))
 
     assert prefetch_locations == [
