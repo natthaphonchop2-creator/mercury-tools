@@ -389,6 +389,9 @@ jobs:
           test "$(find "$RUNNER_TEMP/relayed-release-control" -type f | wc -l | tr -d ' ')" = "1"
           printf '%s  %s\n' "$EXPECTED_PAYLOAD_SHA256" "$ATTESTATION" \
             | sha256sum --check
+          GC_AUTO_VALUES="$(git config --local --get-all gc.auto || true)"
+          test "$GC_AUTO_VALUES" = "0"
+          git config --local --unset-all gc.auto
           PUBLIC_TREE_DIGEST="$(uv run python - <<'PY'
           from pathlib import Path
           from mercury_tools.release.artifacts import (
