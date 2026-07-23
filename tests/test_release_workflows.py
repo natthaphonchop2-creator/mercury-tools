@@ -777,18 +777,12 @@ def test_release_relay_removes_only_checkout_gc_auto_before_candidate_inspection
     )
     command = verify["run"]
 
-    read_gc_auto = 'GC_AUTO_VALUES="$(git config --local --get-all gc.auto || true)"'
-    require_checkout_value = 'test "$GC_AUTO_VALUES" = "0"'
-    remove_checkout_value = "git config --local --unset-all gc.auto"
+    normalize_checkout = "python3 scripts/normalize_release_checkout_config.py"
     inspect_candidate = "load_release_candidate("
 
-    assert read_gc_auto in command
-    assert require_checkout_value in command
-    assert remove_checkout_value in command
-    assert command.index(read_gc_auto) < command.index(require_checkout_value)
-    assert command.index(require_checkout_value) < command.index(remove_checkout_value)
-    assert command.index(remove_checkout_value) < command.index(inspect_candidate)
-    assert "git config --local --remove-section" not in command
+    assert normalize_checkout in command
+    assert command.index(normalize_checkout) < command.index(inspect_candidate)
+    assert "git config" not in command
 
 
 def test_release_build_removes_only_checkout_gc_auto_before_candidate_mount() -> None:
@@ -806,17 +800,17 @@ def test_release_build_removes_only_checkout_gc_auto_before_candidate_mount() ->
     )
     command = normalize["run"]
 
-    read_gc_auto = 'GC_AUTO_VALUES="$(git config --local --get-all gc.auto || true)"'
-    require_checkout_value = 'test "$GC_AUTO_VALUES" = "0"'
-    remove_checkout_value = "git config --local --unset-all gc.auto"
-
-    assert read_gc_auto in command
-    assert require_checkout_value in command
-    assert remove_checkout_value in command
-    assert command.index(read_gc_auto) < command.index(require_checkout_value)
-    assert command.index(require_checkout_value) < command.index(remove_checkout_value)
-    assert "git config --local --remove-section" not in command
+    assert command.splitlines() == [
+        "set -euo pipefail",
+        "python3 scripts/normalize_release_checkout_config.py",
+    ]
     assert build_steps.index(normalize) < build_steps.index(build)
+    assert (
+        json.dumps(payload, sort_keys=True).count(
+            "python3 scripts/normalize_release_checkout_config.py"
+        )
+        == 2
+    )
 
 
 def test_release_control_transport_and_candidate_containers_are_fail_closed() -> None:
