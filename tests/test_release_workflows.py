@@ -767,6 +767,52 @@ def test_release_relay_gzip_transport_uses_bounded_verified_decoder() -> None:
     assert "EXPECTED_PAYLOAD_SHA256" in verify_command
 
 
+def test_release_relay_removes_only_checkout_gc_auto_before_candidate_inspection() -> None:
+    payload = _workflow(ACTIVE_RELEASE_WORKFLOW)
+    relay_steps = payload["jobs"]["relayed-release-control"]["steps"]
+    verify = next(
+        step
+        for step in relay_steps
+        if step.get("name") == "Verify exact sanitized relay payload"
+    )
+    command = verify["run"]
+
+    normalize_checkout = "python3 scripts/normalize_release_checkout_config.py"
+    inspect_candidate = "load_release_candidate("
+
+    assert normalize_checkout in command
+    assert command.index(normalize_checkout) < command.index(inspect_candidate)
+    assert "git config" not in command
+
+
+def test_release_build_removes_only_checkout_gc_auto_before_candidate_mount() -> None:
+    payload = _workflow(ACTIVE_RELEASE_WORKFLOW)
+    build_steps = payload["jobs"]["build-artifacts"]["steps"]
+    normalize = next(
+        step
+        for step in build_steps
+        if step.get("name") == "Normalize checkout-generated Git config"
+    )
+    build = next(
+        step
+        for step in build_steps
+        if step.get("name") == "Build and verify in the isolated candidate runtime"
+    )
+    command = normalize["run"]
+
+    assert command.splitlines() == [
+        "set -euo pipefail",
+        "python3 scripts/normalize_release_checkout_config.py",
+    ]
+    assert build_steps.index(normalize) < build_steps.index(build)
+    assert (
+        json.dumps(payload, sort_keys=True).count(
+            "python3 scripts/normalize_release_checkout_config.py"
+        )
+        == 2
+    )
+
+
 def test_release_control_transport_and_candidate_containers_are_fail_closed() -> None:
     payload = _workflow(ACTIVE_RELEASE_WORKFLOW)
     serialized = json.dumps(payload, sort_keys=True)

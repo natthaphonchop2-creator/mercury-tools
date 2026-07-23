@@ -389,6 +389,7 @@ jobs:
           test "$(find "$RUNNER_TEMP/relayed-release-control" -type f | wc -l | tr -d ' ')" = "1"
           printf '%s  %s\n' "$EXPECTED_PAYLOAD_SHA256" "$ATTESTATION" \
             | sha256sum --check
+          python3 scripts/normalize_release_checkout_config.py
           PUBLIC_TREE_DIGEST="$(uv run python - <<'PY'
           from pathlib import Path
           from mercury_tools.release.artifacts import (
@@ -465,6 +466,10 @@ jobs:
           ref: ${{ inputs.reviewed_main_sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Normalize checkout-generated Git config
+        run: |
+          set -euo pipefail
+          python3 scripts/normalize_release_checkout_config.py
       - name: Download exact sanitized attestation
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
