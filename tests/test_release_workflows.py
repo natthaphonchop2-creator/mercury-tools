@@ -791,6 +791,34 @@ def test_release_relay_removes_only_checkout_gc_auto_before_candidate_inspection
     assert "git config --local --remove-section" not in command
 
 
+def test_release_build_removes_only_checkout_gc_auto_before_candidate_mount() -> None:
+    payload = _workflow(ACTIVE_RELEASE_WORKFLOW)
+    build_steps = payload["jobs"]["build-artifacts"]["steps"]
+    normalize = next(
+        step
+        for step in build_steps
+        if step.get("name") == "Normalize checkout-generated Git config"
+    )
+    build = next(
+        step
+        for step in build_steps
+        if step.get("name") == "Build and verify in the isolated candidate runtime"
+    )
+    command = normalize["run"]
+
+    read_gc_auto = 'GC_AUTO_VALUES="$(git config --local --get-all gc.auto || true)"'
+    require_checkout_value = 'test "$GC_AUTO_VALUES" = "0"'
+    remove_checkout_value = "git config --local --unset-all gc.auto"
+
+    assert read_gc_auto in command
+    assert require_checkout_value in command
+    assert remove_checkout_value in command
+    assert command.index(read_gc_auto) < command.index(require_checkout_value)
+    assert command.index(require_checkout_value) < command.index(remove_checkout_value)
+    assert "git config --local --remove-section" not in command
+    assert build_steps.index(normalize) < build_steps.index(build)
+
+
 def test_release_control_transport_and_candidate_containers_are_fail_closed() -> None:
     payload = _workflow(ACTIVE_RELEASE_WORKFLOW)
     serialized = json.dumps(payload, sort_keys=True)

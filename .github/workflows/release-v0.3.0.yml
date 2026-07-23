@@ -468,6 +468,12 @@ jobs:
           ref: ${{ inputs.reviewed_main_sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Normalize checkout-generated Git config
+        run: |
+          set -euo pipefail
+          GC_AUTO_VALUES="$(git config --local --get-all gc.auto || true)"
+          test "$GC_AUTO_VALUES" = "0"
+          git config --local --unset-all gc.auto
       - name: Download exact sanitized attestation
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
