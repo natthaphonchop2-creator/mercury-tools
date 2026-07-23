@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
-from pydantic import ConfigDict, Field, ValidationError, model_validator
+from pydantic import ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from mercury_tools.release.models import (
     GateStatus,
@@ -31,6 +31,14 @@ TRUSTED_RELEASE_CONTROL_SURFACES = (
     "render_build_and_runtime_logs",
     "supabase_knowledge_and_storage",
 )
+_TRUSTED_RELEASE_CONTROL_SURFACES_BY_VERSION = {
+    "0.2.2": TRUSTED_RELEASE_CONTROL_SURFACES,
+    "0.3.0": (*TRUSTED_RELEASE_CONTROL_SURFACES, "public_mcp_responses"),
+}
+_PREVENT_SELF_REVIEW_BY_VERSION = {
+    "0.2.2": True,
+    "0.3.0": False,
+}
 
 TRUSTED_HOSTED_ATTESTATION_ENV = "MERCURY_TRUSTED_HOSTED_ATTESTATION"
 TRUSTED_HOSTED_ATTESTATION_SHA256_ENV = (
@@ -69,7 +77,7 @@ class TrustedPreflightReceipt(_TrustedModel):
     admin_bypass_disabled: Literal[True]
     control_repository_id: int = Field(gt=0)
     environment: Literal["production-release"]
-    prevent_self_review: Literal[True]
+    prevent_self_review: bool
     protected_branch_only: Literal[True]
     required_configuration_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     required_reviewers: int = Field(gt=0, le=100)
@@ -146,13 +154,21 @@ class TrustedAttestationV2(_TrustedModel):
     schema_version: Literal[2]
     staging: TrustedStagingReceipt
     surface_evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    surface_count: Literal[8]
-    surfaces: tuple[SurfaceAttestation, ...] = Field(min_length=8, max_length=8)
+    surface_count: Literal[8, 9]
+    surfaces: tuple[SurfaceAttestation, ...] = Field(min_length=8, max_length=9)
     version: Literal["0.2.2", "0.3.0"]
     workflow: TrustedWorkflowReceipt
 
+    @field_validator("surface_count", mode="before")
+    @classmethod
+    def validate_surface_count_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("trusted_attestation_v2_surface_count_invalid")
+        return value
+
     @model_validator(mode="after")
     def validate_release_identity(self) -> TrustedAttestationV2:
+        expected_surfaces = _TRUSTED_RELEASE_CONTROL_SURFACES_BY_VERSION[self.version]
         if (
             self.reviewed_sha != self.provider_evidence.reviewed_sha
             or self.provider_evidence.render.commit != self.reviewed_sha
@@ -161,8 +177,11 @@ class TrustedAttestationV2(_TrustedModel):
             or self.provider_evidence.supabase.migration_id
             != _REQUIRED_MIGRATION_BY_VERSION[self.version]
             or self.staging.ref != f"v{self.version}-rc.{self.reviewed_sha[:12]}"
+            or self.preflight.prevent_self_review
+            is not _PREVENT_SELF_REVIEW_BY_VERSION[self.version]
+            or self.surface_count != len(expected_surfaces)
             or tuple(item.surface for item in self.surfaces)
-            != TRUSTED_RELEASE_CONTROL_SURFACES
+            != expected_surfaces
             or any(item.status is not GateStatus.PASSED for item in self.surfaces)
             or any(item.completed_at > self.issued_at for item in self.surfaces)
         ):

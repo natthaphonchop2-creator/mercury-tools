@@ -27,6 +27,7 @@ SURFACES = (
     "render_build_and_runtime_logs",
     "supabase_knowledge_and_storage",
 )
+V030_SURFACES = (*SURFACES, "public_mcp_responses")
 
 
 def _canonical_digest(payload: dict[str, object]) -> str:
@@ -40,12 +41,14 @@ def _attestation_payload(
     version: str = "0.2.2",
     migration_id: str = "20260716100000",
     hosted_tool_count: int = 20,
+    surface_names: tuple[str, ...] = SURFACES,
+    prevent_self_review: bool = True,
 ) -> dict[str, object]:
     issued_at = NOW.isoformat().replace("+00:00", "Z")
     started_at = (NOW - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
     expires_at = (NOW + timedelta(minutes=60)).isoformat().replace("+00:00", "Z")
     surfaces = []
-    for name in SURFACES:
+    for name in surface_names:
         surfaces.append(
             {
                 "blocker_codes": [],
@@ -71,7 +74,7 @@ def _attestation_payload(
             "admin_bypass_disabled": True,
             "control_repository_id": CONTROL_REPOSITORY_ID,
             "environment": "production-release",
-            "prevent_self_review": True,
+            "prevent_self_review": prevent_self_review,
             "protected_branch_only": True,
             "required_configuration_sha256": "5" * 64,
             "required_reviewers": 1,
@@ -116,7 +119,7 @@ def _attestation_payload(
             "repository": "natthaphonchop2-creator/mercury-tools-staging",
             "tag_object_sha": "9" * 40,
         },
-        "surface_count": 8,
+        "surface_count": len(surfaces),
         "surface_evidence_sha256": "a" * 64,
         "surfaces": surfaces,
         "version": version,
@@ -168,6 +171,67 @@ def test_v022_attestation_is_strict_identity_bound_and_carries_staging(tmp_path)
     )
     assert attestation.staging.ref == f"v0.2.2-rc.{REVIEWED_SHA[:12]}"
     assert tuple(attestation.surface_map()) == SURFACES
+
+
+def test_v030_attestation_accepts_version_specific_preflight_and_surfaces(
+    tmp_path,
+) -> None:
+    path = tmp_path / "trusted-hosted-attestation.json"
+    payload = _attestation_payload(
+        version="0.3.0",
+        migration_id="20260719120000",
+        surface_names=V030_SURFACES,
+        prevent_self_review=False,
+    )
+    digest = _write_attestation(path, payload)
+
+    attestation = _load(path, digest)
+
+    assert attestation.preflight.prevent_self_review is False
+    assert attestation.surface_count == len(V030_SURFACES)
+    assert tuple(attestation.surface_map()) == V030_SURFACES
+
+
+@pytest.mark.parametrize(
+    ("version", "migration_id", "surface_names", "prevent_self_review"),
+    (
+        ("0.2.2", "20260716100000", V030_SURFACES, True),
+        ("0.2.2", "20260716100000", SURFACES, False),
+        ("0.3.0", "20260719120000", SURFACES, False),
+        ("0.3.0", "20260719120000", V030_SURFACES, True),
+    ),
+)
+def test_attestation_rejects_cross_version_preflight_and_surface_contracts(
+    tmp_path,
+    version: str,
+    migration_id: str,
+    surface_names: tuple[str, ...],
+    prevent_self_review: bool,
+) -> None:
+    path = tmp_path / "trusted-hosted-attestation.json"
+    payload = _attestation_payload(
+        version=version,
+        migration_id=migration_id,
+        surface_names=surface_names,
+        prevent_self_review=prevent_self_review,
+    )
+    digest = _write_attestation(path, payload)
+
+    with pytest.raises(ReleaseGateError, match="^trusted_attestation_v2_invalid$"):
+        _load(path, digest)
+
+
+def test_attestation_rejects_non_integer_surface_count_on_the_wire(tmp_path) -> None:
+    path = tmp_path / "trusted-hosted-attestation.json"
+    payload = _attestation_payload()
+    payload["surface_count"] = 8.0
+    payload["payload_sha256"] = _canonical_digest(
+        {key: value for key, value in payload.items() if key != "payload_sha256"}
+    )
+    digest = _write_attestation(path, payload)
+
+    with pytest.raises(ReleaseGateError, match="^trusted_attestation_v2_invalid$"):
+        _load(path, digest)
 
 
 def test_v022_attestation_rejects_unknown_fields_and_identity_drift(tmp_path) -> None:
@@ -284,6 +348,8 @@ def test_v030_attestation_and_handoff_bind_new_release_identity(tmp_path) -> Non
             version="0.3.0",
             migration_id="20260719120000",
             hosted_tool_count=24,
+            surface_names=V030_SURFACES,
+            prevent_self_review=False,
         ),
     )
     attestation = _load(attestation_path, digest)
