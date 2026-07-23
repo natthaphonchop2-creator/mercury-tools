@@ -35,8 +35,8 @@ on:
         description: Numeric GitHub repository ID for the trusted release-control repository
         required: true
         type: string
-      release_control_attestation_b64:
-        description: Base64-encoded sanitized trusted-hosted-attestation.json
+      release_control_attestation_gzip_b64:
+        description: Base64-encoded gzip transport of sanitized trusted-hosted-attestation.json
         required: true
         type: string
 
@@ -44,7 +44,7 @@ permissions:
   contents: read
 
 env:
-  RELEASE_CONTROL_PIN: c86c1adf082c5334db7411843014931a77048038
+  RELEASE_CONTROL_PIN: aa4d9daf6cc25a5eefecd6b669c978853c0e783d
   RELEASE_CONTROL_REPOSITORY: natthaphonchop2-creator/mercury-release-control-v2
   RELEASE_TAG: v0.3.0
   RELEASE_VERSION: 0.3.0
@@ -349,21 +349,27 @@ jobs:
           enable-cache: false
       - name: Install locked release verifier
         run: uv sync --frozen --no-dev
-      - name: Decode untrusted sanitized attestation transport
+      - name: Decode untrusted sanitized attestation gzip transport
         env:
-          ATTESTATION_B64: ${{ inputs.release_control_attestation_b64 }}
+          ATTESTATION_GZIP_B64: ${{ inputs.release_control_attestation_gzip_b64 }}
           EXPECTED_PAYLOAD_SHA256: ${{ inputs.release_control_attestation_payload_sha256 }}
         run: |
           set -euo pipefail
-          test -n "$ATTESTATION_B64"
-          test "${#ATTESTATION_B64}" -le 60000
+          test -n "$ATTESTATION_GZIP_B64"
+          test "${#ATTESTATION_GZIP_B64}" -le 60000
           OUTPUT_ROOT="$RUNNER_TEMP/relayed-release-control"
           install -d -m 700 "$OUTPUT_ROOT"
           umask 077
-          printf '%s' "$ATTESTATION_B64" | base64 --decode \
-            >"$OUTPUT_ROOT/trusted-hosted-attestation.json"
-          printf '%s  %s\n' "$EXPECTED_PAYLOAD_SHA256" \
-            "$OUTPUT_ROOT/trusted-hosted-attestation.json" | sha256sum --check
+          ATTESTATION="$OUTPUT_ROOT/trusted-hosted-attestation.json"
+          printf '%s' "$ATTESTATION_GZIP_B64" \
+            | uv run python -m mercury_tools.release.relay \
+              --output "$ATTESTATION" \
+              --expected-sha256 "$EXPECTED_PAYLOAD_SHA256" \
+              --max-encoded-chars 60000 \
+              --max-compressed-bytes 45000 \
+              --max-output-bytes 1048576
+          test -f "$ATTESTATION"
+          test ! -L "$ATTESTATION"
       - name: Verify exact sanitized relay payload
         id: attestation
         env:

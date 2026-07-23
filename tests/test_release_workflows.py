@@ -478,7 +478,7 @@ def test_release_is_manual_sha_bound_and_handoff_depends_on_every_gate() -> None
         "release_control_attestation_artifact_id",
         "release_control_attestation_artifact_digest",
         "release_control_attestation_payload_sha256",
-        "release_control_attestation_b64",
+        "release_control_attestation_gzip_b64",
         "release_control_repository_id",
     }
     assert set(dispatch["inputs"]) == required_inputs
@@ -559,7 +559,9 @@ def test_release_is_manual_sha_bound_and_handoff_depends_on_every_gate() -> None
     trusted_run = _run_text(trusted)
     assert "actions/checkout" in json.dumps(trusted)
     assert "secrets." not in json.dumps(trusted, sort_keys=True)
-    assert "base64 --decode" in trusted_run
+    assert "python -m mercury_tools.release.relay" in trusted_run
+    assert "release_control_attestation_gzip_b64" in json.dumps(trusted, sort_keys=True)
+    assert "release_control_attestation_b64" not in json.dumps(trusted, sort_keys=True)
     assert "RELEASE_CONTROL_PIN" in trusted_run
     assert "trusted-hosted-attestation.json" in trusted_run
     assert "untrusted relay" in json.dumps(trusted).lower()
@@ -719,11 +721,50 @@ def test_mercury_release_jobs_never_receive_production_provider_credentials() ->
     assert "environment" not in trusted
     assert "actions/checkout" in trusted_serialized
     assert "secrets." not in trusted_serialized
-    assert "release_control_attestation_b64" in trusted_serialized
-    assert "base64 --decode" in _run_text(trusted)
-    assert 'test "${#ATTESTATION_B64}" -le 60000' in _run_text(trusted)
-    assert "65536" not in _run_text(trusted)
+    assert "release_control_attestation_gzip_b64" in trusted_serialized
+    assert "release_control_attestation_b64" not in trusted_serialized
+    assert "python -m mercury_tools.release.relay" in _run_text(trusted)
+    assert 'test "${#ATTESTATION_GZIP_B64}" -le 60000' in _run_text(trusted)
+    assert "--max-compressed-bytes 45000" in _run_text(trusted)
+    assert "--max-output-bytes 1048576" in _run_text(trusted)
     assert jobs["build-artifacts"]["needs"] == "relayed-release-control"
+
+
+def test_release_relay_gzip_transport_uses_bounded_verified_decoder() -> None:
+    payload = _workflow(ACTIVE_RELEASE_WORKFLOW)
+    dispatch_inputs = payload["on"]["workflow_dispatch"]["inputs"]
+    relay_steps = payload["jobs"]["relayed-release-control"]["steps"]
+    decode = next(
+        step
+        for step in relay_steps
+        if step.get("name") == "Decode untrusted sanitized attestation gzip transport"
+    )
+    verify = next(
+        step
+        for step in relay_steps
+        if step.get("name") == "Verify exact sanitized relay payload"
+    )
+
+    assert "release_control_attestation_gzip_b64" in dispatch_inputs
+    assert "release_control_attestation_b64" not in dispatch_inputs
+    assert decode["env"]["ATTESTATION_GZIP_B64"] == (
+        "${{ inputs.release_control_attestation_gzip_b64 }}"
+    )
+
+    command = decode["run"]
+    assert 'test "${#ATTESTATION_GZIP_B64}" -le 60000' in command
+    assert "python -m mercury_tools.release.relay" in command
+    assert '--expected-sha256 "$EXPECTED_PAYLOAD_SHA256"' in command
+    assert '--max-encoded-chars 60000' in command
+    assert '--max-compressed-bytes 45000' in command
+    assert '--max-output-bytes 1048576' in command
+    assert 'trusted-hosted-attestation.json.gz' not in command
+
+    verify_command = verify["run"]
+    assert 'trusted-hosted-attestation.json' in verify_command
+    assert 'find "$RUNNER_TEMP/relayed-release-control" -type f' in verify_command
+    assert ' = "1"' in verify_command
+    assert "EXPECTED_PAYLOAD_SHA256" in verify_command
 
 
 def test_release_control_transport_and_candidate_containers_are_fail_closed() -> None:
@@ -750,7 +791,7 @@ def test_release_control_transport_and_candidate_containers_are_fail_closed() ->
     trusted = jobs["relayed-release-control"]
     trusted_text = json.dumps(trusted, sort_keys=True)
     assert "actions/checkout" in trusted_text
-    assert "base64 --decode" in _run_text(trusted)
+    assert "python -m mercury_tools.release.relay" in _run_text(trusted)
     assert "release_control_attestation_artifact_id" in trusted_text
     assert "release_control_attestation_artifact_digest" in trusted_text
     assert "release_control_attestation_payload_sha256" in trusted_text
