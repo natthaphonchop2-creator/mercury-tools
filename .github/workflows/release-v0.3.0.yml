@@ -479,7 +479,7 @@ jobs:
             --read-only --cap-drop ALL \
             --security-opt no-new-privileges:true \
             --user "$(id -u):$(id -g)" \
-            --tmpfs /tmp:rw,nosuid,nodev,mode=1777,size=1073741824 \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777,size=1073741824 \
             --volume "$GITHUB_WORKSPACE:/workspace:ro" \
             --volume "$UV_CACHE_DIR:/release-uv-cache:rw" \
             --workdir /workspace \
@@ -576,7 +576,8 @@ jobs:
             --network none --read-only --cap-drop ALL \
             --security-opt no-new-privileges:true \
             --user "$(id -u):$(id -g)" \
-            --tmpfs /tmp:rw,nosuid,nodev,mode=1777,size=2147483648 \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777,size=2147483648 \
+            --tmpfs "/release-runtime:rw,exec,nosuid,nodev,mode=0700,uid=$(id -u),gid=$(id -g),size=2147483648" \
             --volume "$GITHUB_WORKSPACE:/workspace:ro" \
             --volume "$RUNNER_TEMP/mercury-scanners/bin:/release-bin:ro" \
             --volume "$RUNNER_TEMP/mercury-uv-cache:/release-uv-cache:ro" \
@@ -591,23 +592,55 @@ jobs:
             --env MERCURY_TRUSTED_HOSTED_ATTESTATION \
             --env MERCURY_TRUSTED_HOSTED_ATTESTATION_SHA256 \
             --env RELEASE_UV_SOURCE_IMAGE \
-            --env HOME=/tmp/mercury-home --env UV_CACHE_DIR=/tmp/uv-cache \
-            --env UV_PROJECT_ENVIRONMENT=/tmp/mercury-venv \
+            --env HOME=/release-runtime/home \
+            --env TMPDIR=/release-runtime/tmp \
+            --env UV_CACHE_DIR=/release-runtime/uv-cache \
+            --env UV_PROJECT_ENVIRONMENT=/release-runtime/mercury-venv \
             --env UV_HTTP_TIMEOUT=120 --env UV_PYTHON=/usr/local/bin/python3.12 \
             --env UV_PYTHON_DOWNLOADS=never \
             "$RELEASE_IMAGE" sh -ceu '
               test -n "$RELEASE_UV_SOURCE_IMAGE"
-              cp -a /release-uv-cache /tmp/uv-cache
-              chmod -R u+w /tmp/uv-cache
+              TMP_MOUNT_OPTIONS="$(awk '\''$2 == "/tmp" { print $4 }'\'' /proc/mounts)"
+              RUNTIME_MOUNT_OPTIONS="$(awk '\''$2 == "/release-runtime" { print $4 }'\'' /proc/mounts)"
+              test -n "$TMP_MOUNT_OPTIONS"
+              test -n "$RUNTIME_MOUNT_OPTIONS"
+              case ",$TMP_MOUNT_OPTIONS," in
+                *,noexec,*) ;;
+                *) echo "release runtime: /tmp must be noexec" >&2; exit 64 ;;
+              esac
+              case ",$RUNTIME_MOUNT_OPTIONS," in
+                *,noexec,*) echo "release runtime: dedicated mount must be executable" >&2; exit 64 ;;
+                *) ;;
+              esac
+              test "$(stat -c '\''%u:%g:%a'\'' /release-runtime)" = "$(id -u):$(id -g):700"
+              install -d -m 700 "$HOME" "$TMPDIR"
+              cp -a /release-uv-cache "$UV_CACHE_DIR"
+              chmod -R u+w "$UV_CACHE_DIR"
               export PATH="/release-bin:$PATH"
               release-toolchain/uv-linux-x86_64 sync \
                 --offline --frozen --no-dev --no-install-project --no-build
               PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/workspace/src \
-                /tmp/mercury-venv/bin/python \
+                /release-runtime/mercury-venv/bin/python -c '\''
+          import pathlib
+          import sys
+          import tempfile
+          from pydantic_core import _pydantic_core
+
+          runtime = pathlib.Path("/release-runtime/mercury-venv")
+          if pathlib.Path(sys.executable).as_posix() != str(runtime / "bin/python"):
+              raise SystemExit("release runtime: unexpected interpreter path")
+          native_module = pathlib.Path(_pydantic_core.__file__).resolve()
+          if not native_module.is_relative_to(runtime):
+              raise SystemExit("release runtime: native module escaped candidate runtime")
+          if tempfile.gettempdir() != "/release-runtime/tmp":
+              raise SystemExit("release runtime: unexpected temporary directory")
+          '\''
+              PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/workspace/src \
+                /release-runtime/mercury-venv/bin/python \
                 scripts/build_release_artifacts.py --version 0.3.0 \
                 --output /release-output/artifacts
               PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/workspace/src \
-                /tmp/mercury-venv/bin/python \
+                /release-runtime/mercury-venv/bin/python \
                 scripts/verify_release.py --version 0.3.0 \
                 --artifacts /release-output/artifacts
             '

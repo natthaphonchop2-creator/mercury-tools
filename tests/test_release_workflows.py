@@ -269,6 +269,28 @@ def test_gitleaks_fixture_allowlists_are_exact_and_fail_closed() -> None:
 def test_ci_is_full_history_fail_closed_and_emits_exact_skip_junit() -> None:
     payload = _workflow("ci.yml")
     _assert_pinned_actions_and_no_bypasses(payload)
+    runtime_smoke = payload["jobs"]["release-runtime-smoke"]
+    runtime_smoke_command = _run_text(runtime_smoke)
+    assert runtime_smoke["timeout-minutes"] == "15"
+    assert "release-toolchain/platform.json" in runtime_smoke_command
+    assert "platform descriptor hash mismatch" in runtime_smoke_command
+    assert "uv lock hash mismatch" in runtime_smoke_command
+    assert "unexpected uv binary path" in runtime_smoke_command
+    assert "uv binary hash mismatch" in runtime_smoke_command
+    assert "--network none" in runtime_smoke_command
+    assert "--tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777" in runtime_smoke_command
+    assert (
+        '--tmpfs "/release-runtime:rw,exec,nosuid,nodev,mode=0700,'
+        'uid=$(id -u),gid=$(id -g),size=1073741824"'
+    ) in runtime_smoke_command
+    assert "release-toolchain/uv-linux-x86_64 sync" in runtime_smoke_command
+    assert "--offline --frozen --no-dev --no-install-project --no-build" in " ".join(
+        runtime_smoke_command.replace("\\\n", " ").split()
+    )
+    assert "from pydantic_core import _pydantic_core" in runtime_smoke_command
+    assert "native module escaped candidate runtime" in runtime_smoke_command
+    assert "secrets." not in json.dumps(runtime_smoke, sort_keys=True)
+
     test = payload["jobs"]["test"]
     assert test["if"] == "github.event_name == 'push' && github.ref == 'refs/heads/main'"
     checkout = test["steps"][0]
@@ -589,8 +611,24 @@ def test_release_is_manual_sha_bound_and_handoff_depends_on_every_gate() -> None
         "release-toolchain/uv-linux-x86_64 sync "
         "--offline --frozen --no-dev --no-install-project --no-build"
     ) in " ".join(build.replace("\\\n", " ").split())
-    assert build.count("PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/workspace/src") == 2
-    assert build.count("/tmp/mercury-venv/bin/python") == 2
+    assert build.count("PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/workspace/src") == 3
+    assert build.count("/release-runtime/mercury-venv/bin/python") == 3
+    assert "/tmp/mercury-venv" not in build
+    assert "--tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777" in build
+    assert (
+        '--tmpfs "/release-runtime:rw,exec,nosuid,nodev,mode=0700,'
+        'uid=$(id -u),gid=$(id -g),size=2147483648"'
+    ) in build
+    assert "--env HOME=/release-runtime/home" in build
+    assert "--env TMPDIR=/release-runtime/tmp" in build
+    assert "--env UV_CACHE_DIR=/release-runtime/uv-cache" in build
+    assert "--env UV_PROJECT_ENVIRONMENT=/release-runtime/mercury-venv" in build
+    assert 'install -d -m 700 "$HOME" "$TMPDIR"' in build
+    assert "release runtime: /tmp must be noexec" in build
+    assert "release runtime: dedicated mount must be executable" in build
+    assert "from pydantic_core import _pydantic_core" in build
+    assert 'tempfile.gettempdir() != "/release-runtime/tmp"' in build
+    assert "native module escaped candidate runtime" in build
     assert "uv-linux-x86_64 run --offline" not in build
     offline_sync = build.index("release-toolchain/uv-linux-x86_64 sync")
     build_script = build.index("scripts/build_release_artifacts.py")
@@ -890,6 +928,18 @@ def test_release_control_transport_and_candidate_containers_are_fail_closed() ->
         assert "--security-opt no-new-privileges" in command
         assert ':ro"' in command
         assert "--tmpfs /tmp:" in command
+        candidate_tmpfs = next(
+            line.strip()
+            for line in command.splitlines()
+            if "--tmpfs /tmp:" in line and "size=2147483648" in line
+        )
+        assert "noexec" in candidate_tmpfs
+        assert (
+            '--tmpfs "/release-runtime:rw,exec,nosuid,nodev,mode=0700,'
+            'uid=$(id -u),gid=$(id -g),size=2147483648"'
+        ) in command
+        assert "--env TMPDIR=/release-runtime/tmp" in command
+        assert "--env UV_PROJECT_ENVIRONMENT=/release-runtime/mercury-venv" in command
         assert "mount -t tmpfs" in command
         assert "size=2147483648" in command
         assert "validate_candidate_output.py" in command
