@@ -390,18 +390,11 @@ jobs:
           printf '%s  %s\n' "$EXPECTED_PAYLOAD_SHA256" "$ATTESTATION" \
             | sha256sum --check
           python3 scripts/normalize_release_checkout_config.py
-          PUBLIC_TREE_DIGEST="$(uv run python - <<'PY'
-          from pathlib import Path
-          from mercury_tools.release.artifacts import (
-              load_release_candidate,
-              source_tree_digest,
-          )
-
-          candidate = load_release_candidate(
-              Path('.'), version='0.3.0', require_clean=True
-          )
-          print(source_tree_digest(candidate.entries))
-          PY
+          test "$(/usr/bin/git rev-parse --verify HEAD)" = "$EXPECTED_REVIEWED_SHA"
+          PUBLIC_TREE_DIGEST="$(
+            /usr/bin/git archive --format=tar "$EXPECTED_REVIEWED_SHA" \
+              | uv run python -c \
+                'import sys; from mercury_tools.release.public_tree import build_public_tree; print(build_public_tree(sys.stdin.buffer.read()).digest)'
           )"
           export ATTESTATION PUBLIC_TREE_DIGEST
           uv run python - <<'PY'

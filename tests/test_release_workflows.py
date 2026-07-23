@@ -778,10 +778,13 @@ def test_release_relay_removes_only_checkout_gc_auto_before_candidate_inspection
     command = verify["run"]
 
     normalize_checkout = "python3 scripts/normalize_release_checkout_config.py"
-    inspect_candidate = "load_release_candidate("
+    inspect_source_tree = '/usr/bin/git archive --format=tar "$EXPECTED_REVIEWED_SHA"'
 
     assert normalize_checkout in command
-    assert command.index(normalize_checkout) < command.index(inspect_candidate)
+    assert command.index(normalize_checkout) < command.index(inspect_source_tree)
+    assert '/usr/bin/git rev-parse --verify HEAD)" = "$EXPECTED_REVIEWED_SHA"' in command
+    assert "build_public_tree" in command
+    assert "load_release_candidate(" not in command
     assert "git config" not in command
 
 

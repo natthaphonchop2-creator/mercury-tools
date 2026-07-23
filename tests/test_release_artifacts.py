@@ -36,6 +36,7 @@ from mercury_tools.release.models import (
     SecretScanReport,
     SurfaceAttestation,
 )
+from mercury_tools.release.public_tree import build_public_tree
 from mercury_tools.release.scanner import ReleaseGateError, build_blocked_report
 from mercury_tools.release.verify import (
     RELEASE_CROSS_FILESYSTEM_CAPABILITY_SKIP_REASON,
@@ -845,6 +846,59 @@ def test_runtime_policy_overrides_an_inherited_alternate_interpreter(
 
     runtime = manifest.as_dict()["builder_provenance"]["runtime"]
     assert runtime["interpreter"]["path"] == str(_FIXTURE_INTERPRETER)
+
+
+def test_git_archive_public_tree_digest_does_not_require_the_build_runtime(
+    tmp_path: Path,
+) -> None:
+    root = make_release_tree(tmp_path)
+    pyproject = root / "pyproject.toml"
+    source = pyproject.read_text(encoding="utf-8")
+    missing_interpreter = tmp_path / "missing-python"
+    assert str(_FIXTURE_INTERPRETER) in source
+    pyproject.write_text(
+        source.replace(str(_FIXTURE_INTERPRETER), str(missing_interpreter), 1),
+        encoding="utf-8",
+    )
+    _commit_release_tree(root, "pin unavailable build runtime")
+
+    with pytest.raises(ReleaseGateError, match="^release_build_toolchain_invalid$"):
+        release_artifacts.load_release_candidate(
+            root,
+            version=VERSION,
+            require_clean=True,
+        )
+
+    archive = subprocess.run(
+        ["/usr/bin/git", "archive", "--format=tar", "HEAD"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    ).stdout
+    digest = build_public_tree(archive).digest
+
+    assert re.fullmatch(r"[0-9a-f]{64}", digest)
+
+
+def test_git_archive_public_tree_digest_matches_the_release_candidate(
+    tmp_path: Path,
+) -> None:
+    root = make_release_tree(tmp_path)
+    candidate = release_artifacts.load_release_candidate(
+        root,
+        version=VERSION,
+        require_clean=True,
+    )
+    archive = subprocess.run(
+        ["/usr/bin/git", "archive", "--format=tar", "HEAD"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    ).stdout
+
+    assert build_public_tree(archive).digest == release_artifacts.source_tree_digest(
+        candidate.entries
+    )
 
 
 def test_release_git_bootstrap_ignores_path_shadow(
