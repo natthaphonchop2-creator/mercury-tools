@@ -8,6 +8,121 @@ permissions:
   contents: read
 
 jobs:
+  release-runtime-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout release runtime inputs
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Verify pinned offline native runtime
+        run: |
+          set -euo pipefail
+          IFS=$'\t' read -r RELEASE_PLATFORM RELEASE_IMAGE < <(
+            python3 - <<'PY'
+          import hashlib
+          import json
+          import re
+          import tomllib
+          from pathlib import Path
+
+          policy = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["tool"]["mercury"]["release-build"]
+          descriptor_policy = policy["platform"]
+          if descriptor_policy["path"] != "release-toolchain/platform.json":
+              raise SystemExit("unexpected platform descriptor path")
+          descriptor_path = Path(descriptor_policy["path"])
+          descriptor_bytes = descriptor_path.read_bytes()
+          if hashlib.sha256(descriptor_bytes).hexdigest() != descriptor_policy["sha256"]:
+              raise SystemExit("platform descriptor hash mismatch")
+          if hashlib.sha256(Path("uv.lock").read_bytes()).hexdigest() != policy["lock_sha256"]:
+              raise SystemExit("uv lock hash mismatch")
+          uv_policy = policy["uv"]
+          if uv_policy["path"] != "release-toolchain/uv-linux-x86_64":
+              raise SystemExit("unexpected uv binary path")
+          if hashlib.sha256(Path(uv_policy["path"]).read_bytes()).hexdigest() != uv_policy["sha256"]:
+              raise SystemExit("uv binary hash mismatch")
+          descriptor = json.loads(descriptor_bytes)
+          image_pattern = re.compile(r"^[a-z0-9][a-z0-9._/-]{0,255}@sha256:[0-9a-f]{64}$")
+          if descriptor.get("architecture") != "linux/amd64":
+              raise SystemExit("unexpected release architecture")
+          if image_pattern.fullmatch(str(descriptor.get("image", ""))) is None:
+              raise SystemExit("unpinned release image")
+          print(f"{descriptor['architecture']}\t{descriptor['image']}")
+          PY
+          )
+          test -n "$RELEASE_PLATFORM"
+          test -n "$RELEASE_IMAGE"
+          CACHE_DIR="$RUNNER_TEMP/mercury-release-runtime-smoke-cache"
+          install -d -m 700 "$CACHE_DIR"
+          docker run --rm --platform "$RELEASE_PLATFORM" \
+            --read-only --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777,size=1073741824 \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$CACHE_DIR:/release-uv-cache:rw" \
+            --workdir /workspace \
+            --env HOME=/tmp/mercury-home \
+            --env UV_CACHE_DIR=/release-uv-cache \
+            --env UV_PROJECT_ENVIRONMENT=/tmp/mercury-prefetch-venv \
+            --env UV_PYTHON=/usr/local/bin/python3.12 \
+            --env UV_PYTHON_DOWNLOADS=never \
+            "$RELEASE_IMAGE" sh -ceu '
+              release-toolchain/uv-linux-x86_64 sync \
+                --frozen --no-dev --no-install-project --no-build
+            '
+          chmod -R a-w "$CACHE_DIR"
+          docker run --rm --platform "$RELEASE_PLATFORM" \
+            --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777,size=1073741824 \
+            --tmpfs "/release-runtime:rw,exec,nosuid,nodev,mode=0700,uid=$(id -u),gid=$(id -g),size=1073741824" \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$CACHE_DIR:/release-uv-cache:ro" \
+            --workdir /workspace \
+            --env HOME=/release-runtime/home \
+            --env TMPDIR=/release-runtime/tmp \
+            --env UV_CACHE_DIR=/release-runtime/uv-cache \
+            --env UV_PROJECT_ENVIRONMENT=/release-runtime/mercury-venv \
+            --env UV_PYTHON=/usr/local/bin/python3.12 \
+            --env UV_PYTHON_DOWNLOADS=never \
+            "$RELEASE_IMAGE" sh -ceu '
+              TMP_MOUNT_OPTIONS="$(awk '\''$2 == "/tmp" { print $4 }'\'' /proc/mounts)"
+              RUNTIME_MOUNT_OPTIONS="$(awk '\''$2 == "/release-runtime" { print $4 }'\'' /proc/mounts)"
+              case ",$TMP_MOUNT_OPTIONS," in
+                *,noexec,*) ;;
+                *) echo "release runtime smoke: /tmp must be noexec" >&2; exit 64 ;;
+              esac
+              case ",$RUNTIME_MOUNT_OPTIONS," in
+                *,noexec,*) echo "release runtime smoke: dedicated mount must be executable" >&2; exit 64 ;;
+                *) ;;
+              esac
+              test "$(stat -c '\''%u:%g:%a'\'' /release-runtime)" = "$(id -u):$(id -g):700"
+              install -d -m 700 "$HOME" "$TMPDIR"
+              cp -a /release-uv-cache "$UV_CACHE_DIR"
+              chmod -R u+w "$UV_CACHE_DIR"
+              release-toolchain/uv-linux-x86_64 sync \
+                --offline --frozen --no-dev --no-install-project --no-build
+              PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/workspace/src \
+                /release-runtime/mercury-venv/bin/python -c '\''
+          import pathlib
+          import sys
+          import tempfile
+          from pydantic_core import _pydantic_core
+
+          runtime = pathlib.Path("/release-runtime/mercury-venv")
+          if pathlib.Path(sys.executable).as_posix() != str(runtime / "bin/python"):
+              raise SystemExit("release runtime smoke: unexpected interpreter path")
+          if not pathlib.Path(_pydantic_core.__file__).resolve().is_relative_to(runtime):
+              raise SystemExit("release runtime smoke: native module escaped candidate runtime")
+          if tempfile.gettempdir() != "/release-runtime/tmp":
+              raise SystemExit("release runtime smoke: unexpected temporary directory")
+          '\''
+            '
+
   test:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
