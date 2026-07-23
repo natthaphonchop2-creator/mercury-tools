@@ -351,17 +351,18 @@ jobs:
         run: uv sync --frozen --no-dev
       - name: Decode untrusted sanitized attestation gzip transport
         env:
-          ATTESTATION_GZIP_B64: ${{ inputs.release_control_attestation_gzip_b64 }}
           EXPECTED_PAYLOAD_SHA256: ${{ inputs.release_control_attestation_payload_sha256 }}
         run: |
           set -euo pipefail
-          test -n "$ATTESTATION_GZIP_B64"
-          test "${#ATTESTATION_GZIP_B64}" -le 60000
+          test -r "$GITHUB_EVENT_PATH"
           OUTPUT_ROOT="$RUNNER_TEMP/relayed-release-control"
           install -d -m 700 "$OUTPUT_ROOT"
           umask 077
           ATTESTATION="$OUTPUT_ROOT/trusted-hosted-attestation.json"
-          printf '%s' "$ATTESTATION_GZIP_B64" \
+          jq --exit-status --join-output '
+            .inputs.release_control_attestation_gzip_b64
+            | select(type == "string" and length > 0 and length <= 60000)
+          ' "$GITHUB_EVENT_PATH" \
             | uv run python -m mercury_tools.release.relay \
               --output "$ATTESTATION" \
               --expected-sha256 "$EXPECTED_PAYLOAD_SHA256" \
