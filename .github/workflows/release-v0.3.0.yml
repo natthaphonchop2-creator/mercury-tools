@@ -599,10 +599,14 @@ jobs:
               cp -a /release-uv-cache /tmp/uv-cache
               chmod -R u+w /tmp/uv-cache
               export PATH="/release-bin:$PATH"
-              release-toolchain/uv-linux-x86_64 run --offline --frozen --no-dev python \
+              release-toolchain/uv-linux-x86_64 sync \
+                --offline --frozen --no-dev --no-install-project --no-build
+              PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/workspace/src \
+                /tmp/mercury-venv/bin/python \
                 scripts/build_release_artifacts.py --version 0.3.0 \
                 --output /release-output/artifacts
-              release-toolchain/uv-linux-x86_64 run --offline --frozen --no-dev python \
+              PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/workspace/src \
+                /tmp/mercury-venv/bin/python \
                 scripts/verify_release.py --version 0.3.0 \
                 --artifacts /release-output/artifacts
             '
