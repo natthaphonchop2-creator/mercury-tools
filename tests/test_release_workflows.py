@@ -737,7 +737,19 @@ def test_mercury_release_jobs_never_receive_production_provider_credentials() ->
     assert "release_control_attestation_gzip_b64" in trusted_serialized
     assert "release_control_attestation_b64" not in trusted_serialized
     assert "python -m mercury_tools.release.relay" in _run_text(trusted)
-    assert 'test "${#ATTESTATION_GZIP_B64}" -le 60000' in _run_text(trusted)
+    decode = next(
+        step
+        for step in trusted["steps"]
+        if step.get("name") == "Decode untrusted sanitized attestation gzip transport"
+    )
+    assert decode.get("env") == {
+        "EXPECTED_PAYLOAD_SHA256": (
+            "${{ inputs.release_control_attestation_payload_sha256 }}"
+        )
+    }
+    assert "${{" not in decode["run"]
+    assert "GITHUB_EVENT_PATH" in _run_text(trusted)
+    assert ".inputs.release_control_attestation_gzip_b64" in _run_text(trusted)
     assert "--max-compressed-bytes 45000" in _run_text(trusted)
     assert "--max-output-bytes 1048576" in _run_text(trusted)
     assert jobs["build-artifacts"]["needs"] == "relayed-release-control"
@@ -760,12 +772,18 @@ def test_release_relay_gzip_transport_uses_bounded_verified_decoder() -> None:
 
     assert "release_control_attestation_gzip_b64" in dispatch_inputs
     assert "release_control_attestation_b64" not in dispatch_inputs
-    assert decode["env"]["ATTESTATION_GZIP_B64"] == (
-        "${{ inputs.release_control_attestation_gzip_b64 }}"
-    )
+    assert decode.get("env") == {
+        "EXPECTED_PAYLOAD_SHA256": (
+            "${{ inputs.release_control_attestation_payload_sha256 }}"
+        )
+    }
 
     command = decode["run"]
-    assert 'test "${#ATTESTATION_GZIP_B64}" -le 60000' in command
+    assert "${{" not in command
+    assert "GITHUB_EVENT_PATH" in command
+    assert ".inputs.release_control_attestation_gzip_b64" in command
+    assert "length <= 60000" in command
+    assert "jq --exit-status --join-output" in command
     assert "python -m mercury_tools.release.relay" in command
     assert '--expected-sha256 "$EXPECTED_PAYLOAD_SHA256"' in command
     assert '--max-encoded-chars 60000' in command
