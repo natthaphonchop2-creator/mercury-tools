@@ -96,11 +96,15 @@ def test_bundled_provider_setup_skills_use_hosted_connector_lifecycle() -> None:
         markdown = skill_markdown(skill_name)
 
         assert markdown is not None
+        assert "create_public_workspace" in markdown
         assert "list_connectors" in markdown
         assert "get_connector_setup" in markdown
         assert "link_connector_profile" in markdown
+        assert "validate_connector_connection" in markdown
         assert "connector_status" in markdown
         assert "connector_capabilities" in markdown
+        assert "workspace_id" in markdown
+        assert "keep it private" in markdown
         assert LOCAL_API_DRIVER_COMMANDS.isdisjoint(markdown)
 
 
@@ -109,6 +113,7 @@ def test_generic_setup_guide_uses_the_hosted_lifecycle_and_local_handoff_boundar
 
     assert markdown is not None
     lifecycle = (
+        "create_public_workspace",
         "list_connectors",
         "get_connector_setup",
         "link_connector_profile",
@@ -122,7 +127,8 @@ def test_generic_setup_guide_uses_the_hosted_lifecycle_and_local_handoff_boundar
     assert "docs/ADVANCED_LOCAL_ERP.md" in markdown
     assert LOCAL_API_DRIVER_COMMANDS.isdisjoint(markdown)
     assert "mercury credentials" not in markdown
-    assert "workspace_id" not in markdown
+    assert "workspace_id" in markdown
+    assert "keep it private" in markdown
 
 
 def test_bundled_journal_skill_returns_advanced_local_handoff_for_writes() -> None:

@@ -1571,6 +1571,11 @@ class SupabaseProductStore:
             "status": "ok",
             "public_mode": True,
             "workspace_id": workspace_id,
+            "workspace_access": {
+                "handling": "keep_private",
+                "expires_at": utc_from_epoch(int(token_payload["exp"])),
+            },
+            "next_tool": "list_connectors",
             "workspace": workspace,
         }
 

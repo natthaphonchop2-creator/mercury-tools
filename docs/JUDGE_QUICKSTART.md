@@ -33,7 +33,7 @@ Use only hosted connector-lifecycle tools. This does not collect or transmit
 ERP credentials:
 
 ```bash
-codex exec 'Use only the mercury-finance MCP. Call list_connectors, select one documented connector mode and environment, then call get_connector_setup and connector_status. Report only factual readiness, required setup, and the next safe action. Do not ask for or accept credentials, do not invoke a local ERP action, and do not execute an ERP mutation.'
+codex exec 'Use only the mercury-finance MCP. Call create_public_workspace if there is no current workspace, keep the returned workspace_id private, call list_connectors, select one documented connector mode and environment, then call get_connector_setup and connector_status. Report only host/local-attested readiness, required setup, and the next safe action. Do not ask for or accept credentials, do not invoke a local ERP action, and do not execute an ERP mutation.'
 ```
 
 Expected behavior: Mercury returns connector-neutral setup and readiness

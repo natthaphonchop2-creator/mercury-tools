@@ -1605,6 +1605,8 @@ def test_connector_status_returns_workspace_scoped_sanitized_profiles(
 
     assert payload["status"] == "ok"
     assert payload["setup_required"] is False
+    assert payload["readiness_basis"] == "local_runtime_attested"
+    assert payload["provider_called_by_mercury"] is False
     assert payload["active_connector"]["connector_id"] == "flowaccount"
     assert payload["connector_profiles"][0]["status"] == "ready_read_only"
     assert "'server_vault':" not in str(payload)
@@ -1643,8 +1645,31 @@ def test_connector_status_requires_setup_without_ready_profile(
     assert payload["status"] == "requires_setup"
     assert payload["reason"] == "not_validated"
     assert payload["setup_required"] is True
-    assert payload["next_tool"] == "link_connector_profile"
+    assert payload["next_tool"] == "validate_connector_connection"
     assert payload["next_skill"] == "connector-credential-setup-th"
+
+
+def test_connector_status_links_profile_when_workspace_has_no_profile(
+    monkeypatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    configure_product_env(monkeypatch)
+
+    class FakeStore:
+        def public_dashboard(self, workspace_id):
+            return {
+                "workspace": {"name": "Demo Co"},
+                "connector_profiles": [],
+            }
+
+    monkeypatch.setattr(server, "_product_store", lambda settings=None: FakeStore())
+
+    payload = server.connector_status(workspace_id=make_workspace_id())
+
+    assert payload["status"] == "requires_setup"
+    assert payload["setup_required"] is True
+    assert payload["next_tool"] == "link_connector_profile"
 
 
 def test_run_workspace_flow_requires_ready_connector(monkeypatch) -> None:
