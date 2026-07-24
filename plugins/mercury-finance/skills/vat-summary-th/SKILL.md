@@ -13,26 +13,15 @@ description: Use when the user asks for Thai VAT output tax, input tax, filing c
    same Skill ID and validated inputs.
 3. If the route returns `connector_selection_required`, ask the user to choose one exact
    `connector_id`, `connection_mode`, and `environment` tuple from `choices`, then rerun.
-4. Stop on any unavailable or setup status. Execute exactly one route branch below. Do not
-   continue into another route branch.
+4. Stop on any unavailable or setup status. Continue only when the route returns
+   `status=ready`.
 
-## Route branches
+## Connected provider execution
 
-### `native_mcp`
-
-Use only the returned `invoke_provider_capability` steps in `ordered_steps`, in order,
-through the exact provider MCP tools and server named by `host_tool_requirements`. Run
-optional steps only when they are returned with `required=false`.
-
-### `api_driver`
-
-Use only the returned `advanced_local_handoff` step in `ordered_steps` and the local
-Mercury tools named by that step. Do not invoke a provider MCP or a bridge in this branch.
-
-### `local_bridge_required`
-
-Stop without running data-access commands, report the bridge/setup requirement, and wait for setup
-to complete before rerouting. Do not fall through to either ready branch.
+Use only the returned `invoke_connected_provider_capability` steps, in order. The host
+must invoke the exact separately connected ERP/provider capability described by
+`host_tool_requirements`; Mercury never receives the provider credential. Run optional
+steps only when they are returned with `required=false`.
 
 ## Evidence and result
 

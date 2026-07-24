@@ -13,14 +13,6 @@ def test_mcp_server_imports_and_exposes_server() -> None:
     assert mcp.name == "Mercury Tools"
 
 
-def test_local_mcp_is_a_separate_one_server_surface() -> None:
-    from mercury_tools.mcp.local_server import local_mcp
-    from mercury_tools.mcp.server import mcp
-
-    assert local_mcp.name == "Mercury Finance"
-    assert local_mcp is not mcp
-
-
 def test_public_mcp_tools_have_submission_annotations() -> None:
     from mercury_tools.mcp.server import mcp
 

@@ -1,99 +1,93 @@
 # Mercury Tools
 
-Mercury Finance is an Accounting and ERP connector platform for cited accounting
-knowledge, connector discovery, workspace readiness, and portable accounting Skills.
+Mercury Finance is one hosted MCP and Codex plugin for accounting knowledge, ERP
+connector discovery, workspace readiness, and reusable finance workflows. It uses the
+LLM already provided by Codex or another MCP host; users do not need an OpenAI API key,
+Python, Supabase credentials, or a local Mercury server.
+
 Mercury Tools is an independent open-source project and is not affiliated with Mercury
 Technologies, Inc.
 
-## Installation
+## Install the Codex plugin
 
-### 1. Marketplace one-click plugin
+Run this single command:
 
-Install **Mercury Finance** from the Codex marketplace. The public plugin registers one
-hosted Mercury MCP and needs no repository clone, Python or uv installation, Supabase
-configuration, Mercury Owner Token, or ERP secret.
+```bash
+codex plugin marketplace add natthaphonchop2-creator/mercury-tools --ref v0.3.1 \
+  && codex plugin add mercury-finance@mercury-tools
+```
 
-The installed server is `mercury-finance`, with the note **Mercury Accounting and ERP
-connector platform.** It exposes exactly 24 hosted tools.
+Restart the ChatGPT desktop app, open a new task, and select **Mercury Finance**. The
+plugin installs one remote server named `mercury-finance` and requires no authentication.
 
-### 2. Hosted MCP URL fallback
+Example requests:
 
-When marketplace installation is unavailable, add this hosted endpoint in the MCP host:
+- `Use Mercury Finance to prepare a Thai VAT context pack.`
+- `List the ERP connectors Mercury knows and show the setup steps for PEAK.`
+- `Create a Mercury workspace and prepare a company health review.`
+- `Plan a reconciliation using Mercury and my connected spreadsheet tools.`
+
+## Hosted MCP
+
+Hosts that support Streamable HTTP can connect directly:
 
 ```text
 https://mercury-tools-mcp.onrender.com/mcp
 ```
 
-Use HTTP transport. The hosted endpoint has no token, headers, environment variables, or
-local launch command in its public configuration.
+The public configuration has no bearer token, custom headers, environment variables, or
+local launch command. The service exposes 24 hosted tools in five groups:
 
-### 3. GitHub development install
+- cited accounting and ERP knowledge
+- public workspace state
+- connector catalog, setup, status, and capability routing
+- accounting Skill catalog and Skill plans
+- Mercury Flow validation, execution planning, and saved flows
 
-For repository development, clone the source and install development dependencies:
+## Connector model
+
+Mercury is connector-neutral. It can describe FlowAccount, PEAK, Express, and custom ERP
+interfaces from reviewed catalog and RAG sources. Provider authorization remains with the
+ERP or MCP host. Mercury stores only sanitized connector profile metadata and evidence
+references; it does not accept ERP credentials in chat or store raw provider tokens.
+
+When an authorized ERP or productivity provider is already connected to the host, Mercury
+returns the ordered capabilities and evidence requirements that the host should use.
+Catalog presence alone is not a claim that a provider endpoint is currently available.
+
+## Development
 
 ```bash
 git clone https://github.com/natthaphonchop2-creator/mercury-tools.git
 cd mercury-tools
 uv sync --extra dev
 uv run ruff check .
-uv run pytest -q tests/test_plugin_package.py tests/test_plugin_clean_install.py
+uv run pytest -q
+uv run python scripts/review_mcp_contract.py
+uv run python scripts/validate_plugin.py
 ```
 
-This development path does not alter the one-click hosted plugin contract.
-
-### 4. Advanced local API-driver / Local Bridge setup
-
-Reviewed API-driver reads and approval-gated ERP mutations, plus Local Bridge work, use a
-separately connected local Mercury MCP. It is never auto-registered next to the hosted
-server because duplicate Mercury tool names would make routing ambiguous. The advanced-local
-server exposes exactly 20 tools.
-
-Start the advanced server only after reviewing
-[LOCAL_CREDENTIALS.md](docs/LOCAL_CREDENTIALS.md) and
-[ADVANCED_LOCAL_ERP.md](docs/ADVANCED_LOCAL_ERP.md):
+Run the MCP locally when developing server changes:
 
 ```bash
-mercury mcp serve-local
+uv run mercury-tools mcp serve --transport streamable-http --allow-unauthenticated
 ```
 
-## Connect a system
+Useful references:
 
-1. Call `create_public_workspace` once when no current workspace exists. Reuse its
-   `workspace_id` for the remaining steps and keep it private; it is an expiring access
-   handle for that workspace.
-2. Use `list_connectors` to choose one connector, mode, and environment.
-3. Use `get_connector_setup`, then complete provider or host authorization outside
-   Mercury.
-4. Use `link_connector_profile` with sanitized profile details only.
-5. After the host or separately connected local runtime performs the documented safe
-   probe, record only its sanitized result with `validate_connector_connection`.
-6. Use `connector_status` and `connector_capabilities` to confirm host/local-attested
-   readiness.
+- [Connector catalog](docs/CONNECTOR_CATALOG.md)
+- [Action catalog](docs/ACTION_CATALOG.md)
+- [Remote deployment](docs/REMOTE_DEPLOYMENT.md)
+- [Judge quickstart](docs/JUDGE_QUICKSTART.md)
 
-The hosted product never receives ERP credentials or raw provider payloads. For a
-reviewed API-driver write, Mercury returns an advanced-local handoff instead of invoking
-the local runtime. A ready status means the host or local runtime supplied matching,
-catalog-bound evidence; it does not mean the hosted Mercury server called the ERP itself.
+## Release
 
-## Connector catalog
+The active release path is deliberately small:
 
-[CONNECTOR_CATALOG.md](docs/CONNECTOR_CATALOG.md) lists supported connector families,
-connection modes, ownership boundaries, attested readiness, capability states, and review
-dates. Catalog presence is not a claim of live production support.
+1. CI runs lint, tests, MCP contract review, plugin validation, and package build.
+2. Render deploys `main`.
+3. A semantic version tag such as `v0.3.1` triggers the GitHub release workflow.
+4. The release workflow packages the Python distribution and Codex plugin archive.
 
-## Safety boundaries
-
-- Hosted profiles contain only sanitized metadata and evidence references.
-- Provider OAuth sessions remain owned by the MCP host or provider.
-- Local API-driver credentials are entered only through the hidden terminal prompt in
-  [LOCAL_CREDENTIALS.md](docs/LOCAL_CREDENTIALS.md).
-- Advanced mutations require immutable preparation, one immutable approval, payload
-  binding, audit logging, and no replay after an unknown outcome.
-
-## Development checks
-
-```bash
-uv run ruff check .
-uv run pytest -q tests/test_plugin_package.py tests/test_plugin_clean_install.py
-uv run python scripts/validate_release_plugin.py
-```
+The release path is intentionally limited to CI, package build, secret scan, Hosted MCP
+smoke, and a GitHub release.

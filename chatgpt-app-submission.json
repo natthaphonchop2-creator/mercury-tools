@@ -4,7 +4,7 @@
   "app_info": {
     "display_name": "Mercury Finance",
     "subtitle": "Connector-neutral accounting and ERP context",
-    "description": "Mercury Finance is a connector-neutral hosted core for cited accounting knowledge, sanitized connector profiles, portable Skills, capability routing, and controlled flow plans. The hosted core stores sanitized connector profile and audit metadata but no ERP credentials. Native provider OAuth stays with the host/provider; advanced local reviewed drivers may execute eligible ERP actions only after host approval and local validation.",
+    "description": "Mercury Finance is one hosted MCP for cited accounting knowledge, sanitized ERP connector profiles, portable Skills, capability routing, and controlled flow plans. It stores no ERP credentials. Provider authorization and provider calls remain with the user's connected MCP host or ERP integration.",
     "category": "FINANCE"
   },
   "tools": {
@@ -316,7 +316,7 @@
       "user_prompt": "Set up PEAK through its reviewed API driver without putting any credential in this chat.",
       "file_attachment_urls": null,
       "tools_triggered": "list_connectors, get_connector_setup, link_connector_profile, validate_connector_connection, connector_status",
-      "expected_output": "Returns a secure advanced-local handoff and stores only sanitized evidence after local validation.",
+      "expected_output": "Returns the exact connected-provider requirements and stores only sanitized evidence after host-side validation.",
       "expected_output_url": null
     },
     {

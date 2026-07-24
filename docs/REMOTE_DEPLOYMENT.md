@@ -1,48 +1,24 @@
-# Mercury Tools Hosted HTTP Deployment
+# Mercury Hosted MCP Deployment
 
-The Render service is the hosted Mercury MCP used by the public Mercury Finance
-plugin. It does not replace the separately connected advanced-local Mercury
-runtime.
+The Render service is the single MCP used by the Mercury Finance plugin.
 
-Cloud stores catalog, RAG, and audit metadata only. ERP credentials remain repository-local and never enter Render, Supabase, hosted workspace records, MCP arguments, or hosted tool results.
+## Public endpoints
 
-## Public Endpoints
+- Service: `https://mercury-tools-mcp.onrender.com`
+- Health: `https://mercury-tools-mcp.onrender.com/healthz`
+- Status: `https://mercury-tools-mcp.onrender.com/api/status`
+- MCP: `https://mercury-tools-mcp.onrender.com/mcp`
+- Privacy: `https://mercury-tools-mcp.onrender.com/privacy`
+- Terms: `https://mercury-tools-mcp.onrender.com/terms`
+- Support: `https://mercury-tools-mcp.onrender.com/support`
 
-- Base URL: `https://mercury-tools-mcp.onrender.com`
-- Mandatory health check: `https://mercury-tools-mcp.onrender.com/healthz`
-- Deployment status: `https://mercury-tools-mcp.onrender.com/api/status`
-- Streamable HTTP MCP: `https://mercury-tools-mcp.onrender.com/mcp`
+The MCP uses Streamable HTTP and exposes 24 hosted tools. Public clients do not
+provide a Mercury token, Supabase key, custom header, environment variable, or local
+launch command.
 
-The hosted endpoint exposes 24 tools for catalog, cited knowledge, connector
-lifecycle, accounting skills, flow validation, and public workspace metadata.
-It has no ERP credential schema and no arbitrary ERP write surface. The
-advanced-local Mercury MCP with 20 tools is connected separately and owns
-reviewed ERP execution.
+## Render configuration
 
-## Supabase Boundary
-
-Apply every tracked migration in `supabase/migrations/` in lexical order. The
-release gate specifically verifies the validation-knowledge migration, RAG
-filters, reconciliation skill catalog, batch resolver, and the migration that
-removes obsolete Cloud ERP secret storage.
-
-Supabase may contain only:
-
-- immutable ERP action catalog and version metadata;
-- approved, sanitized endpoint validation knowledge;
-- RAG documents, chunks, citations, and search indexes;
-- public skill and flow metadata;
-- redacted audit metadata that contains no credential or ERP payload value.
-
-RLS revokes direct validation-table access from `public`, `anon`, and
-`authenticated`. Server-side publication uses the service role. ERP request
-bodies, local request state, confirmations, credentials, and the local audit
-ledger stay under the operator's repository.
-
-## Render Settings
-
-Deploy the reviewed commit using `render.yaml`, then set only the server-side
-values required by the hosted metadata surface:
+Deploy `main` using `render.yaml` and configure these server-side values:
 
 ```text
 SUPABASE_URL
@@ -53,56 +29,29 @@ MERCURY_TOOLS_HTTP_REQUIRE_AUTH=false
 MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API=false
 ```
 
-Render supplies `RENDER_GIT_COMMIT`; `/api/status` uses that native exact commit
-when `MERCURY_DEPLOYMENT_COMMIT` is unset or empty.
-`MERCURY_DEPLOYMENT_COMMIT` is an optional explicit override for non-Render
-deployments. A nonempty override always takes
-precedence, and an invalid override fails closed instead of falling through to
-`RENDER_GIT_COMMIT`. Both values must be a lowercase 40-character Git SHA.
-Neither value is inferred from the filesystem or a mutable branch. Do not add
-FlowAccount, PEAK, or imported ERP credentials to the Render environment.
+Do not add FlowAccount, PEAK, Express, or custom ERP credentials to Render. Provider
+authorization remains with the ERP or MCP host.
 
-## Catalog And RAG Ingestion
+## Supabase boundary
 
-With Supabase settings available only to the operator process, ingest the
-curated wiki and publish only a complete reviewed validation report:
+Supabase stores:
 
-```bash
-uv run mercury ingest wiki --path ./wiki
-uv run python scripts/review_validation_knowledge.py \
-  --input release-evidence/flowaccount-qualification.json \
-  --input release-evidence/peak-contract-validation.json \
-  --reviewer-role release_reviewer \
-  --output release-evidence/approved-validation.json
-uv run python scripts/publish_validation_knowledge.py \
-  --input release-evidence/approved-validation.json \
-  --reviewer-role release_reviewer \
-  --ingest-rag
-uv run mercury search "FlowAccount invoice endpoint" --json
-uv run mercury search "PEAK invoice endpoint" --json
-```
+- reviewed knowledge sources, documents, chunks, and citations
+- connector catalog and sanitized capability evidence
+- public workspace, Skill, and Flow metadata
+- redacted MCP audit metadata
 
-Results must preserve connector routing and include citations. Published
-validation rows must already be reviewed and sanitized; raw provider traffic is
-not an ingestion input. Release-control independently requires exactly 190
-FlowAccount and 64 PEAK approved validation identities, one reviewed validation
-document and chunk per identity, and connector-bound cited retrieval through the
-hosted MCP for both providers.
+It must not store ERP API keys, OAuth tokens, passwords, raw provider payloads, tax IDs,
+or personal contact data.
 
-## Release Verification
+## Deploy and verify
 
-The release verifier requires `/healthz` independently of `/api/status` and
-compares both requested identity values exactly:
+Render deploys automatically after `main` changes. Verify the public service with:
 
 ```bash
-export REVIEWED_MAIN_SHA='<40-character-lowercase-reviewed-git-commit>'
-export RENDER_OWNER_ID='<Render workspace owner ID>'
-uv run python scripts/verify_render_release.py \
-  --url https://mercury-tools-mcp.onrender.com \
-  --version 0.3.0 \
-  --commit "$REVIEWED_MAIN_SHA"
+curl --fail https://mercury-tools-mcp.onrender.com/healthz
+uv run python scripts/smoke_hosted_plugin.py --remote-only
 ```
 
-The command fails unless health, exact package version, exact deployment
-commit, MCP initialize/list, 254-action catalog, cited RAG retrieval, hosted
-read-only boundary, and Render build/runtime log scans all pass.
+The smoke test initializes MCP, lists the exact hosted tool surface, and executes safe
+read-only calls.

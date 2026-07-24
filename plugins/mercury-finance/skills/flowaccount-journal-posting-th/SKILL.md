@@ -16,25 +16,13 @@ Use the hosted connector lifecycle and Skill routing before handling a journal r
    journal date, unique reference, description, and at least two balanced debit/credit
    lines. Stop when an account is missing or ambiguous, and never infer a balancing line.
 
-## API-Driver Write Handoff
+## Provider Execution
 
-For a reviewed API-driver journal mutation, return `advanced_local_handoff` rather than
-calling a local ERP action from this public Skill. Direct the user to
-the local credential guide and `docs/ADVANCED_LOCAL_ERP.md`, and require a separately connected local Mercury MCP before continuing. The hosted plugin does not own ERP credentials or execute local mutations.
+Prepare a balanced journal proposal and show the exact date, reference, description,
+accounts, debit, credit, and evidence before any provider call. The host must request
+explicit user confirmation before invoking a connected provider write capability.
+Mercury does not receive provider credentials.
 
-The advanced-local handoff must use this input shape, without sending it to the hosted
-plugin:
-
-```yaml
-action_id: reviewed-action-id
-inputs:
-  json_object: '{"body":{"reference":"EXAMPLE-001"}}'
-```
-
-`json_object` is the only `inputs` property. It contains one UTF-8 JSON object and must
-not contain credentials.
-
-The advanced local guide defines the immutable preparation, one approval, class-specific
-execution, expiry, redaction, audit, and no-replay requirements. On connector,
-authorization, validation, or accounting-context failure, stop and return only sanitized
-remediation. Respond in concise Thai.
+If the host has no authorized provider capability for the selected environment, return
+`provider_connection_required` and stop. On connector, authorization, validation, or
+accounting-context failure, return only sanitized remediation. Respond in concise Thai.

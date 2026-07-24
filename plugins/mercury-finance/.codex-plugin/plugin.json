@@ -1,7 +1,7 @@
 {
   "name": "mercury-finance",
-  "version": "0.3.0+codex.20260719",
-  "description": "Mercury Accounting and ERP connector platform.",
+  "version": "0.3.1",
+  "description": "Hosted accounting knowledge, ERP connector discovery, and finance workflows.",
   "author": {
     "name": "Mercury Agent",
     "url": "https://github.com/natthaphonchop2-creator/mercury-tools"
@@ -20,8 +20,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Mercury Finance",
-    "shortDescription": "Mercury Accounting and ERP connector platform.",
-    "longDescription": "Mercury Accounting and ERP connector platform provides hosted connector discovery, workspace readiness, cited accounting knowledge, and portable accounting Skills. Advanced API-driver and Local Bridge execution stays separately connected. Mercury Tools is an independent open-source project and is not affiliated with Mercury Technologies, Inc.",
+    "shortDescription": "Accounting knowledge, ERP connectors, and finance workflows.",
+    "longDescription": "Mercury Finance connects Codex to one hosted MCP for cited accounting knowledge, connector discovery, workspace readiness, and reusable finance workflows. Install once with no local server, Python runtime, Supabase key, or Mercury token. Mercury Tools is an independent open-source project and is not affiliated with Mercury Technologies, Inc.",
     "developerName": "Mercury Agent",
     "category": "Finance",
     "capabilities": [
@@ -29,13 +29,17 @@
       "Read",
       "Write"
     ],
-    "websiteURL": "https://github.com/natthaphonchop2-creator/mercury-tools",
+    "websiteURL": "https://mercury-tools-mcp.onrender.com/",
+    "privacyPolicyURL": "https://mercury-tools-mcp.onrender.com/privacy",
+    "termsOfServiceURL": "https://mercury-tools-mcp.onrender.com/terms",
     "defaultPrompt": [
       "Connect an accounting or ERP system",
       "Check which accounting capabilities are ready for this workspace",
       "Prepare an evidence-backed company health review",
       "Plan a reconciliation using my connected ERP and spreadsheet tools"
     ],
-    "brandColor": "#42C6BB"
+    "brandColor": "#42C6BB",
+    "composerIcon": "./assets/mercury-finance-logo.png",
+    "logo": "./assets/mercury-finance-logo.png"
   }
 }

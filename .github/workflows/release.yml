@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081
+        with:
+          version: 0.11.9
+
+      - name: Install and validate
+        run: |
+          uv sync --extra dev --frozen
+          uv run ruff check .
+          uv run pytest -q --ignore=tests/integration
+          uv run python scripts/review_mcp_contract.py
+          uv run python scripts/validate_plugin.py
+
+      - name: Verify tag matches package
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          uv run python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          if os.environ["RELEASE_TAG"] != f"v{version}":
+              raise SystemExit("release tag does not match project version")
+          PY
+
+      - name: Build release artifacts
+        run: |
+          uv build --wheel --sdist --out-dir dist
+          cd plugins/mercury-finance
+          zip -qr "../../dist/mercury-finance-plugin-${GITHUB_REF_NAME#v}.zip" .
+
+      - name: Scan release source and artifacts
+        env:
+          GITLEAKS_URL: https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz
+          GITLEAKS_SHA256: 9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c
+        run: |
+          curl --fail --location --silent --show-error "$GITLEAKS_URL" --output /tmp/gitleaks.tar.gz
+          printf '%s  %s\n' "$GITLEAKS_SHA256" /tmp/gitleaks.tar.gz | sha256sum --check
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          chmod 0555 /tmp/gitleaks
+          /tmp/gitleaks git --config .gitleaks.toml --no-banner --redact --exit-code 1 --log-opts="--all" .
+          mkdir -p /tmp/mercury-release-scan/wheel /tmp/mercury-release-scan/sdist
+          unzip -q dist/*.whl -d /tmp/mercury-release-scan/wheel
+          tar -xzf dist/*.tar.gz -C /tmp/mercury-release-scan/sdist
+          unzip -q dist/mercury-finance-plugin-*.zip -d /tmp/mercury-release-scan/plugin
+          (
+            cd /tmp/mercury-release-scan
+            /tmp/gitleaks dir --config "$GITHUB_WORKSPACE/.gitleaks.toml" \
+              --no-banner --redact --exit-code 1 .
+          )
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Mercury Finance $GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag

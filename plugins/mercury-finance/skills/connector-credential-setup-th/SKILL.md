@@ -1,6 +1,6 @@
 ---
 name: connector-credential-setup-th
-description: Use when an accounting or ERP task is blocked because local connector credentials are not ready
+description: Use when an accounting or ERP task is blocked because provider authorization is not ready
 ---
 
 # Connector Credential Setup TH
@@ -17,9 +17,9 @@ Use the hosted connector lifecycle without skipping or reordering:
 4. After the user has completed the provider or host authorization outside Mercury,
    call `link_connector_profile` with only the sanitized connector selection and profile
    details required by the hosted tool.
-5. After the host or separately connected local runtime performs the documented safe
-   probe, call `validate_connector_connection` with only its sanitized evidence for the
-   same connector, mode, and environment.
+5. After the MCP host or ERP provider performs the documented safe probe, call
+   `validate_connector_connection` with only its sanitized evidence for the same
+   connector, mode, and environment.
 6. Call `connector_status` for the workspace. Stop on `not_ready`,
    `environment_mismatch`, or a setup requirement.
 7. Call `connector_capabilities` for the selected connector, mode, and environment.
@@ -27,7 +27,6 @@ Use the hosted connector lifecycle without skipping or reordering:
    Never imply that hosted Mercury called the ERP when
    `provider_called_by_mercury` is false.
 
-For an API-driver or Local Bridge requirement, return the advanced-local handoff to the
-local credential guide and `docs/ADVANCED_LOCAL_ERP.md`. The hosted plugin does not
-receive, store, or test ERP credentials and it must never invoke local execution tools.
-Never ask for, accept, or paste credentials in chat. Respond in concise Thai.
+The hosted plugin does not receive, store, or test ERP credentials. When the selected
+provider cannot be authorized by the host, report `provider_connection_required` and
+stop. Never ask for, accept, or paste credentials in chat. Respond in concise Thai.

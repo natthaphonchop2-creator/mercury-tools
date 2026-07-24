@@ -56,11 +56,10 @@ def test_submission_listing_uses_public_mcp_without_custom_ui() -> None:
             listing["data_handling_summary"],
         )
     ).lower()
-    assert "connector-neutral hosted core" in boundary
+    assert "one hosted mcp" in boundary
     assert "sanitized connector profile and audit metadata" in boundary
     assert "no erp credentials" in boundary
-    assert "advanced local reviewed drivers" in boundary
-    assert "host approval" in boundary
+    assert "connected mcp host or erp integration" in boundary
 
 
 def test_chatgpt_submission_describes_the_same_connector_neutral_boundary() -> None:
@@ -69,11 +68,10 @@ def test_chatgpt_submission_describes_the_same_connector_neutral_boundary() -> N
     )
     description = submission["app_info"]["description"].lower()
 
-    assert "connector-neutral hosted core" in description
-    assert "sanitized connector profile and audit metadata" in description
+    assert "one hosted mcp" in description
+    assert "sanitized erp connector profiles" in description
     assert "no erp credentials" in description
-    assert "advanced local reviewed drivers" in description
-    assert "host approval" in description
+    assert "connected mcp host or erp integration" in description
 
 
 def test_chatgpt_submission_annotations_match_the_hosted_registry() -> None:
@@ -187,7 +185,7 @@ def test_public_submission_skills_only_reference_public_tools() -> None:
     assert all(tool_name not in combined for tool_name in local_only)
     assert "Never pass an API key" in combined
     assert "no ERP credentials" in combined
-    assert "host approval" in normalized
+    assert "user approval" in normalized
 
 
 def test_connector_onboarding_skill_uses_the_exact_public_lifecycle() -> None:
@@ -198,7 +196,7 @@ def test_connector_onboarding_skill_uses_the_exact_public_lifecycle() -> None:
 
     lifecycle = (
         "list_connectors -> get_connector_setup -> link_connector_profile -> "
-        "host/provider OAuth or local handoff -> validate_connector_connection -> "
+        "host/provider authorization -> validate_connector_connection -> "
         "connector_status"
     )
     assert lifecycle in normalized

@@ -3,7 +3,7 @@
   "submission_type": "app-plus-skills",
   "plugin_name": "Mercury Finance",
   "short_description": "Connector-neutral accounting knowledge, profiles, Skills, and finance workflow plans.",
-  "long_description": "Mercury Finance is a connector-neutral hosted core for cited accounting knowledge, sanitized connector profiles, portable Skills, capability routing, and controlled Mercury Flow plans. The hosted core stores sanitized connector profile and audit metadata but no ERP credentials, and it never claims to invoke another provider MCP through the host. Native provider OAuth remains owned by the host/provider. Advanced local reviewed drivers can perform eligible ERP reads or approval-gated actions only after host approval and explicit local validation.",
+  "long_description": "Mercury Finance is one hosted MCP for cited accounting knowledge, sanitized ERP connector profiles, portable Skills, capability routing, and controlled Mercury Flow plans. It stores no ERP credentials and never claims a provider action succeeded without host-observed evidence. Provider OAuth and provider calls remain owned by the user's connected MCP host or ERP integration.",
   "category": "Finance",
   "logo_file": "assets/mercury-finance-logo.png",
   "developer_identity_instruction": "Select the verified individual or business identity from the publishing OpenAI organization.",
@@ -27,6 +27,6 @@
   "recommended_availability": [
     "TH"
   ],
-  "data_handling_summary": "The hosted core stores sanitized connector profile and audit metadata, optional non-sensitive workspace display metadata, immutable Mercury Flow versions, and evidence references. It stores no ERP credentials, OAuth tokens, API keys, personal identifiers, raw provider payloads, or LAN access details. Advanced local reviewed drivers keep credentials in repository-local secure state and may execute only after host approval.",
+  "data_handling_summary": "The hosted core stores sanitized connector profile and audit metadata, optional non-sensitive workspace display metadata, immutable Mercury Flow versions, and evidence references. It stores no ERP credentials, OAuth tokens, API keys, personal identifiers, raw provider payloads, or LAN access details. Provider authorization remains with the user's connected MCP host or ERP integration.",
   "independence_notice": "Mercury Finance is an independent open-source project and is not affiliated with Mercury Technologies, Inc."
 }

@@ -107,7 +107,8 @@ def test_company_health_skill_routes_over_two_provider_profiles(
         "required": True,
         "state": "observed",
     }
-    assert route["ordered_steps"][0]["action"] == "advanced_local_handoff"
+    assert route["ordered_steps"][0]["action"] == "invoke_connected_provider_capability"
+    assert route["host_tool_requirements"][0]["connection_mode"] == "api_driver"
     assert "must-not-leak" not in str(route)
 
 
@@ -260,10 +261,12 @@ def test_native_provider_unavailable_write_does_not_block_unrelated_read_skill()
     assert unavailable["status"] == "unavailable"
     assert unavailable["reason"] == "provider_capability_unavailable"
     assert readable["status"] == "ready"
-    assert readable["ordered_steps"][0]["action"] == "invoke_provider_capability"
+    assert readable["ordered_steps"][0]["action"] == "invoke_connected_provider_capability"
     assert readable["host_tool_requirements"] == [
         {
             "connector_id": "flowaccount",
+            "connection_mode": "native_mcp",
+            "environment": "production",
             "external_server_name": "flowaccount-accounting-mcp",
             "provider_capabilities": ["company.info.read"],
         }
@@ -293,16 +296,16 @@ def test_native_route_preserves_server_case_and_includes_only_observed_optional_
 
     assert route["status"] == "ready"
     assert route["ordered_steps"] == [
-        {
-            "step": 1,
-            "action": "invoke_provider_capability",
+            {
+                "step": 1,
+                "action": "invoke_connected_provider_capability",
             "capability": "company.read",
             "provider_capabilities": ["company.info.read"],
             "required": True,
         },
-        {
-            "step": 2,
-            "action": "invoke_provider_capability",
+            {
+                "step": 2,
+                "action": "invoke_connected_provider_capability",
             "capability": "documents.invoice.list",
             "provider_capabilities": ["documents.invoice.list"],
             "required": False,
@@ -311,6 +314,8 @@ def test_native_route_preserves_server_case_and_includes_only_observed_optional_
     assert route["host_tool_requirements"] == [
         {
             "connector_id": "flowaccount",
+            "connection_mode": "native_mcp",
+            "environment": "production",
             "external_server_name": "FlowAccount-Prod-MCP",
             "provider_capabilities": [
                 "company.info.read",
