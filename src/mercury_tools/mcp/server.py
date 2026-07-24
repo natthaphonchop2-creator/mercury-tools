@@ -2306,8 +2306,8 @@ def run_accounting_skill(
                 "output_schema_name": skill.output_schema_name,
                 "skill_markdown": skill_markdown(skill.skill_id),
                 "note": (
-                    "Mercury returns an ordered host plan. Provider MCP, advanced local "
-                    "API-driver, and Local Bridge execution remain outside this hosted tool."
+                    "Mercury returns an ordered host plan. The MCP host invokes any "
+                    "separately authorized ERP provider or bridge capability."
                 ),
             }
         )

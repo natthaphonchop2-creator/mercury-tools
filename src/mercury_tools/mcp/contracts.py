@@ -32,28 +32,3 @@ HOSTED_TOOL_NAMES = frozenset(
         "save_workspace_flow",
     }
 )
-
-ADVANCED_LOCAL_TOOL_NAMES = frozenset(
-    {
-        "search_knowledge",
-        "retrieve_context_pack",
-        "get_document",
-        "connector_status",
-        "run_accounting_skill",
-        "run_mercury_flow",
-        "list_workspace_flows",
-        "save_workspace_flow",
-        "run_workspace_flow",
-        "search_erp_actions",
-        "get_erp_action_schema",
-        "run_erp_read",
-        "prepare_erp_mutation",
-        "execute_erp_create",
-        "execute_erp_update",
-        "execute_sensitive_erp_action",
-        "get_erp_request_status",
-        "import_erp_spec",
-        "list_connector_drivers",
-        "credential_status",
-    }
-)

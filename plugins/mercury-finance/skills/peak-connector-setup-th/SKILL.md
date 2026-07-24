@@ -1,6 +1,6 @@
 ---
 name: peak-connector-setup-th
-description: Use when a PEAK task needs local connector setup or connection troubleshooting
+description: Use when a PEAK task needs connector setup or connection troubleshooting
 ---
 
 # PEAK Connector Setup TH
@@ -12,21 +12,20 @@ Use the hosted lifecycle for the user-selected PEAK environment:
    public issue, log, or unrelated chat.
 2. Call `list_connectors` and confirm PEAK, its API-driver mode, and one exact
    environment selected by the user.
-3. Call `get_connector_setup` for that selection. Return the non-secret setup result
-   and the advanced-local handoff; do not collect any API-driver values in chat.
+3. Call `get_connector_setup` for that selection. Return only non-secret setup guidance;
+   do not collect API-driver values in chat.
 4. Call `link_connector_profile` only with the sanitized profile selection after the
    required local setup is complete outside Mercury.
-5. After the separately connected local runtime performs the documented safe probe,
-   call `validate_connector_connection` with only its sanitized evidence for the same
-   PEAK mode and environment.
+5. After the host performs the documented safe probe, call
+   `validate_connector_connection` with only its sanitized evidence for the same PEAK
+   mode and environment.
 6. Call `connector_status` for the workspace. Stop when the profile remains unready or
    the environment differs from the selected mode.
 7. Call `connector_capabilities` for PEAK and report the returned attested readiness
    state before planning any action. State the returned readiness basis and never imply
    that hosted Mercury called PEAK when `provider_called_by_mercury` is false.
 
-Reviewed API-driver writes require a separately connected local Mercury MCP. Return
-`advanced_local_handoff` with the local credential guide and
-`docs/ADVANCED_LOCAL_ERP.md`; never invoke local execution tools from this public Skill.
-Never ask for, accept, or paste credentials in chat. Never change environments implicitly.
-Respond in concise Thai.
+Invoke only capabilities exposed by an already connected and authorized PEAK provider in
+the host. If the provider capability is unavailable, report
+`provider_connection_required` and stop. Never ask for, accept, or paste credentials in
+chat. Never change environments implicitly. Respond in concise Thai.

@@ -183,7 +183,7 @@ def _assess_profile(
     }
 
 
-def _native_host_plan(
+def _host_execution_plan(
     assessment: Mapping[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     profile = assessment["profile"]
@@ -196,7 +196,7 @@ def _native_host_plan(
     steps = [
         {
             "step": index,
-            "action": "invoke_provider_capability",
+            "action": "invoke_connected_provider_capability",
             "capability": item["capability"],
             "provider_capabilities": item["provider_capabilities"],
             "required": item["required"],
@@ -206,6 +206,8 @@ def _native_host_plan(
     server_name = _safe_external_server_name(profile.get("external_server_name"))
     requirement = {
         "connector_id": public_profile["connector_id"],
+        "connection_mode": public_profile["connection_mode"],
+        "environment": public_profile["environment"],
         "external_server_name": server_name,
         "provider_capabilities": sorted(
             {
@@ -223,24 +225,7 @@ def _ready_route(
     assessment: Mapping[str, Any],
 ) -> dict[str, Any]:
     public_profile = assessment["public_profile"]
-    if public_profile["connection_mode"] == "native_mcp":
-        ordered_steps, host_tool_requirements = _native_host_plan(assessment)
-    else:
-        ordered_steps = [
-            {
-                "step": 1,
-                "action": "advanced_local_handoff",
-                "connector_id": public_profile["connector_id"],
-                "environment": public_profile["environment"],
-                "tools": [
-                    "connector_status",
-                    "search_erp_actions",
-                    "get_erp_action_schema",
-                    "run_erp_read",
-                ],
-            }
-        ]
-        host_tool_requirements = []
+    ordered_steps, host_tool_requirements = _host_execution_plan(assessment)
     return {
         "status": "ready",
         "skill_id": skill.skill_id,

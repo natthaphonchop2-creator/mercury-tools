@@ -17,13 +17,10 @@ neutral terms. Use this hosted lifecycle without skipping or reordering:
    guidance.
 4. Call `link_connector_profile` with the selected workspace and sanitized profile details.
    Do not send credentials, OAuth values, provider payloads, or local paths.
-5. For native MCP, have the host or provider complete OAuth outside Mercury. For an
-   API-driver or Local Bridge requirement, return `advanced_local_handoff` to
-   `docs/ADVANCED_LOCAL_ERP.md` and stop the hosted branch until a separately connected
-   local MCP supplies sanitized validation evidence. Do not invoke a local CLI or local
-   tool from this public Skill.
-6. When host/provider OAuth or the separately connected advanced-local branch has returned
-   sanitized evidence, call `validate_connector_connection` for the same workspace,
+5. Have the MCP host or ERP provider complete authorization outside Mercury. Mercury
+   never asks for credentials in chat and never stores provider tokens.
+6. After the host performs the documented safe probe, call
+   `validate_connector_connection` with sanitized evidence for the same workspace,
    connector, mode, and environment.
 7. Call `connector_status` for that same selection. Stop on a setup requirement,
    validation failure, or environment mismatch; otherwise report only the returned status

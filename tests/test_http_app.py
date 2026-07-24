@@ -77,7 +77,7 @@ def test_status_exposes_exact_package_version_and_deployment_commit(monkeypatch)
 
     payload = TestClient(create_http_app(require_auth=False)).get("/api/status").json()
 
-    assert payload["version"] == __version__ == "0.3.0"
+    assert payload["version"] == __version__ == "0.3.1"
     assert payload["deployment_commit"] == commit
 
 

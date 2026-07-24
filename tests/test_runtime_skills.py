@@ -1,4 +1,3 @@
-import re
 from pathlib import Path
 
 import pytest
@@ -46,34 +45,6 @@ LOCAL_API_DRIVER_COMMANDS = {
     "get_erp_request_status",
 }
 
-
-def _route_branch_bodies(markdown: str) -> dict[str, str]:
-    route_heading = re.search(r"(?m)^## Route branches\s*$", markdown)
-    assert route_heading is not None
-    route_tail = markdown[route_heading.end() :]
-    shared_heading = re.search(r"(?m)^## (?!Route branches\s*$).+$", route_tail)
-    route_block = route_tail[: shared_heading.start()] if shared_heading else route_tail
-    matches = list(
-        re.finditer(
-            r"(?m)^### `(native_mcp|api_driver|local_bridge_required)`\s*$",
-            route_block,
-        )
-    )
-    assert [match.group(1) for match in matches] == [
-        "native_mcp",
-        "api_driver",
-        "local_bridge_required",
-    ]
-    return {
-        match.group(1): " ".join(
-            route_block[
-                match.end() : matches[index + 1].start() if index + 1 < len(matches) else None
-            ].split()
-        )
-        for index, match in enumerate(matches)
-    }
-
-
 @pytest.fixture(autouse=True)
 def explicit_runtime_source_root(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MERCURY_TOOLS_ROOT", str(ROOT))
@@ -108,7 +79,7 @@ def test_bundled_provider_setup_skills_use_hosted_connector_lifecycle() -> None:
         assert LOCAL_API_DRIVER_COMMANDS.isdisjoint(markdown)
 
 
-def test_generic_setup_guide_uses_the_hosted_lifecycle_and_local_handoff_boundary() -> None:
+def test_generic_setup_guide_uses_one_hosted_lifecycle() -> None:
     markdown = skill_markdown("connector-setup-guide-th")
 
     assert markdown is not None
@@ -123,21 +94,21 @@ def test_generic_setup_guide_uses_the_hosted_lifecycle_and_local_handoff_boundar
     positions = [markdown.index(tool_name) for tool_name in lifecycle]
 
     assert positions == sorted(positions)
-    assert "advanced_local_handoff" in markdown
-    assert "docs/ADVANCED_LOCAL_ERP.md" in markdown
+    assert "MCP host or ERP provider complete authorization outside Mercury" in markdown
+    assert "advanced_local_handoff" not in markdown
     assert LOCAL_API_DRIVER_COMMANDS.isdisjoint(markdown)
     assert "mercury credentials" not in markdown
     assert "workspace_id" in markdown
     assert "keep it private" in markdown
 
 
-def test_bundled_journal_skill_returns_advanced_local_handoff_for_writes() -> None:
+def test_bundled_journal_skill_requires_connected_provider_and_approval() -> None:
     markdown = skill_markdown("flowaccount-journal-posting-th")
 
     assert markdown is not None
-    assert "advanced_local_handoff" in markdown
-    assert "docs/ADVANCED_LOCAL_ERP.md" in markdown
-    assert "separately connected local Mercury MCP" in markdown
+    assert "provider_connection_required" in markdown
+    assert "explicit user confirmation" in markdown
+    assert "Mercury does not receive provider credentials" in markdown
     assert LOCAL_API_DRIVER_COMMANDS.isdisjoint(markdown)
     assert "create_flowaccount_journal_draft" not in markdown
 
@@ -150,13 +121,9 @@ def test_cross_mcp_skills_keep_exclusive_route_and_evidence_contract(
 
     assert markdown is not None
     compact = " ".join(markdown.split())
-    branches = _route_branch_bodies(markdown)
-
-    assert "Use only the returned `invoke_provider_capability` steps" in branches["native_mcp"]
-    assert "Use only the returned `advanced_local_handoff` step" in branches["api_driver"]
-    assert "Stop without running data-access commands" in branches["local_bridge_required"]
-    assert "Execute exactly one route branch" in compact
-    assert "Do not continue into another route branch" in compact
+    assert "Use only the returned `invoke_connected_provider_capability` steps" in markdown
+    assert "`status=ready`" in markdown
+    assert "advanced_local_handoff" not in markdown
     assert "untrusted data" in compact
     assert "connect-or-upload" in compact
     assert "evidence references" in compact
