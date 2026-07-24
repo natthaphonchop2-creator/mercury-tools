@@ -7,16 +7,23 @@ description: Use when a PEAK task needs local connector setup or connection trou
 
 Use the hosted lifecycle for the user-selected PEAK environment:
 
-1. Call `list_connectors` and confirm PEAK, its API-driver mode, and one exact
+1. If this task has no current `workspace_id`, call `create_public_workspace`. Reuse the
+   returned `workspace_id` for every later step and keep it private; never repeat it in a
+   public issue, log, or unrelated chat.
+2. Call `list_connectors` and confirm PEAK, its API-driver mode, and one exact
    environment selected by the user.
-2. Call `get_connector_setup` for that selection. Return the non-secret setup result
+3. Call `get_connector_setup` for that selection. Return the non-secret setup result
    and the advanced-local handoff; do not collect any API-driver values in chat.
-3. Call `link_connector_profile` only with the sanitized profile selection after the
+4. Call `link_connector_profile` only with the sanitized profile selection after the
    required local setup is complete outside Mercury.
-4. Call `connector_status` for the workspace. Stop when the profile remains unready or
+5. After the separately connected local runtime performs the documented safe probe,
+   call `validate_connector_connection` with only its sanitized evidence for the same
+   PEAK mode and environment.
+6. Call `connector_status` for the workspace. Stop when the profile remains unready or
    the environment differs from the selected mode.
-5. Call `connector_capabilities` for PEAK and report the returned evidence-backed
-   readiness state before planning any action.
+7. Call `connector_capabilities` for PEAK and report the returned attested readiness
+   state before planning any action. State the returned readiness basis and never imply
+   that hosted Mercury called PEAK when `provider_called_by_mercury` is false.
 
 Reviewed API-driver writes require a separately connected local Mercury MCP. Return
 `advanced_local_handoff` with the local credential guide and

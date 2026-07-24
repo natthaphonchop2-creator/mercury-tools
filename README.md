@@ -58,20 +58,27 @@ mercury mcp serve-local
 
 ## Connect a system
 
-1. Use `list_connectors` to choose one connector, mode, and environment.
-2. Use `get_connector_setup`, then complete provider or host authorization outside
+1. Call `create_public_workspace` once when no current workspace exists. Reuse its
+   `workspace_id` for the remaining steps and keep it private; it is an expiring access
+   handle for that workspace.
+2. Use `list_connectors` to choose one connector, mode, and environment.
+3. Use `get_connector_setup`, then complete provider or host authorization outside
    Mercury.
-3. Use `link_connector_profile` with sanitized profile details only.
-4. Use `connector_status` and `connector_capabilities` to confirm factual readiness.
+4. Use `link_connector_profile` with sanitized profile details only.
+5. After the host or separately connected local runtime performs the documented safe
+   probe, record only its sanitized result with `validate_connector_connection`.
+6. Use `connector_status` and `connector_capabilities` to confirm host/local-attested
+   readiness.
 
 The hosted product never receives ERP credentials or raw provider payloads. For a
 reviewed API-driver write, Mercury returns an advanced-local handoff instead of invoking
-the local runtime.
+the local runtime. A ready status means the host or local runtime supplied matching,
+catalog-bound evidence; it does not mean the hosted Mercury server called the ERP itself.
 
 ## Connector catalog
 
 [CONNECTOR_CATALOG.md](docs/CONNECTOR_CATALOG.md) lists supported connector families,
-connection modes, ownership boundaries, factual readiness, capability states, and review
+connection modes, ownership boundaries, attested readiness, capability states, and review
 dates. Catalog presence is not a claim of live production support.
 
 ## Safety boundaries

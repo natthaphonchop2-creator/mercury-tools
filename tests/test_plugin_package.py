@@ -174,14 +174,12 @@ EXPECTED_DESCRIPTIONS = {
 PACKAGE_FORBIDDEN_TERMS = {
     "approve_flowaccount_journal",
     "create_flowaccount_journal_draft",
-    "create_public_workspace",
     "preview_flowaccount_journal",
     "required_secret_fields",
     "retrieve_workspace_context_pack",
     "run_mercury_flow",
     "start_connector_setup",
     "submit_connector_credentials",
-    "workspace_id",
 }
 CREDENTIAL_FIELD_NAMES = {
     "application_code",
@@ -498,9 +496,11 @@ def test_public_setup_skills_use_hosted_lifecycle_without_chat_credentials() -> 
         "peak-connector-setup-th",
     )
     required_order = (
+        "create_public_workspace",
         "list_connectors",
         "get_connector_setup",
         "link_connector_profile",
+        "validate_connector_connection",
         "connector_status",
         "connector_capabilities",
     )
@@ -508,6 +508,8 @@ def test_public_setup_skills_use_hosted_lifecycle_without_chat_credentials() -> 
     for skill_name in hosted_setup_skills:
         text = skill_text(skill_name)
         assert_terms_in_order(text, required_order)
+        assert "workspace_id" in text
+        assert "keep it private" in text
         assert "Never ask for, accept, or paste credentials in chat." in text
         assert "credential_status" not in text
         assert "mercury credentials" not in text
@@ -521,6 +523,7 @@ def test_connector_setup_guide_uses_the_exact_hosted_lifecycle() -> None:
     assert_terms_in_order(
         text,
         (
+            "create_public_workspace",
             "list_connectors",
             "get_connector_setup",
             "link_connector_profile",
@@ -528,9 +531,33 @@ def test_connector_setup_guide_uses_the_exact_hosted_lifecycle() -> None:
             "connector_status",
         ),
     )
+    assert "workspace_id" in text
+    assert "keep it private" in text
     assert "credential_status" not in text
     assert "mercury credentials" not in text
     assert "Never ask for, accept, or paste credentials in chat." in text
+
+
+def test_readme_connect_lifecycle_creates_private_workspace_before_connector_setup() -> None:
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    connect_section = text.split("## Connect a system", 1)[1].split("## Connector catalog", 1)[0]
+    normalized_section = " ".join(connect_section.split())
+
+    assert_terms_in_order(
+        connect_section,
+        (
+            "create_public_workspace",
+            "list_connectors",
+            "get_connector_setup",
+            "link_connector_profile",
+            "validate_connector_connection",
+            "connector_status",
+            "connector_capabilities",
+        ),
+    )
+    assert "workspace_id" in connect_section
+    assert "keep it private" in connect_section
+    assert "host/local-attested readiness" in normalized_section
 
 
 def test_read_skills_preserve_evidence_and_compact_thai_output() -> None:
@@ -808,7 +835,7 @@ def test_public_journal_catalog_tags_exclude_private() -> None:
     assert journal["tags"] == ["flowaccount", "journal", "write", "thai"]
 
 
-def test_skill_package_has_no_private_or_workspace_tool_terms() -> None:
+def test_skill_package_has_no_private_or_deprecated_tool_terms() -> None:
     combined = "\n".join(
         path.read_text(encoding="utf-8")
         for path in sorted(SKILLS_ROOT.glob("*/SKILL.md"))

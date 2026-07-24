@@ -189,6 +189,9 @@ def test_product_store_creates_public_workspace_and_resolves_dashboard() -> None
 
     assert created["workspace_id"].startswith("mw_")
     assert created["workspace"]["name"] == "Public Demo Co"
+    assert created["workspace_access"]["handling"] == "keep_private"
+    assert created["workspace_access"]["expires_at"].endswith("+00:00")
+    assert created["next_tool"] == "list_connectors"
     assert dashboard["status"] == "ok"
     assert dashboard["public_mode"] is True
     assert dashboard["workspace_id"] == created["workspace_id"]

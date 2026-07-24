@@ -1221,13 +1221,21 @@ def _active_workspace_connector_profile(dashboard_payload: dict[str, Any]) -> di
 
 
 def _connector_context_from_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    evidence_source = _clean_selector(profile.get("evidence_source"))
+    readiness_basis = {
+        "native_mcp_safe_read": "host_attested",
+        "api_driver_safe_probe": "local_runtime_attested",
+        "local_bridge_safe_probe": "local_runtime_attested",
+    }.get(evidence_source)
     context = {
         "connector_id": str(profile.get("connector_id") or "").strip().lower(),
         "connection_mode": str(profile.get("connection_mode") or "").strip().lower(),
         "environment": str(profile.get("environment") or "").strip().lower(),
         "status": str(profile.get("status") or "needs_validation"),
         "capability_states": _profile_capability_states(profile),
-        "evidence_source": profile.get("evidence_source"),
+        "evidence_source": evidence_source,
+        "readiness_basis": readiness_basis,
+        "provider_called_by_mercury": False if readiness_basis else None,
         "validated_at": profile.get("validated_at"),
     }
     return context
@@ -1975,6 +1983,12 @@ def connector_capabilities(
                 "connection_mode": mode.mode.value,
                 "environment": environment,
                 "profile": profile,
+                "readiness_basis": (
+                    _connector_context_from_profile(profile).get("readiness_basis")
+                    if isinstance(profile, dict)
+                    else None
+                ),
+                "provider_called_by_mercury": False if profile else None,
                 "declared_capability_states": declared,
                 "observed_capability_states": observed,
                 "capability_states": capability_states,
@@ -2122,6 +2136,7 @@ def connector_status(
             ]
         active_context = None
         resolution: dict[str, Any] | None = None
+        selected_profile: dict[str, Any] | None = None
         if len(public_profiles) == 1:
             selected_profile = public_profiles[0]
             resolution = _workspace_connector_resolution(
@@ -2151,10 +2166,38 @@ def connector_status(
                 },
                 "connector_profiles": public_profiles,
                 "active_connector": active_context,
+                "readiness_basis": (
+                    active_context.get("readiness_basis") if active_context else None
+                ),
+                "provider_called_by_mercury": (
+                    active_context.get("provider_called_by_mercury")
+                    if active_context
+                    else None
+                ),
                 "setup_required": not bool(active_context),
-                "next_tool": "get_connector_setup"
-                if status == "mode_required"
-                else ("link_connector_profile" if not active_context else None),
+                "next_tool": (
+                    "get_connector_setup"
+                    if status == "mode_required"
+                    else (
+                        "validate_connector_connection"
+                        if selected_profile
+                        and all(
+                            selected_profile.get(field)
+                            for field in (
+                                "connector_id",
+                                "connection_mode",
+                                "environment",
+                            )
+                        )
+                        and (resolution or {}).get("reason")
+                        in {
+                            "not_validated",
+                            "not_authorized",
+                            "validation_failed",
+                        }
+                        else ("link_connector_profile" if not active_context else None)
+                    )
+                ),
                 "next_skill": "connector-credential-setup-th" if not active_context else None,
             }
         )
