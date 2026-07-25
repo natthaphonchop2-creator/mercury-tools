@@ -14,6 +14,7 @@ from tempfile import TemporaryDirectory
 from typing import Any
 from urllib.parse import urlparse
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, TypeAdapter, ValidationError
@@ -23,7 +24,20 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
 from mercury_tools import __version__
-from mercury_tools.cloud.api import CloudDependencies, cloud_routes
+from mercury_tools.auth.consent import (
+    ConsentHandoff,
+    MercuryConsent,
+    OAuthSessionCookie,
+    SupabaseConsentHandoff,
+)
+from mercury_tools.auth.middleware import MercuryOAuthMiddleware
+from mercury_tools.auth.models import PrincipalResolver
+from mercury_tools.auth.supabase_jwt import validator_from_settings
+from mercury_tools.cloud.api import (
+    CloudDependencies,
+    cloud_routes,
+    protected_resource_routes,
+)
 from mercury_tools.config import load_settings
 from mercury_tools.connectors.catalog import (
     connector_by_id,
@@ -3868,8 +3882,12 @@ def create_http_app(
     *,
     require_auth: bool | None = None,
     cloud_dependencies: CloudDependencies | None = None,
+    principal_resolver: PrincipalResolver | None = None,
+    consent_handoff: ConsentHandoff | None = None,
+    consent_http_client: httpx.AsyncClient | None = None,
 ):
     settings = load_settings()
+    settings.validate_v1()
     mcp.settings.streamable_http_path = settings.mcp_path
     if settings.public_base_url:
         public_url = urlparse(settings.public_base_url)
@@ -3890,6 +3908,8 @@ def create_http_app(
         *public_app.routes,
         *cloud_routes(cloud_dependencies or CloudDependencies(settings=settings)),
     ]
+    if settings.v1_enabled:
+        routes.extend(protected_resource_routes(settings))
     app = Starlette(routes=routes, lifespan=lifespan)
     app.add_route("/", root, methods=["GET"])
     app.add_route("/api/status", status, methods=["GET"])
@@ -3902,6 +3922,27 @@ def create_http_app(
         openai_apps_challenge,
         methods=["GET"],
     )
+    if settings.v1_enabled:
+        session_cookie = OAuthSessionCookie(settings.vault_active_key)
+        consent = MercuryConsent(
+            handoff=consent_handoff
+            or SupabaseConsentHandoff(
+                authorization_server=settings.supabase_auth_issuer,
+                publishable_key=settings.supabase_publishable_key,
+                session_cookie=session_cookie,
+                http_client=consent_http_client,
+            ),
+            canonical_resource=settings.canonical_mcp_resource,
+            browser_origin=(
+                settings.provider_callback_base_url
+                or settings.canonical_mcp_resource
+            ),
+            session_cookie=session_cookie,
+        )
+        app.add_route("/oauth/consent", consent.show, methods=["GET"])
+        app.add_route("/oauth/consent", consent.decide, methods=["POST"])
+        app.add_route("/oauth/sign-in", consent.sign_in_page, methods=["GET"])
+        app.add_route("/oauth/sign-in", consent.sign_in, methods=["POST"])
     if settings.enable_legacy_http_api:
         for page_path in (
             "/start",
@@ -3928,7 +3969,14 @@ def create_http_app(
 
     should_require_auth = settings.http_require_auth if require_auth is None else require_auth
     app.state.mercury_http_require_auth = should_require_auth
-    if should_require_auth:
+    if settings.v1_enabled:
+        app.add_middleware(
+            MercuryOAuthMiddleware,
+            principal_resolver=principal_resolver or validator_from_settings(settings),
+            canonical_resource=settings.canonical_mcp_resource,
+            mcp_path=settings.mcp_path,
+        )
+    elif should_require_auth:
         if not settings.http_auth_configured:
             raise RuntimeError(
                 "MERCURY_TOOLS_HTTP_BEARER_TOKEN or MERCURY_CONNECT_SIGNING_SECRET is required when HTTP auth is enabled."

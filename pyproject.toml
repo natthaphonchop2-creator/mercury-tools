@@ -45,6 +45,7 @@ mercury-tools = "mercury_tools.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
+"mercury_tools.auth" = ["templates/*.html"]
 "mercury_tools.catalog" = ["global/*/semantic-contracts.json"]
 
 [tool.pytest.ini_options]

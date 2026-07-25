@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+from pathlib import Path
 
 import pytest
+import yaml
 
 from mercury_tools.config import V1ConfigurationError, load_settings
 from mercury_tools.v1.constants import (
@@ -16,6 +18,7 @@ V1_ENVIRONMENT_VARIABLES = (
     "MERCURY_V1_ENABLED",
     "MERCURY_CANONICAL_MCP_RESOURCE",
     "SUPABASE_AUTH_ISSUER",
+    "SUPABASE_PUBLISHABLE_KEY",
     "SUPABASE_JWKS_URL",
     "SUPABASE_JWT_AUDIENCE",
     "MERCURY_VAULT_ACTIVE_KEY",
@@ -43,6 +46,7 @@ def _enable_valid_v1_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "MERCURY_V1_ENABLED": "true",
         "MERCURY_CANONICAL_MCP_RESOURCE": CANONICAL_MCP_RESOURCE,
         "SUPABASE_AUTH_ISSUER": "https://project.supabase.co/auth/v1",
+        "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_test",
         "SUPABASE_JWKS_URL": (
             "https://project.supabase.co/auth/v1/.well-known/jwks.json"
         ),
@@ -100,6 +104,7 @@ def test_v1_requires_canonical_https_resource_when_enabled(
     ("name", "value", "error_code"),
     [
         ("SUPABASE_AUTH_ISSUER", None, "v1_jwks_configuration_missing"),
+        ("SUPABASE_PUBLISHABLE_KEY", None, "v1_publishable_key_missing"),
         ("SUPABASE_JWKS_URL", None, "v1_jwks_configuration_missing"),
         ("SUPABASE_JWT_AUDIENCE", None, "v1_jwks_configuration_missing"),
         ("SUPABASE_JWKS_URL", "http://project.supabase.co/jwks", "v1_jwks_url_invalid"),
@@ -168,3 +173,24 @@ def test_v1_preview_ttl_is_exactly_thirty_minutes() -> None:
     assert CANONICAL_MCP_RESOURCE == "https://mercury-tools-mcp.onrender.com/mcp"
     assert PREVIEW_TTL_SECONDS == 30 * 60
     assert MAX_BATCH_DOCUMENTS == 25
+
+
+def test_publishable_key_is_loaded_and_declared_without_literal_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_valid_v1_environment(monkeypatch)
+
+    settings = load_settings()
+    render = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / "render.yaml").read_text()
+    )
+    env_vars = {
+        item["key"]: item
+        for item in render["services"][0]["envVars"]
+    }
+
+    assert settings.supabase_publishable_key == "sb_publishable_test"
+    assert env_vars["SUPABASE_PUBLISHABLE_KEY"] == {
+        "key": "SUPABASE_PUBLISHABLE_KEY",
+        "sync": False,
+    }

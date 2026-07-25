@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Authorize Mercury access</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      background: #f5f7f8;
+      color: #172126;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+    }
+    main {
+      width: min(36rem, calc(100% - 2rem));
+      background: #fff;
+      border: 1px solid #d8e0e3;
+      border-radius: 8px;
+      padding: 2rem;
+      box-sizing: border-box;
+    }
+    h1 {
+      margin: 0 0 0.75rem;
+      font-size: 1.5rem;
+      letter-spacing: 0;
+    }
+    p, li {
+      line-height: 1.5;
+    }
+    dl {
+      display: grid;
+      gap: 0.5rem;
+      margin: 1.5rem 0;
+    }
+    dt {
+      font-weight: 700;
+    }
+    dd {
+      margin: 0 0 0.5rem;
+      overflow-wrap: anywhere;
+    }
+    ul {
+      padding-left: 1.25rem;
+    }
+    form {
+      display: flex;
+      gap: 0.75rem;
+      margin-top: 1.5rem;
+    }
+    button {
+      border: 1px solid #25614c;
+      border-radius: 6px;
+      padding: 0.7rem 1rem;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button[value="approve"] {
+      background: #25614c;
+      color: #fff;
+    }
+    button[value="deny"] {
+      background: #fff;
+      color: #243238;
+      border-color: #829096;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Authorize $client_name</h1>
+    <p>This application is requesting access to your Mercury workspace.</p>
+    <dl>
+      <dt>Requesting client</dt>
+      <dd>$client_name</dd>
+      <dt>Redirect URI</dt>
+      <dd><code>$redirect_uri</code></dd>
+      <dt>Mercury resource</dt>
+      <dd><code>$resource</code></dd>
+      <dt>Requested identity scopes</dt>
+      <dd>
+        <ul>
+          $scope_items
+        </ul>
+      </dd>
+      <dt>Workspace access</dt>
+      <dd>Access to your Mercury workspace under Mercury policy and permissions.</dd>
+    </dl>
+    <form method="post" action="/oauth/consent">
+      <input type="hidden" name="authorization_id" value="$authorization_id">
+      <button type="submit" name="decision" value="approve">Approve</button>
+      <button type="submit" name="decision" value="deny">Deny</button>
+    </form>
+  </main>
+</body>
+</html>

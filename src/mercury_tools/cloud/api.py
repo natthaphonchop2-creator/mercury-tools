@@ -18,6 +18,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from mercury_tools.auth.consent import IDENTITY_SCOPES
 from mercury_tools.catalog.models import (
     CatalogAction,
     HttpMethod,
@@ -421,6 +422,34 @@ def cloud_routes(dependencies: CloudDependencies) -> list[Route]:
         Route(
             "/api/cloud/v1/documents/{document_id:path}",
             dependencies.get_document,
+            methods=["GET"],
+        ),
+    ]
+
+
+def protected_resource_routes(settings: Settings) -> list[Route]:
+    async def metadata(_request: Request) -> Response:
+        return JSONResponse(
+            {
+                "resource": settings.canonical_mcp_resource,
+                "authorization_servers": [settings.supabase_auth_issuer],
+                "scopes_supported": [
+                    scope for scope in ("openid", "email", "profile") if scope in IDENTITY_SCOPES
+                ],
+                "bearer_methods_supported": ["header"],
+            },
+            headers={"Cache-Control": "public, max-age=300"},
+        )
+
+    return [
+        Route(
+            "/.well-known/oauth-protected-resource",
+            metadata,
+            methods=["GET"],
+        ),
+        Route(
+            "/.well-known/oauth-protected-resource/mcp",
+            metadata,
             methods=["GET"],
         ),
     ]

@@ -24,6 +24,8 @@ services:
         value: https://vbnlkqvauqwnjbxngkas.supabase.co/auth/v1/.well-known/jwks.json
       - key: SUPABASE_JWT_AUDIENCE
         value: https://mercury-tools-mcp.onrender.com/mcp
+      - key: SUPABASE_PUBLISHABLE_KEY
+        sync: false
       - key: MERCURY_VAULT_ACTIVE_KEY
         sync: false
       - key: MERCURY_VAULT_ACTIVE_KEY_VERSION

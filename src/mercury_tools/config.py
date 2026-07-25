@@ -36,6 +36,7 @@ class Settings:
     supabase_url: str
     supabase_service_role_key: str
     openai_api_key: str
+    supabase_publishable_key: str = ""
     embedding_provider: str = DEFAULT_EMBEDDING_PROVIDER
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     embedding_dim: int = DEFAULT_EMBEDDING_DIM
@@ -114,6 +115,8 @@ class Settings:
             raise V1ConfigurationError("v1_jwks_url_invalid")
         if self.supabase_jwt_audience != self.canonical_mcp_resource:
             raise V1ConfigurationError("v1_jwt_audience_mismatch")
+        if not self.supabase_publishable_key:
+            raise V1ConfigurationError("v1_publishable_key_missing")
 
         if not self.vault_active_key or not self.vault_active_key_version:
             raise V1ConfigurationError("v1_vault_configuration_missing")
@@ -215,6 +218,7 @@ def load_settings(*, dotenv_path: str | Path | None = None) -> Settings:
         supabase_url=os.environ.get("SUPABASE_URL", "").strip().rstrip("/"),
         supabase_service_role_key=os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip(),
         openai_api_key=os.environ.get("OPENAI_API_KEY", "").strip(),
+        supabase_publishable_key=os.environ.get("SUPABASE_PUBLISHABLE_KEY", "").strip(),
         embedding_provider=os.environ.get(
             "MERCURY_TOOLS_EMBEDDING_PROVIDER",
             DEFAULT_EMBEDDING_PROVIDER,
