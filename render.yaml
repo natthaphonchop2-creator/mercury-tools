@@ -14,6 +14,34 @@ services:
         value: /mcp
       - key: MERCURY_TOOLS_HTTP_REQUIRE_AUTH
         value: "false"
+      - key: MERCURY_V1_ENABLED
+        value: "false"
+      - key: MERCURY_CANONICAL_MCP_RESOURCE
+        value: https://mercury-tools-mcp.onrender.com/mcp
+      - key: SUPABASE_AUTH_ISSUER
+        value: https://vbnlkqvauqwnjbxngkas.supabase.co/auth/v1
+      - key: SUPABASE_JWKS_URL
+        value: https://vbnlkqvauqwnjbxngkas.supabase.co/auth/v1/.well-known/jwks.json
+      - key: SUPABASE_JWT_AUDIENCE
+        value: https://mercury-tools-mcp.onrender.com/mcp
+      - key: MERCURY_VAULT_ACTIVE_KEY
+        sync: false
+      - key: MERCURY_VAULT_ACTIVE_KEY_VERSION
+        sync: false
+      - key: MERCURY_VAULT_PREVIOUS_KEY
+        sync: false
+      - key: MERCURY_VAULT_PREVIOUS_KEY_VERSION
+        sync: false
+      - key: FLOWACCOUNT_MCP_SANDBOX_URL
+        sync: false
+      - key: FLOWACCOUNT_MCP_PRODUCTION_URL
+        sync: false
+      - key: PEAK_MCP_UAT_URL
+        sync: false
+      - key: PEAK_MCP_PRODUCTION_URL
+        sync: false
+      - key: MERCURY_PROVIDER_CALLBACK_BASE_URL
+        sync: false
       - key: MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API
         value: "false"
       - key: MERCURY_CONNECT_SIGNING_SECRET
