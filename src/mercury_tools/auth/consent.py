@@ -220,12 +220,15 @@ class SupabaseConsentHandoff:
             if isinstance(payload, Mapping) and set(payload) == {"redirect_url"}:
                 return AuthorizationRedirect.model_validate(payload)
             client = payload["client"]
+            scope = payload["scope"]
+            if not isinstance(scope, str):
+                raise ValueError
             return ConsentDetails(
                 authorization_id=payload["authorization_id"],
                 client_id=client["id"],
                 client_name=client["name"],
                 redirect_uri=payload["redirect_uri"],
-                scopes=frozenset(payload["scope"].split()),
+                scopes=frozenset(scope.split()),
             )
         except (KeyError, TypeError, ValueError, ValidationError):
             raise ConsentError() from None

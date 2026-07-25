@@ -62,10 +62,11 @@ class StubConsentHandoff:
 
 @pytest.fixture(autouse=True)
 def _v1_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    from mercury_tools.mcp.server import mcp
-    from mercury_tools.mcp.v1_tools import GET_MERCURY_CONTEXT_TOOL
+    from mercury_tools.mcp import server
+    from mercury_tools.mcp.v1_tools import configure_v1_tools
 
-    original_tool = mcp._tool_manager.get_tool(GET_MERCURY_CONTEXT_TOOL)
+    original_enabled = server._PROCESS_V1_ENABLED
+    original_tools = dict(server.mcp._tool_manager._tools)
     values = {
         "MERCURY_V1_ENABLED": "true",
         "MERCURY_CANONICAL_MCP_RESOURCE": CANONICAL_MCP_RESOURCE,
@@ -86,13 +87,16 @@ def _v1_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
+    with server._PROCESS_V1_CONFIGURATION_LOCK:
+        configure_v1_tools(server.mcp, enabled=True)
+        server._PROCESS_V1_ENABLED = True
     try:
         yield
     finally:
-        if original_tool is None:
-            mcp._tool_manager._tools.pop(GET_MERCURY_CONTEXT_TOOL, None)
-        else:
-            mcp._tool_manager._tools[GET_MERCURY_CONTEXT_TOOL] = original_tool
+        with server._PROCESS_V1_CONFIGURATION_LOCK:
+            server.mcp._tool_manager._tools.clear()
+            server.mcp._tool_manager._tools.update(original_tools)
+            server._PROCESS_V1_ENABLED = original_enabled
 
 
 def _details(**overrides: object) -> ConsentDetails:
@@ -563,6 +567,70 @@ def test_default_handoff_accepts_trusted_auto_approval_response() -> None:
         "https://client.example/oauth/callback"
         "?code=auto-approved&state=opaque"
     )
+
+
+@pytest.mark.parametrize(
+    "scope",
+    (
+        None,
+        ["openid", "email", "profile"],
+        {"openid": True},
+    ),
+)
+def test_default_handoff_rejects_non_string_scope_with_sanitized_error(
+    scope: object,
+) -> None:
+    access_token = "supabase-malformed-scope-access-token"
+
+    async def supabase(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/token"):
+            return httpx.Response(
+                200,
+                json={"access_token": access_token, "expires_in": 600},
+            )
+        assert request.headers["authorization"] == f"Bearer {access_token}"
+        return httpx.Response(
+            200,
+            json={
+                "authorization_id": AUTHORIZATION_ID,
+                "redirect_uri": "https://client.example/oauth/callback",
+                "client": {
+                    "id": "client-1",
+                    "name": "Trusted Desktop Host",
+                },
+                "scope": scope,
+            },
+        )
+
+    async_client = httpx.AsyncClient(transport=httpx.MockTransport(supabase))
+    try:
+        client = TestClient(
+            create_http_app(consent_http_client=async_client),
+            base_url=MERCURY_ORIGIN,
+            raise_server_exceptions=False,
+        )
+        signed_in = client.post(
+            "/oauth/sign-in",
+            data={
+                "authorization_id": AUTHORIZATION_ID,
+                "email": "owner@example.com",
+                "password": "correct horse battery staple",
+            },
+            headers=FORM_HEADERS,
+            follow_redirects=False,
+        )
+        response = client.get(
+            signed_in.headers["location"],
+            follow_redirects=False,
+        )
+    finally:
+        asyncio.run(async_client.aclose())
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "mercury_authorization_invalid"}
+    assert access_token not in response.text
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Referrer-Policy"] == "no-referrer"
 
 
 def test_built_wheel_contains_and_renders_canonical_auth_templates(

@@ -725,6 +725,27 @@ def test_identity_migration_enforces_idempotent_personal_workspace_uniqueness() 
     assert "'owner'" in body
     assert "'personal'" in body
     assert "'mercury workspace'" in body
+    workspace_conflict = body.split(
+        "on conflict (owner_auth_user_id) where is_automatic_default",
+        1,
+    )[1].split("returning id into v_workspace_id", 1)[0]
+    for field in (
+        "workspace_key",
+        "name",
+        "plan",
+        "status",
+        "tenant_id",
+        "owner_auth_user_id",
+        "is_automatic_default",
+    ):
+        assert f"{field} = excluded.{field}" in workspace_conflict
+    assert "updated_at = pg_catalog.statement_timestamp()" in workspace_conflict
+    membership_conflict = body.split(
+        "on conflict (workspace_id, auth_user_id) "
+        "where auth_user_id is not null",
+        1,
+    )[1].split("select coalesce(", 1)[0]
+    assert "host_app = excluded.host_app" in membership_conflict
 
 
 def test_identity_migration_rls_and_rpc_derive_identity_only_from_auth_uid() -> None:

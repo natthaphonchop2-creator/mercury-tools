@@ -62,10 +62,11 @@ class PrincipalCloudDependencies:
 
 @pytest.fixture(autouse=True)
 def _v1_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    from mercury_tools.mcp.server import mcp
-    from mercury_tools.mcp.v1_tools import GET_MERCURY_CONTEXT_TOOL
+    from mercury_tools.mcp import server
+    from mercury_tools.mcp.v1_tools import configure_v1_tools
 
-    original_tool = mcp._tool_manager.get_tool(GET_MERCURY_CONTEXT_TOOL)
+    original_enabled = server._PROCESS_V1_ENABLED
+    original_tools = dict(server.mcp._tool_manager._tools)
     values = {
         "MERCURY_V1_ENABLED": "true",
         "MERCURY_CANONICAL_MCP_RESOURCE": CANONICAL_MCP_RESOURCE,
@@ -86,13 +87,16 @@ def _v1_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
+    with server._PROCESS_V1_CONFIGURATION_LOCK:
+        configure_v1_tools(server.mcp, enabled=True)
+        server._PROCESS_V1_ENABLED = True
     try:
         yield
     finally:
-        if original_tool is None:
-            mcp._tool_manager._tools.pop(GET_MERCURY_CONTEXT_TOOL, None)
-        else:
-            mcp._tool_manager._tools[GET_MERCURY_CONTEXT_TOOL] = original_tool
+        with server._PROCESS_V1_CONFIGURATION_LOCK:
+            server.mcp._tool_manager._tools.clear()
+            server.mcp._tool_manager._tools.update(original_tools)
+            server._PROCESS_V1_ENABLED = original_enabled
 
 
 def _principal() -> MercuryPrincipal:
@@ -104,33 +108,52 @@ def _principal() -> MercuryPrincipal:
     )
 
 
-def test_v1_startup_freezes_oauth_boundary_and_tool_exposure(
+def test_two_live_v1_apps_reject_contradictory_configuration_without_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mercury_tools.auth.middleware import MercuryOAuthMiddleware
     from mercury_tools.mcp.server import mcp
 
-    app = create_http_app(
+    first_app = create_http_app(
         principal_resolver=StubResolver(_principal()),
         cloud_dependencies=PrincipalCloudDependencies(),
     )
     registered_tool = mcp._tool_manager.get_tool("get_mercury_context")
-
-    assert registered_tool is not None
-    assert any(
-        middleware.cls is MercuryOAuthMiddleware
-        for middleware in app.user_middleware
+    second_app = create_http_app(
+        principal_resolver=StubResolver(_principal()),
+        cloud_dependencies=PrincipalCloudDependencies(),
     )
-    assert "get_mercury_context" in {
-        tool.name for tool in asyncio.run(mcp.list_tools())
-    }
 
-    monkeypatch.setenv("MERCURY_V1_ENABLED", "false")
+    with TestClient(first_app, raise_server_exceptions=False) as first_client:
+        assert registered_tool is not None
+        for app in (first_app, second_app):
+            assert any(
+                middleware.cls is MercuryOAuthMiddleware
+                for middleware in app.user_middleware
+            )
+        assert first_client.get("/mcp").status_code == 401
+        assert "get_mercury_context" in {
+            tool.name for tool in asyncio.run(mcp.list_tools())
+        }
 
-    assert mcp._tool_manager.get_tool("get_mercury_context") is registered_tool
-    assert "get_mercury_context" in {
-        tool.name for tool in asyncio.run(mcp.list_tools())
-    }
+        monkeypatch.setenv("MERCURY_V1_ENABLED", "false")
+
+        with pytest.raises(
+            RuntimeError,
+            match="^mercury_v1_process_configuration_conflict$",
+        ):
+            create_http_app(require_auth=False)
+
+        assert mcp._tool_manager.get_tool("get_mercury_context") is registered_tool
+        for app in (first_app, second_app):
+            assert any(
+                middleware.cls is MercuryOAuthMiddleware
+                for middleware in app.user_middleware
+            )
+        assert "get_mercury_context" in {
+            tool.name for tool in asyncio.run(mcp.list_tools())
+        }
+        assert first_client.get("/mcp").status_code == 401
 
 
 def test_missing_or_invalid_bearer_returns_rfc_9728_challenge() -> None:
@@ -293,9 +316,7 @@ def test_health_legal_support_and_metadata_routes_remain_public(path: str) -> No
     assert resolver.tokens == []
 
 
-def test_v1_rejects_legacy_mc_token_without_breaking_legacy_feature_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_v1_rejects_legacy_mc_token() -> None:
     resolver = StubResolver(MercuryAuthError("mercury_token_invalid"))
     v1_client = TestClient(
         create_http_app(
@@ -307,12 +328,3 @@ def test_v1_rejects_legacy_mc_token_without_breaking_legacy_feature_path(
         "/mcp",
         headers={"Authorization": "Bearer mc_legacy"},
     ).status_code == 401
-
-    monkeypatch.setenv("MERCURY_V1_ENABLED", "false")
-    monkeypatch.setenv("MERCURY_TOOLS_HTTP_REQUIRE_AUTH", "true")
-    monkeypatch.setenv("MERCURY_TOOLS_HTTP_BEARER_TOKEN", "legacy-token")
-    with TestClient(create_http_app(require_auth=True)) as legacy_client:
-        assert legacy_client.get(
-            "/mcp",
-            headers={"Authorization": "Bearer legacy-token"},
-        ).status_code != 401

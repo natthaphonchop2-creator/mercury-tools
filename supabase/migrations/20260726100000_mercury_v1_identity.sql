@@ -201,8 +201,14 @@ begin
   on conflict (owner_auth_user_id)
     where is_automatic_default
   do update set
+    workspace_key = excluded.workspace_key,
+    name = excluded.name,
+    plan = excluded.plan,
+    status = excluded.status,
     tenant_id = excluded.tenant_id,
-    owner_auth_user_id = excluded.owner_auth_user_id
+    owner_auth_user_id = excluded.owner_auth_user_id,
+    is_automatic_default = excluded.is_automatic_default,
+    updated_at = pg_catalog.statement_timestamp()
   returning id into v_workspace_id;
 
   insert into public.mercury_workspace_members (
@@ -230,6 +236,7 @@ begin
   do update set
     tenant_id = excluded.tenant_id,
     role = 'owner',
+    host_app = excluded.host_app,
     status = 'active',
     last_seen_at = excluded.last_seen_at;
 

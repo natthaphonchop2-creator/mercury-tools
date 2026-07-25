@@ -7,6 +7,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import threading
 from collections.abc import Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -152,7 +153,15 @@ class StrictInputFastMCP(FastMCP):
 
 
 mcp = StrictInputFastMCP("Mercury Tools")
-configure_v1_tools(mcp, enabled=load_settings().v1_enabled)
+_PROCESS_V1_CONFIGURATION_LOCK = threading.Lock()
+_PROCESS_V1_ENABLED = load_settings().v1_enabled
+configure_v1_tools(mcp, enabled=_PROCESS_V1_ENABLED)
+
+
+def _require_process_v1_configuration(enabled: bool) -> None:
+    with _PROCESS_V1_CONFIGURATION_LOCK:
+        if enabled != _PROCESS_V1_ENABLED:
+            raise RuntimeError("mercury_v1_process_configuration_conflict")
 
 _SEARCH_FILTER_FIELDS = frozenset(SearchFilters.__dataclass_fields__)
 MAX_MCP_FLOW_FILES = 50
@@ -3890,7 +3899,7 @@ def create_http_app(
 ):
     settings = load_settings()
     settings.validate_v1()
-    configure_v1_tools(mcp, enabled=settings.v1_enabled)
+    _require_process_v1_configuration(settings.v1_enabled)
     mcp.settings.streamable_http_path = settings.mcp_path
     if settings.public_base_url:
         public_url = urlparse(settings.public_base_url)
