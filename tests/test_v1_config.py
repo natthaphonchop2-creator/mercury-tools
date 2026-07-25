@@ -17,6 +17,7 @@ from mercury_tools.v1.constants import (
 V1_ENVIRONMENT_VARIABLES = (
     "MERCURY_V1_ENABLED",
     "MERCURY_CANONICAL_MCP_RESOURCE",
+    "SUPABASE_URL",
     "SUPABASE_AUTH_ISSUER",
     "SUPABASE_PUBLISHABLE_KEY",
     "SUPABASE_JWKS_URL",
@@ -45,6 +46,7 @@ def _enable_valid_v1_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     values = {
         "MERCURY_V1_ENABLED": "true",
         "MERCURY_CANONICAL_MCP_RESOURCE": CANONICAL_MCP_RESOURCE,
+        "SUPABASE_URL": "https://project.supabase.co",
         "SUPABASE_AUTH_ISSUER": "https://project.supabase.co/auth/v1",
         "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_test",
         "SUPABASE_JWKS_URL": (
@@ -137,6 +139,44 @@ def test_v1_rejects_missing_jwks_or_vault_key_configuration(
         monkeypatch.setenv(name, value)
 
     _assert_v1_error(monkeypatch, code=error_code)
+
+
+@pytest.mark.parametrize(
+    "invalid_url",
+    (
+        "http://project.supabase.co",
+        "https://embedded-secret@project.supabase.co",
+        "https://project.supabase.co?redirect=attacker",
+        "https://project.supabase.co#attacker",
+        "https://project.supabase.co/rest/v1",
+    ),
+)
+def test_v1_supabase_data_api_requires_clean_https_project_origin(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_url: str,
+) -> None:
+    _enable_valid_v1_environment(monkeypatch)
+    monkeypatch.setenv("SUPABASE_URL", invalid_url)
+
+    with pytest.raises(V1ConfigurationError) as exc_info:
+        load_settings().validate_v1()
+
+    assert exc_info.value.code == "v1_supabase_url_invalid"
+    assert "embedded-secret" not in repr(exc_info.value)
+    assert "redirect=attacker" not in repr(exc_info.value)
+
+
+def test_v1_supabase_data_api_must_match_auth_issuer_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_valid_v1_environment(monkeypatch)
+    monkeypatch.setenv("SUPABASE_URL", "https://attacker.supabase.co")
+
+    with pytest.raises(V1ConfigurationError) as exc_info:
+        load_settings().validate_v1()
+
+    assert exc_info.value.code == "v1_supabase_origin_mismatch"
+    assert "attacker.supabase.co" not in repr(exc_info.value)
 
 
 @pytest.mark.parametrize(

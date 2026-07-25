@@ -81,6 +81,7 @@ from mercury_tools.mcp.schemas import (
     SearchMode,
     WorkspaceFlowMetadata,
 )
+from mercury_tools.mcp.v1_tools import configure_v1_tools
 from mercury_tools.mercury_runtime import (
     get_accounting_skill_schema as runtime_accounting_skill_schema,
 )
@@ -151,6 +152,7 @@ class StrictInputFastMCP(FastMCP):
 
 
 mcp = StrictInputFastMCP("Mercury Tools")
+configure_v1_tools(mcp, enabled=load_settings().v1_enabled)
 
 _SEARCH_FILTER_FIELDS = frozenset(SearchFilters.__dataclass_fields__)
 MAX_MCP_FLOW_FILES = 50
@@ -3888,6 +3890,7 @@ def create_http_app(
 ):
     settings = load_settings()
     settings.validate_v1()
+    configure_v1_tools(mcp, enabled=settings.v1_enabled)
     mcp.settings.streamable_http_path = settings.mcp_path
     if settings.public_base_url:
         public_url = urlparse(settings.public_base_url)

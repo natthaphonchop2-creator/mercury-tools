@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
@@ -60,10 +61,15 @@ class StubConsentHandoff:
 
 
 @pytest.fixture(autouse=True)
-def _v1_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+def _v1_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    from mercury_tools.mcp.server import mcp
+    from mercury_tools.mcp.v1_tools import GET_MERCURY_CONTEXT_TOOL
+
+    original_tool = mcp._tool_manager.get_tool(GET_MERCURY_CONTEXT_TOOL)
     values = {
         "MERCURY_V1_ENABLED": "true",
         "MERCURY_CANONICAL_MCP_RESOURCE": CANONICAL_MCP_RESOURCE,
+        "SUPABASE_URL": "https://vbnlkqvauqwnjbxngkas.supabase.co",
         "SUPABASE_AUTH_ISSUER": AUTHORIZATION_SERVER,
         "SUPABASE_PUBLISHABLE_KEY": PUBLISHABLE_KEY,
         "SUPABASE_JWKS_URL": f"{AUTHORIZATION_SERVER}/.well-known/jwks.json",
@@ -80,6 +86,13 @@ def _v1_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
+    try:
+        yield
+    finally:
+        if original_tool is None:
+            mcp._tool_manager._tools.pop(GET_MERCURY_CONTEXT_TOOL, None)
+        else:
+            mcp._tool_manager._tools[GET_MERCURY_CONTEXT_TOOL] = original_tool
 
 
 def _details(**overrides: object) -> ConsentDetails:

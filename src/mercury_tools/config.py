@@ -7,7 +7,7 @@ import binascii
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 
@@ -113,6 +113,10 @@ class Settings:
             self.supabase_auth_issuer
         ) or not _is_server_only_https_url(self.supabase_jwks_url):
             raise V1ConfigurationError("v1_jwks_url_invalid")
+        v1_supabase_rest_url(
+            project_url=self.supabase_url,
+            auth_issuer=self.supabase_auth_issuer,
+        )
         if self.supabase_jwt_audience != self.canonical_mcp_resource:
             raise V1ConfigurationError("v1_jwt_audience_mismatch")
         if not self.supabase_publishable_key:
@@ -185,6 +189,44 @@ def _is_server_only_https_url(value: str) -> bool:
         )
     except ValueError:
         return False
+
+
+def v1_supabase_rest_url(*, project_url: str, auth_issuer: str) -> str:
+    """Validate one trusted Supabase project origin before deriving PostgREST."""
+
+    if not _is_server_only_https_url(project_url):
+        raise V1ConfigurationError("v1_supabase_url_invalid")
+    try:
+        project = urlsplit(project_url)
+        issuer = urlsplit(auth_issuer)
+        if project.path not in {"", "/"}:
+            raise V1ConfigurationError("v1_supabase_url_invalid")
+        project_origin = (
+            project.scheme,
+            project.hostname,
+            project.port or 443,
+        )
+        issuer_origin = (
+            issuer.scheme,
+            issuer.hostname,
+            issuer.port or 443,
+        )
+    except ValueError:
+        raise V1ConfigurationError("v1_supabase_url_invalid") from None
+    if (
+        not _is_server_only_https_url(auth_issuer)
+        or project_origin != issuer_origin
+    ):
+        raise V1ConfigurationError("v1_supabase_origin_mismatch")
+    return urlunsplit(
+        (
+            project.scheme,
+            project.netloc,
+            "/rest/v1",
+            "",
+            "",
+        )
+    )
 
 
 def _validate_vault_key(value: str) -> None:
