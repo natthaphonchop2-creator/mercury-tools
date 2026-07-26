@@ -440,6 +440,8 @@ class _WireModelContract:
 def _assert_closed_wire_schema(schema: Mapping[str, Any]) -> None:
     if not schema:
         raise TypeError("provider_schema_model_invalid")
+    if "$schema" in schema and schema["$schema"] != _WIRE_SCHEMA_DIALECT:
+        raise TypeError("provider_schema_model_invalid")
     schema_format = schema.get("format")
     if schema_format is not None and (
         not isinstance(schema_format, str)

@@ -279,6 +279,55 @@ class FormattedWireModel(BaseModel):
     created_at: datetime
 
 
+class AlternateDraft7TuplePayload(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+        json_schema_extra={"$schema": "http://json-schema.org/draft-07/schema#"},
+    )
+
+    values: tuple[int]
+
+    @field_serializer("values")
+    def serialize_values(self, _value: tuple[int]):
+        return ["not-an-integer"]
+
+
+class NestedAlternateDraft7WireModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+    )
+
+    payload: AlternateDraft7TuplePayload
+
+
+class InvalidNestedTuplePayload(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+    )
+
+    values: tuple[int]
+
+    @field_serializer("values")
+    def serialize_values(self, _value: tuple[int]):
+        return ["not-an-integer"]
+
+
+class InvalidNestedTupleSerializedResponse(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+    )
+
+    payload: InvalidNestedTuplePayload
+
+
 def _wire_schema_sha256(model: type[BaseModel]) -> str:
     return hashlib.sha256(
         canonical_json(
@@ -880,6 +929,22 @@ def test_jsonschema_format_validation_is_a_direct_runtime_dependency() -> None:
             lambda _binding: UnsupportedFormatArguments,
             _resolve_invoice_response_model,
         ),
+        (
+            NestedAlternateDraft7WireModel(payload=AlternateDraft7TuplePayload(values=(1,))),
+            _verified_binding(
+                request_schema_sha256=_wire_schema_sha256(NestedAlternateDraft7WireModel)
+            ),
+            lambda _binding: NestedAlternateDraft7WireModel,
+            _resolve_invoice_response_model,
+        ),
+        (
+            InvoiceArguments(invoice_id="invoice-123"),
+            _verified_binding(
+                response_schema_sha256=_wire_schema_sha256(NestedAlternateDraft7WireModel)
+            ),
+            _resolve_invoice_request_model,
+            lambda _binding: NestedAlternateDraft7WireModel,
+        ),
     ],
     ids=[
         "alternate-request-model",
@@ -897,6 +962,8 @@ def test_jsonschema_format_validation_is_a_direct_runtime_dependency() -> None:
         "custom-request-serializer-invalid-uuid",
         "custom-request-serializer-invalid-date-time",
         "unsupported-request-format",
+        "nested-draft-7-request-schema",
+        "nested-draft-7-response-schema",
     ],
 )
 async def test_catalog_schema_models_and_hashes_fail_closed_before_auth_or_session(
@@ -994,8 +1061,24 @@ async def test_alias_policy_is_identical_for_wire_schema_request_and_response(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_model", "normalized"),
+    [
+        (
+            UnsafeSerializedResponse,
+            UnsafeSerializedResponse(invoice_id="invoice-123"),
+        ),
+        (
+            InvalidNestedTupleSerializedResponse,
+            InvalidNestedTupleSerializedResponse(payload=InvalidNestedTuplePayload(values=(1,))),
+        ),
+    ],
+    ids=["object-shape", "nested-tuple"],
+)
 async def test_custom_response_serializer_cannot_escape_bound_wire_schema(
     monkeypatch: pytest.MonkeyPatch,
+    response_model: type[BaseModel],
+    normalized: BaseModel,
 ) -> None:
     harness = FakeMCPHarness()
     harness.install(monkeypatch)
@@ -1009,17 +1092,13 @@ async def test_custom_response_serializer_cannot_escape_bound_wire_schema(
             connection,
             binding,
             resource_uri_sha256,
-        ).model_copy(
-            update={"response_schema_sha256": _wire_schema_sha256(UnsafeSerializedResponse)}
-        )
+        ).model_copy(update={"response_schema_sha256": _wire_schema_sha256(response_model)})
 
     with pytest.raises(ProviderRuntimeError) as error:
         await _driver(
             binding_verifier=verifier,
-            response_model_resolver=lambda _binding: UnsafeSerializedResponse,
-            response_normalizer=lambda _binding, _content: UnsafeSerializedResponse(
-                invoice_id="invoice-123"
-            ),
+            response_model_resolver=lambda _binding: response_model,
+            response_normalizer=lambda _binding, _content: normalized,
         ).call(
             _connection(),
             _binding(),
@@ -1047,10 +1126,14 @@ async def test_custom_response_serializer_cannot_escape_bound_wire_schema(
             InvalidDateTimeSerializedResponse,
             InvalidDateTimeSerializedResponse(created_at=NOW),
         ),
+        (
+            InvalidNestedTupleSerializedResponse,
+            InvalidNestedTupleSerializedResponse(payload=InvalidNestedTuplePayload(values=(1,))),
+        ),
     ],
-    ids=["uuid", "date-time"],
+    ids=["uuid", "date-time", "nested-tuple"],
 )
-async def test_create_response_serializer_format_violation_is_outcome_unknown(
+async def test_create_response_serializer_wire_violation_is_outcome_unknown(
     monkeypatch: pytest.MonkeyPatch,
     response_model: type[BaseModel],
     normalized: BaseModel,
