@@ -19,11 +19,11 @@ from typing import Any
 from uuid import UUID
 
 import httpx
-from jsonschema.validators import validator_for
+from jsonschema import Draft202012Validator, FormatChecker
 from mcp import ClientSession
-from mcp.client.streamable_http import StreamableHTTPTransport, streamable_http_client
+from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import McpError
-from mcp.types import INVALID_PARAMS, INVALID_REQUEST, PARSE_ERROR
+from mcp.types import INVALID_PARAMS, INVALID_REQUEST, PARSE_ERROR, JSONRPCMessage
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -102,60 +102,11 @@ _BLOCKED_HEADER_NAMES = frozenset(
 _AUTH_HTTP_STATUSES = frozenset({401, 403})
 _MCP_SCHEMA_ERROR_CODES = frozenset({PARSE_ERROR, INVALID_REQUEST, INVALID_PARAMS})
 _HTTP_HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
-_SAFE_CORRELATION_VALUE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._:-]{0,127}$")
 _PROVIDER_LOG_REDACTION = "provider_runtime_log_redacted"
+_PROVIDER_LOGGER_NAME = "mercury.provider.runtime"
+_PROVIDER_LOG_PATHNAME = "provider_runtime"
+_PROVIDER_LOG_BOUNDARY_ATTR = "_mercury_provider_make_record_boundary_v1"
 _PINNED_CLIENT_INITIALIZE_CODE = ClientSession.initialize.__code__
-_PINNED_UNEXPECTED_CONTENT_TYPE_CODE = (
-    StreamableHTTPTransport._handle_unexpected_content_type.__code__
-)
-_PINNED_UNEXPECTED_CONTENT_TYPE_LINES = frozenset(
-    line
-    for _start, _end, line in _PINNED_UNEXPECTED_CONTENT_TYPE_CODE.co_lines()
-    if line is not None
-)
-_LOG_RECORD_STANDARD_FIELDS = frozenset(logging.LogRecord("", 0, "", 0, "", (), None).__dict__)
-_LOG_RECORD_SENSITIVE_FIELDS = frozenset(
-    {
-        "args",
-        "asctime",
-        "exc_info",
-        "exc_text",
-        "message",
-        "msg",
-        "stack_info",
-    }
-)
-_LOG_RECORD_SAFE_CORRELATION_FIELDS = frozenset(
-    {
-        "correlation_id",
-        "operation_id",
-        "request_id",
-        "span_id",
-        "trace_id",
-    }
-)
-_SAFE_PROVIDER_LOGGER_PREFIXES = (
-    "client",
-    "httpcore",
-    "httpx",
-    "mcp",
-    "mercury_tools",
-)
-
-
-class _SuppressRawMCPTransportLogs(logging.Filter):
-    """Drop the SDK transport's raw request/session/error records process-wide."""
-
-    def filter(self, _record: logging.LogRecord) -> bool:
-        return False
-
-
-_MCP_TRANSPORT_LOG_FILTER = _SuppressRawMCPTransportLogs()
-_MCP_TRANSPORT_LOGGER = logging.getLogger("mcp.client.streamable_http")
-if not any(
-    isinstance(item, _SuppressRawMCPTransportLogs) for item in _MCP_TRANSPORT_LOGGER.filters
-):
-    _MCP_TRANSPORT_LOGGER.addFilter(_MCP_TRANSPORT_LOG_FILTER)
 
 
 class _ProviderProtocolFailure(Enum):
@@ -164,150 +115,114 @@ class _ProviderProtocolFailure(Enum):
 
 
 @dataclass(slots=True)
-class _ProviderLogState:
+class _ProviderRuntimeState:
+    correlation_values: Mapping[str, str]
     protocol_failure: _ProviderProtocolFailure | None = None
 
 
-_PROVIDER_LOG_SCOPE: ContextVar[_ProviderLogState | None] = ContextVar(
-    "mercury_provider_log_scope",
-    default=None,
-)
+_provider_log_boundary_state = logging.Logger.__dict__.get(_PROVIDER_LOG_BOUNDARY_ATTR)
+if not isinstance(_provider_log_boundary_state, dict):
+    _provider_log_boundary_state = {
+        "scope": ContextVar("mercury_provider_log_scope", default=None),
+        "delegate": logging.Logger.makeRecord,
+        "wrapper": None,
+    }
+    setattr(logging.Logger, _PROVIDER_LOG_BOUNDARY_ATTR, _provider_log_boundary_state)
+_PROVIDER_LOG_SCOPE: ContextVar[_ProviderRuntimeState | None] = _provider_log_boundary_state[
+    "scope"
+]
 
 
-def _is_safe_correlation_value(value: object) -> bool:
-    return isinstance(value, str) and _SAFE_CORRELATION_VALUE.fullmatch(value) is not None
-
-
-def _safe_provider_logger_name(value: object) -> str:
-    if not isinstance(value, str):
-        return _PROVIDER_LOG_REDACTION
-    if value == "root" or any(
-        value == prefix or value.startswith(f"{prefix}.")
-        for prefix in _SAFE_PROVIDER_LOGGER_PREFIXES
-    ):
-        return value
-    return _PROVIDER_LOG_REDACTION
-
-
-def _replace_standard_log_data(
-    record: logging.LogRecord,
-    args: tuple[Any, ...],
-    kwargs: Mapping[str, Any],
-) -> None:
-    name = args[0] if args else kwargs.get("name")
-    level = args[1] if len(args) > 1 else kwargs.get("level", 0)
-    lineno = args[3] if len(args) > 3 else kwargs.get("lineno", 0)
-    safe_level = level if isinstance(level, int) else 0
-    safe_lineno = lineno if isinstance(lineno, int) else 0
-    baseline = logging.LogRecord(
-        _safe_provider_logger_name(name),
+def _safe_provider_log_record(
+    state: _ProviderRuntimeState,
+    level: object,
+) -> logging.LogRecord:
+    safe_level = level if isinstance(level, int) and not isinstance(level, bool) else logging.INFO
+    record = logging.LogRecord(
+        _PROVIDER_LOGGER_NAME,
         safe_level,
-        _PROVIDER_LOG_REDACTION,
-        safe_lineno,
+        _PROVIDER_LOG_PATHNAME,
+        0,
         _PROVIDER_LOG_REDACTION,
         (),
         None,
-        _PROVIDER_LOG_REDACTION,
+        _PROVIDER_LOG_PATHNAME,
         None,
     )
-    for key, value in baseline.__dict__.items():
+    for key, value in state.correlation_values.items():
         record.__dict__[key] = value
-
-
-class _ProviderScopedLogData(dict[str, Any]):
-    """Sanitize fields installed by factories, Logger.extra, and formatters."""
-
-    def __init__(self, values: Mapping[str, Any]) -> None:
-        super().__init__()
-        for key, value in values.items():
-            self[key] = value
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        if key in _LOG_RECORD_SAFE_CORRELATION_FIELDS and _is_safe_correlation_value(value):
-            super().__setitem__(key, value)
-            return
-        if key == "args":
-            super().__setitem__(key, ())
-            return
-        if key in {"exc_info", "exc_text", "stack_info"}:
-            super().__setitem__(key, None)
-            return
-        if key in {"asctime", "message", "msg"}:
-            super().__setitem__(key, _PROVIDER_LOG_REDACTION)
-            return
-        if key in _LOG_RECORD_STANDARD_FIELDS and key not in _LOG_RECORD_SENSITIVE_FIELDS:
-            super().__setitem__(key, value)
-            return
-        super().__setitem__(key, _PROVIDER_LOG_REDACTION)
-
-    def update(
-        self,
-        values: Mapping[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        if values is not None:
-            for key, value in values.items():
-                self[key] = value
-        for key, value in kwargs.items():
-            self[key] = value
-
-
-def _is_pinned_unexpected_content_type_log(
-    args: tuple[Any, ...],
-    kwargs: Mapping[str, Any],
-) -> bool:
-    pathname = args[2] if len(args) > 2 else kwargs.get("pathname")
-    lineno = args[3] if len(args) > 3 else kwargs.get("lineno")
-    func_name = args[7] if len(args) > 7 else kwargs.get("func")
-    return (
-        pathname == _PINNED_UNEXPECTED_CONTENT_TYPE_CODE.co_filename
-        and lineno in _PINNED_UNEXPECTED_CONTENT_TYPE_LINES
-        and func_name == _PINNED_UNEXPECTED_CONTENT_TYPE_CODE.co_name
-    )
+    return record
 
 
 def _install_provider_log_record_boundary() -> None:
-    previous_factory = logging.getLogRecordFactory()
-    if getattr(previous_factory, "_mercury_provider_boundary", False):
-        return
+    state = logging.Logger.__dict__[_PROVIDER_LOG_BOUNDARY_ATTR]
+    wrapper = state["wrapper"]
+    if wrapper is None:
 
-    def provider_log_record_factory(
-        *args: Any,
-        **kwargs: Any,
-    ) -> logging.LogRecord:
-        record = previous_factory(*args, **kwargs)
-        state = _PROVIDER_LOG_SCOPE.get()
-        if state is None:
-            return record
-        record_name = args[0] if args else kwargs.get("name")
-        exc_info = args[6] if len(args) > 6 else kwargs.get("exc_info")
-        if _is_pinned_unexpected_content_type_log(args, kwargs):
-            state.protocol_failure = _ProviderProtocolFailure.UNEXPECTED_CONTENT_TYPE
-        elif (
-            record_name == "mcp.client.streamable_http"
-            and isinstance(exc_info, tuple)
-            and len(exc_info) > 1
-            and isinstance(exc_info[1], BaseException)
-            and _contains_exception(
-                exc_info[1],
-                (ValidationError, json.JSONDecodeError),
+        def provider_make_record(
+            logger: logging.Logger,
+            name: str,
+            level: int,
+            fn: str,
+            lno: int,
+            msg: object,
+            args: object,
+            exc_info: object,
+            func: str | None = None,
+            extra: Mapping[str, object] | None = None,
+            sinfo: str | None = None,
+        ) -> logging.LogRecord:
+            boundary = logging.Logger.__dict__[_PROVIDER_LOG_BOUNDARY_ATTR]
+            provider_state = boundary["scope"].get()
+            if provider_state is not None:
+                return _safe_provider_log_record(provider_state, level)
+            delegate = boundary["delegate"]
+            return delegate(
+                logger,
+                name,
+                level,
+                fn,
+                lno,
+                msg,
+                args,
+                exc_info,
+                func,
+                extra,
+                sinfo,
             )
+
+        wrapper = provider_make_record
+        state["wrapper"] = wrapper
+
+    if logging.Logger.makeRecord is not wrapper:
+        state["delegate"] = logging.Logger.makeRecord
+        logging.Logger.makeRecord = wrapper
+
+
+def _remove_legacy_transport_log_filters() -> None:
+    transport_logger = logging.getLogger("mcp.client.streamable_http")
+    for item in tuple(transport_logger.filters):
+        item_type = type(item)
+        if (
+            item_type.__module__ == __name__
+            and item_type.__name__ == "_SuppressRawMCPTransportLogs"
         ):
-            state.protocol_failure = _ProviderProtocolFailure.PARSER
-        _replace_standard_log_data(record, args, kwargs)
-        record.__dict__ = _ProviderScopedLogData(record.__dict__)
-        return record
-
-    provider_log_record_factory._mercury_provider_boundary = True  # type: ignore[attr-defined]
-    logging.setLogRecordFactory(provider_log_record_factory)
+            transport_logger.removeFilter(item)
 
 
+_remove_legacy_transport_log_filters()
 _install_provider_log_record_boundary()
 
 
 @contextmanager
-def _provider_log_suppression():
-    state = _ProviderLogState()
+def _provider_log_suppression(
+    *,
+    operation_id: UUID | None = None,
+):
+    correlations: dict[str, str] = {}
+    if type(operation_id) is UUID and operation_id.int != 0:
+        correlations["operation_id"] = str(operation_id)
+    state = _ProviderRuntimeState(correlation_values=correlations)
     token = _PROVIDER_LOG_SCOPE.set(state)
     try:
         yield state
@@ -327,21 +242,35 @@ class _OperationDeadlineExpired(TimeoutError):
 class _OperationDeadline:
     started_at: float
     expires_at: float
+    outer_expires_at: float
+    _clock: Callable[[], float]
 
     @classmethod
-    def start(cls, seconds: float) -> _OperationDeadline:
-        started_at = asyncio.get_running_loop().time()
-        return cls(started_at=started_at, expires_at=started_at + seconds)
+    def start(
+        cls,
+        seconds: float,
+        *,
+        clock: Callable[[], float] | None = None,
+    ) -> _OperationDeadline:
+        selected_clock = clock or asyncio.get_running_loop().time
+        started_at = selected_clock()
+        expires_at = started_at + seconds
+        return cls(
+            started_at=started_at,
+            expires_at=expires_at,
+            outer_expires_at=expires_at,
+            _clock=selected_clock,
+        )
 
     def reschedule(self, seconds: float) -> None:
-        self.expires_at = self.started_at + seconds
+        self.expires_at = min(self.outer_expires_at, self.started_at + seconds)
         self.check()
 
     def check(self) -> None:
         self.remaining()
 
     def remaining(self) -> float:
-        remaining = self.expires_at - asyncio.get_running_loop().time()
+        remaining = self.expires_at - self._clock()
         if remaining <= 0:
             raise _OperationDeadlineExpired
         return remaining
@@ -472,13 +401,37 @@ _SCHEMA_OBJECT_KEYWORDS = frozenset(
         "unevaluatedProperties",
     }
 )
+_WIRE_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
+_SUPPORTED_WIRE_FORMATS = frozenset(
+    {
+        "date",
+        "date-time",
+        "duration",
+        "email",
+        "hostname",
+        "idn-email",
+        "idn-hostname",
+        "ipv4",
+        "ipv6",
+        "iri",
+        "iri-reference",
+        "json-pointer",
+        "regex",
+        "relative-json-pointer",
+        "time",
+        "uri",
+        "uri-reference",
+        "uri-template",
+        "uuid",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
 class _WireModelContract:
     model: type[BaseModel]
     schema_sha256: str
-    validator: Any
+    validator: Draft202012Validator
 
     def validate(self, value: object) -> None:
         self.validator.validate(value)
@@ -486,6 +439,13 @@ class _WireModelContract:
 
 def _assert_closed_wire_schema(schema: Mapping[str, Any]) -> None:
     if not schema:
+        raise TypeError("provider_schema_model_invalid")
+    schema_format = schema.get("format")
+    if schema_format is not None and (
+        not isinstance(schema_format, str)
+        or schema_format not in _SUPPORTED_WIRE_FORMATS
+        or schema_format not in FormatChecker.checkers
+    ):
         raise TypeError("provider_schema_model_invalid")
 
     schema_type = schema.get("type")
@@ -544,13 +504,21 @@ def _wire_model_contract(model: type[BaseModel]) -> _WireModelContract:
         if not isinstance(schema, Mapping):
             raise TypeError
         _assert_closed_wire_schema(schema)
-        validator_class = validator_for(schema)
-        validator_class.check_schema(schema)
+        validation_schema = dict(schema)
+        declared_dialect = validation_schema.get("$schema")
+        if declared_dialect not in {None, _WIRE_SCHEMA_DIALECT}:
+            raise TypeError
+        validation_schema["$schema"] = _WIRE_SCHEMA_DIALECT
+        Draft202012Validator.check_schema(validation_schema)
+        format_checker = FormatChecker(formats=sorted(_SUPPORTED_WIRE_FORMATS))
         canonical_schema = canonical_json(schema)
         return _WireModelContract(
             model=model,
             schema_sha256=hashlib.sha256(canonical_schema.encode("utf-8")).hexdigest(),
-            validator=validator_class(schema),
+            validator=Draft202012Validator(
+                validation_schema,
+                format_checker=format_checker,
+            ),
         )
     except Exception:
         raise TypeError("provider_schema_model_invalid") from None
@@ -588,6 +556,7 @@ class StreamableMCPDriver:
         response_normalizer: ResponseNormalizer | None = None,
         request_model_resolver: RequestModelResolver | None = None,
         response_model_resolver: ResponseModelResolver | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
     ) -> None:
         checked_manifest = ProviderDriverManifest.model_validate(manifest.model_dump(mode="json"))
         self.provider = checked_manifest.provider
@@ -598,20 +567,24 @@ class StreamableMCPDriver:
         self._response_normalizer = response_normalizer or _unconfigured_normalizer
         self._request_model_resolver = request_model_resolver
         self._response_model_resolver = response_model_resolver
+        self._monotonic_clock = monotonic_clock
 
     async def discover(
         self,
         connection: ProviderConnection,
     ) -> ProviderDiscovery:
-        deadline = _OperationDeadline.start(self._operation_seconds(TimeoutClass.DISCOVERY))
-        log_state: _ProviderLogState | None = None
+        deadline = _OperationDeadline.start(
+            self._operation_seconds(TimeoutClass.DISCOVERY),
+            clock=self._monotonic_clock,
+        )
+        runtime_state: _ProviderRuntimeState | None = None
         observed_auth_statuses: set[int] = set()
         failure: ProviderRuntimeError | None = None
         resource: ResolvedProviderResource | None = None
         capabilities: list[str] | None = None
         boundary: _RequestBoundaryValues | None = None
         try:
-            with _provider_log_suppression() as log_state:
+            with _provider_log_suppression() as runtime_state:
                 async with asyncio.timeout_at(deadline.expires_at):
                     connection = self._validate_connection_binding(connection)
                     deadline.check()
@@ -625,6 +598,7 @@ class StreamableMCPDriver:
                         observed_auth_statuses,
                         boundary,
                         deadline,
+                        runtime_state,
                     ) as (session, get_session_id):
                         initialized = await self._initialize_session(session)
                         deadline.check()
@@ -643,7 +617,7 @@ class StreamableMCPDriver:
             failure = self._predispatch_error(
                 exc,
                 observed_auth_statuses,
-                log_state,
+                runtime_state,
             )
         if failure is not None:
             raise failure from None
@@ -667,7 +641,7 @@ class StreamableMCPDriver:
             raise self._predispatch_error(
                 exc,
                 observed_auth_statuses,
-                log_state,
+                runtime_state,
             ) from None
         except Exception:
             raise ProviderResponseInvalid(
@@ -680,14 +654,17 @@ class StreamableMCPDriver:
         self,
         connection: ProviderConnection,
     ) -> ProviderValidation:
-        deadline = _OperationDeadline.start(self._operation_seconds(TimeoutClass.READ))
-        log_state: _ProviderLogState | None = None
+        deadline = _OperationDeadline.start(
+            self._operation_seconds(TimeoutClass.READ),
+            clock=self._monotonic_clock,
+        )
+        runtime_state: _ProviderRuntimeState | None = None
         observed_auth_statuses: set[int] = set()
         failure: ProviderRuntimeError | None = None
         resource: ResolvedProviderResource | None = None
         boundary: _RequestBoundaryValues | None = None
         try:
-            with _provider_log_suppression() as log_state:
+            with _provider_log_suppression() as runtime_state:
                 async with asyncio.timeout_at(deadline.expires_at):
                     connection = self._validate_connection_binding(connection)
                     deadline.check()
@@ -701,6 +678,7 @@ class StreamableMCPDriver:
                         observed_auth_statuses,
                         boundary,
                         deadline,
+                        runtime_state,
                     ) as (session, get_session_id):
                         initialized = await self._initialize_session(session)
                         deadline.check()
@@ -715,7 +693,7 @@ class StreamableMCPDriver:
             failure = self._predispatch_error(
                 exc,
                 observed_auth_statuses,
-                log_state,
+                runtime_state,
             )
         if failure is not None:
             raise failure from None
@@ -739,7 +717,7 @@ class StreamableMCPDriver:
             raise self._predispatch_error(
                 exc,
                 observed_auth_statuses,
-                log_state,
+                runtime_state,
             ) from None
         except Exception:
             raise ProviderResponseInvalid(
@@ -761,8 +739,11 @@ class StreamableMCPDriver:
             and binding.operation_class is ProviderOperationClass.CREATE
             else TimeoutClass.READ
         )
-        deadline = _OperationDeadline.start(self._operation_seconds(timeout_class))
-        log_state: _ProviderLogState | None = None
+        deadline = _OperationDeadline.start(
+            self._operation_seconds(timeout_class),
+            clock=self._monotonic_clock,
+        )
+        runtime_state: _ProviderRuntimeState | None = None
         possible_dispatch = False
         observed_auth_statuses: set[int] = set()
         failure: ProviderRuntimeError | None = None
@@ -770,7 +751,10 @@ class StreamableMCPDriver:
         verified_binding: VerifiedRuntimeBinding | None = None
         boundary: _RequestBoundaryValues | None = None
         try:
-            with _provider_log_suppression() as log_state:
+            trusted_operation_id = (
+                operation_id if type(operation_id) is UUID and operation_id.int != 0 else None
+            )
+            with _provider_log_suppression(operation_id=trusted_operation_id) as runtime_state:
                 async with asyncio.timeout_at(deadline.expires_at) as operation_timeout:
                     connection, binding = self._validate_call_binding(
                         connection,
@@ -814,6 +798,7 @@ class StreamableMCPDriver:
                         observed_auth_statuses,
                         boundary,
                         deadline,
+                        runtime_state,
                     ) as (session, get_session_id):
                         initialized = await self._initialize_session(session)
                         deadline.check()
@@ -880,13 +865,13 @@ class StreamableMCPDriver:
                 failure = self._dispatched_read_error(
                     exc,
                     observed_auth_statuses,
-                    log_state,
+                    runtime_state,
                 )
             else:
                 failure = self._predispatch_error(
                     exc,
                     observed_auth_statuses,
-                    log_state,
+                    runtime_state,
                 )
         if failure is not None:
             raise failure from None
@@ -911,12 +896,12 @@ class StreamableMCPDriver:
                 raise self._dispatched_read_error(
                     exc,
                     observed_auth_statuses,
-                    log_state,
+                    runtime_state,
                 ) from None
             raise self._predispatch_error(
                 exc,
                 observed_auth_statuses,
-                log_state,
+                runtime_state,
             ) from None
         return result
 
@@ -949,6 +934,7 @@ class StreamableMCPDriver:
         observed_auth_statuses: set[int],
         boundary: _RequestBoundaryValues,
         deadline: _OperationDeadline,
+        runtime_state: _ProviderRuntimeState,
     ):
         headers = await self._request_headers(connection, boundary, deadline)
         deadline.check()
@@ -958,9 +944,26 @@ class StreamableMCPDriver:
             connect=self._manifest.timeout_classes[timeout_class].connect_seconds,
         )
 
-        async def observe_auth_status(response: httpx.Response) -> None:
+        async def observe_response(response: httpx.Response) -> None:
             if response.status_code in _AUTH_HTTP_STATUSES:
                 observed_auth_statuses.add(response.status_code)
+            if (
+                response.request.method == "POST"
+                and 200 <= response.status_code < 300
+                and response.status_code != 202
+            ):
+                content_type = response.headers.get("content-type", "")
+                media_type = content_type.partition(";")[0].strip().casefold()
+                if media_type not in {"application/json", "text/event-stream"}:
+                    runtime_state.protocol_failure = (
+                        _ProviderProtocolFailure.UNEXPECTED_CONTENT_TYPE
+                    )
+                elif media_type == "application/json":
+                    content = await response.aread()
+                    try:
+                        JSONRPCMessage.model_validate_json(content)
+                    except (ValidationError, json.JSONDecodeError):
+                        runtime_state.protocol_failure = _ProviderProtocolFailure.PARSER
 
         try:
             deadline.remaining()
@@ -969,7 +972,7 @@ class StreamableMCPDriver:
                     headers=headers,
                     timeout=timeout,
                     follow_redirects=False,
-                    event_hooks={"response": [observe_auth_status]},
+                    event_hooks={"response": [observe_response]},
                 ) as http_client,
                 streamable_http_client(
                     resource.uri,
@@ -1362,7 +1365,7 @@ class StreamableMCPDriver:
         self,
         error: Exception,
         observed_auth_statuses: set[int],
-        log_state: _ProviderLogState | None,
+        runtime_state: _ProviderRuntimeState | None,
     ) -> ProviderRuntimeError:
         if observed_auth_statuses or _contains_http_status(
             error,
@@ -1373,8 +1376,8 @@ class StreamableMCPDriver:
                 dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
             )
         if (
-            log_state is not None
-            and log_state.protocol_failure is not None
+            runtime_state is not None
+            and runtime_state.protocol_failure is not None
             or _is_sdk_schema_failure(error)
             or _is_unsupported_protocol_error(error)
         ):
@@ -1399,7 +1402,7 @@ class StreamableMCPDriver:
         self,
         error: Exception,
         observed_auth_statuses: set[int],
-        log_state: _ProviderLogState | None,
+        runtime_state: _ProviderRuntimeState | None,
     ) -> ProviderRuntimeError:
         if observed_auth_statuses or _contains_http_status(
             error,
@@ -1410,8 +1413,8 @@ class StreamableMCPDriver:
                 dispatch_certainty=DispatchCertainty.DISPATCHED,
             )
         if (
-            log_state is not None
-            and log_state.protocol_failure is not None
+            runtime_state is not None
+            and runtime_state.protocol_failure is not None
             or _is_sdk_schema_failure(error)
             or _is_unsupported_protocol_error(error)
         ):
@@ -1473,7 +1476,10 @@ def _contains_mcp_error_code(
 def _is_sdk_schema_failure(
     error: BaseException,
 ) -> bool:
-    if _contains_exception(error, (_MCPProtocolFailure, ValidationError)):
+    if _contains_exception(
+        error,
+        (_MCPProtocolFailure, ValidationError, json.JSONDecodeError),
+    ):
         return True
     return _contains_mcp_error_code(error, _MCP_SCHEMA_ERROR_CODES)
 

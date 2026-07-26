@@ -13,6 +13,7 @@ authors = [{ name = "Mercury Agent" }]
 dependencies = [
   "cryptography>=45,<47",
   "httpx==0.28.1",
+  "jsonschema[format-nongpl]>=4.26,<5",
   "mcp==1.26.0",
   "PyJWT[crypto]>=2.10,<3",
   "pydantic==2.13.4",
