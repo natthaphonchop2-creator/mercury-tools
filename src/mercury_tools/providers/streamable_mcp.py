@@ -14,12 +14,14 @@ from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
+from enum import Enum, auto
 from typing import Any
 from uuid import UUID
 
 import httpx
+from jsonschema.validators import validator_for
 from mcp import ClientSession
-from mcp.client.streamable_http import streamable_http_client
+from mcp.client.streamable_http import StreamableHTTPTransport, streamable_http_client
 from mcp.shared.exceptions import McpError
 from mcp.types import INVALID_PARAMS, INVALID_REQUEST, PARSE_ERROR
 from pydantic import (
@@ -100,8 +102,45 @@ _BLOCKED_HEADER_NAMES = frozenset(
 _AUTH_HTTP_STATUSES = frozenset({401, 403})
 _MCP_SCHEMA_ERROR_CODES = frozenset({PARSE_ERROR, INVALID_REQUEST, INVALID_PARAMS})
 _HTTP_HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_SAFE_CORRELATION_VALUE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._:-]{0,127}$")
 _PROVIDER_LOG_REDACTION = "provider_runtime_log_redacted"
 _PINNED_CLIENT_INITIALIZE_CODE = ClientSession.initialize.__code__
+_PINNED_UNEXPECTED_CONTENT_TYPE_CODE = (
+    StreamableHTTPTransport._handle_unexpected_content_type.__code__
+)
+_PINNED_UNEXPECTED_CONTENT_TYPE_LINES = frozenset(
+    line
+    for _start, _end, line in _PINNED_UNEXPECTED_CONTENT_TYPE_CODE.co_lines()
+    if line is not None
+)
+_LOG_RECORD_STANDARD_FIELDS = frozenset(logging.LogRecord("", 0, "", 0, "", (), None).__dict__)
+_LOG_RECORD_SENSITIVE_FIELDS = frozenset(
+    {
+        "args",
+        "asctime",
+        "exc_info",
+        "exc_text",
+        "message",
+        "msg",
+        "stack_info",
+    }
+)
+_LOG_RECORD_SAFE_CORRELATION_FIELDS = frozenset(
+    {
+        "correlation_id",
+        "operation_id",
+        "request_id",
+        "span_id",
+        "trace_id",
+    }
+)
+_SAFE_PROVIDER_LOGGER_PREFIXES = (
+    "client",
+    "httpcore",
+    "httpx",
+    "mcp",
+    "mercury_tools",
+)
 
 
 class _SuppressRawMCPTransportLogs(logging.Filter):
@@ -119,15 +158,112 @@ if not any(
     _MCP_TRANSPORT_LOGGER.addFilter(_MCP_TRANSPORT_LOG_FILTER)
 
 
+class _ProviderProtocolFailure(Enum):
+    PARSER = auto()
+    UNEXPECTED_CONTENT_TYPE = auto()
+
+
 @dataclass(slots=True)
 class _ProviderLogState:
-    parser_failure: bool = False
+    protocol_failure: _ProviderProtocolFailure | None = None
 
 
 _PROVIDER_LOG_SCOPE: ContextVar[_ProviderLogState | None] = ContextVar(
     "mercury_provider_log_scope",
     default=None,
 )
+
+
+def _is_safe_correlation_value(value: object) -> bool:
+    return isinstance(value, str) and _SAFE_CORRELATION_VALUE.fullmatch(value) is not None
+
+
+def _safe_provider_logger_name(value: object) -> str:
+    if not isinstance(value, str):
+        return _PROVIDER_LOG_REDACTION
+    if value == "root" or any(
+        value == prefix or value.startswith(f"{prefix}.")
+        for prefix in _SAFE_PROVIDER_LOGGER_PREFIXES
+    ):
+        return value
+    return _PROVIDER_LOG_REDACTION
+
+
+def _replace_standard_log_data(
+    record: logging.LogRecord,
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+) -> None:
+    name = args[0] if args else kwargs.get("name")
+    level = args[1] if len(args) > 1 else kwargs.get("level", 0)
+    lineno = args[3] if len(args) > 3 else kwargs.get("lineno", 0)
+    safe_level = level if isinstance(level, int) else 0
+    safe_lineno = lineno if isinstance(lineno, int) else 0
+    baseline = logging.LogRecord(
+        _safe_provider_logger_name(name),
+        safe_level,
+        _PROVIDER_LOG_REDACTION,
+        safe_lineno,
+        _PROVIDER_LOG_REDACTION,
+        (),
+        None,
+        _PROVIDER_LOG_REDACTION,
+        None,
+    )
+    for key, value in baseline.__dict__.items():
+        record.__dict__[key] = value
+
+
+class _ProviderScopedLogData(dict[str, Any]):
+    """Sanitize fields installed by factories, Logger.extra, and formatters."""
+
+    def __init__(self, values: Mapping[str, Any]) -> None:
+        super().__init__()
+        for key, value in values.items():
+            self[key] = value
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        if key in _LOG_RECORD_SAFE_CORRELATION_FIELDS and _is_safe_correlation_value(value):
+            super().__setitem__(key, value)
+            return
+        if key == "args":
+            super().__setitem__(key, ())
+            return
+        if key in {"exc_info", "exc_text", "stack_info"}:
+            super().__setitem__(key, None)
+            return
+        if key in {"asctime", "message", "msg"}:
+            super().__setitem__(key, _PROVIDER_LOG_REDACTION)
+            return
+        if key in _LOG_RECORD_STANDARD_FIELDS and key not in _LOG_RECORD_SENSITIVE_FIELDS:
+            super().__setitem__(key, value)
+            return
+        super().__setitem__(key, _PROVIDER_LOG_REDACTION)
+
+    def update(
+        self,
+        values: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if values is not None:
+            for key, value in values.items():
+                self[key] = value
+        for key, value in kwargs.items():
+            self[key] = value
+
+
+def _is_pinned_unexpected_content_type_log(
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+) -> bool:
+    pathname = args[2] if len(args) > 2 else kwargs.get("pathname")
+    lineno = args[3] if len(args) > 3 else kwargs.get("lineno")
+    func_name = args[7] if len(args) > 7 else kwargs.get("func")
+    return (
+        pathname == _PINNED_UNEXPECTED_CONTENT_TYPE_CODE.co_filename
+        and lineno in _PINNED_UNEXPECTED_CONTENT_TYPE_LINES
+        and func_name == _PINNED_UNEXPECTED_CONTENT_TYPE_CODE.co_name
+    )
 
 
 def _install_provider_log_record_boundary() -> None:
@@ -143,21 +279,23 @@ def _install_provider_log_record_boundary() -> None:
         state = _PROVIDER_LOG_SCOPE.get()
         if state is None:
             return record
-        if (
-            record.name == "mcp.client.streamable_http"
-            and record.exc_info is not None
-            and isinstance(record.exc_info[1], BaseException)
+        record_name = args[0] if args else kwargs.get("name")
+        exc_info = args[6] if len(args) > 6 else kwargs.get("exc_info")
+        if _is_pinned_unexpected_content_type_log(args, kwargs):
+            state.protocol_failure = _ProviderProtocolFailure.UNEXPECTED_CONTENT_TYPE
+        elif (
+            record_name == "mcp.client.streamable_http"
+            and isinstance(exc_info, tuple)
+            and len(exc_info) > 1
+            and isinstance(exc_info[1], BaseException)
             and _contains_exception(
-                record.exc_info[1],
+                exc_info[1],
                 (ValidationError, json.JSONDecodeError),
             )
         ):
-            state.parser_failure = True
-        record.msg = _PROVIDER_LOG_REDACTION
-        record.args = ()
-        record.exc_info = None
-        record.exc_text = None
-        record.stack_info = None
+            state.protocol_failure = _ProviderProtocolFailure.PARSER
+        _replace_standard_log_data(record, args, kwargs)
+        record.__dict__ = _ProviderScopedLogData(record.__dict__)
         return record
 
     provider_log_record_factory._mercury_provider_boundary = True  # type: ignore[attr-defined]
@@ -289,19 +427,145 @@ HeaderFactory = Callable[
 ]
 
 
-def validation_schema_sha256(model: type[BaseModel]) -> str:
-    """Return the canonical Task 5 identity for a closed validation model."""
+_SCHEMA_MAP_KEYWORDS = frozenset(
+    {
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "patternProperties",
+        "properties",
+    }
+)
+_SCHEMA_SINGLE_KEYWORDS = frozenset(
+    {
+        "contains",
+        "contentSchema",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+    }
+)
+_SCHEMA_LIST_KEYWORDS = frozenset(
+    {
+        "allOf",
+        "anyOf",
+        "oneOf",
+        "prefixItems",
+    }
+)
+_SCHEMA_OBJECT_KEYWORDS = frozenset(
+    {
+        "additionalProperties",
+        "dependencies",
+        "dependentRequired",
+        "dependentSchemas",
+        "maxProperties",
+        "minProperties",
+        "patternProperties",
+        "properties",
+        "propertyNames",
+        "required",
+        "unevaluatedProperties",
+    }
+)
 
-    if (
-        not isinstance(model, type)
-        or not issubclass(model, BaseModel)
-        or model.model_config.get("extra") != "forbid"
-        or model.model_config.get("frozen") is not True
-        or model.model_config.get("revalidate_instances") != "always"
+
+@dataclass(frozen=True, slots=True)
+class _WireModelContract:
+    model: type[BaseModel]
+    schema_sha256: str
+    validator: Any
+
+    def validate(self, value: object) -> None:
+        self.validator.validate(value)
+
+
+def _assert_closed_wire_schema(schema: Mapping[str, Any]) -> None:
+    if not schema:
+        raise TypeError("provider_schema_model_invalid")
+
+    schema_type = schema.get("type")
+    object_schema = (
+        schema_type == "object"
+        or (isinstance(schema_type, list) and "object" in schema_type)
+        or any(key in schema for key in _SCHEMA_OBJECT_KEYWORDS)
+        or (
+            schema_type is None
+            and "$ref" not in schema
+            and not any(key in schema for key in _SCHEMA_LIST_KEYWORDS)
+        )
+    )
+    if object_schema and (
+        schema.get("additionalProperties") is not False
+        or schema.get("unevaluatedProperties", False) not in {False, None}
+        or bool(schema.get("patternProperties"))
     ):
         raise TypeError("provider_schema_model_invalid")
-    schema = model.model_json_schema(mode="validation")
-    return hashlib.sha256(canonical_json(schema).encode("utf-8")).hexdigest()
+
+    for key, value in schema.items():
+        if key in _SCHEMA_MAP_KEYWORDS:
+            if not isinstance(value, Mapping):
+                raise TypeError("provider_schema_model_invalid")
+            for child in value.values():
+                if not isinstance(child, Mapping):
+                    raise TypeError("provider_schema_model_invalid")
+                _assert_closed_wire_schema(child)
+        elif key in _SCHEMA_SINGLE_KEYWORDS:
+            if not isinstance(value, Mapping):
+                raise TypeError("provider_schema_model_invalid")
+            _assert_closed_wire_schema(value)
+        elif key in _SCHEMA_LIST_KEYWORDS:
+            if not isinstance(value, list) or not value:
+                raise TypeError("provider_schema_model_invalid")
+            for child in value:
+                if not isinstance(child, Mapping):
+                    raise TypeError("provider_schema_model_invalid")
+                _assert_closed_wire_schema(child)
+
+
+def _wire_model_contract(model: type[BaseModel]) -> _WireModelContract:
+    try:
+        if (
+            not isinstance(model, type)
+            or not issubclass(model, BaseModel)
+            or model.model_config.get("extra") != "forbid"
+            or model.model_config.get("frozen") is not True
+            or model.model_config.get("revalidate_instances") != "always"
+        ):
+            raise TypeError
+        schema = model.model_json_schema(
+            by_alias=True,
+            mode="serialization",
+        )
+        if not isinstance(schema, Mapping):
+            raise TypeError
+        _assert_closed_wire_schema(schema)
+        validator_class = validator_for(schema)
+        validator_class.check_schema(schema)
+        canonical_schema = canonical_json(schema)
+        return _WireModelContract(
+            model=model,
+            schema_sha256=hashlib.sha256(canonical_schema.encode("utf-8")).hexdigest(),
+            validator=validator_class(schema),
+        )
+    except Exception:
+        raise TypeError("provider_schema_model_invalid") from None
+
+
+def wire_schema_sha256(model: type[BaseModel]) -> str:
+    """Return the canonical Task 5 wire schema identity."""
+
+    return _wire_model_contract(model).schema_sha256
+
+
+def validation_schema_sha256(model: type[BaseModel]) -> str:
+    """Compatibility alias for the Task 5 wire schema identity."""
+
+    return wire_schema_sha256(model)
 
 
 def _unconfigured_normalizer(
@@ -491,7 +755,13 @@ class StreamableMCPDriver:
         arguments: BaseModel,
         operation_id: UUID,
     ) -> ProviderCallResult:
-        deadline = _OperationDeadline.start(self._operation_seconds(TimeoutClass.READ))
+        timeout_class = (
+            TimeoutClass.CREATE
+            if isinstance(binding, QualifiedCapabilityBinding)
+            and binding.operation_class is ProviderOperationClass.CREATE
+            else TimeoutClass.READ
+        )
+        deadline = _OperationDeadline.start(self._operation_seconds(timeout_class))
         log_state: _ProviderLogState | None = None
         possible_dispatch = False
         observed_auth_statuses: set[int] = set()
@@ -499,7 +769,6 @@ class StreamableMCPDriver:
         result: ProviderCallResult | None = None
         verified_binding: VerifiedRuntimeBinding | None = None
         boundary: _RequestBoundaryValues | None = None
-        timeout_class = TimeoutClass.READ
         try:
             with _provider_log_suppression() as log_state:
                 async with asyncio.timeout_at(deadline.expires_at) as operation_timeout:
@@ -528,13 +797,13 @@ class StreamableMCPDriver:
                     boundary.add(verified_binding.provider_tool)
                     deadline.reschedule(self._operation_seconds(timeout_class))
                     operation_timeout.reschedule(deadline.expires_at)
-                    request_model, response_model = await self._resolve_schema_models(
+                    request_contract, response_contract = await self._resolve_schema_models(
                         verified_binding,
                         deadline,
                     )
                     serialized_arguments = self._serialize_arguments(
                         arguments,
-                        request_model,
+                        request_contract,
                         deadline,
                     )
                     deadline.check()
@@ -563,7 +832,7 @@ class StreamableMCPDriver:
                         deadline.check()
                         normalized_data = await self._normalize_call(
                             verified_binding,
-                            response_model,
+                            response_contract,
                             raw_result,
                             boundary,
                             deadline,
@@ -903,7 +1172,7 @@ class StreamableMCPDriver:
         self,
         binding: VerifiedRuntimeBinding,
         deadline: _OperationDeadline,
-    ) -> tuple[type[BaseModel], type[BaseModel]]:
+    ) -> tuple[_WireModelContract, _WireModelContract]:
         try:
             if self._request_model_resolver is None or self._response_model_resolver is None:
                 raise TypeError
@@ -915,13 +1184,13 @@ class StreamableMCPDriver:
             if inspect.isawaitable(response_model):
                 response_model = await response_model
             deadline.check()
-            request_digest = validation_schema_sha256(request_model)
+            request_contract = _wire_model_contract(request_model)
             deadline.check()
-            response_digest = validation_schema_sha256(response_model)
+            response_contract = _wire_model_contract(response_model)
             deadline.check()
             if (
-                request_digest != binding.request_schema_sha256
-                or response_digest != binding.response_schema_sha256
+                request_contract.schema_sha256 != binding.request_schema_sha256
+                or response_contract.schema_sha256 != binding.response_schema_sha256
             ):
                 raise TypeError
         except _OperationDeadlineExpired:
@@ -931,25 +1200,35 @@ class StreamableMCPDriver:
                 self.provider,
                 dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
             ) from None
-        return request_model, response_model
+        return request_contract, response_contract
 
     def _serialize_arguments(
         self,
         arguments: BaseModel,
-        request_model: type[BaseModel],
+        request_contract: _WireModelContract,
         deadline: _OperationDeadline,
     ) -> dict[str, Any]:
         try:
-            if type(arguments) is not request_model:
+            if type(arguments) is not request_contract.model:
                 raise TypeError
-            revalidated = request_model.model_validate(arguments)
+            revalidated = request_contract.model.model_validate(
+                arguments,
+                by_alias=True,
+                by_name=True,
+            )
             deadline.check()
-            if type(revalidated) is not request_model:
+            if type(revalidated) is not request_contract.model:
                 raise TypeError
-            serialized = revalidated.model_dump(mode="json")
+            serialized = revalidated.model_dump(
+                by_alias=True,
+                mode="json",
+                warnings="error",
+            )
             deadline.check()
             if not isinstance(serialized, dict):
                 raise TypeError
+            request_contract.validate(serialized)
+            deadline.check()
         except _OperationDeadlineExpired:
             raise
         except Exception:
@@ -1018,7 +1297,7 @@ class StreamableMCPDriver:
     async def _normalize_call(
         self,
         binding: VerifiedRuntimeBinding,
-        response_model: type[BaseModel],
+        response_contract: _WireModelContract,
         result: object,
         boundary: _RequestBoundaryValues,
         deadline: _OperationDeadline,
@@ -1041,18 +1320,23 @@ class StreamableMCPDriver:
             deadline.check()
             if not isinstance(normalized, BaseModel):
                 raise TypeError
-            response_digest = validation_schema_sha256(response_model)
-            deadline.check()
-            if (
-                type(normalized) is not response_model
-                or response_digest != binding.response_schema_sha256
-            ):
+            if type(normalized) is not response_contract.model:
                 raise TypeError
-            revalidated = response_model.model_validate(normalized)
+            revalidated = response_contract.model.model_validate(
+                normalized,
+                by_alias=True,
+                by_name=True,
+            )
             deadline.check()
-            if type(revalidated) is not response_model:
+            if type(revalidated) is not response_contract.model:
                 raise TypeError
-            serialized = revalidated.model_dump(mode="json")
+            serialized = revalidated.model_dump(
+                by_alias=True,
+                mode="json",
+                warnings="error",
+            )
+            deadline.check()
+            response_contract.validate(serialized)
             deadline.check()
             if boundary.rejects(serialized):
                 raise ValueError
@@ -1090,7 +1374,7 @@ class StreamableMCPDriver:
             )
         if (
             log_state is not None
-            and log_state.parser_failure
+            and log_state.protocol_failure is not None
             or _is_sdk_schema_failure(error)
             or _is_unsupported_protocol_error(error)
         ):
@@ -1127,7 +1411,7 @@ class StreamableMCPDriver:
             )
         if (
             log_state is not None
-            and log_state.parser_failure
+            and log_state.protocol_failure is not None
             or _is_sdk_schema_failure(error)
             or _is_unsupported_protocol_error(error)
         ):
@@ -1225,4 +1509,5 @@ __all__ = [
     "ResponseModelResolver",
     "StreamableMCPDriver",
     "validation_schema_sha256",
+    "wire_schema_sha256",
 ]

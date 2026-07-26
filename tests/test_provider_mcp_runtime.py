@@ -20,7 +20,13 @@ import pytest
 from mcp import ClientSession
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCResponse
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_serializer,
+)
 
 import mercury_tools.providers.streamable_mcp as streamable_module
 from mercury_tools.catalog.identity import canonical_json
@@ -107,14 +113,103 @@ class OpenInvoiceModel(BaseModel):
     invoice_id: str
 
 
-def _validation_schema_sha256(model: type[BaseModel]) -> str:
+class AliasedInvoiceArguments(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+    )
+
+    invoice_id: str = Field(alias="invoiceId")
+
+
+class AliasedInvoiceResponse(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+    )
+
+    invoice_id: str = Field(alias="invoiceId")
+
+
+class OpenMetadata(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    note: str
+
+
+class NestedOpenArguments(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+    )
+
+    metadata: OpenMetadata
+
+
+class NestedOpenResponse(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+    )
+
+    metadata: OpenMetadata
+
+
+class ArbitraryMappingArguments(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+    )
+
+    payload: dict[str, object]
+
+
+class UnsafeSerializedArguments(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+    )
+
+    invoice_id: str
+
+    @field_serializer("invoice_id", return_type=str)
+    def serialize_invoice_id(self, _value: str) -> object:
+        return {"PRIVATE_UNBOUND_REQUEST_FIELD": True}
+
+
+class UnsafeSerializedResponse(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+    )
+
+    invoice_id: str
+
+    @field_serializer("invoice_id", return_type=str)
+    def serialize_invoice_id(self, _value: str) -> object:
+        return {"PRIVATE_UNBOUND_RESPONSE_FIELD": True}
+
+
+def _wire_schema_sha256(model: type[BaseModel]) -> str:
     return hashlib.sha256(
-        canonical_json(model.model_json_schema(mode="validation")).encode("utf-8")
+        canonical_json(
+            model.model_json_schema(
+                by_alias=True,
+                mode="serialization",
+            )
+        ).encode("utf-8")
     ).hexdigest()
 
 
-INVOICE_ARGUMENTS_SCHEMA_SHA256 = _validation_schema_sha256(InvoiceArguments)
-INVOICE_RESPONSE_SCHEMA_SHA256 = _validation_schema_sha256(InvoiceResponse)
+INVOICE_ARGUMENTS_SCHEMA_SHA256 = _wire_schema_sha256(InvoiceArguments)
+INVOICE_RESPONSE_SCHEMA_SHA256 = _wire_schema_sha256(InvoiceResponse)
 
 
 class BoundaryMetadata(BaseModel):
@@ -299,7 +394,7 @@ class FakeMCPHarness:
         self.initialize_delay = 0.0
         self.list_delay = 0.0
         self.call_delay = 0.0
-        self.session_exit_block = 0.0
+        self.session_exit_callback: Callable[[], None] | None = None
         self.call_count = 0
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -361,7 +456,8 @@ class FakeMCPHarness:
                 return self
 
             async def __aexit__(self, *_args: object) -> None:
-                time.sleep(harness.session_exit_block)
+                if harness.session_exit_callback is not None:
+                    harness.session_exit_callback()
                 return None
 
             async def initialize(self) -> object:
@@ -417,6 +513,52 @@ class FakeMCPHarness:
             fake_streamable_http_client,
         )
         monkeypatch.setattr(streamable_module, "ClientSession", FakeClientSession)
+
+
+class FakeOperationDeadline:
+    def __init__(self) -> None:
+        self.elapsed = 0.0
+        self.limit = 0.0
+        self.expires_at = 0.0
+        self.expired = False
+        self.initial_seconds: list[float] = []
+        self.rescheduled_seconds: list[float] = []
+
+    def start(self, seconds: float) -> FakeOperationDeadline:
+        self.limit = seconds
+        self.expires_at = asyncio.get_running_loop().time() + 3600
+        self.initial_seconds.append(seconds)
+        return self
+
+    def reschedule(self, seconds: float) -> None:
+        self.limit = seconds
+        self.rescheduled_seconds.append(seconds)
+        self.check()
+
+    def advance(self, seconds: float) -> None:
+        self.elapsed += seconds
+
+    def expire(self) -> None:
+        self.expired = True
+
+    def check(self) -> None:
+        self.remaining()
+
+    def remaining(self) -> float:
+        if self.expired or self.elapsed >= self.limit:
+            raise streamable_module._OperationDeadlineExpired
+        return self.limit - self.elapsed
+
+
+def _install_fake_operation_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    deadline: FakeOperationDeadline,
+) -> None:
+    monkeypatch.setattr(
+        streamable_module._OperationDeadline,
+        "start",
+        classmethod(lambda _cls, seconds: deadline.start(seconds)),
+    )
 
 
 def _driver(
@@ -529,27 +671,21 @@ def test_immutable_normalized_json_serializes_without_schema_warnings() -> None:
         list.append(result.normalized_data["capabilities"], "injected")
 
 
-def test_validation_schema_digest_is_deterministic_canonical_sha256() -> None:
+def test_wire_schema_digest_is_deterministic_canonical_sha256() -> None:
     assert INVOICE_ARGUMENTS_SCHEMA_SHA256 == (
         "e84a9c87a57519c5cd9319b40d521bf191220ecac0f77bad5f2c2c4c962953e4"
     )
     assert INVOICE_RESPONSE_SCHEMA_SHA256 == (
         "bbcfbd66bf01a44d3bd842e0dd9fee3e0b76fd39f77681aa5486bd3b5ce5c85a"
     )
+    assert streamable_module.wire_schema_sha256(InvoiceArguments) == INVOICE_ARGUMENTS_SCHEMA_SHA256
+    assert streamable_module.wire_schema_sha256(InvoiceResponse) == INVOICE_RESPONSE_SCHEMA_SHA256
     assert (
-        streamable_module.validation_schema_sha256(InvoiceArguments)
-        == INVOICE_ARGUMENTS_SCHEMA_SHA256
-    )
-    assert (
-        streamable_module.validation_schema_sha256(InvoiceResponse)
-        == INVOICE_RESPONSE_SCHEMA_SHA256
-    )
-    assert (
-        streamable_module.validation_schema_sha256(AlternateInvoiceArguments)
+        streamable_module.wire_schema_sha256(AlternateInvoiceArguments)
         != INVOICE_ARGUMENTS_SCHEMA_SHA256
     )
     with pytest.raises(TypeError):
-        streamable_module.validation_schema_sha256(OpenInvoiceModel)
+        streamable_module.wire_schema_sha256(OpenInvoiceModel)
 
 
 @pytest.mark.asyncio
@@ -609,6 +745,35 @@ def test_validation_schema_digest_is_deterministic_canonical_sha256() -> None:
             _resolve_invoice_request_model,
             lambda _binding: OpenInvoiceModel,
         ),
+        (
+            NestedOpenArguments(
+                metadata=OpenMetadata(
+                    note="safe",
+                    PRIVATE_UNBOUND_NESTED_FIELD=True,
+                )
+            ),
+            _verified_binding(request_schema_sha256=_wire_schema_sha256(NestedOpenArguments)),
+            lambda _binding: NestedOpenArguments,
+            _resolve_invoice_response_model,
+        ),
+        (
+            ArbitraryMappingArguments(payload={"PRIVATE_UNBOUND_MAPPING_FIELD": True}),
+            _verified_binding(request_schema_sha256=_wire_schema_sha256(ArbitraryMappingArguments)),
+            lambda _binding: ArbitraryMappingArguments,
+            _resolve_invoice_response_model,
+        ),
+        (
+            UnsafeSerializedArguments(invoice_id="invoice-123"),
+            _verified_binding(request_schema_sha256=_wire_schema_sha256(UnsafeSerializedArguments)),
+            lambda _binding: UnsafeSerializedArguments,
+            _resolve_invoice_response_model,
+        ),
+        (
+            InvoiceArguments(invoice_id="invoice-123"),
+            _verified_binding(response_schema_sha256=_wire_schema_sha256(NestedOpenResponse)),
+            _resolve_invoice_request_model,
+            lambda _binding: NestedOpenResponse,
+        ),
     ],
     ids=[
         "alternate-request-model",
@@ -619,6 +784,10 @@ def test_validation_schema_digest_is_deterministic_canonical_sha256() -> None:
         "missing-response-model-resolver",
         "open-request-model",
         "open-response-model",
+        "nested-open-request-model",
+        "arbitrary-mapping-request-model",
+        "custom-request-serializer-outside-schema",
+        "nested-open-response-model",
     ],
 )
 async def test_catalog_schema_models_and_hashes_fail_closed_before_auth_or_session(
@@ -666,6 +835,95 @@ async def test_catalog_schema_models_and_hashes_fail_closed_before_auth_or_sessi
     assert harness.clients == []
     assert harness.sessions == []
     assert harness.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_alias_policy_is_identical_for_wire_schema_request_and_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = FakeMCPHarness()
+    harness.install(monkeypatch)
+
+    def verifier(
+        connection: ProviderConnection,
+        binding: QualifiedCapabilityBinding,
+        resource_uri_sha256: str,
+    ) -> VerifiedRuntimeBinding:
+        return _verify_binding(
+            connection,
+            binding,
+            resource_uri_sha256,
+        ).model_copy(
+            update={
+                "request_schema_sha256": _wire_schema_sha256(AliasedInvoiceArguments),
+                "response_schema_sha256": _wire_schema_sha256(AliasedInvoiceResponse),
+            }
+        )
+
+    def normalizer(
+        _binding: VerifiedRuntimeBinding,
+        _structured_content: Mapping[str, Any],
+    ) -> BaseModel:
+        return AliasedInvoiceResponse(invoiceId="invoice-123")
+
+    result = await _driver(
+        binding_verifier=verifier,
+        request_model_resolver=lambda _binding: AliasedInvoiceArguments,
+        response_model_resolver=lambda _binding: AliasedInvoiceResponse,
+        response_normalizer=normalizer,
+    ).call(
+        _connection(),
+        _binding(),
+        AliasedInvoiceArguments(invoiceId="invoice-123"),
+        OPERATION_ID,
+    )
+
+    call_event = next(event for event in harness.events if event[0] == "call_tool")
+    _tool, serialized_arguments, _timeout = call_event[2]
+    assert serialized_arguments == {"invoiceId": "invoice-123"}
+    assert result.normalized_data == {"invoiceId": "invoice-123"}
+
+
+@pytest.mark.asyncio
+async def test_custom_response_serializer_cannot_escape_bound_wire_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = FakeMCPHarness()
+    harness.install(monkeypatch)
+
+    def verifier(
+        connection: ProviderConnection,
+        binding: QualifiedCapabilityBinding,
+        resource_uri_sha256: str,
+    ) -> VerifiedRuntimeBinding:
+        return _verify_binding(
+            connection,
+            binding,
+            resource_uri_sha256,
+        ).model_copy(
+            update={"response_schema_sha256": _wire_schema_sha256(UnsafeSerializedResponse)}
+        )
+
+    with pytest.raises(ProviderRuntimeError) as error:
+        await _driver(
+            binding_verifier=verifier,
+            response_model_resolver=lambda _binding: UnsafeSerializedResponse,
+            response_normalizer=lambda _binding, _content: UnsafeSerializedResponse(
+                invoice_id="invoice-123"
+            ),
+        ).call(
+            _connection(),
+            _binding(),
+            InvoiceArguments(invoice_id="invoice-123"),
+            OPERATION_ID,
+        )
+
+    assert harness.call_count == 1
+    _assert_sanitized_error(
+        error.value,
+        code="provider_response_invalid",
+        dispatch_certainty=DispatchCertainty.DISPATCHED,
+    )
 
 
 @pytest.mark.parametrize(
@@ -1033,7 +1291,7 @@ async def _exercise_real_transport_log_scenario(scenario: str) -> tuple[str, ...
         async with (
             httpx.AsyncClient(
                 transport=httpx.MockTransport(handler),
-                timeout=httpx.Timeout(0.05),
+                timeout=httpx.Timeout(1.0),
             ) as client,
             streamable_module.streamable_http_client(
                 endpoint,
@@ -1043,14 +1301,14 @@ async def _exercise_real_transport_log_scenario(scenario: str) -> tuple[str, ...
             ClientSession(
                 read_stream,
                 write_stream,
-                read_timeout_seconds=timedelta(seconds=0.03),
+                read_timeout_seconds=timedelta(seconds=0.25),
             ) as session,
         ):
             await session.initialize()
             await session.call_tool(
                 "PRIVATE_PROVIDER_TOOL_SENTINEL",
                 {"invoice_id": "PRIVATE_ARGUMENT_SENTINEL"},
-                read_timeout_seconds=timedelta(seconds=0.03),
+                read_timeout_seconds=timedelta(seconds=0.25),
             )
     except Exception:
         pass
@@ -1153,6 +1411,89 @@ async def test_provider_log_boundary_covers_descendants_and_is_concurrency_safe(
     assert all(record.args == () for record in redacted_records)
     assert all(record.exc_info is None for record in redacted_records)
     assert all(record.stack_info is None for record in redacted_records)
+
+
+class _StructuredLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps(
+            record.__dict__,
+            default=str,
+            sort_keys=True,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+async def test_provider_log_boundary_redacts_chained_and_late_extra_attributes(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    level: int,
+) -> None:
+    harness = FakeMCPHarness()
+    harness.install(monkeypatch)
+    caplog.set_level(level)
+    installed_factory = logging.getLogRecordFactory()
+
+    def preexisting_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = logging.LogRecord(*args, **kwargs)
+        record.chained_copy = record.msg
+        record.pathname = record.msg
+        record.processName = record.msg
+        return record
+
+    logging.setLogRecordFactory(preexisting_factory)
+    streamable_module._install_provider_log_record_boundary()
+
+    async def logging_headers(
+        _connection: ProviderConnection,
+    ) -> ProviderAuthHeaders:
+        logging.getLogger("mcp.client.session.descendant").log(
+            level,
+            "PRIVATE_CHAINED_LOG_SENTINEL",
+            extra={
+                "provider_secret": "PRIVATE_EXTRA_LOG_SENTINEL",
+                "request_id": "request-safe-123",
+            },
+        )
+        return _auth_headers()
+
+    async def unrelated_log() -> None:
+        await asyncio.sleep(0)
+        logging.getLogger("httpx.public").log(
+            level,
+            "PUBLIC_STRUCTURED_LOG_SENTINEL",
+            extra={
+                "public_detail": "PUBLIC_EXTRA_LOG_SENTINEL",
+                "request_id": "request-public-456",
+            },
+        )
+
+    try:
+        await asyncio.gather(
+            _driver(header_factory=logging_headers).discover(_connection()),
+            unrelated_log(),
+        )
+    finally:
+        logging.setLogRecordFactory(installed_factory)
+
+    formatter = _StructuredLogFormatter()
+    rendered = "\n".join(formatter.format(record) for record in caplog.records)
+    assert "PRIVATE_CHAINED_LOG_SENTINEL" not in rendered
+    assert "PRIVATE_EXTRA_LOG_SENTINEL" not in rendered
+    assert "provider_runtime_log_redacted" in rendered
+    provider_record = next(
+        record for record in caplog.records if record.name == "mcp.client.session.descendant"
+    )
+    assert provider_record.request_id == "request-safe-123"
+    assert provider_record.chained_copy == "provider_runtime_log_redacted"
+    assert provider_record.provider_secret == "provider_runtime_log_redacted"
+    assert provider_record.pathname == "provider_runtime_log_redacted"
+    assert provider_record.processName != "PRIVATE_CHAINED_LOG_SENTINEL"
+    assert "PUBLIC_STRUCTURED_LOG_SENTINEL" in rendered
+    assert "PUBLIC_EXTRA_LOG_SENTINEL" in rendered
+    public_record = next(record for record in caplog.records if record.name == "httpx.public")
+    assert public_record.request_id == "request-public-456"
+    assert public_record.chained_copy == "PUBLIC_STRUCTURED_LOG_SENTINEL"
 
 
 async def _exercise_actual_client_call_tool_warning() -> None:
@@ -1492,7 +1833,7 @@ async def test_blocking_synchronous_predispatch_seams_cannot_dispatch_after_dead
 
         arguments = BlockingInvoiceArguments(invoice_id="invoice-123")
         verified = verified.model_copy(
-            update={"request_schema_sha256": _validation_schema_sha256(BlockingInvoiceArguments)}
+            update={"request_schema_sha256": _wire_schema_sha256(BlockingInvoiceArguments)}
         )
 
     driver = _driver(
@@ -1518,6 +1859,68 @@ async def test_blocking_synchronous_predispatch_seams_cannot_dispatch_after_dead
     )
     assert harness.clients == []
     assert harness.sessions == []
+    assert harness.call_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation_class", "expected_code"),
+    [
+        (ProviderOperationClass.READ, "provider_timeout_pre_dispatch"),
+        (ProviderOperationClass.CREATE, None),
+    ],
+)
+async def test_requested_operation_class_selects_initial_verifier_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    operation_class: ProviderOperationClass,
+    expected_code: str | None,
+) -> None:
+    harness = FakeMCPHarness()
+    harness.install(monkeypatch)
+    deadline = FakeOperationDeadline()
+    _install_fake_operation_deadline(monkeypatch, deadline)
+
+    def verifier(
+        connection: ProviderConnection,
+        binding: QualifiedCapabilityBinding,
+        resource_uri_sha256: str,
+    ) -> VerifiedRuntimeBinding:
+        deadline.advance(40)
+        return _verify_binding(
+            connection,
+            binding,
+            resource_uri_sha256,
+        )
+
+    driver = _driver(binding_verifier=verifier)
+    if expected_code is None:
+        result = await driver.call(
+            _connection(),
+            _binding(operation_class),
+            InvoiceArguments(invoice_id="invoice-123"),
+            OPERATION_ID,
+        )
+        assert result.status_class is ProviderStatusClass.SUCCESS
+        assert deadline.initial_seconds == [60]
+        assert deadline.rescheduled_seconds == [60]
+        assert harness.call_count == 1
+        return
+
+    with pytest.raises(ProviderRuntimeError) as error:
+        await driver.call(
+            _connection(),
+            _binding(operation_class),
+            InvoiceArguments(invoice_id="invoice-123"),
+            OPERATION_ID,
+        )
+
+    _assert_sanitized_error(
+        error.value,
+        code=expected_code,
+        dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+    )
+    assert deadline.initial_seconds == [30]
+    assert deadline.rescheduled_seconds == []
     assert harness.call_count == 0
 
 
@@ -1559,8 +1962,10 @@ async def test_blocking_synchronous_postdispatch_work_cannot_return_success(
     expected_certainty: DispatchCertainty,
 ) -> None:
     harness = FakeMCPHarness()
+    deadline = FakeOperationDeadline()
+    _install_fake_operation_deadline(monkeypatch, deadline)
     if blocked_seam == "teardown":
-        harness.session_exit_block = 0.08
+        harness.session_exit_callback = deadline.expire
     harness.install(monkeypatch)
 
     def normalizer(
@@ -1568,11 +1973,10 @@ async def test_blocking_synchronous_postdispatch_work_cannot_return_success(
         structured_content: Mapping[str, Any],
     ) -> BaseModel:
         if blocked_seam == "normalizer":
-            time.sleep(0.08)
+            deadline.expire()
         return _normalize_invoice(binding, structured_content)
 
     driver = _driver(response_normalizer=normalizer)
-    monkeypatch.setattr(driver, "_operation_seconds", lambda _timeout_class: 0.05)
 
     with pytest.raises(ProviderRuntimeError) as error:
         await driver.call(
@@ -1782,6 +2186,34 @@ def _install_real_mock_transport(
                     content=b"PRIVATE_MALFORMED_INITIALIZE_SENTINEL",
                     request=request,
                 )
+            if scenario in {
+                "wrong-content-type-initialize",
+                "missing-content-type-initialize",
+            }:
+                headers = (
+                    {"Content-Type": "text/plain"}
+                    if scenario == "wrong-content-type-initialize"
+                    else {}
+                )
+                return httpx.Response(
+                    200,
+                    headers=headers,
+                    content=json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": payload["id"],
+                            "result": {
+                                "protocolVersion": "2025-11-25",
+                                "capabilities": {},
+                                "serverInfo": {
+                                    "name": "PRIVATE_CONTENT_TYPE_SENTINEL",
+                                    "version": "1",
+                                },
+                            },
+                        }
+                    ).encode(),
+                    request=request,
+                )
             if scenario == "mcp-408":
                 return httpx.Response(
                     200,
@@ -1836,6 +2268,30 @@ def _install_real_mock_transport(
                 },
                 request=request,
             )
+        if method == "tools/call" and scenario in {
+            "wrong-content-type-call",
+            "missing-content-type-call",
+        }:
+            headers = (
+                {"Content-Type": "text/plain"} if scenario == "wrong-content-type-call" else {}
+            )
+            return httpx.Response(
+                200,
+                headers=headers,
+                content=json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": payload["id"],
+                        "result": {
+                            "structuredContent": {
+                                "invoice": {"id": "PRIVATE_CONTENT_TYPE_CALL_SENTINEL"}
+                            },
+                            "isError": False,
+                        },
+                    }
+                ).encode(),
+                request=request,
+            )
         return httpx.Response(202, request=request)
 
     def build_client(
@@ -1864,6 +2320,8 @@ def _install_real_mock_transport(
         ("malformed-list", "provider_schema_changed"),
         ("invalid-parsed-list", "provider_schema_changed"),
         ("unsupported-protocol", "provider_schema_changed"),
+        ("wrong-content-type-initialize", "provider_schema_changed"),
+        ("missing-content-type-initialize", "provider_schema_changed"),
         ("mcp-408", "provider_timeout_pre_dispatch"),
         ("network-close", "provider_unavailable"),
     ],
@@ -1899,8 +2357,70 @@ async def test_real_driver_transport_failures_are_precisely_classified(
         "PRIVATE_NETWORK_CLOSE_SENTINEL",
         "PRIVATE_SESSION_SENTINEL",
         "PRIVATE_SERVER_SENTINEL",
+        "PRIVATE_CONTENT_TYPE_SENTINEL",
     ):
         assert sentinel not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "operation_class", "expected_code", "expected_certainty"),
+    [
+        (
+            "wrong-content-type-call",
+            ProviderOperationClass.READ,
+            "provider_schema_changed",
+            DispatchCertainty.DISPATCHED,
+        ),
+        (
+            "missing-content-type-call",
+            ProviderOperationClass.READ,
+            "provider_schema_changed",
+            DispatchCertainty.DISPATCHED,
+        ),
+        (
+            "wrong-content-type-call",
+            ProviderOperationClass.CREATE,
+            "provider_outcome_unknown",
+            DispatchCertainty.UNKNOWN,
+        ),
+        (
+            "missing-content-type-call",
+            ProviderOperationClass.CREATE,
+            "provider_outcome_unknown",
+            DispatchCertainty.UNKNOWN,
+        ),
+    ],
+)
+async def test_real_content_type_failure_respects_dispatch_certainty(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    scenario: str,
+    operation_class: ProviderOperationClass,
+    expected_code: str,
+    expected_certainty: DispatchCertainty,
+) -> None:
+    observed_requests: list[str] = []
+    _install_real_mock_transport(monkeypatch, scenario, observed_requests)
+    caplog.set_level(logging.DEBUG)
+    driver = _driver()
+    monkeypatch.setattr(driver, "_operation_seconds", lambda _timeout_class: 0.2)
+
+    with pytest.raises(ProviderRuntimeError) as error:
+        await driver.call(
+            _connection(),
+            _binding(operation_class),
+            InvoiceArguments(invoice_id="invoice-123"),
+            OPERATION_ID,
+        )
+
+    _assert_sanitized_error(
+        error.value,
+        code=expected_code,
+        dispatch_certainty=expected_certainty,
+    )
+    assert observed_requests.count("POST:tools/call") == 1
+    assert "PRIVATE_CONTENT_TYPE_CALL_SENTINEL" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -2234,7 +2754,7 @@ async def test_normalized_response_rejects_request_boundary_values_under_nested_
             connection,
             binding,
             resource_uri_sha256,
-        ).model_copy(update={"response_schema_sha256": _validation_schema_sha256(BoundaryResponse)})
+        ).model_copy(update={"response_schema_sha256": _wire_schema_sha256(BoundaryResponse)})
 
     with pytest.raises(ProviderRuntimeError) as error:
         await _driver(
