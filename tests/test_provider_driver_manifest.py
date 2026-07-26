@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from mercury_tools.config import Settings
 from mercury_tools.providers.manifest import (
     ProviderManifestError,
+    TimeoutClass,
+    TimeoutPolicy,
     load_provider_manifest,
     resolve_provider_resource,
 )
@@ -258,6 +262,37 @@ def test_resource_resolution_rejects_caller_endpoint_and_invalid_server_config()
     assert "provider.example" not in repr(error.value)
     assert error.value.__cause__ is None
     assert error.value.__context__ is None
+
+
+def test_manifest_nested_collections_are_deeply_immutable() -> None:
+    manifest = load_provider_manifest(FLOWACCOUNT_MANIFEST)
+
+    assert isinstance(manifest.environments, Mapping)
+    assert not isinstance(manifest.environments, dict)
+    assert isinstance(manifest.timeout_classes, Mapping)
+    assert not isinstance(manifest.timeout_classes, dict)
+
+    with pytest.raises(TypeError):
+        manifest.environments["sandbox"] = "flowaccount_mcp_production_url"  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        manifest.environments.update(  # type: ignore[attr-defined]
+            {"sandbox": "flowaccount_mcp_production_url"}
+        )
+    with pytest.raises(TypeError):
+        manifest.timeout_classes[TimeoutClass.CREATE] = TimeoutPolicy(
+            connect_seconds=5,
+            operation_seconds=60,
+        )
+    with pytest.raises(AttributeError):
+        manifest.timeout_classes.clear()  # type: ignore[attr-defined]
+    with pytest.raises(AttributeError):
+        manifest.allowed_permissions.append("injected")  # type: ignore[attr-defined]
+    with pytest.raises(AttributeError):
+        manifest.discovery_mappings.append("injected")  # type: ignore[attr-defined]
+    with pytest.raises(ValidationError):
+        manifest.timeout_classes[TimeoutClass.CREATE].operation_seconds = 1  # type: ignore[misc]
+    with pytest.raises(ValidationError):
+        manifest.discovery_mappings[0].provider_tool = "injected"  # type: ignore[misc]
 
 
 def test_registry_loads_only_known_provider_manifests_from_server_catalog() -> None:

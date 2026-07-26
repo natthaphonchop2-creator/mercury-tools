@@ -10,10 +10,18 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from mercury_tools.catalog.identity import validate_credential_safe
 from mercury_tools.config import Settings
@@ -114,7 +122,7 @@ class DiscoveryMapping(_ManifestModel):
 class ProviderDriverManifest(_ManifestModel):
     manifest_version: Literal["1"]
     provider: ProviderId
-    environments: dict[
+    environments: Mapping[
         str,
         Literal[
             "flowaccount_mcp_sandbox_url",
@@ -127,7 +135,7 @@ class ProviderDriverManifest(_ManifestModel):
     protocol_version: Literal["2025-11-25"]
     auth_adapter: AuthorizationMethod
     allowed_permissions: tuple[str, ...]
-    timeout_classes: dict[TimeoutClass, TimeoutPolicy]
+    timeout_classes: Mapping[TimeoutClass, TimeoutPolicy]
     discovery_mappings: tuple[DiscoveryMapping, ...]
 
     @model_validator(mode="before")
@@ -148,6 +156,20 @@ class ProviderDriverManifest(_ManifestModel):
         ):
             raise ValueError("provider_manifest_invalid")
         return value
+
+    @field_serializer("environments")
+    def serialize_environments(
+        self,
+        value: Mapping[str, str],
+    ) -> dict[str, str]:
+        return dict(value)
+
+    @field_serializer("timeout_classes")
+    def serialize_timeout_classes(
+        self,
+        value: Mapping[TimeoutClass, TimeoutPolicy],
+    ) -> dict[TimeoutClass, TimeoutPolicy]:
+        return dict(value)
 
     @model_validator(mode="after")
     def validate_exact_contract(self) -> ProviderDriverManifest:
@@ -189,6 +211,16 @@ class ProviderDriverManifest(_ManifestModel):
             )
             if mapping.timeout_class is not expected_timeout:
                 raise ValueError("provider_manifest_invalid")
+        object.__setattr__(
+            self,
+            "environments",
+            MappingProxyType(dict(self.environments)),
+        )
+        object.__setattr__(
+            self,
+            "timeout_classes",
+            MappingProxyType(dict(self.timeout_classes)),
+        )
         return self
 
 

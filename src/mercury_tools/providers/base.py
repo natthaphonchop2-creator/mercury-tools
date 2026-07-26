@@ -44,6 +44,12 @@ class ProviderOperationClass(StrEnum):
     CREATE = "create"
 
 
+class ProviderQualificationState(StrEnum):
+    ENABLED = "enabled"
+    DISABLED = "disabled"
+    SUPERSEDED = "superseded"
+
+
 class ProviderStatusClass(StrEnum):
     SUCCESS = "success"
     UNAVAILABLE = "unavailable"
@@ -98,6 +104,55 @@ class QualifiedCapabilityBinding(_ProviderModel):
     @field_validator("provider_tool")
     @classmethod
     def validate_provider_tool(cls, value: str) -> str:
+        if any(unicodedata.category(character) in {"Cc", "Cf"} for character in value):
+            raise ValueError("provider_binding_invalid")
+        return value
+
+
+class VerifiedRuntimeBinding(_ProviderModel):
+    """A trusted server-side execution record resolved by Catalog authority."""
+
+    qualification_state: ProviderQualificationState
+    provider: ProviderId
+    environment: str = Field(min_length=1, max_length=64, pattern=_IDENTIFIER.pattern)
+    resource_uri_sha256: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=_SHA256.pattern,
+    )
+    normalized_capability: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=_IDENTIFIER.pattern,
+    )
+    capability_version: str = Field(min_length=1, max_length=64)
+    provider_tool: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=_TOOL_NAME.pattern,
+        exclude=True,
+        repr=False,
+    )
+    operation_class: ProviderOperationClass
+    request_schema_sha256: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=_SHA256.pattern,
+    )
+    response_schema_sha256: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=_SHA256.pattern,
+    )
+    qualification_hash: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=_SHA256.pattern,
+    )
+
+    @field_validator("capability_version", "provider_tool")
+    @classmethod
+    def validate_internal_identifier(cls, value: str) -> str:
         if any(unicodedata.category(character) in {"Cc", "Cf"} for character in value):
             raise ValueError("provider_binding_invalid")
         return value
@@ -265,6 +320,7 @@ __all__ = [
     "ProviderDriver",
     "ProviderOperationClass",
     "ProviderOutcomeUnknown",
+    "ProviderQualificationState",
     "ProviderResponseInvalid",
     "ProviderRuntimeError",
     "ProviderSchemaChanged",
@@ -273,4 +329,5 @@ __all__ = [
     "ProviderUnavailable",
     "ProviderValidation",
     "QualifiedCapabilityBinding",
+    "VerifiedRuntimeBinding",
 ]
