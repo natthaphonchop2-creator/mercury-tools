@@ -12,6 +12,7 @@ from mercury_tools.providers.models import AuthorizationMethod, ProviderId
 from mercury_tools.providers.streamable_mcp import (
     BindingVerifier,
     HeaderFactory,
+    RequestModelResolver,
     ResponseModelResolver,
     ResponseNormalizer,
     StreamableMCPDriver,
@@ -52,6 +53,7 @@ def build_provider_registry(
     header_factories: Mapping[AuthorizationMethod, HeaderFactory] | None = None,
     binding_verifier: BindingVerifier | None = None,
     response_normalizer: ResponseNormalizer | None = None,
+    request_model_resolver: RequestModelResolver | None = None,
     response_model_resolver: ResponseModelResolver | None = None,
 ) -> ProviderDriverRegistry:
     """Load the two server-controlled manifests without accepting resource URLs."""
@@ -68,6 +70,7 @@ def build_provider_registry(
                 header_factory=factories.get(manifest.auth_adapter),
                 binding_verifier=binding_verifier,
                 response_normalizer=response_normalizer,
+                request_model_resolver=request_model_resolver,
                 response_model_resolver=response_model_resolver,
             )
         )

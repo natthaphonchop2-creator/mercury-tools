@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -22,6 +23,7 @@ from mcp.types import JSONRPCMessage, JSONRPCResponse
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 import mercury_tools.providers.streamable_mcp as streamable_module
+from mercury_tools.catalog.identity import canonical_json
 from mercury_tools.config import Settings
 from mercury_tools.providers.base import (
     DispatchCertainty,
@@ -81,6 +83,40 @@ class InvoiceResponse(BaseModel):
     invoice_id: str
 
 
+class AlternateInvoiceArguments(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+    )
+
+    invoice_id: str
+
+
+class AlternateInvoiceResponse(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+    )
+
+    invoice_id: str
+
+
+class OpenInvoiceModel(BaseModel):
+    invoice_id: str
+
+
+def _validation_schema_sha256(model: type[BaseModel]) -> str:
+    return hashlib.sha256(
+        canonical_json(model.model_json_schema(mode="validation")).encode("utf-8")
+    ).hexdigest()
+
+
+INVOICE_ARGUMENTS_SCHEMA_SHA256 = _validation_schema_sha256(InvoiceArguments)
+INVOICE_RESPONSE_SCHEMA_SHA256 = _validation_schema_sha256(InvoiceResponse)
+
+
 class BoundaryMetadata(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -134,9 +170,7 @@ def _connection(
         readiness=ConnectionReadiness.READY,
         revision=1,
         last_validated_at=NOW,
-        credential_envelope_ids=(
-            UUID("88888888-8888-4888-8888-888888888888"),
-        ),
+        credential_envelope_ids=(UUID("88888888-8888-4888-8888-888888888888"),),
         created_at=NOW,
         updated_at=NOW,
     )
@@ -166,10 +200,10 @@ def _verified_binding(
     provider_tool: str = "catalog_qualified_tool",
     normalized_capability: str = "documents.invoice.get",
     qualification_hash: str = "a" * 64,
-    resource_uri_sha256: str = (
-        "a938c191dfa72244698c04a394f2021d7f9a7c7bce71591815696b137e9f349d"
-    ),
+    resource_uri_sha256: str = ("a938c191dfa72244698c04a394f2021d7f9a7c7bce71591815696b137e9f349d"),
     qualification_state: ProviderQualificationState = ProviderQualificationState.ENABLED,
+    request_schema_sha256: str = INVOICE_ARGUMENTS_SCHEMA_SHA256,
+    response_schema_sha256: str = INVOICE_RESPONSE_SCHEMA_SHA256,
 ) -> VerifiedRuntimeBinding:
     return VerifiedRuntimeBinding(
         qualification_state=qualification_state,
@@ -180,18 +214,24 @@ def _verified_binding(
         capability_version="1.0.0",
         provider_tool=provider_tool,
         operation_class=operation_class,
-        request_schema_sha256="b" * 64,
-        response_schema_sha256="c" * 64,
+        request_schema_sha256=request_schema_sha256,
+        response_schema_sha256=response_schema_sha256,
         qualification_hash=qualification_hash,
     )
 
 
 def _auth_headers(
     *,
+    provider: ProviderId = ProviderId.FLOWACCOUNT,
+    authorization_method: AuthorizationMethod = AuthorizationMethod.OAUTH2_PKCE,
     name: str = "X-Mercury-Test-Auth",
     value: str = "PRIVATE_AUTH_HEADER_VALUE",
 ) -> ProviderAuthHeaders:
-    return ProviderAuthHeaders(headers=(ProviderAuthHeader(name=name, value=value),))
+    return ProviderAuthHeaders(
+        provider=provider,
+        authorization_method=authorization_method,
+        headers=(ProviderAuthHeader(name=name, value=value),),
+    )
 
 
 def _verify_binding(
@@ -209,10 +249,17 @@ def _verify_binding(
     )
 
 
+def _resolve_invoice_request_model(
+    binding: VerifiedRuntimeBinding,
+) -> type[BaseModel]:
+    assert binding.request_schema_sha256 == INVOICE_ARGUMENTS_SCHEMA_SHA256
+    return InvoiceArguments
+
+
 def _resolve_invoice_response_model(
     binding: VerifiedRuntimeBinding,
 ) -> type[BaseModel]:
-    assert binding.response_schema_sha256 == "c" * 64
+    assert binding.response_schema_sha256 == INVOICE_RESPONSE_SCHEMA_SHA256
     return InvoiceResponse
 
 
@@ -252,6 +299,7 @@ class FakeMCPHarness:
         self.initialize_delay = 0.0
         self.list_delay = 0.0
         self.call_delay = 0.0
+        self.session_exit_block = 0.0
         self.call_count = 0
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -313,6 +361,7 @@ class FakeMCPHarness:
                 return self
 
             async def __aexit__(self, *_args: object) -> None:
+                time.sleep(harness.session_exit_block)
                 return None
 
             async def initialize(self) -> object:
@@ -373,30 +422,28 @@ class FakeMCPHarness:
 def _driver(
     *,
     header_factory: Callable[[ProviderConnection], object] | None | object = _DEFAULT,
-    binding_verifier: Callable[
-        [ProviderConnection, QualifiedCapabilityBinding, str], object
-    ]
+    binding_verifier: Callable[[ProviderConnection, QualifiedCapabilityBinding, str], object]
     | None = _verify_binding,
     response_normalizer: Callable[
         [VerifiedRuntimeBinding, Mapping[str, Any]], object
     ] = _normalize_invoice,
+    request_model_resolver: Callable[[VerifiedRuntimeBinding], object]
+    | None = _resolve_invoice_request_model,
     response_model_resolver: Callable[[VerifiedRuntimeBinding], object]
     | None = _resolve_invoice_response_model,
 ) -> StreamableMCPDriver:
     manifest = load_provider_manifest(
-        Path(__file__).resolve().parents[1]
-        / "catalog/global/flowaccount/driver.json"
+        Path(__file__).resolve().parents[1] / "catalog/global/flowaccount/driver.json"
     )
     return StreamableMCPDriver(
         settings=_settings(),
         manifest=manifest,
         header_factory=(
-            (lambda _connection: _auth_headers())
-            if header_factory is _DEFAULT
-            else header_factory
+            (lambda _connection: _auth_headers()) if header_factory is _DEFAULT else header_factory
         ),
         binding_verifier=binding_verifier,
         response_normalizer=response_normalizer,
+        request_model_resolver=request_model_resolver,
         response_model_resolver=response_model_resolver,
     )
 
@@ -482,6 +529,145 @@ def test_immutable_normalized_json_serializes_without_schema_warnings() -> None:
         list.append(result.normalized_data["capabilities"], "injected")
 
 
+def test_validation_schema_digest_is_deterministic_canonical_sha256() -> None:
+    assert INVOICE_ARGUMENTS_SCHEMA_SHA256 == (
+        "e84a9c87a57519c5cd9319b40d521bf191220ecac0f77bad5f2c2c4c962953e4"
+    )
+    assert INVOICE_RESPONSE_SCHEMA_SHA256 == (
+        "bbcfbd66bf01a44d3bd842e0dd9fee3e0b76fd39f77681aa5486bd3b5ce5c85a"
+    )
+    assert (
+        streamable_module.validation_schema_sha256(InvoiceArguments)
+        == INVOICE_ARGUMENTS_SCHEMA_SHA256
+    )
+    assert (
+        streamable_module.validation_schema_sha256(InvoiceResponse)
+        == INVOICE_RESPONSE_SCHEMA_SHA256
+    )
+    assert (
+        streamable_module.validation_schema_sha256(AlternateInvoiceArguments)
+        != INVOICE_ARGUMENTS_SCHEMA_SHA256
+    )
+    with pytest.raises(TypeError):
+        streamable_module.validation_schema_sha256(OpenInvoiceModel)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "arguments",
+        "verified",
+        "request_model_resolver",
+        "response_model_resolver",
+    ),
+    [
+        (
+            AlternateInvoiceArguments(invoice_id="invoice-123"),
+            _verified_binding(),
+            lambda _binding: InvoiceArguments,
+            _resolve_invoice_response_model,
+        ),
+        (
+            InvoiceArguments.model_construct(invoice_id=123),
+            _verified_binding(),
+            _resolve_invoice_request_model,
+            _resolve_invoice_response_model,
+        ),
+        (
+            InvoiceArguments(invoice_id="invoice-123"),
+            _verified_binding(request_schema_sha256="d" * 64),
+            lambda _binding: InvoiceArguments,
+            _resolve_invoice_response_model,
+        ),
+        (
+            InvoiceArguments(invoice_id="invoice-123"),
+            _verified_binding(response_schema_sha256="e" * 64),
+            _resolve_invoice_request_model,
+            lambda _binding: InvoiceResponse,
+        ),
+        (
+            InvoiceArguments(invoice_id="invoice-123"),
+            _verified_binding(),
+            None,
+            _resolve_invoice_response_model,
+        ),
+        (
+            InvoiceArguments(invoice_id="invoice-123"),
+            _verified_binding(),
+            _resolve_invoice_request_model,
+            None,
+        ),
+        (
+            InvoiceArguments(invoice_id="invoice-123"),
+            _verified_binding(),
+            lambda _binding: OpenInvoiceModel,
+            _resolve_invoice_response_model,
+        ),
+        (
+            InvoiceArguments(invoice_id="invoice-123"),
+            _verified_binding(),
+            _resolve_invoice_request_model,
+            lambda _binding: OpenInvoiceModel,
+        ),
+    ],
+    ids=[
+        "alternate-request-model",
+        "request-model-bypassed-validation",
+        "request-schema-hash-mismatch",
+        "response-schema-hash-mismatch",
+        "missing-request-model-resolver",
+        "missing-response-model-resolver",
+        "open-request-model",
+        "open-response-model",
+    ],
+)
+async def test_catalog_schema_models_and_hashes_fail_closed_before_auth_or_session(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: BaseModel,
+    verified: VerifiedRuntimeBinding,
+    request_model_resolver: Callable[[VerifiedRuntimeBinding], object] | None,
+    response_model_resolver: Callable[[VerifiedRuntimeBinding], object] | None,
+) -> None:
+    harness = FakeMCPHarness()
+    harness.install(monkeypatch)
+    header_calls = 0
+
+    def headers(_connection: ProviderConnection) -> ProviderAuthHeaders:
+        nonlocal header_calls
+        header_calls += 1
+        return _auth_headers()
+
+    def verifier(
+        _connection: ProviderConnection,
+        _binding: QualifiedCapabilityBinding,
+        _resource_uri_sha256: str,
+    ) -> VerifiedRuntimeBinding:
+        return verified
+
+    with pytest.raises(ProviderRuntimeError) as error:
+        await _driver(
+            header_factory=headers,
+            binding_verifier=verifier,
+            request_model_resolver=request_model_resolver,
+            response_model_resolver=response_model_resolver,
+        ).call(
+            _connection(),
+            _binding(),
+            arguments,
+            OPERATION_ID,
+        )
+
+    _assert_sanitized_error(
+        error.value,
+        code="provider_response_invalid",
+        dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+    )
+    assert header_calls == 0
+    assert harness.clients == []
+    assert harness.sessions == []
+    assert harness.call_count == 0
+
+
 @pytest.mark.parametrize(
     "reserved_key",
     ["sessionId", "session-id", "MCP-Session-Id", "toolName", "tool-name"],
@@ -565,9 +751,7 @@ async def test_untrusted_binding_must_match_exact_enabled_verified_runtime_bindi
         binding: QualifiedCapabilityBinding,
         resource_uri_sha256: str,
     ) -> VerifiedRuntimeBinding:
-        verifier_inputs.append(
-            (connection.id, binding.qualification_hash, resource_uri_sha256)
-        )
+        verifier_inputs.append((connection.id, binding.qualification_hash, resource_uri_sha256))
         return verified
 
     def headers(_connection: ProviderConnection) -> ProviderAuthHeaders:
@@ -697,6 +881,34 @@ async def test_connection_auth_method_must_match_manifest_before_adapter_invocat
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "auth_headers",
+    [
+        _auth_headers(provider=ProviderId.PEAK),
+        _auth_headers(authorization_method=AuthorizationMethod.PROVIDER_CREDENTIALS),
+    ],
+    ids=["wrong-provider", "wrong-authorization-method"],
+)
+async def test_auth_header_result_identity_must_match_connection_and_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+    auth_headers: ProviderAuthHeaders,
+) -> None:
+    harness = FakeMCPHarness()
+    harness.install(monkeypatch)
+
+    with pytest.raises(ProviderRuntimeError) as error:
+        await _driver(header_factory=lambda _connection: auth_headers).discover(_connection())
+
+    _assert_sanitized_error(
+        error.value,
+        code="provider_auth_required",
+        dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+    )
+    assert harness.clients == []
+    assert harness.sessions == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "headers",
     [
         (
@@ -751,9 +963,7 @@ async def test_auth_header_result_rejects_duplicates_and_protocol_controls(
     malformed = ProviderAuthHeaders.model_construct(headers=headers)
 
     with pytest.raises(ProviderRuntimeError) as error:
-        await _driver(header_factory=lambda _connection: malformed).discover(
-            _connection()
-        )
+        await _driver(header_factory=lambda _connection: malformed).discover(_connection())
 
     _assert_sanitized_error(
         error.value,
@@ -883,33 +1093,44 @@ async def test_real_mcp_transport_logs_are_suppressed_for_process_lifetime(
 
 
 @pytest.mark.asyncio
-async def test_provider_log_suppression_is_request_scoped_and_concurrency_safe(
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+async def test_provider_log_boundary_covers_descendants_and_is_concurrency_safe(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
+    level: int,
 ) -> None:
     harness = FakeMCPHarness()
     harness.install(monkeypatch)
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(level)
 
     async def logging_headers(
         _connection: ProviderConnection,
     ) -> ProviderAuthHeaders:
         for logger_name in (
             "",
-            "client",
-            "httpx",
-            "httpcore.connection",
-            "httpcore.http11",
+            "client.child",
+            "mcp.client.session",
+            "httpx.child",
+            "httpcore.connection.child",
+            "httpcore.http11.child",
         ):
-            logging.getLogger(logger_name).debug(
-                "PRIVATE_PROVIDER_LOG_SENTINEL"
+            raw_error = RuntimeError("PRIVATE_LOG_EXCEPTION_SENTINEL")
+            logging.getLogger(logger_name).log(
+                level,
+                "PRIVATE_PROVIDER_LOG_SENTINEL %s",
+                "PRIVATE_LOG_ARGUMENT_SENTINEL",
+                exc_info=(RuntimeError, raw_error, raw_error.__traceback__),
+                stack_info=True,
             )
         await asyncio.sleep(0)
         return _auth_headers()
 
     async def unrelated_log() -> None:
         await asyncio.sleep(0)
-        logging.getLogger("httpx").debug("PUBLIC_CONCURRENT_LOG_SENTINEL")
+        logging.getLogger("httpx.child").log(
+            level,
+            "PUBLIC_CONCURRENT_LOG_SENTINEL",
+        )
 
     await asyncio.gather(
         _driver(header_factory=logging_headers).discover(_connection()),
@@ -918,7 +1139,100 @@ async def test_provider_log_suppression_is_request_scoped_and_concurrency_safe(
 
     rendered = caplog.text
     assert "PRIVATE_PROVIDER_LOG_SENTINEL" not in rendered
+    assert "PRIVATE_LOG_ARGUMENT_SENTINEL" not in rendered
+    assert "PRIVATE_LOG_EXCEPTION_SENTINEL" not in rendered
+    assert "provider_runtime_log_redacted" in rendered
     assert "PUBLIC_CONCURRENT_LOG_SENTINEL" in rendered
+    redacted_records = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "provider_runtime_log_redacted"
+    ]
+    assert redacted_records
+    assert all(record.msg == "provider_runtime_log_redacted" for record in redacted_records)
+    assert all(record.args == () for record in redacted_records)
+    assert all(record.exc_info is None for record in redacted_records)
+    assert all(record.stack_info is None for record in redacted_records)
+
+
+async def _exercise_actual_client_call_tool_warning() -> None:
+    server_send, client_receive = anyio.create_memory_object_stream(4)
+    client_send, server_receive = anyio.create_memory_object_stream(4)
+
+    async def respond() -> None:
+        async with server_send, server_receive:
+            async for request in server_receive:
+                root = request.message.root
+                method = getattr(root, "method", None)
+                request_id = getattr(root, "id", None)
+                if request_id is None:
+                    continue
+                if method == "initialize":
+                    result = {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "serverInfo": {
+                            "name": "PRIVATE_SERVER_SENTINEL",
+                            "version": "1",
+                        },
+                    }
+                elif method == "tools/call":
+                    result = {
+                        "content": [],
+                        "structuredContent": {
+                            "invoice_id": "invoice-123",
+                        },
+                        "isError": False,
+                    }
+                elif method == "tools/list":
+                    result = {"tools": []}
+                else:
+                    result = {}
+                await server_send.send(
+                    SessionMessage(
+                        JSONRPCMessage(
+                            JSONRPCResponse(
+                                jsonrpc="2.0",
+                                id=request_id,
+                                result=result,
+                            )
+                        )
+                    )
+                )
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(respond)
+        with streamable_module._provider_log_suppression():
+            async with ClientSession(
+                client_receive,
+                client_send,
+                read_timeout_seconds=timedelta(seconds=0.1),
+            ) as session:
+                await session.initialize()
+                result = await session.call_tool(
+                    "PRIVATE_PROVIDER_TOOL_SENTINEL",
+                    {"invoice_id": "PRIVATE_ARGUMENT_SENTINEL"},
+                    read_timeout_seconds=timedelta(seconds=0.1),
+                )
+                assert result.isError is False
+        task_group.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+async def test_actual_successful_client_session_warning_is_redacted_before_handlers(
+    caplog: pytest.LogCaptureFixture,
+    level: int,
+) -> None:
+    caplog.set_level(level)
+
+    await _exercise_actual_client_call_tool_warning()
+
+    rendered = caplog.text
+    assert "PRIVATE_PROVIDER_TOOL_SENTINEL" not in rendered
+    assert "PRIVATE_ARGUMENT_SENTINEL" not in rendered
+    assert "PRIVATE_SERVER_SENTINEL" not in rendered
+    assert "provider_runtime_log_redacted" in rendered
 
 
 @pytest.mark.asyncio
@@ -975,6 +1289,7 @@ async def test_registry_injects_trusted_runtime_and_response_schema_boundaries(
         },
         binding_verifier=_verify_binding,
         response_normalizer=_normalize_invoice,
+        request_model_resolver=_resolve_invoice_request_model,
         response_model_resolver=_resolve_invoice_response_model,
     )
 
@@ -1024,9 +1339,7 @@ async def test_every_operation_uses_fresh_scoped_client_session_and_timeout(
     )
     await driver.call(
         second,
-        _binding(ProviderOperationClass.CREATE).model_copy(
-            update={"environment": "production"}
-        ),
+        _binding(ProviderOperationClass.CREATE).model_copy(update={"environment": "production"}),
         InvoiceArguments(invoice_id="invoice-456"),
         UUID("99999999-9999-4999-8999-999999999999"),
     )
@@ -1037,10 +1350,12 @@ async def test_every_operation_uses_fresh_scoped_client_session_and_timeout(
     assert all(client.follow_redirects is False for client in harness.clients)
     assert [client.timeout.connect for client in harness.clients] == [5, 5, 5, 5]
     assert [client.timeout.read for client in harness.clients] == [30, 30, 30, 60]
-    assert [
-        session.read_timeout_seconds.total_seconds()
-        for session in harness.sessions
-    ] == [30, 30, 30, 60]
+    assert [session.read_timeout_seconds.total_seconds() for session in harness.sessions] == [
+        30,
+        30,
+        30,
+        60,
+    ]
     assert harness.clients[0].headers != harness.clients[1].headers
     assert harness.clients[0].headers == harness.clients[2].headers
     assert harness.clients[1].headers == harness.clients[3].headers
@@ -1054,8 +1369,7 @@ async def test_driver_retains_its_own_revalidated_manifest_copy(
     harness = FakeMCPHarness()
     harness.install(monkeypatch)
     manifest = load_provider_manifest(
-        Path(__file__).resolve().parents[1]
-        / "catalog/global/flowaccount/driver.json"
+        Path(__file__).resolve().parents[1] / "catalog/global/flowaccount/driver.json"
     )
     driver = StreamableMCPDriver(
         settings=_settings(),
@@ -1101,6 +1415,179 @@ async def test_operation_deadline_includes_header_resolution(
     )
     assert harness.clients == []
     assert harness.sessions == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "blocked_seam",
+    [
+        "header-factory",
+        "binding-verifier",
+        "request-model-resolver",
+        "response-model-resolver",
+        "request-serialization",
+    ],
+)
+async def test_blocking_synchronous_predispatch_seams_cannot_dispatch_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_seam: str,
+) -> None:
+    harness = FakeMCPHarness()
+    harness.install(monkeypatch)
+    arguments: BaseModel = InvoiceArguments(invoice_id="invoice-123")
+    verified = _verified_binding()
+
+    def header_factory(_connection: ProviderConnection) -> ProviderAuthHeaders:
+        if blocked_seam == "header-factory":
+            time.sleep(0.08)
+        return _auth_headers()
+
+    def verifier(
+        connection: ProviderConnection,
+        binding: QualifiedCapabilityBinding,
+        resource_uri_sha256: str,
+    ) -> VerifiedRuntimeBinding:
+        if blocked_seam == "binding-verifier":
+            time.sleep(0.08)
+        return verified.model_copy(
+            update={
+                "provider": connection.provider,
+                "environment": binding.environment,
+                "resource_uri_sha256": resource_uri_sha256,
+                "normalized_capability": binding.normalized_capability,
+                "provider_tool": binding.provider_tool,
+                "operation_class": binding.operation_class,
+                "qualification_hash": binding.qualification_hash,
+            }
+        )
+
+    def request_resolver(
+        _binding: VerifiedRuntimeBinding,
+    ) -> type[BaseModel]:
+        if blocked_seam == "request-model-resolver":
+            time.sleep(0.08)
+        return type(arguments)
+
+    def response_resolver(
+        _binding: VerifiedRuntimeBinding,
+    ) -> type[BaseModel]:
+        if blocked_seam == "response-model-resolver":
+            time.sleep(0.08)
+        return InvoiceResponse
+
+    if blocked_seam == "request-serialization":
+
+        class BlockingInvoiceArguments(BaseModel):
+            model_config = ConfigDict(
+                extra="forbid",
+                frozen=True,
+                revalidate_instances="always",
+            )
+
+            invoice_id: str
+
+            def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+                time.sleep(0.08)
+                return super().model_dump(*args, **kwargs)
+
+        arguments = BlockingInvoiceArguments(invoice_id="invoice-123")
+        verified = verified.model_copy(
+            update={"request_schema_sha256": _validation_schema_sha256(BlockingInvoiceArguments)}
+        )
+
+    driver = _driver(
+        header_factory=header_factory,
+        binding_verifier=verifier,
+        request_model_resolver=request_resolver,
+        response_model_resolver=response_resolver,
+    )
+    monkeypatch.setattr(driver, "_operation_seconds", lambda _timeout_class: 0.05)
+
+    with pytest.raises(ProviderRuntimeError) as error:
+        await driver.call(
+            _connection(),
+            _binding(),
+            arguments,
+            OPERATION_ID,
+        )
+
+    _assert_sanitized_error(
+        error.value,
+        code="provider_timeout_pre_dispatch",
+        dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+    )
+    assert harness.clients == []
+    assert harness.sessions == []
+    assert harness.call_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("blocked_seam", "operation_class", "expected_code", "expected_certainty"),
+    [
+        (
+            "normalizer",
+            ProviderOperationClass.READ,
+            "provider_unavailable",
+            DispatchCertainty.DISPATCHED,
+        ),
+        (
+            "normalizer",
+            ProviderOperationClass.CREATE,
+            "provider_outcome_unknown",
+            DispatchCertainty.UNKNOWN,
+        ),
+        (
+            "teardown",
+            ProviderOperationClass.READ,
+            "provider_unavailable",
+            DispatchCertainty.DISPATCHED,
+        ),
+        (
+            "teardown",
+            ProviderOperationClass.CREATE,
+            "provider_outcome_unknown",
+            DispatchCertainty.UNKNOWN,
+        ),
+    ],
+)
+async def test_blocking_synchronous_postdispatch_work_cannot_return_success(
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_seam: str,
+    operation_class: ProviderOperationClass,
+    expected_code: str,
+    expected_certainty: DispatchCertainty,
+) -> None:
+    harness = FakeMCPHarness()
+    if blocked_seam == "teardown":
+        harness.session_exit_block = 0.08
+    harness.install(monkeypatch)
+
+    def normalizer(
+        binding: VerifiedRuntimeBinding,
+        structured_content: Mapping[str, Any],
+    ) -> BaseModel:
+        if blocked_seam == "normalizer":
+            time.sleep(0.08)
+        return _normalize_invoice(binding, structured_content)
+
+    driver = _driver(response_normalizer=normalizer)
+    monkeypatch.setattr(driver, "_operation_seconds", lambda _timeout_class: 0.05)
+
+    with pytest.raises(ProviderRuntimeError) as error:
+        await driver.call(
+            _connection(),
+            _binding(operation_class),
+            InvoiceArguments(invoice_id="invoice-123"),
+            OPERATION_ID,
+        )
+
+    assert harness.call_count == 1
+    _assert_sanitized_error(
+        error.value,
+        code=expected_code,
+        dispatch_certainty=expected_certainty,
+    )
 
 
 @pytest.mark.asyncio
@@ -1257,6 +1744,199 @@ async def test_actual_client_session_timeout_and_protocol_errors_are_closed(
     )
 
 
+def _install_real_mock_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    observed_requests: list[str],
+) -> None:
+    real_async_client = httpx.AsyncClient
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            observed_requests.append("DELETE")
+            if scenario == "teardown":
+                raise httpx.ConnectError(
+                    "PRIVATE_TEARDOWN_SENTINEL",
+                    request=request,
+                )
+            return httpx.Response(200, request=request)
+        if request.method == "GET":
+            observed_requests.append("GET")
+            return httpx.Response(405, request=request)
+
+        payload = json.loads(request.content)
+        method = payload.get("method")
+        observed_requests.append(f"POST:{method}")
+        if method == "notifications/initialized":
+            return httpx.Response(202, request=request)
+        if method == "initialize":
+            if scenario == "network-close":
+                raise httpx.ConnectError(
+                    "PRIVATE_NETWORK_CLOSE_SENTINEL",
+                    request=request,
+                )
+            if scenario == "malformed-initialize":
+                return httpx.Response(
+                    200,
+                    headers={"Content-Type": "application/json"},
+                    content=b"PRIVATE_MALFORMED_INITIALIZE_SENTINEL",
+                    request=request,
+                )
+            if scenario == "mcp-408":
+                return httpx.Response(
+                    200,
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": payload["id"],
+                        "error": {
+                            "code": 408,
+                            "message": "PRIVATE_MCP_408_SENTINEL",
+                        },
+                    },
+                    request=request,
+                )
+            protocol_version = "2099-01-01" if scenario == "unsupported-protocol" else "2025-11-25"
+            return httpx.Response(
+                200,
+                headers={
+                    "Content-Type": "application/json",
+                    "Mcp-Session-Id": "PRIVATE_SESSION_SENTINEL",
+                },
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": protocol_version,
+                        "capabilities": {},
+                        "serverInfo": {
+                            "name": "PRIVATE_SERVER_SENTINEL",
+                            "version": "1",
+                        },
+                    },
+                },
+                request=request,
+            )
+        if method == "tools/list":
+            if scenario == "malformed-list":
+                return httpx.Response(
+                    200,
+                    headers={"Content-Type": "application/json"},
+                    content=b"PRIVATE_MALFORMED_LIST_SENTINEL",
+                    request=request,
+                )
+            result: Mapping[str, Any] = {} if scenario == "invalid-parsed-list" else {"tools": []}
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "application/json"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": result,
+                },
+                request=request,
+            )
+        return httpx.Response(202, request=request)
+
+    def build_client(
+        *,
+        headers: Mapping[str, str],
+        timeout: httpx.Timeout,
+        follow_redirects: bool,
+        event_hooks: Mapping[str, list[Callable[[httpx.Response], object]]],
+    ) -> httpx.AsyncClient:
+        return real_async_client(
+            headers=headers,
+            timeout=timeout,
+            follow_redirects=follow_redirects,
+            event_hooks=event_hooks,
+            transport=httpx.MockTransport(handler),
+        )
+
+    monkeypatch.setattr(streamable_module.httpx, "AsyncClient", build_client)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "expected_code"),
+    [
+        ("malformed-initialize", "provider_schema_changed"),
+        ("malformed-list", "provider_schema_changed"),
+        ("invalid-parsed-list", "provider_schema_changed"),
+        ("unsupported-protocol", "provider_schema_changed"),
+        ("mcp-408", "provider_timeout_pre_dispatch"),
+        ("network-close", "provider_unavailable"),
+    ],
+)
+async def test_real_driver_transport_failures_are_precisely_classified(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    scenario: str,
+    expected_code: str,
+) -> None:
+    observed_requests: list[str] = []
+    _install_real_mock_transport(monkeypatch, scenario, observed_requests)
+    caplog.set_level(logging.DEBUG)
+    driver = _driver()
+    monkeypatch.setattr(driver, "_operation_seconds", lambda _timeout_class: 0.08)
+
+    with pytest.raises(ProviderRuntimeError) as error:
+        await driver.discover(_connection())
+
+    _assert_sanitized_error(
+        error.value,
+        code=expected_code,
+        dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+    )
+    assert "POST:initialize" in observed_requests
+    if scenario in {"malformed-list", "invalid-parsed-list"}:
+        assert "POST:tools/list" in observed_requests
+    rendered = caplog.text
+    for sentinel in (
+        "PRIVATE_MALFORMED_INITIALIZE_SENTINEL",
+        "PRIVATE_MALFORMED_LIST_SENTINEL",
+        "PRIVATE_MCP_408_SENTINEL",
+        "PRIVATE_NETWORK_CLOSE_SENTINEL",
+        "PRIVATE_SESSION_SENTINEL",
+        "PRIVATE_SERVER_SENTINEL",
+    ):
+        assert sentinel not in rendered
+
+
+@pytest.mark.asyncio
+async def test_real_driver_teardown_error_is_suppressed_and_does_not_change_success(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    observed_requests: list[str] = []
+    _install_real_mock_transport(monkeypatch, "teardown", observed_requests)
+    caplog.set_level(logging.DEBUG)
+
+    result = await _driver().discover(_connection())
+
+    assert result.status_class is ProviderStatusClass.SUCCESS
+    assert "DELETE" in observed_requests
+    assert "PRIVATE_TEARDOWN_SENTINEL" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ordinary_initialize_runtime_error_is_unavailable_not_schema_changed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = FakeMCPHarness()
+    harness.initialize_error = RuntimeError("PRIVATE_NETWORK_CLOSE_SENTINEL")
+    harness.install(monkeypatch)
+
+    with pytest.raises(ProviderRuntimeError) as error:
+        await _driver().discover(_connection())
+
+    _assert_sanitized_error(
+        error.value,
+        code="provider_unavailable",
+        dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+    )
+
+
 @pytest.mark.asyncio
 async def test_predispatch_failures_are_classified_without_raw_boundary_data(
     monkeypatch: pytest.MonkeyPatch,
@@ -1332,9 +2012,7 @@ async def test_http_auth_and_unknown_transport_errors_are_sanitized(
         dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
     )
 
-    harness.transport_error = RuntimeError(
-        "PRIVATE_RAW_TOOL PRIVATE_SESSION_SENTINEL X-Private"
-    )
+    harness.transport_error = RuntimeError("PRIVATE_RAW_TOOL PRIVATE_SESSION_SENTINEL X-Private")
     with pytest.raises(ProviderRuntimeError) as unavailable_error:
         await _driver().discover(_connection())
     _assert_sanitized_error(
@@ -1424,11 +2102,12 @@ async def test_read_response_schema_and_normalizer_failures_are_closed(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("normalizer", "response_model_resolver"),
+    ("normalizer", "response_model_resolver", "expected_certainty"),
     [
         (
             lambda _binding, _content: {"invoice_id": "invoice-123"},
             _resolve_invoice_response_model,
+            DispatchCertainty.DISPATCHED,
         ),
         (
             lambda _binding, _content: BoundaryResponse(
@@ -1436,16 +2115,17 @@ async def test_read_response_schema_and_normalizer_failures_are_closed(
                 metadata=BoundaryMetadata(alias="safe"),
             ),
             _resolve_invoice_response_model,
+            DispatchCertainty.DISPATCHED,
         ),
         (
-            lambda _binding, _content: InvoiceResponse.model_construct(
-                invoice_id=123
-            ),
+            lambda _binding, _content: InvoiceResponse.model_construct(invoice_id=123),
             _resolve_invoice_response_model,
+            DispatchCertainty.DISPATCHED,
         ),
         (
             _normalize_invoice,
             None,
+            DispatchCertainty.NOT_DISPATCHED,
         ),
     ],
     ids=[
@@ -1459,6 +2139,7 @@ async def test_response_normalizer_requires_revalidated_exact_catalog_response_m
     monkeypatch: pytest.MonkeyPatch,
     normalizer: Callable[[VerifiedRuntimeBinding, Mapping[str, Any]], object],
     response_model_resolver: Callable[[VerifiedRuntimeBinding], object] | None,
+    expected_certainty: DispatchCertainty,
 ) -> None:
     harness = FakeMCPHarness()
     harness.install(monkeypatch)
@@ -1477,7 +2158,7 @@ async def test_response_normalizer_requires_revalidated_exact_catalog_response_m
     _assert_sanitized_error(
         error.value,
         code="provider_response_invalid",
-        dispatch_certainty=DispatchCertainty.DISPATCHED,
+        dispatch_certainty=expected_certainty,
     )
 
 
@@ -1508,7 +2189,11 @@ async def test_response_schema_resolver_receives_verified_catalog_schema_hash(
 
     assert result.normalized_data == {"invoice_id": "invoice-123"}
     assert observed == [
-        ("documents.invoice.get", "1.0.0", "c" * 64),
+        (
+            "documents.invoice.get",
+            "1.0.0",
+            INVOICE_RESPONSE_SCHEMA_SHA256,
+        ),
     ]
 
 
@@ -1540,8 +2225,20 @@ async def test_normalized_response_rejects_request_boundary_values_under_nested_
             metadata=BoundaryMetadata(alias=boundary_value),
         )
 
+    def verify_boundary_response(
+        connection: ProviderConnection,
+        binding: QualifiedCapabilityBinding,
+        resource_uri_sha256: str,
+    ) -> VerifiedRuntimeBinding:
+        return _verify_binding(
+            connection,
+            binding,
+            resource_uri_sha256,
+        ).model_copy(update={"response_schema_sha256": _validation_schema_sha256(BoundaryResponse)})
+
     with pytest.raises(ProviderRuntimeError) as error:
         await _driver(
+            binding_verifier=verify_boundary_response,
             response_normalizer=unsafe_normalizer,
             response_model_resolver=lambda _binding: BoundaryResponse,
         ).call(
