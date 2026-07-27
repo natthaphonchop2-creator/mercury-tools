@@ -20,6 +20,7 @@ PUBLIC_PATHS = frozenset(
         "/support",
         "/.well-known/oauth-protected-resource",
         "/.well-known/oauth-protected-resource/mcp",
+        "/auth/providers/flowaccount/callback",
     }
 )
 REQUIRED_IDENTITY_SCOPES = frozenset({"openid", "email", "profile"})
@@ -91,9 +92,7 @@ class MercuryOAuthMiddleware(BaseHTTPMiddleware):
             {"error": "mercury_auth_required"},
             status_code=401,
             headers={
-                "WWW-Authenticate": (
-                    f'Bearer resource_metadata="{self.resource_metadata_url}"'
-                )
+                "WWW-Authenticate": (f'Bearer resource_metadata="{self.resource_metadata_url}"')
             },
         )
 

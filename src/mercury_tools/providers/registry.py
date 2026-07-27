@@ -7,6 +7,10 @@ from pathlib import Path
 
 from mercury_tools.config import Settings
 from mercury_tools.providers.base import ProviderDriver
+from mercury_tools.providers.flowaccount import (
+    FlowAccountMCPDriver,
+    FlowAccountProfileBindingResolver,
+)
 from mercury_tools.providers.manifest import load_provider_manifest
 from mercury_tools.providers.models import AuthorizationMethod, ProviderId
 from mercury_tools.providers.streamable_mcp import (
@@ -55,6 +59,7 @@ def build_provider_registry(
     response_normalizer: ResponseNormalizer | None = None,
     request_model_resolver: RequestModelResolver | None = None,
     response_model_resolver: ResponseModelResolver | None = None,
+    flowaccount_profile_binding_resolver: (FlowAccountProfileBindingResolver | None) = None,
 ) -> ProviderDriverRegistry:
     """Load the two server-controlled manifests without accepting resource URLs."""
 
@@ -63,17 +68,25 @@ def build_provider_registry(
     registry = ProviderDriverRegistry()
     for provider in (ProviderId.FLOWACCOUNT, ProviderId.PEAK):
         manifest = load_provider_manifest(root / provider.value / "driver.json")
-        registry.register(
-            StreamableMCPDriver(
-                settings=settings,
-                manifest=manifest,
-                header_factory=factories.get(manifest.auth_adapter),
-                binding_verifier=binding_verifier,
-                response_normalizer=response_normalizer,
-                request_model_resolver=request_model_resolver,
-                response_model_resolver=response_model_resolver,
-            )
+        runtime = StreamableMCPDriver(
+            settings=settings,
+            manifest=manifest,
+            header_factory=factories.get(manifest.auth_adapter),
+            binding_verifier=binding_verifier,
+            response_normalizer=response_normalizer,
+            request_model_resolver=request_model_resolver,
+            response_model_resolver=response_model_resolver,
         )
+        if provider is ProviderId.FLOWACCOUNT and flowaccount_profile_binding_resolver is not None:
+            registry.register(
+                FlowAccountMCPDriver(
+                    runtime=runtime,
+                    manifest=manifest,
+                    profile_binding_resolver=(flowaccount_profile_binding_resolver),
+                )
+            )
+        else:
+            registry.register(runtime)
     return registry
 
 
