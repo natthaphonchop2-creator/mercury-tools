@@ -163,6 +163,7 @@ def _require_process_v1_configuration(enabled: bool) -> None:
         if enabled != _PROCESS_V1_ENABLED:
             raise RuntimeError("mercury_v1_process_configuration_conflict")
 
+
 _SEARCH_FILTER_FIELDS = frozenset(SearchFilters.__dataclass_fields__)
 MAX_MCP_FLOW_FILES = 50
 MAX_MCP_FLOW_FILE_CHARS = 500_000
@@ -2195,9 +2196,7 @@ def connector_status(
                     active_context.get("readiness_basis") if active_context else None
                 ),
                 "provider_called_by_mercury": (
-                    active_context.get("provider_called_by_mercury")
-                    if active_context
-                    else None
+                    active_context.get("provider_called_by_mercury") if active_context else None
                 ),
                 "setup_required": not bool(active_context),
                 "next_tool": (
@@ -3893,6 +3892,7 @@ def create_http_app(
     *,
     require_auth: bool | None = None,
     cloud_dependencies: CloudDependencies | None = None,
+    provider_oauth_service: Any | None = None,
     principal_resolver: PrincipalResolver | None = None,
     consent_handoff: ConsentHandoff | None = None,
     consent_http_client: httpx.AsyncClient | None = None,
@@ -3910,6 +3910,12 @@ def create_http_app(
         if allowed_origin and allowed_origin not in mcp.settings.transport_security.allowed_origins:
             mcp.settings.transport_security.allowed_origins.append(allowed_origin)
     public_app = mcp.streamable_http_app()
+    if cloud_dependencies is not None and provider_oauth_service is not None:
+        raise RuntimeError("provider_oauth_service_dependency_conflict")
+    selected_cloud_dependencies = cloud_dependencies or CloudDependencies(
+        settings=settings,
+        provider_oauth_service=provider_oauth_service,
+    )
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -3918,7 +3924,7 @@ def create_http_app(
 
     routes = [
         *public_app.routes,
-        *cloud_routes(cloud_dependencies or CloudDependencies(settings=settings)),
+        *cloud_routes(selected_cloud_dependencies),
     ]
     if settings.v1_enabled:
         routes.extend(protected_resource_routes(settings))
@@ -3945,10 +3951,7 @@ def create_http_app(
                 http_client=consent_http_client,
             ),
             canonical_resource=settings.canonical_mcp_resource,
-            browser_origin=(
-                settings.provider_callback_base_url
-                or settings.canonical_mcp_resource
-            ),
+            browser_origin=(settings.provider_callback_base_url or settings.canonical_mcp_resource),
             session_cookie=session_cookie,
         )
         app.add_route("/oauth/consent", consent.show, methods=["GET"])

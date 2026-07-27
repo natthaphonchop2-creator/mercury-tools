@@ -33,6 +33,18 @@ PUBLISHABLE_KEY = "sb_publishable_test"
 FORM_HEADERS = {"Origin": MERCURY_ORIGIN}
 
 
+class UnusedProviderOAuthService:
+    async def complete_callback(self, _callback: object) -> None:
+        raise AssertionError("consent tests must not invoke provider OAuth")
+
+
+def _create_http_app(**kwargs: object):
+    return create_http_app(
+        provider_oauth_service=UnusedProviderOAuthService(),
+        **kwargs,
+    )
+
+
 class StubConsentHandoff:
     def __init__(self, details: ConsentDetails) -> None:
         self.details = details
@@ -113,7 +125,7 @@ def _details(**overrides: object) -> ConsentDetails:
 
 def _client(handoff: StubConsentHandoff) -> TestClient:
     return TestClient(
-        create_http_app(consent_handoff=handoff),
+        _create_http_app(consent_handoff=handoff),
         base_url=MERCURY_ORIGIN,
         raise_server_exceptions=False,
     )
@@ -158,9 +170,9 @@ def test_consent_displays_verified_client_scopes_resource_and_workspace_access()
 def test_consent_rejects_wildcard_or_unsafe_hosted_redirect_uri(
     redirect_uri: str,
 ) -> None:
-    response = _client(
-        StubConsentHandoff(_details(redirect_uri=redirect_uri))
-    ).get(f"/oauth/consent?authorization_id={AUTHORIZATION_ID}")
+    response = _client(StubConsentHandoff(_details(redirect_uri=redirect_uri))).get(
+        f"/oauth/consent?authorization_id={AUTHORIZATION_ID}"
+    )
 
     assert response.status_code == 400
     assert response.json() == {"error": "mercury_authorization_invalid"}
@@ -172,9 +184,7 @@ def test_consent_rejects_mismatched_oauth_transaction() -> None:
         _details().model_copy(update={"authorization_id": "auth_txn_ffffffffffffffff"})
     )
 
-    response = _client(handoff).get(
-        f"/oauth/consent?authorization_id={AUTHORIZATION_ID}"
-    )
+    response = _client(handoff).get(f"/oauth/consent?authorization_id={AUTHORIZATION_ID}")
 
     assert response.status_code == 400
     assert response.json() == {"error": "mercury_authorization_invalid"}
@@ -444,10 +454,10 @@ def test_default_browser_sign_in_session_details_and_decision_handoff(
     async_client = httpx.AsyncClient(transport=httpx.MockTransport(supabase))
     try:
         client = TestClient(
-            create_http_app(consent_http_client=async_client),
+            _create_http_app(consent_http_client=async_client),
             base_url=MERCURY_ORIGIN,
             raise_server_exceptions=False,
-            )
+        )
         unauthenticated = client.get(
             f"/oauth/consent?authorization_id={AUTHORIZATION_ID}",
             follow_redirects=False,
@@ -506,8 +516,7 @@ def test_default_browser_sign_in_session_details_and_decision_handoff(
         )
         assert decided.status_code == 303
         assert decided.headers["location"] == (
-            "https://client.example/oauth/callback"
-            f"?code=opaque-{decision}&state=opaque-state"
+            f"https://client.example/oauth/callback?code=opaque-{decision}&state=opaque-state"
         )
         assert access_token not in decided.text
         assert refresh_token not in decided.text
@@ -532,8 +541,7 @@ def test_default_handoff_accepts_trusted_auto_approval_response() -> None:
             200,
             json={
                 "redirect_url": (
-                    "https://client.example/oauth/callback"
-                    "?code=auto-approved&state=opaque"
+                    "https://client.example/oauth/callback?code=auto-approved&state=opaque"
                 )
             },
         )
@@ -541,7 +549,7 @@ def test_default_handoff_accepts_trusted_auto_approval_response() -> None:
     async_client = httpx.AsyncClient(transport=httpx.MockTransport(supabase))
     try:
         client = TestClient(
-            create_http_app(consent_http_client=async_client),
+            _create_http_app(consent_http_client=async_client),
             base_url=MERCURY_ORIGIN,
             raise_server_exceptions=False,
         )
@@ -564,8 +572,7 @@ def test_default_handoff_accepts_trusted_auto_approval_response() -> None:
 
     assert approved.status_code == 303
     assert approved.headers["location"] == (
-        "https://client.example/oauth/callback"
-        "?code=auto-approved&state=opaque"
+        "https://client.example/oauth/callback?code=auto-approved&state=opaque"
     )
 
 
@@ -605,7 +612,7 @@ def test_default_handoff_rejects_non_string_scope_with_sanitized_error(
     async_client = httpx.AsyncClient(transport=httpx.MockTransport(supabase))
     try:
         client = TestClient(
-            create_http_app(consent_http_client=async_client),
+            _create_http_app(consent_http_client=async_client),
             base_url=MERCURY_ORIGIN,
             raise_server_exceptions=False,
         )
@@ -663,9 +670,7 @@ details = ConsentDetails(
 print(_render_consent(details, canonical_resource="https://resource.example/mcp"))
 """
     env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(
-        (str(tmp_path / "installed"), env.get("PYTHONPATH", ""))
-    )
+    env["PYTHONPATH"] = os.pathsep.join((str(tmp_path / "installed"), env.get("PYTHONPATH", "")))
     rendered = subprocess.run(
         [sys.executable, "-c", code],
         cwd=tmp_path,

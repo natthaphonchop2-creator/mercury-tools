@@ -49,6 +49,10 @@ from mercury_tools.providers.base import (
     QualifiedCapabilityBinding,
     VerifiedRuntimeBinding,
 )
+from mercury_tools.providers.flowaccount import (
+    FlowAccountProfile,
+    FlowAccountProfileRequest,
+)
 from mercury_tools.providers.manifest import load_provider_manifest
 from mercury_tools.providers.models import (
     AuthorizationMethod,
@@ -2345,11 +2349,15 @@ async def test_registry_injects_trusted_runtime_and_response_schema_boundaries(
         response_normalizer=_normalize_invoice,
         request_model_resolver=_resolve_invoice_request_model,
         response_model_resolver=_resolve_invoice_response_model,
+        flowaccount_profile_binding_resolver=lambda _connection, provider_tool: _binding(
+            provider_tool=provider_tool,
+            normalized_capability="provider_profile.get",
+        ),
     )
 
     result = await registry.get(ProviderId.FLOWACCOUNT).call(
         _connection(),
-        _binding(),
+        _binding(provider_tool="get_invoice"),
         InvoiceArguments(invoice_id="invoice-123"),
         OPERATION_ID,
     )
@@ -2360,6 +2368,81 @@ async def test_registry_injects_trusted_runtime_and_response_schema_boundaries(
         "initialize",
         "call_tool",
     ]
+
+
+@pytest.mark.asyncio
+async def test_registry_runtime_normalizes_raw_nested_flowaccount_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = FakeMCPHarness()
+    harness.call_result = SimpleNamespace(
+        structuredContent={
+            "company": {
+                "id": "company-123",
+                "display_name": "FlowAccount Test Company",
+            }
+        },
+        isError=False,
+    )
+    harness.install(monkeypatch)
+
+    def verify_profile(
+        connection: ProviderConnection,
+        binding: QualifiedCapabilityBinding,
+        resource_uri_sha256: str,
+    ) -> VerifiedRuntimeBinding:
+        verified = _verify_binding(connection, binding, resource_uri_sha256)
+        if binding.normalized_capability == "provider_profile.get":
+            return verified.model_copy(
+                update={
+                    "request_schema_sha256": _wire_schema_sha256(FlowAccountProfileRequest),
+                    "response_schema_sha256": _wire_schema_sha256(FlowAccountProfile),
+                }
+            )
+        return verified
+
+    def request_model(binding: VerifiedRuntimeBinding) -> type[BaseModel]:
+        if binding.normalized_capability == "provider_profile.get":
+            return FlowAccountProfileRequest
+        return _resolve_invoice_request_model(binding)
+
+    def response_model(binding: VerifiedRuntimeBinding) -> type[BaseModel]:
+        if binding.normalized_capability == "provider_profile.get":
+            return FlowAccountProfile
+        return _resolve_invoice_response_model(binding)
+
+    registry = build_provider_registry(
+        settings=_settings(),
+        manifest_root=Path(__file__).resolve().parents[1] / "catalog/global",
+        header_factories={
+            AuthorizationMethod.OAUTH2_PKCE: lambda _connection: _auth_headers(),
+        },
+        binding_verifier=verify_profile,
+        response_normalizer=_normalize_invoice,
+        request_model_resolver=request_model,
+        response_model_resolver=response_model,
+        flowaccount_profile_binding_resolver=lambda _connection, provider_tool: _binding(
+            provider_tool=provider_tool,
+            normalized_capability="provider_profile.get",
+        ),
+    )
+
+    validation = await registry.get(ProviderId.FLOWACCOUNT).validate_connection(
+        _connection().model_copy(
+            update={
+                "readiness": ConnectionReadiness.REQUIRES_VALIDATION,
+                "last_validated_at": None,
+            }
+        )
+    )
+
+    assert validation.normalized_data == {
+        "company_id": "company-123",
+        "company_display_name": "FlowAccount Test Company",
+    }
+    call_event = next(event for event in harness.events if event[0] == "call_tool")
+    assert call_event[2][0] == "get_provider_profile"
+    assert call_event[2][1] == {}
 
 
 @pytest.mark.asyncio

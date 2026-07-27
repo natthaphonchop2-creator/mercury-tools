@@ -143,6 +143,7 @@ class FlowAccountOAuthTokens(_FlowAccountModel):
         repr=False,
         exclude=True,
     )
+    token_type: str
     expires_at: datetime
     granted_permissions: tuple[str, ...]
 
@@ -159,6 +160,13 @@ class FlowAccountOAuthTokens(_FlowAccountModel):
         if value != value.strip() or any(character.isspace() for character in value):
             raise ValueError("flowaccount_credentials_invalid")
         return value
+
+    @field_validator("token_type")
+    @classmethod
+    def validate_token_type(cls, value: str) -> str:
+        if value.casefold() != "bearer":
+            raise ValueError("flowaccount_credentials_invalid")
+        return "Bearer"
 
     @field_validator("granted_permissions")
     @classmethod
@@ -464,8 +472,9 @@ class FlowAccountOAuthHeaderFactory:
                 if inspect.isawaitable(refreshed):
                     refreshed = await refreshed
                 refreshed = FlowAccountOAuthTokens.model_validate(refreshed)
-                if refreshed.expires_at <= now or not set(refreshed.granted_permissions).issubset(
-                    opened.bundle.granted_permissions
+                if (
+                    refreshed.expires_at <= now
+                    or refreshed.granted_permissions != opened.bundle.granted_permissions
                 ):
                     raise FlowAccountCredentialError("flowaccount_reauthorization_required")
                 if refreshed.refresh_token is None:
@@ -509,17 +518,16 @@ class FlowAccountOAuthHeaderFactory:
 
 
 def normalize_flowaccount_response(
-    binding: QualifiedCapabilityBinding,
+    binding: Any,
     structured_content: Mapping[str, Any],
 ) -> BaseModel:
     """Normalize only reviewed FlowAccount MCP response shapes."""
 
     try:
-        checked = QualifiedCapabilityBinding.model_validate(binding)
         if (
-            checked.provider is not ProviderId.FLOWACCOUNT
-            or checked.normalized_capability != _PROFILE_CAPABILITY
-            or checked.provider_tool != _PROFILE_TOOL
+            getattr(binding, "provider", None) is not ProviderId.FLOWACCOUNT
+            or getattr(binding, "normalized_capability", None) != _PROFILE_CAPABILITY
+            or getattr(binding, "provider_tool", None) != _PROFILE_TOOL
         ):
             raise ValueError
         raw = _ProviderProfileResponse.model_validate(structured_content)

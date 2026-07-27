@@ -43,7 +43,7 @@ from mercury_tools.cloud.models import (
     validate_public_catalog_action,
     validate_raw_catalog_action_payload,
 )
-from mercury_tools.config import Settings, load_settings
+from mercury_tools.config import Settings, V1ConfigurationError, load_settings
 from mercury_tools.db.catalog import SupabaseCatalogStore
 from mercury_tools.db.product import SKILL_CATALOG_SEED
 from mercury_tools.db.supabase import SupabaseRagStore
@@ -124,6 +124,18 @@ class CloudDependencies:
     skill_loader: Callable[[str], str | None] = skill_markdown
     clock: Callable[[], datetime] | None = None
     provider_oauth_service: Any | None = None
+
+    def __post_init__(self) -> None:
+        if self.provider_oauth_service is not None and not callable(
+            getattr(self.provider_oauth_service, "complete_callback", None)
+        ):
+            raise V1ConfigurationError("v1_provider_oauth_service_invalid")
+        if (
+            self.settings is not None
+            and self.settings.v1_enabled
+            and self.provider_oauth_service is None
+        ):
+            raise V1ConfigurationError("v1_provider_oauth_service_missing")
 
     def _catalog_store(self) -> Any:
         if self.catalog_store is None:
@@ -335,7 +347,7 @@ class CloudDependencies:
         }
         query = list(request.query_params.multi_items())
         keys = [key for key, _value in query]
-        if set(keys) != {"code", "state", "company_id"} or len(keys) != len(set(keys)):
+        if set(keys) != {"code", "state"} or len(keys) != len(set(keys)):
             return JSONResponse(
                 {"error": "provider_oauth_callback_invalid"},
                 status_code=400,
@@ -351,8 +363,6 @@ class CloudDependencies:
             callback = OAuthCallback(
                 code=request.query_params["code"],
                 state=request.query_params["state"],
-                provider="flowaccount",
-                selected_company_id=request.query_params["company_id"],
             )
             summary = await self.provider_oauth_service.complete_callback(callback)
         except ProviderOAuthError as exc:
@@ -471,8 +481,7 @@ def cloud_routes(dependencies: CloudDependencies) -> list[Route]:
         "provider_oauth_service",
         None,
     )
-    settings = getattr(dependencies, "settings", None)
-    if provider_oauth_service is not None or (settings is not None and settings.v1_enabled):
+    if provider_oauth_service is not None:
         routes.append(
             Route(
                 FLOWACCOUNT_CALLBACK_PATH,

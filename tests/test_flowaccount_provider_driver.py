@@ -38,7 +38,7 @@ from mercury_tools.providers.models import (
     ProviderConnection,
     ProviderId,
 )
-from mercury_tools.providers.registry import build_provider_registry
+from mercury_tools.providers.registry import ProviderRegistryError, build_provider_registry
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = load_provider_manifest(ROOT / "catalog/global/flowaccount/driver.json")
@@ -292,6 +292,7 @@ async def test_encrypted_header_factory_refreshes_at_most_once_before_dispatch()
     expired = FlowAccountOAuthTokens(
         access_token="EXPIRED_ACCESS_TOKEN_SENTINEL",
         refresh_token="REFRESH_TOKEN_SENTINEL",
+        token_type="Bearer",
         expires_at=NOW - timedelta(seconds=1),
         granted_permissions=("documents.read", "profile.read"),
     )
@@ -313,6 +314,7 @@ async def test_encrypted_header_factory_refreshes_at_most_once_before_dispatch()
         return FlowAccountOAuthTokens(
             access_token="NEW_ACCESS_TOKEN_SENTINEL",
             refresh_token="NEW_REFRESH_TOKEN_SENTINEL",
+            token_type="bearer",
             expires_at=NOW + timedelta(hours=1),
             granted_permissions=("documents.read", "profile.read"),
         )
@@ -359,6 +361,7 @@ async def test_expired_token_without_refresh_support_fails_closed() -> None:
         tokens=FlowAccountOAuthTokens(
             access_token="EXPIRED_ACCESS_TOKEN_SENTINEL",
             refresh_token=None,
+            token_type="Bearer",
             expires_at=NOW - timedelta(seconds=1),
             granted_permissions=("profile.read",),
         ),
@@ -388,6 +391,53 @@ async def test_expired_token_without_refresh_support_fails_closed() -> None:
         await factory(connection)
 
 
+@pytest.mark.asyncio
+async def test_refresh_rejects_reduced_or_changed_scope_without_returning_header() -> None:
+    vault = _vault()
+    connection = _connection()
+    envelopes = seal_flowaccount_credentials(
+        vault=vault,
+        connection=connection,
+        tokens=FlowAccountOAuthTokens(
+            access_token="EXPIRED_ACCESS_TOKEN_SENTINEL",
+            refresh_token="REFRESH_TOKEN_SENTINEL",
+            token_type="Bearer",
+            expires_at=NOW - timedelta(seconds=1),
+            granted_permissions=("documents.read", "profile.read"),
+        ),
+        token_endpoint="https://identity.flowaccount.example/oauth/token",
+        resource_uri="https://flowaccount-sandbox.example/mcp",
+        client_id="dynamic-client-id",
+        client_secret=None,
+        token_endpoint_auth_method="none",
+    )
+    repository = CredentialRepository(envelopes)
+
+    async def refresh(_request: FlowAccountRefreshRequest) -> FlowAccountOAuthTokens:
+        return FlowAccountOAuthTokens(
+            access_token="REDUCED_SCOPE_TOKEN_SENTINEL",
+            refresh_token="REFRESH_TOKEN_SENTINEL",
+            token_type="Bearer",
+            expires_at=NOW + timedelta(hours=1),
+            granted_permissions=("profile.read",),
+        )
+
+    factory = FlowAccountOAuthHeaderFactory(
+        vault=vault,
+        load_envelopes=repository.load,
+        save_envelopes=repository.save,
+        refresh=refresh,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(
+        FlowAccountCredentialError,
+        match="^flowaccount_reauthorization_required$",
+    ):
+        await factory(connection)
+    assert repository.saved == []
+
+
 def test_registry_can_wrap_only_flowaccount_with_task6_profile_validation() -> None:
     settings = __import__("mercury_tools.config", fromlist=["Settings"]).Settings(
         supabase_url="",
@@ -406,6 +456,27 @@ def test_registry_can_wrap_only_flowaccount_with_task6_profile_validation() -> N
 
     assert isinstance(registry.get("flowaccount"), FlowAccountMCPDriver)
     assert not isinstance(registry.get("peak"), FlowAccountMCPDriver)
+
+
+def test_registry_fails_closed_without_flowaccount_profile_binding_wiring() -> None:
+    settings = __import__("mercury_tools.config", fromlist=["Settings"]).Settings(
+        supabase_url="",
+        supabase_service_role_key="",
+        openai_api_key="",
+        flowaccount_mcp_sandbox_url="https://flowaccount-sandbox.example/mcp",
+        flowaccount_mcp_production_url="https://flowaccount.example/mcp",
+        peak_mcp_uat_url="https://peak-uat.example/mcp",
+        peak_mcp_production_url="https://peak.example/mcp",
+    )
+
+    with pytest.raises(
+        ProviderRegistryError,
+        match="^flowaccount_profile_binding_resolver_missing$",
+    ):
+        build_provider_registry(
+            settings=settings,
+            manifest_root=ROOT / "catalog/global",
+        )
 
 
 def test_v1_hosted_path_does_not_import_or_call_direct_rest_driver() -> None:

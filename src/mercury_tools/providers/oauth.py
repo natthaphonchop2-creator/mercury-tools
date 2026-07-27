@@ -5,20 +5,26 @@ from __future__ import annotations
 import base64
 import hashlib
 import inspect
+import ipaddress
 import json
 import re
 import secrets
+import socket
+import ssl
 import threading
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
+import anyio
+import httpcore
 import httpx
+from httpcore._backends.auto import AutoBackend
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -28,7 +34,7 @@ from pydantic import (
 )
 
 from mercury_tools.auth.models import MercuryPrincipal, PrincipalResolver
-from mercury_tools.config import Settings
+from mercury_tools.config import Settings, v1_supabase_rest_url
 from mercury_tools.credentials.models import CredentialBinding, CredentialEnvelope
 from mercury_tools.credentials.vault import CredentialVault, CredentialVaultError
 from mercury_tools.providers.base import ProviderStatusClass
@@ -121,12 +127,75 @@ def _same_origin(left: str, right: str) -> bool:
     )
 
 
+def _url_origin(value: str) -> str:
+    parsed = urlsplit(value)
+    host = parsed.hostname
+    if host is None:
+        raise ValueError
+    port = parsed.port
+    default_port = port is None or port == 443
+    authority = host if default_port else f"{host}:{port}"
+    return f"https://{authority}"
+
+
+def _clean_https_origin(value: str) -> str:
+    checked = _clean_https_url(
+        value,
+        code="provider_oauth_configuration_invalid",
+    )
+    parsed = urlsplit(checked)
+    if parsed.path not in {"", "/"}:
+        raise ValueError
+    return _url_origin(checked)
+
+
 def _b64url(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
 
 def _state_hash(value: str) -> str:
     return hashlib.sha256(value.encode("ascii")).hexdigest()
+
+
+def _checked_selected_company_id(value: str | None, *, code: str) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not 0 < len(value) <= 512
+        or value != value.strip()
+        or any(
+            character.isspace() or unicodedata.category(character) in {"Cc", "Cf"}
+            for character in value
+        )
+    ):
+        raise ValueError(code)
+    return value
+
+
+def _checked_permissions(
+    value: tuple[str, ...],
+    *,
+    code: str,
+) -> tuple[str, ...]:
+    if (
+        not isinstance(value, tuple)
+        or not value
+        or tuple(sorted(value)) != value
+        or len(value) != len(set(value))
+        or any(not isinstance(item, str) or not item or len(item) > 200 for item in value)
+    ):
+        raise ValueError(code)
+    return value
+
+
+async def _resolve_public_addresses(host: str, port: int) -> tuple[str, ...]:
+    infos = await anyio.getaddrinfo(
+        host,
+        port,
+        type=socket.SOCK_STREAM,
+    )
+    return tuple(sorted({str(info[4][0]) for info in infos}))
 
 
 class ProviderOAuthError(RuntimeError):
@@ -144,6 +213,7 @@ class OAuthAuthorizationSession(_OAuthModel):
     resource_uri: str
     authorization_endpoint: str
     token_endpoint: str
+    revocation_endpoint: str | None = None
     callback_uri: str
     client_id: str = Field(min_length=1, max_length=1024)
     client_secret: str | None = Field(
@@ -168,6 +238,13 @@ class OAuthAuthorizationSession(_OAuthModel):
     )
     @classmethod
     def validate_url(cls, value: str) -> str:
+        return _clean_https_url(value, code="provider_oauth_downstream_invalid")
+
+    @field_validator("revocation_endpoint")
+    @classmethod
+    def validate_optional_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
         return _clean_https_url(value, code="provider_oauth_downstream_invalid")
 
     @field_validator("client_secret")
@@ -210,12 +287,6 @@ class OAuthCallback(_OAuthModel):
     environment: str | None = Field(default=None, min_length=1, max_length=64)
     workspace_id: UUID | None = None
     redirect_uri: str | None = None
-    selected_company_id: str = Field(
-        min_length=1,
-        max_length=512,
-        repr=False,
-        exclude=True,
-    )
 
     @field_validator("code", "state")
     @classmethod
@@ -231,16 +302,6 @@ class OAuthCallback(_OAuthModel):
             return value
         return _clean_https_url(value, code="provider_oauth_callback_invalid")
 
-    @field_validator("selected_company_id")
-    @classmethod
-    def validate_company(cls, value: str) -> str:
-        if any(
-            character.isspace() or unicodedata.category(character) in {"Cc", "Cf"}
-            for character in value
-        ):
-            raise ValueError("provider_oauth_callback_invalid")
-        return value
-
 
 class ProviderAuthorizationStart(_OAuthModel):
     authorization_url: str
@@ -255,12 +316,12 @@ class ProviderAuthorizationStart(_OAuthModel):
 
 
 class _StoredOAuthPayload(_OAuthModel):
-    mercury_access_token: str = Field(repr=False, exclude=True)
     code_verifier: str = Field(repr=False, exclude=True)
     authorization_url: str
     resource_uri: str
     authorization_endpoint: str
     token_endpoint: str
+    revocation_endpoint: str | None = None
     callback_uri: str
     client_id: str
     client_secret: str | None = Field(default=None, repr=False, exclude=True)
@@ -270,6 +331,15 @@ class _StoredOAuthPayload(_OAuthModel):
         "client_secret_post",
     ]
     granted_permissions: tuple[str, ...]
+    selected_company_id: str | None = Field(default=None, repr=False, exclude=True)
+
+    @field_validator("selected_company_id")
+    @classmethod
+    def validate_selected_company_id(cls, value: str | None) -> str | None:
+        return _checked_selected_company_id(
+            value,
+            code="provider_oauth_state_invalid",
+        )
 
     def session(self) -> OAuthAuthorizationSession:
         return OAuthAuthorizationSession(
@@ -277,6 +347,7 @@ class _StoredOAuthPayload(_OAuthModel):
             resource_uri=self.resource_uri,
             authorization_endpoint=self.authorization_endpoint,
             token_endpoint=self.token_endpoint,
+            revocation_endpoint=self.revocation_endpoint,
             callback_uri=self.callback_uri,
             client_id=self.client_id,
             client_secret=self.client_secret,
@@ -285,8 +356,13 @@ class _StoredOAuthPayload(_OAuthModel):
         )
 
 
+class _StoredOAuthStateAccess(_OAuthModel):
+    mercury_access_token: str = Field(repr=False, exclude=True)
+    authorization_envelope: Mapping[str, Any] = Field(repr=False, exclude=True)
+
+
 @dataclass(frozen=True, repr=False)
-class _OAuthStateRecord:
+class ProviderOAuthStateRecord:
     id: UUID
     tenant_id: UUID
     workspace_id: UUID
@@ -295,9 +371,37 @@ class _OAuthStateRecord:
     environment: str
     state_hash: str
     callback_uri: str
+    requested_permissions: tuple[str, ...]
     expires_at: datetime
     encrypted_payload: CredentialEnvelope
     consumed_at: datetime | None = None
+
+
+class ProviderOAuthStateStore(Protocol):
+    async def create(
+        self,
+        *,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        provider: ProviderId,
+        environment: str,
+        state_hash: str,
+        callback_uri: str,
+        requested_permissions: tuple[str, ...],
+        expires_at: datetime,
+        encrypted_payload: CredentialEnvelope,
+        mercury_access_token: str,
+    ) -> ProviderOAuthStateRecord: ...
+
+    async def peek(self, *, state_hash: str) -> ProviderOAuthStateRecord: ...
+
+    async def consume(
+        self,
+        *,
+        record: ProviderOAuthStateRecord,
+        mercury_access_token: str,
+    ) -> ProviderOAuthStateRecord: ...
 
 
 class InMemoryProviderOAuthStateStore:
@@ -314,12 +418,12 @@ class InMemoryProviderOAuthStateStore:
         self._provider_store = provider_store
         self._clock = clock or (lambda: datetime.now(UTC))
         self._lock = threading.RLock()
-        self._states: dict[str, _OAuthStateRecord] = {}
+        self._states: dict[str, ProviderOAuthStateRecord] = {}
 
     def __repr__(self) -> str:
         return "InMemoryProviderOAuthStateStore()"
 
-    def create(
+    async def create(
         self,
         *,
         tenant_id: UUID,
@@ -329,10 +433,18 @@ class InMemoryProviderOAuthStateStore:
         environment: str,
         state_hash: str,
         callback_uri: str,
+        requested_permissions: tuple[str, ...],
         expires_at: datetime,
         encrypted_payload: CredentialEnvelope,
-    ) -> _OAuthStateRecord:
+        mercury_access_token: str,
+    ) -> ProviderOAuthStateRecord:
         try:
+            checked_permissions = _checked_permissions(
+                requested_permissions,
+                code="provider_oauth_state_invalid",
+            )
+            if not mercury_access_token:
+                raise ValueError
             attempt = self._provider_store.create_attempt(
                 tenant_id=tenant_id,
                 workspace_id=workspace_id,
@@ -350,7 +462,7 @@ class InMemoryProviderOAuthStateStore:
                 environment=environment,
                 token_hash=state_hash,
             )
-            record = _OAuthStateRecord(
+            record = ProviderOAuthStateRecord(
                 id=encrypted_payload.connection_id,
                 tenant_id=tenant_id,
                 workspace_id=workspace_id,
@@ -359,6 +471,7 @@ class InMemoryProviderOAuthStateStore:
                 environment=environment,
                 state_hash=state_hash,
                 callback_uri=callback_uri,
+                requested_permissions=checked_permissions,
                 expires_at=expires_at,
                 encrypted_payload=encrypted_payload,
             )
@@ -372,7 +485,7 @@ class InMemoryProviderOAuthStateStore:
             self._states[state_hash] = record
         return record
 
-    def peek(self, *, state_hash: str) -> _OAuthStateRecord:
+    async def peek(self, *, state_hash: str) -> ProviderOAuthStateRecord:
         now = self._timestamp()
         with self._lock:
             record = self._states.get(state_hash)
@@ -380,37 +493,31 @@ class InMemoryProviderOAuthStateStore:
                 raise ProviderOAuthError("provider_oauth_state_invalid")
             return record
 
-    def consume(
+    async def consume(
         self,
         *,
-        state_hash: str,
-        tenant_id: UUID,
-        workspace_id: UUID,
-        auth_user_id: UUID,
-        provider: ProviderId,
-        environment: str,
-    ) -> _OAuthStateRecord:
+        record: ProviderOAuthStateRecord,
+        mercury_access_token: str,
+    ) -> ProviderOAuthStateRecord:
+        if not mercury_access_token:
+            raise ProviderOAuthError("provider_oauth_state_invalid")
         now = self._timestamp()
         with self._lock:
-            record = self._states.get(state_hash)
+            current = self._states.get(record.state_hash)
             if (
-                record is None
-                or record.consumed_at is not None
-                or record.expires_at <= now
-                or record.tenant_id != tenant_id
-                or record.workspace_id != workspace_id
-                or record.auth_user_id != auth_user_id
-                or record.provider is not provider
-                or not secrets.compare_digest(record.environment, environment)
+                current is None
+                or current != record
+                or current.consumed_at is not None
+                or current.expires_at <= now
             ):
                 raise ProviderOAuthError("provider_oauth_state_invalid")
-            consumed = _OAuthStateRecord(
+            consumed = ProviderOAuthStateRecord(
                 **{
-                    **record.__dict__,
+                    **current.__dict__,
                     "consumed_at": now,
                 }
             )
-            del self._states[state_hash]
+            del self._states[current.state_hash]
             return consumed
 
     def _timestamp(self) -> datetime:
@@ -423,11 +530,517 @@ class InMemoryProviderOAuthStateStore:
             raise ProviderOAuthError("provider_oauth_state_invalid") from None
 
 
+class SupabaseProviderOAuthStateStore:
+    """Durable OAuth state adapter over the Task 4 atomic RPC contract."""
+
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        http_client: httpx.AsyncClient,
+        callback_uri: str,
+        uuid_factory: Callable[[], UUID] | None = None,
+    ) -> None:
+        try:
+            self._base_url = v1_supabase_rest_url(
+                project_url=settings.supabase_url,
+                auth_issuer=settings.supabase_auth_issuer,
+            )
+            if (
+                not settings.supabase_publishable_key
+                or not settings.supabase_service_role_key
+                or not isinstance(http_client, httpx.AsyncClient)
+            ):
+                raise ValueError
+            self._callback_uri = _clean_https_url(
+                callback_uri,
+                code="provider_oauth_configuration_invalid",
+            )
+        except Exception:
+            raise ProviderOAuthError("provider_oauth_configuration_invalid") from None
+        self._publishable_key = settings.supabase_publishable_key
+        self._service_role_key = settings.supabase_service_role_key
+        self._http = http_client
+        self._uuid_factory = uuid_factory or uuid4
+
+    def __repr__(self) -> str:
+        return "SupabaseProviderOAuthStateStore()"
+
+    async def create(
+        self,
+        *,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        provider: ProviderId,
+        environment: str,
+        state_hash: str,
+        callback_uri: str,
+        requested_permissions: tuple[str, ...],
+        expires_at: datetime,
+        encrypted_payload: CredentialEnvelope,
+        mercury_access_token: str,
+    ) -> ProviderOAuthStateRecord:
+        try:
+            checked_provider = ProviderId(provider)
+            checked_permissions = _checked_permissions(
+                requested_permissions,
+                code="provider_oauth_state_invalid",
+            )
+            checked_envelope = CredentialEnvelope.model_validate(encrypted_payload)
+            normalized_expiry = _aware_utc(
+                expires_at,
+                code="provider_oauth_state_invalid",
+            )
+            if (
+                checked_provider is not ProviderId.FLOWACCOUNT
+                or callback_uri != self._callback_uri
+                or not mercury_access_token
+                or checked_envelope.connection_id != checked_envelope.id
+                or checked_envelope.tenant_id != tenant_id
+                or checked_envelope.workspace_id != workspace_id
+                or checked_envelope.auth_user_id != auth_user_id
+                or checked_envelope.provider != ProviderId.FLOWACCOUNT.value
+                or checked_envelope.environment != environment
+                or checked_envelope.credential_type != "oauth_state"
+            ):
+                raise ValueError
+            attempt_id = self._checked_uuid(self._uuid_factory())
+            setup_row = await self._rpc(
+                "create_mercury_provider_setup_attempt",
+                mercury_access_token=mercury_access_token,
+                payload={
+                    "p_attempt_id": str(attempt_id),
+                    "p_tenant_id": str(tenant_id),
+                    "p_workspace_id": str(workspace_id),
+                    "p_auth_user_id": str(auth_user_id),
+                    "p_provider": checked_provider.value,
+                    "p_environment": environment,
+                    "p_token_hash": state_hash,
+                    "p_expires_at": normalized_expiry.isoformat(),
+                },
+            )
+            if (
+                self._checked_uuid(setup_row.get("attempt_id")) != attempt_id
+                or self._checked_uuid(setup_row.get("tenant_id")) != tenant_id
+                or self._checked_uuid(setup_row.get("workspace_id")) != workspace_id
+                or self._checked_uuid(setup_row.get("auth_user_id")) != auth_user_id
+                or setup_row.get("provider") != checked_provider.value
+                or setup_row.get("environment") != environment
+                or self._timestamp(setup_row.get("expires_at")) != normalized_expiry
+                or setup_row.get("consumed_at") is not None
+            ):
+                raise ValueError
+            callback_state = self._callback_state(
+                state_id=checked_envelope.id,
+                permissions=checked_permissions,
+            )
+            state_row = await self._rpc(
+                "create_mercury_provider_oauth_state",
+                mercury_access_token=mercury_access_token,
+                payload={
+                    "p_state_id": str(checked_envelope.id),
+                    "p_setup_attempt_id": str(attempt_id),
+                    "p_tenant_id": str(tenant_id),
+                    "p_workspace_id": str(workspace_id),
+                    "p_auth_user_id": str(auth_user_id),
+                    "p_provider": checked_provider.value,
+                    "p_environment": environment,
+                    "p_state_hash": state_hash,
+                    "p_pkce_verifier_ciphertext": _postgres_bytea(checked_envelope.ciphertext),
+                    "p_pkce_key_version": checked_envelope.key_version,
+                    "p_pkce_nonce": _postgres_bytea(checked_envelope.nonce),
+                    "p_pkce_aad_hash": _postgres_bytea(checked_envelope.aad_hash),
+                    "p_callback_state": callback_state,
+                    "p_expires_at": normalized_expiry.isoformat(),
+                },
+            )
+            if (
+                self._checked_uuid(state_row.get("oauth_state_id")) != checked_envelope.id
+                or self._checked_uuid(state_row.get("setup_attempt_id")) != attempt_id
+                or self._timestamp(state_row.get("expires_at")) != normalized_expiry
+            ):
+                raise ValueError
+            return ProviderOAuthStateRecord(
+                id=checked_envelope.id,
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                auth_user_id=auth_user_id,
+                provider=checked_provider,
+                environment=environment,
+                state_hash=state_hash,
+                callback_uri=callback_uri,
+                requested_permissions=checked_permissions,
+                expires_at=normalized_expiry,
+                encrypted_payload=checked_envelope,
+            )
+        except ProviderOAuthError:
+            raise
+        except Exception:
+            raise ProviderOAuthError("provider_oauth_state_invalid") from None
+
+    async def peek(self, *, state_hash: str) -> ProviderOAuthStateRecord:
+        try:
+            response = await self._http.get(
+                f"{self._base_url}/mercury_provider_oauth_states",
+                params={
+                    "state_hash": f"eq.{state_hash}",
+                    "consumed_at": "is.null",
+                    "select": (
+                        "id,tenant_id,workspace_id,auth_user_id,provider,"
+                        "environment,state_hash,pkce_verifier_ciphertext,"
+                        "pkce_key_version,pkce_nonce,pkce_aad_hash,"
+                        "callback_state,expires_at,consumed_at,created_at"
+                    ),
+                    "limit": "1",
+                },
+                headers=self._service_headers(),
+                follow_redirects=False,
+            )
+            row = _single_response_row(response)
+            record = self._record_from_row(row)
+            if (
+                not secrets.compare_digest(record.state_hash, state_hash)
+                or record.consumed_at is not None
+            ):
+                raise ValueError
+            return record
+        except ProviderOAuthError:
+            raise
+        except Exception:
+            raise ProviderOAuthError("provider_oauth_state_invalid") from None
+
+    async def consume(
+        self,
+        *,
+        record: ProviderOAuthStateRecord,
+        mercury_access_token: str,
+    ) -> ProviderOAuthStateRecord:
+        try:
+            if not mercury_access_token:
+                raise ValueError
+            row = await self._rpc(
+                "consume_mercury_provider_oauth_state",
+                mercury_access_token=mercury_access_token,
+                payload={
+                    "p_tenant_id": str(record.tenant_id),
+                    "p_workspace_id": str(record.workspace_id),
+                    "p_auth_user_id": str(record.auth_user_id),
+                    "p_provider": record.provider.value,
+                    "p_environment": record.environment,
+                    "p_state_hash": record.state_hash,
+                },
+            )
+            if self._checked_uuid(row.get("oauth_state_id")) != record.id or row.get(
+                "callback_state"
+            ) != self._callback_state(
+                state_id=record.id,
+                permissions=record.requested_permissions,
+            ):
+                raise ValueError
+            envelope = CredentialEnvelope(
+                id=record.id,
+                tenant_id=record.tenant_id,
+                workspace_id=record.workspace_id,
+                auth_user_id=record.auth_user_id,
+                connection_id=record.id,
+                provider=record.provider.value,
+                environment=record.environment,
+                credential_type="oauth_state",
+                key_version=row["pkce_key_version"],
+                nonce=_decode_postgres_bytea(row["pkce_nonce"]),
+                ciphertext=_decode_postgres_bytea(row["pkce_verifier_ciphertext"]),
+                aad_hash=_decode_postgres_bytea(row["pkce_aad_hash"]),
+                created_at=record.encrypted_payload.created_at,
+            )
+            return ProviderOAuthStateRecord(
+                **{
+                    **record.__dict__,
+                    "encrypted_payload": envelope,
+                    "consumed_at": self._timestamp(row.get("consumed_at")),
+                }
+            )
+        except ProviderOAuthError:
+            raise
+        except Exception:
+            raise ProviderOAuthError("provider_oauth_state_invalid") from None
+
+    async def _rpc(
+        self,
+        function: str,
+        *,
+        mercury_access_token: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        response = await self._http.post(
+            f"{self._base_url}/rpc/{function}",
+            json=dict(payload),
+            headers={
+                "apikey": self._publishable_key,
+                "Authorization": f"Bearer {mercury_access_token}",
+                "Content-Type": "application/json",
+            },
+            follow_redirects=False,
+        )
+        return _single_response_row(response)
+
+    def _record_from_row(self, row: Mapping[str, Any]) -> ProviderOAuthStateRecord:
+        state_id = self._checked_uuid(row.get("id"))
+        tenant_id = self._checked_uuid(row.get("tenant_id"))
+        workspace_id = self._checked_uuid(row.get("workspace_id"))
+        auth_user_id = self._checked_uuid(row.get("auth_user_id"))
+        provider = ProviderId(row.get("provider"))
+        environment = row.get("environment")
+        state_hash = row.get("state_hash")
+        expires_at = self._timestamp(row.get("expires_at"))
+        created_at = self._timestamp(row.get("created_at"))
+        callback_state = row.get("callback_state")
+        requested_permissions = (
+            callback_state.get("requested_permissions")
+            if isinstance(callback_state, Mapping)
+            else None
+        )
+        checked_permissions = (
+            _checked_permissions(
+                tuple(requested_permissions),
+                code="provider_oauth_state_invalid",
+            )
+            if isinstance(requested_permissions, list)
+            else None
+        )
+        if (
+            provider is not ProviderId.FLOWACCOUNT
+            or not isinstance(environment, str)
+            or not isinstance(state_hash, str)
+            or checked_permissions is None
+            or callback_state
+            != self._callback_state(
+                state_id=state_id,
+                permissions=checked_permissions,
+            )
+        ):
+            raise ValueError
+        envelope = CredentialEnvelope(
+            id=state_id,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            auth_user_id=auth_user_id,
+            connection_id=state_id,
+            provider=provider.value,
+            environment=environment,
+            credential_type="oauth_state",
+            key_version=row["pkce_key_version"],
+            nonce=_decode_postgres_bytea(row["pkce_nonce"]),
+            ciphertext=_decode_postgres_bytea(row["pkce_verifier_ciphertext"]),
+            aad_hash=_decode_postgres_bytea(row["pkce_aad_hash"]),
+            created_at=created_at,
+        )
+        consumed_at = row.get("consumed_at")
+        return ProviderOAuthStateRecord(
+            id=state_id,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            auth_user_id=auth_user_id,
+            provider=provider,
+            environment=environment,
+            state_hash=state_hash,
+            callback_uri=self._callback_uri,
+            requested_permissions=checked_permissions,
+            expires_at=expires_at,
+            encrypted_payload=envelope,
+            consumed_at=(self._timestamp(consumed_at) if consumed_at is not None else None),
+        )
+
+    def _service_headers(self) -> dict[str, str]:
+        return {
+            "apikey": self._service_role_key,
+            "Authorization": f"Bearer {self._service_role_key}",
+            "Content-Type": "application/json",
+        }
+
+    @staticmethod
+    def _callback_state(
+        *,
+        state_id: UUID,
+        permissions: Sequence[str],
+    ) -> dict[str, Any]:
+        return {
+            "return_path": FLOWACCOUNT_CALLBACK_PATH,
+            "requested_permissions": list(permissions),
+            "connection_attempt_id": str(state_id),
+        }
+
+    @staticmethod
+    def _checked_uuid(value: Any) -> UUID:
+        checked = value if isinstance(value, UUID) else UUID(str(value))
+        if checked.int == 0:
+            raise ValueError
+        return checked
+
+    @staticmethod
+    def _timestamp(value: Any) -> datetime:
+        if not isinstance(value, str):
+            raise ValueError
+        return _aware_utc(
+            datetime.fromisoformat(value.replace("Z", "+00:00")),
+            code="provider_oauth_state_invalid",
+        )
+
+
+OAuthAddressResolver = Callable[
+    [str, int],
+    Sequence[str] | Awaitable[Sequence[str]],
+]
+
+
+class OAuthNetworkGuard(Protocol):
+    async def request(
+        self,
+        method: str,
+        url: str,
+        **kwargs: Any,
+    ) -> httpx.Response: ...
+
+
+class _PinnedNetworkBackend:
+    def __init__(self, guard: PublicOAuthNetworkGuard) -> None:
+        self._guard = guard
+        self._backend = AutoBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> Any:
+        addresses = await self._guard.resolve_and_pin(host, port)
+        return await self._backend.connect_tcp(
+            sorted(addresses)[0],
+            port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+    async def connect_unix_socket(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("provider_oauth_downstream_invalid")
+
+    async def sleep(self, seconds: float) -> None:
+        await anyio.sleep(seconds)
+
+
+class _PinnedOAuthTransport(httpx.AsyncHTTPTransport):
+    def __init__(self, guard: PublicOAuthNetworkGuard) -> None:
+        super().__init__(verify=ssl.create_default_context(), trust_env=False, retries=0)
+        self._pool = httpcore.AsyncConnectionPool(
+            ssl_context=ssl.create_default_context(),
+            retries=0,
+            network_backend=_PinnedNetworkBackend(guard),
+        )
+
+
+class PublicOAuthNetworkGuard:
+    """HTTPS request boundary with public-only DNS pinning per origin."""
+
+    def __init__(
+        self,
+        *,
+        resolver: OAuthAddressResolver | None = None,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self._resolver = resolver or _resolve_public_addresses
+        self._pins: dict[tuple[str, int], frozenset[str]] = {}
+        self._lock = threading.RLock()
+        self._http = http_client
+        if self._http is None:
+            self._http = httpx.AsyncClient(
+                transport=_PinnedOAuthTransport(self),
+                follow_redirects=False,
+                trust_env=False,
+            )
+
+    def __repr__(self) -> str:
+        return "PublicOAuthNetworkGuard()"
+
+    async def request(
+        self,
+        method: str,
+        url: str,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        parsed = urlsplit(_clean_https_url(url, code="provider_oauth_downstream_invalid"))
+        if parsed.hostname is None:
+            raise ProviderOAuthError("provider_oauth_downstream_invalid")
+        await self.resolve_and_pin(parsed.hostname, parsed.port or 443)
+        try:
+            return await self._http.request(
+                method,
+                url,
+                follow_redirects=False,
+                **kwargs,
+            )
+        except ProviderOAuthError:
+            raise
+        except Exception:
+            raise ProviderOAuthError("provider_oauth_downstream_invalid") from None
+
+    async def resolve_and_pin(self, host: str, port: int) -> frozenset[str]:
+        try:
+            resolved = self._resolver(host, port)
+            if inspect.isawaitable(resolved):
+                resolved = await resolved
+            if isinstance(resolved, (str, bytes, bytearray)):
+                raise ValueError
+            addresses = frozenset(str(value) for value in resolved)
+            if not addresses or len(addresses) > 16:
+                raise ValueError
+            for value in addresses:
+                address = ipaddress.ip_address(value)
+                if not address.is_global:
+                    raise ValueError
+            key = (host.casefold(), port)
+            with self._lock:
+                pinned = self._pins.get(key)
+                if pinned is not None and pinned != addresses:
+                    raise ValueError
+                self._pins[key] = addresses
+            return addresses
+        except ProviderOAuthError:
+            raise
+        except Exception:
+            raise ProviderOAuthError("provider_oauth_downstream_invalid") from None
+
+
 class DownstreamMCPOAuthClient:
     """Strict OAuth discovery rooted only at the configured MCP resource."""
 
-    def __init__(self, *, http_client: httpx.AsyncClient) -> None:
-        self._http = http_client
+    def __init__(
+        self,
+        *,
+        network_guard: OAuthNetworkGuard,
+        authorization_server_origins: Mapping[
+            tuple[ProviderId | str, str],
+            Sequence[str],
+        ],
+    ) -> None:
+        self._network_guard = network_guard
+        try:
+            origins: dict[tuple[ProviderId, str], frozenset[str]] = {}
+            for (provider, environment), values in authorization_server_origins.items():
+                checked_provider = ProviderId(provider)
+                if not environment or isinstance(values, (str, bytes, bytearray)) or not values:
+                    raise ValueError
+                checked_values = frozenset(_clean_https_origin(value) for value in values)
+                if len(checked_values) != len(values):
+                    raise ValueError
+                origins[(checked_provider, environment)] = checked_values
+            if not origins:
+                raise ValueError
+        except Exception:
+            raise ProviderOAuthError("provider_oauth_configuration_invalid") from None
+        self._authorization_server_origins = origins
 
     def __repr__(self) -> str:
         return "DownstreamMCPOAuthClient()"
@@ -435,6 +1048,8 @@ class DownstreamMCPOAuthClient:
     async def start_authorization(
         self,
         *,
+        provider: ProviderId,
+        environment: str,
         resource_uri: str,
         callback_uri: str,
         allowed_permissions: tuple[str, ...],
@@ -450,13 +1065,15 @@ class DownstreamMCPOAuthClient:
                 callback_uri,
                 code="provider_oauth_downstream_invalid",
             )
+            checked_provider = ProviderId(provider)
+            allowed_origins = self._authorization_server_origins[(checked_provider, environment)]
             if tuple(sorted(allowed_permissions)) != allowed_permissions or not allowed_permissions:
                 raise ValueError
 
-            challenge_response = await self._http.get(
+            challenge_response = await self._network_guard.request(
+                "GET",
                 resource_uri,
                 headers={"MCP-Protocol-Version": "2025-11-25"},
-                follow_redirects=False,
             )
             challenge = challenge_response.headers.get("www-authenticate", "")
             if "bearer" not in challenge.casefold():
@@ -482,6 +1099,8 @@ class DownstreamMCPOAuthClient:
                 authorization_servers[0],
                 code="provider_oauth_downstream_invalid",
             )
+            if _url_origin(authorization_server) not in allowed_origins:
+                raise ValueError
 
             supported = _string_set(
                 resource_metadata.get("scopes_supported"),
@@ -520,6 +1139,15 @@ class DownstreamMCPOAuthClient:
                 server_metadata.get("registration_endpoint"),
                 issuer=authorization_server,
             )
+            revocation_value = server_metadata.get("revocation_endpoint")
+            revocation_endpoint = (
+                _trusted_server_endpoint(
+                    revocation_value,
+                    issuer=authorization_server,
+                )
+                if revocation_value is not None
+                else None
+            )
             supported_auth_methods = _string_set(
                 server_metadata.get(
                     "token_endpoint_auth_methods_supported",
@@ -551,6 +1179,7 @@ class DownstreamMCPOAuthClient:
                 resource_uri=resource_uri,
                 authorization_endpoint=authorization_endpoint,
                 token_endpoint=token_endpoint,
+                revocation_endpoint=revocation_endpoint,
                 callback_uri=callback_uri,
                 client_id=registration["client_id"],
                 client_secret=registration["client_secret"],
@@ -627,8 +1256,36 @@ class DownstreamMCPOAuthClient:
         except Exception:
             raise ProviderOAuthError("provider_oauth_exchange_failed") from None
 
+    async def revoke(
+        self,
+        *,
+        session: OAuthAuthorizationSession,
+        tokens: FlowAccountOAuthTokens,
+    ) -> bool:
+        try:
+            checked_session = OAuthAuthorizationSession.model_validate(session)
+            checked_tokens = FlowAccountOAuthTokens.model_validate(tokens)
+            if checked_session.revocation_endpoint is None:
+                return False
+            response = await self._client_authenticated_request(
+                checked_session,
+                checked_session.revocation_endpoint,
+                {
+                    "token": (checked_tokens.refresh_token or checked_tokens.access_token),
+                    "token_type_hint": (
+                        "refresh_token"
+                        if checked_tokens.refresh_token is not None
+                        else "access_token"
+                    ),
+                    "client_id": checked_session.client_id,
+                },
+            )
+            return response.status_code in {200, 204}
+        except Exception:
+            return False
+
     async def _metadata(self, url: str) -> dict[str, Any]:
-        response = await self._http.get(url, follow_redirects=False)
+        response = await self._network_guard.request("GET", url)
         if response.status_code != 200:
             raise ValueError
         return _json_object(response)
@@ -654,7 +1311,8 @@ class DownstreamMCPOAuthClient:
         )
         if preferred is None:
             raise ValueError
-        response = await self._http.post(
+        response = await self._network_guard.request(
+            "POST",
             registration_endpoint,
             json={
                 "redirect_uris": [callback_uri],
@@ -662,7 +1320,6 @@ class DownstreamMCPOAuthClient:
                 "response_types": ["code"],
                 "token_endpoint_auth_method": preferred,
             },
-            follow_redirects=False,
         )
         if response.status_code not in {200, 201}:
             raise ValueError
@@ -671,12 +1328,15 @@ class DownstreamMCPOAuthClient:
         client_secret = payload.get("client_secret")
         auth_method = payload.get("token_endpoint_auth_method")
         redirect_uris = payload.get("redirect_uris")
+        grant_types = payload.get("grant_types")
+        response_types = payload.get("response_types")
         if (
             not isinstance(client_id, str)
             or not client_id
             or auth_method != preferred
-            or not isinstance(redirect_uris, list)
-            or callback_uri not in redirect_uris
+            or redirect_uris != [callback_uri]
+            or grant_types != ["authorization_code", "refresh_token"]
+            or response_types != ["code"]
             or (preferred != "none" and (not isinstance(client_secret, str) or not client_secret))
             or (client_secret is not None and not isinstance(client_secret, str))
         ):
@@ -701,15 +1361,37 @@ class DownstreamMCPOAuthClient:
             if session.client_secret is None:
                 raise ValueError
             form["client_secret"] = session.client_secret
-        response = await self._http.post(
+        response = await self._network_guard.request(
+            "POST",
             session.token_endpoint,
             data=form,
             auth=auth,
-            follow_redirects=False,
         )
         if response.status_code != 200:
             raise ValueError
         return response
+
+    async def _client_authenticated_request(
+        self,
+        session: OAuthAuthorizationSession,
+        endpoint: str,
+        form: dict[str, str],
+    ) -> httpx.Response:
+        auth: httpx.BasicAuth | None = None
+        if session.token_endpoint_auth_method == "client_secret_basic":
+            if session.client_secret is None:
+                raise ValueError
+            auth = httpx.BasicAuth(session.client_id, session.client_secret)
+        elif session.token_endpoint_auth_method == "client_secret_post":
+            if session.client_secret is None:
+                raise ValueError
+            form["client_secret"] = session.client_secret
+        return await self._network_guard.request(
+            "POST",
+            endpoint,
+            data=form,
+            auth=auth,
+        )
 
 
 class ProviderOAuthService:
@@ -724,7 +1406,7 @@ class ProviderOAuthService:
         principal_resolver: PrincipalResolver,
         manifest: ProviderDriverManifest,
         oauth_client: Any,
-        state_store: InMemoryProviderOAuthStateStore,
+        state_store: ProviderOAuthStateStore,
         connection_store: Any,
         vault: CredentialVault,
         driver: Any,
@@ -755,10 +1437,16 @@ class ProviderOAuthService:
         workspace_id: UUID,
         provider: ProviderId | str,
         environment: str,
+        *,
+        selected_company_id: str | None = None,
     ) -> ProviderAuthorizationStart:
         try:
             checked_principal = MercuryPrincipal.model_validate(principal)
             checked_provider = ProviderId(provider)
+            checked_selected_company_id = _checked_selected_company_id(
+                selected_company_id,
+                code="provider_oauth_request_invalid",
+            )
             if checked_provider is not ProviderId.FLOWACCOUNT:
                 raise ValueError
             access_token = self._mercury_access_token(checked_principal)
@@ -784,6 +1472,8 @@ class ProviderOAuthService:
             code_verifier = _b64url(self._random_exact(32))
             code_challenge = _b64url(hashlib.sha256(code_verifier.encode("ascii")).digest())
             session = await self._oauth_client.start_authorization(
+                provider=ProviderId.FLOWACCOUNT,
+                environment=environment,
                 resource_uri=resource.uri,
                 callback_uri=callback_uri,
                 allowed_permissions=self._manifest.allowed_permissions,
@@ -799,6 +1489,20 @@ class ProviderOAuthService:
                 raise ValueError
 
             state_id = uuid4()
+            authorization_envelope = self._vault.seal(
+                _oauth_authorization_binding(
+                    tenant_id=membership.tenant_id,
+                    workspace_id=workspace_id,
+                    auth_user_id=checked_principal.subject,
+                    state_id=state_id,
+                    environment=environment,
+                ),
+                _serialize_authorization_payload(
+                    code_verifier=code_verifier,
+                    session=session,
+                    selected_company_id=checked_selected_company_id,
+                ),
+            )
             encrypted_payload = self._vault.seal(
                 _oauth_state_binding(
                     tenant_id=membership.tenant_id,
@@ -807,13 +1511,12 @@ class ProviderOAuthService:
                     state_id=state_id,
                     environment=environment,
                 ),
-                _serialize_state_payload(
+                _serialize_state_access(
                     mercury_access_token=access_token,
-                    code_verifier=code_verifier,
-                    session=session,
+                    authorization_envelope=authorization_envelope,
                 ),
-            )
-            self._state_store.create(
+            ).model_copy(update={"id": state_id})
+            await self._state_store.create(
                 tenant_id=membership.tenant_id,
                 workspace_id=workspace_id,
                 auth_user_id=checked_principal.subject,
@@ -821,8 +1524,10 @@ class ProviderOAuthService:
                 environment=environment,
                 state_hash=_state_hash(state),
                 callback_uri=callback_uri,
+                requested_permissions=session.granted_permissions,
                 expires_at=expires_at,
                 encrypted_payload=encrypted_payload,
+                mercury_access_token=access_token,
             )
             return ProviderAuthorizationStart(
                 authorization_url=session.authorization_url,
@@ -845,7 +1550,17 @@ class ProviderOAuthService:
             checked_callback = OAuthCallback.model_validate(callback)
         except (TypeError, ValueError, ValidationError):
             raise ProviderOAuthError("provider_oauth_callback_invalid") from None
-        return await self._complete(checked_principal, checked_callback)
+        try:
+            record = await self._state_store.peek(state_hash=_state_hash(checked_callback.state))
+            access = self._open_state_access(record)
+        except Exception:
+            raise ProviderOAuthError("provider_oauth_state_invalid") from None
+        return await self._complete(
+            checked_principal,
+            checked_callback,
+            record=record,
+            mercury_access_token=access.mercury_access_token,
+        )
 
     async def complete_callback(
         self,
@@ -853,9 +1568,9 @@ class ProviderOAuthService:
     ) -> ProviderConnectionSummary:
         try:
             checked_callback = OAuthCallback.model_validate(callback)
-            record = self._state_store.peek(state_hash=_state_hash(checked_callback.state))
-            payload = self._open_state_payload(record)
-            principal = await self._principal_resolver.resolve(payload.mercury_access_token)
+            record = await self._state_store.peek(state_hash=_state_hash(checked_callback.state))
+            access = self._open_state_access(record)
+            principal = await self._principal_resolver.resolve(access.mercury_access_token)
             if principal.subject != record.auth_user_id:
                 raise ValueError
             enriched = checked_callback.model_copy(
@@ -868,17 +1583,25 @@ class ProviderOAuthService:
             )
         except Exception:
             raise ProviderOAuthError("provider_oauth_state_invalid") from None
-        return await self._complete(principal, enriched)
+        return await self._complete(
+            principal,
+            enriched,
+            record=record,
+            mercury_access_token=access.mercury_access_token,
+        )
 
     async def _complete(
         self,
         principal: MercuryPrincipal,
         callback: OAuthCallback,
+        *,
+        record: ProviderOAuthStateRecord,
+        mercury_access_token: str,
     ) -> ProviderConnectionSummary:
         state_hash = _state_hash(callback.state)
-        record = self._state_store.peek(state_hash=state_hash)
         if (
-            record.auth_user_id != principal.subject
+            not secrets.compare_digest(record.state_hash, state_hash)
+            or record.auth_user_id != principal.subject
             or callback.workspace_id != record.workspace_id
             or callback.provider is not record.provider
             or callback.environment != record.environment
@@ -887,15 +1610,20 @@ class ProviderOAuthService:
         if callback.redirect_uri != record.callback_uri:
             raise ProviderOAuthError("provider_oauth_callback_invalid")
 
-        payload = self._open_state_payload(record)
-        self._state_store.consume(
-            state_hash=state_hash,
-            tenant_id=record.tenant_id,
-            workspace_id=record.workspace_id,
-            auth_user_id=record.auth_user_id,
-            provider=record.provider,
-            environment=record.environment,
+        consumed = await self._state_store.consume(
+            record=record,
+            mercury_access_token=mercury_access_token,
         )
+        access = self._open_state_access(consumed)
+        payload = self._open_authorization_payload(
+            consumed,
+            access.authorization_envelope,
+        )
+        if (
+            payload.callback_uri != consumed.callback_uri
+            or payload.granted_permissions != consumed.requested_permissions
+        ):
+            raise ProviderOAuthError("provider_oauth_state_invalid")
         try:
             tokens = await self._oauth_client.exchange_code(
                 session=payload.session(),
@@ -903,7 +1631,7 @@ class ProviderOAuthService:
                 code_verifier=payload.code_verifier,
             )
             tokens = FlowAccountOAuthTokens.model_validate(tokens)
-            if not set(tokens.granted_permissions).issubset(payload.granted_permissions):
+            if tokens.granted_permissions != payload.granted_permissions:
                 raise ValueError
         except ProviderOAuthError:
             raise
@@ -911,6 +1639,7 @@ class ProviderOAuthService:
             raise ProviderOAuthError("provider_oauth_exchange_failed") from None
 
         connection_id = uuid4()
+        provisional_account_id = f"oauth-pending-{consumed.id}"
         now = self._timestamp()
         provisional = ProviderConnection(
             id=connection_id,
@@ -919,7 +1648,7 @@ class ProviderOAuthService:
             auth_user_id=record.auth_user_id,
             provider=ProviderId.FLOWACCOUNT,
             environment=record.environment,
-            provider_account_id=callback.selected_company_id,
+            provider_account_id=provisional_account_id,
             account_display_name="FlowAccount",
             authorization_method=AuthorizationMethod.OAUTH2_PKCE,
             granted_permissions=tokens.granted_permissions,
@@ -947,7 +1676,7 @@ class ProviderOAuthService:
             connection_id=connection_id,
             provider=ProviderId.FLOWACCOUNT,
             environment=record.environment,
-            company_or_merchant_id=callback.selected_company_id,
+            company_or_merchant_id=provisional_account_id,
             account_display_name="FlowAccount",
             authorization_method=AuthorizationMethod.OAUTH2_PKCE,
             granted_permissions=tokens.granted_permissions,
@@ -973,9 +1702,8 @@ class ProviderOAuthService:
             display_name = validation.normalized_data["company_display_name"]
             if not isinstance(company_id, str) or not isinstance(display_name, str):
                 raise ValueError
-            if not secrets.compare_digest(
-                company_id,
-                callback.selected_company_id,
+            if payload.selected_company_id is not None and not secrets.compare_digest(
+                company_id, payload.selected_company_id
             ):
                 failure = ProviderOAuthError("provider_oauth_company_mismatch")
         except ProviderOAuthError as exc:
@@ -984,46 +1712,105 @@ class ProviderOAuthService:
             failure = ProviderOAuthError("provider_oauth_validation_failed")
 
         if failure is not None:
-            self._connection_store.save_connection(
+            if failure.code == "provider_oauth_validation_failed":
+                self._connection_store.save_connection(
+                    tenant_id=record.tenant_id,
+                    workspace_id=record.workspace_id,
+                    auth_user_id=record.auth_user_id,
+                    connection_id=connection_id,
+                    provider=ProviderId.FLOWACCOUNT,
+                    environment=record.environment,
+                    company_or_merchant_id=provisional_account_id,
+                    account_display_name="FlowAccount",
+                    authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+                    granted_permissions=tokens.granted_permissions,
+                    readiness=ConnectionReadiness.VALIDATION_FAILED,
+                    revision=2,
+                    validated_at=None,
+                    envelopes=envelopes,
+                )
+            revoked = False
+            if failure.code == "provider_oauth_company_mismatch":
+                revoked = await self._oauth_client.revoke(
+                    session=payload.session(),
+                    tokens=tokens,
+                )
+            self._connection_store.disconnect(
                 tenant_id=record.tenant_id,
                 workspace_id=record.workspace_id,
                 auth_user_id=record.auth_user_id,
                 connection_id=connection_id,
-                provider=ProviderId.FLOWACCOUNT,
-                environment=record.environment,
-                company_or_merchant_id=callback.selected_company_id,
-                account_display_name="FlowAccount",
-                authorization_method=AuthorizationMethod.OAUTH2_PKCE,
-                granted_permissions=tokens.granted_permissions,
-                readiness=ConnectionReadiness.VALIDATION_FAILED,
-                revision=2,
-                validated_at=None,
-                envelopes=envelopes,
+                provider_revocation_required=(
+                    failure.code == "provider_oauth_company_mismatch"
+                    and payload.revocation_endpoint is not None
+                    and not revoked
+                ),
             )
             raise failure
 
-        ready = self._connection_store.save_connection(
+        self._connection_store.disconnect(
             tenant_id=record.tenant_id,
             workspace_id=record.workspace_id,
             auth_user_id=record.auth_user_id,
             connection_id=connection_id,
+        )
+        ready_connection_id = uuid4()
+        exact_connection = provisional.model_copy(
+            update={
+                "id": ready_connection_id,
+                "provider_account_id": company_id,
+                "account_display_name": display_name,
+                "credential_envelope_ids": (uuid4(),),
+            }
+        )
+        exact_envelopes = seal_flowaccount_credentials(
+            vault=self._vault,
+            connection=exact_connection,
+            tokens=tokens,
+            token_endpoint=payload.token_endpoint,
+            resource_uri=payload.resource_uri,
+            client_id=payload.client_id,
+            client_secret=payload.client_secret,
+            token_endpoint_auth_method=payload.token_endpoint_auth_method,
+        )
+        self._connection_store.save_connection(
+            tenant_id=record.tenant_id,
+            workspace_id=record.workspace_id,
+            auth_user_id=record.auth_user_id,
+            connection_id=ready_connection_id,
             provider=ProviderId.FLOWACCOUNT,
             environment=record.environment,
-            company_or_merchant_id=callback.selected_company_id,
+            company_or_merchant_id=company_id,
+            account_display_name=display_name,
+            authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+            granted_permissions=tokens.granted_permissions,
+            readiness=ConnectionReadiness.REQUIRES_VALIDATION,
+            revision=1,
+            validated_at=None,
+            envelopes=exact_envelopes,
+        )
+        ready = self._connection_store.save_connection(
+            tenant_id=record.tenant_id,
+            workspace_id=record.workspace_id,
+            auth_user_id=record.auth_user_id,
+            connection_id=ready_connection_id,
+            provider=ProviderId.FLOWACCOUNT,
+            environment=record.environment,
+            company_or_merchant_id=company_id,
             account_display_name=display_name,
             authorization_method=AuthorizationMethod.OAUTH2_PKCE,
             granted_permissions=tokens.granted_permissions,
             readiness=ConnectionReadiness.READY,
             revision=2,
             validated_at=self._timestamp(),
-            envelopes=envelopes,
+            envelopes=exact_envelopes,
         )
         return ready.summary()
 
-    def _open_state_payload(
+    def _open_state_access(
         self,
-        record: _OAuthStateRecord,
-    ) -> _StoredOAuthPayload:
+        record: ProviderOAuthStateRecord,
+    ) -> _StoredOAuthStateAccess:
         plaintext: bytearray | None = None
         try:
             plaintext = self._vault.open(
@@ -1035,6 +1822,35 @@ class ProviderOAuthService:
                     environment=record.environment,
                 ),
                 record.encrypted_payload,
+            )
+            return _StoredOAuthStateAccess.model_validate_json(plaintext)
+        except (CredentialVaultError, TypeError, ValueError, ValidationError):
+            raise ProviderOAuthError("provider_oauth_state_invalid") from None
+        finally:
+            if plaintext is not None:
+                with suppress(Exception):
+                    plaintext[:] = b"\x00" * len(plaintext)
+
+    def _open_authorization_payload(
+        self,
+        record: ProviderOAuthStateRecord,
+        envelope_record: Mapping[str, Any],
+    ) -> _StoredOAuthPayload:
+        plaintext: bytearray | None = None
+        try:
+            envelope = _authorization_envelope_from_record(
+                envelope_record,
+                state=record,
+            )
+            plaintext = self._vault.open(
+                _oauth_authorization_binding(
+                    tenant_id=record.tenant_id,
+                    workspace_id=record.workspace_id,
+                    auth_user_id=record.auth_user_id,
+                    state_id=record.id,
+                    environment=record.environment,
+                ),
+                envelope,
             )
             return _StoredOAuthPayload.model_validate_json(plaintext)
         except (CredentialVaultError, TypeError, ValueError, ValidationError):
@@ -1091,30 +1907,121 @@ def _oauth_state_binding(
     )
 
 
-def _serialize_state_payload(
+def _oauth_authorization_binding(
+    *,
+    tenant_id: UUID,
+    workspace_id: UUID,
+    auth_user_id: UUID,
+    state_id: UUID,
+    environment: str,
+) -> CredentialBinding:
+    return CredentialBinding(
+        tenant_id=tenant_id,
+        workspace_id=workspace_id,
+        auth_user_id=auth_user_id,
+        connection_id=state_id,
+        provider=ProviderId.FLOWACCOUNT.value,
+        company_or_merchant_id="oauth-state",
+        environment=environment,
+        credential_type="oauth_authorization",
+    )
+
+
+def _serialize_state_access(
     *,
     mercury_access_token: str,
-    code_verifier: str,
-    session: OAuthAuthorizationSession,
+    authorization_envelope: CredentialEnvelope,
 ) -> bytes:
     return json.dumps(
         {
             "mercury_access_token": mercury_access_token,
-            "code_verifier": code_verifier,
-            "authorization_url": session.authorization_url,
-            "resource_uri": session.resource_uri,
-            "authorization_endpoint": session.authorization_endpoint,
-            "token_endpoint": session.token_endpoint,
-            "callback_uri": session.callback_uri,
-            "client_id": session.client_id,
-            "client_secret": session.client_secret,
-            "token_endpoint_auth_method": session.token_endpoint_auth_method,
-            "granted_permissions": session.granted_permissions,
+            "authorization_envelope": _authorization_envelope_record(authorization_envelope),
         },
         ensure_ascii=True,
         separators=(",", ":"),
         sort_keys=True,
     ).encode("ascii")
+
+
+def _serialize_authorization_payload(
+    *,
+    code_verifier: str,
+    session: OAuthAuthorizationSession,
+    selected_company_id: str | None,
+) -> bytes:
+    return json.dumps(
+        {
+            "code_verifier": code_verifier,
+            "authorization_url": session.authorization_url,
+            "resource_uri": session.resource_uri,
+            "authorization_endpoint": session.authorization_endpoint,
+            "token_endpoint": session.token_endpoint,
+            "revocation_endpoint": session.revocation_endpoint,
+            "callback_uri": session.callback_uri,
+            "client_id": session.client_id,
+            "client_secret": session.client_secret,
+            "token_endpoint_auth_method": session.token_endpoint_auth_method,
+            "granted_permissions": session.granted_permissions,
+            "selected_company_id": selected_company_id,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+
+
+def _authorization_envelope_record(
+    envelope: CredentialEnvelope,
+) -> dict[str, Any]:
+    checked = CredentialEnvelope.model_validate(envelope)
+    return {
+        "id": str(checked.id),
+        "tenant_id": str(checked.tenant_id),
+        "workspace_id": str(checked.workspace_id),
+        "auth_user_id": str(checked.auth_user_id),
+        "connection_id": str(checked.connection_id),
+        "provider": checked.provider,
+        "environment": checked.environment,
+        "credential_type": checked.credential_type,
+        "key_version": checked.key_version,
+        "nonce": checked.nonce.hex(),
+        "ciphertext": checked.ciphertext.hex(),
+        "aad_hash": checked.aad_hash.hex(),
+        "created_at": checked.created_at.isoformat(),
+    }
+
+
+def _authorization_envelope_from_record(
+    value: Mapping[str, Any],
+    *,
+    state: ProviderOAuthStateRecord,
+) -> CredentialEnvelope:
+    envelope = CredentialEnvelope(
+        id=UUID(str(value["id"])),
+        tenant_id=UUID(str(value["tenant_id"])),
+        workspace_id=UUID(str(value["workspace_id"])),
+        auth_user_id=UUID(str(value["auth_user_id"])),
+        connection_id=UUID(str(value["connection_id"])),
+        provider=value["provider"],
+        environment=value["environment"],
+        credential_type=value["credential_type"],
+        key_version=value["key_version"],
+        nonce=bytes.fromhex(value["nonce"]),
+        ciphertext=bytes.fromhex(value["ciphertext"]),
+        aad_hash=bytes.fromhex(value["aad_hash"]),
+        created_at=datetime.fromisoformat(value["created_at"]),
+    )
+    if (
+        envelope.tenant_id != state.tenant_id
+        or envelope.workspace_id != state.workspace_id
+        or envelope.auth_user_id != state.auth_user_id
+        or envelope.connection_id != state.id
+        or envelope.provider != state.provider.value
+        or envelope.environment != state.environment
+        or envelope.credential_type != "oauth_authorization"
+    ):
+        raise ValueError
+    return envelope
 
 
 def _protected_resource_metadata_url(resource_uri: str) -> str:
@@ -1168,7 +2075,7 @@ def _string_set(value: Any) -> set[str]:
     return set(value)
 
 
-def _json_object(response: httpx.Response) -> dict[str, Any]:
+def _json_value(response: httpx.Response) -> Any:
     if not 0 < len(response.content) <= _MAX_METADATA_BYTES:
         raise ValueError
 
@@ -1180,10 +2087,33 @@ def _json_object(response: httpx.Response) -> dict[str, Any]:
             result[key] = value
         return result
 
-    payload = json.loads(response.content, object_pairs_hook=unique_object)
+    return json.loads(response.content, object_pairs_hook=unique_object)
+
+
+def _json_object(response: httpx.Response) -> dict[str, Any]:
+    payload = _json_value(response)
     if not isinstance(payload, dict):
         raise ValueError
     return payload
+
+
+def _single_response_row(response: httpx.Response) -> dict[str, Any]:
+    if response.status_code < 200 or response.status_code >= 300:
+        raise ValueError
+    payload = _json_value(response)
+    if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
+        raise ValueError
+    return payload[0]
+
+
+def _postgres_bytea(value: bytes) -> str:
+    return f"\\x{value.hex()}"
+
+
+def _decode_postgres_bytea(value: Any) -> bytes:
+    if not isinstance(value, str) or not value.startswith("\\x"):
+        raise ValueError
+    return bytes.fromhex(value[2:])
 
 
 def _oauth_tokens(
@@ -1196,6 +2126,7 @@ def _oauth_tokens(
     refresh_token = payload.get("refresh_token")
     expires_in = payload.get("expires_in")
     scope = payload.get("scope")
+    token_type = payload.get("token_type")
     if (
         not isinstance(access_token, str)
         or not access_token
@@ -1204,6 +2135,8 @@ def _oauth_tokens(
         or not isinstance(expires_in, int | float)
         or not 0 < expires_in <= 31_536_000
         or (scope is not None and not isinstance(scope, str))
+        or not isinstance(token_type, str)
+        or token_type.casefold() != "bearer"
     ):
         raise ValueError
     permissions = tuple(sorted(scope.split())) if scope is not None else allowed_permissions
@@ -1212,6 +2145,7 @@ def _oauth_tokens(
     return FlowAccountOAuthTokens(
         access_token=access_token,
         refresh_token=refresh_token,
+        token_type=token_type,
         expires_at=datetime.now(UTC) + timedelta(seconds=float(expires_in)),
         granted_permissions=permissions,
     )
@@ -1221,9 +2155,14 @@ __all__ = [
     "DownstreamMCPOAuthClient",
     "FLOWACCOUNT_CALLBACK_PATH",
     "InMemoryProviderOAuthStateStore",
+    "OAuthNetworkGuard",
     "OAuthAuthorizationSession",
     "OAuthCallback",
     "ProviderAuthorizationStart",
     "ProviderOAuthError",
+    "ProviderOAuthStateRecord",
+    "ProviderOAuthStateStore",
     "ProviderOAuthService",
+    "PublicOAuthNetworkGuard",
+    "SupabaseProviderOAuthStateStore",
 ]

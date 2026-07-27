@@ -292,6 +292,7 @@ def test_registry_loads_only_known_provider_manifests_from_server_catalog() -> N
     registry = build_provider_registry(
         settings=_settings(),
         manifest_root=ROOT / "catalog/global",
+        flowaccount_profile_binding_resolver=lambda _connection, _tool: None,
     )
 
     assert isinstance(registry, ProviderDriverRegistry)

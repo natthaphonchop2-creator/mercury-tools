@@ -10,6 +10,7 @@ from mercury_tools.providers.base import ProviderDriver
 from mercury_tools.providers.flowaccount import (
     FlowAccountMCPDriver,
     FlowAccountProfileBindingResolver,
+    normalize_flowaccount_response,
 )
 from mercury_tools.providers.manifest import load_provider_manifest
 from mercury_tools.providers.models import AuthorizationMethod, ProviderId
@@ -63,6 +64,19 @@ def build_provider_registry(
 ) -> ProviderDriverRegistry:
     """Load the two server-controlled manifests without accepting resource URLs."""
 
+    if flowaccount_profile_binding_resolver is None:
+        raise ProviderRegistryError("flowaccount_profile_binding_resolver_missing")
+
+    def provider_scoped_normalizer(binding, structured_content):
+        if (
+            binding.provider is ProviderId.FLOWACCOUNT
+            and binding.normalized_capability == "provider_profile.get"
+        ):
+            return normalize_flowaccount_response(binding, structured_content)
+        if response_normalizer is None:
+            raise ValueError("provider_response_normalizer_missing")
+        return response_normalizer(binding, structured_content)
+
     root = Path(manifest_root)
     factories = dict(header_factories or {})
     registry = ProviderDriverRegistry()
@@ -73,16 +87,16 @@ def build_provider_registry(
             manifest=manifest,
             header_factory=factories.get(manifest.auth_adapter),
             binding_verifier=binding_verifier,
-            response_normalizer=response_normalizer,
+            response_normalizer=provider_scoped_normalizer,
             request_model_resolver=request_model_resolver,
             response_model_resolver=response_model_resolver,
         )
-        if provider is ProviderId.FLOWACCOUNT and flowaccount_profile_binding_resolver is not None:
+        if provider is ProviderId.FLOWACCOUNT:
             registry.register(
                 FlowAccountMCPDriver(
                     runtime=runtime,
                     manifest=manifest,
-                    profile_binding_resolver=(flowaccount_profile_binding_resolver),
+                    profile_binding_resolver=flowaccount_profile_binding_resolver,
                 )
             )
         else:

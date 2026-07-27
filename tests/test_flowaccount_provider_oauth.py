@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import json
+import threading
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -10,13 +14,15 @@ from uuid import UUID
 
 import httpx
 import pytest
+from pydantic import ValidationError
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
 from mercury_tools.auth.middleware import MercuryOAuthMiddleware
 from mercury_tools.auth.models import MercuryPrincipal
 from mercury_tools.cloud.api import CloudDependencies, cloud_routes
-from mercury_tools.config import Settings
+from mercury_tools.config import Settings, V1ConfigurationError
+from mercury_tools.credentials.models import CredentialBinding
 from mercury_tools.credentials.vault import CredentialVault
 from mercury_tools.providers.base import (
     DispatchCertainty,
@@ -24,7 +30,10 @@ from mercury_tools.providers.base import (
     ProviderStatusClass,
     ProviderValidation,
 )
-from mercury_tools.providers.flowaccount import FlowAccountOAuthTokens
+from mercury_tools.providers.flowaccount import (
+    FlowAccountOAuthTokens,
+    FlowAccountRefreshRequest,
+)
 from mercury_tools.providers.manifest import load_provider_manifest
 from mercury_tools.providers.models import (
     ConnectionReadiness,
@@ -39,6 +48,8 @@ from mercury_tools.providers.oauth import (
     OAuthCallback,
     ProviderOAuthError,
     ProviderOAuthService,
+    PublicOAuthNetworkGuard,
+    SupabaseProviderOAuthStateStore,
 )
 from mercury_tools.providers.store import ProviderConnectionStore
 from mercury_tools.workspaces.models import WorkspaceMembership, WorkspaceRole
@@ -57,10 +68,15 @@ AUTHORIZATION_SERVER = "https://identity.flowaccount.example/oauth"
 AUTHORIZATION_ENDPOINT = "https://identity.flowaccount.example/oauth/authorize"
 TOKEN_ENDPOINT = "https://identity.flowaccount.example/oauth/token"
 REGISTRATION_ENDPOINT = "https://identity.flowaccount.example/oauth/register"
+REVOCATION_ENDPOINT = "https://identity.flowaccount.example/oauth/revoke"
 MERCURY_ACCESS_TOKEN = "MERCURY_USER_ACCESS_TOKEN_SENTINEL"
 PROVIDER_ACCESS_TOKEN = "FLOWACCOUNT_ACCESS_TOKEN_SENTINEL"
 PROVIDER_REFRESH_TOKEN = "FLOWACCOUNT_REFRESH_TOKEN_SENTINEL"
 DYNAMIC_CLIENT_SECRET = "FLOWACCOUNT_DYNAMIC_CLIENT_SECRET_SENTINEL"
+AUTHORIZATION_SERVER_ORIGINS = {
+    (ProviderId.FLOWACCOUNT, "sandbox"): ("https://identity.flowaccount.example",),
+    (ProviderId.FLOWACCOUNT, "production"): ("https://identity.flowaccount.example",),
+}
 
 
 def _settings() -> Settings:
@@ -143,10 +159,13 @@ class FakeOAuthClient:
     def __init__(self) -> None:
         self.starts: list[dict[str, object]] = []
         self.exchanges: list[dict[str, object]] = []
+        self.revocations = 0
 
     async def start_authorization(
         self,
         *,
+        provider: ProviderId,
+        environment: str,
         resource_uri: str,
         callback_uri: str,
         allowed_permissions: tuple[str, ...],
@@ -155,6 +174,8 @@ class FakeOAuthClient:
     ) -> OAuthAuthorizationSession:
         self.starts.append(
             {
+                "provider": provider,
+                "environment": environment,
                 "resource_uri": resource_uri,
                 "callback_uri": callback_uri,
                 "allowed_permissions": allowed_permissions,
@@ -179,6 +200,7 @@ class FakeOAuthClient:
             resource_uri=resource_uri,
             authorization_endpoint=AUTHORIZATION_ENDPOINT,
             token_endpoint=TOKEN_ENDPOINT,
+            revocation_endpoint=REVOCATION_ENDPOINT,
             callback_uri=callback_uri,
             client_id="dynamic-client-id",
             client_secret=DYNAMIC_CLIENT_SECRET,
@@ -203,9 +225,21 @@ class FakeOAuthClient:
         return FlowAccountOAuthTokens(
             access_token=PROVIDER_ACCESS_TOKEN,
             refresh_token=PROVIDER_REFRESH_TOKEN,
+            token_type="Bearer",
             expires_at=NOW + timedelta(hours=1),
             granted_permissions=session.granted_permissions,
         )
+
+    async def revoke(
+        self,
+        *,
+        session: OAuthAuthorizationSession,
+        tokens: FlowAccountOAuthTokens,
+    ) -> bool:
+        assert session.revocation_endpoint == REVOCATION_ENDPOINT
+        assert tokens.token_type == "Bearer"
+        self.revocations += 1
+        return True
 
 
 class FakeFlowAccountDriver:
@@ -219,9 +253,11 @@ class FakeFlowAccountDriver:
             "documents.invoice.list",
             "provider_profile.get",
         ),
+        validation_error: bool = False,
     ) -> None:
         self.profile_company_id = profile_company_id
         self.discovery_capabilities = discovery_capabilities
+        self.validation_error = validation_error
         self.events: list[str] = []
 
     async def discover(self, _connection) -> ProviderDiscovery:
@@ -238,6 +274,8 @@ class FakeFlowAccountDriver:
 
     async def validate_connection(self, _connection) -> ProviderValidation:
         self.events.append("provider_profile.get")
+        if self.validation_error:
+            raise RuntimeError("retryable downstream validation failure")
         return ProviderValidation(
             provider=ProviderId.FLOWACCOUNT,
             status_class=ProviderStatusClass.SUCCESS,
@@ -257,6 +295,131 @@ class RecordingConnectionStore:
     def save_connection(self, **kwargs):
         self.saved.append(dict(kwargs))
         return self.store.save_connection(**kwargs)
+
+    def disconnect(self, **kwargs):
+        return self.store.disconnect(**kwargs)
+
+
+class SharedOAuthStateRPCBackend:
+    """Deterministic local model of the Task 4 create/consume RPC contract."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.attempts: dict[str, dict[str, object]] = {}
+        self.states: dict[str, dict[str, object]] = {}
+        self.authorization_headers: list[tuple[str, str]] = []
+        self.consume_successes = 0
+        self.consume_failures = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content) if request.content else {}
+        path = request.url.path
+        self.authorization_headers.append((path, request.headers.get("authorization", "")))
+        if path.endswith("/rpc/create_mercury_provider_setup_attempt"):
+            return self._create_attempt(payload)
+        if path.endswith("/rpc/create_mercury_provider_oauth_state"):
+            return self._create_state(payload)
+        if path.endswith("/rpc/consume_mercury_provider_oauth_state"):
+            return self._consume_state(payload)
+        if path.endswith("/mercury_provider_oauth_states"):
+            return self._peek_state(request)
+        return httpx.Response(404, json={"error": "unexpected"})
+
+    def _create_attempt(self, payload: dict[str, object]) -> httpx.Response:
+        attempt_id = str(payload["p_attempt_id"])
+        row = {
+            "attempt_id": attempt_id,
+            "tenant_id": payload["p_tenant_id"],
+            "workspace_id": payload["p_workspace_id"],
+            "auth_user_id": payload["p_auth_user_id"],
+            "provider": payload["p_provider"],
+            "environment": payload["p_environment"],
+            "expires_at": payload["p_expires_at"],
+            "consumed_at": None,
+            "created_at": NOW.isoformat(),
+        }
+        with self._lock:
+            self.attempts[attempt_id] = row
+        return httpx.Response(200, json=[row])
+
+    def _create_state(self, payload: dict[str, object]) -> httpx.Response:
+        attempt_id = str(payload["p_setup_attempt_id"])
+        state_id = str(payload["p_state_id"])
+        with self._lock:
+            attempt = self.attempts.get(attempt_id)
+            if attempt is None or attempt["consumed_at"] is not None:
+                return httpx.Response(400, json={"message": "provider_oauth_state_invalid"})
+            attempt["consumed_at"] = NOW.isoformat()
+            row = {
+                "id": state_id,
+                "setup_attempt_id": attempt_id,
+                "tenant_id": payload["p_tenant_id"],
+                "workspace_id": payload["p_workspace_id"],
+                "auth_user_id": payload["p_auth_user_id"],
+                "provider": payload["p_provider"],
+                "environment": payload["p_environment"],
+                "state_hash": payload["p_state_hash"],
+                "pkce_verifier_ciphertext": payload["p_pkce_verifier_ciphertext"],
+                "pkce_key_version": payload["p_pkce_key_version"],
+                "pkce_nonce": payload["p_pkce_nonce"],
+                "pkce_aad_hash": payload["p_pkce_aad_hash"],
+                "callback_state": payload["p_callback_state"],
+                "expires_at": payload["p_expires_at"],
+                "consumed_at": None,
+                "created_at": NOW.isoformat(),
+            }
+            self.states[str(payload["p_state_hash"])] = row
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "oauth_state_id": state_id,
+                    "setup_attempt_id": attempt_id,
+                    "expires_at": payload["p_expires_at"],
+                    "created_at": NOW.isoformat(),
+                }
+            ],
+        )
+
+    def _peek_state(self, request: httpx.Request) -> httpx.Response:
+        requested_hash = request.url.params["state_hash"].removeprefix("eq.")
+        with self._lock:
+            row = self.states.get(requested_hash)
+            rows = [] if row is None or row["consumed_at"] is not None else [dict(row)]
+        return httpx.Response(200, json=rows)
+
+    def _consume_state(self, payload: dict[str, object]) -> httpx.Response:
+        state_hash = str(payload["p_state_hash"])
+        with self._lock:
+            row = self.states.get(state_hash)
+            if (
+                row is None
+                or row["consumed_at"] is not None
+                or row["tenant_id"] != payload["p_tenant_id"]
+                or row["workspace_id"] != payload["p_workspace_id"]
+                or row["auth_user_id"] != payload["p_auth_user_id"]
+                or row["provider"] != payload["p_provider"]
+                or row["environment"] != payload["p_environment"]
+            ):
+                self.consume_failures += 1
+                return httpx.Response(400, json={"message": "provider_oauth_state_invalid"})
+            consumed = {
+                "oauth_state_id": row["id"],
+                "setup_attempt_id": row["setup_attempt_id"],
+                "pkce_verifier_ciphertext": row["pkce_verifier_ciphertext"],
+                "pkce_key_version": row["pkce_key_version"],
+                "pkce_nonce": row["pkce_nonce"],
+                "pkce_aad_hash": row["pkce_aad_hash"],
+                "callback_state": row["callback_state"],
+                "consumed_at": NOW.isoformat(),
+            }
+            row["consumed_at"] = NOW.isoformat()
+            row["pkce_verifier_ciphertext"] = None
+            row["pkce_key_version"] = None
+            row["pkce_nonce"] = None
+            row["pkce_aad_hash"] = None
+            self.consume_successes += 1
+        return httpx.Response(200, json=[consumed])
 
 
 def _service(
@@ -306,6 +469,94 @@ def _service(
 
 
 @pytest.mark.asyncio
+async def test_supabase_state_store_is_cross_instance_atomic_and_clears_verifier() -> None:
+    backend = SharedOAuthStateRPCBackend()
+    state_id = UUID("77777777-7777-4777-8777-777777777777")
+    attempt_id = UUID("88888888-8888-4888-8888-888888888888")
+    state_hash = "a" * 64
+    vault = _vault()
+    encrypted = vault.seal(
+        CredentialBinding(
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=USER_ID,
+            connection_id=state_id,
+            provider="flowaccount",
+            company_or_merchant_id="oauth-state",
+            environment="sandbox",
+            credential_type="oauth_state",
+        ),
+        b"ENCRYPTED_STATE_PLAINTEXT_SENTINEL",
+    ).model_copy(update={"id": state_id})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(backend),
+        follow_redirects=False,
+    ) as client:
+        first = SupabaseProviderOAuthStateStore(
+            settings=_settings(),
+            http_client=client,
+            uuid_factory=lambda: attempt_id,
+            callback_uri=CALLBACK_URI,
+        )
+        second = SupabaseProviderOAuthStateStore(
+            settings=_settings(),
+            http_client=client,
+            callback_uri=CALLBACK_URI,
+        )
+        created = await first.create(
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=USER_ID,
+            provider=ProviderId.FLOWACCOUNT,
+            environment="sandbox",
+            state_hash=state_hash,
+            callback_uri=CALLBACK_URI,
+            requested_permissions=("documents.read", "profile.read"),
+            expires_at=NOW + timedelta(minutes=10),
+            encrypted_payload=encrypted,
+            mercury_access_token=MERCURY_ACCESS_TOKEN,
+        )
+        first_peek, second_peek = await asyncio.gather(
+            first.peek(state_hash=state_hash),
+            second.peek(state_hash=state_hash),
+        )
+        outcomes = await asyncio.gather(
+            first.consume(
+                record=first_peek,
+                mercury_access_token=MERCURY_ACCESS_TOKEN,
+            ),
+            second.consume(
+                record=second_peek,
+                mercury_access_token=MERCURY_ACCESS_TOKEN,
+            ),
+            return_exceptions=True,
+        )
+
+    successes = [item for item in outcomes if not isinstance(item, Exception)]
+    failures = [item for item in outcomes if isinstance(item, Exception)]
+    assert created.id == state_id
+    assert len(successes) == len(failures) == 1
+    assert isinstance(failures[0], ProviderOAuthError)
+    assert str(failures[0]) == "provider_oauth_state_invalid"
+    assert backend.consume_successes == backend.consume_failures == 1
+    assert backend.states[state_hash]["pkce_verifier_ciphertext"] is None
+    assert backend.states[state_hash]["pkce_key_version"] is None
+    assert backend.states[state_hash]["pkce_nonce"] is None
+    assert backend.states[state_hash]["pkce_aad_hash"] is None
+    assert all(
+        authorization == f"Bearer {MERCURY_ACCESS_TOKEN}"
+        for path, authorization in backend.authorization_headers
+        if "/rpc/" in path
+    )
+    assert all(
+        authorization == "Bearer service-role"
+        for path, authorization in backend.authorization_headers
+        if path.endswith("/mercury_provider_oauth_states")
+    )
+
+
+@pytest.mark.asyncio
 async def test_start_uses_256_bit_state_s256_pkce_and_exact_ten_minute_binding() -> None:
     service, oauth_client, *_ = _service()
 
@@ -347,6 +598,8 @@ async def test_start_uses_256_bit_state_s256_pkce_and_exact_ten_minute_binding()
     assert "code_verifier" not in first_query
     assert "access_token" not in first.authorization_url
     assert oauth_client.starts[0]["resource_uri"] == RESOURCE_URI
+    assert oauth_client.starts[0]["provider"] is ProviderId.FLOWACCOUNT
+    assert oauth_client.starts[0]["environment"] == "sandbox"
     assert oauth_client.starts[0]["allowed_permissions"] == (
         "documents.create",
         "documents.read",
@@ -359,8 +612,10 @@ async def test_strict_downstream_discovery_starts_at_configured_resource_and_int
     None
 ):
     calls: list[tuple[str, str]] = []
+    registration_request: dict[str, object] | None = None
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal registration_request
         calls.append((request.method, str(request.url)))
         if str(request.url) == RESOURCE_URI:
             return httpx.Response(
@@ -396,6 +651,7 @@ async def test_strict_downstream_discovery_starts_at_configured_resource_and_int
                     "authorization_endpoint": AUTHORIZATION_ENDPOINT,
                     "token_endpoint": TOKEN_ENDPOINT,
                     "registration_endpoint": REGISTRATION_ENDPOINT,
+                    "revocation_endpoint": REVOCATION_ENDPOINT,
                     "response_types_supported": ["code"],
                     "grant_types_supported": [
                         "authorization_code",
@@ -408,7 +664,7 @@ async def test_strict_downstream_discovery_starts_at_configured_resource_and_int
                 },
             )
         if str(request.url) == REGISTRATION_ENDPOINT:
-            assert request.json() if False else True
+            registration_request = json.loads(request.content)
             return httpx.Response(
                 201,
                 json={
@@ -426,8 +682,17 @@ async def test_strict_downstream_discovery_starts_at_configured_resource_and_int
         transport=httpx.MockTransport(handler),
         follow_redirects=False,
     ) as client:
-        oauth_client = DownstreamMCPOAuthClient(http_client=client)
+        network_guard = PublicOAuthNetworkGuard(
+            resolver=lambda _host, _port: ("1.1.1.1",),
+            http_client=client,
+        )
+        oauth_client = DownstreamMCPOAuthClient(
+            network_guard=network_guard,
+            authorization_server_origins=AUTHORIZATION_SERVER_ORIGINS,
+        )
         session = await oauth_client.start_authorization(
+            provider=ProviderId.FLOWACCOUNT,
+            environment="sandbox",
             resource_uri=RESOURCE_URI,
             callback_uri=CALLBACK_URI,
             allowed_permissions=MANIFEST.allowed_permissions,
@@ -444,10 +709,318 @@ async def test_strict_downstream_discovery_starts_at_configured_resource_and_int
         "https://identity.flowaccount.example/.well-known/oauth-authorization-server/oauth"
     )
     assert calls[3] == ("POST", REGISTRATION_ENDPOINT)
+    assert registration_request == {
+        "redirect_uris": [CALLBACK_URI],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "client_secret_basic",
+    }
     assert query["scope"] == ["documents.read profile.read"]
     assert query["redirect_uri"] == [CALLBACK_URI]
     assert session.client_secret == DYNAMIC_CLIENT_SECRET
+    assert session.revocation_endpoint == REVOCATION_ENDPOINT
     assert repr(session).find(DYNAMIC_CLIENT_SECRET) == -1
+
+
+def _discovery_handler(
+    *,
+    registration_payload: dict[str, object],
+    authorization_server: str = AUTHORIZATION_SERVER,
+) -> Callable[[httpx.Request], httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == RESOURCE_URI:
+            return httpx.Response(
+                401,
+                headers={
+                    "WWW-Authenticate": (
+                        'Bearer resource_metadata="'
+                        "https://flowaccount-sandbox.example/"
+                        '.well-known/oauth-protected-resource/mcp", '
+                        'scope="profile.read documents.read"'
+                    )
+                },
+            )
+        if request.url.path == "/.well-known/oauth-protected-resource/mcp":
+            return httpx.Response(
+                200,
+                json={
+                    "resource": RESOURCE_URI,
+                    "authorization_servers": [authorization_server],
+                    "scopes_supported": ["profile.read", "documents.read"],
+                },
+            )
+        if request.url.path.endswith("/.well-known/oauth-authorization-server/oauth"):
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": authorization_server,
+                    "authorization_endpoint": (f"{authorization_server.rstrip('/')}/authorize"),
+                    "token_endpoint": f"{authorization_server.rstrip('/')}/token",
+                    "registration_endpoint": (f"{authorization_server.rstrip('/')}/register"),
+                    "response_types_supported": ["code"],
+                    "grant_types_supported": ["authorization_code", "refresh_token"],
+                    "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+                    "code_challenge_methods_supported": ["S256"],
+                },
+            )
+        if request.url.path.endswith("/register"):
+            return httpx.Response(201, json=registration_payload)
+        return httpx.Response(404)
+
+    return handler
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "registration_override",
+    [
+        {"redirect_uris": [CALLBACK_URI, "https://attacker.example/callback"]},
+        {"grant_types": ["authorization_code"]},
+        {"response_types": ["code", "token"]},
+    ],
+)
+async def test_dynamic_registration_requires_exact_returned_metadata(
+    registration_override: dict[str, object],
+) -> None:
+    registration = {
+        "client_id": "dynamic-client-id",
+        "client_secret": DYNAMIC_CLIENT_SECRET,
+        "redirect_uris": [CALLBACK_URI],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "client_secret_basic",
+        **registration_override,
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_discovery_handler(registration_payload=registration)),
+    ) as client:
+        oauth_client = DownstreamMCPOAuthClient(
+            network_guard=PublicOAuthNetworkGuard(
+                resolver=lambda _host, _port: ("1.1.1.1",),
+                http_client=client,
+            ),
+            authorization_server_origins=AUTHORIZATION_SERVER_ORIGINS,
+        )
+        with pytest.raises(
+            ProviderOAuthError,
+            match="^provider_oauth_downstream_invalid$",
+        ):
+            await oauth_client.start_authorization(
+                provider=ProviderId.FLOWACCOUNT,
+                environment="sandbox",
+                resource_uri=RESOURCE_URI,
+                callback_uri=CALLBACK_URI,
+                allowed_permissions=MANIFEST.allowed_permissions,
+                state="A" * 43,
+                code_challenge="B" * 43,
+            )
+
+
+@pytest.mark.asyncio
+async def test_metadata_authorization_server_must_match_reviewed_environment_origin() -> None:
+    attacker_server = "https://attacker.example/oauth"
+    calls: list[str] = []
+    handler = _discovery_handler(
+        registration_payload={},
+        authorization_server=attacker_server,
+    )
+
+    def recording_handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return handler(request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(recording_handler),
+    ) as client:
+        oauth_client = DownstreamMCPOAuthClient(
+            network_guard=PublicOAuthNetworkGuard(
+                resolver=lambda _host, _port: ("1.1.1.1",),
+                http_client=client,
+            ),
+            authorization_server_origins=AUTHORIZATION_SERVER_ORIGINS,
+        )
+        with pytest.raises(
+            ProviderOAuthError,
+            match="^provider_oauth_downstream_invalid$",
+        ):
+            await oauth_client.start_authorization(
+                provider=ProviderId.FLOWACCOUNT,
+                environment="sandbox",
+                resource_uri=RESOURCE_URI,
+                callback_uri=CALLBACK_URI,
+                allowed_permissions=MANIFEST.allowed_permissions,
+                state="A" * 43,
+                code_challenge="B" * 43,
+            )
+
+    assert all("attacker.example/.well-known" not in url for url in calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "answers",
+    [
+        [("127.0.0.1",)],
+        [("1.1.1.1",), ("10.0.0.9",)],
+    ],
+    ids=["private-address", "dns-rebinding"],
+)
+async def test_network_guard_rejects_non_public_or_rebound_resolution(
+    answers: list[tuple[str, ...]],
+) -> None:
+    calls: list[str] = []
+    remaining = list(answers)
+
+    def resolver(_host: str, _port: int) -> tuple[str, ...]:
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return _discovery_handler(
+            registration_payload={
+                "client_id": "dynamic-client-id",
+                "client_secret": DYNAMIC_CLIENT_SECRET,
+                "redirect_uris": [CALLBACK_URI],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "client_secret_basic",
+            }
+        )(request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        oauth_client = DownstreamMCPOAuthClient(
+            network_guard=PublicOAuthNetworkGuard(
+                resolver=resolver,
+                http_client=client,
+            ),
+            authorization_server_origins=AUTHORIZATION_SERVER_ORIGINS,
+        )
+        with pytest.raises(
+            ProviderOAuthError,
+            match="^provider_oauth_downstream_invalid$",
+        ):
+            await oauth_client.start_authorization(
+                provider=ProviderId.FLOWACCOUNT,
+                environment="sandbox",
+                resource_uri=RESOURCE_URI,
+                callback_uri=CALLBACK_URI,
+                allowed_permissions=MANIFEST.allowed_permissions,
+                state="A" * 43,
+                code_challenge="B" * 43,
+            )
+
+    assert len(calls) <= 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("token_type", "accepted"),
+    [(None, False), ("MAC", False), ("bearer", True)],
+)
+async def test_exchange_requires_case_insensitive_bearer_token_type(
+    token_type: str | None,
+    accepted: bool,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = {
+            "access_token": PROVIDER_ACCESS_TOKEN,
+            "refresh_token": PROVIDER_REFRESH_TOKEN,
+            "expires_in": 3600,
+            "scope": "documents.read profile.read",
+        }
+        if token_type is not None:
+            payload["token_type"] = token_type
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        oauth_client = DownstreamMCPOAuthClient(
+            network_guard=PublicOAuthNetworkGuard(
+                resolver=lambda _host, _port: ("1.1.1.1",),
+                http_client=client,
+            ),
+            authorization_server_origins=AUTHORIZATION_SERVER_ORIGINS,
+        )
+        exchange = oauth_client.exchange_code(
+            session=OAuthAuthorizationSession(
+                authorization_url=AUTHORIZATION_ENDPOINT,
+                resource_uri=RESOURCE_URI,
+                authorization_endpoint=AUTHORIZATION_ENDPOINT,
+                token_endpoint=TOKEN_ENDPOINT,
+                revocation_endpoint=REVOCATION_ENDPOINT,
+                callback_uri=CALLBACK_URI,
+                client_id="dynamic-client-id",
+                client_secret=DYNAMIC_CLIENT_SECRET,
+                token_endpoint_auth_method="client_secret_basic",
+                granted_permissions=("documents.read", "profile.read"),
+            ),
+            code="authorization-code",
+            code_verifier="A" * 43,
+        )
+        if accepted:
+            tokens = await exchange
+            assert tokens.token_type == "Bearer"
+        else:
+            with pytest.raises(
+                ProviderOAuthError,
+                match="^provider_oauth_exchange_failed$",
+            ):
+                await exchange
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("token_type", "accepted"),
+    [(None, False), ("MAC", False), ("BEARER", True)],
+)
+async def test_refresh_requires_case_insensitive_bearer_token_type(
+    token_type: str | None,
+    accepted: bool,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = {
+            "access_token": PROVIDER_ACCESS_TOKEN,
+            "refresh_token": PROVIDER_REFRESH_TOKEN,
+            "expires_in": 3600,
+            "scope": "documents.read profile.read",
+        }
+        if token_type is not None:
+            payload["token_type"] = token_type
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        oauth_client = DownstreamMCPOAuthClient(
+            network_guard=PublicOAuthNetworkGuard(
+                resolver=lambda _host, _port: ("1.1.1.1",),
+                http_client=client,
+            ),
+            authorization_server_origins=AUTHORIZATION_SERVER_ORIGINS,
+        )
+        refresh = oauth_client.refresh(
+            FlowAccountRefreshRequest(
+                token_endpoint=TOKEN_ENDPOINT,
+                resource_uri=RESOURCE_URI,
+                client_id="dynamic-client-id",
+                client_secret=DYNAMIC_CLIENT_SECRET,
+                token_endpoint_auth_method="client_secret_basic",
+                refresh_token=PROVIDER_REFRESH_TOKEN,
+                granted_permissions=("documents.read", "profile.read"),
+            )
+        )
+        if accepted:
+            tokens = await refresh
+            assert tokens.token_type == "Bearer"
+        else:
+            with pytest.raises(
+                ProviderOAuthError,
+                match="^provider_oauth_exchange_failed$",
+            ):
+                await refresh
 
 
 @pytest.mark.asyncio
@@ -460,6 +1033,7 @@ async def test_callback_encrypts_credentials_consumes_verifier_and_requires_both
         WORKSPACE_ID,
         "flowaccount",
         "sandbox",
+        selected_company_id="company-123",
     )
     state = parse_qs(urlsplit(start.authorization_url).query)["state"][0]
     callback = OAuthCallback(
@@ -469,7 +1043,6 @@ async def test_callback_encrypts_credentials_consumes_verifier_and_requires_both
         environment="sandbox",
         workspace_id=WORKSPACE_ID,
         redirect_uri=CALLBACK_URI,
-        selected_company_id="company-123",
     )
 
     summary = await service.complete(_principal(), callback)
@@ -479,9 +1052,10 @@ async def test_callback_encrypts_credentials_consumes_verifier_and_requires_both
     assert summary.granted_permissions == ("documents.read", "profile.read")
     assert driver.events == ["discover", "provider_profile.get"]
     assert len(oauth_client.exchanges) == 1
-    assert len(connection_store.saved) == 2
+    assert len(connection_store.saved) == 3
     assert connection_store.saved[0]["readiness"] is ConnectionReadiness.REQUIRES_VALIDATION
-    assert connection_store.saved[1]["readiness"] is ConnectionReadiness.READY
+    assert connection_store.saved[1]["readiness"] is ConnectionReadiness.REQUIRES_VALIDATION
+    assert connection_store.saved[2]["readiness"] is ConnectionReadiness.READY
     credential_types = {
         envelope.credential_type for envelope in connection_store.saved[-1]["envelopes"]
     }
@@ -505,13 +1079,46 @@ async def test_callback_encrypts_credentials_consumes_verifier_and_requires_both
         await service.complete(_principal(), callback)
 
     # The encrypted envelopes remain authenticated against the selected company.
-    saved_connection = connection_store.store.list_for_workspace(
+    saved_connection = next(
+        item
+        for item in connection_store.store.list_for_workspace(
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=USER_ID,
+        )
+        if item.readiness is ConnectionReadiness.READY
+    )
+    assert saved_connection.connection_id == summary.connection_id
+    assert vault is not None
+
+
+@pytest.mark.asyncio
+async def test_callback_uses_profile_company_without_nonstandard_query_parameter() -> None:
+    service, _, _, _, connection_store, _ = _service()
+    start = await service.start(
+        _principal(),
+        WORKSPACE_ID,
+        "flowaccount",
+        "sandbox",
+    )
+    state = parse_qs(urlsplit(start.authorization_url).query)["state"][0]
+
+    summary = await service.complete_callback(
+        OAuthCallback(
+            code="authorization-code",
+            state=state,
+        )
+    )
+
+    assert summary.readiness is ConnectionReadiness.READY
+    assert summary.account_display_name == "FlowAccount Test Company"
+    ready = connection_store.store.list_for_workspace(
         tenant_id=TENANT_ID,
         workspace_id=WORKSPACE_ID,
         auth_user_id=USER_ID,
-    )[0]
-    assert saved_connection.connection_id == summary.connection_id
-    assert vault is not None
+    )
+    assert len(ready) == 2
+    assert sum(item.readiness is ConnectionReadiness.READY for item in ready) == 1
 
 
 @pytest.mark.asyncio
@@ -562,7 +1169,6 @@ async def test_callback_rejects_wrong_workspace_environment_redirect_or_state(
         environment="sandbox",
         workspace_id=WORKSPACE_ID,
         redirect_uri=CALLBACK_URI,
-        selected_company_id="company-123",
     )
 
     with pytest.raises(ProviderOAuthError, match=f"^{expected_code}$"):
@@ -578,6 +1184,7 @@ async def test_callback_rejects_wrong_user_expiry_and_provider_company_mismatch(
         WORKSPACE_ID,
         "flowaccount",
         "sandbox",
+        selected_company_id="company-123",
     )
     state = parse_qs(urlsplit(start.authorization_url).query)["state"][0]
     callback = OAuthCallback(
@@ -587,7 +1194,6 @@ async def test_callback_rejects_wrong_user_expiry_and_provider_company_mismatch(
         environment="sandbox",
         workspace_id=WORKSPACE_ID,
         redirect_uri=CALLBACK_URI,
-        selected_company_id="company-123",
     )
 
     with pytest.raises(ProviderOAuthError, match="^provider_oauth_state_invalid$"):
@@ -597,7 +1203,7 @@ async def test_callback_rejects_wrong_user_expiry_and_provider_company_mismatch(
     with pytest.raises(ProviderOAuthError, match="^provider_oauth_state_invalid$"):
         await service.complete(_principal(), callback)
 
-    mismatch_service, *_ = _service(
+    mismatch_service, mismatch_oauth, _, _, mismatch_store, _ = _service(
         driver=FakeFlowAccountDriver(profile_company_id="company-other")
     )
     mismatch_start = await mismatch_service.start(
@@ -605,6 +1211,7 @@ async def test_callback_rejects_wrong_user_expiry_and_provider_company_mismatch(
         WORKSPACE_ID,
         "flowaccount",
         "sandbox",
+        selected_company_id="company-123",
     )
     mismatch_state = parse_qs(urlsplit(mismatch_start.authorization_url).query)["state"][0]
     with pytest.raises(
@@ -615,6 +1222,50 @@ async def test_callback_rejects_wrong_user_expiry_and_provider_company_mismatch(
             _principal(),
             callback.model_copy(update={"state": mismatch_state}),
         )
+    mismatch_connections = mismatch_store.store.list_for_workspace(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=USER_ID,
+    )
+    assert len(mismatch_connections) == 1
+    assert mismatch_connections[0].readiness is ConnectionReadiness.DISCONNECTED
+    assert mismatch_store.store._envelopes == {}
+    assert mismatch_oauth.revocations == 1
+
+
+@pytest.mark.asyncio
+async def test_retryable_validation_failure_has_zero_dispatchable_credential_retention() -> None:
+    service, oauth_client, _, _, connection_store, _ = _service(
+        driver=FakeFlowAccountDriver(validation_error=True)
+    )
+    start = await service.start(
+        _principal(),
+        WORKSPACE_ID,
+        "flowaccount",
+        "sandbox",
+    )
+    state = parse_qs(urlsplit(start.authorization_url).query)["state"][0]
+
+    with pytest.raises(
+        ProviderOAuthError,
+        match="^provider_oauth_validation_failed$",
+    ):
+        await service.complete_callback(
+            OAuthCallback(
+                code="authorization-code",
+                state=state,
+            )
+        )
+
+    connections = connection_store.store.list_for_workspace(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=USER_ID,
+    )
+    assert len(connections) == 1
+    assert connections[0].readiness is ConnectionReadiness.DISCONNECTED
+    assert connection_store.store._envelopes == {}
+    assert oauth_client.revocations == 0
 
 
 class CallbackService:
@@ -664,11 +1315,18 @@ def test_exact_callback_is_public_and_returns_only_safe_fields() -> None:
         params={
             "code": "AUTHORIZATION_CODE_SENTINEL",
             "state": "A" * 43,
-            "company_id": "company-123",
         },
     )
     sibling = client.get(f"{FLOWACCOUNT_CALLBACK_PATH}/extra")
     other_provider = client.get("/auth/providers/peak/callback")
+    nonstandard_company = client.get(
+        FLOWACCOUNT_CALLBACK_PATH,
+        params={
+            "code": "AUTHORIZATION_CODE_SENTINEL",
+            "state": "B" * 43,
+            "company_id": "company-123",
+        },
+    )
 
     assert response.status_code == 200
     assert response.json() == {
@@ -681,8 +1339,30 @@ def test_exact_callback_is_public_and_returns_only_safe_fields() -> None:
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["Referrer-Policy"] == "no-referrer"
     assert sibling.status_code == other_provider.status_code == 401
+    assert nonstandard_company.status_code == 400
+    assert callback_service.callbacks[0].model_fields_set == {"code", "state"}
     assert "AUTHORIZATION_CODE_SENTINEL" not in response.text
     assert "A" * 43 not in response.text
+
+
+def test_callback_model_rejects_nonstandard_company_parameter() -> None:
+    with pytest.raises(ValidationError):
+        OAuthCallback(
+            code="authorization-code",
+            state="A" * 43,
+            selected_company_id="company-123",
+        )
+
+
+def test_v1_cloud_dependencies_require_explicit_provider_oauth_service() -> None:
+    with pytest.raises(
+        V1ConfigurationError,
+        match="v1_provider_oauth_service_missing",
+    ):
+        CloudDependencies(settings=replace(_settings(), v1_enabled=True))
+
+    dependencies = CloudDependencies(settings=_settings())
+    assert FLOWACCOUNT_CALLBACK_PATH not in {route.path for route in cloud_routes(dependencies)}
 
 
 def test_oauth_models_errors_and_repr_do_not_retain_secrets() -> None:
@@ -693,7 +1373,6 @@ def test_oauth_models_errors_and_repr_do_not_retain_secrets() -> None:
         environment="sandbox",
         workspace_id=WORKSPACE_ID,
         redirect_uri=CALLBACK_URI,
-        selected_company_id="company-123",
     )
     error = ProviderOAuthError("provider_oauth_state_invalid")
 

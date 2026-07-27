@@ -12,7 +12,9 @@ from starlette.testclient import TestClient
 
 from mercury_tools.auth.models import MercuryAuthError, MercuryPrincipal
 from mercury_tools.auth.supabase_jwt import authorization_server_metadata_url
+from mercury_tools.config import V1ConfigurationError
 from mercury_tools.mcp.server import create_http_app
+from mercury_tools.providers.oauth import FLOWACCOUNT_CALLBACK_PATH
 from mercury_tools.v1.constants import CANONICAL_MCP_RESOURCE
 
 AUTHORIZATION_SERVER = "https://vbnlkqvauqwnjbxngkas.supabase.co/auth/v1"
@@ -31,6 +33,11 @@ class StubResolver:
         if isinstance(self.result, MercuryAuthError):
             raise self.result
         return self.result
+
+
+class ConfiguredProviderOAuthService:
+    async def complete_callback(self, _callback: object) -> object:
+        raise AssertionError("startup wiring test must not dispatch a callback")
 
 
 class PrincipalCloudDependencies:
@@ -108,6 +115,30 @@ def _principal() -> MercuryPrincipal:
     )
 
 
+def test_v1_default_http_app_requires_explicit_provider_oauth_service() -> None:
+    with pytest.raises(
+        V1ConfigurationError,
+        match="v1_provider_oauth_service_missing",
+    ):
+        create_http_app(principal_resolver=StubResolver(_principal()))
+
+    with pytest.raises(
+        V1ConfigurationError,
+        match="v1_provider_oauth_service_invalid",
+    ):
+        create_http_app(
+            principal_resolver=StubResolver(_principal()),
+            provider_oauth_service=object(),
+        )
+
+    app = create_http_app(
+        principal_resolver=StubResolver(_principal()),
+        provider_oauth_service=ConfiguredProviderOAuthService(),
+    )
+
+    assert FLOWACCOUNT_CALLBACK_PATH in {getattr(route, "path", None) for route in app.routes}
+
+
 def test_two_live_v1_apps_reject_contradictory_configuration_without_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -128,13 +159,10 @@ def test_two_live_v1_apps_reject_contradictory_configuration_without_mutation(
         assert registered_tool is not None
         for app in (first_app, second_app):
             assert any(
-                middleware.cls is MercuryOAuthMiddleware
-                for middleware in app.user_middleware
+                middleware.cls is MercuryOAuthMiddleware for middleware in app.user_middleware
             )
         assert first_client.get("/mcp").status_code == 401
-        assert "get_mercury_context" in {
-            tool.name for tool in asyncio.run(mcp.list_tools())
-        }
+        assert "get_mercury_context" in {tool.name for tool in asyncio.run(mcp.list_tools())}
 
         monkeypatch.setenv("MERCURY_V1_ENABLED", "false")
 
@@ -147,12 +175,9 @@ def test_two_live_v1_apps_reject_contradictory_configuration_without_mutation(
         assert mcp._tool_manager.get_tool("get_mercury_context") is registered_tool
         for app in (first_app, second_app):
             assert any(
-                middleware.cls is MercuryOAuthMiddleware
-                for middleware in app.user_middleware
+                middleware.cls is MercuryOAuthMiddleware for middleware in app.user_middleware
             )
-        assert "get_mercury_context" in {
-            tool.name for tool in asyncio.run(mcp.list_tools())
-        }
+        assert "get_mercury_context" in {tool.name for tool in asyncio.run(mcp.list_tools())}
         assert first_client.get("/mcp").status_code == 401
 
 
@@ -202,9 +227,7 @@ def test_authenticated_but_unauthorized_request_returns_403() -> None:
 
 
 def test_missing_required_identity_scope_returns_403() -> None:
-    principal = _principal().model_copy(
-        update={"scopes": frozenset({"openid", "email"})}
-    )
+    principal = _principal().model_copy(update={"scopes": frozenset({"openid", "email"})})
     client = TestClient(
         create_http_app(
             principal_resolver=StubResolver(principal),
@@ -263,8 +286,7 @@ def test_root_and_path_metadata_publish_exact_mercury_resource() -> None:
 
 def test_supabase_dynamic_registration_is_discoverable_from_issuer() -> None:
     assert authorization_server_metadata_url(AUTHORIZATION_SERVER) == (
-        "https://vbnlkqvauqwnjbxngkas.supabase.co/"
-        ".well-known/oauth-authorization-server/auth/v1"
+        "https://vbnlkqvauqwnjbxngkas.supabase.co/.well-known/oauth-authorization-server/auth/v1"
     )
 
 
@@ -324,7 +346,10 @@ def test_v1_rejects_legacy_mc_token() -> None:
             cloud_dependencies=PrincipalCloudDependencies(),
         )
     )
-    assert v1_client.get(
-        "/mcp",
-        headers={"Authorization": "Bearer mc_legacy"},
-    ).status_code == 401
+    assert (
+        v1_client.get(
+            "/mcp",
+            headers={"Authorization": "Bearer mc_legacy"},
+        ).status_code
+        == 401
+    )
