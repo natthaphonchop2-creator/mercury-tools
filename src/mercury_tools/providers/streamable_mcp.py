@@ -437,10 +437,19 @@ class _WireModelContract:
         self.validator.validate(value)
 
 
+def _assert_wire_schema_dialect(value: object) -> None:
+    if isinstance(value, Mapping):
+        if "$schema" in value and value["$schema"] != _WIRE_SCHEMA_DIALECT:
+            raise TypeError("provider_schema_model_invalid")
+        for child in value.values():
+            _assert_wire_schema_dialect(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            _assert_wire_schema_dialect(child)
+
+
 def _assert_closed_wire_schema(schema: Mapping[str, Any]) -> None:
     if not schema:
-        raise TypeError("provider_schema_model_invalid")
-    if "$schema" in schema and schema["$schema"] != _WIRE_SCHEMA_DIALECT:
         raise TypeError("provider_schema_model_invalid")
     schema_format = schema.get("format")
     if schema_format is not None and (
@@ -505,11 +514,9 @@ def _wire_model_contract(model: type[BaseModel]) -> _WireModelContract:
         )
         if not isinstance(schema, Mapping):
             raise TypeError
+        _assert_wire_schema_dialect(schema)
         _assert_closed_wire_schema(schema)
         validation_schema = dict(schema)
-        declared_dialect = validation_schema.get("$schema")
-        if declared_dialect not in {None, _WIRE_SCHEMA_DIALECT}:
-            raise TypeError
         validation_schema["$schema"] = _WIRE_SCHEMA_DIALECT
         Draft202012Validator.check_schema(validation_schema)
         format_checker = FormatChecker(formats=sorted(_SUPPORTED_WIRE_FORMATS))

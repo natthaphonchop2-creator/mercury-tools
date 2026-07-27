@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, get_type_hints
+from typing import Any, ClassVar, get_type_hints
 from uuid import UUID
 
 import anyio
@@ -277,6 +277,66 @@ class FormattedWireModel(BaseModel):
 
     item_id: UUID
     created_at: datetime
+
+
+class CustomSequenceAlternateDialectWireModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+    )
+
+    invoice_id: str
+
+    @classmethod
+    def model_json_schema(cls, **kwargs: Any) -> dict[str, Any]:
+        schema = super().model_json_schema(**kwargs)
+        schema["x-custom-resources"] = (
+            {"nested": [{"$schema": "http://json-schema.org/draft-07/schema#"}]},
+        )
+        return schema
+
+
+class InheritedDraft202012LocalRefTupleModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+        json_schema_extra={
+            "default": {"values": {"freeform": True}},
+            "examples": [{"values": {"freeform": True}}],
+        },
+    )
+    target_dialect: ClassVar[str | None] = None
+
+    values: object
+
+    @field_serializer("values")
+    def serialize_values(self, _value: object):
+        return ["not-an-integer"]
+
+    @classmethod
+    def model_json_schema(cls, **kwargs: Any) -> dict[str, Any]:
+        schema = super().model_json_schema(**kwargs)
+        schema["properties"]["values"] = {"$ref": "#/x-hidden-resources/0"}
+        target = {
+            "type": "array",
+            "prefixItems": [{"type": "integer"}],
+            "minItems": 1,
+            "maxItems": 1,
+        }
+        if cls.target_dialect is not None:
+            target["$schema"] = cls.target_dialect
+        schema["x-hidden-resources"] = [target]
+        return schema
+
+
+class ExplicitDraft202012LocalRefTupleModel(InheritedDraft202012LocalRefTupleModel):
+    target_dialect = "https://json-schema.org/draft/2020-12/schema"
+
+
+class AlternateDraft7LocalRefTupleModel(InheritedDraft202012LocalRefTupleModel):
+    target_dialect = "http://json-schema.org/draft-07/schema#"
 
 
 class AlternateDraft7TuplePayload(BaseModel):
@@ -809,6 +869,11 @@ def test_wire_contract_binds_draft_2020_12_and_checks_supported_formats() -> Non
         streamable_module.wire_schema_sha256(UnsupportedFormatArguments)
 
 
+def test_wire_schema_dialect_scan_reaches_custom_list_and_tuple_values() -> None:
+    with pytest.raises(TypeError, match="provider_schema_model_invalid"):
+        streamable_module.wire_schema_sha256(CustomSequenceAlternateDialectWireModel)
+
+
 def test_jsonschema_format_validation_is_a_direct_runtime_dependency() -> None:
     project = tomllib.loads(
         (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
@@ -930,6 +995,30 @@ def test_jsonschema_format_validation_is_a_direct_runtime_dependency() -> None:
             _resolve_invoice_response_model,
         ),
         (
+            AlternateDraft7LocalRefTupleModel(values=(1,)),
+            _verified_binding(
+                request_schema_sha256=_wire_schema_sha256(AlternateDraft7LocalRefTupleModel)
+            ),
+            lambda _binding: AlternateDraft7LocalRefTupleModel,
+            _resolve_invoice_response_model,
+        ),
+        (
+            InheritedDraft202012LocalRefTupleModel(values=(1,)),
+            _verified_binding(
+                request_schema_sha256=_wire_schema_sha256(InheritedDraft202012LocalRefTupleModel)
+            ),
+            lambda _binding: InheritedDraft202012LocalRefTupleModel,
+            _resolve_invoice_response_model,
+        ),
+        (
+            ExplicitDraft202012LocalRefTupleModel(values=(1,)),
+            _verified_binding(
+                request_schema_sha256=_wire_schema_sha256(ExplicitDraft202012LocalRefTupleModel)
+            ),
+            lambda _binding: ExplicitDraft202012LocalRefTupleModel,
+            _resolve_invoice_response_model,
+        ),
+        (
             NestedAlternateDraft7WireModel(payload=AlternateDraft7TuplePayload(values=(1,))),
             _verified_binding(
                 request_schema_sha256=_wire_schema_sha256(NestedAlternateDraft7WireModel)
@@ -962,6 +1051,9 @@ def test_jsonschema_format_validation_is_a_direct_runtime_dependency() -> None:
         "custom-request-serializer-invalid-uuid",
         "custom-request-serializer-invalid-date-time",
         "unsupported-request-format",
+        "custom-key-local-ref-draft-7-request-schema",
+        "custom-key-local-ref-inherited-2020-12-request",
+        "custom-key-local-ref-explicit-2020-12-request",
         "nested-draft-7-request-schema",
         "nested-draft-7-response-schema",
     ],
@@ -1072,8 +1164,21 @@ async def test_alias_policy_is_identical_for_wire_schema_request_and_response(
             InvalidNestedTupleSerializedResponse,
             InvalidNestedTupleSerializedResponse(payload=InvalidNestedTuplePayload(values=(1,))),
         ),
+        (
+            InheritedDraft202012LocalRefTupleModel,
+            InheritedDraft202012LocalRefTupleModel(values=(1,)),
+        ),
+        (
+            ExplicitDraft202012LocalRefTupleModel,
+            ExplicitDraft202012LocalRefTupleModel(values=(1,)),
+        ),
     ],
-    ids=["object-shape", "nested-tuple"],
+    ids=[
+        "object-shape",
+        "nested-tuple",
+        "custom-key-local-ref-inherited-2020-12",
+        "custom-key-local-ref-explicit-2020-12",
+    ],
 )
 async def test_custom_response_serializer_cannot_escape_bound_wire_schema(
     monkeypatch: pytest.MonkeyPatch,
@@ -1130,8 +1235,22 @@ async def test_custom_response_serializer_cannot_escape_bound_wire_schema(
             InvalidNestedTupleSerializedResponse,
             InvalidNestedTupleSerializedResponse(payload=InvalidNestedTuplePayload(values=(1,))),
         ),
+        (
+            InheritedDraft202012LocalRefTupleModel,
+            InheritedDraft202012LocalRefTupleModel(values=(1,)),
+        ),
+        (
+            ExplicitDraft202012LocalRefTupleModel,
+            ExplicitDraft202012LocalRefTupleModel(values=(1,)),
+        ),
     ],
-    ids=["uuid", "date-time", "nested-tuple"],
+    ids=[
+        "uuid",
+        "date-time",
+        "nested-tuple",
+        "custom-key-local-ref-inherited-2020-12",
+        "custom-key-local-ref-explicit-2020-12",
+    ],
 )
 async def test_create_response_serializer_wire_violation_is_outcome_unknown(
     monkeypatch: pytest.MonkeyPatch,
