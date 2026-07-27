@@ -529,6 +529,8 @@ def _assert_closed_local_ref_targets(root_schema: Mapping[str, Any]) -> None:
     active_schema_ids: set[int] = set()
 
     def visit(schema: Mapping[str, Any]) -> None:
+        if schema is not root_schema and "$id" in schema:
+            raise TypeError("provider_schema_model_invalid")
         schema_id = id(schema)
         if schema_id in checked_schema_ids:
             return

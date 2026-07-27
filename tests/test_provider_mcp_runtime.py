@@ -326,6 +326,67 @@ class HiddenOpenObjectLocalRefWireModel(BaseModel):
         return schema
 
 
+class NestedResourceLocalRefWireModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+    )
+
+    value: object
+
+    @field_serializer("value")
+    def serialize_value(self, _value: object):
+        return {"PRIVATE_UNBOUND_FIELD": True}
+
+    @classmethod
+    def model_json_schema(cls, **kwargs: Any) -> dict[str, Any]:
+        schema = super().model_json_schema(**kwargs)
+        schema["properties"]["value"] = {
+            "$id": "urn:mercury:test:nested-resource",
+            "$ref": "#/x-hidden~1resources/open~0object",
+            "x-hidden/resources": {
+                "open~object": {
+                    "type": "object",
+                }
+            },
+        }
+        schema["x-hidden/resources"] = {
+            "open~object": {
+                "type": "object",
+                "additionalProperties": False,
+            }
+        }
+        return schema
+
+
+class NestedResourceCycleLocalRefWireModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+    )
+
+    value: object
+
+    @classmethod
+    def model_json_schema(cls, **kwargs: Any) -> dict[str, Any]:
+        schema = super().model_json_schema(**kwargs)
+        schema["properties"]["value"] = {
+            "$id": "urn:mercury:test:nested-resource-cycle",
+            "$ref": "#/x-targets/first",
+            "x-targets": {
+                "first": {"$ref": "#/x-targets/second"},
+                "second": {"$ref": "#/x-targets/first"},
+            },
+        }
+        schema["x-targets"] = {
+            "first": {"type": "string"},
+            "second": {"type": "string"},
+        }
+        return schema
+
+
 class ClosedNestedPayload(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -342,8 +403,16 @@ class NestedPydanticDefsWireModel(BaseModel):
         frozen=True,
         revalidate_instances="always",
         json_schema_extra={
-            "default": {"$ref": "https://annotation.example/not-a-schema"},
-            "examples": [{"$ref": "#/missing-annotation"}],
+            "default": {
+                "$id": "urn:mercury:annotation:default",
+                "$ref": "https://annotation.example/not-a-schema",
+            },
+            "examples": [
+                {
+                    "$id": "urn:mercury:annotation:example",
+                    "$ref": "#/missing-annotation",
+                }
+            ],
         },
     )
 
@@ -383,6 +452,14 @@ class EscapedLocalRefWireModel(InvalidLocalRefWireModel):
         schema["x-targets/group"] = {
             "value~schema": cls.target,
         }
+        return schema
+
+
+class RootIdLocalRefWireModel(EscapedLocalRefWireModel):
+    @classmethod
+    def model_json_schema(cls, **kwargs: Any) -> dict[str, Any]:
+        schema = super().model_json_schema(**kwargs)
+        schema["$id"] = "urn:mercury:test:root-resource"
         return schema
 
 
@@ -1004,8 +1081,27 @@ def test_nested_pydantic_defs_and_annotation_objects_remain_valid() -> None:
     contract = streamable_module._wire_model_contract(NestedPydanticDefsWireModel)
 
     assert schema["properties"]["payload"]["$ref"] == "#/$defs/ClosedNestedPayload"
+    assert schema["default"]["$id"] == "urn:mercury:annotation:default"
+    assert schema["examples"][0]["$id"] == "urn:mercury:annotation:example"
     contract.validate({"payload": {"note": "safe"}})
     streamable_module._wire_model_contract(EscapedLocalRefWireModel).validate({"value": "safe"})
+    streamable_module._wire_model_contract(RootIdLocalRefWireModel).validate({"value": "safe"})
+
+
+def test_wire_validation_rejects_nested_schema_resource_boundaries() -> None:
+    contract = streamable_module._wire_model_contract(NestedResourceLocalRefWireModel)
+    wire_value = NestedResourceLocalRefWireModel(value={"safe": True}).model_dump(mode="json")
+
+    assert wire_value == {"value": {"PRIVATE_UNBOUND_FIELD": True}}
+    with pytest.raises(TypeError, match="provider_schema_model_invalid"):
+        contract.validate(wire_value)
+
+
+def test_wire_validation_rejects_nested_resource_cycles_without_recursion_failure() -> None:
+    contract = streamable_module._wire_model_contract(NestedResourceCycleLocalRefWireModel)
+
+    with pytest.raises(TypeError, match="provider_schema_model_invalid"):
+        contract.validate({"value": "safe"})
 
 
 @pytest.mark.parametrize(
@@ -1171,6 +1267,14 @@ def test_jsonschema_format_validation_is_a_direct_runtime_dependency() -> None:
             _resolve_invoice_response_model,
         ),
         (
+            NestedResourceLocalRefWireModel(value={"safe": True}),
+            _verified_binding(
+                request_schema_sha256=_wire_schema_sha256(NestedResourceLocalRefWireModel)
+            ),
+            lambda _binding: NestedResourceLocalRefWireModel,
+            _resolve_invoice_response_model,
+        ),
+        (
             AlternateDraft7LocalRefTupleModel(values=(1,)),
             _verified_binding(
                 request_schema_sha256=_wire_schema_sha256(AlternateDraft7LocalRefTupleModel)
@@ -1228,6 +1332,7 @@ def test_jsonschema_format_validation_is_a_direct_runtime_dependency() -> None:
         "custom-request-serializer-invalid-date-time",
         "unsupported-request-format",
         "custom-key-local-ref-open-object-request",
+        "nested-schema-resource-request",
         "custom-key-local-ref-draft-7-request-schema",
         "custom-key-local-ref-inherited-2020-12-request",
         "custom-key-local-ref-explicit-2020-12-request",
@@ -1346,6 +1451,10 @@ async def test_alias_policy_is_identical_for_wire_schema_request_and_response(
             HiddenOpenObjectLocalRefWireModel(value={"safe": True}),
         ),
         (
+            NestedResourceLocalRefWireModel,
+            NestedResourceLocalRefWireModel(value={"safe": True}),
+        ),
+        (
             InheritedDraft202012LocalRefTupleModel,
             InheritedDraft202012LocalRefTupleModel(values=(1,)),
         ),
@@ -1358,6 +1467,7 @@ async def test_alias_policy_is_identical_for_wire_schema_request_and_response(
         "object-shape",
         "nested-tuple",
         "custom-key-local-ref-open-object",
+        "nested-schema-resource",
         "custom-key-local-ref-inherited-2020-12",
         "custom-key-local-ref-explicit-2020-12",
     ],
@@ -1422,6 +1532,10 @@ async def test_custom_response_serializer_cannot_escape_bound_wire_schema(
             HiddenOpenObjectLocalRefWireModel(value={"safe": True}),
         ),
         (
+            NestedResourceLocalRefWireModel,
+            NestedResourceLocalRefWireModel(value={"safe": True}),
+        ),
+        (
             InheritedDraft202012LocalRefTupleModel,
             InheritedDraft202012LocalRefTupleModel(values=(1,)),
         ),
@@ -1435,6 +1549,7 @@ async def test_custom_response_serializer_cannot_escape_bound_wire_schema(
         "date-time",
         "nested-tuple",
         "custom-key-local-ref-open-object",
+        "nested-schema-resource",
         "custom-key-local-ref-inherited-2020-12",
         "custom-key-local-ref-explicit-2020-12",
     ],
