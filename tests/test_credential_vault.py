@@ -49,7 +49,8 @@ def _vault(
 
     return CredentialVault(
         active_key_version=active_key_version,
-        keys=keys or {
+        keys=keys
+        or {
             PREVIOUS_KEY_VERSION: PREVIOUS_KEY,
             ACTIVE_KEY_VERSION: ACTIVE_KEY,
         },

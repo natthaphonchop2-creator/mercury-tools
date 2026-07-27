@@ -193,9 +193,7 @@ class ProviderDriverManifest(_ManifestModel):
                 raise ValueError("provider_manifest_invalid")
 
         tools = [mapping.provider_tool for mapping in self.discovery_mappings]
-        capabilities = [
-            mapping.normalized_capability for mapping in self.discovery_mappings
-        ]
+        capabilities = [mapping.normalized_capability for mapping in self.discovery_mappings]
         if (
             not tools
             or len(tools) != len(set(tools))

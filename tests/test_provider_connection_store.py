@@ -13,9 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CONNECTION_MIGRATION = (
     ROOT / "supabase/migrations/20260726101000_mercury_v1_provider_connections.sql"
 )
-VAULT_MIGRATION = (
-    ROOT / "supabase/migrations/20260726102000_mercury_v1_credential_vault.sql"
-)
+VAULT_MIGRATION = ROOT / "supabase/migrations/20260726102000_mercury_v1_credential_vault.sql"
 
 TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
 OTHER_TENANT_ID = UUID("22222222-2222-4222-8222-222222222222")
@@ -273,9 +271,7 @@ def test_provider_models_reject_nil_tenant_user_workspace_bindings() -> None:
     with pytest.raises(ValidationError, match="provider_setup_attempt_invalid"):
         type(attempt).model_validate(attempt.model_copy(update={"tenant_id": UUID(int=0)}))
     with pytest.raises(ValidationError, match="provider_connection_invalid"):
-        type(connection).model_validate(
-            connection.model_copy(update={"workspace_id": UUID(int=0)})
-        )
+        type(connection).model_validate(connection.model_copy(update={"workspace_id": UUID(int=0)}))
 
 
 def test_save_and_list_connection_returns_only_tenant_bound_summaries() -> None:
@@ -305,9 +301,7 @@ def test_save_and_list_connection_returns_only_tenant_bound_summaries() -> None:
     )
 
     assert connection.id == CONNECTION_ID
-    assert connection.credential_envelope_ids == tuple(
-        envelope.id for envelope in envelopes
-    )
+    assert connection.credential_envelope_ids == tuple(envelope.id for envelope in envelopes)
     assert len(own) == 1
     assert own[0].connection_id == CONNECTION_ID
     assert own[0].account_display_name == "Mercury Test Company"
@@ -401,11 +395,14 @@ def test_save_authenticates_each_envelope_before_connection_becomes_ready() -> N
     ):
         _save_connection(store, envelopes=(forged,))
 
-    assert store.list_for_workspace(
-        tenant_id=TENANT_ID,
-        workspace_id=WORKSPACE_ID,
-        auth_user_id=AUTH_USER_ID,
-    ) == ()
+    assert (
+        store.list_for_workspace(
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=AUTH_USER_ID,
+        )
+        == ()
+    )
 
 
 def test_save_clears_each_request_scoped_opened_plaintext_copy() -> None:
@@ -543,9 +540,7 @@ def test_reconnect_reactivates_only_the_same_disconnected_connection_id() -> Non
     assert reconnected.readiness is ConnectionReadiness.READY
     assert reconnected.provider_revocation_required is False
     assert reconnected.disconnected_at is None
-    assert reconnected.credential_envelope_ids == tuple(
-        envelope.id for envelope in replacements
-    )
+    assert reconnected.credential_envelope_ids == tuple(envelope.id for envelope in replacements)
 
 
 @pytest.mark.parametrize(
@@ -676,10 +671,7 @@ def test_provider_connection_migration_is_expand_first_and_secretless() -> None:
     ):
         assert f"create table if not exists public.{table_name}" in sql
         assert f"alter table public.{table_name} enable row level security" in sql
-        assert (
-            f"revoke all on table public.{table_name} from public, anon, authenticated"
-            in sql
-        )
+        assert f"revoke all on table public.{table_name} from public, anon, authenticated" in sql
 
     for field_name in (
         "tenant_id",
@@ -715,10 +707,7 @@ def test_provider_connection_migration_is_expand_first_and_secretless() -> None:
 def test_credential_vault_migration_has_exact_envelope_boundary_and_narrow_rpcs() -> None:
     sql = _normalized_sql(VAULT_MIGRATION)
 
-    assert (
-        "create table if not exists public.mercury_provider_credential_envelopes"
-        in sql
-    )
+    assert "create table if not exists public.mercury_provider_credential_envelopes" in sql
     for field_name in (
         "id",
         "tenant_id",
@@ -739,8 +728,7 @@ def test_credential_vault_migration_has_exact_envelope_boundary_and_narrow_rpcs(
         assert re.search(rf"\b{field_name}\b", sql)
 
     assert (
-        "alter table public.mercury_provider_credential_envelopes "
-        "enable row level security"
+        "alter table public.mercury_provider_credential_envelopes enable row level security"
     ) in sql
     assert (
         "revoke all on table public.mercury_provider_credential_envelopes "
@@ -765,8 +753,7 @@ def test_credential_vault_migration_has_exact_envelope_boundary_and_narrow_rpcs(
     assert sql.count("set search_path = ''") >= 4
     assert "delete from public.mercury_provider_credential_envelopes" in sql
     assert (
-        "create or replace function "
-        "public.mercury_assert_provider_backend_workspace_access("
+        "create or replace function public.mercury_assert_provider_backend_workspace_access("
     ) in sql
     for function_name in (
         "save_mercury_provider_connection",

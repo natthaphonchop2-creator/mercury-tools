@@ -68,9 +68,7 @@ class CredentialVault:
         try:
             if not isinstance(keys, Mapping) or not keys:
                 raise TypeError
-            checked_active_key_version = validate_credential_key_version(
-                active_key_version
-            )
+            checked_active_key_version = validate_credential_key_version(active_key_version)
             if checked_active_key_version not in keys:
                 raise TypeError
             ciphers: dict[str, AESGCM] = {}
@@ -100,9 +98,7 @@ class CredentialVault:
         """Build the vault from the configured active and optional previous keys."""
 
         try:
-            active_version = validate_credential_key_version(
-                settings.vault_active_key_version
-            )
+            active_version = validate_credential_key_version(settings.vault_active_key_version)
             active_key = cls._decode_configured_key(settings.vault_active_key)
             previous_key_configured = bool(settings.vault_previous_key)
             previous_version_configured = bool(settings.vault_previous_key_version)
@@ -115,9 +111,7 @@ class CredentialVault:
                 )
                 if previous_version == active_version:
                     raise TypeError
-                keys[previous_version] = cls._decode_configured_key(
-                    settings.vault_previous_key
-                )
+                keys[previous_version] = cls._decode_configured_key(settings.vault_previous_key)
         except (AttributeError, TypeError, ValueError, binascii.Error):
             raise ValueError("credential_vault_configuration_invalid") from None
         return cls(
@@ -267,11 +261,7 @@ class CredentialVault:
 
     def _timestamp(self) -> datetime:
         value = self._clock()
-        if (
-            not isinstance(value, datetime)
-            or value.tzinfo is None
-            or value.utcoffset() is None
-        ):
+        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("credential_vault_clock_invalid")
         return value.astimezone(UTC)
 

@@ -108,11 +108,7 @@ def _wait_for_postgres(container: str) -> None:
 
 
 def _authenticated(sql: str, *, auth_user_id: UUID = AUTH_USER_ID) -> str:
-    return (
-        "set role authenticated;\n"
-        f"set request.jwt.claim.sub = '{auth_user_id}';\n"
-        f"{sql}"
-    )
+    return f"set role authenticated;\nset request.jwt.claim.sub = '{auth_user_id}';\n{sql}"
 
 
 def _service(sql: str) -> str:
@@ -332,12 +328,8 @@ def test_disconnect_deletes_envelopes_and_increments_revision_once(
         ) as disconnected;
     """
 
-    first = json.loads(
-        _psql(postgres_context.container, _service(disconnect_sql))
-    )
-    second = json.loads(
-        _psql(postgres_context.container, _service(disconnect_sql))
-    )
+    first = json.loads(_psql(postgres_context.container, _service(disconnect_sql)))
+    second = json.loads(_psql(postgres_context.container, _service(disconnect_sql)))
     persisted = json.loads(
         _psql(
             postgres_context.container,
@@ -519,16 +511,19 @@ def test_oauth_setup_attempt_is_claimed_once_under_concurrent_replay(
     assert len(successes) == 1
     assert len(failures) == 1
     _assert_secret_safe_error(failures[0], "provider_oauth_state_invalid")
-    assert _psql(
-        postgres_context.container,
-        _service(
-            f"""
+    assert (
+        _psql(
+            postgres_context.container,
+            _service(
+                f"""
             select pg_catalog.count(*)
             from public.mercury_provider_oauth_states
             where setup_attempt_id = '{attempt_id}';
             """
-        ),
-    ) == "1"
+            ),
+        )
+        == "1"
+    )
 
 
 def test_authenticated_cannot_persist_load_or_disconnect_credentials(
@@ -718,16 +713,19 @@ def test_setup_oauth_and_envelope_errors_hide_complete_sentinel_material(
         envelope_id_sentinel,
         ciphertext_sentinel,
     )
-    assert _psql(
-        postgres_context.container,
-        _service(
-            f"""
+    assert (
+        _psql(
+            postgres_context.container,
+            _service(
+                f"""
             select pg_catalog.count(*)
             from public.mercury_provider_connections
             where id = '{connection_id}';
             """
-        ),
-    ) == "0"
+            ),
+        )
+        == "0"
+    )
 
 
 def test_permission_arrays_reject_null_non_string_duplicates_and_unsorted_values(

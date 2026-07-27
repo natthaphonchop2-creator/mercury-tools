@@ -152,11 +152,7 @@ class ProviderConnectionStore:
                 ),
                 None,
             )
-            if (
-                attempt is None
-                or attempt.consumed_at is not None
-                or attempt.expires_at <= now
-            ):
+            if attempt is None or attempt.consumed_at is not None or attempt.expires_at <= now:
                 raise ProviderStoreError("provider_setup_attempt_invalid")
             consumed = SetupAttempt.model_validate(
                 {
@@ -199,10 +195,9 @@ class ProviderConnectionStore:
             supplied_permissions = tuple(granted_permissions)
         except TypeError:
             raise ProviderStoreError("provider_connection_invalid") from None
-        if (
-            any(not isinstance(item, str) for item in supplied_permissions)
-            or len(supplied_permissions) != len(set(supplied_permissions))
-        ):
+        if any(not isinstance(item, str) for item in supplied_permissions) or len(
+            supplied_permissions
+        ) != len(set(supplied_permissions)):
             raise ProviderStoreError("provider_connection_invalid")
         permissions = tuple(sorted(supplied_permissions))
         checked_envelopes = self._validate_envelopes(
@@ -250,15 +245,11 @@ class ProviderConnectionStore:
                 raise ProviderStoreError("provider_credential_binding_invalid")
             if current is None:
                 if revision != 1 or any(
-                    self._same_account(item, connection)
-                    for item in self._connections.values()
+                    self._same_account(item, connection) for item in self._connections.values()
                 ):
                     raise ProviderStoreError("provider_connection_conflict")
             else:
-                if (
-                    revision != current.revision + 1
-                    or not self._same_binding(current, connection)
-                ):
+                if revision != current.revision + 1 or not self._same_binding(current, connection):
                     raise ProviderStoreError("provider_connection_conflict")
                 connection = ProviderConnection.model_validate(
                     {
@@ -325,18 +316,13 @@ class ProviderConnectionStore:
             ):
                 raise ProviderStoreError("provider_connection_not_found")
 
-            already_disconnected = (
-                current.readiness is ConnectionReadiness.DISCONNECTED
-            )
+            already_disconnected = current.readiness is ConnectionReadiness.DISCONNECTED
             deleted = 0
             if not already_disconnected:
                 for envelope_id in current.credential_envelope_ids:
                     if self._envelopes.pop(envelope_id, None) is not None:
                         deleted += 1
-                required = (
-                    current.provider_revocation_required
-                    or provider_revocation_required
-                )
+                required = current.provider_revocation_required or provider_revocation_required
                 disconnected = ProviderConnection.model_validate(
                     {
                         **self._connection_values(current),
@@ -351,10 +337,7 @@ class ProviderConnectionStore:
                 self._connections[connection_id] = disconnected
             else:
                 disconnected = current
-                required = (
-                    current.provider_revocation_required
-                    or provider_revocation_required
-                )
+                required = current.provider_revocation_required or provider_revocation_required
                 if required != current.provider_revocation_required:
                     disconnected = ProviderConnection.model_validate(
                         {
@@ -388,9 +371,7 @@ class ProviderConnectionStore:
         if isinstance(envelopes, (str, bytes, bytearray)):
             raise ProviderStoreError("provider_credential_binding_invalid")
         try:
-            checked = tuple(
-                CredentialEnvelope.model_validate(envelope) for envelope in envelopes
-            )
+            checked = tuple(CredentialEnvelope.model_validate(envelope) for envelope in envelopes)
         except (TypeError, ValueError, ValidationError):
             raise ProviderStoreError("provider_credential_binding_invalid") from None
         if (
@@ -424,9 +405,7 @@ class ProviderConnectionStore:
                     credential_type=envelope.credential_type,
                 )
             except (TypeError, ValueError, ValidationError):
-                raise ProviderStoreError(
-                    "provider_credential_binding_invalid"
-                ) from None
+                raise ProviderStoreError("provider_credential_binding_invalid") from None
             if not secrets.compare_digest(
                 envelope.aad_hash,
                 credential_aad_hash(binding, key_version=envelope.key_version),
@@ -438,9 +417,7 @@ class ProviderConnectionStore:
                 if not isinstance(opened, bytearray):
                     raise ProviderStoreError("provider_credential_binding_invalid")
             except CredentialVaultError:
-                raise ProviderStoreError(
-                    "provider_credential_binding_invalid"
-                ) from None
+                raise ProviderStoreError("provider_credential_binding_invalid") from None
             finally:
                 if opened is not None:
                     self._clear_opened_plaintext(opened)
@@ -448,11 +425,7 @@ class ProviderConnectionStore:
 
     def _timestamp(self) -> datetime:
         value = self._clock()
-        if (
-            not isinstance(value, datetime)
-            or value.tzinfo is None
-            or value.utcoffset() is None
-        ):
+        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("provider_store_clock_invalid")
         return value.astimezone(UTC)
 
@@ -480,8 +453,7 @@ class ProviderConnectionStore:
     @staticmethod
     def _attempt_values(attempt: SetupAttempt) -> dict[str, object]:
         return {
-            field_name: getattr(attempt, field_name)
-            for field_name in type(attempt).model_fields
+            field_name: getattr(attempt, field_name) for field_name in type(attempt).model_fields
         }
 
     @staticmethod

@@ -182,12 +182,8 @@ class CredentialEnvelope(_CredentialModel):
             "ciphertext": self.ciphertext.hex(),
             "aad_hash": self.aad_hash.hex(),
             "created_at": self.created_at.isoformat(),
-            "rotated_at": (
-                self.rotated_at.isoformat() if self.rotated_at is not None else None
-            ),
-            "revoked_at": (
-                self.revoked_at.isoformat() if self.revoked_at is not None else None
-            ),
+            "rotated_at": (self.rotated_at.isoformat() if self.rotated_at is not None else None),
+            "revoked_at": (self.revoked_at.isoformat() if self.revoked_at is not None else None),
         }
 
     def audit_reference(self) -> dict[str, Any]:

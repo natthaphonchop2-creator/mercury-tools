@@ -127,15 +127,11 @@ def test_seed_manifests_are_closed_secretless_transport_descriptions() -> None:
     ("mutator", "private_sentinel"),
     [
         (
-            lambda payload: payload.update(
-                {"unexpected": "PRIVATE_MANIFEST_SENTINEL"}
-            ),
+            lambda payload: payload.update({"unexpected": "PRIVATE_MANIFEST_SENTINEL"}),
             "PRIVATE_MANIFEST_SENTINEL",
         ),
         (
-            lambda payload: payload.update(
-                {"endpoint": "https://model-supplied.example/mcp"}
-            ),
+            lambda payload: payload.update({"endpoint": "https://model-supplied.example/mcp"}),
             "model-supplied.example",
         ),
         (
@@ -224,15 +220,14 @@ def test_resource_is_resolved_only_from_settings_and_bound_to_uri_hash() -> None
     assert resource.provider.value == "flowaccount"
     assert resource.environment == "sandbox"
     assert resource.uri == "https://flowaccount-sandbox.example/mcp"
-    assert resource.uri_sha256 == hashlib.sha256(
-        b"https://flowaccount-sandbox.example/mcp"
-    ).hexdigest()
+    assert (
+        resource.uri_sha256
+        == hashlib.sha256(b"https://flowaccount-sandbox.example/mcp").hexdigest()
+    )
     assert "flowaccount-sandbox.example" not in repr(resource)
 
     changed = resolve_provider_resource(
-        settings=_settings(
-            flowaccount_mcp_sandbox_url="https://flowaccount-staged.example/mcp"
-        ),
+        settings=_settings(flowaccount_mcp_sandbox_url="https://flowaccount-staged.example/mcp"),
         manifest=manifest,
         environment="sandbox",
     )
@@ -253,9 +248,7 @@ def test_resource_resolution_rejects_caller_endpoint_and_invalid_server_config()
 
     with pytest.raises(ProviderManifestError, match="^provider_resource_unavailable$") as error:
         resolve_provider_resource(
-            settings=_settings(
-                flowaccount_mcp_sandbox_url="https://provider.example/mcp?private"
-            ),
+            settings=_settings(flowaccount_mcp_sandbox_url="https://provider.example/mcp?private"),
             manifest=manifest,
             environment="sandbox",
         )
