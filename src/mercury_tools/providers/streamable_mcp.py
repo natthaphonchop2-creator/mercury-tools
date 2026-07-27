@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum, auto
 from typing import Any
+from urllib.parse import unquote_to_bytes
 from uuid import UUID
 
 import httpx
@@ -102,6 +103,9 @@ _BLOCKED_HEADER_NAMES = frozenset(
 _AUTH_HTTP_STATUSES = frozenset({401, 403})
 _MCP_SCHEMA_ERROR_CODES = frozenset({PARSE_ERROR, INVALID_REQUEST, INVALID_PARAMS})
 _HTTP_HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_JSON_POINTER_ARRAY_INDEX = re.compile(r"0|[1-9][0-9]*")
+_INVALID_JSON_POINTER_ESCAPE = re.compile(r"~(?:[^01]|$)")
+_INVALID_URI_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _PROVIDER_LOG_REDACTION = "provider_runtime_log_redacted"
 _PROVIDER_LOGGER_NAME = "mercury.provider.runtime"
 _PROVIDER_LOG_PATHNAME = "provider_runtime"
@@ -434,6 +438,7 @@ class _WireModelContract:
     validator: Draft202012Validator
 
     def validate(self, value: object) -> None:
+        _assert_closed_local_ref_targets(self.validator.schema)
         self.validator.validate(value)
 
 
@@ -446,6 +451,102 @@ def _assert_wire_schema_dialect(value: object) -> None:
     elif isinstance(value, (list, tuple)):
         for child in value:
             _assert_wire_schema_dialect(child)
+
+
+def _decode_local_json_pointer(reference: object) -> tuple[str, ...]:
+    if not isinstance(reference, str) or not reference.startswith("#"):
+        raise TypeError("provider_schema_model_invalid")
+    fragment = reference[1:]
+    if _INVALID_URI_PERCENT_ESCAPE.search(fragment):
+        raise TypeError("provider_schema_model_invalid")
+    try:
+        pointer = unquote_to_bytes(fragment).decode("utf-8")
+    except UnicodeDecodeError:
+        raise TypeError("provider_schema_model_invalid") from None
+    if not pointer:
+        return ()
+    if not pointer.startswith("/"):
+        raise TypeError("provider_schema_model_invalid")
+
+    tokens: list[str] = []
+    for token in pointer[1:].split("/"):
+        if _INVALID_JSON_POINTER_ESCAPE.search(token):
+            raise TypeError("provider_schema_model_invalid")
+        tokens.append(token.replace("~1", "/").replace("~0", "~"))
+    return tuple(tokens)
+
+
+def _resolve_local_schema_ref(
+    root_schema: Mapping[str, Any],
+    reference: object,
+) -> Mapping[str, Any]:
+    target: object = root_schema
+    for token in _decode_local_json_pointer(reference):
+        if isinstance(target, Mapping):
+            if token not in target:
+                raise TypeError("provider_schema_model_invalid")
+            target = target[token]
+        elif isinstance(target, list):
+            if _JSON_POINTER_ARRAY_INDEX.fullmatch(token) is None:
+                raise TypeError("provider_schema_model_invalid")
+            try:
+                target = target[int(token)]
+            except (IndexError, ValueError):
+                raise TypeError("provider_schema_model_invalid") from None
+        else:
+            raise TypeError("provider_schema_model_invalid")
+    if not isinstance(target, Mapping):
+        raise TypeError("provider_schema_model_invalid")
+    return target
+
+
+def _wire_schema_children(schema: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    children: list[Mapping[str, Any]] = []
+    for key, value in schema.items():
+        if key in _SCHEMA_MAP_KEYWORDS:
+            if not isinstance(value, Mapping):
+                raise TypeError("provider_schema_model_invalid")
+            if any(not isinstance(child, Mapping) for child in value.values()):
+                raise TypeError("provider_schema_model_invalid")
+            children.extend(value.values())
+        elif key in _SCHEMA_SINGLE_KEYWORDS:
+            if not isinstance(value, Mapping):
+                raise TypeError("provider_schema_model_invalid")
+            children.append(value)
+        elif key in _SCHEMA_LIST_KEYWORDS:
+            if (
+                not isinstance(value, list)
+                or not value
+                or any(not isinstance(child, Mapping) for child in value)
+            ):
+                raise TypeError("provider_schema_model_invalid")
+            children.extend(value)
+    return children
+
+
+def _assert_closed_local_ref_targets(root_schema: Mapping[str, Any]) -> None:
+    checked_schema_ids: set[int] = set()
+    active_schema_ids: set[int] = set()
+
+    def visit(schema: Mapping[str, Any]) -> None:
+        schema_id = id(schema)
+        if schema_id in checked_schema_ids:
+            return
+        if schema_id in active_schema_ids:
+            raise TypeError("provider_schema_model_invalid")
+        active_schema_ids.add(schema_id)
+        try:
+            if "$ref" in schema:
+                target = _resolve_local_schema_ref(root_schema, schema["$ref"])
+                _assert_closed_wire_schema(target)
+                visit(target)
+            for child in _wire_schema_children(schema):
+                visit(child)
+        finally:
+            active_schema_ids.discard(schema_id)
+        checked_schema_ids.add(schema_id)
+
+    visit(root_schema)
 
 
 def _assert_closed_wire_schema(schema: Mapping[str, Any]) -> None:
@@ -477,25 +578,8 @@ def _assert_closed_wire_schema(schema: Mapping[str, Any]) -> None:
     ):
         raise TypeError("provider_schema_model_invalid")
 
-    for key, value in schema.items():
-        if key in _SCHEMA_MAP_KEYWORDS:
-            if not isinstance(value, Mapping):
-                raise TypeError("provider_schema_model_invalid")
-            for child in value.values():
-                if not isinstance(child, Mapping):
-                    raise TypeError("provider_schema_model_invalid")
-                _assert_closed_wire_schema(child)
-        elif key in _SCHEMA_SINGLE_KEYWORDS:
-            if not isinstance(value, Mapping):
-                raise TypeError("provider_schema_model_invalid")
-            _assert_closed_wire_schema(value)
-        elif key in _SCHEMA_LIST_KEYWORDS:
-            if not isinstance(value, list) or not value:
-                raise TypeError("provider_schema_model_invalid")
-            for child in value:
-                if not isinstance(child, Mapping):
-                    raise TypeError("provider_schema_model_invalid")
-                _assert_closed_wire_schema(child)
+    for child in _wire_schema_children(schema):
+        _assert_closed_wire_schema(child)
 
 
 def _wire_model_contract(model: type[BaseModel]) -> _WireModelContract:

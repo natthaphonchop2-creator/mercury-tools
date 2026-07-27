@@ -297,6 +297,128 @@ class CustomSequenceAlternateDialectWireModel(BaseModel):
         return schema
 
 
+class HiddenOpenObjectLocalRefWireModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+        json_schema_extra={
+            "default": {"value": {"freeform": True}},
+            "examples": [{"value": {"freeform": True}}],
+        },
+    )
+
+    value: object
+
+    @field_serializer("value")
+    def serialize_value(self, _value: object):
+        return {"PRIVATE_UNBOUND_FIELD": True}
+
+    @classmethod
+    def model_json_schema(cls, **kwargs: Any) -> dict[str, Any]:
+        schema = super().model_json_schema(**kwargs)
+        schema["properties"]["value"] = {"$ref": "#/x-hidden~1resources/open~0object"}
+        schema["x-hidden/resources"] = {
+            "open~object": {
+                "type": "object",
+            }
+        }
+        return schema
+
+
+class ClosedNestedPayload(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+    )
+
+    note: str
+
+
+class NestedPydanticDefsWireModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+        json_schema_extra={
+            "default": {"$ref": "https://annotation.example/not-a-schema"},
+            "examples": [{"$ref": "#/missing-annotation"}],
+        },
+    )
+
+    payload: ClosedNestedPayload
+
+
+class InvalidLocalRefWireModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+    )
+    reference: ClassVar[str] = "#/x-targets/value"
+    target: ClassVar[object] = {"type": "string"}
+
+    value: object
+
+    @classmethod
+    def model_json_schema(cls, **kwargs: Any) -> dict[str, Any]:
+        schema = super().model_json_schema(**kwargs)
+        schema["properties"]["value"] = {"$ref": cls.reference}
+        schema["x-targets"] = {"value": cls.target}
+        return schema
+
+
+class ExternalRefWireModel(InvalidLocalRefWireModel):
+    reference = "urn:mercury:test-schema"
+
+
+class EscapedLocalRefWireModel(InvalidLocalRefWireModel):
+    reference = "#/%78-targets~1group/value~0schema"
+
+    @classmethod
+    def model_json_schema(cls, **kwargs: Any) -> dict[str, Any]:
+        schema = super().model_json_schema(**kwargs)
+        del schema["x-targets"]
+        schema["x-targets/group"] = {
+            "value~schema": cls.target,
+        }
+        return schema
+
+
+class MissingLocalRefWireModel(InvalidLocalRefWireModel):
+    reference = "#/x-targets/missing"
+
+
+class NonMappingLocalRefWireModel(InvalidLocalRefWireModel):
+    target = 7
+
+
+class InvalidPointerEscapeWireModel(InvalidLocalRefWireModel):
+    reference = "#/x-targets/bad~2escape"
+
+
+class InvalidPercentEscapeWireModel(InvalidLocalRefWireModel):
+    reference = "#/x-targets/%GG"
+
+
+class NonPointerFragmentWireModel(InvalidLocalRefWireModel):
+    reference = "#named-anchor"
+
+
+class CyclicLocalRefWireModel(InvalidLocalRefWireModel):
+    reference = "#/x-targets/first"
+
+    @classmethod
+    def model_json_schema(cls, **kwargs: Any) -> dict[str, Any]:
+        schema = super().model_json_schema(**kwargs)
+        schema["x-targets"] = {
+            "first": {"$ref": "#/x-targets/second"},
+            "second": {"$ref": "#/x-targets/first"},
+        }
+        return schema
+
+
 class InheritedDraft202012LocalRefTupleModel(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -874,6 +996,52 @@ def test_wire_schema_dialect_scan_reaches_custom_list_and_tuple_values() -> None
         streamable_module.wire_schema_sha256(CustomSequenceAlternateDialectWireModel)
 
 
+def test_nested_pydantic_defs_and_annotation_objects_remain_valid() -> None:
+    schema = NestedPydanticDefsWireModel.model_json_schema(
+        by_alias=True,
+        mode="serialization",
+    )
+    contract = streamable_module._wire_model_contract(NestedPydanticDefsWireModel)
+
+    assert schema["properties"]["payload"]["$ref"] == "#/$defs/ClosedNestedPayload"
+    contract.validate({"payload": {"note": "safe"}})
+    streamable_module._wire_model_contract(EscapedLocalRefWireModel).validate({"value": "safe"})
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        ExternalRefWireModel,
+        MissingLocalRefWireModel,
+        NonMappingLocalRefWireModel,
+        InvalidPointerEscapeWireModel,
+        InvalidPercentEscapeWireModel,
+        NonPointerFragmentWireModel,
+    ],
+    ids=[
+        "external",
+        "missing-target",
+        "non-mapping-target",
+        "invalid-pointer-escape",
+        "invalid-percent-escape",
+        "non-pointer-fragment",
+    ],
+)
+def test_wire_validation_rejects_external_and_invalid_refs(
+    model: type[InvalidLocalRefWireModel],
+) -> None:
+    with pytest.raises(TypeError, match="provider_schema_model_invalid"):
+        contract = streamable_module._wire_model_contract(model)
+        contract.validate({"value": "safe"})
+
+
+def test_wire_validation_rejects_local_ref_cycles_without_recursion_failure() -> None:
+    contract = streamable_module._wire_model_contract(CyclicLocalRefWireModel)
+
+    with pytest.raises(TypeError, match="provider_schema_model_invalid"):
+        contract.validate({"value": "safe"})
+
+
 def test_jsonschema_format_validation_is_a_direct_runtime_dependency() -> None:
     project = tomllib.loads(
         (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
@@ -995,6 +1163,14 @@ def test_jsonschema_format_validation_is_a_direct_runtime_dependency() -> None:
             _resolve_invoice_response_model,
         ),
         (
+            HiddenOpenObjectLocalRefWireModel(value={"safe": True}),
+            _verified_binding(
+                request_schema_sha256=_wire_schema_sha256(HiddenOpenObjectLocalRefWireModel)
+            ),
+            lambda _binding: HiddenOpenObjectLocalRefWireModel,
+            _resolve_invoice_response_model,
+        ),
+        (
             AlternateDraft7LocalRefTupleModel(values=(1,)),
             _verified_binding(
                 request_schema_sha256=_wire_schema_sha256(AlternateDraft7LocalRefTupleModel)
@@ -1051,6 +1227,7 @@ def test_jsonschema_format_validation_is_a_direct_runtime_dependency() -> None:
         "custom-request-serializer-invalid-uuid",
         "custom-request-serializer-invalid-date-time",
         "unsupported-request-format",
+        "custom-key-local-ref-open-object-request",
         "custom-key-local-ref-draft-7-request-schema",
         "custom-key-local-ref-inherited-2020-12-request",
         "custom-key-local-ref-explicit-2020-12-request",
@@ -1165,6 +1342,10 @@ async def test_alias_policy_is_identical_for_wire_schema_request_and_response(
             InvalidNestedTupleSerializedResponse(payload=InvalidNestedTuplePayload(values=(1,))),
         ),
         (
+            HiddenOpenObjectLocalRefWireModel,
+            HiddenOpenObjectLocalRefWireModel(value={"safe": True}),
+        ),
+        (
             InheritedDraft202012LocalRefTupleModel,
             InheritedDraft202012LocalRefTupleModel(values=(1,)),
         ),
@@ -1176,6 +1357,7 @@ async def test_alias_policy_is_identical_for_wire_schema_request_and_response(
     ids=[
         "object-shape",
         "nested-tuple",
+        "custom-key-local-ref-open-object",
         "custom-key-local-ref-inherited-2020-12",
         "custom-key-local-ref-explicit-2020-12",
     ],
@@ -1236,6 +1418,10 @@ async def test_custom_response_serializer_cannot_escape_bound_wire_schema(
             InvalidNestedTupleSerializedResponse(payload=InvalidNestedTuplePayload(values=(1,))),
         ),
         (
+            HiddenOpenObjectLocalRefWireModel,
+            HiddenOpenObjectLocalRefWireModel(value={"safe": True}),
+        ),
+        (
             InheritedDraft202012LocalRefTupleModel,
             InheritedDraft202012LocalRefTupleModel(values=(1,)),
         ),
@@ -1248,6 +1434,7 @@ async def test_custom_response_serializer_cannot_escape_bound_wire_schema(
         "uuid",
         "date-time",
         "nested-tuple",
+        "custom-key-local-ref-open-object",
         "custom-key-local-ref-inherited-2020-12",
         "custom-key-local-ref-explicit-2020-12",
     ],
