@@ -23,7 +23,7 @@ from mercury_tools.auth.consent import (
     OAuthSession,
 )
 from mercury_tools.auth.models import MercuryPrincipal
-from mercury_tools.mcp.server import create_http_app
+from mercury_tools.mcp.server import create_test_http_app
 from mercury_tools.v1.constants import CANONICAL_MCP_RESOURCE
 
 AUTHORIZATION_SERVER = "https://vbnlkqvauqwnjbxngkas.supabase.co/auth/v1"
@@ -39,7 +39,7 @@ class UnusedProviderOAuthService:
 
 
 def _create_http_app(**kwargs: object):
-    return create_http_app(
+    return create_test_http_app(
         provider_oauth_service=UnusedProviderOAuthService(),
         **kwargs,
     )

@@ -21,6 +21,7 @@ MIGRATIONS = (
     ROOT / "supabase/migrations/20260726101000_mercury_v1_provider_connections.sql",
     ROOT / "supabase/migrations/20260726102000_mercury_v1_credential_vault.sql",
     ROOT / "supabase/migrations/20260727100000_mercury_v1_provider_oauth_cleanup.sql",
+    ROOT / "supabase/migrations/20260728100000_mercury_v1_provider_oauth_reconnect.sql",
 )
 AUTH_USER_ID = UUID("33333333-3333-4333-8333-333333333333")
 OTHER_AUTH_USER_ID = UUID("44444444-4444-4444-8444-444444444444")
@@ -1073,4 +1074,269 @@ def test_reconnect_requires_same_id_next_revision_and_exact_account_binding(
         "revocation": False,
         "disconnected_at": None,
         "envelope_ids": [str(replacement_envelope_id)],
+    }
+
+
+def test_oauth_finalize_atomically_reuses_disconnected_id_and_preserves_failed_stage(
+    postgres_context: PostgresContext,
+) -> None:
+    connection_id = uuid4()
+    original_envelope_id = uuid4()
+    account_id = f"oauth-reconnect-{connection_id}"
+    _psql(
+        postgres_context.container,
+        _service(
+            _save_sql(
+                postgres_context,
+                connection_id=connection_id,
+                envelope_id=original_envelope_id,
+                account_id=account_id,
+            )
+        ),
+    )
+    _psql(
+        postgres_context.container,
+        _service(
+            f"""
+            select *
+            from public.disconnect_mercury_provider_connection(
+              '{postgres_context.tenant_id}',
+              '{postgres_context.workspace_id}',
+              '{AUTH_USER_ID}',
+              '{connection_id}',
+              false
+            );
+            """
+        ),
+    )
+
+    def stage_sql(staged_id: UUID, envelope_id: UUID) -> str:
+        return f"""
+          select pg_catalog.row_to_json(staged)::pg_catalog.text
+          from public.stage_mercury_provider_connection(
+            '{staged_id}',
+            '{postgres_context.tenant_id}',
+            '{postgres_context.workspace_id}',
+            '{AUTH_USER_ID}',
+            'flowaccount',
+            'sandbox',
+            'oauth-pending-{staged_id}',
+            'FlowAccount',
+            'oauth2_pkce',
+            '["documents.read","profile.read"]'::pg_catalog.jsonb,
+            'requires_validation',
+            1,
+            null,
+            pg_catalog.jsonb_build_array(
+              pg_catalog.jsonb_build_object(
+                'id', '{envelope_id}',
+                'credential_type', 'access_token',
+                'key_version', 'v1',
+                'nonce', pg_catalog.repeat('ab', 12),
+                'ciphertext', pg_catalog.repeat('cd', 16),
+                'aad_hash', pg_catalog.repeat('ef', 32),
+                'created_at', pg_catalog.statement_timestamp(),
+                'rotated_at', null,
+                'revoked_at', null
+              )
+            )
+          ) as staged;
+        """
+
+    def resolve_target() -> dict[str, object]:
+        return json.loads(
+            _psql(
+                postgres_context.container,
+                _service(
+                    f"""
+                    select pg_catalog.row_to_json(target)::pg_catalog.text
+                    from public.resolve_mercury_provider_connection_target(
+                      '{postgres_context.tenant_id}',
+                      '{postgres_context.workspace_id}',
+                      '{AUTH_USER_ID}',
+                      'flowaccount',
+                      'sandbox',
+                      '{account_id}',
+                      '{uuid4()}'
+                    ) as target;
+                    """
+                ),
+            )
+        )
+
+    def finalize_sql(
+        staged_id: UUID,
+        envelope_id: UUID,
+        revision: int,
+    ) -> str:
+        return f"""
+          select pg_catalog.row_to_json(finalized)::pg_catalog.text
+          from public.finalize_mercury_provider_connection(
+            '{staged_id}',
+            '{connection_id}',
+            '{postgres_context.tenant_id}',
+            '{postgres_context.workspace_id}',
+            '{AUTH_USER_ID}',
+            'flowaccount',
+            'sandbox',
+            '{account_id}',
+            'FlowAccount Test Company',
+            'oauth2_pkce',
+            '["documents.read","profile.read"]'::pg_catalog.jsonb,
+            'ready',
+            {revision},
+            pg_catalog.statement_timestamp(),
+            pg_catalog.jsonb_build_array(
+              pg_catalog.jsonb_build_object(
+                'id', '{envelope_id}',
+                'credential_type', 'access_token',
+                'key_version', 'v1',
+                'nonce', pg_catalog.repeat('ab', 12),
+                'ciphertext', pg_catalog.repeat('cd', 16),
+                'aad_hash', pg_catalog.repeat('ef', 32),
+                'created_at', pg_catalog.statement_timestamp(),
+                'rotated_at', null,
+                'revoked_at', null
+              )
+            )
+          ) as finalized;
+        """
+
+    first_stage_id = uuid4()
+    _psql(
+        postgres_context.container,
+        _service(stage_sql(first_stage_id, uuid4())),
+    )
+    first_target = resolve_target()
+    first_finalized = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(
+                finalize_sql(
+                    first_stage_id,
+                    uuid4(),
+                    int(first_target["revision"]),
+                )
+            ),
+        )
+    )
+
+    assert first_target == {
+        "connection_id": str(connection_id),
+        "revision": 3,
+        "reuses_existing": True,
+    }
+    assert first_finalized["connection_id"] == str(connection_id)
+    assert first_finalized["revision"] == 3
+    assert first_finalized["readiness"] == "ready"
+
+    _psql(
+        postgres_context.container,
+        _service(
+            f"""
+            select *
+            from public.disconnect_mercury_provider_connection(
+              '{postgres_context.tenant_id}',
+              '{postgres_context.workspace_id}',
+              '{AUTH_USER_ID}',
+              '{connection_id}',
+              false
+            );
+            """
+        ),
+    )
+    failed_stage_id = uuid4()
+    failed_stage_envelope_id = uuid4()
+    _psql(
+        postgres_context.container,
+        _service(stage_sql(failed_stage_id, failed_stage_envelope_id)),
+    )
+    second_target = resolve_target()
+    failed_finalize = _psql_result(
+        postgres_context.container,
+        _service(
+            finalize_sql(
+                failed_stage_id,
+                uuid4(),
+                int(second_target["revision"]) - 1,
+            )
+        ),
+    )
+    _assert_secret_safe_error(
+        failed_finalize,
+        "provider_connection_conflict",
+    )
+
+    staged_after_failure = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(
+                f"""
+                select pg_catalog.json_build_object(
+                  'readiness', connection.readiness,
+                  'revision', connection.revision,
+                  'revocation', connection.provider_revocation_required,
+                  'envelopes', connection.credential_envelope_ids
+                )::pg_catalog.text
+                from public.mercury_provider_connections as connection
+                where connection.id = '{failed_stage_id}';
+                """
+            ),
+        )
+    )
+    assert staged_after_failure == {
+        "readiness": "requires_validation",
+        "revision": 1,
+        "revocation": True,
+        "envelopes": [str(failed_stage_envelope_id)],
+    }
+
+    _psql(
+        postgres_context.container,
+        _service(
+            f"""
+            select *
+            from public.record_mercury_provider_revocation_obligation(
+              '{postgres_context.tenant_id}',
+              '{postgres_context.workspace_id}',
+              '{AUTH_USER_ID}',
+              '{failed_stage_id}',
+              'flowaccount',
+              'sandbox',
+              'oauth-pending-{failed_stage_id}',
+              'FlowAccount',
+              'oauth2_pkce',
+              '["documents.read","profile.read"]'::pg_catalog.jsonb
+            );
+            """
+        ),
+    )
+    cleaned_stage = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(
+                f"""
+                select pg_catalog.json_build_object(
+                  'readiness', connection.readiness,
+                  'revision', connection.revision,
+                  'revocation', connection.provider_revocation_required,
+                  'envelopes', connection.credential_envelope_ids,
+                  'persisted_envelopes', (
+                    select pg_catalog.count(*)
+                    from public.mercury_provider_credential_envelopes as envelope
+                    where envelope.connection_id = connection.id
+                  )
+                )::pg_catalog.text
+                from public.mercury_provider_connections as connection
+                where connection.id = '{failed_stage_id}';
+                """
+            ),
+        )
+    )
+    assert cleaned_stage == {
+        "readiness": "disconnected",
+        "revision": 2,
+        "revocation": True,
+        "envelopes": [],
+        "persisted_envelopes": 0,
     }

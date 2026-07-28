@@ -100,6 +100,7 @@ from mercury_tools.product import (
 )
 from mercury_tools.prompts import get_prompt
 from mercury_tools.providers.production import (
+    ProviderOAuthProductionComposition,
     build_provider_oauth_production_composition,
 )
 from mercury_tools.rag.chunking import chunk_document, sha256_text
@@ -3895,18 +3896,95 @@ async def healthz(request: Request) -> Response:
 def create_http_app(
     *,
     require_auth: bool | None = None,
+    provider_oauth_composition: ProviderOAuthProductionComposition | None = None,
+):
+    """Build the production HTTP app from one validated dependency bundle."""
+
+    return _create_http_app(
+        require_auth=require_auth,
+        provider_oauth_composition=provider_oauth_composition,
+    )
+
+
+def create_test_http_app(
+    *,
+    require_auth: bool | None = None,
     cloud_dependencies: CloudDependencies | None = None,
     provider_oauth_service: Any | None = None,
     principal_resolver: PrincipalResolver | None = None,
     consent_handoff: ConsentHandoff | None = None,
     consent_http_client: httpx.AsyncClient | None = None,
 ):
+    """Build an app with explicit test doubles; production serve never calls this."""
+
+    return _create_http_app(
+        require_auth=require_auth,
+        cloud_dependencies=cloud_dependencies,
+        provider_oauth_service=provider_oauth_service,
+        principal_resolver=principal_resolver,
+        consent_handoff=consent_handoff,
+        consent_http_client=consent_http_client,
+        test_only_dependencies=True,
+    )
+
+
+def _create_http_app(
+    *,
+    require_auth: bool | None = None,
+    provider_oauth_composition: ProviderOAuthProductionComposition | None = None,
+    cloud_dependencies: CloudDependencies | None = None,
+    provider_oauth_service: Any | None = None,
+    principal_resolver: PrincipalResolver | None = None,
+    consent_handoff: ConsentHandoff | None = None,
+    consent_http_client: httpx.AsyncClient | None = None,
+    test_only_dependencies: bool = False,
+):
     settings = load_settings()
     settings.validate_v1()
     _require_process_v1_configuration(settings.v1_enabled)
+    if not test_only_dependencies and any(
+        dependency is not None
+        for dependency in (
+            cloud_dependencies,
+            provider_oauth_service,
+            principal_resolver,
+            consent_handoff,
+            consent_http_client,
+        )
+    ):
+        raise V1ConfigurationError("v1_provider_oauth_composition_invalid")
+    if provider_oauth_composition is not None and (
+        test_only_dependencies
+        or cloud_dependencies is not None
+        or provider_oauth_service is not None
+    ):
+        raise V1ConfigurationError("v1_provider_oauth_composition_invalid")
+
     selected_principal_resolver = principal_resolver
-    if settings.v1_enabled and selected_principal_resolver is None:
-        selected_principal_resolver = validator_from_settings(settings)
+    selected_composition = provider_oauth_composition
+    if settings.v1_enabled:
+        if selected_composition is not None:
+            if not isinstance(
+                selected_composition,
+                ProviderOAuthProductionComposition,
+            ):
+                raise V1ConfigurationError("v1_provider_oauth_composition_invalid")
+            selected_composition.validate_for_runtime(settings)
+            selected_principal_resolver = selected_composition.principal_resolver
+            provider_oauth_service = selected_composition.provider_oauth_service
+        else:
+            if selected_principal_resolver is None:
+                selected_principal_resolver = validator_from_settings(settings)
+            if cloud_dependencies is None and provider_oauth_service is None:
+                selected_composition = build_provider_oauth_production_composition(
+                    settings=settings,
+                    principal_resolver=selected_principal_resolver,
+                )
+                selected_composition.validate_for_runtime(settings)
+                provider_oauth_service = selected_composition.provider_oauth_service
+    elif selected_composition is not None:
+        raise V1ConfigurationError("v1_provider_oauth_composition_invalid")
+
     http_mcp = copy(mcp)
     http_mcp.settings = mcp.settings.model_copy(deep=True)
     http_mcp._session_manager = None
@@ -3925,13 +4003,6 @@ def create_http_app(
     public_app = http_mcp.streamable_http_app()
     if cloud_dependencies is not None and provider_oauth_service is not None:
         raise RuntimeError("provider_oauth_service_dependency_conflict")
-    provider_oauth_composition = None
-    if settings.v1_enabled and cloud_dependencies is None and provider_oauth_service is None:
-        provider_oauth_composition = build_provider_oauth_production_composition(
-            settings=settings,
-            principal_resolver=selected_principal_resolver,
-        )
-        provider_oauth_service = provider_oauth_composition.provider_oauth_service
     selected_cloud_dependencies = cloud_dependencies or CloudDependencies(
         settings=settings,
         provider_oauth_service=provider_oauth_service,
@@ -3942,13 +4013,13 @@ def create_http_app(
     @asynccontextmanager
     async def lifespan(_app):
         try:
-            if provider_oauth_composition is not None:
-                await provider_oauth_composition.startup()
+            if selected_composition is not None:
+                await selected_composition.startup()
             async with public_app.router.lifespan_context(public_app):
                 yield
         finally:
-            if provider_oauth_composition is not None:
-                await provider_oauth_composition.aclose()
+            if selected_composition is not None:
+                await selected_composition.aclose()
 
     routes = [
         *public_app.routes,

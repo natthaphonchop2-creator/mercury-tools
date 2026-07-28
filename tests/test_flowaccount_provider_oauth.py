@@ -51,7 +51,7 @@ from mercury_tools.providers.oauth import (
     PublicOAuthNetworkGuard,
     SupabaseProviderOAuthStateStore,
 )
-from mercury_tools.providers.store import ProviderConnectionStore
+from mercury_tools.providers.store import ProviderConnectionStore, ProviderStoreError
 from mercury_tools.workspaces.models import WorkspaceMembership, WorkspaceRole
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -296,6 +296,24 @@ class RecordingConnectionStore:
     def save_connection(self, **kwargs):
         self.saved.append(dict(kwargs))
         return self.store.save_connection(**kwargs)
+
+    def stage_connection(self, **kwargs):
+        self.events.append("stage")
+        self.saved.append(dict(kwargs))
+        return self.store.stage_connection(**kwargs)
+
+    def resolve_connection_target(self, **kwargs):
+        self.events.append("resolve_target")
+        return self.store.resolve_connection_target(**kwargs)
+
+    def finalize_connection(self, **kwargs):
+        self.events.append("finalize")
+        self.saved.append(dict(kwargs))
+        return self.store.finalize_connection(**kwargs)
+
+    def record_revocation_obligation(self, **kwargs):
+        self.events.append("record_revocation_obligation")
+        return self.store.record_revocation_obligation(**kwargs)
 
     def disconnect(self, **kwargs):
         self.events.append("disconnect")
@@ -966,6 +984,157 @@ def _discovery_handler(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("status_code", "challenge"),
+    [
+        (
+            302,
+            (
+                'Bearer resource_metadata="'
+                "https://flowaccount-sandbox.example/"
+                '.well-known/oauth-protected-resource/mcp"'
+            ),
+        ),
+        (
+            401,
+            (
+                'NotBearer resource_metadata="'
+                "https://flowaccount-sandbox.example/"
+                '.well-known/oauth-protected-resource/mcp"'
+            ),
+        ),
+        (
+            401,
+            (
+                'Basic realm="Bearer", resource_metadata="'
+                "https://flowaccount-sandbox.example/"
+                '.well-known/oauth-protected-resource/mcp"'
+            ),
+        ),
+    ],
+)
+async def test_protected_resource_requires_401_with_exact_bearer_scheme(
+    status_code: int,
+    challenge: str,
+) -> None:
+    registration = {
+        "client_id": "dynamic-client-id",
+        "client_secret": DYNAMIC_CLIENT_SECRET,
+        "redirect_uris": [CALLBACK_URI],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "client_secret_basic",
+    }
+    downstream = _discovery_handler(registration_payload=registration)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == RESOURCE_URI:
+            return httpx.Response(
+                status_code,
+                headers={"WWW-Authenticate": challenge},
+            )
+        return downstream(request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=False,
+    ) as client:
+        oauth_client = DownstreamMCPOAuthClient(
+            network_guard=PublicOAuthNetworkGuard(
+                resolver=lambda _host, _port: ("1.1.1.1",),
+                http_client=client,
+            ),
+            authorization_server_origins=AUTHORIZATION_SERVER_ORIGINS,
+        )
+
+        with pytest.raises(
+            ProviderOAuthError,
+            match="^provider_oauth_downstream_invalid$",
+        ):
+            await oauth_client.start_authorization(
+                provider=ProviderId.FLOWACCOUNT,
+                environment="sandbox",
+                resource_uri=RESOURCE_URI,
+                callback_uri=CALLBACK_URI,
+                allowed_permissions=MANIFEST.allowed_permissions,
+                state="A" * 43,
+                code_challenge="B" * 43,
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [
+            ("WWW-Authenticate", 'Basic realm="Mercury"'),
+            (
+                "WWW-Authenticate",
+                (
+                    'bEaReR resource_metadata="'
+                    "https://flowaccount-sandbox.example/"
+                    '.well-known/oauth-protected-resource/mcp", '
+                    'scope="profile.read documents.read"'
+                ),
+            ),
+        ],
+        [
+            (
+                "WWW-Authenticate",
+                (
+                    'Basic realm="Mercury", Bearer resource_metadata="'
+                    "https://flowaccount-sandbox.example/"
+                    '.well-known/oauth-protected-resource/mcp", '
+                    'scope="profile.read documents.read"'
+                ),
+            ),
+        ],
+    ],
+    ids=["multiple-headers", "multiple-challenges"],
+)
+async def test_protected_resource_accepts_exact_bearer_among_multiple_challenges(
+    headers: list[tuple[str, str]],
+) -> None:
+    registration = {
+        "client_id": "dynamic-client-id",
+        "client_secret": DYNAMIC_CLIENT_SECRET,
+        "redirect_uris": [CALLBACK_URI],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "client_secret_basic",
+    }
+    downstream = _discovery_handler(registration_payload=registration)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == RESOURCE_URI:
+            return httpx.Response(401, headers=headers)
+        return downstream(request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=False,
+    ) as client:
+        oauth_client = DownstreamMCPOAuthClient(
+            network_guard=PublicOAuthNetworkGuard(
+                resolver=lambda _host, _port: ("1.1.1.1",),
+                http_client=client,
+            ),
+            authorization_server_origins=AUTHORIZATION_SERVER_ORIGINS,
+        )
+        session = await oauth_client.start_authorization(
+            provider=ProviderId.FLOWACCOUNT,
+            environment="sandbox",
+            resource_uri=RESOURCE_URI,
+            callback_uri=CALLBACK_URI,
+            allowed_permissions=MANIFEST.allowed_permissions,
+            state="A" * 43,
+            code_challenge="B" * 43,
+        )
+
+    assert session.granted_permissions == ("documents.read", "profile.read")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "registration_override",
     [
         {"redirect_uris": [CALLBACK_URI, "https://attacker.example/callback"]},
@@ -1278,10 +1447,9 @@ async def test_callback_encrypts_credentials_consumes_verifier_and_requires_both
     assert summary.granted_permissions == ("documents.read", "profile.read")
     assert driver.events == ["discover", "provider_profile.get"]
     assert len(oauth_client.exchanges) == 1
-    assert len(connection_store.saved) == 3
+    assert len(connection_store.saved) == 2
     assert connection_store.saved[0]["readiness"] is ConnectionReadiness.REQUIRES_VALIDATION
-    assert connection_store.saved[1]["readiness"] is ConnectionReadiness.REQUIRES_VALIDATION
-    assert connection_store.saved[2]["readiness"] is ConnectionReadiness.READY
+    assert connection_store.saved[1]["readiness"] is ConnectionReadiness.READY
     credential_types = {
         envelope.credential_type for envelope in connection_store.saved[-1]["envelopes"]
     }
@@ -1345,6 +1513,100 @@ async def test_callback_uses_profile_company_without_nonstandard_query_parameter
     )
     assert len(ready) == 2
     assert sum(item.readiness is ConnectionReadiness.READY for item in ready) == 1
+
+
+@pytest.mark.asyncio
+async def test_ready_disconnect_reconnect_reuses_connection_id_and_advances_revision() -> None:
+    service, _, _, _, connection_store, _ = _service()
+    first_start = await service.start(
+        _principal(),
+        WORKSPACE_ID,
+        "flowaccount",
+        "sandbox",
+    )
+    first_state = parse_qs(urlsplit(first_start.authorization_url).query)["state"][0]
+    first = await service.complete_callback(
+        OAuthCallback(code="first-authorization-code", state=first_state)
+    )
+    disconnected = connection_store.disconnect(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=USER_ID,
+        connection_id=first.connection_id,
+    )
+
+    second_start = await service.start(
+        _principal(),
+        WORKSPACE_ID,
+        "flowaccount",
+        "sandbox",
+    )
+    second_state = parse_qs(urlsplit(second_start.authorization_url).query)["state"][0]
+    reconnected = await service.complete_callback(
+        OAuthCallback(code="second-authorization-code", state=second_state)
+    )
+    summaries = connection_store.store.list_for_workspace(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=USER_ID,
+    )
+
+    assert reconnected.connection_id == first.connection_id
+    assert reconnected.revision == disconnected.revision + 1
+    assert reconnected.readiness is ConnectionReadiness.READY
+    assert reconnected.provider_revocation_required is False
+    assert [
+        item.connection_id for item in summaries if item.readiness is ConnectionReadiness.READY
+    ] == [first.connection_id]
+
+
+@pytest.mark.asyncio
+async def test_finalization_failure_revokes_or_persists_durable_obligation() -> None:
+    class FailedRevocationClient(FakeOAuthClient):
+        async def revoke(
+            self,
+            *,
+            session: OAuthAuthorizationSession,
+            tokens: FlowAccountOAuthTokens,
+        ) -> bool:
+            assert session.revocation_endpoint == REVOCATION_ENDPOINT
+            assert tokens.token_type == "Bearer"
+            self.revocations += 1
+            return False
+
+    oauth_client = FailedRevocationClient()
+    service, _, _, _, connection_store, _ = _service(oauth_client=oauth_client)
+
+    def fail_finalization(**_kwargs):
+        connection_store.events.append("finalize")
+        raise ProviderStoreError("provider_connection_conflict")
+
+    connection_store.finalize_connection = fail_finalization
+    start = await service.start(
+        _principal(),
+        WORKSPACE_ID,
+        "flowaccount",
+        "sandbox",
+    )
+    state = parse_qs(urlsplit(start.authorization_url).query)["state"][0]
+
+    with pytest.raises(
+        ProviderStoreError,
+        match="^provider_connection_conflict$",
+    ):
+        await service.complete_callback(OAuthCallback(code="authorization-code", state=state))
+
+    summaries = connection_store.store.list_for_workspace(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=USER_ID,
+    )
+    obligations = [item for item in summaries if item.provider_revocation_required]
+    assert len(obligations) == 1
+    assert obligations[0].readiness is ConnectionReadiness.DISCONNECTED
+    assert connection_store.store._envelopes == {}
+    assert oauth_client.revocations == 1
+    assert connection_store.events[-2:] == ["finalize", "disconnect"]
 
 
 @pytest.mark.asyncio
@@ -1597,7 +1859,7 @@ async def test_retryable_validation_failure_has_zero_dispatchable_credential_ret
     assert len(connections) == 1
     assert connections[0].readiness is ConnectionReadiness.DISCONNECTED
     assert connection_store.store._envelopes == {}
-    assert oauth_client.revocations == 0
+    assert oauth_client.revocations == 1
 
 
 class CallbackService:
@@ -1698,20 +1960,61 @@ def test_exact_callback_accepts_standard_error_union_and_returns_stable_error() 
 
     response = client.get(
         FLOWACCOUNT_CALLBACK_PATH,
-        params={"error": "access_denied", "state": "A" * 43},
+        params={
+            "error": "access_denied",
+            "state": "A" * 43,
+            "error_description": "USER_DENIED_DESCRIPTION_SENTINEL",
+            "error_uri": "https://provider.example/errors/ERROR_URI_SENTINEL",
+        },
     )
     both = client.get(
         FLOWACCOUNT_CALLBACK_PATH,
         params={"code": "code", "error": "access_denied", "state": "B" * 43},
+    )
+    duplicate_description = client.get(
+        FLOWACCOUNT_CALLBACK_PATH,
+        params=[
+            ("error", "access_denied"),
+            ("state", "C" * 43),
+            ("error_description", "first"),
+            ("error_description", "second"),
+        ],
+    )
+    success_with_error_metadata = client.get(
+        FLOWACCOUNT_CALLBACK_PATH,
+        params={
+            "code": "code",
+            "state": "D" * 43,
+            "error_description": "must-not-attach-to-success",
+        },
+    )
+    oversized_description = client.get(
+        FLOWACCOUNT_CALLBACK_PATH,
+        params={
+            "error": "access_denied",
+            "state": "E" * 43,
+            "error_description": "x" * 1025,
+        },
     )
 
     assert response.status_code == 400
     assert response.json() == {"error": "provider_oauth_authorization_failed"}
     assert both.status_code == 400
     assert both.json() == {"error": "provider_oauth_callback_invalid"}
+    assert duplicate_description.status_code == 400
+    assert duplicate_description.json() == {"error": "provider_oauth_callback_invalid"}
+    assert success_with_error_metadata.status_code == 400
+    assert success_with_error_metadata.json() == {"error": "provider_oauth_callback_invalid"}
+    assert oversized_description.status_code == 400
+    assert oversized_description.json() == {"error": "provider_oauth_callback_invalid"}
     assert service.callbacks[0].model_fields_set == {"error", "state"}
     assert "access_denied" not in response.text
     assert "A" * 43 not in response.text
+    rendered = f"{service.callbacks[0]!r} {service.callbacks[0].model_dump_json()}"
+    assert "USER_DENIED_DESCRIPTION_SENTINEL" not in rendered
+    assert "ERROR_URI_SENTINEL" not in rendered
+    assert "USER_DENIED_DESCRIPTION_SENTINEL" not in response.text
+    assert "ERROR_URI_SENTINEL" not in response.text
 
 
 def test_callback_model_rejects_nonstandard_company_parameter() -> None:

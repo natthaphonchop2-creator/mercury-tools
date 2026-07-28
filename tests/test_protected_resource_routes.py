@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 from collections.abc import Iterator
 from uuid import UUID
 
@@ -13,7 +14,7 @@ from starlette.testclient import TestClient
 from mercury_tools.auth.models import MercuryAuthError, MercuryPrincipal
 from mercury_tools.auth.supabase_jwt import authorization_server_metadata_url
 from mercury_tools.config import V1ConfigurationError
-from mercury_tools.mcp.server import create_http_app
+from mercury_tools.mcp.server import create_http_app, create_test_http_app
 from mercury_tools.providers.oauth import FLOWACCOUNT_CALLBACK_PATH
 from mercury_tools.v1.constants import CANONICAL_MCP_RESOURCE
 
@@ -132,26 +133,35 @@ def test_v1_default_http_app_builds_and_runs_production_oauth_composition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mercury_tools.mcp import server
+    from mercury_tools.providers.production import ProviderOAuthProductionComposition
 
     events: list[str] = []
-
-    class Composition:
-        provider_oauth_service = ConfiguredProviderOAuthService()
-
-        async def startup(self) -> None:
-            events.append("startup")
-
-        async def aclose(self) -> None:
-            events.append("close")
+    original_build = server.build_provider_oauth_production_composition
 
     def build(*, settings, principal_resolver):
         assert settings.v1_enabled is True
-        assert isinstance(principal_resolver, StubResolver)
         events.append("build")
-        return Composition()
+        return original_build(
+            settings=settings,
+            principal_resolver=principal_resolver,
+        )
+
+    async def startup(self) -> None:
+        self.validate_for_runtime(self.settings)
+        events.append("startup")
+
+    async def close(self) -> None:
+        events.append("close")
+        await self.network_guard.aclose()
+        if self.owns_state_http_client:
+            await self.state_http_client.aclose()
+        if self.owns_connection_http_client:
+            self.connection_http_client.close()
 
     monkeypatch.setattr(server, "build_provider_oauth_production_composition", build)
-    app = create_http_app(principal_resolver=StubResolver(_principal()))
+    monkeypatch.setattr(ProviderOAuthProductionComposition, "startup", startup)
+    monkeypatch.setattr(ProviderOAuthProductionComposition, "aclose", close)
+    app = create_http_app()
 
     assert FLOWACCOUNT_CALLBACK_PATH in {getattr(route, "path", None) for route in app.routes}
     with TestClient(app):
@@ -164,7 +174,7 @@ def test_v1_custom_cloud_dependencies_cannot_bypass_oauth_validation() -> None:
         V1ConfigurationError,
         match="v1_provider_oauth_service_missing",
     ):
-        create_http_app(
+        create_test_http_app(
             principal_resolver=StubResolver(_principal()),
             cloud_dependencies=object(),
         )
@@ -178,7 +188,7 @@ def test_v1_custom_cloud_dependencies_cannot_bypass_oauth_validation() -> None:
         V1ConfigurationError,
         match="v1_cloud_dependencies_invalid",
     ):
-        create_http_app(
+        create_test_http_app(
             principal_resolver=StubResolver(_principal()),
             cloud_dependencies=incomplete_dependencies,
         )
@@ -187,10 +197,62 @@ def test_v1_custom_cloud_dependencies_cannot_bypass_oauth_validation() -> None:
         V1ConfigurationError,
         match="v1_provider_oauth_service_invalid",
     ):
-        create_http_app(
+        create_test_http_app(
             principal_resolver=StubResolver(_principal()),
             provider_oauth_service=object(),
         )
+
+
+def test_production_http_app_exposes_only_typed_composition_injection() -> None:
+    from mercury_tools.providers.production import ProviderOAuthProductionComposition
+
+    parameters = inspect.signature(create_http_app).parameters
+
+    assert "provider_oauth_composition" in parameters
+    assert {
+        "cloud_dependencies",
+        "provider_oauth_service",
+        "principal_resolver",
+        "consent_handoff",
+        "consent_http_client",
+    }.isdisjoint(parameters)
+
+    incomplete_typed_composition = object.__new__(ProviderOAuthProductionComposition)
+    for invalid_composition in (object(), incomplete_typed_composition):
+        with pytest.raises(
+            V1ConfigurationError,
+            match="v1_provider_oauth_composition_invalid",
+        ):
+            create_http_app(provider_oauth_composition=invalid_composition)
+
+
+def test_arbitrary_dependencies_are_isolated_to_explicit_test_factory() -> None:
+    from mercury_tools.mcp import server
+    from mercury_tools.providers.production import (
+        build_provider_oauth_production_composition,
+        build_test_provider_oauth_production_composition,
+    )
+
+    factory = getattr(server, "create_test_http_app", None)
+    assert callable(factory)
+
+    app = factory(
+        principal_resolver=StubResolver(_principal()),
+        cloud_dependencies=PrincipalCloudDependencies(),
+    )
+
+    assert FLOWACCOUNT_CALLBACK_PATH in {getattr(route, "path", None) for route in app.routes}
+    assert "test_app_factory" not in inspect.signature(server.serve).parameters
+    production_builder_parameters = inspect.signature(
+        build_provider_oauth_production_composition
+    ).parameters
+    assert set(production_builder_parameters) == {"settings", "principal_resolver"}
+    assert {
+        "state_http_client",
+        "connection_http_client",
+        "network_guard",
+        "workspace_service",
+    } <= set(inspect.signature(build_test_provider_oauth_production_composition).parameters)
 
 
 def test_two_live_v1_apps_reject_contradictory_configuration_without_mutation(
@@ -199,12 +261,12 @@ def test_two_live_v1_apps_reject_contradictory_configuration_without_mutation(
     from mercury_tools.auth.middleware import MercuryOAuthMiddleware
     from mercury_tools.mcp.server import mcp
 
-    first_app = create_http_app(
+    first_app = create_test_http_app(
         principal_resolver=StubResolver(_principal()),
         cloud_dependencies=PrincipalCloudDependencies(),
     )
     registered_tool = mcp._tool_manager.get_tool("get_mercury_context")
-    second_app = create_http_app(
+    second_app = create_test_http_app(
         principal_resolver=StubResolver(_principal()),
         cloud_dependencies=PrincipalCloudDependencies(),
     )
@@ -243,7 +305,7 @@ def test_two_live_v1_apps_reject_contradictory_configuration_without_mutation(
 def test_missing_or_invalid_bearer_returns_rfc_9728_challenge() -> None:
     resolver = StubResolver(MercuryAuthError("mercury_token_invalid"))
     client = TestClient(
-        create_http_app(
+        create_test_http_app(
             principal_resolver=resolver,
             cloud_dependencies=PrincipalCloudDependencies(),
         ),
@@ -269,7 +331,7 @@ def test_missing_or_invalid_bearer_returns_rfc_9728_challenge() -> None:
 def test_authenticated_but_unauthorized_request_returns_403() -> None:
     resolver = StubResolver(MercuryAuthError("mercury_scope_insufficient"))
     client = TestClient(
-        create_http_app(
+        create_test_http_app(
             principal_resolver=resolver,
             cloud_dependencies=PrincipalCloudDependencies(),
         )
@@ -288,7 +350,7 @@ def test_authenticated_but_unauthorized_request_returns_403() -> None:
 def test_missing_required_identity_scope_returns_403() -> None:
     principal = _principal().model_copy(update={"scopes": frozenset({"openid", "email"})})
     client = TestClient(
-        create_http_app(
+        create_test_http_app(
             principal_resolver=StubResolver(principal),
             cloud_dependencies=PrincipalCloudDependencies(),
         )
@@ -306,7 +368,7 @@ def test_missing_required_identity_scope_returns_403() -> None:
 def test_principal_is_stored_before_v1_api_handler_runs() -> None:
     principal = _principal()
     client = TestClient(
-        create_http_app(
+        create_test_http_app(
             principal_resolver=StubResolver(principal),
             cloud_dependencies=PrincipalCloudDependencies(),
         )
@@ -323,7 +385,7 @@ def test_principal_is_stored_before_v1_api_handler_runs() -> None:
 
 def test_root_and_path_metadata_publish_exact_mercury_resource() -> None:
     client = TestClient(
-        create_http_app(
+        create_test_http_app(
             principal_resolver=StubResolver(_principal()),
             cloud_dependencies=PrincipalCloudDependencies(),
         )
@@ -354,7 +416,7 @@ def test_challenge_always_names_canonical_resource_metadata(
 ) -> None:
     monkeypatch.setenv("MERCURY_TOOLS_MCP_PATH", "/custom-mcp")
     client = TestClient(
-        create_http_app(
+        create_test_http_app(
             principal_resolver=StubResolver(_principal()),
             cloud_dependencies=PrincipalCloudDependencies(),
         )
@@ -384,7 +446,7 @@ def test_challenge_always_names_canonical_resource_metadata(
 def test_health_legal_support_and_metadata_routes_remain_public(path: str) -> None:
     resolver = StubResolver(MercuryAuthError("mercury_token_invalid"))
     client = TestClient(
-        create_http_app(
+        create_test_http_app(
             principal_resolver=resolver,
             cloud_dependencies=PrincipalCloudDependencies(),
         ),
@@ -400,7 +462,7 @@ def test_health_legal_support_and_metadata_routes_remain_public(path: str) -> No
 def test_v1_rejects_legacy_mc_token() -> None:
     resolver = StubResolver(MercuryAuthError("mercury_token_invalid"))
     v1_client = TestClient(
-        create_http_app(
+        create_test_http_app(
             principal_resolver=resolver,
             cloud_dependencies=PrincipalCloudDependencies(),
         )

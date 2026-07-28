@@ -25,7 +25,10 @@ from mercury_tools.providers.oauth import (
     PublicOAuthNetworkGuard,
     SupabaseProviderOAuthStateStore,
 )
-from mercury_tools.providers.production import build_provider_oauth_production_composition
+from mercury_tools.providers.production import (
+    build_provider_oauth_production_composition,
+    build_test_provider_oauth_production_composition,
+)
 from mercury_tools.providers.store import ProviderStoreError, SupabaseProviderConnectionStore
 
 NOW = datetime(2026, 7, 27, 8, 0, tzinfo=UTC)
@@ -33,6 +36,8 @@ TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
 WORKSPACE_ID = UUID("22222222-2222-4222-8222-222222222222")
 USER_ID = UUID("33333333-3333-4333-8333-333333333333")
 CONNECTION_ID = UUID("44444444-4444-4444-8444-444444444444")
+STAGED_CONNECTION_ID = UUID("55555555-5555-4555-8555-555555555555")
+PROPOSED_CONNECTION_ID = UUID("66666666-6666-4666-8666-666666666666")
 
 
 def _settings(**updates: object) -> Settings:
@@ -71,7 +76,11 @@ def _vault() -> CredentialVault:
     )
 
 
-def _envelopes():
+def _envelopes(
+    *,
+    connection_id: UUID = CONNECTION_ID,
+    account_id: str = "company-123",
+):
     vault = _vault()
 
     def binding(credential_type: str) -> CredentialBinding:
@@ -79,9 +88,9 @@ def _envelopes():
             tenant_id=TENANT_ID,
             workspace_id=WORKSPACE_ID,
             auth_user_id=USER_ID,
-            connection_id=CONNECTION_ID,
+            connection_id=connection_id,
             provider="flowaccount",
-            company_or_merchant_id="company-123",
+            company_or_merchant_id=account_id,
             environment="sandbox",
             credential_type=credential_type,
         )
@@ -92,18 +101,26 @@ def _envelopes():
     )
 
 
-def _save_row(*, revision: int) -> dict[str, object]:
+def _save_row(
+    *,
+    revision: int,
+    connection_id: UUID = CONNECTION_ID,
+    readiness: str = "ready",
+    account_display_name: str = "FlowAccount Test Company",
+    last_validated_at: str | None = NOW.isoformat(),
+    provider_revocation_required: bool = False,
+) -> dict[str, object]:
     return {
-        "connection_id": str(CONNECTION_ID),
+        "connection_id": str(connection_id),
         "provider": "flowaccount",
         "environment": "sandbox",
-        "account_display_name": "FlowAccount Test Company",
+        "account_display_name": account_display_name,
         "authorization_method": "oauth2_pkce",
         "granted_permissions": ["documents.read", "profile.read"],
-        "readiness": "ready",
+        "readiness": readiness,
         "revision": revision,
-        "last_validated_at": NOW.isoformat(),
-        "provider_revocation_required": False,
+        "last_validated_at": last_validated_at,
+        "provider_revocation_required": provider_revocation_required,
         "created_at": NOW.isoformat(),
         "updated_at": NOW.isoformat(),
     }
@@ -295,6 +312,144 @@ def test_supabase_connection_store_maps_concurrent_revision_conflict() -> None:
     assert str(failures[0]) == "provider_connection_conflict"
 
 
+def test_supabase_reconnect_store_uses_exact_atomic_rpc_bindings() -> None:
+    requests: list[tuple[str, dict[str, object]]] = []
+    pending_account_id = "oauth-pending-state"
+    staged_envelopes = _envelopes(
+        connection_id=STAGED_CONNECTION_ID,
+        account_id=pending_account_id,
+    )
+    exact_envelopes = _envelopes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        function = request.url.path.rsplit("/", 1)[-1]
+        requests.append((function, payload))
+        if function == "stage_mercury_provider_connection":
+            return httpx.Response(
+                200,
+                json=[
+                    _save_row(
+                        revision=1,
+                        connection_id=STAGED_CONNECTION_ID,
+                        readiness="requires_validation",
+                        account_display_name="FlowAccount",
+                        last_validated_at=None,
+                        provider_revocation_required=True,
+                    )
+                ],
+            )
+        if function == "resolve_mercury_provider_connection_target":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "connection_id": str(CONNECTION_ID),
+                        "revision": 3,
+                        "reuses_existing": True,
+                    }
+                ],
+            )
+        if function == "finalize_mercury_provider_connection":
+            return httpx.Response(200, json=[_save_row(revision=3)])
+        if function == "record_mercury_provider_revocation_obligation":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "connection_id": str(STAGED_CONNECTION_ID),
+                        "status": "disconnected",
+                        "deleted_envelope_count": 0,
+                        "already_disconnected": True,
+                        "provider_revocation_required": True,
+                        "revision": 2,
+                    }
+                ],
+            )
+        return httpx.Response(404)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        store = SupabaseProviderConnectionStore(
+            settings=_settings(),
+            vault=_vault(),
+            http_client=client,
+        )
+        staged = store.stage_connection(
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=USER_ID,
+            connection_id=STAGED_CONNECTION_ID,
+            provider=ProviderId.FLOWACCOUNT,
+            environment="sandbox",
+            company_or_merchant_id=pending_account_id,
+            account_display_name="FlowAccount",
+            authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+            granted_permissions=("documents.read", "profile.read"),
+            readiness=ConnectionReadiness.REQUIRES_VALIDATION,
+            revision=1,
+            validated_at=None,
+            envelopes=staged_envelopes,
+        )
+        target = store.resolve_connection_target(
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=USER_ID,
+            provider=ProviderId.FLOWACCOUNT,
+            environment="sandbox",
+            company_or_merchant_id="company-123",
+            proposed_connection_id=PROPOSED_CONNECTION_ID,
+        )
+        finalized = store.finalize_connection(
+            staged_connection_id=STAGED_CONNECTION_ID,
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=USER_ID,
+            connection_id=target.connection_id,
+            provider=ProviderId.FLOWACCOUNT,
+            environment="sandbox",
+            company_or_merchant_id="company-123",
+            account_display_name="FlowAccount Test Company",
+            authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+            granted_permissions=("documents.read", "profile.read"),
+            readiness=ConnectionReadiness.READY,
+            revision=target.revision,
+            validated_at=NOW,
+            envelopes=exact_envelopes,
+        )
+        obligation = store.record_revocation_obligation(
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=USER_ID,
+            connection_id=STAGED_CONNECTION_ID,
+            provider=ProviderId.FLOWACCOUNT,
+            environment="sandbox",
+            company_or_merchant_id=pending_account_id,
+            account_display_name="FlowAccount",
+            authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+            granted_permissions=("documents.read", "profile.read"),
+        )
+
+    assert staged.provider_revocation_required is True
+    assert target.connection_id == CONNECTION_ID
+    assert target.revision == 3
+    assert target.reuses_existing is True
+    assert finalized.id == CONNECTION_ID
+    assert finalized.revision == 3
+    assert obligation.provider_revocation_required is True
+    assert [function for function, _payload in requests] == [
+        "stage_mercury_provider_connection",
+        "resolve_mercury_provider_connection_target",
+        "finalize_mercury_provider_connection",
+        "record_mercury_provider_revocation_obligation",
+    ]
+    assert requests[1][1]["p_proposed_connection_id"] == str(PROPOSED_CONNECTION_ID)
+    assert requests[2][1]["p_staged_connection_id"] == str(STAGED_CONNECTION_ID)
+    for _function, payload in requests:
+        assert payload["p_tenant_id"] == str(TENANT_ID)
+        assert payload["p_workspace_id"] == str(WORKSPACE_ID)
+        assert payload["p_auth_user_id"] == str(USER_ID)
+
+
 def test_production_composition_fails_closed_without_reviewed_origins() -> None:
     class Resolver:
         async def resolve(self, _token: str):
@@ -360,14 +515,21 @@ async def test_production_composition_binds_durable_stores_guard_and_exact_regis
                 resolver=lambda _host, _port: ("1.1.1.1",),
                 http_client=guarded_http,
             )
-            composition = build_provider_oauth_production_composition(
-                settings=_settings(),
+            settings = _settings()
+            composition = build_test_provider_oauth_production_composition(
+                settings=settings,
                 principal_resolver=Resolver(),
                 state_http_client=state_http,
                 connection_http_client=connection_http,
                 network_guard=network_guard,
                 workspace_service=object(),
             )
+            with pytest.raises(
+                V1ConfigurationError,
+                match="v1_provider_oauth_composition_invalid",
+            ):
+                composition.validate_for_runtime(settings)
+            composition.validate_for_test(settings)
 
             service = composition.provider_oauth_service
             flowaccount = composition.registry.get(ProviderId.FLOWACCOUNT)

@@ -108,10 +108,26 @@ _ORDINARY_DEPENDENCY_ERRORS = (
     RuntimeError,
     OverflowError,
 )
+_OAUTH_ERROR_DESCRIPTION = re.compile(r"^[\x20-\x21\x23-\x5B\x5D-\x7E]{1,1024}$")
+_OAUTH_ERROR_URI = re.compile(r"^[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]{1,2048}$")
+_OAUTH_ERROR_OPTIONAL_KEYS = frozenset({"error_description", "error_uri"})
 
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _valid_oauth_error_metadata(request: Request, keys: set[str]) -> bool:
+    description = request.query_params.get("error_description")
+    if "error_description" in keys and (
+        description is None or _OAUTH_ERROR_DESCRIPTION.fullmatch(description) is None
+    ):
+        return False
+
+    error_uri = request.query_params.get("error_uri")
+    if "error_uri" not in keys:
+        return True
+    return bool(error_uri and _OAUTH_ERROR_URI.fullmatch(error_uri))
 
 
 @dataclass
@@ -348,7 +364,13 @@ class CloudDependencies:
         query = list(request.query_params.multi_items())
         keys = [key for key, _value in query]
         key_set = set(keys)
-        if key_set not in ({"code", "state"}, {"error", "state"}) or len(keys) != len(key_set):
+        success_keys = {"code", "state"}
+        error_keys = {"error", "state"}
+        error_callback = error_keys <= key_set <= error_keys | _OAUTH_ERROR_OPTIONAL_KEYS
+        if len(keys) != len(key_set) or (
+            key_set != success_keys
+            and (not error_callback or not _valid_oauth_error_metadata(request, key_set))
+        ):
             return JSONResponse(
                 {"error": "provider_oauth_callback_invalid"},
                 status_code=400,
@@ -361,8 +383,9 @@ class CloudDependencies:
                 headers=headers,
             )
         try:
+            callback_keys = error_keys if error_callback else success_keys
             callback = OAuthCallback.model_validate(
-                {key: request.query_params[key] for key in key_set}
+                {key: request.query_params[key] for key in callback_keys}
             )
             summary = await self.provider_oauth_service.complete_callback(callback)
         except ProviderOAuthError as exc:

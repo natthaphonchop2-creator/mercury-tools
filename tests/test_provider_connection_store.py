@@ -17,6 +17,9 @@ VAULT_MIGRATION = ROOT / "supabase/migrations/20260726102000_mercury_v1_credenti
 OAUTH_CLEANUP_MIGRATION = (
     ROOT / "supabase/migrations/20260727100000_mercury_v1_provider_oauth_cleanup.sql"
 )
+OAUTH_RECONNECT_MIGRATION = (
+    ROOT / "supabase/migrations/20260728100000_mercury_v1_provider_oauth_reconnect.sql"
+)
 
 TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
 OTHER_TENANT_ID = UUID("22222222-2222-4222-8222-222222222222")
@@ -26,6 +29,7 @@ WORKSPACE_ID = UUID("55555555-5555-4555-8555-555555555555")
 OTHER_WORKSPACE_ID = UUID("66666666-6666-4666-8666-666666666666")
 CONNECTION_ID = UUID("77777777-7777-4777-8777-777777777777")
 SECOND_CONNECTION_ID = UUID("88888888-8888-4888-8888-888888888888")
+THIRD_CONNECTION_ID = UUID("99999999-9999-4999-8999-999999999999")
 NOW = datetime(2026, 7, 26, 11, 0, tzinfo=UTC)
 TOKEN_HASH = "a" * 64
 OTHER_TOKEN_HASH = "b" * 64
@@ -587,6 +591,101 @@ def test_reconnect_reactivates_only_the_same_disconnected_connection_id() -> Non
     assert reconnected.credential_envelope_ids == tuple(envelope.id for envelope in replacements)
 
 
+def test_atomic_finalization_reuses_disconnected_company_and_clears_staged_obligation() -> None:
+    from mercury_tools.providers.models import (
+        AuthorizationMethod,
+        ConnectionReadiness,
+        ProviderId,
+    )
+
+    vault = _vault()
+    store = _store(vault=vault)
+    original = _save_connection(store)
+    disconnected = store.disconnect(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=AUTH_USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    staged_account_id = "oauth-pending-attempt"
+    staged_envelopes = (
+        vault.seal(
+            _binding(
+                "access_token",
+                connection_id=SECOND_CONNECTION_ID,
+                company_or_merchant_id=staged_account_id,
+            ),
+            b"staged-access-token",
+        ),
+    )
+    staged = store.stage_connection(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=AUTH_USER_ID,
+        connection_id=SECOND_CONNECTION_ID,
+        provider=ProviderId.FLOWACCOUNT,
+        environment="sandbox",
+        company_or_merchant_id=staged_account_id,
+        account_display_name="FlowAccount",
+        authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+        granted_permissions=("documents.read", "profile.read"),
+        readiness=ConnectionReadiness.REQUIRES_VALIDATION,
+        revision=1,
+        validated_at=None,
+        envelopes=staged_envelopes,
+    )
+    target = store.resolve_connection_target(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=AUTH_USER_ID,
+        provider=ProviderId.FLOWACCOUNT,
+        environment="sandbox",
+        company_or_merchant_id="company-123",
+        proposed_connection_id=THIRD_CONNECTION_ID,
+    )
+    exact_envelopes = (
+        vault.seal(
+            _binding(
+                "access_token",
+                connection_id=target.connection_id,
+            ),
+            b"replacement-access-token",
+        ),
+    )
+    finalized = store.finalize_connection(
+        staged_connection_id=staged.id,
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=AUTH_USER_ID,
+        connection_id=target.connection_id,
+        provider=ProviderId.FLOWACCOUNT,
+        environment="sandbox",
+        company_or_merchant_id="company-123",
+        account_display_name="FlowAccount Test Company",
+        authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+        granted_permissions=("documents.read", "profile.read"),
+        readiness=ConnectionReadiness.READY,
+        revision=target.revision,
+        validated_at=NOW,
+        envelopes=exact_envelopes,
+    )
+    summaries = store.list_for_workspace(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=AUTH_USER_ID,
+    )
+
+    assert target.connection_id == original.id
+    assert target.revision == disconnected.revision + 1
+    assert finalized.id == original.id
+    assert finalized.revision == target.revision
+    assert finalized.provider_revocation_required is False
+    staged_summary = next(item for item in summaries if item.connection_id == staged.id)
+    assert staged_summary.readiness is ConnectionReadiness.DISCONNECTED
+    assert staged_summary.provider_revocation_required is False
+    assert not any(envelope.connection_id == staged.id for envelope in store._envelopes.values())
+
+
 @pytest.mark.parametrize(
     ("revision", "environment", "company_or_merchant_id"),
     [
@@ -842,6 +941,7 @@ def test_migrations_use_valid_pg_catalog_type_names_for_postgres_17() -> None:
             CONNECTION_MIGRATION,
             VAULT_MIGRATION,
             OAUTH_CLEANUP_MIGRATION,
+            OAUTH_RECONNECT_MIGRATION,
         )
     )
 
@@ -878,5 +978,28 @@ def test_oauth_cleanup_migration_has_atomic_cancel_cleanup_and_revocation_rpcs()
     assert "readiness <> 'disconnected'" in sql
     assert "credential_envelope_ids <> '{}'::pg_catalog.uuid[]" in sql
     assert "provider_revocation_required = false" in sql
+    assert "drop table" not in sql
+    assert "truncate" not in sql
+
+
+def test_oauth_reconnect_migration_has_atomic_stage_target_finalize_and_obligation_rpcs() -> None:
+    sql = _normalized_sql(OAUTH_RECONNECT_MIGRATION)
+
+    for function_name in (
+        "stage_mercury_provider_connection",
+        "resolve_mercury_provider_connection_target",
+        "finalize_mercury_provider_connection",
+        "record_mercury_provider_revocation_obligation",
+    ):
+        assert f"create or replace function public.{function_name}(" in sql
+        assert re.search(
+            rf"grant execute on function public\.{function_name}\([^;]*\) "
+            r"to service_role;",
+            sql,
+        )
+
+    assert "provider_revocation_required = true" in sql
+    assert "readiness <> 'disconnected'" in sql
+    assert "for update" in sql
     assert "drop table" not in sql
     assert "truncate" not in sql

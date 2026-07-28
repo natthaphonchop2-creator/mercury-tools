@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
 from urllib.parse import urlsplit, urlunsplit
+from urllib.request import parse_http_list
 from uuid import UUID, uuid4
 
 import anyio
@@ -75,8 +76,9 @@ _OAUTH_ERROR_CODES = frozenset(
         "provider_oauth_validation_failed",
     }
 )
-_WWW_RESOURCE_METADATA = re.compile(r'(?:^|[\s,])resource_metadata="([^"\\]+)"')
-_WWW_SCOPE = re.compile(r'(?:^|[\s,])scope="([^"\\]+)"')
+_AUTH_TOKEN = r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+"
+_AUTH_CHALLENGE_START = re.compile(rf"^({_AUTH_TOKEN})(?:[ \t]+(.+))?$")
+_AUTH_PARAMETER = re.compile(rf'^({_AUTH_TOKEN})[ \t]*=[ \t]*(?:"([^"\\]*)"|({_AUTH_TOKEN}))$')
 
 
 class _OAuthModel(BaseModel):
@@ -157,6 +159,40 @@ def _b64url(value: bytes) -> str:
 
 def _state_hash(value: str) -> str:
     return hashlib.sha256(value.encode("ascii")).hexdigest()
+
+
+def _bearer_challenge_parameters(headers: httpx.Headers) -> dict[str, str]:
+    challenges: list[tuple[str, list[str]]] = []
+    for header in headers.get_list("www-authenticate"):
+        current: tuple[str, list[str]] | None = None
+        for item in parse_http_list(header):
+            segment = item.strip()
+            start = _AUTH_CHALLENGE_START.fullmatch(segment)
+            if start is not None:
+                current = (start.group(1), [])
+                challenges.append(current)
+                if start.group(2) is not None:
+                    current[1].append(start.group(2))
+            elif current is not None:
+                current[1].append(segment)
+            else:
+                raise ValueError
+
+    bearer = [parameters for scheme, parameters in challenges if scheme.casefold() == "bearer"]
+    if len(bearer) != 1:
+        raise ValueError
+
+    parsed: dict[str, str] = {}
+    for parameter in bearer[0]:
+        match = _AUTH_PARAMETER.fullmatch(parameter)
+        if match is None:
+            raise ValueError
+        name = match.group(1).casefold()
+        value = match.group(2) if match.group(2) is not None else match.group(3)
+        if name in parsed or value is None:
+            raise ValueError
+        parsed[name] = value
+    return parsed
 
 
 def _checked_selected_company_id(value: str | None, *, code: str) -> str | None:
@@ -1235,13 +1271,12 @@ class DownstreamMCPOAuthClient:
                 resource_uri,
                 headers={"MCP-Protocol-Version": "2025-11-25"},
             )
-            challenge = challenge_response.headers.get("www-authenticate", "")
-            if "bearer" not in challenge.casefold():
+            if challenge_response.status_code != 401:
                 raise ValueError
-            metadata_match = _WWW_RESOURCE_METADATA.search(challenge)
-            if metadata_match is None:
+            challenge = _bearer_challenge_parameters(challenge_response.headers)
+            resource_metadata_url = challenge.get("resource_metadata")
+            if resource_metadata_url is None:
                 raise ValueError
-            resource_metadata_url = metadata_match.group(1)
             if resource_metadata_url != _protected_resource_metadata_url(resource_uri):
                 raise ValueError
 
@@ -1265,9 +1300,9 @@ class DownstreamMCPOAuthClient:
             supported = _string_set(
                 resource_metadata.get("scopes_supported"),
             )
-            scope_match = _WWW_SCOPE.search(challenge)
-            if scope_match is not None:
-                challenged = set(scope_match.group(1).split())
+            challenged_scope = challenge.get("scope")
+            if challenged_scope is not None:
+                challenged = set(challenged_scope.split())
                 supported &= challenged
             granted_permissions = tuple(sorted(set(allowed_permissions) & supported))
             if not granted_permissions:
@@ -1808,38 +1843,201 @@ class ProviderOAuthService:
         except Exception:
             raise ProviderOAuthError("provider_oauth_exchange_failed") from None
 
-        connection_id = uuid4()
+        staged_connection_id = uuid4()
         provisional_account_id = f"oauth-pending-{consumed.id}"
-        now = self._timestamp()
-        provisional = ProviderConnection(
-            id=connection_id,
-            tenant_id=record.tenant_id,
-            workspace_id=record.workspace_id,
-            auth_user_id=record.auth_user_id,
-            provider=ProviderId.FLOWACCOUNT,
-            environment=record.environment,
-            provider_account_id=provisional_account_id,
-            account_display_name="FlowAccount",
-            authorization_method=AuthorizationMethod.OAUTH2_PKCE,
-            granted_permissions=tokens.granted_permissions,
-            readiness=ConnectionReadiness.REQUIRES_VALIDATION,
-            revision=1,
-            last_validated_at=None,
-            credential_envelope_ids=(uuid4(),),
-            created_at=now,
-            updated_at=now,
-        )
-        envelopes = seal_flowaccount_credentials(
-            vault=self._vault,
-            connection=provisional,
-            tokens=tokens,
-            token_endpoint=payload.token_endpoint,
-            resource_uri=payload.resource_uri,
-            client_id=payload.client_id,
-            client_secret=payload.client_secret,
-            token_endpoint_auth_method=payload.token_endpoint_auth_method,
-        )
-        connection = self._connection_store.save_connection(
+        staged = False
+        try:
+            now = self._timestamp()
+            provisional = ProviderConnection(
+                id=staged_connection_id,
+                tenant_id=record.tenant_id,
+                workspace_id=record.workspace_id,
+                auth_user_id=record.auth_user_id,
+                provider=ProviderId.FLOWACCOUNT,
+                environment=record.environment,
+                provider_account_id=provisional_account_id,
+                account_display_name="FlowAccount",
+                authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+                granted_permissions=tokens.granted_permissions,
+                readiness=ConnectionReadiness.REQUIRES_VALIDATION,
+                revision=1,
+                last_validated_at=None,
+                credential_envelope_ids=(uuid4(),),
+                created_at=now,
+                updated_at=now,
+            )
+            provisional_envelopes = seal_flowaccount_credentials(
+                vault=self._vault,
+                connection=provisional,
+                tokens=tokens,
+                token_endpoint=payload.token_endpoint,
+                resource_uri=payload.resource_uri,
+                client_id=payload.client_id,
+                client_secret=payload.client_secret,
+                token_endpoint_auth_method=payload.token_endpoint_auth_method,
+            )
+            connection = self._connection_store.stage_connection(
+                tenant_id=record.tenant_id,
+                workspace_id=record.workspace_id,
+                auth_user_id=record.auth_user_id,
+                connection_id=staged_connection_id,
+                provider=ProviderId.FLOWACCOUNT,
+                environment=record.environment,
+                company_or_merchant_id=provisional_account_id,
+                account_display_name="FlowAccount",
+                authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+                granted_permissions=tokens.granted_permissions,
+                readiness=ConnectionReadiness.REQUIRES_VALIDATION,
+                revision=1,
+                validated_at=None,
+                envelopes=provisional_envelopes,
+            )
+            staged = True
+
+            try:
+                discovery = await self._driver.discover(connection)
+                if (
+                    discovery.status_class is not ProviderStatusClass.SUCCESS
+                    or _PROFILE_CAPABILITY not in discovery.normalized_data["capabilities"]
+                ):
+                    raise ValueError
+                validation = await self._driver.validate_connection(connection)
+                if validation.status_class is not ProviderStatusClass.SUCCESS:
+                    raise ValueError
+                company_id = validation.normalized_data["company_id"]
+                display_name = validation.normalized_data["company_display_name"]
+                if not isinstance(company_id, str) or not isinstance(display_name, str):
+                    raise ValueError
+                if payload.selected_company_id is not None and not secrets.compare_digest(
+                    company_id,
+                    payload.selected_company_id,
+                ):
+                    raise ProviderOAuthError("provider_oauth_company_mismatch")
+            except ProviderOAuthError:
+                raise
+            except Exception:
+                raise ProviderOAuthError("provider_oauth_validation_failed") from None
+
+            target = self._connection_store.resolve_connection_target(
+                tenant_id=record.tenant_id,
+                workspace_id=record.workspace_id,
+                auth_user_id=record.auth_user_id,
+                provider=ProviderId.FLOWACCOUNT,
+                environment=record.environment,
+                company_or_merchant_id=company_id,
+                proposed_connection_id=uuid4(),
+            )
+            validated_at = self._timestamp()
+            exact_connection = ProviderConnection(
+                id=target.connection_id,
+                tenant_id=record.tenant_id,
+                workspace_id=record.workspace_id,
+                auth_user_id=record.auth_user_id,
+                provider=ProviderId.FLOWACCOUNT,
+                environment=record.environment,
+                provider_account_id=company_id,
+                account_display_name=display_name,
+                authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+                granted_permissions=tokens.granted_permissions,
+                readiness=ConnectionReadiness.READY,
+                revision=target.revision,
+                last_validated_at=validated_at,
+                credential_envelope_ids=(uuid4(),),
+                created_at=now,
+                updated_at=validated_at,
+            )
+            exact_envelopes = seal_flowaccount_credentials(
+                vault=self._vault,
+                connection=exact_connection,
+                tokens=tokens,
+                token_endpoint=payload.token_endpoint,
+                resource_uri=payload.resource_uri,
+                client_id=payload.client_id,
+                client_secret=payload.client_secret,
+                token_endpoint_auth_method=payload.token_endpoint_auth_method,
+            )
+            ready = self._connection_store.finalize_connection(
+                staged_connection_id=staged_connection_id,
+                tenant_id=record.tenant_id,
+                workspace_id=record.workspace_id,
+                auth_user_id=record.auth_user_id,
+                connection_id=target.connection_id,
+                provider=ProviderId.FLOWACCOUNT,
+                environment=record.environment,
+                company_or_merchant_id=company_id,
+                account_display_name=display_name,
+                authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+                granted_permissions=tokens.granted_permissions,
+                readiness=ConnectionReadiness.READY,
+                revision=target.revision,
+                validated_at=validated_at,
+                envelopes=exact_envelopes,
+            )
+            return ready.summary()
+        except BaseException:
+            obligation_persisted = False
+            try:
+                self._persist_revocation_obligation(
+                    record=record,
+                    connection_id=staged_connection_id,
+                    provisional_account_id=provisional_account_id,
+                    granted_permissions=tokens.granted_permissions,
+                    staged=staged,
+                )
+                obligation_persisted = True
+            except Exception:
+                pass
+
+            revoked = False
+            if payload.revocation_endpoint is not None:
+                try:
+                    revoked = await self._oauth_client.revoke(
+                        session=payload.session(),
+                        tokens=tokens,
+                    )
+                except Exception:
+                    revoked = False
+            if revoked:
+                if obligation_persisted:
+                    with suppress(Exception):
+                        self._connection_store.complete_revocation(
+                            tenant_id=record.tenant_id,
+                            workspace_id=record.workspace_id,
+                            auth_user_id=record.auth_user_id,
+                            connection_id=staged_connection_id,
+                        )
+            elif not obligation_persisted:
+                self._persist_revocation_obligation(
+                    record=record,
+                    connection_id=staged_connection_id,
+                    provisional_account_id=provisional_account_id,
+                    granted_permissions=tokens.granted_permissions,
+                    staged=staged,
+                )
+            raise
+
+    def _persist_revocation_obligation(
+        self,
+        *,
+        record: ProviderOAuthStateRecord,
+        connection_id: UUID,
+        provisional_account_id: str,
+        granted_permissions: tuple[str, ...],
+        staged: bool,
+    ) -> None:
+        if staged:
+            try:
+                self._connection_store.disconnect(
+                    tenant_id=record.tenant_id,
+                    workspace_id=record.workspace_id,
+                    auth_user_id=record.auth_user_id,
+                    connection_id=connection_id,
+                    provider_revocation_required=True,
+                )
+                return
+            except Exception:
+                pass
+        self._connection_store.record_revocation_obligation(
             tenant_id=record.tenant_id,
             workspace_id=record.workspace_id,
             auth_user_id=record.auth_user_id,
@@ -1849,136 +2047,8 @@ class ProviderOAuthService:
             company_or_merchant_id=provisional_account_id,
             account_display_name="FlowAccount",
             authorization_method=AuthorizationMethod.OAUTH2_PKCE,
-            granted_permissions=tokens.granted_permissions,
-            readiness=ConnectionReadiness.REQUIRES_VALIDATION,
-            revision=1,
-            validated_at=None,
-            envelopes=envelopes,
+            granted_permissions=granted_permissions,
         )
-
-        display_name = "FlowAccount"
-        failure: ProviderOAuthError | None = None
-        try:
-            discovery = await self._driver.discover(connection)
-            if (
-                discovery.status_class is not ProviderStatusClass.SUCCESS
-                or _PROFILE_CAPABILITY not in discovery.normalized_data["capabilities"]
-            ):
-                raise ValueError
-            validation = await self._driver.validate_connection(connection)
-            if validation.status_class is not ProviderStatusClass.SUCCESS:
-                raise ValueError
-            company_id = validation.normalized_data["company_id"]
-            display_name = validation.normalized_data["company_display_name"]
-            if not isinstance(company_id, str) or not isinstance(display_name, str):
-                raise ValueError
-            if payload.selected_company_id is not None and not secrets.compare_digest(
-                company_id, payload.selected_company_id
-            ):
-                failure = ProviderOAuthError("provider_oauth_company_mismatch")
-        except ProviderOAuthError as exc:
-            failure = exc
-        except Exception:
-            failure = ProviderOAuthError("provider_oauth_validation_failed")
-
-        if failure is not None:
-            if failure.code == "provider_oauth_validation_failed":
-                self._connection_store.save_connection(
-                    tenant_id=record.tenant_id,
-                    workspace_id=record.workspace_id,
-                    auth_user_id=record.auth_user_id,
-                    connection_id=connection_id,
-                    provider=ProviderId.FLOWACCOUNT,
-                    environment=record.environment,
-                    company_or_merchant_id=provisional_account_id,
-                    account_display_name="FlowAccount",
-                    authorization_method=AuthorizationMethod.OAUTH2_PKCE,
-                    granted_permissions=tokens.granted_permissions,
-                    readiness=ConnectionReadiness.VALIDATION_FAILED,
-                    revision=2,
-                    validated_at=None,
-                    envelopes=envelopes,
-                )
-            mismatch = failure.code == "provider_oauth_company_mismatch"
-            self._connection_store.disconnect(
-                tenant_id=record.tenant_id,
-                workspace_id=record.workspace_id,
-                auth_user_id=record.auth_user_id,
-                connection_id=connection_id,
-                provider_revocation_required=mismatch,
-            )
-            if mismatch and payload.revocation_endpoint is not None:
-                revoked = await self._oauth_client.revoke(
-                    session=payload.session(),
-                    tokens=tokens,
-                )
-                if revoked:
-                    self._connection_store.complete_revocation(
-                        tenant_id=record.tenant_id,
-                        workspace_id=record.workspace_id,
-                        auth_user_id=record.auth_user_id,
-                        connection_id=connection_id,
-                    )
-            raise failure
-
-        self._connection_store.disconnect(
-            tenant_id=record.tenant_id,
-            workspace_id=record.workspace_id,
-            auth_user_id=record.auth_user_id,
-            connection_id=connection_id,
-        )
-        ready_connection_id = uuid4()
-        exact_connection = provisional.model_copy(
-            update={
-                "id": ready_connection_id,
-                "provider_account_id": company_id,
-                "account_display_name": display_name,
-                "credential_envelope_ids": (uuid4(),),
-            }
-        )
-        exact_envelopes = seal_flowaccount_credentials(
-            vault=self._vault,
-            connection=exact_connection,
-            tokens=tokens,
-            token_endpoint=payload.token_endpoint,
-            resource_uri=payload.resource_uri,
-            client_id=payload.client_id,
-            client_secret=payload.client_secret,
-            token_endpoint_auth_method=payload.token_endpoint_auth_method,
-        )
-        self._connection_store.save_connection(
-            tenant_id=record.tenant_id,
-            workspace_id=record.workspace_id,
-            auth_user_id=record.auth_user_id,
-            connection_id=ready_connection_id,
-            provider=ProviderId.FLOWACCOUNT,
-            environment=record.environment,
-            company_or_merchant_id=company_id,
-            account_display_name=display_name,
-            authorization_method=AuthorizationMethod.OAUTH2_PKCE,
-            granted_permissions=tokens.granted_permissions,
-            readiness=ConnectionReadiness.REQUIRES_VALIDATION,
-            revision=1,
-            validated_at=None,
-            envelopes=exact_envelopes,
-        )
-        ready = self._connection_store.save_connection(
-            tenant_id=record.tenant_id,
-            workspace_id=record.workspace_id,
-            auth_user_id=record.auth_user_id,
-            connection_id=ready_connection_id,
-            provider=ProviderId.FLOWACCOUNT,
-            environment=record.environment,
-            company_or_merchant_id=company_id,
-            account_display_name=display_name,
-            authorization_method=AuthorizationMethod.OAUTH2_PKCE,
-            granted_permissions=tokens.granted_permissions,
-            readiness=ConnectionReadiness.READY,
-            revision=2,
-            validated_at=self._timestamp(),
-            envelopes=exact_envelopes,
-        )
-        return ready.summary()
 
     def _open_state_access(
         self,

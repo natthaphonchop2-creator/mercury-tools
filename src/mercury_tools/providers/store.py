@@ -7,6 +7,7 @@ import secrets
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -54,6 +55,26 @@ class ProviderStoreError(RuntimeError):
             raise ValueError("provider_store_error_invalid")
         self.code = code
         super().__init__(code)
+
+
+@dataclass(frozen=True)
+class ProviderConnectionTarget:
+    """Optimistic target selected for one atomic connection finalization."""
+
+    connection_id: UUID
+    revision: int
+    reuses_existing: bool
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.connection_id, UUID)
+            or self.connection_id.int == 0
+            or not isinstance(self.revision, int)
+            or isinstance(self.revision, bool)
+            or self.revision < 1
+            or not isinstance(self.reuses_existing, bool)
+        ):
+            raise ProviderStoreError("provider_connection_invalid")
 
 
 class ProviderConnectionStore:
@@ -268,6 +289,270 @@ class ProviderConnectionStore:
             for envelope in checked_envelopes:
                 self._envelopes[envelope.id] = envelope
         return connection
+
+    def stage_connection(
+        self,
+        *,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        connection_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+        company_or_merchant_id: str,
+        account_display_name: str,
+        authorization_method: AuthorizationMethod | str,
+        granted_permissions: Sequence[str],
+        readiness: ConnectionReadiness | str,
+        revision: int,
+        validated_at: datetime | None,
+        envelopes: Sequence[CredentialEnvelope],
+    ) -> ProviderConnection:
+        if (
+            readiness != ConnectionReadiness.REQUIRES_VALIDATION
+            or revision != 1
+            or validated_at is not None
+        ):
+            raise ProviderStoreError("provider_connection_invalid")
+        with self._lock:
+            staged = self.save_connection(
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                auth_user_id=auth_user_id,
+                connection_id=connection_id,
+                provider=provider,
+                environment=environment,
+                company_or_merchant_id=company_or_merchant_id,
+                account_display_name=account_display_name,
+                authorization_method=authorization_method,
+                granted_permissions=granted_permissions,
+                readiness=readiness,
+                revision=revision,
+                validated_at=validated_at,
+                envelopes=envelopes,
+            ).model_copy(update={"provider_revocation_required": True})
+            self._connections[connection_id] = staged
+            return staged
+
+    def resolve_connection_target(
+        self,
+        *,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+        company_or_merchant_id: str,
+        proposed_connection_id: UUID,
+    ) -> ProviderConnectionTarget:
+        self._bound_ids(tenant_id, workspace_id, auth_user_id)
+        self._require_uuid(proposed_connection_id)
+        now = self._timestamp()
+        try:
+            probe = ProviderConnection(
+                id=proposed_connection_id,
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                auth_user_id=auth_user_id,
+                provider=ProviderId(provider),
+                environment=environment,
+                provider_account_id=company_or_merchant_id,
+                account_display_name="Provider account",
+                authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+                granted_permissions=(),
+                readiness=ConnectionReadiness.DISCONNECTED,
+                revision=1,
+                credential_envelope_ids=(),
+                provider_revocation_required=False,
+                disconnected_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+        except (TypeError, ValueError, ValidationError):
+            raise ProviderStoreError("provider_connection_invalid") from None
+
+        with self._lock:
+            matching = [
+                connection
+                for connection in self._connections.values()
+                if self._same_account(connection, probe)
+            ]
+            if len(matching) > 1:
+                raise ProviderStoreError("provider_connection_conflict")
+            if matching:
+                current = matching[0]
+                if (
+                    current.readiness is not ConnectionReadiness.DISCONNECTED
+                    or current.credential_envelope_ids
+                    or current.provider_revocation_required
+                ):
+                    raise ProviderStoreError("provider_connection_conflict")
+                return ProviderConnectionTarget(
+                    connection_id=current.id,
+                    revision=current.revision + 1,
+                    reuses_existing=True,
+                )
+            if proposed_connection_id in self._connections:
+                raise ProviderStoreError("provider_connection_conflict")
+            return ProviderConnectionTarget(
+                connection_id=proposed_connection_id,
+                revision=1,
+                reuses_existing=False,
+            )
+
+    def finalize_connection(
+        self,
+        *,
+        staged_connection_id: UUID,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        connection_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+        company_or_merchant_id: str,
+        account_display_name: str,
+        authorization_method: AuthorizationMethod | str,
+        granted_permissions: Sequence[str],
+        readiness: ConnectionReadiness | str,
+        revision: int,
+        validated_at: datetime | None,
+        envelopes: Sequence[CredentialEnvelope],
+    ) -> ProviderConnection:
+        if readiness != ConnectionReadiness.READY or staged_connection_id == connection_id:
+            raise ProviderStoreError("provider_connection_invalid")
+        self._bound_ids(tenant_id, workspace_id, auth_user_id)
+        self._require_uuid(staged_connection_id)
+
+        with self._lock:
+            staged = self._connections.get(staged_connection_id)
+            if (
+                staged is None
+                or staged.tenant_id != tenant_id
+                or staged.workspace_id != workspace_id
+                or staged.auth_user_id != auth_user_id
+                or staged.provider
+                is not self._provider(
+                    provider,
+                    "provider_connection_invalid",
+                )
+                or staged.environment != environment
+                or staged.readiness is ConnectionReadiness.DISCONNECTED
+                or not staged.provider_revocation_required
+                or not staged.credential_envelope_ids
+            ):
+                raise ProviderStoreError("provider_connection_invalid")
+
+            connections_before = dict(self._connections)
+            envelopes_before = dict(self._envelopes)
+            try:
+                finalized = self.save_connection(
+                    tenant_id=tenant_id,
+                    workspace_id=workspace_id,
+                    auth_user_id=auth_user_id,
+                    connection_id=connection_id,
+                    provider=provider,
+                    environment=environment,
+                    company_or_merchant_id=company_or_merchant_id,
+                    account_display_name=account_display_name,
+                    authorization_method=authorization_method,
+                    granted_permissions=granted_permissions,
+                    readiness=readiness,
+                    revision=revision,
+                    validated_at=validated_at,
+                    envelopes=envelopes,
+                )
+                self.disconnect(
+                    tenant_id=tenant_id,
+                    workspace_id=workspace_id,
+                    auth_user_id=auth_user_id,
+                    connection_id=staged_connection_id,
+                    provider_revocation_required=True,
+                )
+                self.complete_revocation(
+                    tenant_id=tenant_id,
+                    workspace_id=workspace_id,
+                    auth_user_id=auth_user_id,
+                    connection_id=staged_connection_id,
+                )
+                return finalized
+            except BaseException:
+                self._connections = connections_before
+                self._envelopes = envelopes_before
+                raise
+
+    def record_revocation_obligation(
+        self,
+        *,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        connection_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+        company_or_merchant_id: str,
+        account_display_name: str,
+        authorization_method: AuthorizationMethod | str,
+        granted_permissions: Sequence[str],
+    ) -> DisconnectResult:
+        self._bound_ids(tenant_id, workspace_id, auth_user_id)
+        self._require_uuid(connection_id)
+        now = self._timestamp()
+        try:
+            checked_provider = ProviderId(provider)
+            checked_method = AuthorizationMethod(authorization_method)
+            checked_permissions = tuple(sorted(granted_permissions))
+            obligation = ProviderConnection(
+                id=connection_id,
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                auth_user_id=auth_user_id,
+                provider=checked_provider,
+                environment=environment,
+                provider_account_id=company_or_merchant_id,
+                account_display_name=account_display_name,
+                authorization_method=checked_method,
+                granted_permissions=checked_permissions,
+                readiness=ConnectionReadiness.DISCONNECTED,
+                revision=1,
+                credential_envelope_ids=(),
+                provider_revocation_required=True,
+                disconnected_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            if (
+                isinstance(granted_permissions, (str, bytes, bytearray))
+                or tuple(granted_permissions) != checked_permissions
+            ):
+                raise ValueError
+        except (TypeError, ValueError, ValidationError):
+            raise ProviderStoreError("provider_connection_invalid") from None
+
+        with self._lock:
+            current = self._connections.get(connection_id)
+            if current is not None:
+                if not self._same_binding(current, obligation):
+                    raise ProviderStoreError("provider_connection_conflict")
+                return self.disconnect(
+                    tenant_id=tenant_id,
+                    workspace_id=workspace_id,
+                    auth_user_id=auth_user_id,
+                    connection_id=connection_id,
+                    provider_revocation_required=True,
+                )
+            if any(
+                self._same_account(existing, obligation) for existing in self._connections.values()
+            ):
+                raise ProviderStoreError("provider_connection_conflict")
+            self._connections[connection_id] = obligation
+            return DisconnectResult(
+                connection_id=connection_id,
+                deleted_envelope_count=0,
+                already_disconnected=True,
+                provider_revocation_required=True,
+                revision=1,
+            )
 
     def list_for_workspace(
         self,
@@ -586,6 +871,213 @@ class SupabaseProviderConnectionStore:
         validated_at: datetime | None,
         envelopes: Sequence[CredentialEnvelope],
     ) -> ProviderConnection:
+        return self._persist_connection(
+            function="save_mercury_provider_connection",
+            expected_revocation_required=False,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            auth_user_id=auth_user_id,
+            connection_id=connection_id,
+            provider=provider,
+            environment=environment,
+            company_or_merchant_id=company_or_merchant_id,
+            account_display_name=account_display_name,
+            authorization_method=authorization_method,
+            granted_permissions=granted_permissions,
+            readiness=readiness,
+            revision=revision,
+            validated_at=validated_at,
+            envelopes=envelopes,
+        )
+
+    def stage_connection(
+        self,
+        *,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        connection_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+        company_or_merchant_id: str,
+        account_display_name: str,
+        authorization_method: AuthorizationMethod | str,
+        granted_permissions: Sequence[str],
+        readiness: ConnectionReadiness | str,
+        revision: int,
+        validated_at: datetime | None,
+        envelopes: Sequence[CredentialEnvelope],
+    ) -> ProviderConnection:
+        if (
+            readiness != ConnectionReadiness.REQUIRES_VALIDATION
+            or revision != 1
+            or validated_at is not None
+        ):
+            raise ProviderStoreError("provider_connection_invalid")
+        return self._persist_connection(
+            function="stage_mercury_provider_connection",
+            expected_revocation_required=True,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            auth_user_id=auth_user_id,
+            connection_id=connection_id,
+            provider=provider,
+            environment=environment,
+            company_or_merchant_id=company_or_merchant_id,
+            account_display_name=account_display_name,
+            authorization_method=authorization_method,
+            granted_permissions=granted_permissions,
+            readiness=readiness,
+            revision=revision,
+            validated_at=validated_at,
+            envelopes=envelopes,
+        )
+
+    def resolve_connection_target(
+        self,
+        *,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+        company_or_merchant_id: str,
+        proposed_connection_id: UUID,
+    ) -> ProviderConnectionTarget:
+        try:
+            row = self._rpc_one(
+                "resolve_mercury_provider_connection_target",
+                {
+                    "p_tenant_id": str(tenant_id),
+                    "p_workspace_id": str(workspace_id),
+                    "p_auth_user_id": str(auth_user_id),
+                    "p_provider": ProviderId(provider).value,
+                    "p_environment": environment,
+                    "p_provider_account_id": company_or_merchant_id,
+                    "p_proposed_connection_id": str(proposed_connection_id),
+                },
+            )
+            target = ProviderConnectionTarget(
+                connection_id=UUID(str(row["connection_id"])),
+                revision=row["revision"],
+                reuses_existing=row["reuses_existing"],
+            )
+            if not target.reuses_existing and target.connection_id != proposed_connection_id:
+                raise ValueError
+            return target
+        except ProviderStoreError:
+            raise
+        except Exception:
+            raise ProviderStoreError("provider_connection_invalid") from None
+
+    def finalize_connection(
+        self,
+        *,
+        staged_connection_id: UUID,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        connection_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+        company_or_merchant_id: str,
+        account_display_name: str,
+        authorization_method: AuthorizationMethod | str,
+        granted_permissions: Sequence[str],
+        readiness: ConnectionReadiness | str,
+        revision: int,
+        validated_at: datetime | None,
+        envelopes: Sequence[CredentialEnvelope],
+    ) -> ProviderConnection:
+        if readiness != ConnectionReadiness.READY or staged_connection_id == connection_id:
+            raise ProviderStoreError("provider_connection_invalid")
+        return self._persist_connection(
+            function="finalize_mercury_provider_connection",
+            expected_revocation_required=False,
+            extra_payload={"p_staged_connection_id": str(staged_connection_id)},
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            auth_user_id=auth_user_id,
+            connection_id=connection_id,
+            provider=provider,
+            environment=environment,
+            company_or_merchant_id=company_or_merchant_id,
+            account_display_name=account_display_name,
+            authorization_method=authorization_method,
+            granted_permissions=granted_permissions,
+            readiness=readiness,
+            revision=revision,
+            validated_at=validated_at,
+            envelopes=envelopes,
+        )
+
+    def record_revocation_obligation(
+        self,
+        *,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        connection_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+        company_or_merchant_id: str,
+        account_display_name: str,
+        authorization_method: AuthorizationMethod | str,
+        granted_permissions: Sequence[str],
+    ) -> DisconnectResult:
+        try:
+            if isinstance(granted_permissions, (str, bytes, bytearray)):
+                raise ValueError
+            checked_permissions = tuple(granted_permissions)
+            if tuple(sorted(checked_permissions)) != checked_permissions or len(
+                set(checked_permissions)
+            ) != len(checked_permissions):
+                raise ValueError
+            payload = {
+                "p_tenant_id": str(tenant_id),
+                "p_workspace_id": str(workspace_id),
+                "p_auth_user_id": str(auth_user_id),
+                "p_connection_id": str(connection_id),
+                "p_provider": ProviderId(provider).value,
+                "p_environment": environment,
+                "p_provider_account_id": company_or_merchant_id,
+                "p_account_display_name": account_display_name,
+                "p_authorization_method": AuthorizationMethod(authorization_method).value,
+                "p_granted_permissions": list(checked_permissions),
+            }
+            return self._disconnect_result(
+                self._rpc_one(
+                    "record_mercury_provider_revocation_obligation",
+                    payload,
+                ),
+                connection_id=connection_id,
+            )
+        except ProviderStoreError:
+            raise
+        except Exception:
+            raise ProviderStoreError("provider_connection_invalid") from None
+
+    def _persist_connection(
+        self,
+        *,
+        function: str,
+        expected_revocation_required: bool,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        connection_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+        company_or_merchant_id: str,
+        account_display_name: str,
+        authorization_method: AuthorizationMethod | str,
+        granted_permissions: Sequence[str],
+        readiness: ConnectionReadiness | str,
+        revision: int,
+        validated_at: datetime | None,
+        envelopes: Sequence[CredentialEnvelope],
+        extra_payload: Mapping[str, Any] | None = None,
+    ) -> ProviderConnection:
         checked = self._validated_connection(
             tenant_id=tenant_id,
             workspace_id=workspace_id,
@@ -602,28 +1094,31 @@ class SupabaseProviderConnectionStore:
             validated_at=validated_at,
             envelopes=envelopes,
         )
+        payload = {
+            "p_connection_id": str(checked.id),
+            "p_tenant_id": str(checked.tenant_id),
+            "p_workspace_id": str(checked.workspace_id),
+            "p_auth_user_id": str(checked.auth_user_id),
+            "p_provider": checked.provider.value,
+            "p_environment": checked.environment,
+            "p_provider_account_id": checked.provider_account_id,
+            "p_account_display_name": checked.account_display_name,
+            "p_authorization_method": checked.authorization_method.value,
+            "p_granted_permissions": list(checked.granted_permissions),
+            "p_readiness": checked.readiness.value,
+            "p_revision": checked.revision,
+            "p_last_validated_at": (
+                checked.last_validated_at.isoformat()
+                if checked.last_validated_at is not None
+                else None
+            ),
+            "p_envelopes": [self._envelope_payload(envelope) for envelope in envelopes],
+        }
+        if extra_payload is not None:
+            payload.update(extra_payload)
         row = self._rpc_one(
-            "save_mercury_provider_connection",
-            {
-                "p_connection_id": str(checked.id),
-                "p_tenant_id": str(checked.tenant_id),
-                "p_workspace_id": str(checked.workspace_id),
-                "p_auth_user_id": str(checked.auth_user_id),
-                "p_provider": checked.provider.value,
-                "p_environment": checked.environment,
-                "p_provider_account_id": checked.provider_account_id,
-                "p_account_display_name": checked.account_display_name,
-                "p_authorization_method": checked.authorization_method.value,
-                "p_granted_permissions": list(checked.granted_permissions),
-                "p_readiness": checked.readiness.value,
-                "p_revision": checked.revision,
-                "p_last_validated_at": (
-                    checked.last_validated_at.isoformat()
-                    if checked.last_validated_at is not None
-                    else None
-                ),
-                "p_envelopes": [self._envelope_payload(envelope) for envelope in envelopes],
-            },
+            function,
+            payload,
         )
         try:
             if (
@@ -636,7 +1131,7 @@ class SupabaseProviderConnectionStore:
                 or tuple(row["granted_permissions"]) != checked.granted_permissions
                 or ConnectionReadiness(row["readiness"]) is not checked.readiness
                 or row["revision"] != checked.revision
-                or bool(row["provider_revocation_required"])
+                or bool(row["provider_revocation_required"]) is not expected_revocation_required
             ):
                 raise ValueError
             created_at = _rpc_timestamp(row["created_at"])
@@ -652,6 +1147,7 @@ class SupabaseProviderConnectionStore:
                 update={
                     "created_at": created_at,
                     "updated_at": updated_at,
+                    "provider_revocation_required": expected_revocation_required,
                 }
             )
         except Exception:
@@ -975,6 +1471,7 @@ def _rpc_bytea(value: Any) -> bytes:
 
 
 __all__ = [
+    "ProviderConnectionTarget",
     "ProviderConnectionStore",
     "ProviderStoreError",
     "SupabaseProviderConnectionStore",

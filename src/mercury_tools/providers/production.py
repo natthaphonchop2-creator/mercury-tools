@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -14,7 +15,7 @@ from pydantic import BaseModel
 
 from mercury_tools.auth.middleware import current_mercury_access_token
 from mercury_tools.auth.models import PrincipalResolver
-from mercury_tools.config import Settings, V1ConfigurationError
+from mercury_tools.config import Settings, V1ConfigurationError, v1_supabase_rest_url
 from mercury_tools.credentials.vault import CredentialVault
 from mercury_tools.providers.base import (
     ProviderOperationClass,
@@ -40,7 +41,7 @@ from mercury_tools.providers.oauth import (
     PublicOAuthNetworkGuard,
     SupabaseProviderOAuthStateStore,
 )
-from mercury_tools.providers.registry import build_provider_registry
+from mercury_tools.providers.registry import ProviderDriverRegistry, build_provider_registry
 from mercury_tools.providers.store import SupabaseProviderConnectionStore
 from mercury_tools.providers.streamable_mcp import wire_schema_sha256
 from mercury_tools.workspaces.service import WorkspaceService
@@ -49,19 +50,141 @@ _PROFILE_CAPABILITY = "provider_profile.get"
 _PROFILE_TOOL = "get_provider_profile"
 
 
-@dataclass(repr=False)
+@dataclass(frozen=True, repr=False)
 class ProviderOAuthProductionComposition:
+    settings: Settings = field(repr=False)
+    principal_resolver: PrincipalResolver = field(repr=False)
     provider_oauth_service: ProviderOAuthService
     state_store: SupabaseProviderOAuthStateStore
     connection_store: SupabaseProviderConnectionStore
-    registry: Any
+    registry: ProviderDriverRegistry
     network_guard: PublicOAuthNetworkGuard
     state_http_client: httpx.AsyncClient = field(repr=False)
     connection_http_client: httpx.Client = field(repr=False)
     owns_state_http_client: bool = field(default=True, repr=False)
     owns_connection_http_client: bool = field(default=True, repr=False)
+    test_only_dependencies: bool = field(default=False, repr=False)
+
+    def validate_for_runtime(self, settings: Settings) -> None:
+        """Reject incomplete or cross-wired production dependency bundles."""
+
+        self._validate(settings, allow_test_dependencies=False)
+
+    def validate_for_test(self, settings: Settings) -> None:
+        """Validate a bundle built by the explicitly test-only factory."""
+
+        self._validate(settings, allow_test_dependencies=True)
+
+    def _validate(
+        self,
+        settings: Settings,
+        *,
+        allow_test_dependencies: bool,
+    ) -> None:
+        try:
+            settings.validate_v1()
+            if (
+                not settings.v1_enabled
+                or self.settings != settings
+                or (self.test_only_dependencies and not allow_test_dependencies)
+                or (
+                    not self.test_only_dependencies
+                    and (
+                        not self.owns_state_http_client
+                        or not self.owns_connection_http_client
+                        or not self.network_guard._owns_http
+                    )
+                )
+            ):
+                raise ValueError
+            if (
+                not callable(getattr(self.principal_resolver, "resolve", None))
+                or not isinstance(self.provider_oauth_service, ProviderOAuthService)
+                or not isinstance(self.state_store, SupabaseProviderOAuthStateStore)
+                or not isinstance(
+                    self.connection_store,
+                    SupabaseProviderConnectionStore,
+                )
+                or not isinstance(self.registry, ProviderDriverRegistry)
+                or not isinstance(self.network_guard, PublicOAuthNetworkGuard)
+                or not isinstance(self.state_http_client, httpx.AsyncClient)
+                or not isinstance(self.connection_http_client, httpx.Client)
+                or not isinstance(self.owns_state_http_client, bool)
+                or not isinstance(self.owns_connection_http_client, bool)
+            ):
+                raise ValueError
+
+            service = self.provider_oauth_service
+            flowaccount = self.registry.get(ProviderId.FLOWACCOUNT)
+            expected_rest_url = v1_supabase_rest_url(
+                project_url=settings.supabase_url,
+                auth_issuer=settings.supabase_auth_issuer,
+            )
+            expected_callback_uri = (
+                f"{settings.provider_callback_base_url.rstrip('/')}{FLOWACCOUNT_CALLBACK_PATH}"
+            )
+            expected_origins = {
+                (ProviderId.FLOWACCOUNT, "sandbox"): frozenset(
+                    {
+                        settings.flowaccount_oauth_sandbox_authorization_server_origin,
+                    }
+                ),
+                (ProviderId.FLOWACCOUNT, "production"): frozenset(
+                    {
+                        settings.flowaccount_oauth_production_authorization_server_origin,
+                    }
+                ),
+            }
+            expected_vault_versions = {
+                settings.vault_active_key_version,
+                *(
+                    (settings.vault_previous_key_version,)
+                    if settings.vault_previous_key_version
+                    else ()
+                ),
+            }
+            if (
+                self.registry.providers() != ("flowaccount", "peak")
+                or service._settings != settings
+                or service._principal_resolver is not self.principal_resolver
+                or service._state_store is not self.state_store
+                or service._connection_store is not self.connection_store
+                or service._driver is not flowaccount
+                or service._oauth_client._network_guard is not self.network_guard
+                or self.connection_store._vault is not service._vault
+                or self.state_store._http is not self.state_http_client
+                or self.connection_store._http is not self.connection_http_client
+                or self.state_store._base_url != expected_rest_url
+                or self.connection_store._base_url != expected_rest_url
+                or self.state_store._callback_uri != expected_callback_uri
+                or not secrets.compare_digest(
+                    self.state_store._publishable_key,
+                    settings.supabase_publishable_key,
+                )
+                or not secrets.compare_digest(
+                    self.state_store._service_role_key,
+                    settings.supabase_service_role_key,
+                )
+                or not secrets.compare_digest(
+                    self.connection_store._service_role_key,
+                    settings.supabase_service_role_key,
+                )
+                or service._oauth_client._authorization_server_origins != expected_origins
+                or service._vault._active_key_version != settings.vault_active_key_version
+                or set(service._vault._ciphers) != expected_vault_versions
+                or not callable(getattr(service, "complete_callback", None))
+            ):
+                raise ValueError
+        except V1ConfigurationError:
+            raise
+        except Exception:
+            raise V1ConfigurationError("v1_provider_oauth_composition_invalid") from None
 
     async def startup(self) -> None:
+        self._validate(
+            self.settings,
+            allow_test_dependencies=self.test_only_dependencies,
+        )
         await self.state_store.cleanup_expired(limit=100)
 
     async def aclose(self) -> None:
@@ -76,10 +199,47 @@ def build_provider_oauth_production_composition(
     *,
     settings: Settings,
     principal_resolver: PrincipalResolver,
+) -> ProviderOAuthProductionComposition:
+    """Build the production-owned hosted FlowAccount OAuth dependency bundle."""
+
+    return _build_provider_oauth_composition(
+        settings=settings,
+        principal_resolver=principal_resolver,
+        test_only_dependencies=False,
+    )
+
+
+def build_test_provider_oauth_production_composition(
+    *,
+    settings: Settings,
+    principal_resolver: PrincipalResolver,
     state_http_client: httpx.AsyncClient | None = None,
     connection_http_client: httpx.Client | None = None,
     network_guard: PublicOAuthNetworkGuard | None = None,
     workspace_service: WorkspaceService | None = None,
+) -> ProviderOAuthProductionComposition:
+    """Build a typed composition with explicitly test-only dependency overrides."""
+
+    return _build_provider_oauth_composition(
+        settings=settings,
+        principal_resolver=principal_resolver,
+        state_http_client=state_http_client,
+        connection_http_client=connection_http_client,
+        network_guard=network_guard,
+        workspace_service=workspace_service,
+        test_only_dependencies=True,
+    )
+
+
+def _build_provider_oauth_composition(
+    *,
+    settings: Settings,
+    principal_resolver: PrincipalResolver,
+    state_http_client: httpx.AsyncClient | None = None,
+    connection_http_client: httpx.Client | None = None,
+    network_guard: PublicOAuthNetworkGuard | None = None,
+    workspace_service: WorkspaceService | None = None,
+    test_only_dependencies: bool,
 ) -> ProviderOAuthProductionComposition:
     """Compose the hosted path without provider URLs or credentials from input."""
 
@@ -155,7 +315,9 @@ def build_provider_oauth_production_composition(
             vault=vault,
             driver=registry.get(ProviderId.FLOWACCOUNT),
         )
-        return ProviderOAuthProductionComposition(
+        composition = ProviderOAuthProductionComposition(
+            settings=settings,
+            principal_resolver=principal_resolver,
             provider_oauth_service=service,
             state_store=state_store,
             connection_store=connection_store,
@@ -165,7 +327,13 @@ def build_provider_oauth_production_composition(
             connection_http_client=selected_connection_http,
             owns_state_http_client=state_http_client is None,
             owns_connection_http_client=connection_http_client is None,
+            test_only_dependencies=test_only_dependencies,
         )
+        if test_only_dependencies:
+            composition.validate_for_test(settings)
+        else:
+            composition.validate_for_runtime(settings)
+        return composition
     except V1ConfigurationError:
         raise
     except Exception:
@@ -299,4 +467,5 @@ def _require_profile_binding(binding: VerifiedRuntimeBinding) -> None:
 __all__ = [
     "ProviderOAuthProductionComposition",
     "build_provider_oauth_production_composition",
+    "build_test_provider_oauth_production_composition",
 ]
