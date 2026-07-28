@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import inspect
+import logging
 from collections.abc import Iterator
 from uuid import UUID
 
@@ -34,6 +35,11 @@ class StubResolver:
         if isinstance(self.result, MercuryAuthError):
             raise self.result
         return self.result
+
+
+class AllowAllResolver:
+    async def resolve(self, _bearer_token: str) -> MercuryPrincipal:
+        return _principal()
 
 
 class ConfiguredProviderOAuthService:
@@ -138,13 +144,10 @@ def test_v1_default_http_app_builds_and_runs_production_oauth_composition(
     events: list[str] = []
     original_build = server.build_provider_oauth_production_composition
 
-    def build(*, settings, principal_resolver):
+    def build(*, settings):
         assert settings.v1_enabled is True
         events.append("build")
-        return original_build(
-            settings=settings,
-            principal_resolver=principal_resolver,
-        )
+        return original_build(settings=settings)
 
     async def startup(self) -> None:
         self.validate_for_runtime(self.settings)
@@ -203,27 +206,29 @@ def test_v1_custom_cloud_dependencies_cannot_bypass_oauth_validation() -> None:
         )
 
 
-def test_production_http_app_exposes_only_typed_composition_injection() -> None:
-    from mercury_tools.providers.production import ProviderOAuthProductionComposition
+def test_allow_all_resolver_cannot_enter_production_http_graph() -> None:
+    from mercury_tools.mcp import server
+    from mercury_tools.providers.production import build_provider_oauth_production_composition
 
     parameters = inspect.signature(create_http_app).parameters
 
-    assert "provider_oauth_composition" in parameters
+    assert set(parameters) == {"require_auth"}
     assert {
+        "provider_oauth_composition",
         "cloud_dependencies",
         "provider_oauth_service",
         "principal_resolver",
         "consent_handoff",
         "consent_http_client",
     }.isdisjoint(parameters)
-
-    incomplete_typed_composition = object.__new__(ProviderOAuthProductionComposition)
-    for invalid_composition in (object(), incomplete_typed_composition):
-        with pytest.raises(
-            V1ConfigurationError,
-            match="v1_provider_oauth_composition_invalid",
-        ):
-            create_http_app(provider_oauth_composition=invalid_composition)
+    assert set(inspect.signature(build_provider_oauth_production_composition).parameters) == {
+        "settings"
+    }
+    with pytest.raises(TypeError):
+        build_provider_oauth_production_composition(
+            settings=server.load_settings(),
+            principal_resolver=AllowAllResolver(),
+        )
 
 
 def test_arbitrary_dependencies_are_isolated_to_explicit_test_factory() -> None:
@@ -246,13 +251,80 @@ def test_arbitrary_dependencies_are_isolated_to_explicit_test_factory() -> None:
     production_builder_parameters = inspect.signature(
         build_provider_oauth_production_composition
     ).parameters
-    assert set(production_builder_parameters) == {"settings", "principal_resolver"}
+    assert set(production_builder_parameters) == {"settings"}
     assert {
         "state_http_client",
         "connection_http_client",
         "network_guard",
         "workspace_service",
     } <= set(inspect.signature(build_test_provider_oauth_production_composition).parameters)
+
+
+def test_serve_uses_exact_production_factory_and_disables_sensitive_access_log(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import uvicorn
+
+    from mercury_tools.mcp import server
+
+    app = object()
+    factory_calls: list[dict[str, object]] = []
+    run_calls: list[tuple[object, dict[str, object]]] = []
+    sensitive_target = (
+        f"{FLOWACCOUNT_CALLBACK_PATH}?code=CODE_SENTINEL&state=STATE_SENTINEL"
+        "&error_description=DESCRIPTION_SENTINEL&error_uri=https%3A%2F%2Ferror.example"
+    )
+
+    def production_factory(**kwargs):
+        factory_calls.append(dict(kwargs))
+        return app
+
+    def reject_test_factory(**_kwargs):
+        raise AssertionError("production serve must not call the test-only app factory")
+
+    def run(selected_app, **kwargs):
+        run_calls.append((selected_app, dict(kwargs)))
+        if kwargs.get("access_log", True):
+            logging.getLogger("uvicorn.access").info(
+                '%s - "%s %s HTTP/1.1" %d',
+                "127.0.0.1",
+                "GET",
+                sensitive_target,
+                200,
+            )
+
+    monkeypatch.setattr(server, "create_http_app", production_factory)
+    monkeypatch.setattr(server, "create_test_http_app", reject_test_factory)
+    monkeypatch.setattr(uvicorn, "run", run)
+    caplog.set_level(logging.INFO, logger="uvicorn.access")
+
+    server.serve(
+        transport="streamable-http",
+        host="127.0.0.1",
+        port=8765,
+        require_auth=True,
+    )
+
+    assert factory_calls == [{"require_auth": True}]
+    assert run_calls == [
+        (
+            app,
+            {
+                "host": "127.0.0.1",
+                "port": 8765,
+                "access_log": False,
+            },
+        )
+    ]
+    rendered = caplog.text
+    for sensitive in (
+        "CODE_SENTINEL",
+        "STATE_SENTINEL",
+        "DESCRIPTION_SENTINEL",
+        "error.example",
+    ):
+        assert sensitive not in rendered
 
 
 def test_two_live_v1_apps_reject_contradictory_configuration_without_mutation(

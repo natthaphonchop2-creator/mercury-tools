@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from mercury_tools.auth.middleware import current_mercury_access_token
 from mercury_tools.auth.models import PrincipalResolver
+from mercury_tools.auth.supabase_jwt import SupabaseJwtValidator, validator_from_settings
 from mercury_tools.config import Settings, V1ConfigurationError, v1_supabase_rest_url
 from mercury_tools.credentials.vault import CredentialVault
 from mercury_tools.providers.base import (
@@ -98,7 +99,17 @@ class ProviderOAuthProductionComposition:
             ):
                 raise ValueError
             if (
-                not callable(getattr(self.principal_resolver, "resolve", None))
+                (
+                    not allow_test_dependencies
+                    and (
+                        type(self.principal_resolver) is not SupabaseJwtValidator
+                        or self.principal_resolver.issuer
+                        != settings.supabase_auth_issuer.rstrip("/")
+                        or self.principal_resolver.audience != settings.supabase_jwt_audience
+                        or self.principal_resolver.jwks_url != settings.supabase_jwks_url
+                    )
+                )
+                or not callable(getattr(self.principal_resolver, "resolve", None))
                 or not isinstance(self.provider_oauth_service, ProviderOAuthService)
                 or not isinstance(self.state_store, SupabaseProviderOAuthStateStore)
                 or not isinstance(
@@ -150,6 +161,12 @@ class ProviderOAuthProductionComposition:
                 or service._state_store is not self.state_store
                 or service._connection_store is not self.connection_store
                 or service._driver is not flowaccount
+                or service._mercury_access_token is not current_mercury_access_token
+                or (
+                    not allow_test_dependencies
+                    and not isinstance(service._workspace_service, WorkspaceService)
+                )
+                or service._manifest != flowaccount._manifest
                 or service._oauth_client._network_guard is not self.network_guard
                 or self.connection_store._vault is not service._vault
                 or self.state_store._http is not self.state_http_client
@@ -198,13 +215,12 @@ class ProviderOAuthProductionComposition:
 def build_provider_oauth_production_composition(
     *,
     settings: Settings,
-    principal_resolver: PrincipalResolver,
 ) -> ProviderOAuthProductionComposition:
     """Build the production-owned hosted FlowAccount OAuth dependency bundle."""
 
     return _build_provider_oauth_composition(
         settings=settings,
-        principal_resolver=principal_resolver,
+        principal_resolver=validator_from_settings(settings),
         test_only_dependencies=False,
     )
 
@@ -416,7 +432,7 @@ def _flowaccount_runtime_dependencies(
 
     header_factory = FlowAccountOAuthHeaderFactory(
         vault=vault,
-        load_envelopes=connection_store.load_envelopes,
+        load_envelopes=connection_store.load_runtime_envelopes,
         save_envelopes=connection_store.replace_envelopes,
         refresh=oauth_client.refresh,
     )

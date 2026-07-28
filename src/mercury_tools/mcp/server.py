@@ -3896,14 +3896,10 @@ async def healthz(request: Request) -> Response:
 def create_http_app(
     *,
     require_auth: bool | None = None,
-    provider_oauth_composition: ProviderOAuthProductionComposition | None = None,
 ):
-    """Build the production HTTP app from one validated dependency bundle."""
+    """Build the production HTTP app from settings-bound dependencies."""
 
-    return _create_http_app(
-        require_auth=require_auth,
-        provider_oauth_composition=provider_oauth_composition,
-    )
+    return _create_http_app(require_auth=require_auth)
 
 
 def create_test_http_app(
@@ -3931,7 +3927,6 @@ def create_test_http_app(
 def _create_http_app(
     *,
     require_auth: bool | None = None,
-    provider_oauth_composition: ProviderOAuthProductionComposition | None = None,
     cloud_dependencies: CloudDependencies | None = None,
     provider_oauth_service: Any | None = None,
     principal_resolver: PrincipalResolver | None = None,
@@ -3953,37 +3948,19 @@ def _create_http_app(
         )
     ):
         raise V1ConfigurationError("v1_provider_oauth_composition_invalid")
-    if provider_oauth_composition is not None and (
-        test_only_dependencies
-        or cloud_dependencies is not None
-        or provider_oauth_service is not None
-    ):
-        raise V1ConfigurationError("v1_provider_oauth_composition_invalid")
-
     selected_principal_resolver = principal_resolver
-    selected_composition = provider_oauth_composition
+    selected_composition: ProviderOAuthProductionComposition | None = None
     if settings.v1_enabled:
-        if selected_composition is not None:
-            if not isinstance(
-                selected_composition,
-                ProviderOAuthProductionComposition,
-            ):
-                raise V1ConfigurationError("v1_provider_oauth_composition_invalid")
+        if not test_only_dependencies:
+            selected_composition = build_provider_oauth_production_composition(
+                settings=settings,
+            )
             selected_composition.validate_for_runtime(settings)
             selected_principal_resolver = selected_composition.principal_resolver
             provider_oauth_service = selected_composition.provider_oauth_service
         else:
             if selected_principal_resolver is None:
                 selected_principal_resolver = validator_from_settings(settings)
-            if cloud_dependencies is None and provider_oauth_service is None:
-                selected_composition = build_provider_oauth_production_composition(
-                    settings=settings,
-                    principal_resolver=selected_principal_resolver,
-                )
-                selected_composition.validate_for_runtime(settings)
-                provider_oauth_service = selected_composition.provider_oauth_service
-    elif selected_composition is not None:
-        raise V1ConfigurationError("v1_provider_oauth_composition_invalid")
 
     http_mcp = copy(mcp)
     http_mcp.settings = mcp.settings.model_copy(deep=True)
@@ -4140,7 +4117,12 @@ def serve(
     if transport in {"http", "streamable-http"}:
         import uvicorn
 
-        uvicorn.run(create_http_app(require_auth=require_auth), host=host, port=port)
+        uvicorn.run(
+            create_http_app(require_auth=require_auth),
+            host=host,
+            port=port,
+            access_log=False,
+        )
         return
     raise ValueError(f"Unsupported transport: {transport}")
 

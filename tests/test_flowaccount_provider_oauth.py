@@ -297,6 +297,28 @@ class RecordingConnectionStore:
         self.saved.append(dict(kwargs))
         return self.store.save_connection(**kwargs)
 
+    def begin_oauth_attempt(self, **kwargs):
+        self.events.append("begin_attempt")
+        return self.store.begin_oauth_attempt(**kwargs)
+
+    def attach_oauth_attempt(self, **kwargs):
+        self.events.append("attach_attempt")
+        self.saved.append(dict(kwargs))
+        return self.store.attach_oauth_attempt(**kwargs)
+
+    def finalize_oauth_attempt(self, **kwargs):
+        self.events.append("finalize_attempt")
+        self.saved.append(dict(kwargs))
+        return self.store.finalize_oauth_attempt(**kwargs)
+
+    def fail_oauth_attempt(self, **kwargs):
+        self.events.append("fail_attempt")
+        return self.store.fail_oauth_attempt(**kwargs)
+
+    def complete_oauth_attempt_revocation(self, **kwargs):
+        self.events.append("complete_attempt_revocation")
+        return self.store.complete_oauth_attempt_revocation(**kwargs)
+
     def stage_connection(self, **kwargs):
         self.events.append("stage")
         self.saved.append(dict(kwargs))
@@ -1088,8 +1110,42 @@ async def test_protected_resource_requires_401_with_exact_bearer_scheme(
                 ),
             ),
         ],
+        [
+            (
+                "WWW-Authenticate",
+                (
+                    'Bearer resource_metadata="'
+                    "https://flowaccount-sandbox.example/"
+                    '.well-known/oauth-protected-resource/mcp"'
+                ),
+            ),
+            (
+                "WWW-Authenticate",
+                'scope="profile.read documents.read"',
+            ),
+        ],
+        [
+            ("WWW-Authenticate", "Bearer"),
+            (
+                "WWW-Authenticate",
+                (
+                    'resource_metadata="'
+                    "https://flowaccount-sandbox.example/"
+                    '.well-known/oauth-protected-resource/mcp"'
+                ),
+            ),
+            (
+                "WWW-Authenticate",
+                'scope="profile.read documents.read"',
+            ),
+        ],
     ],
-    ids=["multiple-headers", "multiple-challenges"],
+    ids=[
+        "multiple-headers",
+        "multiple-challenges",
+        "parameters-continue-across-fields",
+        "scheme-and-parameters-split-across-fields",
+    ],
 )
 async def test_protected_resource_accepts_exact_bearer_among_multiple_challenges(
     headers: list[tuple[str, str]],
@@ -1448,8 +1504,19 @@ async def test_callback_encrypts_credentials_consumes_verifier_and_requires_both
     assert driver.events == ["discover", "provider_profile.get"]
     assert len(oauth_client.exchanges) == 1
     assert len(connection_store.saved) == 2
-    assert connection_store.saved[0]["readiness"] is ConnectionReadiness.REQUIRES_VALIDATION
+    assert connection_store.events == [
+        "begin_attempt",
+        "attach_attempt",
+        "resolve_target",
+        "finalize_attempt",
+    ]
     assert connection_store.saved[1]["readiness"] is ConnectionReadiness.READY
+    attempt_ids = {
+        values["attempt_id"] for values in connection_store.saved if "attempt_id" in values
+    }
+    assert len(attempt_ids) == 1
+    attempt_id = attempt_ids.pop()
+    assert connection_store.saved[0]["company_or_merchant_id"] == (f"oauth-pending-{attempt_id}")
     credential_types = {
         envelope.credential_type for envelope in connection_store.saved[-1]["envelopes"]
     }
@@ -1511,8 +1578,11 @@ async def test_callback_uses_profile_company_without_nonstandard_query_parameter
         workspace_id=WORKSPACE_ID,
         auth_user_id=USER_ID,
     )
-    assert len(ready) == 2
-    assert sum(item.readiness is ConnectionReadiness.READY for item in ready) == 1
+    assert len(ready) == 1
+    assert ready[0].connection_id == summary.connection_id
+    assert ready[0].readiness is ConnectionReadiness.READY
+    assert "oauth-pending-" not in ready[0].account_display_name
+    assert len(connection_store.store._connections) == 1
 
 
 @pytest.mark.asyncio
@@ -1555,13 +1625,161 @@ async def test_ready_disconnect_reconnect_reuses_connection_id_and_advances_revi
     assert reconnected.revision == disconnected.revision + 1
     assert reconnected.readiness is ConnectionReadiness.READY
     assert reconnected.provider_revocation_required is False
+    assert len(summaries) == 1
+    assert len(connection_store.store._connections) == 1
     assert [
         item.connection_id for item in summaries if item.readiness is ConnectionReadiness.READY
     ] == [first.connection_id]
 
 
 @pytest.mark.asyncio
-async def test_finalization_failure_revokes_or_persists_durable_obligation() -> None:
+async def test_process_boundary_after_exchange_keeps_preexisting_internal_obligation() -> None:
+    class ProcessBoundary(BaseException):
+        pass
+
+    class ProcessBoundaryOAuthClient(FakeOAuthClient):
+        async def exchange_code(
+            self,
+            *,
+            session: OAuthAuthorizationSession,
+            code: str,
+            code_verifier: str,
+        ) -> FlowAccountOAuthTokens:
+            await super().exchange_code(
+                session=session,
+                code=code,
+                code_verifier=code_verifier,
+            )
+            raise ProcessBoundary
+
+    oauth_client = ProcessBoundaryOAuthClient()
+    service, _, _, _, connection_store, _ = _service(oauth_client=oauth_client)
+    start = await service.start(
+        _principal(),
+        WORKSPACE_ID,
+        "flowaccount",
+        "sandbox",
+    )
+    state = parse_qs(urlsplit(start.authorization_url).query)["state"][0]
+
+    with pytest.raises(ProcessBoundary):
+        await service.complete_callback(OAuthCallback(code="authorization-code", state=state))
+
+    assert connection_store.events == ["begin_attempt"]
+    assert len(oauth_client.exchanges) == 1
+    assert (
+        connection_store.store.list_for_workspace(
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=USER_ID,
+        )
+        == ()
+    )
+    assert len(connection_store.store._oauth_attempts) == 1
+    attempt = next(iter(connection_store.store._oauth_attempts.values()))
+    assert attempt.status == "exchange_pending"
+    assert attempt.provider_revocation_required is True
+
+
+@pytest.mark.asyncio
+async def test_commit_then_timeout_reconciles_by_attempt_id_without_revocation() -> None:
+    oauth_client = FakeOAuthClient()
+    service, _, _, _, connection_store, _ = _service(oauth_client=oauth_client)
+    original_finalize = connection_store.finalize_oauth_attempt
+    calls = 0
+
+    def commit_then_timeout(**kwargs):
+        nonlocal calls
+        calls += 1
+        result = original_finalize(**kwargs)
+        if calls == 1:
+            raise ProviderStoreError("provider_store_unavailable")
+        return result
+
+    connection_store.finalize_oauth_attempt = commit_then_timeout
+    start = await service.start(
+        _principal(),
+        WORKSPACE_ID,
+        "flowaccount",
+        "sandbox",
+    )
+    state = parse_qs(urlsplit(start.authorization_url).query)["state"][0]
+
+    summary = await service.complete_callback(OAuthCallback(code="authorization-code", state=state))
+    visible = connection_store.store.list_for_workspace(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=USER_ID,
+    )
+
+    assert calls == 2
+    assert oauth_client.revocations == 0
+    assert [item.connection_id for item in visible] == [summary.connection_id]
+    assert visible[0].readiness is ConnectionReadiness.READY
+    assert visible[0].provider_revocation_required is False
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_finalize_disconnects_actual_target_before_failed_revocation() -> None:
+    class FailedRevocationClient(FakeOAuthClient):
+        async def revoke(
+            self,
+            *,
+            session: OAuthAuthorizationSession,
+            tokens: FlowAccountOAuthTokens,
+        ) -> bool:
+            assert session.revocation_endpoint == REVOCATION_ENDPOINT
+            assert tokens.token_type == "Bearer"
+            self.revocations += 1
+            return False
+
+    oauth_client = FailedRevocationClient()
+    service, _, _, _, connection_store, _ = _service(oauth_client=oauth_client)
+    original_finalize = connection_store.finalize_oauth_attempt
+    calls = 0
+
+    def commit_then_timeout(**kwargs):
+        nonlocal calls
+        calls += 1
+        original_finalize(**kwargs)
+        raise ProviderStoreError("provider_store_unavailable")
+
+    connection_store.finalize_oauth_attempt = commit_then_timeout
+    start = await service.start(
+        _principal(),
+        WORKSPACE_ID,
+        "flowaccount",
+        "sandbox",
+    )
+    state = parse_qs(urlsplit(start.authorization_url).query)["state"][0]
+
+    with pytest.raises(ProviderStoreError, match="^provider_store_unavailable$"):
+        await service.complete_callback(OAuthCallback(code="authorization-code", state=state))
+
+    visible = connection_store.store.list_for_workspace(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=USER_ID,
+    )
+    attempt = next(iter(connection_store.store._oauth_attempts.values()))
+    assert calls == 2
+    assert len(visible) == 1
+    assert visible[0].connection_id == attempt.target_connection_id
+    assert visible[0].readiness is ConnectionReadiness.DISCONNECTED
+    assert visible[0].provider_revocation_required is True
+    assert not any(item.readiness is ConnectionReadiness.READY for item in visible)
+    assert connection_store.store._envelopes == {}
+    assert set(connection_store.store._oauth_attempt_envelopes) == set(
+        attempt.credential_envelope_ids
+    )
+    assert attempt.credential_envelope_ids
+    assert attempt.status == "failed"
+    assert attempt.provider_revocation_required is True
+    assert oauth_client.revocations == 1
+
+
+@pytest.mark.asyncio
+async def test_finalization_and_revocation_failure_remain_internal_and_durable() -> None:
     class FailedRevocationClient(FakeOAuthClient):
         async def revoke(
             self,
@@ -1578,10 +1796,9 @@ async def test_finalization_failure_revokes_or_persists_durable_obligation() -> 
     service, _, _, _, connection_store, _ = _service(oauth_client=oauth_client)
 
     def fail_finalization(**_kwargs):
-        connection_store.events.append("finalize")
         raise ProviderStoreError("provider_connection_conflict")
 
-    connection_store.finalize_connection = fail_finalization
+    connection_store.finalize_oauth_attempt = fail_finalization
     start = await service.start(
         _principal(),
         WORKSPACE_ID,
@@ -1601,12 +1818,18 @@ async def test_finalization_failure_revokes_or_persists_durable_obligation() -> 
         workspace_id=WORKSPACE_ID,
         auth_user_id=USER_ID,
     )
-    obligations = [item for item in summaries if item.provider_revocation_required]
-    assert len(obligations) == 1
-    assert obligations[0].readiness is ConnectionReadiness.DISCONNECTED
+    assert summaries == ()
     assert connection_store.store._envelopes == {}
+    assert len(connection_store.store._oauth_attempts) == 1
+    attempt = next(iter(connection_store.store._oauth_attempts.values()))
+    assert attempt.status == "failed"
+    assert attempt.provider_revocation_required is True
+    assert attempt.credential_envelope_ids
+    assert set(connection_store.store._oauth_attempt_envelopes) == set(
+        attempt.credential_envelope_ids
+    )
     assert oauth_client.revocations == 1
-    assert connection_store.events[-2:] == ["finalize", "disconnect"]
+    assert connection_store.events[-1] == "fail_attempt"
 
 
 @pytest.mark.asyncio
@@ -1761,12 +1984,16 @@ async def test_callback_rejects_wrong_user_expiry_and_provider_company_mismatch(
         workspace_id=WORKSPACE_ID,
         auth_user_id=USER_ID,
     )
-    assert len(mismatch_connections) == 1
-    assert mismatch_connections[0].readiness is ConnectionReadiness.DISCONNECTED
+    assert mismatch_connections == ()
     assert mismatch_store.store._envelopes == {}
     assert mismatch_oauth.revocations == 1
-    assert mismatch_connections[0].provider_revocation_required is False
-    assert mismatch_store.events[-2:] == ["disconnect", "complete_revocation"]
+    mismatch_attempt = next(iter(mismatch_store.store._oauth_attempts.values()))
+    assert mismatch_attempt.status == "revoked"
+    assert mismatch_attempt.provider_revocation_required is False
+    assert mismatch_store.events[-2:] == [
+        "fail_attempt",
+        "complete_attempt_revocation",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1809,10 +2036,16 @@ async def test_company_mismatch_cancellation_leaves_no_dispatchable_credential()
         workspace_id=WORKSPACE_ID,
         auth_user_id=USER_ID,
     )
-    assert connections[0].readiness is ConnectionReadiness.DISCONNECTED
-    assert connections[0].provider_revocation_required is True
+    assert connections == ()
+    attempt = next(iter(connection_store.store._oauth_attempts.values()))
+    assert attempt.status == "failed"
+    assert attempt.provider_revocation_required is True
     assert connection_store.store._envelopes == {}
-    assert connection_store.events[-1] == "disconnect"
+    assert attempt.credential_envelope_ids
+    assert set(connection_store.store._oauth_attempt_envelopes) == set(
+        attempt.credential_envelope_ids
+    )
+    assert connection_store.events[-1] == "fail_attempt"
 
     completion.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -1822,9 +2055,14 @@ async def test_company_mismatch_cancellation_leaves_no_dispatchable_credential()
         workspace_id=WORKSPACE_ID,
         auth_user_id=USER_ID,
     )
-    assert connections[0].provider_revocation_required is True
+    assert connections == ()
+    attempt = next(iter(connection_store.store._oauth_attempts.values()))
+    assert attempt.provider_revocation_required is True
     assert connection_store.store._envelopes == {}
-    assert "complete_revocation" not in connection_store.events
+    assert set(connection_store.store._oauth_attempt_envelopes) == set(
+        attempt.credential_envelope_ids
+    )
+    assert "complete_attempt_revocation" not in connection_store.events
 
 
 @pytest.mark.asyncio
@@ -1856,10 +2094,14 @@ async def test_retryable_validation_failure_has_zero_dispatchable_credential_ret
         workspace_id=WORKSPACE_ID,
         auth_user_id=USER_ID,
     )
-    assert len(connections) == 1
-    assert connections[0].readiness is ConnectionReadiness.DISCONNECTED
+    assert connections == ()
     assert connection_store.store._envelopes == {}
     assert oauth_client.revocations == 1
+    attempt = next(iter(connection_store.store._oauth_attempts.values()))
+    assert attempt.status == "revoked"
+    assert attempt.provider_revocation_required is False
+    assert attempt.credential_envelope_ids == ()
+    assert connection_store.store._oauth_attempt_envelopes == {}
 
 
 class CallbackService:

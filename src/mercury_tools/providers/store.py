@@ -7,7 +7,7 @@ import secrets
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -34,6 +34,15 @@ from mercury_tools.providers.models import (
 
 _TOKEN_HASH = re.compile(r"^[0-9a-f]{64}$")
 _MAX_ATTEMPT_LIFETIME = timedelta(minutes=10)
+_OAUTH_ATTEMPT_STATUSES = frozenset(
+    {
+        "exchange_pending",
+        "material_attached",
+        "finalized",
+        "failed",
+        "revoked",
+    }
+)
 _STORE_ERROR_CODES = frozenset(
     {
         "provider_connection_conflict",
@@ -77,6 +86,87 @@ class ProviderConnectionTarget:
             raise ProviderStoreError("provider_connection_invalid")
 
 
+@dataclass(frozen=True, repr=False)
+class ProviderOAuthAttempt:
+    """Internal recovery record for one consumed provider OAuth state."""
+
+    id: UUID
+    tenant_id: UUID
+    workspace_id: UUID
+    auth_user_id: UUID
+    provider: ProviderId
+    environment: str
+    granted_permissions: tuple[str, ...]
+    status: str
+    provider_account_id: str | None
+    account_display_name: str | None
+    authorization_method: AuthorizationMethod | None
+    credential_envelope_ids: tuple[UUID, ...]
+    target_connection_id: UUID | None
+    target_revision: int | None
+    provider_revocation_required: bool
+    created_at: datetime
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        if (
+            any(
+                value.int == 0
+                for value in (
+                    self.id,
+                    self.tenant_id,
+                    self.workspace_id,
+                    self.auth_user_id,
+                )
+            )
+            or self.status not in _OAUTH_ATTEMPT_STATUSES
+            or tuple(sorted(self.granted_permissions)) != self.granted_permissions
+            or len(set(self.granted_permissions)) != len(self.granted_permissions)
+            or not isinstance(self.provider_revocation_required, bool)
+            or self.created_at.tzinfo is None
+            or self.updated_at.tzinfo is None
+            or self.updated_at < self.created_at
+            or (self.target_connection_id is None and self.target_revision is not None)
+            or (
+                self.target_connection_id is not None
+                and (
+                    self.target_connection_id.int == 0
+                    or self.target_revision is None
+                    or self.target_revision < 1
+                )
+            )
+        ):
+            raise ProviderStoreError("provider_connection_invalid")
+
+
+@dataclass(frozen=True)
+class ProviderOAuthAttemptResult:
+    """Secretless result of an internal attempt transition."""
+
+    attempt_id: UUID
+    status: str
+    target_connection_id: UUID | None
+    target_revision: int | None
+    provider_revocation_required: bool
+
+    def __post_init__(self) -> None:
+        if (
+            self.attempt_id.int == 0
+            or self.status not in _OAUTH_ATTEMPT_STATUSES
+            or not isinstance(self.provider_revocation_required, bool)
+            or (self.target_connection_id is None and self.target_revision is not None)
+            or (
+                self.target_connection_id is not None
+                and (
+                    self.target_connection_id.int == 0
+                    or self.target_revision is None
+                    or self.target_revision < 1
+                )
+            )
+        ):
+            raise ProviderStoreError("provider_connection_invalid")
+
+
 class ProviderConnectionStore:
     """Reference store enforcing the same bindings as the narrow database RPCs."""
 
@@ -94,6 +184,8 @@ class ProviderConnectionStore:
         self._attempts: dict[UUID, SetupAttempt] = {}
         self._connections: dict[UUID, ProviderConnection] = {}
         self._envelopes: dict[UUID, CredentialEnvelope] = {}
+        self._oauth_attempts: dict[UUID, ProviderOAuthAttempt] = {}
+        self._oauth_attempt_envelopes: dict[UUID, CredentialEnvelope] = {}
 
     def __repr__(self) -> str:
         return "ProviderConnectionStore()"
@@ -187,6 +279,486 @@ class ProviderConnectionStore:
             )
             self._attempts[attempt.id] = consumed
             return consumed
+
+    def begin_oauth_attempt(
+        self,
+        *,
+        attempt_id: UUID,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+        granted_permissions: Sequence[str],
+    ) -> ProviderOAuthAttempt:
+        self._bound_ids(tenant_id, workspace_id, auth_user_id)
+        self._require_uuid(attempt_id)
+        checked_provider = self._provider(provider, "provider_connection_invalid")
+        permissions = self._permissions(granted_permissions)
+        now = self._timestamp()
+        attempt = ProviderOAuthAttempt(
+            id=attempt_id,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            auth_user_id=auth_user_id,
+            provider=checked_provider,
+            environment=environment,
+            granted_permissions=permissions,
+            status="exchange_pending",
+            provider_account_id=None,
+            account_display_name=None,
+            authorization_method=None,
+            credential_envelope_ids=(),
+            target_connection_id=None,
+            target_revision=None,
+            provider_revocation_required=True,
+            created_at=now,
+            updated_at=now,
+        )
+        with self._lock:
+            existing = self._oauth_attempts.get(attempt_id)
+            if existing is not None:
+                if not self._same_oauth_attempt_binding(existing, attempt):
+                    raise ProviderStoreError("provider_connection_conflict")
+                return existing
+            if attempt_id in self._connections:
+                raise ProviderStoreError("provider_connection_conflict")
+            self._oauth_attempts[attempt_id] = attempt
+            return attempt
+
+    def attach_oauth_attempt(
+        self,
+        *,
+        attempt_id: UUID,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+        company_or_merchant_id: str,
+        account_display_name: str,
+        authorization_method: AuthorizationMethod | str,
+        granted_permissions: Sequence[str],
+        readiness: ConnectionReadiness | str,
+        revision: int,
+        validated_at: datetime | None,
+        envelopes: Sequence[CredentialEnvelope],
+    ) -> ProviderConnection:
+        if (
+            readiness != ConnectionReadiness.REQUIRES_VALIDATION
+            or revision != 1
+            or validated_at is not None
+        ):
+            raise ProviderStoreError("provider_connection_invalid")
+        self._bound_ids(tenant_id, workspace_id, auth_user_id)
+        self._require_uuid(attempt_id)
+        checked_provider = self._provider(provider, "provider_connection_invalid")
+        permissions = self._permissions(granted_permissions)
+        try:
+            checked_method = AuthorizationMethod(authorization_method)
+        except (TypeError, ValueError):
+            raise ProviderStoreError("provider_connection_invalid") from None
+        checked_envelopes = self._validate_envelopes(
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            auth_user_id=auth_user_id,
+            connection_id=attempt_id,
+            provider=checked_provider,
+            environment=environment,
+            company_or_merchant_id=company_or_merchant_id,
+            envelopes=envelopes,
+        )
+        now = self._timestamp()
+        try:
+            provisional = ProviderConnection(
+                id=attempt_id,
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                auth_user_id=auth_user_id,
+                provider=checked_provider,
+                environment=environment,
+                provider_account_id=company_or_merchant_id,
+                account_display_name=account_display_name,
+                authorization_method=checked_method,
+                granted_permissions=permissions,
+                readiness=ConnectionReadiness.REQUIRES_VALIDATION,
+                revision=1,
+                last_validated_at=None,
+                credential_envelope_ids=tuple(item.id for item in checked_envelopes),
+                provider_revocation_required=True,
+                disconnected_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+        except (TypeError, ValueError, ValidationError):
+            raise ProviderStoreError("provider_connection_invalid") from None
+
+        with self._lock:
+            attempt = self._require_oauth_attempt(
+                attempt_id=attempt_id,
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                auth_user_id=auth_user_id,
+                provider=checked_provider,
+                environment=environment,
+            )
+            if attempt.granted_permissions != permissions:
+                raise ProviderStoreError("provider_connection_conflict")
+            if attempt.status == "material_attached":
+                stored = tuple(
+                    self._oauth_attempt_envelopes[envelope_id]
+                    for envelope_id in attempt.credential_envelope_ids
+                )
+                if (
+                    attempt.provider_account_id != company_or_merchant_id
+                    or attempt.account_display_name != account_display_name
+                    or attempt.authorization_method is not checked_method
+                    or stored != checked_envelopes
+                ):
+                    raise ProviderStoreError("provider_connection_conflict")
+                return provisional.model_copy(
+                    update={
+                        "created_at": attempt.created_at,
+                        "updated_at": attempt.updated_at,
+                    }
+                )
+            if attempt.status != "exchange_pending":
+                raise ProviderStoreError("provider_connection_conflict")
+            if any(
+                envelope.id in self._envelopes or envelope.id in self._oauth_attempt_envelopes
+                for envelope in checked_envelopes
+            ):
+                raise ProviderStoreError("provider_credential_binding_invalid")
+            for envelope in checked_envelopes:
+                self._oauth_attempt_envelopes[envelope.id] = envelope
+            updated = replace(
+                attempt,
+                status="material_attached",
+                provider_account_id=company_or_merchant_id,
+                account_display_name=account_display_name,
+                authorization_method=checked_method,
+                credential_envelope_ids=tuple(envelope.id for envelope in checked_envelopes),
+                updated_at=now,
+            )
+            self._oauth_attempts[attempt_id] = updated
+            return provisional.model_copy(
+                update={
+                    "created_at": attempt.created_at,
+                    "updated_at": now,
+                }
+            )
+
+    def load_runtime_envelopes(
+        self,
+        connection: ProviderConnection,
+    ) -> tuple[CredentialEnvelope, ...]:
+        try:
+            checked = ProviderConnection.model_validate(connection)
+        except (TypeError, ValueError, ValidationError):
+            raise ProviderStoreError("provider_connection_invalid") from None
+        with self._lock:
+            attempt = self._oauth_attempts.get(checked.id)
+            if attempt is not None:
+                if (
+                    attempt.status != "material_attached"
+                    or attempt.provider_account_id != checked.provider_account_id
+                    or attempt.credential_envelope_ids != checked.credential_envelope_ids
+                ):
+                    raise ProviderStoreError("provider_connection_invalid")
+                return tuple(
+                    self._oauth_attempt_envelopes[envelope_id]
+                    for envelope_id in attempt.credential_envelope_ids
+                )
+        return self.load_envelopes(checked)
+
+    def load_envelopes(
+        self,
+        connection: ProviderConnection,
+    ) -> tuple[CredentialEnvelope, ...]:
+        try:
+            checked = ProviderConnection.model_validate(connection)
+        except (TypeError, ValueError, ValidationError):
+            raise ProviderStoreError("provider_connection_invalid") from None
+        with self._lock:
+            current = self._connections.get(checked.id)
+            if current != checked or checked.readiness is ConnectionReadiness.DISCONNECTED:
+                raise ProviderStoreError("provider_connection_not_found")
+            try:
+                return tuple(
+                    self._envelopes[envelope_id] for envelope_id in checked.credential_envelope_ids
+                )
+            except KeyError:
+                raise ProviderStoreError("provider_credential_binding_invalid") from None
+
+    def finalize_oauth_attempt(
+        self,
+        *,
+        attempt_id: UUID,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        connection_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+        company_or_merchant_id: str,
+        account_display_name: str,
+        authorization_method: AuthorizationMethod | str,
+        granted_permissions: Sequence[str],
+        readiness: ConnectionReadiness | str,
+        revision: int,
+        validated_at: datetime | None,
+        envelopes: Sequence[CredentialEnvelope],
+    ) -> ProviderConnection:
+        if readiness != ConnectionReadiness.READY or attempt_id == connection_id:
+            raise ProviderStoreError("provider_connection_invalid")
+        self._bound_ids(tenant_id, workspace_id, auth_user_id)
+        self._require_uuid(attempt_id)
+        checked_provider = self._provider(provider, "provider_connection_invalid")
+        permissions = self._permissions(granted_permissions)
+        try:
+            checked_method = AuthorizationMethod(authorization_method)
+        except (TypeError, ValueError):
+            raise ProviderStoreError("provider_connection_invalid") from None
+        checked_envelopes = self._validate_envelopes(
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            auth_user_id=auth_user_id,
+            connection_id=connection_id,
+            provider=checked_provider,
+            environment=environment,
+            company_or_merchant_id=company_or_merchant_id,
+            envelopes=envelopes,
+        )
+
+        with self._lock:
+            attempt = self._require_oauth_attempt(
+                attempt_id=attempt_id,
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                auth_user_id=auth_user_id,
+                provider=checked_provider,
+                environment=environment,
+            )
+            if attempt.granted_permissions != permissions or attempt.status not in {
+                "material_attached",
+                "finalized",
+            }:
+                raise ProviderStoreError("provider_connection_conflict")
+            if attempt.status == "finalized":
+                current = self._connections.get(connection_id)
+                if (
+                    current is None
+                    or attempt.target_connection_id != connection_id
+                    or attempt.target_revision != revision
+                    or current.tenant_id != tenant_id
+                    or current.workspace_id != workspace_id
+                    or current.auth_user_id != auth_user_id
+                    or current.provider is not checked_provider
+                    or current.environment != environment
+                    or current.provider_account_id != company_or_merchant_id
+                    or current.account_display_name != account_display_name
+                    or current.authorization_method is not checked_method
+                    or current.granted_permissions != permissions
+                    or current.readiness is not ConnectionReadiness.READY
+                    or current.revision != revision
+                    or current.last_validated_at != validated_at
+                    or tuple(
+                        self._envelopes[envelope_id]
+                        for envelope_id in current.credential_envelope_ids
+                    )
+                    != checked_envelopes
+                ):
+                    raise ProviderStoreError("provider_connection_conflict")
+                return current
+
+            connections_before = dict(self._connections)
+            envelopes_before = dict(self._envelopes)
+            oauth_attempts_before = dict(self._oauth_attempts)
+            oauth_envelopes_before = dict(self._oauth_attempt_envelopes)
+            try:
+                finalized = self.save_connection(
+                    tenant_id=tenant_id,
+                    workspace_id=workspace_id,
+                    auth_user_id=auth_user_id,
+                    connection_id=connection_id,
+                    provider=checked_provider,
+                    environment=environment,
+                    company_or_merchant_id=company_or_merchant_id,
+                    account_display_name=account_display_name,
+                    authorization_method=authorization_method,
+                    granted_permissions=permissions,
+                    readiness=readiness,
+                    revision=revision,
+                    validated_at=validated_at,
+                    envelopes=checked_envelopes,
+                )
+                for envelope_id in attempt.credential_envelope_ids:
+                    self._oauth_attempt_envelopes.pop(envelope_id, None)
+                self._oauth_attempts[attempt_id] = replace(
+                    attempt,
+                    status="finalized",
+                    credential_envelope_ids=(),
+                    target_connection_id=connection_id,
+                    target_revision=revision,
+                    provider_revocation_required=False,
+                    updated_at=self._timestamp(),
+                )
+                return finalized
+            except BaseException:
+                self._connections = connections_before
+                self._envelopes = envelopes_before
+                self._oauth_attempts = oauth_attempts_before
+                self._oauth_attempt_envelopes = oauth_envelopes_before
+                raise
+
+    def fail_oauth_attempt(
+        self,
+        *,
+        attempt_id: UUID,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+    ) -> ProviderOAuthAttempt:
+        checked_provider = self._provider(provider, "provider_connection_invalid")
+        with self._lock:
+            attempt = self._require_oauth_attempt(
+                attempt_id=attempt_id,
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                auth_user_id=auth_user_id,
+                provider=checked_provider,
+                environment=environment,
+            )
+            if attempt.status == "failed":
+                return attempt
+            if attempt.status == "revoked":
+                raise ProviderStoreError("provider_connection_conflict")
+
+            connections_before = dict(self._connections)
+            envelopes_before = dict(self._envelopes)
+            oauth_attempts_before = dict(self._oauth_attempts)
+            oauth_envelopes_before = dict(self._oauth_attempt_envelopes)
+            try:
+                target_revision = attempt.target_revision
+                retained_envelope_ids = attempt.credential_envelope_ids
+                provider_account_id = attempt.provider_account_id
+                account_display_name = attempt.account_display_name
+                authorization_method = attempt.authorization_method
+                if attempt.target_connection_id is not None:
+                    target = self._connections.get(attempt.target_connection_id)
+                    if (
+                        target is None
+                        or target.tenant_id != tenant_id
+                        or target.workspace_id != workspace_id
+                        or target.auth_user_id != auth_user_id
+                        or target.provider is not checked_provider
+                        or target.environment != environment
+                        or target.readiness is not ConnectionReadiness.READY
+                        or target.revision != attempt.target_revision
+                        or target.provider_revocation_required
+                        or not target.credential_envelope_ids
+                    ):
+                        raise ProviderStoreError("provider_connection_conflict")
+                    try:
+                        recovery_envelopes = tuple(
+                            self._envelopes[envelope_id]
+                            for envelope_id in target.credential_envelope_ids
+                        )
+                    except KeyError:
+                        raise ProviderStoreError("provider_credential_binding_invalid") from None
+                    if any(
+                        envelope.id in self._oauth_attempt_envelopes
+                        and self._oauth_attempt_envelopes[envelope.id] != envelope
+                        for envelope in recovery_envelopes
+                    ):
+                        raise ProviderStoreError("provider_credential_binding_invalid")
+                    for envelope in recovery_envelopes:
+                        self._oauth_attempt_envelopes[envelope.id] = envelope
+                    retained_envelope_ids = target.credential_envelope_ids
+                    provider_account_id = target.provider_account_id
+                    account_display_name = target.account_display_name
+                    authorization_method = target.authorization_method
+                    disconnected = self.disconnect(
+                        tenant_id=tenant_id,
+                        workspace_id=workspace_id,
+                        auth_user_id=auth_user_id,
+                        connection_id=attempt.target_connection_id,
+                        provider_revocation_required=True,
+                    )
+                    target_revision = disconnected.revision
+                failed = replace(
+                    attempt,
+                    status="failed",
+                    provider_account_id=provider_account_id,
+                    account_display_name=account_display_name,
+                    authorization_method=authorization_method,
+                    credential_envelope_ids=retained_envelope_ids,
+                    target_revision=target_revision,
+                    provider_revocation_required=True,
+                    updated_at=self._timestamp(),
+                )
+                self._oauth_attempts[attempt_id] = failed
+                return failed
+            except BaseException:
+                self._connections = connections_before
+                self._envelopes = envelopes_before
+                self._oauth_attempts = oauth_attempts_before
+                self._oauth_attempt_envelopes = oauth_envelopes_before
+                raise
+
+    def complete_oauth_attempt_revocation(
+        self,
+        *,
+        attempt_id: UUID,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+    ) -> ProviderOAuthAttempt:
+        checked_provider = self._provider(provider, "provider_connection_invalid")
+        with self._lock:
+            attempt = self._require_oauth_attempt(
+                attempt_id=attempt_id,
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                auth_user_id=auth_user_id,
+                provider=checked_provider,
+                environment=environment,
+            )
+            if attempt.status == "revoked":
+                return attempt
+            if attempt.status != "failed" or not attempt.provider_revocation_required:
+                raise ProviderStoreError("provider_connection_conflict")
+            connections_before = dict(self._connections)
+            oauth_attempts_before = dict(self._oauth_attempts)
+            oauth_envelopes_before = dict(self._oauth_attempt_envelopes)
+            try:
+                if attempt.target_connection_id is not None:
+                    self.complete_revocation(
+                        tenant_id=tenant_id,
+                        workspace_id=workspace_id,
+                        auth_user_id=auth_user_id,
+                        connection_id=attempt.target_connection_id,
+                    )
+                for envelope_id in attempt.credential_envelope_ids:
+                    self._oauth_attempt_envelopes.pop(envelope_id, None)
+                completed = replace(
+                    attempt,
+                    status="revoked",
+                    credential_envelope_ids=(),
+                    provider_revocation_required=False,
+                    updated_at=self._timestamp(),
+                )
+                self._oauth_attempts[attempt_id] = completed
+                return completed
+            except BaseException:
+                self._connections = connections_before
+                self._oauth_attempts = oauth_attempts_before
+                self._oauth_attempt_envelopes = oauth_envelopes_before
+                raise
 
     def save_connection(
         self,
@@ -784,6 +1356,62 @@ class ProviderConnectionStore:
             raise ProviderStoreError(error_code) from None
 
     @staticmethod
+    def _permissions(value: Sequence[str]) -> tuple[str, ...]:
+        if isinstance(value, (str, bytes, bytearray)):
+            raise ProviderStoreError("provider_connection_invalid")
+        try:
+            supplied = tuple(value)
+        except TypeError:
+            raise ProviderStoreError("provider_connection_invalid") from None
+        if (
+            not supplied
+            or any(not isinstance(item, str) for item in supplied)
+            or tuple(sorted(supplied)) != supplied
+            or len(supplied) != len(set(supplied))
+        ):
+            raise ProviderStoreError("provider_connection_invalid")
+        return supplied
+
+    def _require_oauth_attempt(
+        self,
+        *,
+        attempt_id: UUID,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        provider: ProviderId,
+        environment: str,
+    ) -> ProviderOAuthAttempt:
+        self._bound_ids(tenant_id, workspace_id, auth_user_id)
+        self._require_uuid(attempt_id)
+        attempt = self._oauth_attempts.get(attempt_id)
+        if (
+            attempt is None
+            or attempt.tenant_id != tenant_id
+            or attempt.workspace_id != workspace_id
+            or attempt.auth_user_id != auth_user_id
+            or attempt.provider is not provider
+            or attempt.environment != environment
+        ):
+            raise ProviderStoreError("provider_connection_not_found")
+        return attempt
+
+    @staticmethod
+    def _same_oauth_attempt_binding(
+        left: ProviderOAuthAttempt,
+        right: ProviderOAuthAttempt,
+    ) -> bool:
+        return (
+            left.id == right.id
+            and left.tenant_id == right.tenant_id
+            and left.workspace_id == right.workspace_id
+            and left.auth_user_id == right.auth_user_id
+            and left.provider is right.provider
+            and left.environment == right.environment
+            and left.granted_permissions == right.granted_permissions
+        )
+
+    @staticmethod
     def _attempt_values(attempt: SetupAttempt) -> dict[str, object]:
         return {
             field_name: getattr(attempt, field_name) for field_name in type(attempt).model_fields
@@ -852,6 +1480,303 @@ class SupabaseProviderConnectionStore:
 
     def __repr__(self) -> str:
         return "SupabaseProviderConnectionStore()"
+
+    def begin_oauth_attempt(
+        self,
+        *,
+        attempt_id: UUID,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+        granted_permissions: Sequence[str],
+    ) -> ProviderOAuthAttempt:
+        try:
+            ProviderConnectionStore._bound_ids(
+                tenant_id,
+                workspace_id,
+                auth_user_id,
+            )
+            ProviderConnectionStore._require_uuid(attempt_id)
+            checked_provider = ProviderId(provider)
+            permissions = ProviderConnectionStore._permissions(granted_permissions)
+            row = self._rpc_one(
+                "begin_mercury_provider_oauth_attempt",
+                {
+                    "p_attempt_id": str(attempt_id),
+                    "p_tenant_id": str(tenant_id),
+                    "p_workspace_id": str(workspace_id),
+                    "p_auth_user_id": str(auth_user_id),
+                    "p_provider": checked_provider.value,
+                    "p_environment": environment,
+                    "p_granted_permissions": list(permissions),
+                },
+            )
+            result = self._oauth_attempt_result(
+                row,
+                attempt_id=attempt_id,
+                expected_status="exchange_pending",
+            )
+            if result.target_connection_id is not None or not result.provider_revocation_required:
+                raise ValueError
+            created_at = _rpc_timestamp(row["created_at"])
+            updated_at = _rpc_timestamp(row["updated_at"])
+            return ProviderOAuthAttempt(
+                id=attempt_id,
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                auth_user_id=auth_user_id,
+                provider=checked_provider,
+                environment=environment,
+                granted_permissions=permissions,
+                status=result.status,
+                provider_account_id=None,
+                account_display_name=None,
+                authorization_method=None,
+                credential_envelope_ids=(),
+                target_connection_id=None,
+                target_revision=None,
+                provider_revocation_required=True,
+                created_at=created_at,
+                updated_at=updated_at,
+            )
+        except ProviderStoreError:
+            raise
+        except Exception:
+            raise ProviderStoreError("provider_connection_invalid") from None
+
+    def attach_oauth_attempt(
+        self,
+        *,
+        attempt_id: UUID,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+        company_or_merchant_id: str,
+        account_display_name: str,
+        authorization_method: AuthorizationMethod | str,
+        granted_permissions: Sequence[str],
+        readiness: ConnectionReadiness | str,
+        revision: int,
+        validated_at: datetime | None,
+        envelopes: Sequence[CredentialEnvelope],
+    ) -> ProviderConnection:
+        if (
+            readiness != ConnectionReadiness.REQUIRES_VALIDATION
+            or revision != 1
+            or validated_at is not None
+            or attempt_id == UUID(int=0)
+        ):
+            raise ProviderStoreError("provider_connection_invalid")
+        checked = self._validated_connection(
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            auth_user_id=auth_user_id,
+            connection_id=attempt_id,
+            provider=provider,
+            environment=environment,
+            company_or_merchant_id=company_or_merchant_id,
+            account_display_name=account_display_name,
+            authorization_method=authorization_method,
+            granted_permissions=granted_permissions,
+            readiness=readiness,
+            revision=revision,
+            validated_at=validated_at,
+            envelopes=envelopes,
+        )
+        row = self._rpc_one(
+            "attach_mercury_provider_oauth_attempt",
+            {
+                "p_attempt_id": str(attempt_id),
+                "p_tenant_id": str(checked.tenant_id),
+                "p_workspace_id": str(checked.workspace_id),
+                "p_auth_user_id": str(checked.auth_user_id),
+                "p_provider": checked.provider.value,
+                "p_environment": checked.environment,
+                "p_provider_account_id": checked.provider_account_id,
+                "p_account_display_name": checked.account_display_name,
+                "p_authorization_method": checked.authorization_method.value,
+                "p_granted_permissions": list(checked.granted_permissions),
+                "p_readiness": checked.readiness.value,
+                "p_revision": checked.revision,
+                "p_last_validated_at": None,
+                "p_envelopes": [self._envelope_payload(envelope) for envelope in envelopes],
+            },
+        )
+        result = self._oauth_attempt_result(
+            row,
+            attempt_id=attempt_id,
+            expected_status="material_attached",
+        )
+        if result.target_connection_id is not None or not result.provider_revocation_required:
+            raise ProviderStoreError("provider_connection_invalid")
+        return checked.model_copy(
+            update={
+                "provider_revocation_required": True,
+                "created_at": _rpc_timestamp(row["created_at"]),
+                "updated_at": _rpc_timestamp(row["updated_at"]),
+            }
+        )
+
+    def load_runtime_envelopes(
+        self,
+        connection: ProviderConnection,
+    ) -> tuple[CredentialEnvelope, ...]:
+        try:
+            checked = ProviderConnection.model_validate(connection)
+        except (TypeError, ValueError, ValidationError):
+            raise ProviderStoreError("provider_connection_invalid") from None
+        if (
+            checked.provider is ProviderId.FLOWACCOUNT
+            and checked.readiness is ConnectionReadiness.REQUIRES_VALIDATION
+            and checked.provider_account_id == f"oauth-pending-{checked.id}"
+        ):
+            rows = self._rpc_rows(
+                "load_mercury_provider_oauth_attempt_envelopes",
+                {
+                    "p_attempt_id": str(checked.id),
+                    "p_tenant_id": str(checked.tenant_id),
+                    "p_workspace_id": str(checked.workspace_id),
+                    "p_auth_user_id": str(checked.auth_user_id),
+                    "p_provider": checked.provider.value,
+                    "p_environment": checked.environment,
+                },
+            )
+            try:
+                envelopes = tuple(self._envelope_from_row(row) for row in rows)
+                self._validate_envelopes(
+                    connection=checked,
+                    envelopes=envelopes,
+                )
+                if tuple(envelope.id for envelope in envelopes) != checked.credential_envelope_ids:
+                    raise ValueError
+                return envelopes
+            except ProviderStoreError:
+                raise
+            except Exception:
+                raise ProviderStoreError("provider_credential_binding_invalid") from None
+        return self.load_envelopes(checked)
+
+    def finalize_oauth_attempt(
+        self,
+        *,
+        attempt_id: UUID,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        connection_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+        company_or_merchant_id: str,
+        account_display_name: str,
+        authorization_method: AuthorizationMethod | str,
+        granted_permissions: Sequence[str],
+        readiness: ConnectionReadiness | str,
+        revision: int,
+        validated_at: datetime | None,
+        envelopes: Sequence[CredentialEnvelope],
+    ) -> ProviderConnection:
+        if readiness != ConnectionReadiness.READY or attempt_id == connection_id:
+            raise ProviderStoreError("provider_connection_invalid")
+        return self._persist_connection(
+            function="finalize_mercury_provider_oauth_attempt",
+            expected_revocation_required=False,
+            extra_payload={"p_attempt_id": str(attempt_id)},
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            auth_user_id=auth_user_id,
+            connection_id=connection_id,
+            provider=provider,
+            environment=environment,
+            company_or_merchant_id=company_or_merchant_id,
+            account_display_name=account_display_name,
+            authorization_method=authorization_method,
+            granted_permissions=granted_permissions,
+            readiness=readiness,
+            revision=revision,
+            validated_at=validated_at,
+            envelopes=envelopes,
+        )
+
+    def fail_oauth_attempt(
+        self,
+        *,
+        attempt_id: UUID,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+    ) -> ProviderOAuthAttemptResult:
+        return self._oauth_attempt_transition(
+            function="fail_mercury_provider_oauth_attempt",
+            expected_status="failed",
+            attempt_id=attempt_id,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            auth_user_id=auth_user_id,
+            provider=provider,
+            environment=environment,
+        )
+
+    def complete_oauth_attempt_revocation(
+        self,
+        *,
+        attempt_id: UUID,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+    ) -> ProviderOAuthAttemptResult:
+        return self._oauth_attempt_transition(
+            function="complete_mercury_provider_oauth_attempt_revocation",
+            expected_status="revoked",
+            attempt_id=attempt_id,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            auth_user_id=auth_user_id,
+            provider=provider,
+            environment=environment,
+        )
+
+    def _oauth_attempt_transition(
+        self,
+        *,
+        function: str,
+        expected_status: str,
+        attempt_id: UUID,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        provider: ProviderId | str,
+        environment: str,
+    ) -> ProviderOAuthAttemptResult:
+        try:
+            checked_provider = ProviderId(provider)
+            row = self._rpc_one(
+                function,
+                {
+                    "p_attempt_id": str(attempt_id),
+                    "p_tenant_id": str(tenant_id),
+                    "p_workspace_id": str(workspace_id),
+                    "p_auth_user_id": str(auth_user_id),
+                    "p_provider": checked_provider.value,
+                    "p_environment": environment,
+                },
+            )
+            return self._oauth_attempt_result(
+                row,
+                attempt_id=attempt_id,
+                expected_status=expected_status,
+            )
+        except ProviderStoreError:
+            raise
+        except Exception:
+            raise ProviderStoreError("provider_connection_invalid") from None
 
     def save_connection(
         self,
@@ -1406,6 +2331,30 @@ class SupabaseProviderConnectionStore:
                 revision=row["revision"],
             )
             if result.connection_id != connection_id or row.get("status") != "disconnected":
+                raise ValueError
+            return result
+        except Exception:
+            raise ProviderStoreError("provider_connection_invalid") from None
+
+    @staticmethod
+    def _oauth_attempt_result(
+        row: Mapping[str, Any],
+        *,
+        attempt_id: UUID,
+        expected_status: str,
+    ) -> ProviderOAuthAttemptResult:
+        try:
+            target_value = row.get("target_connection_id")
+            result = ProviderOAuthAttemptResult(
+                attempt_id=UUID(str(row["attempt_id"])),
+                status=row["status"],
+                target_connection_id=(
+                    UUID(str(target_value)) if target_value is not None else None
+                ),
+                target_revision=row.get("target_revision"),
+                provider_revocation_required=row["provider_revocation_required"],
+            )
+            if result.attempt_id != attempt_id or result.status != expected_status:
                 raise ValueError
             return result
         except Exception:

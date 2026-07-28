@@ -450,11 +450,219 @@ def test_supabase_reconnect_store_uses_exact_atomic_rpc_bindings() -> None:
         assert payload["p_auth_user_id"] == str(USER_ID)
 
 
-def test_production_composition_fails_closed_without_reviewed_origins() -> None:
-    class Resolver:
-        async def resolve(self, _token: str):
-            raise AssertionError
+def test_supabase_oauth_attempt_store_uses_stable_attempt_rpc_bindings() -> None:
+    requests: list[tuple[str, dict[str, object]]] = []
+    pending_account_id = f"oauth-pending-{STAGED_CONNECTION_ID}"
+    attempt_envelopes = _envelopes(
+        connection_id=STAGED_CONNECTION_ID,
+        account_id=pending_account_id,
+    )
+    exact_envelopes = _envelopes()
 
+    def attempt_row(
+        status: str,
+        *,
+        revocation_required: bool,
+        target_connection_id: UUID | None = None,
+        target_revision: int | None = None,
+    ) -> dict[str, object]:
+        return {
+            "attempt_id": str(STAGED_CONNECTION_ID),
+            "status": status,
+            "provider_revocation_required": revocation_required,
+            "target_connection_id": (
+                str(target_connection_id) if target_connection_id is not None else None
+            ),
+            "target_revision": target_revision,
+            "created_at": NOW.isoformat(),
+            "updated_at": NOW.isoformat(),
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        function = request.url.path.rsplit("/", 1)[-1]
+        requests.append((function, payload))
+        if function == "begin_mercury_provider_oauth_attempt":
+            return httpx.Response(
+                200,
+                json=[
+                    attempt_row(
+                        "exchange_pending",
+                        revocation_required=True,
+                    )
+                ],
+            )
+        if function == "attach_mercury_provider_oauth_attempt":
+            return httpx.Response(
+                200,
+                json=[
+                    attempt_row(
+                        "material_attached",
+                        revocation_required=True,
+                    )
+                ],
+            )
+        if function == "load_mercury_provider_oauth_attempt_envelopes":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        **envelope.model_dump(mode="json"),
+                        "id": str(envelope.id),
+                        "tenant_id": str(envelope.tenant_id),
+                        "workspace_id": str(envelope.workspace_id),
+                        "auth_user_id": str(envelope.auth_user_id),
+                        "connection_id": str(envelope.connection_id),
+                        "nonce": f"\\x{envelope.nonce.hex()}",
+                        "ciphertext": f"\\x{envelope.ciphertext.hex()}",
+                        "aad_hash": f"\\x{envelope.aad_hash.hex()}",
+                    }
+                    for envelope in attempt_envelopes
+                ],
+            )
+        if function == "resolve_mercury_provider_connection_target":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "connection_id": str(CONNECTION_ID),
+                        "revision": 3,
+                        "reuses_existing": True,
+                    }
+                ],
+            )
+        if function == "finalize_mercury_provider_oauth_attempt":
+            return httpx.Response(200, json=[_save_row(revision=3)])
+        if function == "fail_mercury_provider_oauth_attempt":
+            return httpx.Response(
+                200,
+                json=[
+                    attempt_row(
+                        "failed",
+                        revocation_required=True,
+                        target_connection_id=CONNECTION_ID,
+                        target_revision=4,
+                    )
+                ],
+            )
+        if function == "complete_mercury_provider_oauth_attempt_revocation":
+            return httpx.Response(
+                200,
+                json=[
+                    attempt_row(
+                        "revoked",
+                        revocation_required=False,
+                        target_connection_id=CONNECTION_ID,
+                        target_revision=4,
+                    )
+                ],
+            )
+        return httpx.Response(404)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        store = SupabaseProviderConnectionStore(
+            settings=_settings(),
+            vault=_vault(),
+            http_client=client,
+        )
+        attempt = store.begin_oauth_attempt(
+            attempt_id=STAGED_CONNECTION_ID,
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=USER_ID,
+            provider=ProviderId.FLOWACCOUNT,
+            environment="sandbox",
+            granted_permissions=("documents.read", "profile.read"),
+        )
+        provisional = store.attach_oauth_attempt(
+            attempt_id=STAGED_CONNECTION_ID,
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=USER_ID,
+            provider=ProviderId.FLOWACCOUNT,
+            environment="sandbox",
+            company_or_merchant_id=pending_account_id,
+            account_display_name="FlowAccount",
+            authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+            granted_permissions=("documents.read", "profile.read"),
+            readiness=ConnectionReadiness.REQUIRES_VALIDATION,
+            revision=1,
+            validated_at=None,
+            envelopes=attempt_envelopes,
+        )
+        loaded = store.load_runtime_envelopes(provisional)
+        target = store.resolve_connection_target(
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=USER_ID,
+            provider=ProviderId.FLOWACCOUNT,
+            environment="sandbox",
+            company_or_merchant_id="company-123",
+            proposed_connection_id=PROPOSED_CONNECTION_ID,
+        )
+        finalized = store.finalize_oauth_attempt(
+            attempt_id=STAGED_CONNECTION_ID,
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=USER_ID,
+            connection_id=target.connection_id,
+            provider=ProviderId.FLOWACCOUNT,
+            environment="sandbox",
+            company_or_merchant_id="company-123",
+            account_display_name="FlowAccount Test Company",
+            authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+            granted_permissions=("documents.read", "profile.read"),
+            readiness=ConnectionReadiness.READY,
+            revision=target.revision,
+            validated_at=NOW,
+            envelopes=exact_envelopes,
+        )
+        failed = store.fail_oauth_attempt(
+            attempt_id=STAGED_CONNECTION_ID,
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=USER_ID,
+            provider=ProviderId.FLOWACCOUNT,
+            environment="sandbox",
+        )
+        revoked = store.complete_oauth_attempt_revocation(
+            attempt_id=STAGED_CONNECTION_ID,
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=USER_ID,
+            provider=ProviderId.FLOWACCOUNT,
+            environment="sandbox",
+        )
+
+    assert attempt.status == "exchange_pending"
+    assert provisional.id == STAGED_CONNECTION_ID
+    assert loaded == attempt_envelopes
+    assert finalized.id == CONNECTION_ID
+    assert failed.status == "failed"
+    assert failed.target_connection_id == CONNECTION_ID
+    assert revoked.status == "revoked"
+    assert revoked.provider_revocation_required is False
+    assert [function for function, _payload in requests] == [
+        "begin_mercury_provider_oauth_attempt",
+        "attach_mercury_provider_oauth_attempt",
+        "load_mercury_provider_oauth_attempt_envelopes",
+        "resolve_mercury_provider_connection_target",
+        "finalize_mercury_provider_oauth_attempt",
+        "fail_mercury_provider_oauth_attempt",
+        "complete_mercury_provider_oauth_attempt_revocation",
+    ]
+    for _function, payload in requests:
+        assert payload["p_tenant_id"] == str(TENANT_ID)
+        assert payload["p_workspace_id"] == str(WORKSPACE_ID)
+        assert payload["p_auth_user_id"] == str(USER_ID)
+    for index in (0, 1, 2, 4, 5, 6):
+        assert requests[index][1]["p_attempt_id"] == str(STAGED_CONNECTION_ID)
+    serialized = json.dumps(requests)
+    assert "ACCESS_TOKEN_SENTINEL" not in serialized
+    assert "REFRESH_TOKEN_SENTINEL" not in serialized
+
+
+def test_production_composition_fails_closed_without_reviewed_origins() -> None:
     settings = _settings(
         flowaccount_oauth_sandbox_authorization_server_origin="",
     )
@@ -462,10 +670,7 @@ def test_production_composition_fails_closed_without_reviewed_origins() -> None:
         V1ConfigurationError,
         match="v1_flowaccount_authorization_server_origin_missing",
     ):
-        build_provider_oauth_production_composition(
-            settings=settings,
-            principal_resolver=Resolver(),
-        )
+        build_provider_oauth_production_composition(settings=settings)
 
     rendered = repr(settings)
     assert "SERVICE_ROLE_SENTINEL" not in rendered

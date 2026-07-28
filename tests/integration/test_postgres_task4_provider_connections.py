@@ -22,6 +22,7 @@ MIGRATIONS = (
     ROOT / "supabase/migrations/20260726102000_mercury_v1_credential_vault.sql",
     ROOT / "supabase/migrations/20260727100000_mercury_v1_provider_oauth_cleanup.sql",
     ROOT / "supabase/migrations/20260728100000_mercury_v1_provider_oauth_reconnect.sql",
+    ROOT / "supabase/migrations/20260728110000_mercury_v1_provider_oauth_attempts.sql",
 )
 AUTH_USER_ID = UUID("33333333-3333-4333-8333-333333333333")
 OTHER_AUTH_USER_ID = UUID("44444444-4444-4444-8444-444444444444")
@@ -1340,3 +1341,447 @@ def test_oauth_finalize_atomically_reuses_disconnected_id_and_preserves_failed_s
         "envelopes": [],
         "persisted_envelopes": 0,
     }
+
+
+def test_internal_oauth_attempts_reconcile_finalize_and_never_create_public_ghosts(
+    postgres_context: PostgresContext,
+) -> None:
+    def begin_sql(attempt_id: UUID) -> str:
+        return f"""
+          select pg_catalog.row_to_json(attempt)::pg_catalog.text
+          from public.begin_mercury_provider_oauth_attempt(
+            '{attempt_id}',
+            '{postgres_context.tenant_id}',
+            '{postgres_context.workspace_id}',
+            '{AUTH_USER_ID}',
+            'flowaccount',
+            'sandbox',
+            '["documents.read","profile.read"]'::pg_catalog.jsonb
+          ) as attempt;
+        """
+
+    def attach_sql(attempt_id: UUID, envelope_id: UUID) -> str:
+        return f"""
+          select pg_catalog.row_to_json(attempt)::pg_catalog.text
+          from public.attach_mercury_provider_oauth_attempt(
+            '{attempt_id}',
+            '{postgres_context.tenant_id}',
+            '{postgres_context.workspace_id}',
+            '{AUTH_USER_ID}',
+            'flowaccount',
+            'sandbox',
+            'oauth-pending-{attempt_id}',
+            'FlowAccount',
+            'oauth2_pkce',
+            '["documents.read","profile.read"]'::pg_catalog.jsonb,
+            'requires_validation',
+            1,
+            null,
+            pg_catalog.jsonb_build_array(
+              pg_catalog.jsonb_build_object(
+                'id', '{envelope_id}',
+                'credential_type', 'access_token',
+                'key_version', 'v1',
+                'nonce', pg_catalog.repeat('ab', 12),
+                'ciphertext', pg_catalog.repeat('cd', 16),
+                'aad_hash', pg_catalog.repeat('ef', 32),
+                'created_at', '2026-07-28T00:00:00+00:00',
+                'rotated_at', null,
+                'revoked_at', null
+              )
+            )
+          ) as attempt;
+        """
+
+    def resolve_sql(account_id: str, proposed_id: UUID) -> str:
+        return f"""
+          select pg_catalog.row_to_json(target)::pg_catalog.text
+          from public.resolve_mercury_provider_connection_target(
+            '{postgres_context.tenant_id}',
+            '{postgres_context.workspace_id}',
+            '{AUTH_USER_ID}',
+            'flowaccount',
+            'sandbox',
+            '{account_id}',
+            '{proposed_id}'
+          ) as target;
+        """
+
+    def finalize_sql(
+        attempt_id: UUID,
+        target_id: UUID,
+        account_id: str,
+        revision: int,
+        envelope_id: UUID,
+    ) -> str:
+        return f"""
+          select pg_catalog.row_to_json(finalized)::pg_catalog.text
+          from public.finalize_mercury_provider_oauth_attempt(
+            '{attempt_id}',
+            '{target_id}',
+            '{postgres_context.tenant_id}',
+            '{postgres_context.workspace_id}',
+            '{AUTH_USER_ID}',
+            'flowaccount',
+            'sandbox',
+            '{account_id}',
+            'FlowAccount Test Company',
+            'oauth2_pkce',
+            '["documents.read","profile.read"]'::pg_catalog.jsonb,
+            'ready',
+            {revision},
+            '2026-07-28T00:05:00+00:00'::pg_catalog.timestamptz,
+            pg_catalog.jsonb_build_array(
+              pg_catalog.jsonb_build_object(
+                'id', '{envelope_id}',
+                'credential_type', 'access_token',
+                'key_version', 'v1',
+                'nonce', pg_catalog.repeat('ab', 12),
+                'ciphertext', pg_catalog.repeat('cd', 16),
+                'aad_hash', pg_catalog.repeat('ef', 32),
+                'created_at', '2026-07-28T00:00:00+00:00',
+                'rotated_at', null,
+                'revoked_at', null
+              )
+            )
+          ) as finalized;
+        """
+
+    def transition_sql(function: str, attempt_id: UUID) -> str:
+        return f"""
+          select pg_catalog.row_to_json(attempt)::pg_catalog.text
+          from public.{function}(
+            '{attempt_id}',
+            '{postgres_context.tenant_id}',
+            '{postgres_context.workspace_id}',
+            '{AUTH_USER_ID}',
+            'flowaccount',
+            'sandbox'
+          ) as attempt;
+        """
+
+    def visible_count() -> int:
+        return int(
+            _psql(
+                postgres_context.container,
+                _authenticated(
+                    f"""
+                    select pg_catalog.count(*)
+                    from public.list_mercury_provider_connections(
+                      '{postgres_context.tenant_id}',
+                      '{postgres_context.workspace_id}',
+                      '{AUTH_USER_ID}'
+                    );
+                    """
+                ),
+            )
+        )
+
+    def public_attempt_artifact_count(*attempt_ids: UUID) -> int:
+        ids = ", ".join(f"'{attempt_id}'::pg_catalog.uuid" for attempt_id in attempt_ids)
+        account_ids = ", ".join(
+            f"'oauth-pending-{attempt_id}'::pg_catalog.text" for attempt_id in attempt_ids
+        )
+        return int(
+            _psql(
+                postgres_context.container,
+                _service(
+                    f"""
+                    select pg_catalog.count(*)
+                    from public.mercury_provider_connections
+                    where id in ({ids})
+                      or provider_account_id in ({account_ids});
+                    """
+                ),
+            )
+        )
+
+    baseline_visible_count = visible_count()
+    account_id = f"internal-attempt-{uuid4()}"
+    first_attempt_id = uuid4()
+    _psql(
+        postgres_context.container,
+        _service(begin_sql(first_attempt_id)),
+    )
+    attached = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(attach_sql(first_attempt_id, uuid4())),
+        )
+    )
+    assert attached["status"] == "material_attached"
+    loaded_attempt_material = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(
+                f"""
+                select pg_catalog.json_build_object(
+                  'count', pg_catalog.count(*),
+                  'connection_ids', pg_catalog.json_agg(connection_id)
+                )::pg_catalog.text
+                from public.load_mercury_provider_oauth_attempt_envelopes(
+                  '{first_attempt_id}',
+                  '{postgres_context.tenant_id}',
+                  '{postgres_context.workspace_id}',
+                  '{AUTH_USER_ID}',
+                  'flowaccount',
+                  'sandbox'
+                );
+                """
+            ),
+        )
+    )
+    assert loaded_attempt_material == {
+        "count": 1,
+        "connection_ids": [str(first_attempt_id)],
+    }
+    assert visible_count() == baseline_visible_count
+
+    first_target = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(resolve_sql(account_id, uuid4())),
+        )
+    )
+    target_id = UUID(first_target["connection_id"])
+    target_revision = int(first_target["revision"])
+    final_envelope_id = uuid4()
+    first_finalize = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(
+                finalize_sql(
+                    first_attempt_id,
+                    target_id,
+                    account_id,
+                    target_revision,
+                    final_envelope_id,
+                )
+            ),
+        )
+    )
+    reconciled_finalize = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(
+                finalize_sql(
+                    first_attempt_id,
+                    target_id,
+                    account_id,
+                    target_revision,
+                    final_envelope_id,
+                )
+            ),
+        )
+    )
+
+    assert first_finalize == reconciled_finalize
+    assert first_finalize["readiness"] == "ready"
+    assert visible_count() == baseline_visible_count + 1
+    assert public_attempt_artifact_count(first_attempt_id) == 0
+
+    failed = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(
+                transition_sql(
+                    "fail_mercury_provider_oauth_attempt",
+                    first_attempt_id,
+                )
+            ),
+        )
+    )
+    target_after_failure = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(
+                f"""
+                select pg_catalog.json_build_object(
+                  'readiness', readiness,
+                  'revocation', provider_revocation_required,
+                  'envelopes', credential_envelope_ids
+                )::pg_catalog.text
+                from public.mercury_provider_connections
+                where id = '{target_id}';
+                """
+            ),
+        )
+    )
+    finalized_attempt_material_count = int(
+        _psql(
+            postgres_context.container,
+            _service(
+                f"""
+                select pg_catalog.jsonb_array_length(credential_envelopes)
+                from public.mercury_provider_oauth_attempts
+                where id = '{first_attempt_id}';
+                """
+            ),
+        )
+    )
+    finalized_remediation_material = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(
+                f"""
+                select pg_catalog.json_build_object(
+                  'count', pg_catalog.count(*),
+                  'connection_ids', pg_catalog.json_agg(connection_id)
+                )::pg_catalog.text
+                from public.load_mercury_provider_oauth_attempt_envelopes(
+                  '{first_attempt_id}',
+                  '{postgres_context.tenant_id}',
+                  '{postgres_context.workspace_id}',
+                  '{AUTH_USER_ID}',
+                  'flowaccount',
+                  'sandbox'
+                );
+                """
+            ),
+        )
+    )
+    assert failed["status"] == "failed"
+    assert failed["provider_revocation_required"] is True
+    assert finalized_attempt_material_count == 1
+    assert finalized_remediation_material == {
+        "count": 1,
+        "connection_ids": [str(target_id)],
+    }
+    assert target_after_failure == {
+        "readiness": "disconnected",
+        "revocation": True,
+        "envelopes": [],
+    }
+
+    revoked = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(
+                transition_sql(
+                    "complete_mercury_provider_oauth_attempt_revocation",
+                    first_attempt_id,
+                )
+            ),
+        )
+    )
+    assert revoked["status"] == "revoked"
+    assert revoked["provider_revocation_required"] is False
+    assert (
+        _psql(
+            postgres_context.container,
+            _service(
+                f"""
+                select pg_catalog.jsonb_array_length(credential_envelopes)
+                from public.mercury_provider_oauth_attempts
+                where id = '{first_attempt_id}';
+                """
+            ),
+        )
+        == "0"
+    )
+
+    reconnect_attempt_id = uuid4()
+    _psql(postgres_context.container, _service(begin_sql(reconnect_attempt_id)))
+    _psql(
+        postgres_context.container,
+        _service(attach_sql(reconnect_attempt_id, uuid4())),
+    )
+    reconnect_target = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(resolve_sql(account_id, uuid4())),
+        )
+    )
+    assert reconnect_target["connection_id"] == str(target_id)
+    reconnect_envelope_id = uuid4()
+    reconnect_finalize_sql = finalize_sql(
+        reconnect_attempt_id,
+        target_id,
+        account_id,
+        int(reconnect_target["revision"]),
+        reconnect_envelope_id,
+    )
+    _psql(postgres_context.container, _service(reconnect_finalize_sql))
+    _psql(postgres_context.container, _service(reconnect_finalize_sql))
+    assert visible_count() == baseline_visible_count + 1
+
+    process_boundary_attempt_id = uuid4()
+    pending = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(begin_sql(process_boundary_attempt_id)),
+        )
+    )
+    assert pending["status"] == "exchange_pending"
+    assert pending["provider_revocation_required"] is True
+
+    failed_revocation_attempt_id = uuid4()
+    _psql(
+        postgres_context.container,
+        _service(begin_sql(failed_revocation_attempt_id)),
+    )
+    _psql(
+        postgres_context.container,
+        _service(attach_sql(failed_revocation_attempt_id, uuid4())),
+    )
+    durable_failure = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(
+                transition_sql(
+                    "fail_mercury_provider_oauth_attempt",
+                    failed_revocation_attempt_id,
+                )
+            ),
+        )
+    )
+    assert durable_failure["status"] == "failed"
+    assert durable_failure["provider_revocation_required"] is True
+    assert (
+        _psql(
+            postgres_context.container,
+            _service(
+                f"""
+                select pg_catalog.jsonb_array_length(credential_envelopes)
+                from public.mercury_provider_oauth_attempts
+                where id = '{failed_revocation_attempt_id}';
+                """
+            ),
+        )
+        == "1"
+    )
+    failed_remediation_material = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(
+                f"""
+                select pg_catalog.json_build_object(
+                  'count', pg_catalog.count(*),
+                  'connection_ids', pg_catalog.json_agg(connection_id)
+                )::pg_catalog.text
+                from public.load_mercury_provider_oauth_attempt_envelopes(
+                  '{failed_revocation_attempt_id}',
+                  '{postgres_context.tenant_id}',
+                  '{postgres_context.workspace_id}',
+                  '{AUTH_USER_ID}',
+                  'flowaccount',
+                  'sandbox'
+                );
+                """
+            ),
+        )
+    )
+    assert failed_remediation_material == {
+        "count": 1,
+        "connection_ids": [str(failed_revocation_attempt_id)],
+    }
+    assert visible_count() == baseline_visible_count + 1
+    assert (
+        public_attempt_artifact_count(
+            first_attempt_id,
+            reconnect_attempt_id,
+            process_boundary_attempt_id,
+            failed_revocation_attempt_id,
+        )
+        == 0
+    )

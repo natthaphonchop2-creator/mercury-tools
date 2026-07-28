@@ -56,7 +56,7 @@ from mercury_tools.providers.models import (
     ProviderConnectionSummary,
     ProviderId,
 )
-from mercury_tools.providers.store import ProviderConnectionStore
+from mercury_tools.providers.store import ProviderConnectionStore, ProviderStoreError
 from mercury_tools.workspaces.models import WorkspaceRole
 
 FLOWACCOUNT_CALLBACK_PATH = "/auth/providers/flowaccount/callback"
@@ -163,20 +163,20 @@ def _state_hash(value: str) -> str:
 
 def _bearer_challenge_parameters(headers: httpx.Headers) -> dict[str, str]:
     challenges: list[tuple[str, list[str]]] = []
-    for header in headers.get_list("www-authenticate"):
-        current: tuple[str, list[str]] | None = None
-        for item in parse_http_list(header):
-            segment = item.strip()
-            start = _AUTH_CHALLENGE_START.fullmatch(segment)
-            if start is not None:
-                current = (start.group(1), [])
-                challenges.append(current)
-                if start.group(2) is not None:
-                    current[1].append(start.group(2))
-            elif current is not None:
-                current[1].append(segment)
-            else:
-                raise ValueError
+    current: tuple[str, list[str]] | None = None
+    combined = ", ".join(headers.get_list("www-authenticate"))
+    for item in parse_http_list(combined):
+        segment = item.strip()
+        start = _AUTH_CHALLENGE_START.fullmatch(segment)
+        if start is not None:
+            current = (start.group(1), [])
+            challenges.append(current)
+            if start.group(2) is not None:
+                current[1].append(start.group(2))
+        elif current is not None:
+            current[1].append(segment)
+        else:
+            raise ValueError
 
     bearer = [parameters for scheme, parameters in challenges if scheme.casefold() == "bearer"]
     if len(bearer) != 1:
@@ -1829,6 +1829,17 @@ class ProviderOAuthService:
             or payload.granted_permissions != consumed.requested_permissions
         ):
             raise ProviderOAuthError("provider_oauth_state_invalid")
+        attempt_id = consumed.id
+        provisional_account_id = f"oauth-pending-{attempt_id}"
+        self._connection_store.begin_oauth_attempt(
+            attempt_id=attempt_id,
+            tenant_id=record.tenant_id,
+            workspace_id=record.workspace_id,
+            auth_user_id=record.auth_user_id,
+            provider=ProviderId.FLOWACCOUNT,
+            environment=record.environment,
+            granted_permissions=payload.granted_permissions,
+        )
         try:
             tokens = await self._oauth_client.exchange_code(
                 session=payload.session(),
@@ -1843,13 +1854,10 @@ class ProviderOAuthService:
         except Exception:
             raise ProviderOAuthError("provider_oauth_exchange_failed") from None
 
-        staged_connection_id = uuid4()
-        provisional_account_id = f"oauth-pending-{consumed.id}"
-        staged = False
         try:
             now = self._timestamp()
             provisional = ProviderConnection(
-                id=staged_connection_id,
+                id=attempt_id,
                 tenant_id=record.tenant_id,
                 workspace_id=record.workspace_id,
                 auth_user_id=record.auth_user_id,
@@ -1876,11 +1884,11 @@ class ProviderOAuthService:
                 client_secret=payload.client_secret,
                 token_endpoint_auth_method=payload.token_endpoint_auth_method,
             )
-            connection = self._connection_store.stage_connection(
+            connection = self._connection_store.attach_oauth_attempt(
+                attempt_id=attempt_id,
                 tenant_id=record.tenant_id,
                 workspace_id=record.workspace_id,
                 auth_user_id=record.auth_user_id,
-                connection_id=staged_connection_id,
                 provider=ProviderId.FLOWACCOUNT,
                 environment=record.environment,
                 company_or_merchant_id=provisional_account_id,
@@ -1892,7 +1900,6 @@ class ProviderOAuthService:
                 validated_at=None,
                 envelopes=provisional_envelopes,
             )
-            staged = True
 
             try:
                 discovery = await self._driver.discover(connection)
@@ -1956,40 +1963,32 @@ class ProviderOAuthService:
                 client_secret=payload.client_secret,
                 token_endpoint_auth_method=payload.token_endpoint_auth_method,
             )
-            ready = self._connection_store.finalize_connection(
-                staged_connection_id=staged_connection_id,
-                tenant_id=record.tenant_id,
-                workspace_id=record.workspace_id,
-                auth_user_id=record.auth_user_id,
-                connection_id=target.connection_id,
-                provider=ProviderId.FLOWACCOUNT,
-                environment=record.environment,
-                company_or_merchant_id=company_id,
-                account_display_name=display_name,
-                authorization_method=AuthorizationMethod.OAUTH2_PKCE,
-                granted_permissions=tokens.granted_permissions,
-                readiness=ConnectionReadiness.READY,
-                revision=target.revision,
-                validated_at=validated_at,
-                envelopes=exact_envelopes,
-            )
+            finalize = {
+                "attempt_id": attempt_id,
+                "tenant_id": record.tenant_id,
+                "workspace_id": record.workspace_id,
+                "auth_user_id": record.auth_user_id,
+                "connection_id": target.connection_id,
+                "provider": ProviderId.FLOWACCOUNT,
+                "environment": record.environment,
+                "company_or_merchant_id": company_id,
+                "account_display_name": display_name,
+                "authorization_method": AuthorizationMethod.OAUTH2_PKCE,
+                "granted_permissions": tokens.granted_permissions,
+                "readiness": ConnectionReadiness.READY,
+                "revision": target.revision,
+                "validated_at": validated_at,
+                "envelopes": exact_envelopes,
+            }
+            ready = self._finalize_oauth_attempt(finalize)
             return ready.summary()
         except BaseException:
-            obligation_persisted = False
-            try:
-                self._persist_revocation_obligation(
-                    record=record,
-                    connection_id=staged_connection_id,
-                    provisional_account_id=provisional_account_id,
-                    granted_permissions=tokens.granted_permissions,
-                    staged=staged,
-                )
-                obligation_persisted = True
-            except Exception:
-                pass
-
+            cleanup_confirmed = self._fail_oauth_attempt(
+                attempt_id=attempt_id,
+                record=record,
+            )
             revoked = False
-            if payload.revocation_endpoint is not None:
+            if cleanup_confirmed and payload.revocation_endpoint is not None:
                 try:
                     revoked = await self._oauth_client.revoke(
                         session=payload.session(),
@@ -1998,57 +1997,51 @@ class ProviderOAuthService:
                 except Exception:
                     revoked = False
             if revoked:
-                if obligation_persisted:
-                    with suppress(Exception):
-                        self._connection_store.complete_revocation(
-                            tenant_id=record.tenant_id,
-                            workspace_id=record.workspace_id,
-                            auth_user_id=record.auth_user_id,
-                            connection_id=staged_connection_id,
-                        )
-            elif not obligation_persisted:
-                self._persist_revocation_obligation(
-                    record=record,
-                    connection_id=staged_connection_id,
-                    provisional_account_id=provisional_account_id,
-                    granted_permissions=tokens.granted_permissions,
-                    staged=staged,
-                )
+                with suppress(Exception):
+                    self._connection_store.complete_oauth_attempt_revocation(
+                        attempt_id=attempt_id,
+                        tenant_id=record.tenant_id,
+                        workspace_id=record.workspace_id,
+                        auth_user_id=record.auth_user_id,
+                        provider=ProviderId.FLOWACCOUNT,
+                        environment=record.environment,
+                    )
             raise
 
-    def _persist_revocation_obligation(
+    def _finalize_oauth_attempt(
+        self,
+        values: Mapping[str, Any],
+    ) -> ProviderConnection:
+        try:
+            return self._connection_store.finalize_oauth_attempt(**values)
+        except ProviderStoreError as exc:
+            if exc.code != "provider_store_unavailable":
+                raise
+        return self._connection_store.finalize_oauth_attempt(**values)
+
+    def _fail_oauth_attempt(
         self,
         *,
+        attempt_id: UUID,
         record: ProviderOAuthStateRecord,
-        connection_id: UUID,
-        provisional_account_id: str,
-        granted_permissions: tuple[str, ...],
-        staged: bool,
-    ) -> None:
-        if staged:
+    ) -> bool:
+        for retry in range(2):
             try:
-                self._connection_store.disconnect(
+                self._connection_store.fail_oauth_attempt(
+                    attempt_id=attempt_id,
                     tenant_id=record.tenant_id,
                     workspace_id=record.workspace_id,
                     auth_user_id=record.auth_user_id,
-                    connection_id=connection_id,
-                    provider_revocation_required=True,
+                    provider=ProviderId.FLOWACCOUNT,
+                    environment=record.environment,
                 )
-                return
+                return True
+            except ProviderStoreError as exc:
+                if exc.code != "provider_store_unavailable" or retry == 1:
+                    return False
             except Exception:
-                pass
-        self._connection_store.record_revocation_obligation(
-            tenant_id=record.tenant_id,
-            workspace_id=record.workspace_id,
-            auth_user_id=record.auth_user_id,
-            connection_id=connection_id,
-            provider=ProviderId.FLOWACCOUNT,
-            environment=record.environment,
-            company_or_merchant_id=provisional_account_id,
-            account_display_name="FlowAccount",
-            authorization_method=AuthorizationMethod.OAUTH2_PKCE,
-            granted_permissions=granted_permissions,
-        )
+                return False
+        return False
 
     def _open_state_access(
         self,
