@@ -43,6 +43,7 @@ from mercury_tools.providers.base import ProviderStatusClass
 from mercury_tools.providers.flowaccount import (
     FlowAccountOAuthTokens,
     FlowAccountRefreshRequest,
+    open_flowaccount_tokens,
     seal_flowaccount_credentials,
 )
 from mercury_tools.providers.manifest import (
@@ -1854,6 +1855,8 @@ class ProviderOAuthService:
         except Exception:
             raise ProviderOAuthError("provider_oauth_exchange_failed") from None
 
+        provisional_connection: ProviderConnection | None = None
+        material_connection: ProviderConnection | None = None
         try:
             now = self._timestamp()
             provisional = ProviderConnection(
@@ -1874,6 +1877,8 @@ class ProviderOAuthService:
                 created_at=now,
                 updated_at=now,
             )
+            provisional_connection = provisional
+            material_connection = provisional
             provisional_envelopes = seal_flowaccount_credentials(
                 vault=self._vault,
                 connection=provisional,
@@ -1900,6 +1905,7 @@ class ProviderOAuthService:
                 validated_at=None,
                 envelopes=provisional_envelopes,
             )
+            material_connection = connection
 
             try:
                 discovery = await self._driver.discover(connection)
@@ -1925,6 +1931,13 @@ class ProviderOAuthService:
             except Exception:
                 raise ProviderOAuthError("provider_oauth_validation_failed") from None
 
+            tokens = self._load_oauth_attempt_tokens(
+                attempt_id=attempt_id,
+                record=record,
+                connection=connection,
+            )
+            if tokens.granted_permissions != payload.granted_permissions:
+                raise ProviderOAuthError("provider_oauth_validation_failed")
             target = self._connection_store.resolve_connection_target(
                 tenant_id=record.tenant_id,
                 workspace_id=record.workspace_id,
@@ -1946,7 +1959,7 @@ class ProviderOAuthService:
                 account_display_name=display_name,
                 authorization_method=AuthorizationMethod.OAUTH2_PKCE,
                 granted_permissions=tokens.granted_permissions,
-                readiness=ConnectionReadiness.READY,
+                readiness=ConnectionReadiness.REQUIRES_VALIDATION,
                 revision=target.revision,
                 last_validated_at=validated_at,
                 credential_envelope_ids=(uuid4(),),
@@ -1975,12 +1988,20 @@ class ProviderOAuthService:
                 "account_display_name": display_name,
                 "authorization_method": AuthorizationMethod.OAUTH2_PKCE,
                 "granted_permissions": tokens.granted_permissions,
-                "readiness": ConnectionReadiness.READY,
+                "readiness": ConnectionReadiness.REQUIRES_VALIDATION,
                 "revision": target.revision,
                 "validated_at": validated_at,
                 "envelopes": exact_envelopes,
             }
-            ready = self._finalize_oauth_attempt(finalize)
+            material_connection = exact_connection
+            held = self._finalize_oauth_attempt(finalize)
+            material_connection = held
+            ready = self._acknowledge_oauth_attempt(
+                attempt_id=attempt_id,
+                record=record,
+                connection=held,
+            )
+            material_connection = ready
             return ready.summary()
         except BaseException:
             cleanup_confirmed = self._fail_oauth_attempt(
@@ -1988,11 +2009,33 @@ class ProviderOAuthService:
                 record=record,
             )
             revoked = False
-            if cleanup_confirmed and payload.revocation_endpoint is not None:
+            revocation_tokens: FlowAccountOAuthTokens | None = None
+            if (
+                cleanup_confirmed
+                and payload.revocation_endpoint is not None
+                and material_connection is not None
+            ):
+                candidates = [material_connection]
+                if (
+                    provisional_connection is not None
+                    and provisional_connection.id != material_connection.id
+                ):
+                    candidates.append(provisional_connection)
+                for candidate in candidates:
+                    try:
+                        revocation_tokens = self._load_oauth_attempt_tokens(
+                            attempt_id=attempt_id,
+                            record=record,
+                            connection=candidate,
+                        )
+                        break
+                    except Exception:
+                        revocation_tokens = None
+            if revocation_tokens is not None:
                 try:
                     revoked = await self._oauth_client.revoke(
                         session=payload.session(),
-                        tokens=tokens,
+                        tokens=revocation_tokens,
                     )
                 except Exception:
                     revoked = False
@@ -2018,6 +2061,51 @@ class ProviderOAuthService:
             if exc.code != "provider_store_unavailable":
                 raise
         return self._connection_store.finalize_oauth_attempt(**values)
+
+    def _acknowledge_oauth_attempt(
+        self,
+        *,
+        attempt_id: UUID,
+        record: ProviderOAuthStateRecord,
+        connection: ProviderConnection,
+    ) -> ProviderConnection:
+        values = {
+            "attempt_id": attempt_id,
+            "tenant_id": record.tenant_id,
+            "workspace_id": record.workspace_id,
+            "auth_user_id": record.auth_user_id,
+            "provider": ProviderId.FLOWACCOUNT,
+            "environment": record.environment,
+            "connection": connection,
+        }
+        try:
+            return self._connection_store.acknowledge_oauth_attempt(**values)
+        except ProviderStoreError as exc:
+            if exc.code != "provider_store_unavailable":
+                raise
+        return self._connection_store.acknowledge_oauth_attempt(**values)
+
+    def _load_oauth_attempt_tokens(
+        self,
+        *,
+        attempt_id: UUID,
+        record: ProviderOAuthStateRecord,
+        connection: ProviderConnection,
+    ) -> FlowAccountOAuthTokens:
+        envelopes = self._connection_store.load_oauth_attempt_envelopes(
+            attempt_id=attempt_id,
+            tenant_id=record.tenant_id,
+            workspace_id=record.workspace_id,
+            auth_user_id=record.auth_user_id,
+            provider=ProviderId.FLOWACCOUNT,
+            environment=record.environment,
+            connection=connection,
+        )
+        return open_flowaccount_tokens(
+            vault=self._vault,
+            connection=connection,
+            envelopes=envelopes,
+        )
 
     def _fail_oauth_attempt(
         self,

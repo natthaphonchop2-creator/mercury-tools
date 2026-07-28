@@ -23,6 +23,9 @@ OAUTH_RECONNECT_MIGRATION = (
 OAUTH_ATTEMPT_MIGRATION = (
     ROOT / "supabase/migrations/20260728110000_mercury_v1_provider_oauth_attempts.sql"
 )
+OAUTH_GENERATION_MIGRATION = (
+    ROOT / "supabase/migrations/20260728120000_mercury_v1_provider_oauth_generations.sql"
+)
 
 TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
 OTHER_TENANT_ID = UUID("22222222-2222-4222-8222-222222222222")
@@ -695,6 +698,7 @@ def test_internal_oauth_attempt_finalization_is_idempotent_and_never_listed() ->
         ConnectionReadiness,
         ProviderId,
     )
+    from mercury_tools.providers.store import ProviderStoreError
 
     vault = _vault()
     store = _store(vault=vault)
@@ -766,7 +770,7 @@ def test_internal_oauth_attempt_finalization_is_idempotent_and_never_listed() ->
         "account_display_name": "FlowAccount Test Company",
         "authorization_method": AuthorizationMethod.OAUTH2_PKCE,
         "granted_permissions": ("documents.read", "profile.read"),
-        "readiness": ConnectionReadiness.READY,
+        "readiness": ConnectionReadiness.REQUIRES_VALIDATION,
         "revision": target.revision,
         "validated_at": NOW,
         "envelopes": exact_envelopes,
@@ -774,6 +778,31 @@ def test_internal_oauth_attempt_finalization_is_idempotent_and_never_listed() ->
 
     first = store.finalize_oauth_attempt(**finalize)
     reconciled = store.finalize_oauth_attempt(**finalize)
+    held_visible = store.list_for_workspace(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=AUTH_USER_ID,
+    )
+    with pytest.raises(ProviderStoreError, match="^provider_connection_not_found$"):
+        store.load_envelopes(first)
+    acknowledged = store.acknowledge_oauth_attempt(
+        attempt_id=attempt_id,
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=AUTH_USER_ID,
+        provider=ProviderId.FLOWACCOUNT,
+        environment="sandbox",
+        connection=first,
+    )
+    acknowledged_again = store.acknowledge_oauth_attempt(
+        attempt_id=attempt_id,
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=AUTH_USER_ID,
+        provider=ProviderId.FLOWACCOUNT,
+        environment="sandbox",
+        connection=first,
+    )
     visible = store.list_for_workspace(
         tenant_id=TENANT_ID,
         workspace_id=WORKSPACE_ID,
@@ -784,11 +813,153 @@ def test_internal_oauth_attempt_finalization_is_idempotent_and_never_listed() ->
     assert provisional.id == attempt_id
     assert loaded_provisional == provisional_envelopes
     assert first == reconciled
+    assert first.readiness is ConnectionReadiness.REQUIRES_VALIDATION
+    assert held_visible == ()
+    assert acknowledged == acknowledged_again
+    assert acknowledged.readiness is ConnectionReadiness.READY
+    assert acknowledged.revision == first.revision + 1
     assert [item.connection_id for item in visible] == [target.connection_id]
     assert len(store._connections) == 1
     assert store._oauth_attempts[attempt_id].status == "finalized"
+    assert store._oauth_attempts[attempt_id].acknowledged_at is not None
     assert store._oauth_attempts[attempt_id].provider_revocation_required is False
     assert store._oauth_attempt_envelopes == {}
+
+
+def test_oauth_attempt_envelope_replacement_is_revision_checked_and_idempotent() -> None:
+    from mercury_tools.providers.models import (
+        AuthorizationMethod,
+        ConnectionReadiness,
+        ProviderId,
+    )
+    from mercury_tools.providers.store import ProviderStoreError
+
+    vault = _vault()
+    store = _store(vault=vault)
+    attempt_id = SECOND_CONNECTION_ID
+    account_id = f"oauth-pending-{attempt_id}"
+    store.begin_oauth_attempt(
+        attempt_id=attempt_id,
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=AUTH_USER_ID,
+        provider=ProviderId.FLOWACCOUNT,
+        environment="sandbox",
+        granted_permissions=("documents.read", "profile.read"),
+    )
+    original = (
+        vault.seal(
+            _binding(
+                "access_token",
+                connection_id=attempt_id,
+                company_or_merchant_id=account_id,
+            ),
+            b"expired-access-token",
+        ),
+    )
+    provisional = store.attach_oauth_attempt(
+        attempt_id=attempt_id,
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=AUTH_USER_ID,
+        provider=ProviderId.FLOWACCOUNT,
+        environment="sandbox",
+        company_or_merchant_id=account_id,
+        account_display_name="FlowAccount",
+        authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+        granted_permissions=("documents.read", "profile.read"),
+        readiness=ConnectionReadiness.REQUIRES_VALIDATION,
+        revision=1,
+        validated_at=None,
+        envelopes=original,
+    )
+    replacement = (
+        vault.seal(
+            _binding(
+                "access_token",
+                connection_id=attempt_id,
+                company_or_merchant_id=account_id,
+            ),
+            b"rotated-access-token",
+        ),
+    )
+
+    rotated = store.replace_oauth_attempt_envelopes(provisional, replacement)
+    reconciled = store.replace_oauth_attempt_envelopes(provisional, replacement)
+
+    assert rotated == reconciled
+    assert rotated.revision == 2
+    assert rotated.credential_envelope_ids == (replacement[0].id,)
+    assert store.load_runtime_envelopes(provisional) == replacement
+    stale_replacement = (
+        vault.seal(
+            _binding(
+                "access_token",
+                connection_id=attempt_id,
+                company_or_merchant_id=account_id,
+            ),
+            b"other-access-token",
+        ),
+    )
+    with pytest.raises(ProviderStoreError, match="^provider_connection_conflict$"):
+        store.replace_oauth_attempt_envelopes(provisional, stale_replacement)
+
+
+def test_public_list_filters_only_exact_legacy_oauth_discriminator() -> None:
+    from mercury_tools.providers.models import (
+        AuthorizationMethod,
+        ConnectionReadiness,
+        ProviderId,
+    )
+
+    vault = _vault()
+    store = _store(vault=vault)
+    exact_account_id = f"oauth-pending-{SECOND_CONNECTION_ID}"
+    similar_account_id = f"{exact_account_id}-customer"
+    exact_envelope = vault.seal(
+        _binding(
+            "access_token",
+            connection_id=SECOND_CONNECTION_ID,
+            company_or_merchant_id=exact_account_id,
+        ),
+        b"legacy-staging-token",
+    )
+    similar_envelope = vault.seal(
+        _binding(
+            "access_token",
+            connection_id=THIRD_CONNECTION_ID,
+            company_or_merchant_id=similar_account_id,
+        ),
+        b"real-customer-token",
+    )
+    for connection_id, account_id, envelope in (
+        (SECOND_CONNECTION_ID, exact_account_id, exact_envelope),
+        (THIRD_CONNECTION_ID, similar_account_id, similar_envelope),
+    ):
+        store.save_connection(
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=AUTH_USER_ID,
+            connection_id=connection_id,
+            provider=ProviderId.FLOWACCOUNT,
+            environment="sandbox",
+            company_or_merchant_id=account_id,
+            account_display_name="FlowAccount Customer",
+            authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+            granted_permissions=("profile.read",),
+            readiness=ConnectionReadiness.READY,
+            revision=1,
+            validated_at=NOW,
+            envelopes=(envelope,),
+        )
+
+    listed = store.list_for_workspace(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=AUTH_USER_ID,
+    )
+
+    assert [item.connection_id for item in listed] == [THIRD_CONNECTION_ID]
 
 
 @pytest.mark.parametrize(
@@ -1139,5 +1310,42 @@ def test_oauth_attempt_migration_is_internal_idempotent_and_forward_only() -> No
     assert "for update" in sql
     assert "status = 'finalized'" in sql
     assert "status = 'failed'" in sql
+    assert "drop table" not in sql
+    assert "truncate" not in sql
+
+
+def test_oauth_generation_migration_adds_hold_ack_refresh_and_upgrade_guards() -> None:
+    sql = _normalized_sql(OAUTH_GENERATION_MIGRATION)
+
+    for function_name in (
+        "replace_mercury_provider_oauth_attempt_envelopes",
+        "acknowledge_mercury_provider_oauth_attempt",
+    ):
+        assert f"create or replace function public.{function_name}(" in sql
+        assert re.search(
+            rf"grant execute on function public\.{function_name}\([^;]*\) "
+            r"to service_role;",
+            sql,
+        )
+    for obsolete in (
+        "stage_mercury_provider_connection",
+        "finalize_mercury_provider_connection",
+        "record_mercury_provider_revocation_obligation",
+    ):
+        assert re.search(
+            rf"revoke all on function public\.{obsolete}\([^;]*\) "
+            r"from service_role;",
+            sql,
+        )
+
+    assert "oauth_generation_id" in sql
+    assert "material_revision" in sql
+    assert "acknowledged_at" in sql
+    assert "p_expected_revision" in sql
+    assert "'oauth-pending-' || connection.id::pg_catalog.text" in sql
+    assert "'requires_validation'," in sql
+    assert "set readiness = 'ready'" in sql
+    assert "connection.readiness = 'ready'" in sql
+    assert "connection.oauth_generation_id is null" in sql
     assert "drop table" not in sql
     assert "truncate" not in sql

@@ -433,7 +433,7 @@ def _flowaccount_runtime_dependencies(
     header_factory = FlowAccountOAuthHeaderFactory(
         vault=vault,
         load_envelopes=connection_store.load_runtime_envelopes,
-        save_envelopes=connection_store.replace_envelopes,
+        save_envelopes=connection_store.replace_runtime_envelopes,
         refresh=oauth_client.refresh,
     )
     return {

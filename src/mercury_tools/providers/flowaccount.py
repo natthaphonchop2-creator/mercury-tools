@@ -403,6 +403,35 @@ def _open_flowaccount_credentials(
         raise FlowAccountCredentialError("flowaccount_credentials_invalid") from None
 
 
+def open_flowaccount_tokens(
+    *,
+    vault: CredentialVault,
+    connection: ProviderConnection,
+    envelopes: Sequence[CredentialEnvelope],
+) -> FlowAccountOAuthTokens:
+    """Open the latest encrypted OAuth token generation for a bound connection."""
+
+    opened = _open_flowaccount_credentials(
+        vault=vault,
+        connection=connection,
+        envelopes=envelopes,
+    )
+    try:
+        return FlowAccountOAuthTokens(
+            access_token=opened.access_token.decode("utf-8"),
+            refresh_token=(
+                opened.refresh_token.decode("utf-8") if opened.refresh_token is not None else None
+            ),
+            token_type="Bearer",
+            expires_at=opened.bundle.expires_at,
+            granted_permissions=opened.bundle.granted_permissions,
+        )
+    except (TypeError, UnicodeDecodeError, ValueError, ValidationError):
+        raise FlowAccountCredentialError("flowaccount_credentials_invalid") from None
+    finally:
+        opened.clear()
+
+
 class FlowAccountOAuthHeaderFactory:
     """Open one encrypted token bundle and refresh no more than once."""
 
@@ -704,5 +733,6 @@ __all__ = [
     "FlowAccountRefreshRequest",
     "FlowAccountTokenRefresher",
     "normalize_flowaccount_response",
+    "open_flowaccount_tokens",
     "seal_flowaccount_credentials",
 ]
