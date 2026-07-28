@@ -13,6 +13,10 @@ create index if not exists mercury_provider_connections_oauth_generation_idx
   on public.mercury_provider_connections (oauth_generation_id)
   where oauth_generation_id is not null;
 
+create index if not exists mercury_provider_oauth_attempts_target_connection_idx
+  on public.mercury_provider_oauth_attempts (target_connection_id)
+  where target_connection_id is not null;
+
 update public.mercury_provider_oauth_attempts as attempt
 set material_revision = case
       when attempt.status = 'exchange_pending' then 0
@@ -20,24 +24,131 @@ set material_revision = case
       else attempt.material_revision
     end;
 
--- Only pre-generation finalized rows were immediately dispatchable. Limiting
--- this backfill to legacy ready targets keeps migration replay from
--- acknowledging a generation that a new callback deliberately left on hold.
-update public.mercury_provider_oauth_attempts as attempt
-set acknowledged_at = attempt.updated_at
-from public.mercury_provider_connections as connection
-where attempt.status = 'finalized'
-  and attempt.acknowledged_at is null
-  and attempt.target_connection_id = connection.id
-  and connection.readiness = 'ready'
-  and connection.oauth_generation_id is null;
-
+-- Select one proven legacy owner before acknowledging or assigning anything.
+-- The UUID tie-breaker makes evaluation stable but never resolves two attempts
+-- at the same ownership revision; equal latest revisions remain ambiguous.
+with upgrade_targets as materialized (
+  select connection.*
+  from public.mercury_provider_connections as connection
+  where connection.oauth_generation_id is null
+    and exists (
+      select 1
+      from public.mercury_provider_oauth_attempts as history
+      where history.target_connection_id = connection.id
+    )
+),
+binding_compatible_candidates as materialized (
+  select
+    target.id as connection_id,
+    attempt.id as attempt_id,
+    attempt.status,
+    attempt.target_revision,
+    attempt.updated_at,
+    attempt.created_at
+  from upgrade_targets as target
+  join public.mercury_provider_oauth_attempts as attempt
+    on attempt.target_connection_id = target.id
+   and attempt.tenant_id = target.tenant_id
+   and attempt.workspace_id = target.workspace_id
+   and attempt.auth_user_id = target.auth_user_id
+   and attempt.provider = target.provider
+   and attempt.environment = target.environment
+   and (
+     attempt.provider_account_id = target.provider_account_id
+     or (
+       attempt.status = 'finalized'
+       and attempt.provider_account_id
+         = 'oauth-pending-' || attempt.id::pg_catalog.text
+     )
+   )
+   and attempt.authorization_method = target.authorization_method
+   and attempt.granted_permissions = target.granted_permissions
+  where (
+      target.readiness = 'ready'
+      and not target.provider_revocation_required
+      and target.credential_envelope_ids <> '{}'::pg_catalog.uuid[]
+      and attempt.status = 'finalized'
+      and not attempt.provider_revocation_required
+      and attempt.target_revision <= target.revision
+    )
+    or (
+      target.readiness = 'disconnected'
+      and target.provider_revocation_required
+      and attempt.status = 'failed'
+      and attempt.provider_revocation_required
+      and attempt.target_revision = target.revision
+    )
+),
+ranked_candidates as materialized (
+  select
+    candidate.*,
+    pg_catalog.dense_rank() over (
+      partition by candidate.connection_id
+      order by candidate.target_revision desc
+    ) as ownership_rank,
+    pg_catalog.count(*) over (
+      partition by candidate.connection_id, candidate.target_revision
+    ) as ownership_rank_size,
+    pg_catalog.row_number() over (
+      partition by candidate.connection_id
+      order by
+        candidate.target_revision desc,
+        candidate.updated_at desc,
+        candidate.created_at desc,
+        candidate.attempt_id
+    ) as stable_order
+  from binding_compatible_candidates as candidate
+),
+selected_candidates as materialized (
+  select candidate.*
+  from ranked_candidates as candidate
+  where candidate.ownership_rank = 1
+    and candidate.ownership_rank_size = 1
+    and candidate.stable_order = 1
+),
+acknowledged_candidates as (
+  update public.mercury_provider_oauth_attempts as attempt
+  set acknowledged_at = coalesce(
+        attempt.acknowledged_at,
+        attempt.updated_at
+      )
+  from selected_candidates as selected
+  where selected.status = 'finalized'
+    and attempt.id = selected.attempt_id
+  returning attempt.id
+)
 update public.mercury_provider_connections as connection
-set oauth_generation_id = attempt.id
-from public.mercury_provider_oauth_attempts as attempt
-where attempt.target_connection_id = connection.id
+set oauth_generation_id = selected.attempt_id,
+    readiness = case
+      when target.readiness = 'ready'
+        and selected.attempt_id is null
+      then 'requires_validation'
+      else connection.readiness
+    end,
+    updated_at = case
+      when target.readiness = 'ready'
+        and selected.attempt_id is null
+      then pg_catalog.statement_timestamp()
+      else connection.updated_at
+    end
+from upgrade_targets as target
+left join selected_candidates as selected
+  on selected.connection_id = target.id
+where connection.id = target.id
   and connection.oauth_generation_id is null
-  and attempt.status in ('finalized', 'failed', 'revoked');
+  and (
+    selected.attempt_id is not null
+    or target.readiness = 'ready'
+  )
+  and (
+    selected.status = 'failed'
+    or selected.attempt_id is null
+    or exists (
+      select 1
+      from acknowledged_candidates as acknowledged
+      where acknowledged.id = selected.attempt_id
+    )
+  );
 
 do $$
 begin
@@ -1060,7 +1171,14 @@ begin
     and connection.provider_account_id
       <> 'oauth-pending-' || connection.id::pg_catalog.text
     and (
-      connection.oauth_generation_id is null
+      (
+        connection.oauth_generation_id is null
+        and not exists (
+          select 1
+          from public.mercury_provider_oauth_attempts as history
+          where history.target_connection_id = connection.id
+        )
+      )
       or exists (
         select 1
         from public.mercury_provider_oauth_attempts as attempt
@@ -1138,7 +1256,14 @@ begin
       and connection.provider_account_id
         <> 'oauth-pending-' || connection.id::pg_catalog.text
       and (
-        connection.oauth_generation_id is null
+        (
+          connection.oauth_generation_id is null
+          and not exists (
+            select 1
+            from public.mercury_provider_oauth_attempts as history
+            where history.target_connection_id = connection.id
+          )
+        )
         or exists (
           select 1
           from public.mercury_provider_oauth_attempts as attempt

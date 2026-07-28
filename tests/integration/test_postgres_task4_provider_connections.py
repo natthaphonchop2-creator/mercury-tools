@@ -2385,3 +2385,618 @@ def test_base_to_head_upgrade_moves_exact_legacy_ghosts_and_replays_cleanly() ->
         assert listed_similar == 1
     finally:
         _docker("rm", "-f", container, check=False)
+
+
+def test_base_to_head_upgrade_selects_only_proven_oauth_generation_owners() -> None:
+    if os.environ.get(_OPT_IN) != "1":
+        pytest.skip(f"set {_OPT_IN}=1 to run disposable PostgreSQL regression")
+    if not _docker_available():
+        pytest.skip("Docker is unavailable for disposable PostgreSQL regression")
+
+    container = f"mercury-task6-owner-upgrade-{uuid4().hex[:12]}"
+    _docker(
+        "run",
+        "--rm",
+        "-d",
+        "--name",
+        container,
+        "-e",
+        "POSTGRES_PASSWORD=postgres",
+        "-e",
+        "POSTGRES_DB=mercury_task4_test",
+        "postgres:17-alpine",
+    )
+    try:
+        _wait_for_postgres(container)
+        _psql(
+            container,
+            """
+            create role anon nologin;
+            create role authenticated nologin;
+            create role service_role nologin bypassrls;
+            create schema auth;
+            create function auth.uid()
+            returns uuid
+            language sql
+            stable
+            as $$
+              select nullif(
+                current_setting('request.jwt.claim.sub', true),
+                ''
+              )::uuid
+            $$;
+            grant usage on schema auth to anon, authenticated, service_role;
+            grant execute on function auth.uid()
+              to anon, authenticated, service_role;
+            """,
+        )
+        for migration in MIGRATIONS[:-1]:
+            _psql(container, migration.read_text(encoding="utf-8"))
+        payload = json.loads(
+            _psql(
+                container,
+                _authenticated(
+                    """
+                    select pg_catalog.row_to_json(context)::pg_catalog.text
+                    from public.bootstrap_mercury_context() as context;
+                    """
+                ),
+            )
+        )
+        context = PostgresContext(
+            container=container,
+            tenant_id=UUID(payload["memberships"][0]["tenant_id"]),
+            workspace_id=UUID(payload["active_workspace_id"]),
+        )
+        permissions = '["documents.read","profile.read"]'
+
+        def envelope(envelope_id: UUID) -> str:
+            return f"""
+              pg_catalog.jsonb_build_array(
+                pg_catalog.jsonb_build_object(
+                  'id', '{envelope_id}',
+                  'credential_type', 'access_token',
+                  'key_version', 'v1',
+                  'nonce', pg_catalog.repeat('ab', 12),
+                  'ciphertext', pg_catalog.repeat('cd', 16),
+                  'aad_hash', pg_catalog.repeat('ef', 32),
+                  'created_at', '2026-07-28T00:00:00+00:00',
+                  'rotated_at', null,
+                  'revoked_at', null
+                )
+              )
+            """
+
+        def finalize_legacy_generation(
+            *,
+            attempt_id: UUID,
+            proposed_target_id: UUID,
+            account_id: str,
+            envelope_id: UUID,
+        ) -> tuple[UUID, int]:
+            _psql(
+                container,
+                _service(
+                    f"""
+                    select *
+                    from public.begin_mercury_provider_oauth_attempt(
+                      '{attempt_id}',
+                      '{context.tenant_id}',
+                      '{context.workspace_id}',
+                      '{AUTH_USER_ID}',
+                      'flowaccount',
+                      'sandbox',
+                      '{permissions}'::pg_catalog.jsonb
+                    );
+                    select *
+                    from public.attach_mercury_provider_oauth_attempt(
+                      '{attempt_id}',
+                      '{context.tenant_id}',
+                      '{context.workspace_id}',
+                      '{AUTH_USER_ID}',
+                      'flowaccount',
+                      'sandbox',
+                      'oauth-pending-{attempt_id}',
+                      'FlowAccount',
+                      'oauth2_pkce',
+                      '{permissions}'::pg_catalog.jsonb,
+                      'requires_validation',
+                      1,
+                      null,
+                      {envelope(uuid4())}
+                    );
+                    """
+                ),
+            )
+            target = json.loads(
+                _psql(
+                    container,
+                    _service(
+                        f"""
+                        select pg_catalog.row_to_json(result)::pg_catalog.text
+                        from public.resolve_mercury_provider_connection_target(
+                          '{context.tenant_id}',
+                          '{context.workspace_id}',
+                          '{AUTH_USER_ID}',
+                          'flowaccount',
+                          'sandbox',
+                          '{account_id}',
+                          '{proposed_target_id}'
+                        ) as result;
+                        """
+                    ),
+                )
+            )
+            target_id = UUID(target["connection_id"])
+            target_revision = int(target["revision"])
+            _psql(
+                container,
+                _service(
+                    f"""
+                    select *
+                    from public.finalize_mercury_provider_oauth_attempt(
+                      '{attempt_id}',
+                      '{target_id}',
+                      '{context.tenant_id}',
+                      '{context.workspace_id}',
+                      '{AUTH_USER_ID}',
+                      'flowaccount',
+                      'sandbox',
+                      '{account_id}',
+                      'FlowAccount Upgrade Company',
+                      'oauth2_pkce',
+                      '{permissions}'::pg_catalog.jsonb,
+                      'ready',
+                      {target_revision},
+                      '2026-07-28T00:05:00+00:00'::pg_catalog.timestamptz,
+                      {envelope(envelope_id)}
+                    );
+                    """
+                ),
+            )
+            return target_id, target_revision
+
+        def disconnect_and_complete(connection_id: UUID) -> None:
+            _psql(
+                container,
+                _service(
+                    f"""
+                    select *
+                    from public.disconnect_mercury_provider_connection(
+                      '{context.tenant_id}',
+                      '{context.workspace_id}',
+                      '{AUTH_USER_ID}',
+                      '{connection_id}',
+                      true
+                    );
+                    select *
+                    from public.complete_mercury_provider_revocation(
+                      '{context.tenant_id}',
+                      '{context.workspace_id}',
+                      '{AUTH_USER_ID}',
+                      '{connection_id}'
+                    );
+                    """
+                ),
+            )
+
+        def fail_attempt(attempt_id: UUID) -> None:
+            _psql(
+                container,
+                _service(
+                    f"""
+                    select *
+                    from public.fail_mercury_provider_oauth_attempt(
+                      '{attempt_id}',
+                      '{context.tenant_id}',
+                      '{context.workspace_id}',
+                      '{AUTH_USER_ID}',
+                      'flowaccount',
+                      'sandbox'
+                    );
+                    """
+                ),
+            )
+
+        def complete_attempt_revocation(attempt_id: UUID) -> None:
+            _psql(
+                container,
+                _service(
+                    f"""
+                    select *
+                    from public.complete_mercury_provider_oauth_attempt_revocation(
+                      '{attempt_id}',
+                      '{context.tenant_id}',
+                      '{context.workspace_id}',
+                      '{AUTH_USER_ID}',
+                      'flowaccount',
+                      'sandbox'
+                    );
+                    """
+                ),
+            )
+
+        def listed_count(connection_id: UUID) -> int:
+            return int(
+                _psql(
+                    container,
+                    _authenticated(
+                        f"""
+                        select pg_catalog.count(*)
+                        from public.list_mercury_provider_connections(
+                          '{context.tenant_id}',
+                          '{context.workspace_id}',
+                          '{AUTH_USER_ID}'
+                        )
+                        where connection_id = '{connection_id}';
+                        """
+                    ),
+                )
+            )
+
+        def load_result(connection_id: UUID) -> subprocess.CompletedProcess[str]:
+            return _psql_result(
+                container,
+                _service(
+                    f"""
+                    select *
+                    from public.load_mercury_provider_credential_envelopes(
+                      '{context.tenant_id}',
+                      '{context.workspace_id}',
+                      '{AUTH_USER_ID}',
+                      '{connection_id}'
+                    );
+                    """
+                ),
+            )
+
+        # A normal pre-generation reconnect leaves finalized A in history while
+        # finalized B owns the newer revision and envelope on the reused target.
+        account_id = f"owner-upgrade-{uuid4()}"
+        attempt_a_id = uuid4()
+        attempt_b_id = uuid4()
+        envelope_a_id = uuid4()
+        envelope_b_id = uuid4()
+        target_id, revision_a = finalize_legacy_generation(
+            attempt_id=attempt_a_id,
+            proposed_target_id=uuid4(),
+            account_id=account_id,
+            envelope_id=envelope_a_id,
+        )
+        assert revision_a == 1
+        disconnect_and_complete(target_id)
+        reconnected_target_id, revision_b = finalize_legacy_generation(
+            attempt_id=attempt_b_id,
+            proposed_target_id=uuid4(),
+            account_id=account_id,
+            envelope_id=envelope_b_id,
+        )
+        assert reconnected_target_id == target_id
+        assert revision_b == 3
+
+        # Equal ownership ranks are not evidence. UUID ordering may make query
+        # output stable, but it must not choose either finalized attempt.
+        ambiguous_account_id = f"ambiguous-upgrade-{uuid4()}"
+        ambiguous_attempt_a_id = uuid4()
+        ambiguous_attempt_b_id = uuid4()
+        ambiguous_target_id, ambiguous_revision = finalize_legacy_generation(
+            attempt_id=ambiguous_attempt_a_id,
+            proposed_target_id=uuid4(),
+            account_id=ambiguous_account_id,
+            envelope_id=uuid4(),
+        )
+        _psql(
+            container,
+            _service(
+                f"""
+                update public.mercury_provider_oauth_attempts
+                set created_at = '2026-07-28T00:00:00+00:00',
+                    updated_at = '2026-07-28T00:10:00+00:00'
+                where id = '{ambiguous_attempt_a_id}';
+                insert into public.mercury_provider_oauth_attempts (
+                  id,
+                  tenant_id,
+                  workspace_id,
+                  auth_user_id,
+                  provider,
+                  environment,
+                  granted_permissions,
+                  status,
+                  provider_account_id,
+                  account_display_name,
+                  authorization_method,
+                  credential_envelopes,
+                  target_connection_id,
+                  target_revision,
+                  provider_revocation_required,
+                  created_at,
+                  updated_at
+                )
+                values (
+                  '{ambiguous_attempt_b_id}',
+                  '{context.tenant_id}',
+                  '{context.workspace_id}',
+                  '{AUTH_USER_ID}',
+                  'flowaccount',
+                  'sandbox',
+                  '{permissions}'::pg_catalog.jsonb,
+                  'finalized',
+                  '{ambiguous_account_id}',
+                  'FlowAccount Upgrade Company',
+                  'oauth2_pkce',
+                  '[]'::pg_catalog.jsonb,
+                  '{ambiguous_target_id}',
+                  {ambiguous_revision},
+                  false,
+                  '2026-07-28T00:00:00+00:00',
+                  '2026-07-28T00:10:00+00:00'
+                );
+                """
+            ),
+        )
+
+        # A ready target with only completed revoked history has no current
+        # generation owner and must not inherit that historical attempt.
+        absent_account_id = f"absent-upgrade-{uuid4()}"
+        revoked_attempt_id = uuid4()
+        absent_target_id, _ = finalize_legacy_generation(
+            attempt_id=revoked_attempt_id,
+            proposed_target_id=uuid4(),
+            account_id=absent_account_id,
+            envelope_id=uuid4(),
+        )
+        fail_attempt(revoked_attempt_id)
+        complete_attempt_revocation(revoked_attempt_id)
+        absent_envelope_id = uuid4()
+        _psql(
+            container,
+            _service(
+                f"""
+                select *
+                from public.save_mercury_provider_connection(
+                  '{absent_target_id}',
+                  '{context.tenant_id}',
+                  '{context.workspace_id}',
+                  '{AUTH_USER_ID}',
+                  'flowaccount',
+                  'sandbox',
+                  '{absent_account_id}',
+                  'FlowAccount Upgrade Company',
+                  'oauth2_pkce',
+                  '{permissions}'::pg_catalog.jsonb,
+                  'ready',
+                  3,
+                  '2026-07-28T00:15:00+00:00'::pg_catalog.timestamptz,
+                  {envelope(absent_envelope_id)}
+                );
+                """
+            ),
+        )
+
+        # A disconnected target with a current revocation obligation is owned
+        # only by its exact failed generation and is never acknowledged.
+        failed_account_id = f"failed-upgrade-{uuid4()}"
+        failed_attempt_id = uuid4()
+        failed_target_id, _ = finalize_legacy_generation(
+            attempt_id=failed_attempt_id,
+            proposed_target_id=uuid4(),
+            account_id=failed_account_id,
+            envelope_id=uuid4(),
+        )
+        fail_attempt(failed_attempt_id)
+
+        head_migration = MIGRATIONS[-1].read_text(encoding="utf-8")
+        _psql(container, head_migration)
+        _psql(container, head_migration)
+
+        upgraded = json.loads(
+            _psql(
+                container,
+                _service(
+                    f"""
+                    select pg_catalog.json_build_object(
+                      'owner', (
+                        select oauth_generation_id
+                        from public.mercury_provider_connections
+                        where id = '{target_id}'
+                      ),
+                      'attempt_a_acknowledged', (
+                        select acknowledged_at is not null
+                        from public.mercury_provider_oauth_attempts
+                        where id = '{attempt_a_id}'
+                      ),
+                      'attempt_b_acknowledged', (
+                        select acknowledged_at is not null
+                        from public.mercury_provider_oauth_attempts
+                        where id = '{attempt_b_id}'
+                      ),
+                      'ambiguous_owner', (
+                        select oauth_generation_id
+                        from public.mercury_provider_connections
+                        where id = '{ambiguous_target_id}'
+                      ),
+                      'ambiguous_readiness', (
+                        select readiness
+                        from public.mercury_provider_connections
+                        where id = '{ambiguous_target_id}'
+                      ),
+                      'ambiguous_acknowledged', (
+                        select pg_catalog.count(*)
+                        from public.mercury_provider_oauth_attempts
+                        where id in (
+                          '{ambiguous_attempt_a_id}',
+                          '{ambiguous_attempt_b_id}'
+                        )
+                          and acknowledged_at is not null
+                      ),
+                      'absent_owner', (
+                        select oauth_generation_id
+                        from public.mercury_provider_connections
+                        where id = '{absent_target_id}'
+                      ),
+                      'absent_readiness', (
+                        select readiness
+                        from public.mercury_provider_connections
+                        where id = '{absent_target_id}'
+                      ),
+                      'revoked_acknowledged', (
+                        select acknowledged_at is not null
+                        from public.mercury_provider_oauth_attempts
+                        where id = '{revoked_attempt_id}'
+                      ),
+                      'failed_owner', (
+                        select oauth_generation_id
+                        from public.mercury_provider_connections
+                        where id = '{failed_target_id}'
+                      ),
+                      'failed_acknowledged', (
+                        select acknowledged_at is not null
+                        from public.mercury_provider_oauth_attempts
+                        where id = '{failed_attempt_id}'
+                      )
+                    )::pg_catalog.text;
+                    """
+                ),
+            )
+        )
+        assert upgraded == {
+            "owner": str(attempt_b_id),
+            "attempt_a_acknowledged": False,
+            "attempt_b_acknowledged": True,
+            "ambiguous_owner": None,
+            "ambiguous_readiness": "requires_validation",
+            "ambiguous_acknowledged": 0,
+            "absent_owner": None,
+            "absent_readiness": "requires_validation",
+            "revoked_acknowledged": False,
+            "failed_owner": str(failed_attempt_id),
+            "failed_acknowledged": False,
+        }
+
+        for held_target_id in (ambiguous_target_id, absent_target_id):
+            assert listed_count(held_target_id) == 0
+            _assert_secret_safe_error(
+                load_result(held_target_id),
+                "provider_connection_not_found",
+            )
+
+        # Once B is a valid acknowledged owner, migration replay must not
+        # replace it or acknowledge another same-target finalized row.
+        contender_id = uuid4()
+        _psql(
+            container,
+            _service(
+                f"""
+                insert into public.mercury_provider_oauth_attempts (
+                  id,
+                  tenant_id,
+                  workspace_id,
+                  auth_user_id,
+                  provider,
+                  environment,
+                  granted_permissions,
+                  status,
+                  provider_account_id,
+                  account_display_name,
+                  authorization_method,
+                  credential_envelopes,
+                  material_revision,
+                  target_connection_id,
+                  target_revision,
+                  acknowledged_at,
+                  provider_revocation_required,
+                  created_at,
+                  updated_at
+                )
+                values (
+                  '{contender_id}',
+                  '{context.tenant_id}',
+                  '{context.workspace_id}',
+                  '{AUTH_USER_ID}',
+                  'flowaccount',
+                  'sandbox',
+                  '{permissions}'::pg_catalog.jsonb,
+                  'finalized',
+                  '{account_id}',
+                  'FlowAccount Upgrade Company',
+                  'oauth2_pkce',
+                  '[]'::pg_catalog.jsonb,
+                  1,
+                  '{target_id}',
+                  {revision_b},
+                  null,
+                  false,
+                  '2026-07-28T00:20:00+00:00',
+                  '2026-07-28T00:20:00+00:00'
+                );
+                """
+            ),
+        )
+        _psql(container, head_migration)
+        preserved = json.loads(
+            _psql(
+                container,
+                _service(
+                    f"""
+                    select pg_catalog.json_build_object(
+                      'owner', connection.oauth_generation_id,
+                      'owner_acknowledged', owner.acknowledged_at is not null,
+                      'contender_acknowledged', contender.acknowledged_at is not null
+                    )::pg_catalog.text
+                    from public.mercury_provider_connections as connection
+                    join public.mercury_provider_oauth_attempts as owner
+                      on owner.id = connection.oauth_generation_id
+                    join public.mercury_provider_oauth_attempts as contender
+                      on contender.id = '{contender_id}'
+                    where connection.id = '{target_id}';
+                    """
+                ),
+            )
+        )
+        assert preserved == {
+            "owner": str(attempt_b_id),
+            "owner_acknowledged": True,
+            "contender_acknowledged": False,
+        }
+
+        fail_attempt(attempt_b_id)
+        quarantined = json.loads(
+            _psql(
+                container,
+                _service(
+                    f"""
+                    select pg_catalog.json_build_object(
+                      'readiness', connection.readiness,
+                      'revocation', connection.provider_revocation_required,
+                      'connection_envelopes', connection.credential_envelope_ids,
+                      'persisted_envelopes', (
+                        select pg_catalog.count(*)
+                        from public.mercury_provider_credential_envelopes
+                        where connection_id = connection.id
+                      ),
+                      'attempt_status', attempt.status,
+                      'retained_envelope', attempt.credential_envelopes -> 0 ->> 'id'
+                    )::pg_catalog.text
+                    from public.mercury_provider_connections as connection
+                    join public.mercury_provider_oauth_attempts as attempt
+                      on attempt.id = '{attempt_b_id}'
+                    where connection.id = '{target_id}';
+                    """
+                ),
+            )
+        )
+        assert quarantined == {
+            "readiness": "disconnected",
+            "revocation": True,
+            "connection_envelopes": [],
+            "persisted_envelopes": 0,
+            "attempt_status": "failed",
+            "retained_envelope": str(envelope_b_id),
+        }
+        assert listed_count(target_id) == 0
+        _assert_secret_safe_error(
+            load_result(target_id),
+            "provider_connection_not_found",
+        )
+    finally:
+        _docker("rm", "-f", container, check=False)

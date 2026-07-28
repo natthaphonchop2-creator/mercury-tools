@@ -1345,7 +1345,13 @@ def test_oauth_generation_migration_adds_hold_ack_refresh_and_upgrade_guards() -
     assert "'oauth-pending-' || connection.id::pg_catalog.text" in sql
     assert "'requires_validation'," in sql
     assert "set readiness = 'ready'" in sql
-    assert "connection.readiness = 'ready'" in sql
+    assert "selected_candidates as materialized" in sql
+    assert "candidate.ownership_rank_size = 1" in sql
+    assert "from selected_candidates as selected" in sql
+    assert "left join selected_candidates as selected" in sql
+    assert "target.readiness = 'ready'" in sql
+    assert "mercury_provider_oauth_attempts_target_connection_idx" in sql
+    assert "where history.target_connection_id = connection.id" in sql
     assert "connection.oauth_generation_id is null" in sql
     assert "drop table" not in sql
     assert "truncate" not in sql
