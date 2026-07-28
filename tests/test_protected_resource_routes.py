@@ -41,6 +41,12 @@ class ConfiguredProviderOAuthService:
 
 
 class PrincipalCloudDependencies:
+    def __init__(self) -> None:
+        self.provider_oauth_service = ConfiguredProviderOAuthService()
+
+    async def flowaccount_oauth_callback(self, _request: Request) -> JSONResponse:
+        raise AssertionError("callback is not exercised by this dependency stub")
+
     async def list_actions(self, request: Request) -> JSONResponse:
         principal = request.state.mercury_principal
         return JSONResponse({"subject": str(principal.subject)})
@@ -78,6 +84,7 @@ def _v1_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         "MERCURY_V1_ENABLED": "true",
         "MERCURY_CANONICAL_MCP_RESOURCE": CANONICAL_MCP_RESOURCE,
         "SUPABASE_URL": "https://vbnlkqvauqwnjbxngkas.supabase.co",
+        "SUPABASE_SERVICE_ROLE_KEY": "service-role-test",
         "SUPABASE_AUTH_ISSUER": AUTHORIZATION_SERVER,
         "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_test",
         "SUPABASE_JWKS_URL": f"{AUTHORIZATION_SERVER}/.well-known/jwks.json",
@@ -86,6 +93,12 @@ def _v1_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         "MERCURY_VAULT_ACTIVE_KEY_VERSION": "v1",
         "FLOWACCOUNT_MCP_SANDBOX_URL": "https://flowaccount-sandbox.example/mcp",
         "FLOWACCOUNT_MCP_PRODUCTION_URL": "https://flowaccount.example/mcp",
+        "FLOWACCOUNT_OAUTH_SANDBOX_AUTHORIZATION_SERVER_ORIGIN": (
+            "https://identity-sandbox.flowaccount.example"
+        ),
+        "FLOWACCOUNT_OAUTH_PRODUCTION_AUTHORIZATION_SERVER_ORIGIN": (
+            "https://identity.flowaccount.example"
+        ),
         "PEAK_MCP_UAT_URL": "https://peak-uat.example/mcp",
         "PEAK_MCP_PRODUCTION_URL": "https://peak.example/mcp",
         "MERCURY_PROVIDER_CALLBACK_BASE_URL": "https://mercury-tools-mcp.onrender.com",
@@ -115,12 +128,60 @@ def _principal() -> MercuryPrincipal:
     )
 
 
-def test_v1_default_http_app_requires_explicit_provider_oauth_service() -> None:
+def test_v1_default_http_app_builds_and_runs_production_oauth_composition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    events: list[str] = []
+
+    class Composition:
+        provider_oauth_service = ConfiguredProviderOAuthService()
+
+        async def startup(self) -> None:
+            events.append("startup")
+
+        async def aclose(self) -> None:
+            events.append("close")
+
+    def build(*, settings, principal_resolver):
+        assert settings.v1_enabled is True
+        assert isinstance(principal_resolver, StubResolver)
+        events.append("build")
+        return Composition()
+
+    monkeypatch.setattr(server, "build_provider_oauth_production_composition", build)
+    app = create_http_app(principal_resolver=StubResolver(_principal()))
+
+    assert FLOWACCOUNT_CALLBACK_PATH in {getattr(route, "path", None) for route in app.routes}
+    with TestClient(app):
+        assert events == ["build", "startup"]
+    assert events == ["build", "startup", "close"]
+
+
+def test_v1_custom_cloud_dependencies_cannot_bypass_oauth_validation() -> None:
     with pytest.raises(
         V1ConfigurationError,
         match="v1_provider_oauth_service_missing",
     ):
-        create_http_app(principal_resolver=StubResolver(_principal()))
+        create_http_app(
+            principal_resolver=StubResolver(_principal()),
+            cloud_dependencies=object(),
+        )
+
+    incomplete_dependencies = type(
+        "IncompleteDependencies",
+        (),
+        {"provider_oauth_service": ConfiguredProviderOAuthService()},
+    )()
+    with pytest.raises(
+        V1ConfigurationError,
+        match="v1_cloud_dependencies_invalid",
+    ):
+        create_http_app(
+            principal_resolver=StubResolver(_principal()),
+            cloud_dependencies=incomplete_dependencies,
+        )
 
     with pytest.raises(
         V1ConfigurationError,
@@ -130,13 +191,6 @@ def test_v1_default_http_app_requires_explicit_provider_oauth_service() -> None:
             principal_resolver=StubResolver(_principal()),
             provider_oauth_service=object(),
         )
-
-    app = create_http_app(
-        principal_resolver=StubResolver(_principal()),
-        provider_oauth_service=ConfiguredProviderOAuthService(),
-    )
-
-    assert FLOWACCOUNT_CALLBACK_PATH in {getattr(route, "path", None) for route in app.routes}
 
 
 def test_two_live_v1_apps_reject_contradictory_configuration_without_mutation(
@@ -155,13 +209,17 @@ def test_two_live_v1_apps_reject_contradictory_configuration_without_mutation(
         cloud_dependencies=PrincipalCloudDependencies(),
     )
 
-    with TestClient(first_app, raise_server_exceptions=False) as first_client:
+    with (
+        TestClient(first_app, raise_server_exceptions=False) as first_client,
+        TestClient(second_app, raise_server_exceptions=False) as second_client,
+    ):
         assert registered_tool is not None
         for app in (first_app, second_app):
             assert any(
                 middleware.cls is MercuryOAuthMiddleware for middleware in app.user_middleware
             )
         assert first_client.get("/mcp").status_code == 401
+        assert second_client.get("/mcp").status_code == 401
         assert "get_mercury_context" in {tool.name for tool in asyncio.run(mcp.list_tools())}
 
         monkeypatch.setenv("MERCURY_V1_ENABLED", "false")
@@ -179,6 +237,7 @@ def test_two_live_v1_apps_reject_contradictory_configuration_without_mutation(
             )
         assert "get_mercury_context" in {tool.name for tool in asyncio.run(mcp.list_tools())}
         assert first_client.get("/mcp").status_code == 401
+        assert second_client.get("/mcp").status_code == 401
 
 
 def test_missing_or_invalid_bearer_returns_rfc_9728_challenge() -> None:

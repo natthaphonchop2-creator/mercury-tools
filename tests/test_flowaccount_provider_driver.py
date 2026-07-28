@@ -158,6 +158,19 @@ def _profile_binding(
     return _binding("provider_profile.get", provider_tool)
 
 
+def _registry_dependencies() -> dict[str, object]:
+    return {
+        "header_factories": {
+            AuthorizationMethod.OAUTH2_PKCE: lambda _connection: None,
+        },
+        "binding_verifier": lambda _connection, _binding, _resource_hash: None,
+        "response_normalizer": lambda _binding, _content: None,
+        "request_model_resolver": lambda _binding: FlowAccountProfileRequest,
+        "response_model_resolver": lambda _binding: FlowAccountProfile,
+        "flowaccount_profile_binding_resolver": _profile_binding,
+    }
+
+
 @pytest.mark.asyncio
 async def test_flowaccount_driver_maps_manifest_discovery_and_exact_profile_validation() -> None:
     runtime = FakeRuntime()
@@ -451,14 +464,33 @@ def test_registry_can_wrap_only_flowaccount_with_task6_profile_validation() -> N
     registry = build_provider_registry(
         settings=settings,
         manifest_root=ROOT / "catalog/global",
-        flowaccount_profile_binding_resolver=_profile_binding,
+        **_registry_dependencies(),
     )
 
     assert isinstance(registry.get("flowaccount"), FlowAccountMCPDriver)
     assert not isinstance(registry.get("peak"), FlowAccountMCPDriver)
 
 
-def test_registry_fails_closed_without_flowaccount_profile_binding_wiring() -> None:
+@pytest.mark.parametrize(
+    ("dependency", "invalid_value"),
+    [
+        ("header_factories", {}),
+        (
+            "header_factories",
+            {AuthorizationMethod.OAUTH2_PKCE: "not-callable"},
+        ),
+        ("binding_verifier", None),
+        ("binding_verifier", 7),
+        ("response_normalizer", object()),
+        ("request_model_resolver", "not-callable"),
+        ("response_model_resolver", None),
+        ("flowaccount_profile_binding_resolver", object()),
+    ],
+)
+def test_registry_fails_closed_for_incomplete_or_noncallable_flowaccount_wiring(
+    dependency: str,
+    invalid_value: object,
+) -> None:
     settings = __import__("mercury_tools.config", fromlist=["Settings"]).Settings(
         supabase_url="",
         supabase_service_role_key="",
@@ -468,14 +500,17 @@ def test_registry_fails_closed_without_flowaccount_profile_binding_wiring() -> N
         peak_mcp_uat_url="https://peak-uat.example/mcp",
         peak_mcp_production_url="https://peak.example/mcp",
     )
+    dependencies = _registry_dependencies()
+    dependencies[dependency] = invalid_value
 
     with pytest.raises(
         ProviderRegistryError,
-        match="^flowaccount_profile_binding_resolver_missing$",
+        match="^flowaccount_runtime_dependencies_invalid$",
     ):
         build_provider_registry(
             settings=settings,
             manifest_root=ROOT / "catalog/global",
+            **dependencies,
         )
 
 

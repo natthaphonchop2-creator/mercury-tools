@@ -20,6 +20,7 @@ MIGRATIONS = (
     ROOT / "supabase/migrations/20260726100000_mercury_v1_identity.sql",
     ROOT / "supabase/migrations/20260726101000_mercury_v1_provider_connections.sql",
     ROOT / "supabase/migrations/20260726102000_mercury_v1_credential_vault.sql",
+    ROOT / "supabase/migrations/20260727100000_mercury_v1_provider_oauth_cleanup.sql",
 )
 AUTH_USER_ID = UUID("33333333-3333-4333-8333-333333333333")
 OTHER_AUTH_USER_ID = UUID("44444444-4444-4444-8444-444444444444")
@@ -524,6 +525,178 @@ def test_oauth_setup_attempt_is_claimed_once_under_concurrent_replay(
         )
         == "1"
     )
+
+
+def test_oauth_state_consume_and_cancel_are_atomic_under_concurrency(
+    postgres_context: PostgresContext,
+) -> None:
+    attempt_id = uuid4()
+    state_id = uuid4()
+    state_hash = uuid4().hex * 2
+    _psql(
+        postgres_context.container,
+        _authenticated(
+            _create_setup_sql(
+                postgres_context,
+                attempt_id=attempt_id,
+                token_hash=uuid4().hex * 2,
+            )
+        ),
+    )
+    _psql(
+        postgres_context.container,
+        _authenticated(
+            _create_oauth_sql(
+                postgres_context,
+                state_id=state_id,
+                attempt_id=attempt_id,
+                state_hash=state_hash,
+            )
+        ),
+    )
+    barrier = threading.Barrier(2)
+    calls = (
+        _authenticated(
+            f"""
+            select oauth_state_id
+            from public.consume_mercury_provider_oauth_state(
+              '{postgres_context.tenant_id}',
+              '{postgres_context.workspace_id}',
+              '{AUTH_USER_ID}',
+              'flowaccount',
+              'sandbox',
+              '{state_hash}'
+            );
+            """
+        ),
+        _authenticated(
+            f"""
+            select oauth_state_id
+            from public.cancel_mercury_provider_oauth_state(
+              '{postgres_context.tenant_id}',
+              '{postgres_context.workspace_id}',
+              '{AUTH_USER_ID}',
+              'flowaccount',
+              'sandbox',
+              '{state_hash}'
+            );
+            """
+        ),
+    )
+
+    def invoke(sql: str) -> subprocess.CompletedProcess[str]:
+        barrier.wait()
+        return _psql_result(postgres_context.container, sql)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(invoke, calls))
+
+    successes = [result for result in results if result.returncode == 0]
+    failures = [result for result in results if result.returncode != 0]
+    assert len(successes) == len(failures) == 1
+    _assert_secret_safe_error(failures[0], "provider_oauth_state_invalid")
+    persisted = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(
+                f"""
+                select pg_catalog.json_build_object(
+                  'consumed', state.consumed_at is not null,
+                  'ciphertext_cleared', state.pkce_verifier_ciphertext is null,
+                  'key_version_cleared', state.pkce_key_version is null,
+                  'nonce_cleared', state.pkce_nonce is null,
+                  'aad_hash_cleared', state.pkce_aad_hash is null
+                )::pg_catalog.text
+                from public.mercury_provider_oauth_states as state
+                where state.id = '{state_id}';
+                """
+            ),
+        )
+    )
+    assert persisted == {
+        "consumed": True,
+        "ciphertext_cleared": True,
+        "key_version_cleared": True,
+        "nonce_cleared": True,
+        "aad_hash_cleared": True,
+    }
+
+
+def test_expired_oauth_cleanup_clears_unconsumed_verifier_material(
+    postgres_context: PostgresContext,
+) -> None:
+    attempt_id = uuid4()
+    state_id = uuid4()
+    state_hash = uuid4().hex * 2
+    _psql(
+        postgres_context.container,
+        _authenticated(
+            _create_setup_sql(
+                postgres_context,
+                attempt_id=attempt_id,
+                token_hash=uuid4().hex * 2,
+            )
+        ),
+    )
+    _psql(
+        postgres_context.container,
+        _authenticated(
+            _create_oauth_sql(
+                postgres_context,
+                state_id=state_id,
+                attempt_id=attempt_id,
+                state_hash=state_hash,
+            )
+        ),
+    )
+    _psql(
+        postgres_context.container,
+        _service(
+            f"""
+            update public.mercury_provider_oauth_states
+            set created_at = pg_catalog.statement_timestamp() - interval '2 minutes',
+                expires_at = pg_catalog.statement_timestamp() - interval '1 minute'
+            where id = '{state_id}';
+            """
+        ),
+    )
+
+    cleaned = _psql(
+        postgres_context.container,
+        _service(
+            """
+            select cleaned_count
+            from public.cleanup_expired_mercury_provider_oauth_states(100);
+            """
+        ),
+    )
+    persisted = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(
+                f"""
+                select pg_catalog.json_build_object(
+                  'consumed', state.consumed_at is not null,
+                  'ciphertext_cleared', state.pkce_verifier_ciphertext is null,
+                  'key_version_cleared', state.pkce_key_version is null,
+                  'nonce_cleared', state.pkce_nonce is null,
+                  'aad_hash_cleared', state.pkce_aad_hash is null
+                )::pg_catalog.text
+                from public.mercury_provider_oauth_states as state
+                where state.id = '{state_id}';
+                """
+            ),
+        )
+    )
+
+    assert cleaned == "1"
+    assert persisted == {
+        "consumed": True,
+        "ciphertext_cleared": True,
+        "key_version_cleared": True,
+        "nonce_cleared": True,
+        "aad_hash_cleared": True,
+    }
 
 
 def test_authenticated_cannot_persist_load_or_disconnect_credentials(

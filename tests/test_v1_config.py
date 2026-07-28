@@ -18,6 +18,7 @@ V1_ENVIRONMENT_VARIABLES = (
     "MERCURY_V1_ENABLED",
     "MERCURY_CANONICAL_MCP_RESOURCE",
     "SUPABASE_URL",
+    "SUPABASE_SERVICE_ROLE_KEY",
     "SUPABASE_AUTH_ISSUER",
     "SUPABASE_PUBLISHABLE_KEY",
     "SUPABASE_JWKS_URL",
@@ -28,6 +29,8 @@ V1_ENVIRONMENT_VARIABLES = (
     "MERCURY_VAULT_PREVIOUS_KEY_VERSION",
     "FLOWACCOUNT_MCP_SANDBOX_URL",
     "FLOWACCOUNT_MCP_PRODUCTION_URL",
+    "FLOWACCOUNT_OAUTH_SANDBOX_AUTHORIZATION_SERVER_ORIGIN",
+    "FLOWACCOUNT_OAUTH_PRODUCTION_AUTHORIZATION_SERVER_ORIGIN",
     "PEAK_MCP_UAT_URL",
     "PEAK_MCP_PRODUCTION_URL",
     "MERCURY_PROVIDER_CALLBACK_BASE_URL",
@@ -47,11 +50,10 @@ def _enable_valid_v1_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "MERCURY_V1_ENABLED": "true",
         "MERCURY_CANONICAL_MCP_RESOURCE": CANONICAL_MCP_RESOURCE,
         "SUPABASE_URL": "https://project.supabase.co",
+        "SUPABASE_SERVICE_ROLE_KEY": "service-role-test",
         "SUPABASE_AUTH_ISSUER": "https://project.supabase.co/auth/v1",
         "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_test",
-        "SUPABASE_JWKS_URL": (
-            "https://project.supabase.co/auth/v1/.well-known/jwks.json"
-        ),
+        "SUPABASE_JWKS_URL": ("https://project.supabase.co/auth/v1/.well-known/jwks.json"),
         "SUPABASE_JWT_AUDIENCE": CANONICAL_MCP_RESOURCE,
         "MERCURY_VAULT_ACTIVE_KEY": active_key,
         "MERCURY_VAULT_ACTIVE_KEY_VERSION": "v1",
@@ -59,6 +61,12 @@ def _enable_valid_v1_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "MERCURY_VAULT_PREVIOUS_KEY_VERSION": "v0",
         "FLOWACCOUNT_MCP_SANDBOX_URL": "https://flowaccount-sandbox.example.com/mcp",
         "FLOWACCOUNT_MCP_PRODUCTION_URL": "https://flowaccount.example.com/mcp",
+        "FLOWACCOUNT_OAUTH_SANDBOX_AUTHORIZATION_SERVER_ORIGIN": (
+            "https://identity-sandbox.flowaccount.example.com"
+        ),
+        "FLOWACCOUNT_OAUTH_PRODUCTION_AUTHORIZATION_SERVER_ORIGIN": (
+            "https://identity.flowaccount.example.com"
+        ),
         "PEAK_MCP_UAT_URL": "https://peak-uat.example.com/mcp",
         "PEAK_MCP_PRODUCTION_URL": "https://peak.example.com/mcp",
         "MERCURY_PROVIDER_CALLBACK_BASE_URL": "https://mercury.example.com",
@@ -179,6 +187,15 @@ def test_v1_supabase_data_api_must_match_auth_issuer_origin(
     assert "attacker.supabase.co" not in repr(exc_info.value)
 
 
+def test_v1_requires_service_role_for_durable_provider_stores(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_valid_v1_environment(monkeypatch)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY")
+
+    _assert_v1_error(monkeypatch, code="v1_service_role_key_missing")
+
+
 @pytest.mark.parametrize(
     ("name", "invalid_url"),
     [
@@ -208,6 +225,56 @@ def test_provider_endpoint_overrides_are_server_only_https_urls(
     _assert_v1_error(monkeypatch, code="v1_provider_url_invalid")
 
 
+@pytest.mark.parametrize(
+    ("name", "value", "code"),
+    [
+        (
+            "FLOWACCOUNT_OAUTH_SANDBOX_AUTHORIZATION_SERVER_ORIGIN",
+            None,
+            "v1_flowaccount_authorization_server_origin_missing",
+        ),
+        (
+            "FLOWACCOUNT_OAUTH_PRODUCTION_AUTHORIZATION_SERVER_ORIGIN",
+            "https://identity.flowaccount.example.com/oauth",
+            "v1_flowaccount_authorization_server_origin_invalid",
+        ),
+        (
+            "FLOWACCOUNT_OAUTH_PRODUCTION_AUTHORIZATION_SERVER_ORIGIN",
+            "http://identity.flowaccount.example.com",
+            "v1_flowaccount_authorization_server_origin_invalid",
+        ),
+    ],
+)
+def test_flowaccount_authorization_server_origins_are_explicit_clean_origins(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str | None,
+    code: str,
+) -> None:
+    _enable_valid_v1_environment(monkeypatch)
+    if value is None:
+        monkeypatch.delenv(name)
+    else:
+        monkeypatch.setenv(name, value)
+
+    _assert_v1_error(monkeypatch, code=code)
+
+
+def test_provider_callback_base_is_an_exact_https_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_valid_v1_environment(monkeypatch)
+    monkeypatch.setenv(
+        "MERCURY_PROVIDER_CALLBACK_BASE_URL",
+        "https://mercury.example.com/oauth",
+    )
+
+    _assert_v1_error(
+        monkeypatch,
+        code="v1_provider_callback_base_url_invalid",
+    )
+
+
 def test_v1_preview_ttl_is_exactly_thirty_minutes() -> None:
     assert V1_VERSION == "1.0.0"
     assert CANONICAL_MCP_RESOURCE == "https://mercury-tools-mcp.onrender.com/mcp"
@@ -221,16 +288,19 @@ def test_publishable_key_is_loaded_and_declared_without_literal_value(
     _enable_valid_v1_environment(monkeypatch)
 
     settings = load_settings()
-    render = yaml.safe_load(
-        (Path(__file__).resolve().parents[1] / "render.yaml").read_text()
-    )
-    env_vars = {
-        item["key"]: item
-        for item in render["services"][0]["envVars"]
-    }
+    render = yaml.safe_load((Path(__file__).resolve().parents[1] / "render.yaml").read_text())
+    env_vars = {item["key"]: item for item in render["services"][0]["envVars"]}
 
     assert settings.supabase_publishable_key == "sb_publishable_test"
     assert env_vars["SUPABASE_PUBLISHABLE_KEY"] == {
         "key": "SUPABASE_PUBLISHABLE_KEY",
         "sync": False,
     }
+    for name in (
+        "FLOWACCOUNT_OAUTH_SANDBOX_AUTHORIZATION_SERVER_ORIGIN",
+        "FLOWACCOUNT_OAUTH_PRODUCTION_AUTHORIZATION_SERVER_ORIGIN",
+    ):
+        assert env_vars[name] == {
+            "key": name,
+            "sync": False,
+        }

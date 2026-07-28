@@ -38,6 +38,10 @@ services:
         sync: false
       - key: FLOWACCOUNT_MCP_PRODUCTION_URL
         sync: false
+      - key: FLOWACCOUNT_OAUTH_SANDBOX_AUTHORIZATION_SERVER_ORIGIN
+        sync: false
+      - key: FLOWACCOUNT_OAUTH_PRODUCTION_AUTHORIZATION_SERVER_ORIGIN
+        sync: false
       - key: PEAK_MCP_UAT_URL
         sync: false
       - key: PEAK_MCP_PRODUCTION_URL

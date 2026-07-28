@@ -64,8 +64,19 @@ def build_provider_registry(
 ) -> ProviderDriverRegistry:
     """Load the two server-controlled manifests without accepting resource URLs."""
 
-    if flowaccount_profile_binding_resolver is None:
-        raise ProviderRegistryError("flowaccount_profile_binding_resolver_missing")
+    if not isinstance(header_factories, Mapping):
+        raise ProviderRegistryError("flowaccount_runtime_dependencies_invalid")
+    flowaccount_header_factory = header_factories.get(AuthorizationMethod.OAUTH2_PKCE)
+    required_callables = (
+        flowaccount_header_factory,
+        binding_verifier,
+        response_normalizer,
+        request_model_resolver,
+        response_model_resolver,
+        flowaccount_profile_binding_resolver,
+    )
+    if not all(callable(dependency) for dependency in required_callables):
+        raise ProviderRegistryError("flowaccount_runtime_dependencies_invalid")
 
     def provider_scoped_normalizer(binding, structured_content):
         if (
@@ -78,7 +89,7 @@ def build_provider_registry(
         return response_normalizer(binding, structured_content)
 
     root = Path(manifest_root)
-    factories = dict(header_factories or {})
+    factories = dict(header_factories)
     registry = ProviderDriverRegistry()
     for provider in (ProviderId.FLOWACCOUNT, ProviderId.PEAK):
         manifest = load_provider_manifest(root / provider.value / "driver.json")

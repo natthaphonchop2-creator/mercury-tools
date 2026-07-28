@@ -14,6 +14,9 @@ CONNECTION_MIGRATION = (
     ROOT / "supabase/migrations/20260726101000_mercury_v1_provider_connections.sql"
 )
 VAULT_MIGRATION = ROOT / "supabase/migrations/20260726102000_mercury_v1_credential_vault.sql"
+OAUTH_CLEANUP_MIGRATION = (
+    ROOT / "supabase/migrations/20260727100000_mercury_v1_provider_oauth_cleanup.sql"
+)
 
 TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
 OTHER_TENANT_ID = UUID("22222222-2222-4222-8222-222222222222")
@@ -498,6 +501,47 @@ def test_disconnect_deletes_usable_envelope_material_idempotently() -> None:
     assert summaries[0].revision == 2
 
 
+def test_revocation_marker_clears_only_after_atomic_disconnection() -> None:
+    from mercury_tools.providers.models import ConnectionReadiness
+    from mercury_tools.providers.store import ProviderStoreError
+
+    store = _store()
+    _save_connection(store)
+
+    with pytest.raises(ProviderStoreError, match="^provider_connection_invalid$"):
+        store.complete_revocation(
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=AUTH_USER_ID,
+            connection_id=CONNECTION_ID,
+        )
+
+    store.disconnect(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=AUTH_USER_ID,
+        connection_id=CONNECTION_ID,
+        provider_revocation_required=True,
+    )
+    completed = store.complete_revocation(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=AUTH_USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    summary = store.list_for_workspace(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=AUTH_USER_ID,
+    )[0]
+
+    assert completed.provider_revocation_required is False
+    assert completed.deleted_envelope_count == 0
+    assert summary.readiness is ConnectionReadiness.DISCONNECTED
+    assert summary.provider_revocation_required is False
+    assert store._envelopes == {}
+
+
 def test_reconnect_reactivates_only_the_same_disconnected_connection_id() -> None:
     from mercury_tools.providers.models import ConnectionReadiness
     from mercury_tools.providers.store import ProviderStoreError
@@ -792,9 +836,47 @@ def test_migrations_expose_no_public_mcp_tool_or_ambient_workspace_contract() ->
 
 
 def test_migrations_use_valid_pg_catalog_type_names_for_postgres_17() -> None:
-    combined = f"{_normalized_sql(CONNECTION_MIGRATION)} {_normalized_sql(VAULT_MIGRATION)}"
+    combined = " ".join(
+        _normalized_sql(path)
+        for path in (
+            CONNECTION_MIGRATION,
+            VAULT_MIGRATION,
+            OAUTH_CLEANUP_MIGRATION,
+        )
+    )
 
     assert not re.search(r"pg_catalog\.(boolean|integer|bigint)\b", combined)
     for type_name in ("bool", "int4", "int8"):
         assert f"pg_catalog.{type_name}" in combined
     assert "pkce_key_version pg_catalog.text" in combined
+
+
+def test_oauth_cleanup_migration_has_atomic_cancel_cleanup_and_revocation_rpcs() -> None:
+    sql = _normalized_sql(OAUTH_CLEANUP_MIGRATION)
+
+    for function_name in (
+        "cancel_mercury_provider_oauth_state",
+        "cleanup_expired_mercury_provider_oauth_states",
+        "complete_mercury_provider_revocation",
+    ):
+        assert f"create or replace function public.{function_name}(" in sql
+        assert re.search(
+            rf"grant execute on function public\.{function_name}\([^;]*\) "
+            rf"to {'authenticated' if function_name.startswith('cancel_') else 'service_role'};",
+            sql,
+        )
+
+    assert sql.count("for update") >= 2
+    assert "for update skip locked" in sql
+    for column in (
+        "pkce_verifier_ciphertext",
+        "pkce_key_version",
+        "pkce_nonce",
+        "pkce_aad_hash",
+    ):
+        assert f"{column} = null" in sql
+    assert "readiness <> 'disconnected'" in sql
+    assert "credential_envelope_ids <> '{}'::pg_catalog.uuid[]" in sql
+    assert "provider_revocation_required = false" in sql
+    assert "drop table" not in sql
+    assert "truncate" not in sql

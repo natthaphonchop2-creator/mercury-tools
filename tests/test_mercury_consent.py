@@ -83,6 +83,7 @@ def _v1_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         "MERCURY_V1_ENABLED": "true",
         "MERCURY_CANONICAL_MCP_RESOURCE": CANONICAL_MCP_RESOURCE,
         "SUPABASE_URL": "https://vbnlkqvauqwnjbxngkas.supabase.co",
+        "SUPABASE_SERVICE_ROLE_KEY": "service-role-test",
         "SUPABASE_AUTH_ISSUER": AUTHORIZATION_SERVER,
         "SUPABASE_PUBLISHABLE_KEY": PUBLISHABLE_KEY,
         "SUPABASE_JWKS_URL": f"{AUTHORIZATION_SERVER}/.well-known/jwks.json",
@@ -91,6 +92,12 @@ def _v1_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         "MERCURY_VAULT_ACTIVE_KEY_VERSION": "v1",
         "FLOWACCOUNT_MCP_SANDBOX_URL": "https://flowaccount-sandbox.example/mcp",
         "FLOWACCOUNT_MCP_PRODUCTION_URL": "https://flowaccount.example/mcp",
+        "FLOWACCOUNT_OAUTH_SANDBOX_AUTHORIZATION_SERVER_ORIGIN": (
+            "https://identity-sandbox.flowaccount.example"
+        ),
+        "FLOWACCOUNT_OAUTH_PRODUCTION_AUTHORIZATION_SERVER_ORIGIN": (
+            "https://identity.flowaccount.example"
+        ),
         "PEAK_MCP_UAT_URL": "https://peak-uat.example/mcp",
         "PEAK_MCP_PRODUCTION_URL": "https://peak.example/mcp",
         "MERCURY_PROVIDER_CALLBACK_BASE_URL": "https://mercury-tools-mcp.onrender.com",

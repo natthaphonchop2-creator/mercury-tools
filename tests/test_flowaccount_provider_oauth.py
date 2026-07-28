@@ -291,13 +291,19 @@ class RecordingConnectionStore:
     def __init__(self, store: ProviderConnectionStore) -> None:
         self.store = store
         self.saved: list[dict[str, object]] = []
+        self.events: list[str] = []
 
     def save_connection(self, **kwargs):
         self.saved.append(dict(kwargs))
         return self.store.save_connection(**kwargs)
 
     def disconnect(self, **kwargs):
+        self.events.append("disconnect")
         return self.store.disconnect(**kwargs)
+
+    def complete_revocation(self, **kwargs):
+        self.events.append("complete_revocation")
+        return self.store.complete_revocation(**kwargs)
 
 
 class SharedOAuthStateRPCBackend:
@@ -310,6 +316,8 @@ class SharedOAuthStateRPCBackend:
         self.authorization_headers: list[tuple[str, str]] = []
         self.consume_successes = 0
         self.consume_failures = 0
+        self.cancel_successes = 0
+        self.cancel_failures = 0
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content) if request.content else {}
@@ -321,6 +329,10 @@ class SharedOAuthStateRPCBackend:
             return self._create_state(payload)
         if path.endswith("/rpc/consume_mercury_provider_oauth_state"):
             return self._consume_state(payload)
+        if path.endswith("/rpc/cancel_mercury_provider_oauth_state"):
+            return self._cancel_state(payload)
+        if path.endswith("/rpc/cleanup_expired_mercury_provider_oauth_states"):
+            return self._cleanup_states(payload)
         if path.endswith("/mercury_provider_oauth_states"):
             return self._peek_state(request)
         return httpx.Response(404, json={"error": "unexpected"})
@@ -421,11 +433,55 @@ class SharedOAuthStateRPCBackend:
             self.consume_successes += 1
         return httpx.Response(200, json=[consumed])
 
+    def _cancel_state(self, payload: dict[str, object]) -> httpx.Response:
+        state_hash = str(payload["p_state_hash"])
+        with self._lock:
+            row = self.states.get(state_hash)
+            if (
+                row is None
+                or row["consumed_at"] is not None
+                or row["tenant_id"] != payload["p_tenant_id"]
+                or row["workspace_id"] != payload["p_workspace_id"]
+                or row["auth_user_id"] != payload["p_auth_user_id"]
+                or row["provider"] != payload["p_provider"]
+                or row["environment"] != payload["p_environment"]
+            ):
+                self.cancel_failures += 1
+                return httpx.Response(400, json={"message": "provider_oauth_state_invalid"})
+            row["consumed_at"] = NOW.isoformat()
+            row["pkce_verifier_ciphertext"] = None
+            row["pkce_key_version"] = None
+            row["pkce_nonce"] = None
+            row["pkce_aad_hash"] = None
+            self.cancel_successes += 1
+            result = {
+                "oauth_state_id": row["id"],
+                "callback_state": row["callback_state"],
+                "consumed_at": row["consumed_at"],
+            }
+        return httpx.Response(200, json=[result])
+
+    def _cleanup_states(self, payload: dict[str, object]) -> httpx.Response:
+        assert payload == {"p_limit": 100}
+        cleaned = 0
+        with self._lock:
+            for row in self.states.values():
+                expires_at = datetime.fromisoformat(str(row["expires_at"]))
+                if row["consumed_at"] is None and expires_at <= NOW:
+                    row["consumed_at"] = NOW.isoformat()
+                    row["pkce_verifier_ciphertext"] = None
+                    row["pkce_key_version"] = None
+                    row["pkce_nonce"] = None
+                    row["pkce_aad_hash"] = None
+                    cleaned += 1
+        return httpx.Response(200, json=[{"cleaned_count": cleaned}])
+
 
 def _service(
     *,
     clock: Callable[[], datetime] | None = None,
     driver: FakeFlowAccountDriver | None = None,
+    oauth_client: FakeOAuthClient | None = None,
 ) -> tuple[
     ProviderOAuthService,
     FakeOAuthClient,
@@ -442,7 +498,7 @@ def _service(
         clock=active_clock,
     )
     connection_store = RecordingConnectionStore(raw_store)
-    oauth_client = FakeOAuthClient()
+    oauth_client = oauth_client or FakeOAuthClient()
     provider_driver = driver or FakeFlowAccountDriver()
     service = ProviderOAuthService(
         settings=_settings(),
@@ -498,11 +554,13 @@ async def test_supabase_state_store_is_cross_instance_atomic_and_clears_verifier
             http_client=client,
             uuid_factory=lambda: attempt_id,
             callback_uri=CALLBACK_URI,
+            clock=lambda: NOW,
         )
         second = SupabaseProviderOAuthStateStore(
             settings=_settings(),
             http_client=client,
             callback_uri=CALLBACK_URI,
+            clock=lambda: NOW,
         )
         created = await first.create(
             tenant_id=TENANT_ID,
@@ -554,6 +612,142 @@ async def test_supabase_state_store_is_cross_instance_atomic_and_clears_verifier
         for path, authorization in backend.authorization_headers
         if path.endswith("/mercury_provider_oauth_states")
     )
+
+
+@pytest.mark.asyncio
+async def test_supabase_state_consume_and_cancel_are_one_atomic_terminal_transition() -> None:
+    backend = SharedOAuthStateRPCBackend()
+    state_id = UUID("77777777-7777-4777-8777-777777777778")
+    state_hash = "b" * 64
+    vault = _vault()
+    encrypted = vault.seal(
+        CredentialBinding(
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=USER_ID,
+            connection_id=state_id,
+            provider="flowaccount",
+            company_or_merchant_id="oauth-state",
+            environment="sandbox",
+            credential_type="oauth_state",
+        ),
+        b"ENCRYPTED_STATE_PLAINTEXT_SENTINEL",
+    ).model_copy(update={"id": state_id})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(backend),
+        follow_redirects=False,
+    ) as client:
+        first = SupabaseProviderOAuthStateStore(
+            settings=_settings(),
+            http_client=client,
+            uuid_factory=lambda: UUID("88888888-8888-4888-8888-888888888889"),
+            callback_uri=CALLBACK_URI,
+            clock=lambda: NOW,
+        )
+        second = SupabaseProviderOAuthStateStore(
+            settings=_settings(),
+            http_client=client,
+            callback_uri=CALLBACK_URI,
+            clock=lambda: NOW,
+        )
+        await first.create(
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=USER_ID,
+            provider=ProviderId.FLOWACCOUNT,
+            environment="sandbox",
+            state_hash=state_hash,
+            callback_uri=CALLBACK_URI,
+            requested_permissions=("documents.read", "profile.read"),
+            expires_at=NOW + timedelta(minutes=10),
+            encrypted_payload=encrypted,
+            mercury_access_token=MERCURY_ACCESS_TOKEN,
+        )
+        consume_record, cancel_record = await asyncio.gather(
+            first.peek(state_hash=state_hash),
+            second.peek(state_hash=state_hash),
+        )
+        outcomes = await asyncio.gather(
+            first.consume(
+                record=consume_record,
+                mercury_access_token=MERCURY_ACCESS_TOKEN,
+            ),
+            second.cancel(
+                record=cancel_record,
+                mercury_access_token=MERCURY_ACCESS_TOKEN,
+            ),
+            return_exceptions=True,
+        )
+
+    successes = [item for item in outcomes if not isinstance(item, Exception)]
+    failures = [item for item in outcomes if isinstance(item, Exception)]
+    assert len(successes) == len(failures) == 1
+    assert isinstance(failures[0], ProviderOAuthError)
+    assert str(failures[0]) == "provider_oauth_state_invalid"
+    assert backend.consume_successes + backend.cancel_successes == 1
+    assert backend.consume_failures + backend.cancel_failures == 1
+    assert backend.states[state_hash]["pkce_verifier_ciphertext"] is None
+
+
+@pytest.mark.asyncio
+async def test_supabase_state_cleanup_clears_expired_unconsumed_ciphertext() -> None:
+    backend = SharedOAuthStateRPCBackend()
+    state_id = UUID("77777777-7777-4777-8777-777777777779")
+    state_hash = "c" * 64
+    vault = _vault()
+    encrypted = vault.seal(
+        CredentialBinding(
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=USER_ID,
+            connection_id=state_id,
+            provider="flowaccount",
+            company_or_merchant_id="oauth-state",
+            environment="sandbox",
+            credential_type="oauth_state",
+        ),
+        b"EXPIRED_STATE_PLAINTEXT_SENTINEL",
+    ).model_copy(update={"id": state_id})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(backend),
+        follow_redirects=False,
+    ) as client:
+        store = SupabaseProviderOAuthStateStore(
+            settings=_settings(),
+            http_client=client,
+            uuid_factory=lambda: UUID("88888888-8888-4888-8888-888888888890"),
+            callback_uri=CALLBACK_URI,
+        )
+        await store.create(
+            tenant_id=TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=USER_ID,
+            provider=ProviderId.FLOWACCOUNT,
+            environment="sandbox",
+            state_hash=state_hash,
+            callback_uri=CALLBACK_URI,
+            requested_permissions=("documents.read", "profile.read"),
+            expires_at=NOW + timedelta(minutes=10),
+            encrypted_payload=encrypted,
+            mercury_access_token=MERCURY_ACCESS_TOKEN,
+        )
+        backend.states[state_hash]["expires_at"] = (NOW - timedelta(seconds=1)).isoformat()
+        assert await store.cleanup_expired(limit=100) == 1
+
+    row = backend.states[state_hash]
+    assert row["consumed_at"] is not None
+    assert row["pkce_verifier_ciphertext"] is None
+    assert row["pkce_key_version"] is None
+    assert row["pkce_nonce"] is None
+    assert row["pkce_aad_hash"] is None
+    cleanup_auth = [
+        authorization
+        for path, authorization in backend.authorization_headers
+        if path.endswith("/cleanup_expired_mercury_provider_oauth_states")
+    ]
+    assert cleanup_auth == ["Bearer service-role"]
 
 
 @pytest.mark.asyncio
@@ -861,9 +1055,26 @@ async def test_metadata_authorization_server_must_match_reviewed_environment_ori
     "answers",
     [
         [("127.0.0.1",)],
+        [("224.0.0.1",)],
+        [("fec0::1",)],
+        [("ff02::1",)],
+        [("::ffff:10.0.0.1",)],
+        [("fe80::1%eth0",)],
+        [("2001:0DB8::1",)],
+        [("1.1.1.1", "10.0.0.9")],
         [("1.1.1.1",), ("10.0.0.9",)],
     ],
-    ids=["private-address", "dns-rebinding"],
+    ids=[
+        "loopback",
+        "multicast-v4",
+        "site-local-v6",
+        "multicast-v6",
+        "mapped-private-v4",
+        "scoped-v6",
+        "noncanonical-v6",
+        "mixed-dns-answer",
+        "dns-rebinding",
+    ],
 )
 async def test_network_guard_rejects_non_public_or_rebound_resolution(
     answers: list[tuple[str, ...]],
@@ -912,6 +1123,21 @@ async def test_network_guard_rejects_non_public_or_rebound_resolution(
             )
 
     assert len(calls) <= 1
+
+
+@pytest.mark.asyncio
+async def test_network_guard_accepts_only_canonical_public_global_unicast() -> None:
+    guard = PublicOAuthNetworkGuard(
+        resolver=lambda _host, _port: ("1.1.1.1", "2606:4700:4700::1111"),
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: None)),
+    )
+
+    try:
+        assert await guard.resolve_and_pin("provider.example", 443) == frozenset(
+            {"1.1.1.1", "2606:4700:4700::1111"}
+        )
+    finally:
+        await guard._http.aclose()
 
 
 @pytest.mark.asyncio
@@ -1122,6 +1348,52 @@ async def test_callback_uses_profile_company_without_nonstandard_query_parameter
 
 
 @pytest.mark.asyncio
+async def test_error_callback_consumes_state_without_exchanging_provider_code() -> None:
+    service, oauth_client, _, state_store, _, _ = _service()
+    start = await service.start(
+        _principal(),
+        WORKSPACE_ID,
+        "flowaccount",
+        "sandbox",
+        selected_company_id="company-123",
+    )
+    state = parse_qs(urlsplit(start.authorization_url).query)["state"][0]
+    callback = OAuthCallback(
+        state=state,
+        error="access_denied",
+    )
+
+    with pytest.raises(
+        ProviderOAuthError,
+        match="^provider_oauth_authorization_failed$",
+    ):
+        await service.complete_callback(callback)
+    with pytest.raises(ProviderOAuthError, match="^provider_oauth_state_invalid$"):
+        await state_store.peek(state_hash=hashlib.sha256(state.encode("ascii")).hexdigest())
+    with pytest.raises(ProviderOAuthError, match="^provider_oauth_state_invalid$"):
+        await service.complete_callback(callback)
+
+    assert oauth_client.exchanges == []
+    rendered = f"{callback!r} {callback.model_dump_json()}"
+    assert state not in rendered
+    assert "access_denied" not in rendered
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"state": "A" * 43},
+        {"state": "A" * 43, "code": "code", "error": "access_denied"},
+    ],
+)
+def test_callback_model_requires_exact_success_or_error_union(
+    values: dict[str, str],
+) -> None:
+    with pytest.raises(ValidationError):
+        OAuthCallback(**values)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("mutation", "expected_code"),
     [
@@ -1231,6 +1503,66 @@ async def test_callback_rejects_wrong_user_expiry_and_provider_company_mismatch(
     assert mismatch_connections[0].readiness is ConnectionReadiness.DISCONNECTED
     assert mismatch_store.store._envelopes == {}
     assert mismatch_oauth.revocations == 1
+    assert mismatch_connections[0].provider_revocation_required is False
+    assert mismatch_store.events[-2:] == ["disconnect", "complete_revocation"]
+
+
+@pytest.mark.asyncio
+async def test_company_mismatch_cancellation_leaves_no_dispatchable_credential() -> None:
+    revocation_started = asyncio.Event()
+    hold_revocation = asyncio.Event()
+
+    class BlockingRevocationClient(FakeOAuthClient):
+        async def revoke(
+            self,
+            *,
+            session: OAuthAuthorizationSession,
+            tokens: FlowAccountOAuthTokens,
+        ) -> bool:
+            self.revocations += 1
+            revocation_started.set()
+            await hold_revocation.wait()
+            return True
+
+    oauth_client = BlockingRevocationClient()
+    service, _, _, _, connection_store, _ = _service(
+        driver=FakeFlowAccountDriver(profile_company_id="company-other"),
+        oauth_client=oauth_client,
+    )
+    start = await service.start(
+        _principal(),
+        WORKSPACE_ID,
+        "flowaccount",
+        "sandbox",
+        selected_company_id="company-123",
+    )
+    state = parse_qs(urlsplit(start.authorization_url).query)["state"][0]
+    completion = asyncio.create_task(
+        service.complete_callback(OAuthCallback(code="authorization-code", state=state))
+    )
+
+    await revocation_started.wait()
+    connections = connection_store.store.list_for_workspace(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=USER_ID,
+    )
+    assert connections[0].readiness is ConnectionReadiness.DISCONNECTED
+    assert connections[0].provider_revocation_required is True
+    assert connection_store.store._envelopes == {}
+    assert connection_store.events[-1] == "disconnect"
+
+    completion.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await completion
+    connections = connection_store.store.list_for_workspace(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=USER_ID,
+    )
+    assert connections[0].provider_revocation_required is True
+    assert connection_store.store._envelopes == {}
+    assert "complete_revocation" not in connection_store.events
 
 
 @pytest.mark.asyncio
@@ -1342,6 +1674,43 @@ def test_exact_callback_is_public_and_returns_only_safe_fields() -> None:
     assert nonstandard_company.status_code == 400
     assert callback_service.callbacks[0].model_fields_set == {"code", "state"}
     assert "AUTHORIZATION_CODE_SENTINEL" not in response.text
+    assert "A" * 43 not in response.text
+
+
+def test_exact_callback_accepts_standard_error_union_and_returns_stable_error() -> None:
+    class ErrorCallbackService:
+        callbacks: list[OAuthCallback] = []
+
+        async def complete_callback(self, callback: OAuthCallback) -> None:
+            self.callbacks.append(callback)
+            raise ProviderOAuthError("provider_oauth_authorization_failed")
+
+    service = ErrorCallbackService()
+    app = Starlette(
+        routes=cloud_routes(
+            CloudDependencies(
+                settings=_settings(),
+                provider_oauth_service=service,
+            )
+        )
+    )
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.get(
+        FLOWACCOUNT_CALLBACK_PATH,
+        params={"error": "access_denied", "state": "A" * 43},
+    )
+    both = client.get(
+        FLOWACCOUNT_CALLBACK_PATH,
+        params={"code": "code", "error": "access_denied", "state": "B" * 43},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "provider_oauth_authorization_failed"}
+    assert both.status_code == 400
+    assert both.json() == {"error": "provider_oauth_callback_invalid"}
+    assert service.callbacks[0].model_fields_set == {"error", "state"}
+    assert "access_denied" not in response.text
     assert "A" * 43 not in response.text
 
 

@@ -31,6 +31,7 @@ from pydantic import (
     Field,
     ValidationError,
     field_validator,
+    model_validator,
 )
 
 from mercury_tools.auth.models import MercuryPrincipal, PrincipalResolver
@@ -64,6 +65,7 @@ _MAX_METADATA_BYTES = 128 * 1024
 _OAUTH_ERROR_CODES = frozenset(
     {
         "provider_oauth_callback_invalid",
+        "provider_oauth_authorization_failed",
         "provider_oauth_company_mismatch",
         "provider_oauth_configuration_invalid",
         "provider_oauth_downstream_invalid",
@@ -270,9 +272,18 @@ class OAuthAuthorizationSession(_OAuthModel):
 
 
 class OAuthCallback(_OAuthModel):
-    code: str = Field(
+    code: str | None = Field(
+        default=None,
         min_length=1,
         max_length=16_384,
+        repr=False,
+        exclude=True,
+    )
+    error: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z][A-Za-z0-9._~-]*$",
         repr=False,
         exclude=True,
     )
@@ -288,12 +299,20 @@ class OAuthCallback(_OAuthModel):
     workspace_id: UUID | None = None
     redirect_uri: str | None = None
 
-    @field_validator("code", "state")
+    @field_validator("code", "error", "state")
     @classmethod
-    def validate_secret(cls, value: str) -> str:
+    def validate_secret(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
         if value != value.strip() or any(character.isspace() for character in value):
             raise ValueError("provider_oauth_callback_invalid")
         return value
+
+    @model_validator(mode="after")
+    def validate_result_union(self) -> OAuthCallback:
+        if (self.code is None) == (self.error is None):
+            raise ValueError("provider_oauth_callback_invalid")
+        return self
 
     @field_validator("redirect_uri")
     @classmethod
@@ -402,6 +421,15 @@ class ProviderOAuthStateStore(Protocol):
         record: ProviderOAuthStateRecord,
         mercury_access_token: str,
     ) -> ProviderOAuthStateRecord: ...
+
+    async def cancel(
+        self,
+        *,
+        record: ProviderOAuthStateRecord,
+        mercury_access_token: str,
+    ) -> None: ...
+
+    async def cleanup_expired(self, *, limit: int = 100) -> int: ...
 
 
 class InMemoryProviderOAuthStateStore:
@@ -520,6 +548,33 @@ class InMemoryProviderOAuthStateStore:
             del self._states[current.state_hash]
             return consumed
 
+    async def cancel(
+        self,
+        *,
+        record: ProviderOAuthStateRecord,
+        mercury_access_token: str,
+    ) -> None:
+        await self.consume(
+            record=record,
+            mercury_access_token=mercury_access_token,
+        )
+
+    async def cleanup_expired(self, *, limit: int = 100) -> int:
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
+            raise ProviderOAuthError("provider_oauth_state_invalid")
+        now = self._timestamp()
+        with self._lock:
+            expired = sorted(
+                (
+                    state_hash
+                    for state_hash, record in self._states.items()
+                    if record.consumed_at is None and record.expires_at <= now
+                )
+            )[:limit]
+            for state_hash in expired:
+                del self._states[state_hash]
+        return len(expired)
+
     def _timestamp(self) -> datetime:
         try:
             return _aware_utc(
@@ -540,6 +595,7 @@ class SupabaseProviderOAuthStateStore:
         http_client: httpx.AsyncClient,
         callback_uri: str,
         uuid_factory: Callable[[], UUID] | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         try:
             self._base_url = v1_supabase_rest_url(
@@ -562,6 +618,7 @@ class SupabaseProviderOAuthStateStore:
         self._service_role_key = settings.supabase_service_role_key
         self._http = http_client
         self._uuid_factory = uuid_factory or uuid4
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     def __repr__(self) -> str:
         return "SupabaseProviderOAuthStateStore()"
@@ -702,9 +759,67 @@ class SupabaseProviderOAuthStateStore:
             if (
                 not secrets.compare_digest(record.state_hash, state_hash)
                 or record.consumed_at is not None
+                or record.expires_at <= self._now()
             ):
                 raise ValueError
             return record
+        except ProviderOAuthError:
+            raise
+        except Exception:
+            raise ProviderOAuthError("provider_oauth_state_invalid") from None
+
+    async def cancel(
+        self,
+        *,
+        record: ProviderOAuthStateRecord,
+        mercury_access_token: str,
+    ) -> None:
+        try:
+            if not mercury_access_token:
+                raise ValueError
+            row = await self._rpc(
+                "cancel_mercury_provider_oauth_state",
+                mercury_access_token=mercury_access_token,
+                payload={
+                    "p_tenant_id": str(record.tenant_id),
+                    "p_workspace_id": str(record.workspace_id),
+                    "p_auth_user_id": str(record.auth_user_id),
+                    "p_provider": record.provider.value,
+                    "p_environment": record.environment,
+                    "p_state_hash": record.state_hash,
+                },
+            )
+            if (
+                self._checked_uuid(row.get("oauth_state_id")) != record.id
+                or row.get("callback_state")
+                != self._callback_state(
+                    state_id=record.id,
+                    permissions=record.requested_permissions,
+                )
+                or self._timestamp(row.get("consumed_at")) < self._now() - timedelta(minutes=1)
+            ):
+                raise ValueError
+        except ProviderOAuthError:
+            raise
+        except Exception:
+            raise ProviderOAuthError("provider_oauth_state_invalid") from None
+
+    async def cleanup_expired(self, *, limit: int = 100) -> int:
+        try:
+            if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
+                raise ValueError
+            row = await self._service_rpc(
+                "cleanup_expired_mercury_provider_oauth_states",
+                payload={"p_limit": limit},
+            )
+            cleaned = row.get("cleaned_count")
+            if (
+                not isinstance(cleaned, int)
+                or isinstance(cleaned, bool)
+                or not 0 <= cleaned <= limit
+            ):
+                raise ValueError
+            return cleaned
         except ProviderOAuthError:
             raise
         except Exception:
@@ -784,6 +899,20 @@ class SupabaseProviderOAuthStateStore:
         )
         return _single_response_row(response)
 
+    async def _service_rpc(
+        self,
+        function: str,
+        *,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        response = await self._http.post(
+            f"{self._base_url}/rpc/{function}",
+            json=dict(payload),
+            headers=self._service_headers(),
+            follow_redirects=False,
+        )
+        return _single_response_row(response)
+
     def _record_from_row(self, row: Mapping[str, Any]) -> ProviderOAuthStateRecord:
         state_id = self._checked_uuid(row.get("id"))
         tenant_id = self._checked_uuid(row.get("tenant_id"))
@@ -857,6 +986,15 @@ class SupabaseProviderOAuthStateStore:
             "Authorization": f"Bearer {self._service_role_key}",
             "Content-Type": "application/json",
         }
+
+    def _now(self) -> datetime:
+        try:
+            return _aware_utc(
+                self._clock(),
+                code="provider_oauth_state_invalid",
+            )
+        except (TypeError, ValueError):
+            raise ProviderOAuthError("provider_oauth_state_invalid") from None
 
     @staticmethod
     def _callback_state(
@@ -954,6 +1092,7 @@ class PublicOAuthNetworkGuard:
         self._pins: dict[tuple[str, int], frozenset[str]] = {}
         self._lock = threading.RLock()
         self._http = http_client
+        self._owns_http = self._http is None
         if self._http is None:
             self._http = httpx.AsyncClient(
                 transport=_PinnedOAuthTransport(self),
@@ -963,6 +1102,10 @@ class PublicOAuthNetworkGuard:
 
     def __repr__(self) -> str:
         return "PublicOAuthNetworkGuard()"
+
+    async def aclose(self) -> None:
+        if self._owns_http:
+            await self._http.aclose()
 
     async def request(
         self,
@@ -993,13 +1136,9 @@ class PublicOAuthNetworkGuard:
                 resolved = await resolved
             if isinstance(resolved, (str, bytes, bytearray)):
                 raise ValueError
-            addresses = frozenset(str(value) for value in resolved)
+            addresses = frozenset(self._public_global_unicast(value) for value in resolved)
             if not addresses or len(addresses) > 16:
                 raise ValueError
-            for value in addresses:
-                address = ipaddress.ip_address(value)
-                if not address.is_global:
-                    raise ValueError
             key = (host.casefold(), port)
             with self._lock:
                 pinned = self._pins.get(key)
@@ -1011,6 +1150,27 @@ class PublicOAuthNetworkGuard:
             raise
         except Exception:
             raise ProviderOAuthError("provider_oauth_downstream_invalid") from None
+
+    @staticmethod
+    def _public_global_unicast(value: object) -> str:
+        if not isinstance(value, str) or not value or "%" in value:
+            raise ValueError
+        address = ipaddress.ip_address(value)
+        if str(address) != value.casefold():
+            raise ValueError
+        if (
+            address.is_multicast
+            or address.is_reserved
+            or address.is_unspecified
+            or address.is_link_local
+            or address.is_loopback
+            or address.is_private
+            or getattr(address, "is_site_local", False)
+            or getattr(address, "ipv4_mapped", None) is not None
+            or not address.is_global
+        ):
+            raise ValueError
+        return str(address)
 
 
 class DownstreamMCPOAuthClient:
@@ -1441,6 +1601,7 @@ class ProviderOAuthService:
         selected_company_id: str | None = None,
     ) -> ProviderAuthorizationStart:
         try:
+            await self._state_store.cleanup_expired(limit=100)
             checked_principal = MercuryPrincipal.model_validate(principal)
             checked_provider = ProviderId(provider)
             checked_selected_company_id = _checked_selected_company_id(
@@ -1610,6 +1771,15 @@ class ProviderOAuthService:
         if callback.redirect_uri != record.callback_uri:
             raise ProviderOAuthError("provider_oauth_callback_invalid")
 
+        if callback.error is not None:
+            await self._state_store.cancel(
+                record=record,
+                mercury_access_token=mercury_access_token,
+            )
+            raise ProviderOAuthError("provider_oauth_authorization_failed")
+        if callback.code is None:
+            raise ProviderOAuthError("provider_oauth_callback_invalid")
+
         consumed = await self._state_store.consume(
             record=record,
             mercury_access_token=mercury_access_token,
@@ -1729,23 +1899,26 @@ class ProviderOAuthService:
                     validated_at=None,
                     envelopes=envelopes,
                 )
-            revoked = False
-            if failure.code == "provider_oauth_company_mismatch":
-                revoked = await self._oauth_client.revoke(
-                    session=payload.session(),
-                    tokens=tokens,
-                )
+            mismatch = failure.code == "provider_oauth_company_mismatch"
             self._connection_store.disconnect(
                 tenant_id=record.tenant_id,
                 workspace_id=record.workspace_id,
                 auth_user_id=record.auth_user_id,
                 connection_id=connection_id,
-                provider_revocation_required=(
-                    failure.code == "provider_oauth_company_mismatch"
-                    and payload.revocation_endpoint is not None
-                    and not revoked
-                ),
+                provider_revocation_required=mismatch,
             )
+            if mismatch and payload.revocation_endpoint is not None:
+                revoked = await self._oauth_client.revoke(
+                    session=payload.session(),
+                    tokens=tokens,
+                )
+                if revoked:
+                    self._connection_store.complete_revocation(
+                        tenant_id=record.tenant_id,
+                        workspace_id=record.workspace_id,
+                        auth_user_id=record.auth_user_id,
+                        connection_id=connection_id,
+                    )
             raise failure
 
         self._connection_store.disconnect(

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from urllib.parse import urlsplit, urlunsplit
+from uuid import UUID
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from mercury_tools.auth.models import MercuryAuthError, PrincipalResolver
+from mercury_tools.auth.models import MercuryAuthError, MercuryPrincipal, PrincipalResolver
 
 PUBLIC_PATHS = frozenset(
     {
@@ -24,6 +26,10 @@ PUBLIC_PATHS = frozenset(
     }
 )
 REQUIRED_IDENTITY_SCOPES = frozenset({"openid", "email", "profile"})
+_REQUEST_BEARER: ContextVar[tuple[UUID, str] | None] = ContextVar(
+    "mercury_request_bearer",
+    default=None,
+)
 
 
 class MercuryOAuthMiddleware(BaseHTTPMiddleware):
@@ -72,7 +78,11 @@ class MercuryOAuthMiddleware(BaseHTTPMiddleware):
                 status_code=403,
             )
         request.state.mercury_principal = principal
-        return await call_next(request)
+        token = _REQUEST_BEARER.set((principal.subject, bearer_token))
+        try:
+            return await call_next(request)
+        finally:
+            _REQUEST_BEARER.reset(token)
 
     def _is_protected(self, path: str) -> bool:
         if path in PUBLIC_PATHS:
@@ -129,4 +139,16 @@ def _bearer_token(authorization: str | None) -> str | None:
     return token
 
 
-__all__ = ["MercuryOAuthMiddleware", "PUBLIC_PATHS"]
+def current_mercury_access_token(principal: MercuryPrincipal) -> str:
+    checked = MercuryPrincipal.model_validate(principal)
+    request_bearer = _REQUEST_BEARER.get()
+    if request_bearer is None or request_bearer[0] != checked.subject:
+        raise RuntimeError("mercury_request_bearer_unavailable")
+    return request_bearer[1]
+
+
+__all__ = [
+    "MercuryOAuthMiddleware",
+    "PUBLIC_PATHS",
+    "current_mercury_access_token",
+]

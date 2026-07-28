@@ -17,6 +17,7 @@ from mercury_tools.providers.manifest import (
     load_provider_manifest,
     resolve_provider_resource,
 )
+from mercury_tools.providers.models import AuthorizationMethod
 from mercury_tools.providers.registry import (
     ProviderDriverRegistry,
     ProviderRegistryError,
@@ -292,6 +293,13 @@ def test_registry_loads_only_known_provider_manifests_from_server_catalog() -> N
     registry = build_provider_registry(
         settings=_settings(),
         manifest_root=ROOT / "catalog/global",
+        header_factories={
+            AuthorizationMethod.OAUTH2_PKCE: lambda _connection: None,
+        },
+        binding_verifier=lambda _connection, _binding, _resource_hash: None,
+        response_normalizer=lambda _binding, _content: None,
+        request_model_resolver=lambda _binding: None,
+        response_model_resolver=lambda _binding: None,
         flowaccount_profile_binding_resolver=lambda _connection, _tool: None,
     )
 

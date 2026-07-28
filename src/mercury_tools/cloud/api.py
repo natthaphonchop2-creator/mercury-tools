@@ -347,7 +347,8 @@ class CloudDependencies:
         }
         query = list(request.query_params.multi_items())
         keys = [key for key, _value in query]
-        if set(keys) != {"code", "state"} or len(keys) != len(set(keys)):
+        key_set = set(keys)
+        if key_set not in ({"code", "state"}, {"error", "state"}) or len(keys) != len(key_set):
             return JSONResponse(
                 {"error": "provider_oauth_callback_invalid"},
                 status_code=400,
@@ -360,9 +361,8 @@ class CloudDependencies:
                 headers=headers,
             )
         try:
-            callback = OAuthCallback(
-                code=request.query_params["code"],
-                state=request.query_params["state"],
+            callback = OAuthCallback.model_validate(
+                {key: request.query_params[key] for key in key_set}
             )
             summary = await self.provider_oauth_service.complete_callback(callback)
         except ProviderOAuthError as exc:

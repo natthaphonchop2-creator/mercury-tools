@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -34,9 +34,9 @@ class V1ConfigurationError(RuntimeError):
 @dataclass(frozen=True)
 class Settings:
     supabase_url: str
-    supabase_service_role_key: str
-    openai_api_key: str
-    supabase_publishable_key: str = ""
+    supabase_service_role_key: str = field(repr=False)
+    openai_api_key: str = field(repr=False)
+    supabase_publishable_key: str = field(default="", repr=False)
     embedding_provider: str = DEFAULT_EMBEDDING_PROVIDER
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     embedding_dim: int = DEFAULT_EMBEDDING_DIM
@@ -47,24 +47,26 @@ class Settings:
     mcp_port: int = DEFAULT_MCP_PORT
     mcp_path: str = DEFAULT_MCP_PATH
     public_base_url: str = ""
-    http_bearer_token: str = ""
+    http_bearer_token: str = field(default="", repr=False)
     http_require_auth: bool = False
     enable_legacy_http_api: bool = False
-    connect_invite_code: str = ""
-    connect_signing_secret: str = ""
-    openai_apps_challenge_token: str = ""
+    connect_invite_code: str = field(default="", repr=False)
+    connect_signing_secret: str = field(default="", repr=False)
+    openai_apps_challenge_token: str = field(default="", repr=False)
     cloud_base_url: str = DEFAULT_CLOUD_BASE_URL
     v1_enabled: bool = False
     canonical_mcp_resource: str = CANONICAL_MCP_RESOURCE
     supabase_auth_issuer: str = ""
     supabase_jwks_url: str = ""
     supabase_jwt_audience: str = ""
-    vault_active_key: str = ""
+    vault_active_key: str = field(default="", repr=False)
     vault_active_key_version: str = ""
-    vault_previous_key: str = ""
+    vault_previous_key: str = field(default="", repr=False)
     vault_previous_key_version: str = ""
     flowaccount_mcp_sandbox_url: str = ""
     flowaccount_mcp_production_url: str = ""
+    flowaccount_oauth_sandbox_authorization_server_origin: str = ""
+    flowaccount_oauth_production_authorization_server_origin: str = ""
     peak_mcp_uat_url: str = ""
     peak_mcp_production_url: str = ""
     provider_callback_base_url: str = ""
@@ -121,6 +123,8 @@ class Settings:
             raise V1ConfigurationError("v1_jwt_audience_mismatch")
         if not self.supabase_publishable_key:
             raise V1ConfigurationError("v1_publishable_key_missing")
+        if not self.supabase_service_role_key:
+            raise V1ConfigurationError("v1_service_role_key_missing")
 
         if not self.vault_active_key or not self.vault_active_key_version:
             raise V1ConfigurationError("v1_vault_configuration_missing")
@@ -144,6 +148,16 @@ class Settings:
         )
         if not all(_is_server_only_https_url(url) for url in provider_urls):
             raise V1ConfigurationError("v1_provider_url_invalid")
+        if not _is_server_only_https_origin(self.provider_callback_base_url):
+            raise V1ConfigurationError("v1_provider_callback_base_url_invalid")
+        flowaccount_origins = (
+            self.flowaccount_oauth_sandbox_authorization_server_origin,
+            self.flowaccount_oauth_production_authorization_server_origin,
+        )
+        if not all(flowaccount_origins):
+            raise V1ConfigurationError("v1_flowaccount_authorization_server_origin_missing")
+        if not all(_is_server_only_https_origin(origin) for origin in flowaccount_origins):
+            raise V1ConfigurationError("v1_flowaccount_authorization_server_origin_invalid")
 
 
 def _env_bool(name: str, *, default: bool = False) -> bool:
@@ -191,6 +205,15 @@ def _is_server_only_https_url(value: str) -> bool:
         return False
 
 
+def _is_server_only_https_origin(value: str) -> bool:
+    if not _is_server_only_https_url(value):
+        return False
+    try:
+        return urlsplit(value).path in {"", "/"}
+    except ValueError:
+        return False
+
+
 def v1_supabase_rest_url(*, project_url: str, auth_issuer: str) -> str:
     """Validate one trusted Supabase project origin before deriving PostgREST."""
 
@@ -213,10 +236,7 @@ def v1_supabase_rest_url(*, project_url: str, auth_issuer: str) -> str:
         )
     except ValueError:
         raise V1ConfigurationError("v1_supabase_url_invalid") from None
-    if (
-        not _is_server_only_https_url(auth_issuer)
-        or project_origin != issuer_origin
-    ):
+    if not _is_server_only_https_url(auth_issuer) or project_origin != issuer_origin:
         raise V1ConfigurationError("v1_supabase_origin_mismatch")
     return urlunsplit(
         (
@@ -285,9 +305,7 @@ def load_settings(*, dotenv_path: str | Path | None = None) -> Settings:
         ),
         connect_invite_code=os.environ.get("MERCURY_CONNECT_INVITE_CODE", "").strip(),
         connect_signing_secret=os.environ.get("MERCURY_CONNECT_SIGNING_SECRET", "").strip(),
-        openai_apps_challenge_token=os.environ.get(
-            "OPENAI_APPS_CHALLENGE_TOKEN", ""
-        ).strip(),
+        openai_apps_challenge_token=os.environ.get("OPENAI_APPS_CHALLENGE_TOKEN", "").strip(),
         cloud_base_url=(
             os.environ.get("MERCURY_CLOUD_BASE_URL", DEFAULT_CLOUD_BASE_URL).strip().rstrip("/")
             or DEFAULT_CLOUD_BASE_URL
@@ -301,24 +319,20 @@ def load_settings(*, dotenv_path: str | Path | None = None) -> Settings:
         supabase_jwks_url=os.environ.get("SUPABASE_JWKS_URL", "").strip(),
         supabase_jwt_audience=os.environ.get("SUPABASE_JWT_AUDIENCE", "").strip(),
         vault_active_key=os.environ.get("MERCURY_VAULT_ACTIVE_KEY", "").strip(),
-        vault_active_key_version=os.environ.get(
-            "MERCURY_VAULT_ACTIVE_KEY_VERSION", ""
-        ).strip(),
+        vault_active_key_version=os.environ.get("MERCURY_VAULT_ACTIVE_KEY_VERSION", "").strip(),
         vault_previous_key=os.environ.get("MERCURY_VAULT_PREVIOUS_KEY", "").strip(),
-        vault_previous_key_version=os.environ.get(
-            "MERCURY_VAULT_PREVIOUS_KEY_VERSION", ""
+        vault_previous_key_version=os.environ.get("MERCURY_VAULT_PREVIOUS_KEY_VERSION", "").strip(),
+        flowaccount_mcp_sandbox_url=os.environ.get("FLOWACCOUNT_MCP_SANDBOX_URL", "").strip(),
+        flowaccount_mcp_production_url=os.environ.get("FLOWACCOUNT_MCP_PRODUCTION_URL", "").strip(),
+        flowaccount_oauth_sandbox_authorization_server_origin=os.environ.get(
+            "FLOWACCOUNT_OAUTH_SANDBOX_AUTHORIZATION_SERVER_ORIGIN", ""
         ).strip(),
-        flowaccount_mcp_sandbox_url=os.environ.get(
-            "FLOWACCOUNT_MCP_SANDBOX_URL", ""
-        ).strip(),
-        flowaccount_mcp_production_url=os.environ.get(
-            "FLOWACCOUNT_MCP_PRODUCTION_URL", ""
+        flowaccount_oauth_production_authorization_server_origin=os.environ.get(
+            "FLOWACCOUNT_OAUTH_PRODUCTION_AUTHORIZATION_SERVER_ORIGIN", ""
         ).strip(),
         peak_mcp_uat_url=os.environ.get("PEAK_MCP_UAT_URL", "").strip(),
         peak_mcp_production_url=os.environ.get("PEAK_MCP_PRODUCTION_URL", "").strip(),
-        provider_callback_base_url=os.environ.get(
-            "MERCURY_PROVIDER_CALLBACK_BASE_URL", ""
-        ).strip(),
+        provider_callback_base_url=os.environ.get("MERCURY_PROVIDER_CALLBACK_BASE_URL", "").strip(),
     )
 
 

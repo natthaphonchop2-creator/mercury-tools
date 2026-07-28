@@ -10,6 +10,7 @@ import re
 import threading
 from collections.abc import Mapping
 from contextlib import asynccontextmanager, suppress
+from copy import copy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -39,7 +40,7 @@ from mercury_tools.cloud.api import (
     cloud_routes,
     protected_resource_routes,
 )
-from mercury_tools.config import load_settings
+from mercury_tools.config import V1ConfigurationError, load_settings
 from mercury_tools.connectors.catalog import (
     connector_by_id,
     list_connector_public_summaries,
@@ -98,6 +99,9 @@ from mercury_tools.product import (
     verify_client_token,
 )
 from mercury_tools.prompts import get_prompt
+from mercury_tools.providers.production import (
+    build_provider_oauth_production_composition,
+)
 from mercury_tools.rag.chunking import chunk_document, sha256_text
 from mercury_tools.rag.embeddings import create_embedding_provider
 from mercury_tools.rag.models import (
@@ -3900,27 +3904,51 @@ def create_http_app(
     settings = load_settings()
     settings.validate_v1()
     _require_process_v1_configuration(settings.v1_enabled)
-    mcp.settings.streamable_http_path = settings.mcp_path
+    selected_principal_resolver = principal_resolver
+    if settings.v1_enabled and selected_principal_resolver is None:
+        selected_principal_resolver = validator_from_settings(settings)
+    http_mcp = copy(mcp)
+    http_mcp.settings = mcp.settings.model_copy(deep=True)
+    http_mcp._session_manager = None
+    http_mcp.settings.streamable_http_path = settings.mcp_path
     if settings.public_base_url:
         public_url = urlparse(settings.public_base_url)
         allowed_host = public_url.netloc
         allowed_origin = f"{public_url.scheme}://{public_url.netloc}"
-        if allowed_host and allowed_host not in mcp.settings.transport_security.allowed_hosts:
-            mcp.settings.transport_security.allowed_hosts.append(allowed_host)
-        if allowed_origin and allowed_origin not in mcp.settings.transport_security.allowed_origins:
-            mcp.settings.transport_security.allowed_origins.append(allowed_origin)
-    public_app = mcp.streamable_http_app()
+        if allowed_host and allowed_host not in http_mcp.settings.transport_security.allowed_hosts:
+            http_mcp.settings.transport_security.allowed_hosts.append(allowed_host)
+        if (
+            allowed_origin
+            and allowed_origin not in http_mcp.settings.transport_security.allowed_origins
+        ):
+            http_mcp.settings.transport_security.allowed_origins.append(allowed_origin)
+    public_app = http_mcp.streamable_http_app()
     if cloud_dependencies is not None and provider_oauth_service is not None:
         raise RuntimeError("provider_oauth_service_dependency_conflict")
+    provider_oauth_composition = None
+    if settings.v1_enabled and cloud_dependencies is None and provider_oauth_service is None:
+        provider_oauth_composition = build_provider_oauth_production_composition(
+            settings=settings,
+            principal_resolver=selected_principal_resolver,
+        )
+        provider_oauth_service = provider_oauth_composition.provider_oauth_service
     selected_cloud_dependencies = cloud_dependencies or CloudDependencies(
         settings=settings,
         provider_oauth_service=provider_oauth_service,
     )
+    if settings.v1_enabled:
+        _validate_v1_cloud_dependencies(selected_cloud_dependencies)
 
     @asynccontextmanager
     async def lifespan(_app):
-        async with public_app.router.lifespan_context(public_app):
-            yield
+        try:
+            if provider_oauth_composition is not None:
+                await provider_oauth_composition.startup()
+            async with public_app.router.lifespan_context(public_app):
+                yield
+        finally:
+            if provider_oauth_composition is not None:
+                await provider_oauth_composition.aclose()
 
     routes = [
         *public_app.routes,
@@ -3987,7 +4015,7 @@ def create_http_app(
     if settings.v1_enabled:
         app.add_middleware(
             MercuryOAuthMiddleware,
-            principal_resolver=principal_resolver or validator_from_settings(settings),
+            principal_resolver=selected_principal_resolver,
             canonical_resource=settings.canonical_mcp_resource,
             mcp_path=settings.mcp_path,
         )
@@ -4001,6 +4029,31 @@ def create_http_app(
             protected_path=settings.mcp_path,
         )
     return app
+
+
+def _validate_v1_cloud_dependencies(dependencies: Any) -> None:
+    provider_oauth_service = getattr(
+        dependencies,
+        "provider_oauth_service",
+        None,
+    )
+    if provider_oauth_service is None:
+        raise V1ConfigurationError("v1_provider_oauth_service_missing")
+    if not callable(getattr(provider_oauth_service, "complete_callback", None)):
+        raise V1ConfigurationError("v1_provider_oauth_service_invalid")
+    required_handlers = (
+        "flowaccount_oauth_callback",
+        "list_actions",
+        "get_action",
+        "resolve_validation",
+        "list_connectors",
+        "list_skills",
+        "get_skill",
+        "search_knowledge",
+        "get_document",
+    )
+    if not all(callable(getattr(dependencies, name, None)) for name in required_handlers):
+        raise V1ConfigurationError("v1_cloud_dependencies_invalid")
 
 
 def serve(
