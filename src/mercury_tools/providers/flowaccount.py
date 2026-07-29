@@ -45,6 +45,7 @@ from mercury_tools.providers.streamable_mcp import (
     ProviderAuthHeader,
     ProviderAuthHeaders,
     ProviderOperationDeadline,
+    current_provider_operation_deadline,
     provider_operation_deadline,
 )
 from mercury_tools.qualification.provider_mcp import CatalogQualificationResolver
@@ -747,6 +748,8 @@ class FlowAccountMCPDriver:
         binding: QualifiedCapabilityBinding,
         arguments: BaseModel,
         operation_id,
+        *,
+        deadline: ProviderOperationDeadline | None = None,
     ) -> ProviderCallResult:
         checked = self._connection(connection, allow_validation=False)
         try:
@@ -761,14 +764,17 @@ class FlowAccountMCPDriver:
                 if checked_binding.operation_class is ProviderOperationClass.CREATE
                 else TimeoutClass.READ
             )
-            async with self._qualification_operation(timeout_class) as deadline:
+            async with self._qualification_operation(
+                timeout_class,
+                deadline=deadline,
+            ) as operation_deadline:
                 await self._qualification_resolver.assert_binding(checked, checked_binding)
                 return await self._runtime.call(
                     checked,
                     checked_binding,
                     arguments,
                     operation_id,
-                    deadline=deadline,
+                    deadline=operation_deadline,
                 )
         except ProviderRuntimeError:
             raise
@@ -795,14 +801,23 @@ class FlowAccountMCPDriver:
         )
 
     @asynccontextmanager
-    async def _qualification_operation(self, timeout_class: TimeoutClass):
-        deadline = ProviderOperationDeadline.start(self._operation_seconds(timeout_class))
-        snapshot = await self._qualification_resolver.open_snapshot(deadline)
+    async def _qualification_operation(
+        self,
+        timeout_class: TimeoutClass,
+        *,
+        deadline: ProviderOperationDeadline | None = None,
+    ):
+        operation_deadline = (
+            deadline
+            or current_provider_operation_deadline()
+            or ProviderOperationDeadline.start(self._operation_seconds(timeout_class))
+        )
+        snapshot = await self._qualification_resolver.open_snapshot(operation_deadline)
         with (
             self._qualification_resolver.use_snapshot(snapshot),
-            provider_operation_deadline(deadline),
+            provider_operation_deadline(operation_deadline),
         ):
-            yield deadline
+            yield operation_deadline
 
     def _operation_seconds(self, timeout_class: TimeoutClass) -> int:
         return self._manifest.timeout_classes[timeout_class].operation_seconds

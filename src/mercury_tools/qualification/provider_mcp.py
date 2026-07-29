@@ -583,6 +583,83 @@ class CatalogQualificationResolver:
             now=snapshot.now,
         )
 
+    async def bind_exact_for_connection(
+        self,
+        connection: ProviderConnection,
+        *,
+        capability_id: str,
+        capability_version: str,
+        deadline: ProviderOperationDeadline | None = None,
+    ) -> tuple[ProviderMCPQualification, QualifiedCapabilityBinding]:
+        """Bind one exact enabled catalog version for a server-bound connection."""
+
+        checked = ProviderConnection.model_validate(connection)
+        snapshot = await self._current_snapshot(deadline)
+        candidates = tuple(
+            item
+            for item in snapshot.gate._qualifications
+            if (
+                item.provider,
+                item.environment,
+                item.normalized_capability,
+                item.capability_version_sha256,
+            )
+            == (
+                checked.provider.value,
+                checked.environment,
+                capability_id,
+                capability_version,
+            )
+        )
+        if len(candidates) != 1:
+            raise QualificationGateError("capability_unavailable")
+        qualification = candidates[0]
+        selection = CapabilitySelection(
+            provider=qualification.provider,
+            environment=qualification.environment,
+            normalized_capability=qualification.normalized_capability,
+            provider_tool_name=qualification.provider_tool_name,
+            capability_version_sha256=qualification.capability_version_sha256,
+        )
+        binding = snapshot.gate.bind(
+            selection,
+            company_sha256=_server_company_sha256(checked),
+            now=snapshot.now,
+        )
+        return qualification, binding
+
+    def wire_model_for_binding(
+        self,
+        binding: VerifiedRuntimeBinding,
+        *,
+        kind: Literal["input", "output"],
+    ) -> type[BaseModel]:
+        """Return the one catalog wire model bound to an already verified operation."""
+
+        checked = VerifiedRuntimeBinding.model_validate(binding)
+        snapshot = self._snapshot.get()
+        if snapshot is None:
+            raise QualificationGateError("insufficient_evidence")
+        candidates = tuple(
+            item
+            for item in snapshot.gate._qualifications
+            if (
+                item.qualification_state is QualificationState.ENABLED
+                and item.provider == checked.provider.value
+                and item.environment == checked.environment
+                and item.normalized_capability == checked.normalized_capability
+                and item.provider_tool_name == checked.provider_tool
+                and item.capability_version_sha256 == checked.capability_version
+                and item.evidence_revision_sha256 == checked.qualification_hash
+            )
+        )
+        if len(candidates) != 1:
+            raise QualificationGateError("capability_unavailable")
+        from mercury_tools.mcp.generated_tools import catalog_wire_model
+
+        schema = candidates[0].input_schema if kind == "input" else candidates[0].output_schema
+        return catalog_wire_model(schema, kind=kind)
+
     async def resolve_for_connection(
         self,
         connection: ProviderConnection,

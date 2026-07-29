@@ -98,18 +98,24 @@ def build_provider_registry(
         raise ProviderRegistryError("peak_runtime_dependencies_invalid")
 
     def provider_scoped_normalizer(binding, structured_content):
-        if binding.provider is ProviderId.PEAK:
-            if peak_contract is None:
-                raise ValueError("peak_provider_contract_unqualified")
-            return peak_contract.normalize_profile(binding, structured_content)
-        if (
-            binding.provider is ProviderId.FLOWACCOUNT
-            and binding.normalized_capability == "provider_profile.get"
-        ):
-            return normalize_flowaccount_response(binding, structured_content)
-        if response_normalizer is None:
-            raise ValueError("provider_response_normalizer_missing")
-        return response_normalizer(binding, structured_content)
+        try:
+            if binding.provider is ProviderId.PEAK:
+                if peak_contract is None:
+                    raise ValueError("peak_provider_contract_unqualified")
+                return peak_contract.normalize_profile(binding, structured_content)
+            if (
+                binding.provider is ProviderId.FLOWACCOUNT
+                and binding.normalized_capability == "provider_profile.get"
+            ):
+                return normalize_flowaccount_response(binding, structured_content)
+            if response_normalizer is None:
+                raise ValueError("provider_response_normalizer_missing")
+            return response_normalizer(binding, structured_content)
+        except (TypeError, ValueError):
+            return qualification_resolver.wire_model_for_binding(
+                binding,
+                kind="output",
+            ).model_validate(structured_content)
 
     async def provider_scoped_verifier(connection, binding, resource_uri_sha256):
         return await qualification_resolver.verify_binding(
@@ -119,22 +125,28 @@ def build_provider_registry(
         )
 
     def provider_scoped_request_model(binding):
-        if binding.provider is ProviderId.PEAK:
-            if peak_contract is None:
-                raise ValueError("peak_provider_contract_unqualified")
-            return peak_contract.request_model(binding)
-        if request_model_resolver is None:
-            raise ValueError("provider_request_model_resolver_missing")
-        return request_model_resolver(binding)
+        try:
+            if binding.provider is ProviderId.PEAK:
+                if peak_contract is None:
+                    raise ValueError("peak_provider_contract_unqualified")
+                return peak_contract.request_model(binding)
+            if request_model_resolver is None:
+                raise ValueError("provider_request_model_resolver_missing")
+            return request_model_resolver(binding)
+        except (TypeError, ValueError):
+            return qualification_resolver.wire_model_for_binding(binding, kind="input")
 
     def provider_scoped_response_model(binding):
-        if binding.provider is ProviderId.PEAK:
-            if peak_contract is None:
-                raise ValueError("peak_provider_contract_unqualified")
-            return peak_contract.response_model(binding)
-        if response_model_resolver is None:
-            raise ValueError("provider_response_model_resolver_missing")
-        return response_model_resolver(binding)
+        try:
+            if binding.provider is ProviderId.PEAK:
+                if peak_contract is None:
+                    raise ValueError("peak_provider_contract_unqualified")
+                return peak_contract.response_model(binding)
+            if response_model_resolver is None:
+                raise ValueError("provider_response_model_resolver_missing")
+            return response_model_resolver(binding)
+        except (TypeError, ValueError):
+            return qualification_resolver.wire_model_for_binding(binding, kind="output")
 
     root = Path(manifest_root)
     factories = dict(header_factories)

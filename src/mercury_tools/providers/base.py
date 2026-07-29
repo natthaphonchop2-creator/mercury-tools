@@ -7,7 +7,7 @@ import unicodedata
 from collections.abc import Mapping
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
 
 from pydantic import (
@@ -22,6 +22,9 @@ from pydantic import (
 
 from mercury_tools.catalog.identity import validate_credential_safe
 from mercury_tools.providers.models import ProviderConnection, ProviderId
+
+if TYPE_CHECKING:
+    from mercury_tools.providers.streamable_mcp import ProviderOperationDeadline
 
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
@@ -278,6 +281,8 @@ class ProviderDriver(Protocol):
         binding: QualifiedCapabilityBinding,
         arguments: BaseModel,
         operation_id: UUID,
+        *,
+        deadline: ProviderOperationDeadline | None = None,
     ) -> ProviderCallResult: ...
 
 

@@ -20,7 +20,9 @@ from mercury_tools.auth.models import MercuryAuthError, MercuryPrincipal
 from mercury_tools.catalog.models import ProviderMCPQualification, QualificationState
 from mercury_tools.config import load_settings
 from mercury_tools.db.supabase import SupabaseRagStore
+from mercury_tools.execution.hosted.read_service import HostedReadService
 from mercury_tools.mcp.contracts import LEGACY_HOSTED_TOOL_NAMES, V1_HOSTED_TOOL_NAMES
+from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
 from mercury_tools.mcp.v1_errors import (
     MercuryV1ToolError,
     public_error_code,
@@ -274,6 +276,70 @@ async def _catalog_qualifications(runtime: Any) -> tuple[ProviderMCPQualificatio
     result = await asyncio.to_thread(runtime.qualification_catalog.list_provider_mcp_qualifications)
     resolved = await _await_value(result)
     return tuple(ProviderMCPQualification.model_validate(item) for item in resolved)
+
+
+async def refresh_generated_provider_tools(
+    server: FastMCP,
+    *,
+    runtime_factory: ProviderRuntimeFactory | None = None,
+    service_factory: WorkspaceServiceFactory = _workspace_service,
+    context: Context | object | None = None,
+) -> bool:
+    """Publish only enabled catalog read wrappers and notify the active MCP session."""
+
+    publisher = getattr(server, "_mercury_v1_generated_provider_tools", None)
+    if not isinstance(publisher, GeneratedProviderToolPublisher):
+
+        async def execute_generated_read(
+            tool_context: Context,
+            *,
+            workspace_id: UUID,
+            connection_id: UUID,
+            qualification: ProviderMCPQualification,
+            inputs: BaseModel,
+        ) -> Any:
+            principal, membership = await _require_workspace(
+                tool_context,
+                workspace_id=workspace_id,
+                service_factory=service_factory,
+            )
+
+            async def bound_membership(
+                requested_principal: MercuryPrincipal,
+                requested_workspace_id: UUID,
+            ) -> WorkspaceMembership:
+                if (
+                    requested_principal != principal
+                    or requested_workspace_id != workspace_id
+                ):
+                    raise ValueError("workspace_access_denied")
+                return membership
+
+            service = HostedReadService(
+                runtime_factory=runtime_factory or _provider_runtime,
+                membership_resolver=bound_membership,
+                audit_recorder=_record_connector_status_audit,
+            )
+            return await service.execute(
+                principal,
+                workspace_id,
+                connection_id,
+                qualification.normalized_capability,
+                qualification.capability_version_sha256,
+                inputs,
+            )
+
+        publisher = GeneratedProviderToolPublisher(server, execute=execute_generated_read)
+        server._mercury_v1_generated_provider_tools = publisher
+
+    runtime: Any | None = None
+    try:
+        runtime = await _runtime_from(runtime_factory)
+        qualifications = await _catalog_qualifications(runtime)
+        return await publisher.publish(qualifications, context=context)
+    finally:
+        if runtime is not None:
+            await _close_runtime(runtime)
 
 
 def _connection_output(summary: ProviderConnectionSummary) -> ProviderConnectionOutput:
@@ -986,6 +1052,9 @@ def _configure_v1_tools(
     runtime_factory: ProviderRuntimeFactory | None,
 ) -> None:
     if not enabled:
+        publisher = getattr(server, "_mercury_v1_generated_provider_tools", None)
+        if isinstance(publisher, GeneratedProviderToolPublisher):
+            publisher.clear()
         for name in V1_HOSTED_TOOL_NAMES:
             registered = server._tool_manager.get_tool(name)
             if registered is not None and _is_v1_registered_tool(registered):
@@ -1213,5 +1282,6 @@ __all__ = [
     "list_accounting_providers",
     "list_provider_capabilities",
     "list_provider_connections",
+    "refresh_generated_provider_tools",
     "start_provider_connection",
 ]

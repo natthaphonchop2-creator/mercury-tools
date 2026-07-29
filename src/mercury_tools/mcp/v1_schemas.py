@@ -7,7 +7,7 @@ from typing import Annotated, Literal, TypeAlias
 from uuid import UUID
 
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, model_validator
 
 from mercury_tools.catalog.models import QualificationState
 from mercury_tools.providers.models import (
@@ -124,6 +124,19 @@ class V1SuccessEnvelope(V1PublicModel):
         default_factory=list,
         max_length=20,
     )
+
+
+class ProviderReadEnvelope(V1SuccessEnvelope):
+    """Internal result model for a catalog-specific generated read contract."""
+
+    workspace_id: UUID
+    connection_id: UUID
+    provider: ProviderId
+    company_display_name: str = Field(min_length=1, max_length=200)
+    environment: Literal["sandbox", "uat", "production"]
+    capability_id: str = Field(pattern=CAPABILITY_ID_PATTERN, max_length=200)
+    capability_version: str = Field(pattern=SHA256_PATTERN)
+    data: dict[str, JsonValue]
 
 
 class FlowAccountProviderOutput(V1PublicModel):
@@ -357,6 +370,7 @@ __all__ = [
     "PeakProviderOutput",
     "ProviderCapabilityOutput",
     "ProviderConnectionOutput",
+    "ProviderReadEnvelope",
     "ProviderConnectionStart",
     "ReviewedCapabilitySchemaOutput",
     "SHA256_PATTERN",

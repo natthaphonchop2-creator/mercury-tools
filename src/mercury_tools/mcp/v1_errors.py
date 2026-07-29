@@ -7,6 +7,12 @@ from typing import Literal, TypeAlias
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from mercury_tools.auth.models import MercuryAuthError
+from mercury_tools.providers.base import (
+    ProviderAuthRequired,
+    ProviderOutcomeUnknown,
+    ProviderRuntimeError,
+    ProviderSchemaChanged,
+)
 from mercury_tools.providers.oauth import ProviderOAuthError
 from mercury_tools.providers.peak_setup import PeakSetupError
 from mercury_tools.providers.store import ProviderStoreError
@@ -90,6 +96,14 @@ def public_error_code(error: BaseException) -> V1ErrorCode:
             return "workspace_access_denied"
         if isinstance(current, QualificationGateError):
             return current.code
+        if isinstance(current, ProviderSchemaChanged):
+            return "capability_version_changed"
+        if isinstance(current, ProviderAuthRequired):
+            return "provider_authorization_expired"
+        if isinstance(current, ProviderOutcomeUnknown):
+            return "outcome_unknown"
+        if isinstance(current, ProviderRuntimeError):
+            return "capability_unavailable"
         if isinstance(current, ProviderStoreError):
             if current.code == "provider_connection_not_found":
                 return "provider_connection_required"

@@ -41,6 +41,7 @@ from mercury_tools.providers.streamable_mcp import (
     ProviderAuthHeader,
     ProviderAuthHeaders,
     ProviderOperationDeadline,
+    current_provider_operation_deadline,
     provider_operation_deadline,
     wire_schema_sha256,
 )
@@ -655,6 +656,8 @@ class PeakMCPDriver:
         binding: QualifiedCapabilityBinding,
         arguments: BaseModel,
         operation_id: UUID,
+        *,
+        deadline: ProviderOperationDeadline | None = None,
     ) -> ProviderCallResult:
         self._require_contract()
         checked = self._connection(connection, allow_validation=False)
@@ -665,23 +668,69 @@ class PeakMCPDriver:
                 if checked_binding.operation_class is ProviderOperationClass.CREATE
                 else TimeoutClass.READ
             )
-            async with self._qualification_operation(timeout_class):
+            async with self._qualification_operation(
+                timeout_class,
+                deadline=deadline,
+            ):
                 await self._qualification_resolver.assert_binding(checked, checked_binding)
         except Exception:
             raise self._invalid() from None
         raise self._invalid()
 
+    async def call_hosted_read(
+        self,
+        connection: ProviderConnection,
+        binding: QualifiedCapabilityBinding,
+        arguments: BaseModel,
+        operation_id: UUID,
+        *,
+        deadline: ProviderOperationDeadline | None = None,
+    ) -> ProviderCallResult:
+        """Execute a V1-generated read without widening the legacy PEAK call path."""
+
+        self._require_contract()
+        checked = self._connection(connection, allow_validation=False)
+        try:
+            checked_binding = QualifiedCapabilityBinding.model_validate(binding)
+            if checked_binding.operation_class is not ProviderOperationClass.READ:
+                raise ValueError
+            async with self._qualification_operation(
+                TimeoutClass.READ,
+                deadline=deadline,
+            ) as operation_deadline:
+                await self._qualification_resolver.assert_binding(checked, checked_binding)
+                return await self._runtime.call(
+                    checked,
+                    checked_binding,
+                    arguments,
+                    operation_id,
+                    deadline=operation_deadline,
+                )
+        except ProviderRuntimeError:
+            raise
+        except Exception:
+            raise self._invalid() from None
+
     @asynccontextmanager
-    async def _qualification_operation(self, timeout_class: TimeoutClass):
-        deadline = ProviderOperationDeadline.start(
-            self._manifest.timeout_classes[timeout_class].operation_seconds
+    async def _qualification_operation(
+        self,
+        timeout_class: TimeoutClass,
+        *,
+        deadline: ProviderOperationDeadline | None = None,
+    ):
+        operation_deadline = (
+            deadline
+            or current_provider_operation_deadline()
+            or ProviderOperationDeadline.start(
+                self._manifest.timeout_classes[timeout_class].operation_seconds
+            )
         )
-        snapshot = await self._qualification_resolver.open_snapshot(deadline)
+        snapshot = await self._qualification_resolver.open_snapshot(operation_deadline)
         with (
             self._qualification_resolver.use_snapshot(snapshot),
-            provider_operation_deadline(deadline),
+            provider_operation_deadline(operation_deadline),
         ):
-            yield deadline
+            yield operation_deadline
 
     def _connection(
         self,
