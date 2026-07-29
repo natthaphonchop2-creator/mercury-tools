@@ -3,6 +3,7 @@ import re
 from datetime import UTC, datetime
 from enum import IntEnum, StrEnum
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -62,7 +63,7 @@ _ENVIRONMENT = r"^[a-z][a-z0-9_-]{0,63}$"
 _SHA256 = r"^[0-9a-f]{64}$"
 _SAFE_QUALIFICATION_IDENTIFIER = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"
 _CATALOG_EVIDENCE_URI = re.compile(
-    r"^catalog://global/(?:flowaccount|peak)/qualifications/[0-9a-f]{64}\.json$"
+    r"^catalog://global/(?:flowaccount|peak)/qualifications/[0-9a-f]{64}-[0-9a-f]{64}\.json$"
 )
 
 
@@ -221,6 +222,7 @@ class ProviderMCPQualification(BaseModel):
         revalidate_instances="always",
     )
 
+    id: UUID | None = None
     provider: str = Field(pattern=_PROVIDER_ID)
     environment: str = Field(pattern=_ENVIRONMENT)
     provider_tool_name: str = Field(pattern=_PROVIDER_TOOL_NAME)
@@ -231,9 +233,16 @@ class ProviderMCPQualification(BaseModel):
     response_shape_hash: str = Field(pattern=_SHA256)
     required_permissions: tuple[str, ...]
     capability_version_sha256: str = Field(pattern=_SHA256)
+    # The definition version is stable. Each qualification attempt receives a
+    # distinct immutable evidence revision after its artifact is reviewed.
     qualification_state: QualificationState = QualificationState.DISCOVERED_UNREVIEWED
+    company_sha256: str | None = Field(default=None, pattern=_SHA256)
+    evidence_revision_sha256: str | None = Field(default=None, pattern=_SHA256)
     qualification_evidence_uri: str | None = None
+    evidence_evaluated_at: datetime | None = None
     evidence_expires_at: datetime | None = None
+    nonproduction_evidence_revision_sha256: str | None = Field(default=None, pattern=_SHA256)
+    nonproduction_company_sha256: str | None = Field(default=None, pattern=_SHA256)
     production_canary_at: datetime | None = None
     owner_authorized_by: str | None = None
     disable_reason: str | None = None
@@ -279,6 +288,7 @@ class ProviderMCPQualification(BaseModel):
             raise ValueError("provider_mcp_qualification_version_invalid")
 
         for field_name in (
+            "evidence_evaluated_at",
             "evidence_expires_at",
             "production_canary_at",
         ):
@@ -288,22 +298,51 @@ class ProviderMCPQualification(BaseModel):
                     raise ValueError("provider_mcp_qualification_timestamp_invalid")
                 object.__setattr__(self, field_name, value.astimezone(UTC))
 
-        requires_evidence = self.qualification_state in {
-            QualificationState.NONPRODUCTION_QUALIFIED,
-            QualificationState.ENABLED,
+        requires_evidence = self.qualification_state not in {
+            QualificationState.DISCOVERED_UNREVIEWED,
+            QualificationState.SCHEMA_VALIDATED,
         }
         if requires_evidence:
             if (
-                self.qualification_evidence_uri is None
+                self.company_sha256 is None
+                or self.evidence_revision_sha256 is None
+                or self.qualification_evidence_uri is None
                 or _CATALOG_EVIDENCE_URI.fullmatch(self.qualification_evidence_uri) is None
-                or not self.qualification_evidence_uri.startswith(
-                    f"catalog://global/{self.provider}/qualifications/"
+                or self.qualification_evidence_uri
+                != _qualification_evidence_uri(
+                    provider=self.provider,
+                    capability_version_sha256=self.capability_version_sha256,
+                    evidence_revision_sha256=self.evidence_revision_sha256,
                 )
+                or self.evidence_evaluated_at is None
                 or self.evidence_expires_at is None
             ):
                 raise ValueError("provider_mcp_qualification_evidence_required")
-        elif self.qualification_evidence_uri is not None or self.evidence_expires_at is not None:
+        elif any(
+            value is not None
+            for value in (
+                self.company_sha256,
+                self.evidence_revision_sha256,
+                self.qualification_evidence_uri,
+                self.evidence_evaluated_at,
+                self.evidence_expires_at,
+                self.nonproduction_evidence_revision_sha256,
+                self.nonproduction_company_sha256,
+            )
+        ):
             raise ValueError("provider_mcp_qualification_evidence_unexpected")
+
+        if self.environment == "production" and requires_evidence:
+            if (
+                self.nonproduction_evidence_revision_sha256 is None
+                or self.nonproduction_company_sha256 is None
+            ):
+                raise ValueError("provider_mcp_qualification_nonproduction_reference_required")
+        elif (
+            self.nonproduction_evidence_revision_sha256 is not None
+            or self.nonproduction_company_sha256 is not None
+        ):
+            raise ValueError("provider_mcp_qualification_nonproduction_reference_unexpected")
 
         if self.qualification_state is QualificationState.ENABLED:
             if self.environment == "production":
@@ -319,8 +358,26 @@ class ProviderMCPQualification(BaseModel):
                     raise ValueError("provider_mcp_qualification_canary_required")
             elif self.production_canary_at is not None or self.owner_authorized_by is not None:
                 raise ValueError("provider_mcp_qualification_canary_unexpected")
-        elif self.production_canary_at is not None or self.owner_authorized_by is not None:
+        elif self.qualification_state not in {
+            QualificationState.DISABLED,
+            QualificationState.SUPERSEDED,
+        } and (self.production_canary_at is not None or self.owner_authorized_by is not None):
             raise ValueError("provider_mcp_qualification_canary_unexpected")
+
+        if self.qualification_state in {
+            QualificationState.DISABLED,
+            QualificationState.SUPERSEDED,
+        }:
+            if self.environment == "production":
+                if (
+                    self.production_canary_at is None
+                    or self.owner_authorized_by is None
+                    or re.fullmatch(_SAFE_QUALIFICATION_IDENTIFIER, self.owner_authorized_by)
+                    is None
+                ):
+                    raise ValueError("provider_mcp_qualification_canary_required")
+            elif self.production_canary_at is not None or self.owner_authorized_by is not None:
+                raise ValueError("provider_mcp_qualification_canary_unexpected")
 
         if self.qualification_state in {
             QualificationState.DISABLED,
@@ -386,6 +443,18 @@ def _qualification_schema_hash(
             "utf-8"
         )
     ).hexdigest()
+
+
+def _qualification_evidence_uri(
+    *,
+    provider: str,
+    capability_version_sha256: str,
+    evidence_revision_sha256: str,
+) -> str:
+    return (
+        f"catalog://global/{provider}/qualifications/"
+        f"{capability_version_sha256}-{evidence_revision_sha256}.json"
+    )
 
 
 def _provider_mcp_capability_version_sha256(

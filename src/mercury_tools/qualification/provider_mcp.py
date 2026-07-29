@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable
+import re
+import secrets
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -18,8 +20,11 @@ from mercury_tools.providers.base import (
     QualifiedCapabilityBinding,
     VerifiedRuntimeBinding,
 )
-from mercury_tools.providers.models import ProviderId
-from mercury_tools.qualification.artifacts import QualificationArtifact
+from mercury_tools.providers.models import ProviderConnection, ProviderId
+from mercury_tools.qualification.artifacts import (
+    QualificationArtifact,
+    load_catalog_qualification_artifact,
+)
 
 _PROVIDER = r"^(?:flowaccount|peak)$"
 _ENVIRONMENT = r"^[a-z][a-z0-9_-]{0,63}$"
@@ -27,10 +32,11 @@ _CAPABILITY = r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$"
 _TOOL = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"
 _SHA256 = r"^[0-9a-f]{64}$"
 _IDENTIFIER = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"
+_PROFILE_CAPABILITY = "provider_profile.get"
 
 
 class CapabilitySelection(BaseModel):
-    """The full identity an execution caller must present to the catalog gate."""
+    """The exact immutable capability definition selected for execution."""
 
     model_config = ConfigDict(
         extra="forbid",
@@ -98,87 +104,445 @@ class QualificationGateError(RuntimeError):
         super().__init__(code)
 
 
-class CapabilityQualificationGate:
-    """Resolve only exact catalog qualification records into runtime bindings."""
+ArtifactLoader = Callable[[str], QualificationArtifact]
 
-    def __init__(self, qualifications: Iterable[ProviderMCPQualification]) -> None:
-        indexed: dict[tuple[str, str, str, str, str], ProviderMCPQualification] = {}
-        for item in qualifications:
-            checked = ProviderMCPQualification.model_validate(item)
-            identity = _selection_identity_from_qualification(checked)
-            if identity in indexed:
-                raise ValueError("qualification_catalog_duplicate")
-            indexed[identity] = checked
-        self._qualifications = indexed
+
+class CapabilityQualificationGate:
+    """Resolve only current catalog rows and their immutable artifact revisions."""
+
+    def __init__(
+        self,
+        qualifications: Iterable[ProviderMCPQualification],
+        *,
+        artifacts: Iterable[QualificationArtifact] = (),
+        artifact_loader: ArtifactLoader | None = None,
+    ) -> None:
+        self._qualifications = tuple(
+            ProviderMCPQualification.model_validate(item) for item in qualifications
+        )
+        artifact_index: dict[str, QualificationArtifact] = {}
+        for artifact in artifacts:
+            checked = QualificationArtifact.model_validate(artifact)
+            if checked.catalog_uri in artifact_index:
+                raise ValueError("qualification_artifact_duplicate")
+            artifact_index[checked.catalog_uri] = checked
+        self._artifacts = artifact_index
+        self._artifact_loader = artifact_loader
 
     def resolve(
         self,
         selection: CapabilitySelection,
         *,
+        company_sha256: str | None = None,
+        bootstrap: bool = False,
         now: datetime | None = None,
     ) -> CapabilityResolution:
         checked_selection = CapabilitySelection.model_validate(selection)
-        qualification = self._qualifications.get(_selection_identity(checked_selection))
-        if qualification is None:
-            return CapabilityResolution(status="capability_unavailable")
-        checked_now = _now(now)
-        if qualification.qualification_state is QualificationState.ENABLED:
+        if company_sha256 is not None and _sha256_match(company_sha256) is None:
+            raise ValueError("qualification_company_invalid")
+        matching = [
+            item
+            for item in self._qualifications
+            if _selection_identity_from_qualification(item)
+            == _selection_identity(checked_selection)
+        ]
+        return self._resolve_matches(
+            matching,
+            company_sha256=company_sha256,
+            bootstrap=bootstrap,
+            now=_now(now),
+        )
+
+    def resolve_current(
+        self,
+        *,
+        provider: str,
+        environment: str,
+        normalized_capability: str,
+        provider_tool_name: str,
+        company_sha256: str | None,
+        bootstrap: bool,
+        now: datetime | None = None,
+    ) -> CapabilityResolution:
+        matching = [
+            item
+            for item in self._qualifications
             if (
-                qualification.evidence_expires_at is not None
-                and qualification.evidence_expires_at > checked_now
-            ):
-                return CapabilityResolution(status="enabled", qualification=qualification)
-            return CapabilityResolution(status="insufficient_evidence")
-        if qualification.qualification_state in {
-            QualificationState.DISABLED,
-            QualificationState.SUPERSEDED,
-        }:
-            return CapabilityResolution(status="capability_unavailable")
-        return CapabilityResolution(status="insufficient_evidence")
+                item.provider,
+                item.environment,
+                item.normalized_capability,
+                item.provider_tool_name,
+            )
+            == (provider, environment, normalized_capability, provider_tool_name)
+        ]
+        return self._resolve_matches(
+            matching,
+            company_sha256=company_sha256,
+            bootstrap=bootstrap,
+            now=_now(now),
+        )
 
     def bind(
         self,
         selection: CapabilitySelection,
         *,
+        company_sha256: str | None = None,
+        bootstrap: bool = False,
         now: datetime | None = None,
     ) -> QualifiedCapabilityBinding:
-        resolved = self.resolve(selection, now=now)
-        if resolved.status != "enabled" or resolved.qualification is None:
-            raise QualificationGateError(resolved.status)
-        qualification = resolved.qualification
-        return QualifiedCapabilityBinding(
-            provider=ProviderId(qualification.provider),
-            environment=qualification.environment,
-            normalized_capability=qualification.normalized_capability,
-            provider_tool=qualification.provider_tool_name,
-            operation_class=_operation_class(qualification),
-            qualification_hash=qualification.capability_version_sha256,
+        resolved = self.resolve(
+            selection,
+            company_sha256=company_sha256,
+            bootstrap=bootstrap,
+            now=now,
         )
+        return self._binding_from_resolution(resolved)
+
+    def bind_current(
+        self,
+        *,
+        provider: str,
+        environment: str,
+        normalized_capability: str,
+        provider_tool_name: str,
+        company_sha256: str | None,
+        bootstrap: bool,
+        now: datetime | None = None,
+    ) -> QualifiedCapabilityBinding:
+        resolved = self.resolve_current(
+            provider=provider,
+            environment=environment,
+            normalized_capability=normalized_capability,
+            provider_tool_name=provider_tool_name,
+            company_sha256=company_sha256,
+            bootstrap=bootstrap,
+            now=now,
+        )
+        return self._binding_from_resolution(resolved)
 
     def verify(
         self,
         selection: CapabilitySelection,
         *,
         resource_uri_sha256: str,
+        company_sha256: str | None = None,
+        bootstrap: bool = False,
         now: datetime | None = None,
     ) -> VerifiedRuntimeBinding:
-        binding = self.bind(selection, now=now)
-        qualification = self.resolve(selection, now=now).qualification
+        binding = self.bind(
+            selection,
+            company_sha256=company_sha256,
+            bootstrap=bootstrap,
+            now=now,
+        )
+        qualification = self.resolve(
+            selection,
+            company_sha256=company_sha256,
+            bootstrap=bootstrap,
+            now=now,
+        ).qualification
         if qualification is None:
             raise QualificationGateError("capability_unavailable")
-        return VerifiedRuntimeBinding(
-            qualification_state=ProviderQualificationState.ENABLED,
+        return _verified_binding(qualification, binding, resource_uri_sha256)
+
+    def _binding_from_resolution(
+        self,
+        resolved: CapabilityResolution,
+    ) -> QualifiedCapabilityBinding:
+        if resolved.status != "enabled" or resolved.qualification is None:
+            raise QualificationGateError(resolved.status)
+        qualification = resolved.qualification
+        if qualification.evidence_revision_sha256 is None:
+            raise QualificationGateError("insufficient_evidence")
+        return QualifiedCapabilityBinding(
             provider=ProviderId(qualification.provider),
             environment=qualification.environment,
-            resource_uri_sha256=resource_uri_sha256,
             normalized_capability=qualification.normalized_capability,
-            capability_version=qualification.capability_version_sha256,
             provider_tool=qualification.provider_tool_name,
-            operation_class=binding.operation_class,
-            request_schema_sha256=_json_sha256(qualification.input_schema),
-            response_schema_sha256=_json_sha256(qualification.output_schema),
-            qualification_hash=qualification.capability_version_sha256,
+            operation_class=_operation_class(qualification),
+            qualification_hash=qualification.evidence_revision_sha256,
         )
+
+    def _resolve_matches(
+        self,
+        matching: Iterable[ProviderMCPQualification],
+        *,
+        company_sha256: str | None,
+        bootstrap: bool,
+        now: datetime,
+    ) -> CapabilityResolution:
+        candidates = tuple(matching)
+        if not candidates:
+            return CapabilityResolution(status="capability_unavailable")
+        valid = [
+            item
+            for item in candidates
+            if self._is_current_enabled(
+                item,
+                company_sha256=company_sha256,
+                bootstrap=bootstrap,
+                now=now,
+            )
+        ]
+        if len(valid) == 1:
+            return CapabilityResolution(status="enabled", qualification=valid[0])
+        if len(valid) > 1:
+            return CapabilityResolution(status="insufficient_evidence")
+        if any(
+            item.qualification_state in {QualificationState.DISABLED, QualificationState.SUPERSEDED}
+            for item in candidates
+        ) and not any(
+            item.qualification_state is QualificationState.ENABLED for item in candidates
+        ):
+            return CapabilityResolution(status="capability_unavailable")
+        return CapabilityResolution(status="insufficient_evidence")
+
+    def _is_current_enabled(
+        self,
+        qualification: ProviderMCPQualification,
+        *,
+        company_sha256: str | None,
+        bootstrap: bool,
+        now: datetime,
+    ) -> bool:
+        if (
+            qualification.qualification_state is not QualificationState.ENABLED
+            or qualification.evidence_expires_at is None
+            or qualification.evidence_evaluated_at is None
+            or qualification.evidence_expires_at <= now
+            or qualification.evidence_evaluated_at > now
+            or qualification.company_sha256 is None
+            or qualification.evidence_revision_sha256 is None
+        ):
+            return False
+        if not bootstrap and (
+            company_sha256 is None
+            or not secrets.compare_digest(company_sha256, qualification.company_sha256)
+        ):
+            return False
+        artifact = self._artifact_for(qualification)
+        if artifact is None:
+            return False
+        try:
+            artifact.require_valid_for(
+                qualification,
+                now=now,
+                expected_company_sha256=qualification.company_sha256,
+            )
+        except ValueError:
+            return False
+        if (
+            artifact.catalog_uri != qualification.qualification_evidence_uri
+            or artifact.evidence_revision_sha256 != qualification.evidence_revision_sha256
+            or artifact.evaluated_at != qualification.evidence_evaluated_at
+            or artifact.evidence_expires_at != qualification.evidence_expires_at
+        ):
+            return False
+        if qualification.environment == "production":
+            if (
+                qualification.production_canary_at is None
+                or qualification.production_canary_at > now
+                or qualification.nonproduction_evidence_revision_sha256 is None
+                or qualification.nonproduction_company_sha256 is None
+            ):
+                return False
+            return self._has_current_nonproduction_reference(qualification, now=now)
+        return True
+
+    def _has_current_nonproduction_reference(
+        self,
+        production: ProviderMCPQualification,
+        *,
+        now: datetime,
+    ) -> bool:
+        matches = [
+            candidate
+            for candidate in self._qualifications
+            if (
+                candidate.environment != "production"
+                and candidate.evidence_revision_sha256
+                == production.nonproduction_evidence_revision_sha256
+                and candidate.company_sha256 == production.nonproduction_company_sha256
+                and candidate.qualification_state
+                in {QualificationState.NONPRODUCTION_QUALIFIED, QualificationState.ENABLED}
+                and _same_cross_environment_capability(production, candidate)
+                and self._has_current_evidence(candidate, now=now)
+            )
+        ]
+        return len(matches) == 1
+
+    def _has_current_evidence(
+        self,
+        qualification: ProviderMCPQualification,
+        *,
+        now: datetime,
+    ) -> bool:
+        if (
+            qualification.evidence_expires_at is None
+            or qualification.evidence_evaluated_at is None
+            or qualification.evidence_expires_at <= now
+            or qualification.evidence_evaluated_at > now
+            or qualification.company_sha256 is None
+        ):
+            return False
+        artifact = self._artifact_for(qualification)
+        if artifact is None:
+            return False
+        try:
+            artifact.require_valid_for(
+                qualification,
+                now=now,
+                expected_company_sha256=qualification.company_sha256,
+            )
+        except ValueError:
+            return False
+        return (
+            artifact.catalog_uri == qualification.qualification_evidence_uri
+            and artifact.evidence_revision_sha256 == qualification.evidence_revision_sha256
+            and artifact.evaluated_at == qualification.evidence_evaluated_at
+            and artifact.evidence_expires_at == qualification.evidence_expires_at
+        )
+
+    def _artifact_for(
+        self,
+        qualification: ProviderMCPQualification,
+    ) -> QualificationArtifact | None:
+        uri = qualification.qualification_evidence_uri
+        if uri is None:
+            return None
+        try:
+            artifact = self._artifacts.get(uri)
+            if artifact is None and self._artifact_loader is not None:
+                artifact = QualificationArtifact.model_validate(self._artifact_loader(uri))
+            return artifact
+        except (OSError, TypeError, ValueError):
+            return None
+
+
+class QualificationCatalog(Protocol):
+    def list_provider_mcp_qualifications(self) -> list[ProviderMCPQualification]: ...
+
+
+class CatalogQualificationResolver:
+    """Reload catalog authority for every hosted provider dispatch attempt."""
+
+    def __init__(
+        self,
+        *,
+        catalog: QualificationCatalog,
+        catalog_root: str,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
+        if not callable(getattr(catalog, "list_provider_mcp_qualifications", None)):
+            raise ValueError("qualification_catalog_invalid")
+        self._catalog = catalog
+        self._catalog_root = str(catalog_root)
+        self._now = now or (lambda: datetime.now(UTC))
+
+    def bind_bootstrap(
+        self,
+        connection: ProviderConnection,
+        *,
+        normalized_capability: str = _PROFILE_CAPABILITY,
+        provider_tool_name: str,
+    ) -> QualifiedCapabilityBinding:
+        checked = ProviderConnection.model_validate(connection)
+        if normalized_capability != _PROFILE_CAPABILITY:
+            raise QualificationGateError("capability_unavailable")
+        return self._gate().bind_current(
+            provider=checked.provider.value,
+            environment=checked.environment,
+            normalized_capability=normalized_capability,
+            provider_tool_name=provider_tool_name,
+            company_sha256=None,
+            bootstrap=True,
+            now=self._checked_now(),
+        )
+
+    def bind_for_connection(
+        self,
+        connection: ProviderConnection,
+        *,
+        normalized_capability: str,
+        provider_tool_name: str,
+    ) -> QualifiedCapabilityBinding:
+        checked = ProviderConnection.model_validate(connection)
+        return self._gate().bind_current(
+            provider=checked.provider.value,
+            environment=checked.environment,
+            normalized_capability=normalized_capability,
+            provider_tool_name=provider_tool_name,
+            company_sha256=_server_company_sha256(checked),
+            bootstrap=False,
+            now=self._checked_now(),
+        )
+
+    def assert_binding(
+        self,
+        connection: ProviderConnection,
+        binding: QualifiedCapabilityBinding,
+    ) -> QualifiedCapabilityBinding:
+        checked_binding = QualifiedCapabilityBinding.model_validate(binding)
+        checked_connection = ProviderConnection.model_validate(connection)
+        if checked_binding.provider is not checked_connection.provider:
+            raise QualificationGateError("capability_unavailable")
+        if _is_profile_bootstrap(checked_connection, checked_binding):
+            expected = self.bind_bootstrap(
+                checked_connection,
+                normalized_capability=checked_binding.normalized_capability,
+                provider_tool_name=checked_binding.provider_tool,
+            )
+        else:
+            expected = self.bind_for_connection(
+                checked_connection,
+                normalized_capability=checked_binding.normalized_capability,
+                provider_tool_name=checked_binding.provider_tool,
+            )
+        if checked_binding != expected:
+            raise QualificationGateError("capability_unavailable")
+        return expected
+
+    def verify_binding(
+        self,
+        connection: ProviderConnection,
+        binding: QualifiedCapabilityBinding,
+        resource_uri_sha256: str,
+    ) -> VerifiedRuntimeBinding:
+        expected = self.assert_binding(connection, binding)
+        checked_connection = ProviderConnection.model_validate(connection)
+        bootstrap = _is_profile_bootstrap(checked_connection, expected)
+        company_sha256 = None if bootstrap else _server_company_sha256(checked_connection)
+        gate = self._gate()
+        resolution = gate.resolve_current(
+            provider=checked_connection.provider.value,
+            environment=checked_connection.environment,
+            normalized_capability=expected.normalized_capability,
+            provider_tool_name=expected.provider_tool,
+            company_sha256=company_sha256,
+            bootstrap=bootstrap,
+            now=self._checked_now(),
+        )
+        if resolution.status != "enabled" or resolution.qualification is None:
+            raise QualificationGateError(resolution.status)
+        if gate._binding_from_resolution(resolution) != expected:
+            raise QualificationGateError("capability_unavailable")
+        return _verified_binding(resolution.qualification, expected, resource_uri_sha256)
+
+    def _gate(self) -> CapabilityQualificationGate:
+        try:
+            qualifications = self._catalog.list_provider_mcp_qualifications()
+            return CapabilityQualificationGate(
+                qualifications,
+                artifact_loader=lambda uri: load_catalog_qualification_artifact(
+                    self._catalog_root,
+                    uri,
+                ),
+            )
+        except (OSError, TypeError, ValueError, RuntimeError):
+            return CapabilityQualificationGate(())
+
+    def _checked_now(self) -> datetime:
+        return _now(self._now())
 
 
 def transition_qualification(
@@ -187,11 +551,12 @@ def transition_qualification(
     *,
     evidence: QualificationArtifact | None = None,
     nonproduction_evidence: Iterable[ProviderMCPQualification] = (),
+    nonproduction_artifacts: Iterable[QualificationArtifact] = (),
     canary: OwnerAuthorizedCanary | None = None,
     disable_reason: str | None = None,
     now: datetime,
 ) -> ProviderMCPQualification:
-    """Advance one state only after exact, sanitized qualification checks."""
+    """Advance one immutable evidence revision through the only allowed lifecycle."""
 
     current = ProviderMCPQualification.model_validate(qualification)
     target = QualificationState(target_state)
@@ -203,40 +568,43 @@ def transition_qualification(
     if target is QualificationState.SCHEMA_VALIDATED:
         _require_absent(evidence, canary, disable_reason)
     elif target is QualificationState.NONPRODUCTION_QUALIFIED:
-        if evidence is None:
-            raise ValueError("qualification_evidence_required")
+        checked_evidence = _require_current_artifact(current, evidence, now=checked_now)
+        updates.update(_evidence_updates(checked_evidence))
         if current.environment == "production":
-            _require_nonproduction_evidence(
+            candidate = _require_nonproduction_evidence(
                 current,
-                QualificationArtifact.model_validate(evidence),
                 nonproduction_evidence,
+                nonproduction_artifacts,
                 now=checked_now,
             )
-        else:
-            QualificationArtifact.model_validate(evidence).require_valid_for(
-                current,
-                now=checked_now,
+            updates.update(
+                {
+                    "nonproduction_evidence_revision_sha256": candidate.evidence_revision_sha256,
+                    "nonproduction_company_sha256": candidate.company_sha256,
+                }
             )
-        checked_evidence = QualificationArtifact.model_validate(evidence)
-        updates.update(
-            {
-                "qualification_evidence_uri": checked_evidence.catalog_uri,
-                "evidence_expires_at": checked_evidence.evidence_expires_at,
-            }
-        )
     elif target is QualificationState.ENABLED:
         if not _is_v1_enabled_operation(current):
             raise ValueError("qualification_operation_not_allowed")
-        if (
-            current.qualification_evidence_uri is None
-            or current.evidence_expires_at is None
-            or current.evidence_expires_at <= checked_now
-        ):
-            raise ValueError("qualification_evidence_required")
+        checked_evidence = _require_current_artifact(current, evidence, now=checked_now)
+        _require_record_matches_artifact(current, checked_evidence)
         if current.environment == "production":
+            candidate = _require_nonproduction_evidence(
+                current,
+                nonproduction_evidence,
+                nonproduction_artifacts,
+                now=checked_now,
+            )
+            if (
+                current.nonproduction_evidence_revision_sha256 != candidate.evidence_revision_sha256
+                or current.nonproduction_company_sha256 != candidate.company_sha256
+            ):
+                raise ValueError("nonproduction_evidence_required")
             if canary is None:
                 raise ValueError("production_canary_required")
             checked_canary = OwnerAuthorizedCanary.model_validate(canary)
+            if checked_canary.authorized_at > checked_now:
+                raise ValueError("production_canary_invalid")
             if _canary_identity(checked_canary) != _selection_identity_from_qualification(current):
                 raise ValueError("production_canary_mismatch")
             updates.update(
@@ -250,15 +618,7 @@ def transition_qualification(
     else:
         if not isinstance(disable_reason, str) or not disable_reason:
             raise ValueError("qualification_disable_reason_required")
-        updates.update(
-            {
-                "qualification_evidence_uri": None,
-                "evidence_expires_at": None,
-                "production_canary_at": None,
-                "owner_authorized_by": None,
-                "disable_reason": disable_reason,
-            }
-        )
+        updates["disable_reason"] = disable_reason
 
     values = current.model_dump(mode="python")
     values.update(updates)
@@ -277,26 +637,83 @@ _ALLOWED_TRANSITIONS = {
 }
 
 
-def _require_nonproduction_evidence(
-    production: ProviderMCPQualification,
-    artifact: QualificationArtifact,
-    candidates: Iterable[ProviderMCPQualification],
+def _require_current_artifact(
+    definition: ProviderMCPQualification,
+    artifact: QualificationArtifact | None,
     *,
     now: datetime,
+) -> QualificationArtifact:
+    if artifact is None:
+        raise ValueError("qualification_evidence_required")
+    checked = QualificationArtifact.model_validate(artifact)
+    checked.require_valid_for(definition, now=now)
+    return checked
+
+
+def _evidence_updates(artifact: QualificationArtifact) -> dict[str, object]:
+    return {
+        "company_sha256": artifact.company_sha256,
+        "evidence_revision_sha256": artifact.evidence_revision_sha256,
+        "qualification_evidence_uri": artifact.catalog_uri,
+        "evidence_evaluated_at": artifact.evaluated_at,
+        "evidence_expires_at": artifact.evidence_expires_at,
+    }
+
+
+def _require_record_matches_artifact(
+    qualification: ProviderMCPQualification,
+    artifact: QualificationArtifact,
 ) -> None:
+    if (
+        qualification.company_sha256 != artifact.company_sha256
+        or qualification.evidence_revision_sha256 != artifact.evidence_revision_sha256
+        or qualification.qualification_evidence_uri != artifact.catalog_uri
+        or qualification.evidence_evaluated_at != artifact.evaluated_at
+        or qualification.evidence_expires_at != artifact.evidence_expires_at
+    ):
+        raise ValueError("qualification_evidence_mismatch")
+
+
+def _require_nonproduction_evidence(
+    production: ProviderMCPQualification,
+    candidates: Iterable[ProviderMCPQualification],
+    artifacts: Iterable[QualificationArtifact],
+    *,
+    now: datetime,
+) -> ProviderMCPQualification:
+    artifact_by_uri = {
+        checked.catalog_uri: checked
+        for artifact in artifacts
+        if (checked := QualificationArtifact.model_validate(artifact)).passed
+    }
+    matches: list[ProviderMCPQualification] = []
     for candidate in candidates:
         checked = ProviderMCPQualification.model_validate(candidate)
+        artifact = (
+            artifact_by_uri.get(checked.qualification_evidence_uri or "")
+            if checked.qualification_evidence_uri is not None
+            else None
+        )
         if (
             checked.environment != "production"
             and checked.qualification_state
             in {QualificationState.NONPRODUCTION_QUALIFIED, QualificationState.ENABLED}
-            and checked.evidence_expires_at is not None
-            and checked.evidence_expires_at > now
             and _same_cross_environment_capability(production, checked)
+            and artifact is not None
         ):
-            artifact.require_valid_for(checked, now=now)
-            return
-    raise ValueError("nonproduction_evidence_required")
+            try:
+                artifact.require_valid_for(
+                    checked,
+                    now=now,
+                    expected_company_sha256=checked.company_sha256,
+                )
+                _require_record_matches_artifact(checked, artifact)
+            except ValueError:
+                continue
+            matches.append(checked)
+    if len(matches) != 1:
+        raise ValueError("nonproduction_evidence_required")
+    return matches[0]
 
 
 def _same_cross_environment_capability(
@@ -373,6 +790,47 @@ def _canary_identity(canary: OwnerAuthorizedCanary) -> tuple[str, str, str, str,
     )
 
 
+def _verified_binding(
+    qualification: ProviderMCPQualification,
+    binding: QualifiedCapabilityBinding,
+    resource_uri_sha256: str,
+) -> VerifiedRuntimeBinding:
+    return VerifiedRuntimeBinding(
+        qualification_state=ProviderQualificationState.ENABLED,
+        provider=ProviderId(qualification.provider),
+        environment=qualification.environment,
+        resource_uri_sha256=resource_uri_sha256,
+        normalized_capability=qualification.normalized_capability,
+        capability_version=qualification.capability_version_sha256,
+        provider_tool=qualification.provider_tool_name,
+        operation_class=binding.operation_class,
+        request_schema_sha256=_json_sha256(qualification.input_schema),
+        response_schema_sha256=_json_sha256(qualification.output_schema),
+        qualification_hash=binding.qualification_hash,
+    )
+
+
+def _server_company_sha256(connection: ProviderConnection) -> str:
+    value = connection.provider_account_id
+    if value.startswith("oauth-pending-"):
+        raise QualificationGateError("insufficient_evidence")
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _is_profile_bootstrap(
+    connection: ProviderConnection,
+    binding: QualifiedCapabilityBinding,
+) -> bool:
+    return (
+        binding.normalized_capability == _PROFILE_CAPABILITY
+        and connection.provider_account_id.startswith("oauth-pending-")
+    )
+
+
+def _sha256_match(value: str) -> str | None:
+    return value if isinstance(value, str) and re.fullmatch(_SHA256, value) else None
+
+
 def _json_sha256(value: object) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
@@ -384,6 +842,21 @@ def _now(value: datetime | None) -> datetime:
     return checked.astimezone(UTC)
 
 
-def _require_absent(*values: object) -> None:
-    if any(value is not None for value in values):
-        raise ValueError("qualification_transition_invalid")
+def _require_absent(
+    evidence: QualificationArtifact | None,
+    canary: OwnerAuthorizedCanary | None,
+    disable_reason: str | None,
+) -> None:
+    if evidence is not None or canary is not None or disable_reason is not None:
+        raise ValueError("qualification_transition_arguments_invalid")
+
+
+__all__ = [
+    "CapabilityQualificationGate",
+    "CapabilityResolution",
+    "CapabilitySelection",
+    "CatalogQualificationResolver",
+    "OwnerAuthorizedCanary",
+    "QualificationGateError",
+    "transition_qualification",
+]

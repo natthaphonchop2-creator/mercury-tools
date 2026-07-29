@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,23 +16,15 @@ from mercury_tools.auth.models import PrincipalResolver
 from mercury_tools.auth.supabase_jwt import SupabaseJwtValidator, validator_from_settings
 from mercury_tools.config import Settings, V1ConfigurationError, v1_supabase_rest_url
 from mercury_tools.credentials.vault import CredentialVault
-from mercury_tools.providers.base import (
-    ProviderOperationClass,
-    ProviderQualificationState,
-    QualifiedCapabilityBinding,
-    VerifiedRuntimeBinding,
-)
+from mercury_tools.db.catalog import SupabaseCatalogStore
+from mercury_tools.providers.base import ProviderOperationClass, ProviderQualificationState
 from mercury_tools.providers.flowaccount import (
     FlowAccountOAuthHeaderFactory,
     FlowAccountProfile,
     FlowAccountProfileRequest,
 )
-from mercury_tools.providers.manifest import (
-    ProviderDriverManifest,
-    load_provider_manifest,
-    resolve_provider_resource,
-)
-from mercury_tools.providers.models import AuthorizationMethod, ProviderConnection, ProviderId
+from mercury_tools.providers.manifest import load_provider_manifest
+from mercury_tools.providers.models import AuthorizationMethod, ProviderId
 from mercury_tools.providers.oauth import (
     FLOWACCOUNT_CALLBACK_PATH,
     DownstreamMCPOAuthClient,
@@ -50,7 +40,10 @@ from mercury_tools.providers.peak import (
 from mercury_tools.providers.peak_setup import PeakSetupService, SupabasePeakSetupStore
 from mercury_tools.providers.registry import ProviderDriverRegistry, build_provider_registry
 from mercury_tools.providers.store import SupabaseProviderConnectionStore
-from mercury_tools.providers.streamable_mcp import wire_schema_sha256
+from mercury_tools.qualification.provider_mcp import (
+    CatalogQualificationResolver,
+    QualificationCatalog,
+)
 from mercury_tools.workspaces.service import WorkspaceService
 
 _PROFILE_CAPABILITY = "provider_profile.get"
@@ -67,6 +60,8 @@ class ProviderOAuthProductionComposition:
     peak_setup_store: SupabasePeakSetupStore
     connection_store: SupabaseProviderConnectionStore
     registry: ProviderDriverRegistry
+    qualification_catalog: QualificationCatalog = field(repr=False)
+    qualification_resolver: CatalogQualificationResolver = field(repr=False)
     network_guard: PublicOAuthNetworkGuard
     state_http_client: httpx.AsyncClient = field(repr=False)
     connection_http_client: httpx.Client = field(repr=False)
@@ -127,6 +122,10 @@ class ProviderOAuthProductionComposition:
                     SupabaseProviderConnectionStore,
                 )
                 or not isinstance(self.registry, ProviderDriverRegistry)
+                or not callable(
+                    getattr(self.qualification_catalog, "list_provider_mcp_qualifications", None)
+                )
+                or not isinstance(self.qualification_resolver, CatalogQualificationResolver)
                 or not isinstance(self.network_guard, PublicOAuthNetworkGuard)
                 or not isinstance(self.state_http_client, httpx.AsyncClient)
                 or not isinstance(self.connection_http_client, httpx.Client)
@@ -173,6 +172,8 @@ class ProviderOAuthProductionComposition:
                 or service._state_store is not self.state_store
                 or service._connection_store is not self.connection_store
                 or service._driver is not flowaccount
+                or flowaccount._qualification_resolver is not self.qualification_resolver
+                or peak._qualification_resolver is not self.qualification_resolver
                 or service._mercury_access_token is not current_mercury_access_token
                 or (
                     not allow_test_dependencies
@@ -279,6 +280,7 @@ def build_test_provider_oauth_production_composition(
     connection_http_client: httpx.Client | None = None,
     network_guard: PublicOAuthNetworkGuard | None = None,
     workspace_service: WorkspaceService | None = None,
+    qualification_catalog: QualificationCatalog | None = None,
     peak_contract: QualifiedPeakProviderContract | None = None,
 ) -> ProviderOAuthProductionComposition:
     """Build a typed composition with explicitly test-only dependency overrides."""
@@ -290,6 +292,7 @@ def build_test_provider_oauth_production_composition(
         connection_http_client=connection_http_client,
         network_guard=network_guard,
         workspace_service=workspace_service,
+        qualification_catalog=qualification_catalog,
         peak_contract=peak_contract,
         test_only_dependencies=True,
     )
@@ -303,6 +306,7 @@ def _build_provider_oauth_composition(
     connection_http_client: httpx.Client | None = None,
     network_guard: PublicOAuthNetworkGuard | None = None,
     workspace_service: WorkspaceService | None = None,
+    qualification_catalog: QualificationCatalog | None = None,
     peak_contract: QualifiedPeakProviderContract | None = None,
     test_only_dependencies: bool,
 ) -> ProviderOAuthProductionComposition:
@@ -360,9 +364,12 @@ def _build_provider_oauth_composition(
         )
         manifest_root = Path(__file__).resolve().parents[3] / "catalog/global"
         manifest = load_provider_manifest(manifest_root / "flowaccount/driver.json")
+        selected_qualification_catalog = qualification_catalog or SupabaseCatalogStore(settings)
+        qualification_resolver = CatalogQualificationResolver(
+            catalog=selected_qualification_catalog,
+            catalog_root=str(manifest_root),
+        )
         runtime_dependencies = _flowaccount_runtime_dependencies(
-            settings=settings,
-            manifest=manifest,
             vault=vault,
             connection_store=connection_store,
             oauth_client=oauth_client,
@@ -382,6 +389,7 @@ def _build_provider_oauth_composition(
             settings=settings,
             manifest_root=manifest_root,
             **runtime_dependencies,
+            qualification_resolver=qualification_resolver,
         )
         selected_workspace_service = workspace_service or WorkspaceService.from_settings(settings)
         service = ProviderOAuthService(
@@ -415,6 +423,8 @@ def _build_provider_oauth_composition(
             peak_setup_store=peak_setup_store,
             connection_store=connection_store,
             registry=registry,
+            qualification_catalog=selected_qualification_catalog,
+            qualification_resolver=qualification_resolver,
             network_guard=selected_network_guard,
             state_http_client=selected_state_http,
             connection_http_client=selected_connection_http,
@@ -435,74 +445,20 @@ def _build_provider_oauth_composition(
 
 def _flowaccount_runtime_dependencies(
     *,
-    settings: Settings,
-    manifest: ProviderDriverManifest,
     vault: CredentialVault,
     connection_store: SupabaseProviderConnectionStore,
     oauth_client: DownstreamMCPOAuthClient,
 ) -> dict[str, Any]:
-    request_hash = wire_schema_sha256(FlowAccountProfileRequest)
-    response_hash = wire_schema_sha256(FlowAccountProfile)
-
-    def profile_binding(
-        connection: ProviderConnection,
-        provider_tool: str,
-    ) -> QualifiedCapabilityBinding:
-        if (
-            connection.provider is not ProviderId.FLOWACCOUNT
-            or connection.environment not in manifest.environments
-            or provider_tool != _PROFILE_TOOL
-        ):
-            raise ValueError("provider_binding_invalid")
-        return QualifiedCapabilityBinding(
-            provider=ProviderId.FLOWACCOUNT,
-            environment=connection.environment,
-            normalized_capability=_PROFILE_CAPABILITY,
-            provider_tool=_PROFILE_TOOL,
-            operation_class=ProviderOperationClass.READ,
-            qualification_hash=_profile_qualification_hash(
-                manifest,
-                environment=connection.environment,
-            ),
-        )
-
-    def verify_binding(
-        connection: ProviderConnection,
-        binding: QualifiedCapabilityBinding,
-        resource_uri_sha256: str,
-    ) -> VerifiedRuntimeBinding:
-        expected = profile_binding(connection, _PROFILE_TOOL)
-        resource = resolve_provider_resource(
-            settings=settings,
-            manifest=manifest,
-            environment=connection.environment,
-        )
-        if binding != expected or resource_uri_sha256 != resource.uri_sha256:
-            raise ValueError("provider_binding_invalid")
-        return VerifiedRuntimeBinding(
-            qualification_state=ProviderQualificationState.ENABLED,
-            provider=ProviderId.FLOWACCOUNT,
-            environment=connection.environment,
-            resource_uri_sha256=resource.uri_sha256,
-            normalized_capability=_PROFILE_CAPABILITY,
-            capability_version=manifest.manifest_version,
-            provider_tool=_PROFILE_TOOL,
-            operation_class=ProviderOperationClass.READ,
-            request_schema_sha256=request_hash,
-            response_schema_sha256=response_hash,
-            qualification_hash=expected.qualification_hash,
-        )
-
-    def request_model(binding: VerifiedRuntimeBinding) -> type[BaseModel]:
+    def request_model(binding) -> type[BaseModel]:
         _require_profile_binding(binding)
         return FlowAccountProfileRequest
 
-    def response_model(binding: VerifiedRuntimeBinding) -> type[BaseModel]:
+    def response_model(binding) -> type[BaseModel]:
         _require_profile_binding(binding)
         return FlowAccountProfile
 
     def unsupported_normalizer(
-        _binding: VerifiedRuntimeBinding,
+        _binding,
         _structured_content,
     ) -> BaseModel:
         raise ValueError("provider_response_invalid")
@@ -517,36 +473,13 @@ def _flowaccount_runtime_dependencies(
         "header_factories": {
             AuthorizationMethod.OAUTH2_PKCE: header_factory,
         },
-        "binding_verifier": verify_binding,
         "response_normalizer": unsupported_normalizer,
         "request_model_resolver": request_model,
         "response_model_resolver": response_model,
-        "flowaccount_profile_binding_resolver": profile_binding,
     }
 
 
-def _profile_qualification_hash(
-    manifest: ProviderDriverManifest,
-    *,
-    environment: str,
-) -> str:
-    payload = json.dumps(
-        {
-            "manifest_version": manifest.manifest_version,
-            "provider": ProviderId.FLOWACCOUNT.value,
-            "environment": environment,
-            "normalized_capability": _PROFILE_CAPABILITY,
-            "provider_tool": _PROFILE_TOOL,
-            "operation_class": ProviderOperationClass.READ.value,
-        },
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("ascii")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _require_profile_binding(binding: VerifiedRuntimeBinding) -> None:
+def _require_profile_binding(binding) -> None:
     if (
         binding.qualification_state is not ProviderQualificationState.ENABLED
         or binding.provider is not ProviderId.FLOWACCOUNT

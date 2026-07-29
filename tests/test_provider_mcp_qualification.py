@@ -11,6 +11,7 @@ import pytest
 from mercury_tools.catalog.models import ProviderMCPQualification
 from mercury_tools.qualification.artifacts import (
     build_qualification_artifact,
+    load_catalog_qualification_artifact,
     load_qualification_artifact,
     write_qualification_artifact,
 )
@@ -57,9 +58,7 @@ def test_artifact_is_sanitized_version_bound_and_written_once(tmp_path: Path) ->
 
     path = write_qualification_artifact(tmp_path, artifact)
 
-    assert path == (
-        tmp_path / "flowaccount" / "qualifications" / f"{definition.capability_version_sha256}.json"
-    )
+    assert path == (tmp_path / "flowaccount" / "qualifications" / artifact.filename)
     assert load_qualification_artifact(path) == artifact
     assert write_qualification_artifact(tmp_path, artifact) == path
     serialized = path.read_text(encoding="utf-8")
@@ -82,6 +81,53 @@ def test_artifact_rejects_unknown_or_malformed_content(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="^qualification_artifact_invalid$"):
         load_qualification_artifact(path)
+
+
+def test_artifact_writer_rejects_parent_and_target_symlink_escapes(tmp_path: Path) -> None:
+    artifact = _artifact(_definition())
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / artifact.provider).symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="^qualification_artifact_path_invalid$"):
+        write_qualification_artifact(tmp_path, artifact)
+    with pytest.raises(ValueError, match="^qualification_artifact_path_invalid$"):
+        load_catalog_qualification_artifact(tmp_path, artifact.catalog_uri)
+
+    (tmp_path / artifact.provider).unlink()
+    target_dir = tmp_path / artifact.provider / "qualifications"
+    target_dir.mkdir(parents=True)
+    target = target_dir / artifact.filename
+    target.symlink_to(outside / "artifact.json")
+
+    with pytest.raises(ValueError, match="^qualification_artifact_path_invalid$"):
+        write_qualification_artifact(tmp_path, artifact)
+    with pytest.raises(ValueError, match="^qualification_artifact_path_invalid$"):
+        load_catalog_qualification_artifact(tmp_path, artifact.catalog_uri)
+
+
+def test_same_capability_can_create_an_immutable_new_evidence_revision(tmp_path: Path) -> None:
+    definition = _definition()
+    first = _artifact(definition)
+    renewed = build_qualification_artifact(
+        definition=definition,
+        company_sha256="b" * 64,
+        runner_version="runner-v1",
+        evaluated_at=NOW + timedelta(days=1),
+        input_sha256="e" * 64,
+        sanitized_result_identifier="result-002",
+        checks={"schema": True, "permission": True},
+        reviewer="reviewer-1",
+        evidence_expires_at=NOW + timedelta(days=8),
+        passed=True,
+    )
+
+    first_path = write_qualification_artifact(tmp_path, first)
+    renewed_path = write_qualification_artifact(tmp_path, renewed)
+
+    assert first_path != renewed_path
+    assert load_qualification_artifact(first_path) == first
+    assert load_qualification_artifact(renewed_path) == renewed
 
 
 def test_artifact_rejects_expired_or_definition_mismatched_evidence() -> None:
@@ -149,6 +195,4 @@ def test_qualification_cli_writes_only_controlled_sanitized_artifacts(
     payload.write_text(artifact.model_dump_json(), encoding="utf-8")
 
     assert module.main(["--catalog-root", str(tmp_path), "--input", str(payload)]) == 0
-    assert (
-        tmp_path / "flowaccount" / "qualifications" / f"{artifact.capability_version_sha256}.json"
-    ).is_file()
+    assert (tmp_path / "flowaccount" / "qualifications" / artifact.filename).is_file()

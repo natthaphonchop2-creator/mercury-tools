@@ -11,14 +11,19 @@ from uuid import UUID, uuid4
 import pytest
 from pydantic import BaseModel, ConfigDict
 
+from mercury_tools.catalog.models import ProviderMCPQualification, QualificationState
 from mercury_tools.config import Settings
 from mercury_tools.credentials.vault import CredentialVault
 from mercury_tools.providers.base import (
     DispatchCertainty,
     ProviderCallResult,
     ProviderDiscovery,
+    ProviderOperationClass,
+    ProviderQualificationState,
     ProviderResponseInvalid,
     ProviderStatusClass,
+    QualifiedCapabilityBinding,
+    VerifiedRuntimeBinding,
 )
 from mercury_tools.providers.manifest import load_provider_manifest
 from mercury_tools.providers.models import (
@@ -38,6 +43,15 @@ from mercury_tools.providers.peak import (
     seal_peak_credentials,
 )
 from mercury_tools.providers.registry import build_provider_registry
+from mercury_tools.qualification.artifacts import (
+    build_qualification_artifact,
+    write_qualification_artifact,
+)
+from mercury_tools.qualification.provider_mcp import (
+    CatalogQualificationResolver,
+    OwnerAuthorizedCanary,
+    transition_qualification,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = load_provider_manifest(ROOT / "catalog/global/peak/driver.json")
@@ -233,6 +247,139 @@ def _contract() -> QualifiedPeakProviderContract:
     )
 
 
+class _StaticQualificationCatalog:
+    def __init__(self, qualifications: tuple[ProviderMCPQualification, ...]) -> None:
+        self._qualifications = qualifications
+
+    def list_provider_mcp_qualifications(self) -> list[ProviderMCPQualification]:
+        return list(self._qualifications)
+
+
+def _qualified_resolver(
+    tmp_path: Path,
+    *,
+    connection: ProviderConnection,
+    contract: QualifiedPeakProviderContract,
+) -> CatalogQualificationResolver:
+    def definition(environment: str) -> ProviderMCPQualification:
+        return ProviderMCPQualification.discovered(
+            provider="peak",
+            environment=environment,
+            provider_tool_name=contract.profile_tool,
+            normalized_capability="provider_profile.get",
+            input_schema=contract.profile_request_model.model_json_schema(
+                by_alias=True,
+                mode="serialization",
+            ),
+            output_schema=contract.profile_response_model.model_json_schema(
+                by_alias=True,
+                mode="serialization",
+            ),
+            response_shape_hash="b" * 64,
+            required_permissions=("profile.read",),
+        )
+
+    def advance_nonproduction(
+        item: ProviderMCPQualification,
+        company_sha256: str,
+    ) -> tuple[ProviderMCPQualification, object]:
+        artifact = build_qualification_artifact(
+            definition=item,
+            company_sha256=company_sha256,
+            runner_version="test-runner-v1",
+            evaluated_at=NOW,
+            input_sha256="c" * 64,
+            sanitized_result_identifier="test-result",
+            checks={"schema": True},
+            reviewer="reviewer",
+            evidence_expires_at=datetime(2026, 8, 5, tzinfo=UTC),
+            passed=True,
+        )
+        schema = transition_qualification(
+            item,
+            QualificationState.SCHEMA_VALIDATED,
+            now=NOW,
+        )
+        qualified = transition_qualification(
+            schema,
+            QualificationState.NONPRODUCTION_QUALIFIED,
+            evidence=artifact,
+            now=NOW,
+        )
+        return (
+            transition_qualification(
+                qualified,
+                QualificationState.ENABLED,
+                evidence=artifact,
+                now=NOW,
+            ),
+            artifact,
+        )
+
+    sandbox_enabled, sandbox_artifact = advance_nonproduction(definition("sandbox"), "d" * 64)
+    production_definition = definition("production")
+    production_artifact = build_qualification_artifact(
+        definition=production_definition,
+        company_sha256=hashlib.sha256(connection.provider_account_id.encode("utf-8")).hexdigest(),
+        runner_version="test-runner-v1",
+        evaluated_at=NOW,
+        input_sha256="e" * 64,
+        sanitized_result_identifier="test-result-production",
+        checks={"schema": True},
+        reviewer="reviewer",
+        evidence_expires_at=datetime(2026, 8, 5, tzinfo=UTC),
+        passed=True,
+    )
+    production_schema = transition_qualification(
+        production_definition,
+        QualificationState.SCHEMA_VALIDATED,
+        now=NOW,
+    )
+    production_qualified = transition_qualification(
+        production_schema,
+        QualificationState.NONPRODUCTION_QUALIFIED,
+        evidence=production_artifact,
+        nonproduction_evidence=(sandbox_enabled,),
+        nonproduction_artifacts=(sandbox_artifact,),
+        now=NOW,
+    )
+    production_enabled = transition_qualification(
+        production_qualified,
+        QualificationState.ENABLED,
+        evidence=production_artifact,
+        nonproduction_evidence=(sandbox_enabled,),
+        nonproduction_artifacts=(sandbox_artifact,),
+        canary=OwnerAuthorizedCanary(
+            provider="peak",
+            environment="production",
+            normalized_capability="provider_profile.get",
+            provider_tool_name=contract.profile_tool,
+            capability_version_sha256=production_definition.capability_version_sha256,
+            owner_authorized_by="owner",
+            authorized_at=NOW,
+        ),
+        now=NOW,
+    )
+    for artifact in (sandbox_artifact, production_artifact):
+        write_qualification_artifact(tmp_path, artifact)
+    return CatalogQualificationResolver(
+        catalog=_StaticQualificationCatalog((sandbox_enabled, production_enabled)),
+        catalog_root=str(tmp_path),
+        now=lambda: NOW,
+    )
+
+
+def _profile_binding() -> QualifiedCapabilityBinding:
+    return QualifiedCapabilityBinding(
+        provider=ProviderId.PEAK,
+        environment="production",
+        normalized_capability="provider_profile.get",
+        provider_tool="reviewed_provider_profile",
+        operation_class=ProviderOperationClass.READ,
+        qualification_hash="a" * 64,
+    )
+
+
 class RecordingRuntime:
     provider = ProviderId.PEAK
 
@@ -394,12 +541,20 @@ def test_opening_failure_clears_partial_plaintext_and_drops_secret_exception_gra
 
 def test_profile_normalization_drops_raw_payload_exception_graph() -> None:
     contract = _contract()
-    connection = _connection()
-    binding = contract.profile_binding(connection)
-    verified = contract.verify_binding(
-        connection,
-        binding,
-        hashlib.sha256(_settings().peak_mcp_production_url.encode("utf-8")).hexdigest(),
+    verified = VerifiedRuntimeBinding(
+        qualification_state=ProviderQualificationState.ENABLED,
+        provider=ProviderId.PEAK,
+        environment="production",
+        resource_uri_sha256=hashlib.sha256(
+            _settings().peak_mcp_production_url.encode("utf-8")
+        ).hexdigest(),
+        normalized_capability="provider_profile.get",
+        capability_version="test-capability-version",
+        provider_tool=contract.profile_tool,
+        operation_class=ProviderOperationClass.READ,
+        request_schema_sha256=contract.profile_request_schema_sha256,
+        response_schema_sha256=contract.profile_response_schema_sha256,
+        qualification_hash="a" * 64,
     )
     payload = {
         "reviewed_merchant_identifier": "merchant-123",
@@ -470,9 +625,20 @@ async def test_qualified_fixture_alone_supplies_auth_mapping_and_application_cod
 
 
 @pytest.mark.asyncio
-async def test_peak_driver_fails_before_transport_without_qualified_contract() -> None:
+async def test_peak_driver_fails_before_transport_without_qualified_contract(
+    tmp_path: Path,
+) -> None:
     runtime = RecordingRuntime()
-    driver = PeakMCPDriver(runtime=runtime, manifest=MANIFEST, contract=None)
+    driver = PeakMCPDriver(
+        runtime=runtime,
+        manifest=MANIFEST,
+        contract=None,
+        qualification_resolver=CatalogQualificationResolver(
+            catalog=_StaticQualificationCatalog(()),
+            catalog_root=str(tmp_path),
+            now=lambda: NOW,
+        ),
+    )
 
     with pytest.raises(ProviderResponseInvalid):
         await driver.discover(_connection())
@@ -481,7 +647,7 @@ async def test_peak_driver_fails_before_transport_without_qualified_contract() -
     with pytest.raises(ProviderResponseInvalid):
         await driver.call(
             _connection(readiness=ConnectionReadiness.READY),
-            _contract().profile_binding(_connection()),
+            _profile_binding(),
             ReviewedProfileRequest(),
             uuid4(),
         )
@@ -490,10 +656,18 @@ async def test_peak_driver_fails_before_transport_without_qualified_contract() -
 
 
 @pytest.mark.asyncio
-async def test_peak_driver_validates_only_qualified_provider_profile_contract() -> None:
+async def test_peak_driver_validates_only_qualified_provider_profile_contract(
+    tmp_path: Path,
+) -> None:
     runtime = RecordingRuntime()
     contract = _contract()
-    driver = PeakMCPDriver(runtime=runtime, manifest=MANIFEST, contract=contract)
+    resolver = _qualified_resolver(tmp_path, connection=_connection(), contract=contract)
+    driver = PeakMCPDriver(
+        runtime=runtime,
+        manifest=MANIFEST,
+        contract=contract,
+        qualification_resolver=resolver,
+    )
 
     validation = await driver.validate_connection(_connection())
 
@@ -505,14 +679,18 @@ async def test_peak_driver_validates_only_qualified_provider_profile_contract() 
     with pytest.raises(ProviderResponseInvalid):
         await driver.call(
             _connection(readiness=ConnectionReadiness.READY),
-            contract.profile_binding(_connection()),
+            resolver.bind_for_connection(
+                _connection(readiness=ConnectionReadiness.READY),
+                normalized_capability="provider_profile.get",
+                provider_tool_name=contract.profile_tool,
+            ),
             ReviewedProfileRequest(),
             uuid4(),
         )
 
 
 @pytest.mark.asyncio
-async def test_provider_validation_drops_raw_runtime_exception_graph() -> None:
+async def test_provider_validation_drops_raw_runtime_exception_graph(tmp_path: Path) -> None:
     class FailingRuntime(RecordingRuntime):
         async def call(self, *_args: object) -> ProviderCallResult:
             raw_provider_payload = {"credential": USER_TOKEN}
@@ -522,6 +700,11 @@ async def test_provider_validation_drops_raw_runtime_exception_graph() -> None:
         runtime=FailingRuntime(),
         manifest=MANIFEST,
         contract=_contract(),
+        qualification_resolver=_qualified_resolver(
+            tmp_path,
+            connection=_connection(),
+            contract=_contract(),
+        ),
     )
 
     with pytest.raises(ProviderResponseInvalid) as caught:
@@ -531,7 +714,9 @@ async def test_provider_validation_drops_raw_runtime_exception_graph() -> None:
 
 
 @pytest.mark.asyncio
-async def test_peak_setup_validation_uses_request_scoped_envelopes_then_clears_override() -> None:
+async def test_peak_setup_validation_uses_request_scoped_envelopes_then_clears_override(
+    tmp_path: Path,
+) -> None:
     vault = _vault()
     connection = _connection()
     material = _material()
@@ -555,7 +740,16 @@ async def test_peak_setup_validation_uses_request_scoped_envelopes_then_clears_o
         application_code=APPLICATION_CODE,
     )
     runtime = EnvelopeAwareRuntime(factory)
-    driver = PeakMCPDriver(runtime=runtime, manifest=MANIFEST, contract=contract)
+    driver = PeakMCPDriver(
+        runtime=runtime,
+        manifest=MANIFEST,
+        contract=contract,
+        qualification_resolver=_qualified_resolver(
+            tmp_path,
+            connection=connection,
+            contract=contract,
+        ),
+    )
 
     profile = await driver.validate_setup(connection, envelopes)
 
@@ -580,11 +774,9 @@ def test_registry_wraps_peak_in_fail_closed_provider_driver() -> None:
         "header_factories": {
             AuthorizationMethod.OAUTH2_PKCE: lambda _connection: None,
         },
-        "binding_verifier": lambda _connection, _binding, _resource_hash: None,
         "response_normalizer": lambda _binding, _content: None,
         "request_model_resolver": lambda _binding: ReviewedProfileRequest,
         "response_model_resolver": lambda _binding: ReviewedProfileResponse,
-        "flowaccount_profile_binding_resolver": lambda _connection, _tool: None,
     }
 
     registry = build_provider_registry(

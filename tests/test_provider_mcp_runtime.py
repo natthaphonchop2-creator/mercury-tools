@@ -35,6 +35,7 @@ from pydantic import (
 
 import mercury_tools.providers.streamable_mcp as streamable_module
 from mercury_tools.catalog.identity import canonical_json
+from mercury_tools.catalog.models import ProviderMCPQualification, QualificationState
 from mercury_tools.config import Settings
 from mercury_tools.providers.base import (
     DispatchCertainty,
@@ -65,6 +66,14 @@ from mercury_tools.providers.streamable_mcp import (
     ProviderAuthHeader,
     ProviderAuthHeaders,
     StreamableMCPDriver,
+)
+from mercury_tools.qualification.artifacts import (
+    build_qualification_artifact,
+    write_qualification_artifact,
+)
+from mercury_tools.qualification.provider_mcp import (
+    CatalogQualificationResolver,
+    transition_qualification,
 )
 
 TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -760,6 +769,94 @@ def _normalize_invoice(
     invoice = structured_content["invoice"]
     assert isinstance(invoice, Mapping)
     return InvoiceResponse(invoice_id=invoice["id"])
+
+
+class _StaticQualificationCatalog:
+    def __init__(self, qualifications: tuple[ProviderMCPQualification, ...]) -> None:
+        self._qualifications = qualifications
+
+    def list_provider_mcp_qualifications(self) -> list[ProviderMCPQualification]:
+        return list(self._qualifications)
+
+
+def _catalog_qualification_resolver(
+    tmp_path: Path,
+    *,
+    connection: ProviderConnection,
+    include_invoice: bool,
+    include_profile: bool,
+) -> CatalogQualificationResolver:
+    capabilities: list[tuple[str, str, type[BaseModel], type[BaseModel], tuple[str, ...]]] = []
+    if include_invoice:
+        capabilities.append(
+            (
+                "documents.invoice.get",
+                "get_invoice",
+                InvoiceArguments,
+                InvoiceResponse,
+                ("documents.read",),
+            )
+        )
+    if include_profile:
+        capabilities.append(
+            (
+                "provider_profile.get",
+                "get_provider_profile",
+                FlowAccountProfileRequest,
+                FlowAccountProfile,
+                ("profile.read",),
+            )
+        )
+    company_sha256 = hashlib.sha256(connection.provider_account_id.encode("utf-8")).hexdigest()
+    enabled: list[ProviderMCPQualification] = []
+    for capability, provider_tool, request_model, response_model, permissions in capabilities:
+        definition = ProviderMCPQualification.discovered(
+            provider="flowaccount",
+            environment="sandbox",
+            provider_tool_name=provider_tool,
+            normalized_capability=capability,
+            input_schema=request_model.model_json_schema(by_alias=True, mode="serialization"),
+            output_schema=response_model.model_json_schema(by_alias=True, mode="serialization"),
+            response_shape_hash="b" * 64,
+            required_permissions=permissions,
+        )
+        artifact = build_qualification_artifact(
+            definition=definition,
+            company_sha256=company_sha256,
+            runner_version="test-runner-v1",
+            evaluated_at=NOW,
+            input_sha256="c" * 64,
+            sanitized_result_identifier=f"test-{provider_tool}",
+            checks={"schema": True},
+            reviewer="reviewer",
+            evidence_expires_at=NOW + timedelta(days=7),
+            passed=True,
+        )
+        schema = transition_qualification(
+            definition,
+            QualificationState.SCHEMA_VALIDATED,
+            now=NOW,
+        )
+        qualified = transition_qualification(
+            schema,
+            QualificationState.NONPRODUCTION_QUALIFIED,
+            evidence=artifact,
+            now=NOW,
+        )
+        enabled.append(
+            transition_qualification(
+                qualified,
+                QualificationState.ENABLED,
+                evidence=artifact,
+                now=NOW,
+            )
+        )
+        write_qualification_artifact(tmp_path, artifact)
+    return CatalogQualificationResolver(
+        catalog=_StaticQualificationCatalog(tuple(enabled)),
+        catalog_root=str(tmp_path),
+        now=lambda: NOW,
+    )
 
 
 class FakeMCPHarness:
@@ -2336,28 +2433,36 @@ async def test_runtime_initializes_before_discovery_and_catalog_qualified_call(
 @pytest.mark.asyncio
 async def test_registry_injects_trusted_runtime_and_response_schema_boundaries(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     harness = FakeMCPHarness()
     harness.install(monkeypatch)
+    connection = _connection()
+    resolver = _catalog_qualification_resolver(
+        tmp_path,
+        connection=connection,
+        include_invoice=True,
+        include_profile=False,
+    )
     registry = build_provider_registry(
         settings=_settings(),
         manifest_root=Path(__file__).resolve().parents[1] / "catalog/global",
         header_factories={
             AuthorizationMethod.OAUTH2_PKCE: lambda _connection: _auth_headers(),
         },
-        binding_verifier=_verify_binding,
         response_normalizer=_normalize_invoice,
         request_model_resolver=_resolve_invoice_request_model,
         response_model_resolver=_resolve_invoice_response_model,
-        flowaccount_profile_binding_resolver=lambda _connection, provider_tool: _binding(
-            provider_tool=provider_tool,
-            normalized_capability="provider_profile.get",
-        ),
+        qualification_resolver=resolver,
     )
 
     result = await registry.get(ProviderId.FLOWACCOUNT).call(
-        _connection(),
-        _binding(provider_tool="get_invoice"),
+        connection,
+        resolver.bind_for_connection(
+            connection,
+            normalized_capability="documents.invoice.get",
+            provider_tool_name="get_invoice",
+        ),
         InvoiceArguments(invoice_id="invoice-123"),
         OPERATION_ID,
     )
@@ -2373,6 +2478,7 @@ async def test_registry_injects_trusted_runtime_and_response_schema_boundaries(
 @pytest.mark.asyncio
 async def test_registry_runtime_normalizes_raw_nested_flowaccount_profile(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     harness = FakeMCPHarness()
     harness.call_result = SimpleNamespace(
@@ -2386,21 +2492,6 @@ async def test_registry_runtime_normalizes_raw_nested_flowaccount_profile(
     )
     harness.install(monkeypatch)
 
-    def verify_profile(
-        connection: ProviderConnection,
-        binding: QualifiedCapabilityBinding,
-        resource_uri_sha256: str,
-    ) -> VerifiedRuntimeBinding:
-        verified = _verify_binding(connection, binding, resource_uri_sha256)
-        if binding.normalized_capability == "provider_profile.get":
-            return verified.model_copy(
-                update={
-                    "request_schema_sha256": _wire_schema_sha256(FlowAccountProfileRequest),
-                    "response_schema_sha256": _wire_schema_sha256(FlowAccountProfile),
-                }
-            )
-        return verified
-
     def request_model(binding: VerifiedRuntimeBinding) -> type[BaseModel]:
         if binding.normalized_capability == "provider_profile.get":
             return FlowAccountProfileRequest
@@ -2411,30 +2502,31 @@ async def test_registry_runtime_normalizes_raw_nested_flowaccount_profile(
             return FlowAccountProfile
         return _resolve_invoice_response_model(binding)
 
+    connection = _connection().model_copy(
+        update={
+            "readiness": ConnectionReadiness.REQUIRES_VALIDATION,
+            "last_validated_at": None,
+        }
+    )
+    resolver = _catalog_qualification_resolver(
+        tmp_path,
+        connection=connection,
+        include_invoice=False,
+        include_profile=True,
+    )
     registry = build_provider_registry(
         settings=_settings(),
         manifest_root=Path(__file__).resolve().parents[1] / "catalog/global",
         header_factories={
             AuthorizationMethod.OAUTH2_PKCE: lambda _connection: _auth_headers(),
         },
-        binding_verifier=verify_profile,
         response_normalizer=_normalize_invoice,
         request_model_resolver=request_model,
         response_model_resolver=response_model,
-        flowaccount_profile_binding_resolver=lambda _connection, provider_tool: _binding(
-            provider_tool=provider_tool,
-            normalized_capability="provider_profile.get",
-        ),
+        qualification_resolver=resolver,
     )
 
-    validation = await registry.get(ProviderId.FLOWACCOUNT).validate_connection(
-        _connection().model_copy(
-            update={
-                "readiness": ConnectionReadiness.REQUIRES_VALIDATION,
-                "last_validated_at": None,
-            }
-        )
-    )
+    validation = await registry.get(ProviderId.FLOWACCOUNT).validate_connection(connection)
 
     assert validation.normalized_data == {
         "company_id": "company-123",

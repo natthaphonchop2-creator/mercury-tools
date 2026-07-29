@@ -1169,29 +1169,8 @@ async def test_production_composition_binds_durable_stores_guard_and_exact_regis
                 ),
             }
 
-            connection = ProviderConnection(
-                id=CONNECTION_ID,
-                tenant_id=TENANT_ID,
-                workspace_id=WORKSPACE_ID,
-                auth_user_id=USER_ID,
-                provider=ProviderId.FLOWACCOUNT,
-                environment="sandbox",
-                provider_account_id="company-123",
-                account_display_name="FlowAccount Test Company",
-                authorization_method=AuthorizationMethod.OAUTH2_PKCE,
-                granted_permissions=("documents.read", "profile.read"),
-                readiness=ConnectionReadiness.REQUIRES_VALIDATION,
-                revision=1,
-                credential_envelope_ids=(UUID("55555555-5555-4555-8555-555555555555"),),
-                created_at=NOW,
-                updated_at=NOW,
-            )
-            binding = flowaccount._profile_binding_resolver(
-                connection,
-                "get_provider_profile",
-            )
-            assert binding.normalized_capability == "provider_profile.get"
-            assert binding.provider_tool == "get_provider_profile"
+            assert flowaccount._qualification_resolver is composition.qualification_resolver
+            assert peak._qualification_resolver is composition.qualification_resolver
 
             await composition.startup()
             await composition.aclose()

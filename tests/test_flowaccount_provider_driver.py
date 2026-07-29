@@ -8,6 +8,7 @@ from uuid import UUID
 import pytest
 from pydantic import BaseModel, ConfigDict
 
+from mercury_tools.catalog.models import ProviderMCPQualification, QualificationState
 from mercury_tools.credentials.models import CredentialEnvelope
 from mercury_tools.credentials.vault import CredentialVault
 from mercury_tools.providers.base import (
@@ -39,6 +40,14 @@ from mercury_tools.providers.models import (
     ProviderId,
 )
 from mercury_tools.providers.registry import ProviderRegistryError, build_provider_registry
+from mercury_tools.qualification.artifacts import (
+    build_qualification_artifact,
+    write_qualification_artifact,
+)
+from mercury_tools.qualification.provider_mcp import (
+    CatalogQualificationResolver,
+    transition_qualification,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = load_provider_manifest(ROOT / "catalog/global/flowaccount/driver.json")
@@ -151,33 +160,88 @@ class FakeRuntime:
         )
 
 
-def _profile_binding(
-    _connection: ProviderConnection,
-    provider_tool: str,
-) -> QualifiedCapabilityBinding:
-    return _binding("provider_profile.get", provider_tool)
+class _QualificationCatalog:
+    def __init__(self, rows: list[ProviderMCPQualification]) -> None:
+        self.rows = rows
+
+    def list_provider_mcp_qualifications(self) -> list[ProviderMCPQualification]:
+        return self.rows
 
 
-def _registry_dependencies() -> dict[str, object]:
+def _profile_resolver(tmp_path: Path, *, revisions: int = 1) -> CatalogQualificationResolver:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    rows: list[ProviderMCPQualification] = []
+    for index in range(revisions):
+        definition = ProviderMCPQualification.discovered(
+            provider="flowaccount",
+            environment="sandbox",
+            provider_tool_name="get_provider_profile",
+            normalized_capability="provider_profile.get",
+            input_schema={"type": "object", "properties": {}},
+            output_schema={"type": "object", "properties": {}},
+            response_shape_hash="a" * 64,
+            required_permissions=("profile.read",),
+        )
+        artifact = build_qualification_artifact(
+            definition=definition,
+            company_sha256="b" * 64,
+            runner_version="test-runner-v1",
+            evaluated_at=NOW - timedelta(seconds=index),
+            input_sha256=("c" if index == 0 else "d") * 64,
+            sanitized_result_identifier=f"result-{index + 1:03d}",
+            checks={"schema": True},
+            reviewer="release-reviewer",
+            evidence_expires_at=NOW + timedelta(days=7),
+            passed=True,
+        )
+        schema_validated = transition_qualification(
+            definition,
+            QualificationState.SCHEMA_VALIDATED,
+            now=NOW,
+        )
+        nonproduction = transition_qualification(
+            schema_validated,
+            QualificationState.NONPRODUCTION_QUALIFIED,
+            evidence=artifact,
+            now=NOW,
+        )
+        rows.append(
+            transition_qualification(
+                nonproduction,
+                QualificationState.ENABLED,
+                evidence=artifact,
+                now=NOW,
+            )
+        )
+        write_qualification_artifact(tmp_path, artifact)
+    return CatalogQualificationResolver(
+        catalog=_QualificationCatalog(rows),
+        catalog_root=str(tmp_path),
+        now=lambda: NOW,
+    )
+
+
+def _registry_dependencies(resolver: CatalogQualificationResolver) -> dict[str, object]:
     return {
         "header_factories": {
             AuthorizationMethod.OAUTH2_PKCE: lambda _connection: None,
         },
-        "binding_verifier": lambda _connection, _binding, _resource_hash: None,
         "response_normalizer": lambda _binding, _content: None,
         "request_model_resolver": lambda _binding: FlowAccountProfileRequest,
         "response_model_resolver": lambda _binding: FlowAccountProfile,
-        "flowaccount_profile_binding_resolver": _profile_binding,
+        "qualification_resolver": resolver,
     }
 
 
 @pytest.mark.asyncio
-async def test_flowaccount_driver_maps_manifest_discovery_and_exact_profile_validation() -> None:
+async def test_flowaccount_driver_maps_manifest_discovery_and_exact_profile_validation(
+    tmp_path: Path,
+) -> None:
     runtime = FakeRuntime()
     driver = FlowAccountMCPDriver(
         runtime=runtime,
         manifest=MANIFEST,
-        profile_binding_resolver=_profile_binding,
+        qualification_resolver=_profile_resolver(tmp_path),
     )
 
     discovery = await driver.discover(_connection(ConnectionReadiness.REQUIRES_VALIDATION))
@@ -208,12 +272,14 @@ async def test_flowaccount_driver_maps_manifest_discovery_and_exact_profile_vali
 
 
 @pytest.mark.asyncio
-async def test_flowaccount_driver_rejects_unmapped_or_mismatched_qualified_calls() -> None:
+async def test_flowaccount_driver_rejects_unmapped_or_mismatched_qualified_calls(
+    tmp_path: Path,
+) -> None:
     runtime = FakeRuntime()
     driver = FlowAccountMCPDriver(
         runtime=runtime,
         manifest=MANIFEST,
-        profile_binding_resolver=_profile_binding,
+        qualification_resolver=_profile_resolver(tmp_path),
     )
 
     with pytest.raises(ProviderResponseInvalid):
@@ -239,6 +305,43 @@ async def test_flowaccount_driver_rejects_unmapped_or_mismatched_qualified_calls
         )
 
     assert runtime.events == []
+
+
+@pytest.mark.asyncio
+async def test_profile_bootstrap_requires_exact_enabled_catalog_evidence_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    """The pending OAuth identity is not an account qualification substitute."""
+
+    runtime = FakeRuntime()
+    absent = FlowAccountMCPDriver(
+        runtime=runtime,
+        manifest=MANIFEST,
+        qualification_resolver=_profile_resolver(tmp_path, revisions=0),
+    )
+    provisional = _connection(ConnectionReadiness.REQUIRES_VALIDATION).model_copy(
+        update={"provider_account_id": f"oauth-pending-{CONNECTION_ID}"}
+    )
+
+    with pytest.raises(ProviderResponseInvalid):
+        await absent.validate_connection(provisional)
+
+    assert runtime.events == []
+    exact = FlowAccountMCPDriver(
+        runtime=runtime,
+        manifest=MANIFEST,
+        qualification_resolver=_profile_resolver(tmp_path, revisions=1),
+    )
+    assert (
+        await exact.validate_connection(provisional)
+    ).status_class is ProviderStatusClass.SUCCESS
+    ambiguous = FlowAccountMCPDriver(
+        runtime=FakeRuntime(),
+        manifest=MANIFEST,
+        qualification_resolver=_profile_resolver(tmp_path / "ambiguous", revisions=2),
+    )
+    with pytest.raises(ProviderResponseInvalid):
+        await ambiguous.validate_connection(provisional)
 
 
 def test_profile_normalizer_accepts_only_exact_company_shape() -> None:
@@ -451,7 +554,7 @@ async def test_refresh_rejects_reduced_or_changed_scope_without_returning_header
     assert repository.saved == []
 
 
-def test_registry_can_wrap_only_flowaccount_with_task6_profile_validation() -> None:
+def test_registry_can_wrap_only_flowaccount_with_task6_profile_validation(tmp_path: Path) -> None:
     settings = __import__("mercury_tools.config", fromlist=["Settings"]).Settings(
         supabase_url="",
         supabase_service_role_key="",
@@ -464,7 +567,7 @@ def test_registry_can_wrap_only_flowaccount_with_task6_profile_validation() -> N
     registry = build_provider_registry(
         settings=settings,
         manifest_root=ROOT / "catalog/global",
-        **_registry_dependencies(),
+        **_registry_dependencies(_profile_resolver(tmp_path)),
     )
 
     assert isinstance(registry.get("flowaccount"), FlowAccountMCPDriver)
@@ -479,17 +582,16 @@ def test_registry_can_wrap_only_flowaccount_with_task6_profile_validation() -> N
             "header_factories",
             {AuthorizationMethod.OAUTH2_PKCE: "not-callable"},
         ),
-        ("binding_verifier", None),
-        ("binding_verifier", 7),
         ("response_normalizer", object()),
         ("request_model_resolver", "not-callable"),
         ("response_model_resolver", None),
-        ("flowaccount_profile_binding_resolver", object()),
+        ("qualification_resolver", object()),
     ],
 )
 def test_registry_fails_closed_for_incomplete_or_noncallable_flowaccount_wiring(
     dependency: str,
     invalid_value: object,
+    tmp_path: Path,
 ) -> None:
     settings = __import__("mercury_tools.config", fromlist=["Settings"]).Settings(
         supabase_url="",
@@ -500,7 +602,7 @@ def test_registry_fails_closed_for_incomplete_or_noncallable_flowaccount_wiring(
         peak_mcp_uat_url="https://peak-uat.example/mcp",
         peak_mcp_production_url="https://peak.example/mcp",
     )
-    dependencies = _registry_dependencies()
+    dependencies = _registry_dependencies(_profile_resolver(tmp_path))
     dependencies[dependency] = invalid_value
 
     with pytest.raises(

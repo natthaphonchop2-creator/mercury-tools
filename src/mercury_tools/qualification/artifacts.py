@@ -6,7 +6,8 @@ import hashlib
 import json
 import os
 import re
-import tempfile
+import stat
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,12 @@ _PROVIDER = r"^(?:flowaccount|peak)$"
 _ENVIRONMENT = r"^[a-z][a-z0-9_-]{0,63}$"
 _CAPABILITY = r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$"
 _TOOL = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"
+_CATALOG_URI = re.compile(
+    r"^catalog://global/(?P<provider>flowaccount|peak)/qualifications/"
+    r"(?P<version>[0-9a-f]{64})-(?P<revision>[0-9a-f]{64})\.json$"
+)
+_DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+_FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
 
 
 class QualificationArtifact(BaseModel):
@@ -57,6 +64,7 @@ class QualificationArtifact(BaseModel):
     reviewer: str = Field(pattern=_IDENTIFIER)
     evidence_expires_at: datetime
     passed: bool
+    evidence_revision_sha256: str | None = Field(default=None, pattern=_SHA256)
 
     @model_validator(mode="before")
     @classmethod
@@ -81,6 +89,13 @@ class QualificationArtifact(BaseModel):
             object.__setattr__(self, field_name, value.astimezone(UTC))
         if self.evidence_expires_at <= self.evaluated_at:
             raise ValueError("qualification_artifact_invalid")
+        expected_revision = _sha256(
+            self.model_dump(mode="json", exclude={"evidence_revision_sha256"})
+        )
+        if self.evidence_revision_sha256 is None:
+            object.__setattr__(self, "evidence_revision_sha256", expected_revision)
+        elif self.evidence_revision_sha256 != expected_revision:
+            raise ValueError("qualification_artifact_invalid")
         for field_name in type(self).model_fields:
             object.__setattr__(self, field_name, deep_freeze(getattr(self, field_name)))
         return self
@@ -88,16 +103,24 @@ class QualificationArtifact(BaseModel):
     @property
     def catalog_uri(self) -> str:
         return (
-            f"catalog://global/{self.provider}/qualifications/{self.capability_version_sha256}.json"
+            f"catalog://global/{self.provider}/qualifications/"
+            f"{self.capability_version_sha256}-{self.evidence_revision_sha256}.json"
         )
+
+    @property
+    def filename(self) -> str:
+        return f"{self.capability_version_sha256}-{self.evidence_revision_sha256}.json"
 
     def require_valid_for(
         self,
         definition: ProviderMCPQualification,
         *,
         now: datetime,
+        expected_company_sha256: str | None = None,
     ) -> None:
         checked_now = _aware_now(now)
+        if self.evaluated_at > checked_now:
+            raise ValueError("qualification_evidence_future")
         if self.evidence_expires_at <= checked_now:
             raise ValueError("qualification_evidence_expired")
         expected = {
@@ -113,6 +136,14 @@ class QualificationArtifact(BaseModel):
         }
         if any(getattr(self, key) != value for key, value in expected.items()):
             raise ValueError("qualification_evidence_mismatch")
+        required_company = expected_company_sha256 or definition.company_sha256
+        if required_company is not None and self.company_sha256 != required_company:
+            raise ValueError("qualification_evidence_company_mismatch")
+        if (
+            definition.evidence_revision_sha256 is not None
+            and self.evidence_revision_sha256 != definition.evidence_revision_sha256
+        ):
+            raise ValueError("qualification_evidence_revision_mismatch")
         if not self.passed:
             raise ValueError("qualification_evidence_failed")
 
@@ -161,60 +192,177 @@ def write_qualification_artifact(
     catalog_root: str | Path,
     artifact: QualificationArtifact,
 ) -> Path:
-    """Atomically create one version-bound artifact without replacing evidence."""
+    """Atomically create one no-follow, revision-bound artifact below a trusted root."""
 
     checked = QualificationArtifact.model_validate(artifact)
-    root = Path(catalog_root).resolve()
-    directory = root / checked.provider / "qualifications"
-    directory.mkdir(parents=True, exist_ok=True)
-    if directory.is_symlink() or not directory.is_dir():
-        raise ValueError("qualification_artifact_path_invalid")
-    target = directory / f"{checked.capability_version_sha256}.json"
-    if target.parent.resolve() != directory.resolve():
-        raise ValueError("qualification_artifact_path_invalid")
-
-    serialized = f"{checked.model_dump_json(indent=2)}\n".encode()
-    if target.exists():
-        _require_matching_existing_artifact(target, checked)
-        return target
-
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=".qualification-",
-        suffix=".tmp",
-        dir=directory,
-    )
-    temporary = Path(temporary_name)
+    root = _absolute_root(catalog_root)
+    root_fd = _open_root(root)
+    provider_fd = qualifications_fd = None
+    temporary_name: str | None = None
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(serialized)
-            handle.flush()
-            os.fsync(handle.fileno())
+        provider_fd = _open_directory(root_fd, checked.provider, create=True)
+        qualifications_fd = _open_directory(provider_fd, "qualifications", create=True)
+        existing = _read_file(qualifications_fd, checked.filename, missing_ok=True)
+        if existing is not None:
+            _require_matching_existing_artifact_bytes(existing, checked)
+            return root / checked.provider / "qualifications" / checked.filename
+
+        serialized = f"{checked.model_dump_json(indent=2)}\n".encode()
+        temporary_name = f".qualification-{os.urandom(16).hex()}.tmp"
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=qualifications_fd,
+        )
         try:
-            os.link(temporary, target)
-        except FileExistsError:
-            _require_matching_existing_artifact(target, checked)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(
+                    temporary_name,
+                    checked.filename,
+                    src_dir_fd=qualifications_fd,
+                    dst_dir_fd=qualifications_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                existing = _read_file(qualifications_fd, checked.filename, missing_ok=False)
+                _require_matching_existing_artifact_bytes(existing, checked)
         finally:
-            temporary.unlink(missing_ok=True)
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_name, dir_fd=qualifications_fd)
+        return root / checked.provider / "qualifications" / checked.filename
+    except ValueError:
+        raise
     except OSError:
-        temporary.unlink(missing_ok=True)
         raise ValueError("qualification_artifact_write_failed") from None
-    return target
+    finally:
+        if qualifications_fd is not None:
+            os.close(qualifications_fd)
+        if provider_fd is not None:
+            os.close(provider_fd)
+        os.close(root_fd)
+
+
+def load_catalog_qualification_artifact(
+    catalog_root: str | Path,
+    catalog_uri: str,
+) -> QualificationArtifact:
+    """Load an artifact only by its catalog URI through no-follow descriptors."""
+
+    matched = _CATALOG_URI.fullmatch(catalog_uri)
+    if matched is None:
+        raise ValueError("qualification_artifact_path_invalid")
+    root_fd = _open_root(_absolute_root(catalog_root))
+    provider_fd = qualifications_fd = None
+    try:
+        provider = matched.group("provider")
+        filename = f"{matched.group('version')}-{matched.group('revision')}.json"
+        provider_fd = _open_directory(root_fd, provider, create=False)
+        qualifications_fd = _open_directory(provider_fd, "qualifications", create=False)
+        artifact = _artifact_from_bytes(_read_file(qualifications_fd, filename, missing_ok=False))
+        if artifact.catalog_uri != catalog_uri:
+            raise ValueError("qualification_artifact_invalid")
+        return artifact
+    except ValueError:
+        raise
+    except OSError:
+        raise ValueError("qualification_artifact_path_invalid") from None
+    finally:
+        if qualifications_fd is not None:
+            os.close(qualifications_fd)
+        if provider_fd is not None:
+            os.close(provider_fd)
+        os.close(root_fd)
 
 
 def load_qualification_artifact(path: str | Path) -> QualificationArtifact:
     try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        return QualificationArtifact.model_validate(payload)
+        target = Path(path)
+        target_stat = target.lstat()
+        if stat.S_ISLNK(target_stat.st_mode) or not stat.S_ISREG(target_stat.st_mode):
+            raise ValueError
+        with target.open("rb") as handle:
+            return _artifact_from_bytes(handle.read())
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         raise ValueError("qualification_artifact_invalid") from None
 
 
-def _require_matching_existing_artifact(
-    path: Path,
+def _absolute_root(catalog_root: str | Path) -> Path:
+    root = Path(catalog_root).absolute()
+    if not root.is_absolute():
+        raise ValueError("qualification_artifact_path_invalid")
+    return root
+
+
+def _open_root(root: Path) -> int:
+    parts = root.parts
+    if not parts or parts[0] != root.anchor:
+        raise ValueError("qualification_artifact_path_invalid")
+    descriptor = os.open(root.anchor, _DIRECTORY_FLAGS)
+    try:
+        for part in parts[1:]:
+            next_descriptor = _open_directory(descriptor, part, create=False)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
+    except (OSError, ValueError):
+        os.close(descriptor)
+        raise ValueError("qualification_artifact_path_invalid") from None
+
+
+def _open_directory(parent_fd: int, name: str, *, create: bool) -> int:
+    if not name or name in {".", ".."} or "/" in name:
+        raise ValueError("qualification_artifact_path_invalid")
+    if create:
+        with suppress(FileExistsError):
+            os.mkdir(name, mode=0o755, dir_fd=parent_fd)
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("qualification_artifact_path_invalid")
+        return os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+    except ValueError:
+        raise
+    except OSError:
+        raise ValueError("qualification_artifact_path_invalid") from None
+
+
+def _read_file(directory_fd: int, name: str, *, missing_ok: bool) -> bytes | None:
+    try:
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise ValueError("qualification_artifact_path_invalid") from None
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("qualification_artifact_path_invalid")
+    try:
+        descriptor = os.open(name, _FILE_FLAGS, dir_fd=directory_fd)
+        with os.fdopen(descriptor, "rb") as handle:
+            return handle.read()
+    except OSError:
+        raise ValueError("qualification_artifact_path_invalid") from None
+
+
+def _artifact_from_bytes(value: bytes) -> QualificationArtifact:
+    try:
+        return QualificationArtifact.model_validate(json.loads(value.decode("utf-8")))
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("qualification_artifact_invalid") from None
+
+
+def _require_matching_existing_artifact_bytes(
+    serialized: bytes | None,
     expected: QualificationArtifact,
 ) -> None:
+    if serialized is None:
+        raise ValueError("qualification_artifact_path_invalid")
     try:
-        if load_qualification_artifact(path) != expected:
+        if _artifact_from_bytes(serialized) != expected:
             raise ValueError("qualification_artifact_conflict")
     except ValueError as error:
         if str(error) == "qualification_artifact_conflict":
@@ -222,11 +370,24 @@ def _require_matching_existing_artifact(
         raise ValueError("qualification_artifact_conflict") from None
 
 
-def _json_sha256(value: Any) -> str:
+def _sha256(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _json_sha256(value: Any) -> str:
+    return _sha256(value)
 
 
 def _aware_now(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("qualification_evidence_time_invalid")
     return value.astimezone(UTC)
+
+
+__all__ = [
+    "QualificationArtifact",
+    "build_qualification_artifact",
+    "load_catalog_qualification_artifact",
+    "load_qualification_artifact",
+    "write_qualification_artifact",
+]

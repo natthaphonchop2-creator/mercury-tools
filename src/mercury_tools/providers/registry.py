@@ -9,7 +9,6 @@ from mercury_tools.config import Settings
 from mercury_tools.providers.base import ProviderDriver
 from mercury_tools.providers.flowaccount import (
     FlowAccountMCPDriver,
-    FlowAccountProfileBindingResolver,
     normalize_flowaccount_response,
 )
 from mercury_tools.providers.manifest import load_provider_manifest
@@ -19,17 +18,22 @@ from mercury_tools.providers.peak import (
     QualifiedPeakProviderContract,
 )
 from mercury_tools.providers.streamable_mcp import (
-    BindingVerifier,
     HeaderFactory,
     RequestModelResolver,
     ResponseModelResolver,
     ResponseNormalizer,
     StreamableMCPDriver,
 )
+from mercury_tools.qualification.provider_mcp import CatalogQualificationResolver
 
 
 class ProviderRegistryError(LookupError):
     pass
+
+
+class _UnavailableQualificationCatalog:
+    def list_provider_mcp_qualifications(self):
+        return []
 
 
 class ProviderDriverRegistry:
@@ -60,11 +64,10 @@ def build_provider_registry(
     settings: Settings,
     manifest_root: str | Path,
     header_factories: Mapping[AuthorizationMethod, HeaderFactory] | None = None,
-    binding_verifier: BindingVerifier | None = None,
     response_normalizer: ResponseNormalizer | None = None,
     request_model_resolver: RequestModelResolver | None = None,
     response_model_resolver: ResponseModelResolver | None = None,
-    flowaccount_profile_binding_resolver: (FlowAccountProfileBindingResolver | None) = None,
+    qualification_resolver: CatalogQualificationResolver | None = None,
     peak_contract: QualifiedPeakProviderContract | None = None,
 ) -> ProviderDriverRegistry:
     """Load the two server-controlled manifests without accepting resource URLs."""
@@ -74,13 +77,18 @@ def build_provider_registry(
     flowaccount_header_factory = header_factories.get(AuthorizationMethod.OAUTH2_PKCE)
     required_callables = (
         flowaccount_header_factory,
-        binding_verifier,
         response_normalizer,
         request_model_resolver,
         response_model_resolver,
-        flowaccount_profile_binding_resolver,
     )
     if not all(callable(dependency) for dependency in required_callables):
+        raise ProviderRegistryError("flowaccount_runtime_dependencies_invalid")
+    if qualification_resolver is None:
+        qualification_resolver = CatalogQualificationResolver(
+            catalog=_UnavailableQualificationCatalog(),
+            catalog_root=str(manifest_root),
+        )
+    elif not isinstance(qualification_resolver, CatalogQualificationResolver):
         raise ProviderRegistryError("flowaccount_runtime_dependencies_invalid")
     peak_header_factory = header_factories.get(AuthorizationMethod.PROVIDER_CREDENTIALS)
     if peak_contract is not None and (
@@ -104,17 +112,7 @@ def build_provider_registry(
         return response_normalizer(binding, structured_content)
 
     def provider_scoped_verifier(connection, binding, resource_uri_sha256):
-        if connection.provider is ProviderId.PEAK:
-            if peak_contract is None:
-                raise ValueError("peak_provider_contract_unqualified")
-            return peak_contract.verify_binding(
-                connection,
-                binding,
-                resource_uri_sha256,
-            )
-        if binding_verifier is None:
-            raise ValueError("provider_binding_verifier_missing")
-        return binding_verifier(connection, binding, resource_uri_sha256)
+        return qualification_resolver.verify_binding(connection, binding, resource_uri_sha256)
 
     def provider_scoped_request_model(binding):
         if binding.provider is ProviderId.PEAK:
@@ -153,7 +151,7 @@ def build_provider_registry(
                 FlowAccountMCPDriver(
                     runtime=runtime,
                     manifest=manifest,
-                    profile_binding_resolver=flowaccount_profile_binding_resolver,
+                    qualification_resolver=qualification_resolver,
                 )
             )
         else:
@@ -162,6 +160,7 @@ def build_provider_registry(
                     runtime=runtime,
                     manifest=manifest,
                     contract=peak_contract,
+                    qualification_resolver=qualification_resolver,
                 )
             )
     return registry

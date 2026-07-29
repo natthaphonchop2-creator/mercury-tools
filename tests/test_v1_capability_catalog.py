@@ -71,6 +71,7 @@ def _artifact(
 def _qualified(
     definition: ProviderMCPQualification,
 ) -> ProviderMCPQualification:
+    artifact = _artifact(definition)
     schema_validated = transition_qualification(
         definition,
         QualificationState.SCHEMA_VALIDATED,
@@ -79,12 +80,13 @@ def _qualified(
     nonproduction = transition_qualification(
         schema_validated,
         QualificationState.NONPRODUCTION_QUALIFIED,
-        evidence=_artifact(definition),
+        evidence=artifact,
         now=NOW,
     )
     return transition_qualification(
         nonproduction,
         QualificationState.ENABLED,
+        evidence=artifact,
         now=NOW,
     )
 
@@ -140,6 +142,7 @@ def test_only_approved_lifecycle_transitions_are_allowed() -> None:
     enabled = transition_qualification(
         nonproduction,
         QualificationState.ENABLED,
+        evidence=_artifact(definition),
         now=NOW,
     )
 
@@ -183,7 +186,9 @@ def test_schema_change_creates_a_new_unqualified_immutable_version() -> None:
     assert changed.capability_version_sha256 != enabled.capability_version_sha256
     assert changed.qualification_state is QualificationState.DISCOVERED_UNREVIEWED
     assert (
-        CapabilityQualificationGate([enabled, changed]).resolve(_selection(changed)).status
+        CapabilityQualificationGate([enabled, changed], artifacts=(_artifact(enabled),))
+        .resolve(_selection(changed))
+        .status
         == "insufficient_evidence"
     )
 
@@ -261,11 +266,13 @@ def test_production_enablement_requires_exact_nonproduction_evidence_and_owner_c
         QualificationState.SCHEMA_VALIDATED,
         now=NOW,
     )
+    production_artifact = _artifact(production)
     production_nonproduction = transition_qualification(
         production_schema_validated,
         QualificationState.NONPRODUCTION_QUALIFIED,
-        evidence=_artifact(sandbox),
+        evidence=production_artifact,
         nonproduction_evidence=(sandbox_nonproduction,),
+        nonproduction_artifacts=(_artifact(sandbox),),
         now=NOW,
     )
 
@@ -273,12 +280,18 @@ def test_production_enablement_requires_exact_nonproduction_evidence_and_owner_c
         transition_qualification(
             production_nonproduction,
             QualificationState.ENABLED,
+            evidence=production_artifact,
+            nonproduction_evidence=(sandbox_nonproduction,),
+            nonproduction_artifacts=(_artifact(sandbox),),
             now=NOW,
         )
 
     enabled = transition_qualification(
         production_nonproduction,
         QualificationState.ENABLED,
+        evidence=production_artifact,
+        nonproduction_evidence=(sandbox_nonproduction,),
+        nonproduction_artifacts=(_artifact(sandbox),),
         canary=OwnerAuthorizedCanary(
             provider="flowaccount",
             environment="production",
@@ -297,15 +310,21 @@ def test_production_enablement_requires_exact_nonproduction_evidence_and_owner_c
 def test_execution_lookup_is_exact_and_fails_closed_for_expired_evidence() -> None:
     enabled = _qualified(_definition())
     expired = enabled.model_copy(update={"evidence_expires_at": NOW - timedelta(seconds=1)})
-    gate = CapabilityQualificationGate([enabled])
+    gate = CapabilityQualificationGate([enabled], artifacts=(_artifact(enabled),))
 
-    assert gate.resolve(_selection(enabled)).status == "enabled"
+    assert gate.resolve(_selection(enabled), company_sha256="b" * 64, now=NOW).status == "enabled"
     assert (
         gate.resolve(_selection(enabled, environment="production")).status
         == "capability_unavailable"
     )
     assert (
-        CapabilityQualificationGate([expired]).resolve(_selection(expired), now=NOW).status
+        CapabilityQualificationGate([expired], artifacts=(_artifact(enabled),))
+        .resolve(
+            _selection(expired),
+            company_sha256="b" * 64,
+            now=NOW,
+        )
+        .status
         == "insufficient_evidence"
     )
 
@@ -314,7 +333,8 @@ def test_evidence_uri_is_bound_to_the_exact_provider_catalog() -> None:
     enabled = _qualified(_definition())
     values = enabled.model_dump(mode="python")
     values["qualification_evidence_uri"] = (
-        f"catalog://global/peak/qualifications/{enabled.capability_version_sha256}.json"
+        f"catalog://global/peak/qualifications/{enabled.capability_version_sha256}-"
+        f"{enabled.evidence_revision_sha256}.json"
     )
 
     with pytest.raises(ValueError, match="provider_mcp_qualification_evidence_required"):
@@ -323,21 +343,92 @@ def test_evidence_uri_is_bound_to_the_exact_provider_catalog() -> None:
 
 def test_enabled_catalog_qualification_is_the_only_source_of_runtime_binding() -> None:
     enabled = _qualified(_definition())
-    gate = CapabilityQualificationGate([enabled])
+    gate = CapabilityQualificationGate([enabled], artifacts=(_artifact(enabled),))
 
-    binding = gate.bind(_selection(enabled), now=NOW)
+    binding = gate.bind(_selection(enabled), company_sha256="b" * 64, now=NOW)
     verified = gate.verify(
         _selection(enabled),
         resource_uri_sha256="d" * 64,
+        company_sha256="b" * 64,
         now=NOW,
     )
 
     assert binding.provider_tool == enabled.provider_tool_name
-    assert binding.qualification_hash == enabled.capability_version_sha256
+    assert binding.qualification_hash == enabled.evidence_revision_sha256
     assert verified.capability_version == enabled.capability_version_sha256
     with pytest.raises(ValueError):
         CapabilitySelection.model_validate(
             {**_selection(enabled).model_dump(), "rag_recommendation": "approved"}
+        )
+
+
+def test_enabled_resolution_requires_the_exact_artifact_revision_and_subject() -> None:
+    definition = _definition()
+    artifact = _artifact(definition)
+
+    assert artifact.evidence_revision_sha256
+    qualified = _qualified(definition)
+    tampered = qualified.model_copy(
+        update={
+            "company_sha256": "c" * 64,
+            "qualification_evidence_uri": artifact.catalog_uri,
+        }
+    )
+
+    assert (
+        CapabilityQualificationGate([tampered], artifacts=(artifact,))
+        .resolve(
+            _selection(tampered),
+            company_sha256="c" * 64,
+            now=NOW,
+        )
+        .status
+        == "insufficient_evidence"
+    )
+
+
+def test_production_enablement_revalidates_nonproduction_evidence_and_rejects_future_times() -> (
+    None
+):
+    sandbox = _qualified(_definition())
+    production = _definition(environment="production")
+    production = transition_qualification(
+        production,
+        QualificationState.SCHEMA_VALIDATED,
+        now=NOW,
+    )
+    production = transition_qualification(
+        production,
+        QualificationState.NONPRODUCTION_QUALIFIED,
+        evidence=_artifact(_definition(environment="production")),
+        nonproduction_evidence=(sandbox,),
+        nonproduction_artifacts=(_artifact(_definition()),),
+        now=NOW,
+    )
+
+    revoked = transition_qualification(
+        sandbox,
+        QualificationState.DISABLED,
+        disable_reason="reviewed_regression",
+        now=NOW,
+    )
+    with pytest.raises(ValueError, match="^nonproduction_evidence_required$"):
+        transition_qualification(
+            production,
+            QualificationState.ENABLED,
+            evidence=_artifact(_definition(environment="production")),
+            nonproduction_evidence=(revoked,),
+            nonproduction_artifacts=(_artifact(_definition()),),
+            canary=OwnerAuthorizedCanary(
+                provider="flowaccount",
+                environment="production",
+                normalized_capability=production.normalized_capability,
+                provider_tool_name=production.provider_tool_name,
+                capability_version_sha256=production.capability_version_sha256,
+                owner_authorized_by="workspace_owner",
+                authorized_at=NOW + timedelta(seconds=1),
+            ),
+            now=NOW,
         )
 
 

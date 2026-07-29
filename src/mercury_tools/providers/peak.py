@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 import re
-import secrets
 import unicodedata
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import contextmanager, suppress
@@ -42,6 +41,7 @@ from mercury_tools.providers.streamable_mcp import (
     ProviderAuthHeaders,
     wire_schema_sha256,
 )
+from mercury_tools.qualification.provider_mcp import CatalogQualificationResolver
 
 _PROFILE_CAPABILITY = "provider_profile.get"
 _CREDENTIAL_TYPES = ("connect_id", "connect_key", "user_token")
@@ -279,46 +279,6 @@ class QualifiedPeakProviderContract:
             raise PeakCredentialError("peak_credentials_invalid")
         return result
 
-    def profile_binding(self, connection: ProviderConnection) -> QualifiedCapabilityBinding:
-        checked = _peak_connection(connection, allow_validation=True)
-        if checked.environment not in self.resource_uri_sha256_by_environment:
-            raise PeakCredentialError("peak_provider_contract_invalid")
-        return QualifiedCapabilityBinding(
-            provider=ProviderId.PEAK,
-            environment=checked.environment,
-            normalized_capability=_PROFILE_CAPABILITY,
-            provider_tool=self.profile_tool,
-            operation_class=ProviderOperationClass.READ,
-            qualification_hash=self.qualification_hash,
-        )
-
-    def verify_binding(
-        self,
-        connection: ProviderConnection,
-        binding: QualifiedCapabilityBinding,
-        resource_uri_sha256: str,
-    ) -> VerifiedRuntimeBinding:
-        expected = self.profile_binding(connection)
-        expected_resource = self.resource_uri_sha256_by_environment.get(connection.environment)
-        if binding != expected or not secrets.compare_digest(
-            resource_uri_sha256,
-            expected_resource or "",
-        ):
-            raise PeakCredentialError("peak_provider_contract_invalid")
-        return VerifiedRuntimeBinding(
-            qualification_state=ProviderQualificationState.ENABLED,
-            provider=ProviderId.PEAK,
-            environment=connection.environment,
-            resource_uri_sha256=resource_uri_sha256,
-            normalized_capability=_PROFILE_CAPABILITY,
-            capability_version=self.fixture_id,
-            provider_tool=self.profile_tool,
-            operation_class=ProviderOperationClass.READ,
-            request_schema_sha256=self.profile_request_schema_sha256,
-            response_schema_sha256=self.profile_response_schema_sha256,
-            qualification_hash=self.qualification_hash,
-        )
-
     def request_model(self, binding: VerifiedRuntimeBinding) -> type[BaseModel]:
         self._require_profile_binding(binding)
         return self.profile_request_model
@@ -356,7 +316,6 @@ class QualifiedPeakProviderContract:
             or binding.normalized_capability != _PROFILE_CAPABILITY
             or binding.provider_tool != self.profile_tool
             or binding.operation_class is not ProviderOperationClass.READ
-            or binding.qualification_hash != self.qualification_hash
             or expected_resource is None
             or binding.resource_uri_sha256 != expected_resource
             or binding.request_schema_sha256 != self.profile_request_schema_sha256
@@ -569,6 +528,7 @@ class PeakMCPDriver:
         runtime: Any,
         manifest: ProviderDriverManifest,
         contract: QualifiedPeakProviderContract | None,
+        qualification_resolver: CatalogQualificationResolver,
     ) -> None:
         checked_manifest = ProviderDriverManifest.model_validate(manifest.model_dump(mode="json"))
         if checked_manifest.provider is not ProviderId.PEAK:
@@ -577,9 +537,12 @@ class PeakMCPDriver:
             raise ValueError("peak_driver_runtime_invalid")
         if contract is not None and not isinstance(contract, QualifiedPeakProviderContract):
             raise ValueError("peak_driver_contract_invalid")
+        if not isinstance(qualification_resolver, CatalogQualificationResolver):
+            raise ValueError("peak_driver_qualification_resolver_invalid")
         self._runtime = runtime
         self._manifest = checked_manifest
         self._contract = contract
+        self._qualification_resolver = qualification_resolver
 
     def __repr__(self) -> str:
         return f"PeakMCPDriver(contract_qualified={self.contract_qualified!r})"
@@ -589,8 +552,16 @@ class PeakMCPDriver:
         return isinstance(self._contract, QualifiedPeakProviderContract)
 
     async def discover(self, connection: ProviderConnection) -> ProviderDiscovery:
-        self._require_contract()
+        contract = self._require_contract()
         checked = self._connection(connection, allow_validation=True)
+        try:
+            self._qualification_resolver.bind_bootstrap(
+                checked,
+                normalized_capability=_PROFILE_CAPABILITY,
+                provider_tool_name=contract.profile_tool,
+            )
+        except Exception:
+            raise self._invalid() from None
         return await self._runtime.discover(checked)
 
     async def validate_connection(
@@ -602,7 +573,11 @@ class PeakMCPDriver:
         validation: ProviderValidation | None = None
         failed = False
         try:
-            binding = contract.profile_binding(checked)
+            binding = self._qualification_resolver.bind_bootstrap(
+                checked,
+                normalized_capability=_PROFILE_CAPABILITY,
+                provider_tool_name=contract.profile_tool,
+            )
             result = await self._runtime.call(
                 checked,
                 binding,
@@ -672,7 +647,11 @@ class PeakMCPDriver:
         operation_id: UUID,
     ) -> ProviderCallResult:
         self._require_contract()
-        self._connection(connection, allow_validation=False)
+        checked = self._connection(connection, allow_validation=False)
+        try:
+            self._qualification_resolver.assert_binding(checked, binding)
+        except Exception:
+            raise self._invalid() from None
         raise self._invalid()
 
     def _connection(

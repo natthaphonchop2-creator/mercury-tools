@@ -15,10 +15,12 @@ from mercury_tools.catalog.models import (
     CatalogSource,
     HttpMethod,
     ProviderMCPQualification,
+    QualificationState,
     revalidate_catalog_action,
     revalidate_catalog_source,
 )
 from mercury_tools.config import Settings, require_supabase
+from mercury_tools.qualification.artifacts import QualificationArtifact
 
 _FILTER_COLUMNS = {
     "capability": "capability",
@@ -107,11 +109,13 @@ class SupabaseCatalogStore:
             "mercury_provider_capability_qualifications",
             params={
                 "select": (
-                    "provider,environment,provider_tool_name,normalized_capability,"
+                    "id,provider,environment,provider_tool_name,normalized_capability,"
                     "input_schema,output_schema,schema_hash,response_shape_hash,"
                     "required_permissions,capability_version_sha256,qualification_state,"
-                    "qualification_evidence_uri,evidence_expires_at,production_canary_at,"
-                    "owner_authorized_by,disable_reason"
+                    "company_sha256,evidence_revision_sha256,qualification_evidence_uri,"
+                    "evidence_evaluated_at,evidence_expires_at,"
+                    "nonproduction_evidence_revision_sha256,nonproduction_company_sha256,"
+                    "production_canary_at,owner_authorized_by,disable_reason"
                 ),
                 "order": (
                     "provider.asc,environment.asc,normalized_capability.asc,"
@@ -125,6 +129,48 @@ class SupabaseCatalogStore:
             return [ProviderMCPQualification.model_validate(row) for row in rows]
         except (TypeError, ValueError):
             raise ValueError("catalog_qualification_invalid") from None
+
+    def publish_provider_mcp_qualification(
+        self,
+        qualification: ProviderMCPQualification,
+        *,
+        artifact: QualificationArtifact | None = None,
+    ) -> str:
+        """Use the only database mutation path for V1 qualification revisions."""
+
+        try:
+            checked = ProviderMCPQualification.model_validate(qualification)
+            checked_artifact = (
+                QualificationArtifact.model_validate(artifact) if artifact is not None else None
+            )
+            if (
+                checked.qualification_state
+                in {
+                    QualificationState.NONPRODUCTION_QUALIFIED,
+                    QualificationState.ENABLED,
+                    QualificationState.DISABLED,
+                    QualificationState.SUPERSEDED,
+                }
+                and checked_artifact is None
+            ):
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ValueError("catalog_qualification_invalid") from None
+        result = self._request(
+            "POST",
+            "rpc/publish_mercury_provider_capability_qualification",
+            json={
+                "p_qualification": checked.model_dump(mode="json"),
+                "p_artifact": (
+                    checked_artifact.model_dump(mode="json")
+                    if checked_artifact is not None
+                    else None
+                ),
+            },
+        )
+        if not isinstance(result, str):
+            raise RuntimeError("supabase_catalog_response_invalid")
+        return result
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = f"{self.base_url}/{path.lstrip('/')}"

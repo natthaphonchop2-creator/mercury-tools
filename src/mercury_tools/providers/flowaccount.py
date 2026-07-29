@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 import json
-import secrets
 import unicodedata
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
@@ -45,6 +44,7 @@ from mercury_tools.providers.streamable_mcp import (
     ProviderAuthHeader,
     ProviderAuthHeaders,
 )
+from mercury_tools.qualification.provider_mcp import CatalogQualificationResolver
 
 _PROFILE_CAPABILITY = "provider_profile.get"
 _PROFILE_TOOL = "get_provider_profile"
@@ -276,10 +276,6 @@ CredentialEnvelopeSaver = Callable[
 FlowAccountTokenRefresher = Callable[
     [FlowAccountRefreshRequest],
     FlowAccountOAuthTokens | Awaitable[FlowAccountOAuthTokens],
-]
-FlowAccountProfileBindingResolver = Callable[
-    [ProviderConnection, str],
-    QualifiedCapabilityBinding | Awaitable[QualifiedCapabilityBinding],
 ]
 
 
@@ -578,16 +574,18 @@ class FlowAccountMCPDriver:
         *,
         runtime: Any,
         manifest: ProviderDriverManifest,
-        profile_binding_resolver: FlowAccountProfileBindingResolver,
+        qualification_resolver: CatalogQualificationResolver,
     ) -> None:
         checked_manifest = ProviderDriverManifest.model_validate(manifest.model_dump(mode="json"))
         if checked_manifest.provider is not ProviderId.FLOWACCOUNT:
             raise ValueError("flowaccount_driver_manifest_invalid")
         if getattr(runtime, "provider", None) is not ProviderId.FLOWACCOUNT:
             raise ValueError("flowaccount_driver_runtime_invalid")
+        if not isinstance(qualification_resolver, CatalogQualificationResolver):
+            raise ValueError("flowaccount_driver_qualification_resolver_invalid")
         self._runtime = runtime
         self._manifest = checked_manifest
-        self._profile_binding_resolver = profile_binding_resolver
+        self._qualification_resolver = qualification_resolver
         self._mappings = {
             mapping.normalized_capability: mapping.provider_tool
             for mapping in checked_manifest.discovery_mappings
@@ -598,8 +596,13 @@ class FlowAccountMCPDriver:
 
     async def discover(self, connection: ProviderConnection) -> ProviderDiscovery:
         checked = self._connection(connection, allow_validation=True)
-        result = await self._runtime.discover(checked)
         try:
+            self._qualification_resolver.bind_bootstrap(
+                checked,
+                normalized_capability=_PROFILE_CAPABILITY,
+                provider_tool_name=_PROFILE_TOOL,
+            )
+            result = await self._runtime.discover(checked)
             capabilities = result.normalized_data["capabilities"]
             if isinstance(capabilities, (str, bytes, bytearray)):
                 raise TypeError
@@ -625,19 +628,17 @@ class FlowAccountMCPDriver:
         connection: ProviderConnection,
     ) -> ProviderValidation:
         checked = self._connection(connection, allow_validation=True)
-        provider_tool = self._mappings.get(_PROFILE_CAPABILITY)
-        if provider_tool != _PROFILE_TOOL:
-            raise self._invalid()
         try:
-            binding = self._profile_binding_resolver(checked, provider_tool)
-            if inspect.isawaitable(binding):
-                binding = await binding
-            binding = QualifiedCapabilityBinding.model_validate(binding)
+            binding = self._qualification_resolver.bind_bootstrap(
+                checked,
+                normalized_capability=_PROFILE_CAPABILITY,
+                provider_tool_name=_PROFILE_TOOL,
+            )
             if (
                 binding.provider is not ProviderId.FLOWACCOUNT
                 or binding.environment != checked.environment
                 or binding.normalized_capability != _PROFILE_CAPABILITY
-                or binding.provider_tool != provider_tool
+                or binding.provider_tool != _PROFILE_TOOL
                 or binding.operation_class is not ProviderOperationClass.READ
             ):
                 raise ValueError
@@ -671,16 +672,12 @@ class FlowAccountMCPDriver:
         checked = self._connection(connection, allow_validation=False)
         try:
             checked_binding = QualifiedCapabilityBinding.model_validate(binding)
-            expected_tool = self._mappings[checked_binding.normalized_capability]
             if (
                 checked_binding.provider is not ProviderId.FLOWACCOUNT
                 or checked_binding.environment != checked.environment
-                or not secrets.compare_digest(
-                    checked_binding.provider_tool,
-                    expected_tool,
-                )
             ):
                 raise ValueError
+            self._qualification_resolver.assert_binding(checked, checked_binding)
         except Exception:
             raise self._invalid() from None
         return await self._runtime.call(
@@ -728,7 +725,6 @@ __all__ = [
     "FlowAccountOAuthHeaderFactory",
     "FlowAccountOAuthTokens",
     "FlowAccountProfile",
-    "FlowAccountProfileBindingResolver",
     "FlowAccountProfileRequest",
     "FlowAccountRefreshRequest",
     "FlowAccountTokenRefresher",
