@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import unicodedata
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -33,7 +34,7 @@ from mercury_tools.providers.base import (
     ProviderValidation,
     QualifiedCapabilityBinding,
 )
-from mercury_tools.providers.manifest import ProviderDriverManifest
+from mercury_tools.providers.manifest import ProviderDriverManifest, TimeoutClass
 from mercury_tools.providers.models import (
     AuthorizationMethod,
     ConnectionReadiness,
@@ -43,6 +44,8 @@ from mercury_tools.providers.models import (
 from mercury_tools.providers.streamable_mcp import (
     ProviderAuthHeader,
     ProviderAuthHeaders,
+    ProviderOperationDeadline,
+    provider_operation_deadline,
 )
 from mercury_tools.qualification.provider_mcp import CatalogQualificationResolver
 
@@ -597,29 +600,26 @@ class FlowAccountMCPDriver:
     async def discover(self, connection: ProviderConnection) -> ProviderDiscovery:
         checked = self._connection(connection, allow_validation=True)
         try:
-            self._qualification_resolver.bind_bootstrap(
-                checked,
-                normalized_capability=_PROFILE_CAPABILITY,
-                provider_tool_name=_PROFILE_TOOL,
-            )
-            result = await self._runtime.discover(checked)
-            capabilities = result.normalized_data["capabilities"]
-            if isinstance(capabilities, (str, bytes, bytearray)):
-                raise TypeError
-            normalized = tuple(capabilities)
-            if tuple(sorted(normalized)) != normalized or any(
-                capability not in self._mappings for capability in normalized
-            ):
-                raise ValueError
-            return ProviderDiscovery(
-                provider=ProviderId.FLOWACCOUNT,
-                status_class=result.status_class,
-                normalized_data={
-                    **dict(result.normalized_data),
-                    "capabilities": list(normalized),
-                },
-                dispatch_certainty=result.dispatch_certainty,
-            )
+            async with self._qualification_operation(TimeoutClass.DISCOVERY):
+                await self._profile_binding(checked)
+                result = await self._runtime.discover(checked)
+                capabilities = result.normalized_data["capabilities"]
+                if isinstance(capabilities, (str, bytes, bytearray)):
+                    raise TypeError
+                normalized = tuple(capabilities)
+                if tuple(sorted(normalized)) != normalized or any(
+                    capability not in self._mappings for capability in normalized
+                ):
+                    raise ValueError
+                return ProviderDiscovery(
+                    provider=ProviderId.FLOWACCOUNT,
+                    status_class=result.status_class,
+                    normalized_data={
+                        **dict(result.normalized_data),
+                        "capabilities": list(normalized),
+                    },
+                    dispatch_certainty=result.dispatch_certainty,
+                )
         except Exception:
             raise self._invalid() from None
 
@@ -629,34 +629,31 @@ class FlowAccountMCPDriver:
     ) -> ProviderValidation:
         checked = self._connection(connection, allow_validation=True)
         try:
-            binding = self._qualification_resolver.bind_bootstrap(
-                checked,
-                normalized_capability=_PROFILE_CAPABILITY,
-                provider_tool_name=_PROFILE_TOOL,
-            )
-            if (
-                binding.provider is not ProviderId.FLOWACCOUNT
-                or binding.environment != checked.environment
-                or binding.normalized_capability != _PROFILE_CAPABILITY
-                or binding.provider_tool != _PROFILE_TOOL
-                or binding.operation_class is not ProviderOperationClass.READ
-            ):
-                raise ValueError
-            result = await self._runtime.call(
-                checked,
-                binding,
-                FlowAccountProfileRequest(),
-                uuid4(),
-            )
-            if result.status_class is not ProviderStatusClass.SUCCESS:
-                raise ValueError
-            profile = FlowAccountProfile.model_validate(result.normalized_data)
-            return ProviderValidation(
-                provider=ProviderId.FLOWACCOUNT,
-                status_class=ProviderStatusClass.SUCCESS,
-                normalized_data=profile.model_dump(mode="json"),
-                dispatch_certainty=DispatchCertainty.NOT_APPLICABLE,
-            )
+            async with self._qualification_operation(TimeoutClass.READ):
+                binding = await self._profile_binding(checked)
+                if (
+                    binding.provider is not ProviderId.FLOWACCOUNT
+                    or binding.environment != checked.environment
+                    or binding.normalized_capability != _PROFILE_CAPABILITY
+                    or binding.provider_tool != _PROFILE_TOOL
+                    or binding.operation_class is not ProviderOperationClass.READ
+                ):
+                    raise ValueError
+                result = await self._runtime.call(
+                    checked,
+                    binding,
+                    FlowAccountProfileRequest(),
+                    uuid4(),
+                )
+                if result.status_class is not ProviderStatusClass.SUCCESS:
+                    raise ValueError
+                profile = FlowAccountProfile.model_validate(result.normalized_data)
+                return ProviderValidation(
+                    provider=ProviderId.FLOWACCOUNT,
+                    status_class=ProviderStatusClass.SUCCESS,
+                    normalized_data=profile.model_dump(mode="json"),
+                    dispatch_certainty=DispatchCertainty.NOT_APPLICABLE,
+                )
         except ProviderResponseInvalid:
             raise
         except Exception:
@@ -677,15 +674,54 @@ class FlowAccountMCPDriver:
                 or checked_binding.environment != checked.environment
             ):
                 raise ValueError
-            self._qualification_resolver.assert_binding(checked, checked_binding)
+            timeout_class = (
+                TimeoutClass.CREATE
+                if checked_binding.operation_class is ProviderOperationClass.CREATE
+                else TimeoutClass.READ
+            )
+            async with self._qualification_operation(timeout_class):
+                await self._qualification_resolver.assert_binding(checked, checked_binding)
+                return await self._runtime.call(
+                    checked,
+                    checked_binding,
+                    arguments,
+                    operation_id,
+                )
         except Exception:
             raise self._invalid() from None
-        return await self._runtime.call(
-            checked,
-            checked_binding,
-            arguments,
-            operation_id,
+
+    async def _profile_binding(
+        self,
+        connection: ProviderConnection,
+    ) -> QualifiedCapabilityBinding:
+        if (
+            connection.readiness is ConnectionReadiness.REQUIRES_VALIDATION
+            and connection.provider_account_id.startswith("oauth-pending-")
+        ):
+            return await self._qualification_resolver.bind_bootstrap(
+                connection,
+                normalized_capability=_PROFILE_CAPABILITY,
+                provider_tool_name=_PROFILE_TOOL,
+            )
+        return await self._qualification_resolver.bind_for_connection(
+            connection,
+            normalized_capability=_PROFILE_CAPABILITY,
+            provider_tool_name=_PROFILE_TOOL,
         )
+
+    @asynccontextmanager
+    async def _qualification_operation(self, timeout_class: TimeoutClass):
+        deadline = ProviderOperationDeadline.start(self._operation_seconds(timeout_class))
+        async with asyncio.timeout_at(deadline.expires_at):
+            snapshot = await self._qualification_resolver.open_snapshot(deadline)
+            with (
+                self._qualification_resolver.use_snapshot(snapshot),
+                provider_operation_deadline(deadline),
+            ):
+                yield
+
+    def _operation_seconds(self, timeout_class: TimeoutClass) -> int:
+        return self._manifest.timeout_classes[timeout_class].operation_seconds
 
     def _connection(
         self,

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import time
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -46,6 +49,7 @@ from mercury_tools.qualification.artifacts import (
 )
 from mercury_tools.qualification.provider_mcp import (
     CatalogQualificationResolver,
+    QualificationGateError,
     transition_qualification,
 )
 
@@ -243,11 +247,12 @@ async def test_flowaccount_driver_maps_manifest_discovery_and_exact_profile_vali
         manifest=MANIFEST,
         qualification_resolver=_profile_resolver(tmp_path),
     )
-
-    discovery = await driver.discover(_connection(ConnectionReadiness.REQUIRES_VALIDATION))
-    validation = await driver.validate_connection(
-        _connection(ConnectionReadiness.REQUIRES_VALIDATION)
+    provisional = _connection(ConnectionReadiness.REQUIRES_VALIDATION).model_copy(
+        update={"provider_account_id": f"oauth-pending-{CONNECTION_ID}"}
     )
+
+    discovery = await driver.discover(provisional)
+    validation = await driver.validate_connection(provisional)
 
     assert discovery.normalized_data["capabilities"] == (
         "documents.invoice.get",
@@ -342,6 +347,126 @@ async def test_profile_bootstrap_requires_exact_enabled_catalog_evidence_before_
     )
     with pytest.raises(ProviderResponseInvalid):
         await ambiguous.validate_connection(provisional)
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_authority_is_limited_to_pending_flowaccount_oauth_profile(
+    tmp_path: Path,
+) -> None:
+    resolver = _profile_resolver(tmp_path)
+    pending = _connection(ConnectionReadiness.REQUIRES_VALIDATION).model_copy(
+        update={"provider_account_id": f"oauth-pending-{CONNECTION_ID}"}
+    )
+    prohibited = (
+        (
+            pending,
+            "documents.invoice.get",
+            "get_invoice",
+        ),
+        (
+            pending.model_copy(
+                update={
+                    "readiness": ConnectionReadiness.READY,
+                    "last_validated_at": NOW,
+                }
+            ),
+            "provider_profile.get",
+            "get_provider_profile",
+        ),
+        (
+            _connection(ConnectionReadiness.REQUIRES_VALIDATION),
+            "provider_profile.get",
+            "get_provider_profile",
+        ),
+        (
+            pending.model_copy(
+                update={"authorization_method": AuthorizationMethod.PROVIDER_CREDENTIALS}
+            ),
+            "provider_profile.get",
+            "get_provider_profile",
+        ),
+        (
+            pending.model_copy(
+                update={
+                    "provider": ProviderId.PEAK,
+                    "authorization_method": AuthorizationMethod.PROVIDER_CREDENTIALS,
+                }
+            ),
+            "provider_profile.get",
+            "get_provider_profile",
+        ),
+    )
+
+    for connection, capability, tool in prohibited:
+        with pytest.raises(QualificationGateError):
+            await resolver.bind_bootstrap(
+                connection,
+                normalized_capability=capability,
+                provider_tool_name=tool,
+            )
+
+    runtime = FakeRuntime()
+    driver = FlowAccountMCPDriver(
+        runtime=runtime,
+        manifest=MANIFEST,
+        qualification_resolver=resolver,
+    )
+    assert (await driver.validate_connection(pending)).status_class is ProviderStatusClass.SUCCESS
+    assert runtime.events[0][0] == "call"
+
+    for connection in (
+        _connection(ConnectionReadiness.READY),
+        _connection(ConnectionReadiness.REQUIRES_VALIDATION),
+    ):
+        with pytest.raises(ProviderResponseInvalid):
+            await driver.discover(connection)
+
+
+@pytest.mark.asyncio
+async def test_outer_driver_catalog_resolution_is_off_loop_and_deadline_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _profile_resolver(tmp_path)
+
+    class SlowCatalog:
+        def list_provider_mcp_qualifications(self) -> list[ProviderMCPQualification]:
+            time.sleep(1.2)
+            return source._catalog.rows
+
+    runtime = FakeRuntime()
+    driver = FlowAccountMCPDriver(
+        runtime=runtime,
+        manifest=MANIFEST,
+        qualification_resolver=CatalogQualificationResolver(
+            catalog=SlowCatalog(),
+            catalog_root=str(tmp_path),
+            now=lambda: NOW,
+        ),
+    )
+    monkeypatch.setattr(driver, "_operation_seconds", lambda _timeout_class: 1)
+    provisional = _connection(ConnectionReadiness.REQUIRES_VALIDATION).model_copy(
+        update={"provider_account_id": f"oauth-pending-{CONNECTION_ID}"}
+    )
+    ticks = 0
+
+    async def tick() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker = asyncio.create_task(tick())
+    try:
+        with pytest.raises(ProviderResponseInvalid):
+            await driver.discover(provisional)
+    finally:
+        ticker.cancel()
+        with suppress(asyncio.CancelledError):
+            await ticker
+
+    assert ticks >= 10
+    assert runtime.events == []
 
 
 def test_profile_normalizer_accepts_only_exact_company_shape() -> None:

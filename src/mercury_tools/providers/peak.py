@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import re
 import unicodedata
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -29,7 +30,7 @@ from mercury_tools.providers.base import (
     QualifiedCapabilityBinding,
     VerifiedRuntimeBinding,
 )
-from mercury_tools.providers.manifest import ProviderDriverManifest
+from mercury_tools.providers.manifest import ProviderDriverManifest, TimeoutClass
 from mercury_tools.providers.models import (
     AuthorizationMethod,
     ConnectionReadiness,
@@ -39,6 +40,8 @@ from mercury_tools.providers.models import (
 from mercury_tools.providers.streamable_mcp import (
     ProviderAuthHeader,
     ProviderAuthHeaders,
+    ProviderOperationDeadline,
+    provider_operation_deadline,
     wire_schema_sha256,
 )
 from mercury_tools.qualification.provider_mcp import CatalogQualificationResolver
@@ -555,14 +558,15 @@ class PeakMCPDriver:
         contract = self._require_contract()
         checked = self._connection(connection, allow_validation=True)
         try:
-            self._qualification_resolver.bind_bootstrap(
-                checked,
-                normalized_capability=_PROFILE_CAPABILITY,
-                provider_tool_name=contract.profile_tool,
-            )
+            async with self._qualification_operation(TimeoutClass.DISCOVERY):
+                await self._qualification_resolver.bind_for_connection(
+                    checked,
+                    normalized_capability=_PROFILE_CAPABILITY,
+                    provider_tool_name=contract.profile_tool,
+                )
+                return await self._runtime.discover(checked)
         except Exception:
             raise self._invalid() from None
-        return await self._runtime.discover(checked)
 
     async def validate_connection(
         self,
@@ -573,29 +577,30 @@ class PeakMCPDriver:
         validation: ProviderValidation | None = None
         failed = False
         try:
-            binding = self._qualification_resolver.bind_bootstrap(
-                checked,
-                normalized_capability=_PROFILE_CAPABILITY,
-                provider_tool_name=contract.profile_tool,
-            )
-            result = await self._runtime.call(
-                checked,
-                binding,
-                contract.profile_request_model(),
-                uuid4(),
-            )
-            if result.status_class is not ProviderStatusClass.SUCCESS:
-                raise ValueError
-            profile = PeakProfile.model_validate(result.normalized_data)
-            validation = ProviderValidation(
-                provider=ProviderId.PEAK,
-                status_class=ProviderStatusClass.SUCCESS,
-                normalized_data={
-                    "merchant_id": profile.merchant_id,
-                    "merchant_display_name": profile.merchant_display_name,
-                },
-                dispatch_certainty=DispatchCertainty.NOT_APPLICABLE,
-            )
+            async with self._qualification_operation(TimeoutClass.READ):
+                binding = await self._qualification_resolver.bind_for_connection(
+                    checked,
+                    normalized_capability=_PROFILE_CAPABILITY,
+                    provider_tool_name=contract.profile_tool,
+                )
+                result = await self._runtime.call(
+                    checked,
+                    binding,
+                    contract.profile_request_model(),
+                    uuid4(),
+                )
+                if result.status_class is not ProviderStatusClass.SUCCESS:
+                    raise ValueError
+                profile = PeakProfile.model_validate(result.normalized_data)
+                validation = ProviderValidation(
+                    provider=ProviderId.PEAK,
+                    status_class=ProviderStatusClass.SUCCESS,
+                    normalized_data={
+                        "merchant_id": profile.merchant_id,
+                        "merchant_display_name": profile.merchant_display_name,
+                    },
+                    dispatch_certainty=DispatchCertainty.NOT_APPLICABLE,
+                )
         except Exception:
             failed = True
         if failed or validation is None:
@@ -649,10 +654,30 @@ class PeakMCPDriver:
         self._require_contract()
         checked = self._connection(connection, allow_validation=False)
         try:
-            self._qualification_resolver.assert_binding(checked, binding)
+            checked_binding = QualifiedCapabilityBinding.model_validate(binding)
+            timeout_class = (
+                TimeoutClass.CREATE
+                if checked_binding.operation_class is ProviderOperationClass.CREATE
+                else TimeoutClass.READ
+            )
+            async with self._qualification_operation(timeout_class):
+                await self._qualification_resolver.assert_binding(checked, checked_binding)
         except Exception:
             raise self._invalid() from None
         raise self._invalid()
+
+    @asynccontextmanager
+    async def _qualification_operation(self, timeout_class: TimeoutClass):
+        deadline = ProviderOperationDeadline.start(
+            self._manifest.timeout_classes[timeout_class].operation_seconds
+        )
+        async with asyncio.timeout_at(deadline.expires_at):
+            snapshot = await self._qualification_resolver.open_snapshot(deadline)
+            with (
+                self._qualification_resolver.use_snapshot(snapshot),
+                provider_operation_deadline(deadline),
+            ):
+                yield
 
     def _connection(
         self,

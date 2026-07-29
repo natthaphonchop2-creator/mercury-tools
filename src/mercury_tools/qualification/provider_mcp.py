@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 import secrets
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal, Protocol
@@ -20,7 +23,16 @@ from mercury_tools.providers.base import (
     QualifiedCapabilityBinding,
     VerifiedRuntimeBinding,
 )
-from mercury_tools.providers.models import ProviderConnection, ProviderId
+from mercury_tools.providers.models import (
+    AuthorizationMethod,
+    ConnectionReadiness,
+    ProviderConnection,
+    ProviderId,
+)
+from mercury_tools.providers.streamable_mcp import (
+    ProviderOperationDeadline,
+    current_provider_operation_deadline,
+)
 from mercury_tools.qualification.artifacts import (
     QualificationArtifact,
     load_catalog_qualification_artifact,
@@ -33,6 +45,7 @@ _TOOL = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"
 _SHA256 = r"^[0-9a-f]{64}$"
 _IDENTIFIER = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"
 _PROFILE_CAPABILITY = "provider_profile.get"
+_FLOWACCOUNT_PROFILE_TOOL = "get_provider_profile"
 
 
 class CapabilitySelection(BaseModel):
@@ -133,13 +146,11 @@ class CapabilityQualificationGate:
         self,
         selection: CapabilitySelection,
         *,
-        company_sha256: str | None = None,
-        bootstrap: bool = False,
+        company_sha256: str,
         now: datetime | None = None,
     ) -> CapabilityResolution:
         checked_selection = CapabilitySelection.model_validate(selection)
-        if company_sha256 is not None and _sha256_match(company_sha256) is None:
-            raise ValueError("qualification_company_invalid")
+        checked_company = _require_company_sha256(company_sha256)
         matching = [
             item
             for item in self._qualifications
@@ -148,8 +159,7 @@ class CapabilityQualificationGate:
         ]
         return self._resolve_matches(
             matching,
-            company_sha256=company_sha256,
-            bootstrap=bootstrap,
+            company_sha256=checked_company,
             now=_now(now),
         )
 
@@ -160,10 +170,10 @@ class CapabilityQualificationGate:
         environment: str,
         normalized_capability: str,
         provider_tool_name: str,
-        company_sha256: str | None,
-        bootstrap: bool,
+        company_sha256: str,
         now: datetime | None = None,
     ) -> CapabilityResolution:
+        checked_company = _require_company_sha256(company_sha256)
         matching = [
             item
             for item in self._qualifications
@@ -177,8 +187,7 @@ class CapabilityQualificationGate:
         ]
         return self._resolve_matches(
             matching,
-            company_sha256=company_sha256,
-            bootstrap=bootstrap,
+            company_sha256=checked_company,
             now=_now(now),
         )
 
@@ -186,14 +195,12 @@ class CapabilityQualificationGate:
         self,
         selection: CapabilitySelection,
         *,
-        company_sha256: str | None = None,
-        bootstrap: bool = False,
+        company_sha256: str,
         now: datetime | None = None,
     ) -> QualifiedCapabilityBinding:
         resolved = self.resolve(
             selection,
             company_sha256=company_sha256,
-            bootstrap=bootstrap,
             now=now,
         )
         return self._binding_from_resolution(resolved)
@@ -205,8 +212,7 @@ class CapabilityQualificationGate:
         environment: str,
         normalized_capability: str,
         provider_tool_name: str,
-        company_sha256: str | None,
-        bootstrap: bool,
+        company_sha256: str,
         now: datetime | None = None,
     ) -> QualifiedCapabilityBinding:
         resolved = self.resolve_current(
@@ -215,30 +221,85 @@ class CapabilityQualificationGate:
             normalized_capability=normalized_capability,
             provider_tool_name=provider_tool_name,
             company_sha256=company_sha256,
-            bootstrap=bootstrap,
             now=now,
         )
         return self._binding_from_resolution(resolved)
+
+    def _bind_flowaccount_oauth_profile_bootstrap(
+        self,
+        *,
+        environment: str,
+        now: datetime,
+    ) -> QualifiedCapabilityBinding:
+        """Resolve the reviewed FlowAccount OAuth profile bootstrap subject only.
+
+        This is intentionally private: caller-controlled generic gate APIs always
+        require a server-derived company hash. The resolver invokes it only after
+        it has validated the provisional OAuth connection state.
+        """
+
+        return self._binding_from_resolution(
+            self._resolve_flowaccount_oauth_profile_bootstrap(
+                environment=environment,
+                now=now,
+            )
+        )
+
+    def _resolve_flowaccount_oauth_profile_bootstrap(
+        self,
+        *,
+        environment: str,
+        now: datetime,
+    ) -> CapabilityResolution:
+        matching = [
+            item
+            for item in self._qualifications
+            if (
+                item.provider,
+                item.environment,
+                item.normalized_capability,
+                item.provider_tool_name,
+            )
+            == (
+                ProviderId.FLOWACCOUNT.value,
+                environment,
+                _PROFILE_CAPABILITY,
+                _FLOWACCOUNT_PROFILE_TOOL,
+            )
+        ]
+        candidates = tuple(matching)
+        valid = [
+            item
+            for item in candidates
+            if item.company_sha256 is not None
+            and self._is_current_enabled(
+                item,
+                company_sha256=item.company_sha256,
+                now=now,
+            )
+        ]
+        if len(valid) != 1:
+            raise QualificationGateError(
+                "capability_unavailable" if not candidates else "insufficient_evidence"
+            )
+        return CapabilityResolution(status="enabled", qualification=valid[0])
 
     def verify(
         self,
         selection: CapabilitySelection,
         *,
         resource_uri_sha256: str,
-        company_sha256: str | None = None,
-        bootstrap: bool = False,
+        company_sha256: str,
         now: datetime | None = None,
     ) -> VerifiedRuntimeBinding:
         binding = self.bind(
             selection,
             company_sha256=company_sha256,
-            bootstrap=bootstrap,
             now=now,
         )
         qualification = self.resolve(
             selection,
             company_sha256=company_sha256,
-            bootstrap=bootstrap,
             now=now,
         ).qualification
         if qualification is None:
@@ -267,8 +328,7 @@ class CapabilityQualificationGate:
         self,
         matching: Iterable[ProviderMCPQualification],
         *,
-        company_sha256: str | None,
-        bootstrap: bool,
+        company_sha256: str,
         now: datetime,
     ) -> CapabilityResolution:
         candidates = tuple(matching)
@@ -280,7 +340,6 @@ class CapabilityQualificationGate:
             if self._is_current_enabled(
                 item,
                 company_sha256=company_sha256,
-                bootstrap=bootstrap,
                 now=now,
             )
         ]
@@ -301,8 +360,7 @@ class CapabilityQualificationGate:
         self,
         qualification: ProviderMCPQualification,
         *,
-        company_sha256: str | None,
-        bootstrap: bool,
+        company_sha256: str,
         now: datetime,
     ) -> bool:
         if (
@@ -315,10 +373,7 @@ class CapabilityQualificationGate:
             or qualification.evidence_revision_sha256 is None
         ):
             return False
-        if not bootstrap and (
-            company_sha256 is None
-            or not secrets.compare_digest(company_sha256, qualification.company_sha256)
-        ):
+        if not secrets.compare_digest(company_sha256, qualification.company_sha256):
             return False
         artifact = self._artifact_for(qualification)
         if artifact is None:
@@ -423,8 +478,16 @@ class QualificationCatalog(Protocol):
     def list_provider_mcp_qualifications(self) -> list[ProviderMCPQualification]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class CatalogQualificationSnapshot:
+    """One immutable catalog view for a single provider operation."""
+
+    gate: CapabilityQualificationGate
+    now: datetime
+
+
 class CatalogQualificationResolver:
-    """Reload catalog authority for every hosted provider dispatch attempt."""
+    """Resolve catalog authority under the enclosing provider operation deadline."""
 
     def __init__(
         self,
@@ -438,47 +501,101 @@ class CatalogQualificationResolver:
         self._catalog = catalog
         self._catalog_root = str(catalog_root)
         self._now = now or (lambda: datetime.now(UTC))
+        self._snapshot: ContextVar[CatalogQualificationSnapshot | None] = ContextVar(
+            "mercury_catalog_qualification_snapshot",
+            default=None,
+        )
 
-    def bind_bootstrap(
+    async def open_snapshot(
+        self,
+        deadline: ProviderOperationDeadline | None = None,
+    ) -> CatalogQualificationSnapshot:
+        """Load catalog rows without blocking the event loop or escaping deadline."""
+
+        checked_deadline = self._deadline(deadline)
+        checked_deadline.check()
+        try:
+            async with asyncio.timeout_at(checked_deadline.expires_at):
+                qualifications = await asyncio.to_thread(
+                    self._catalog.list_provider_mcp_qualifications
+                )
+            checked_deadline.check()
+            gate = CapabilityQualificationGate(
+                qualifications,
+                artifact_loader=lambda uri: load_catalog_qualification_artifact(
+                    self._catalog_root,
+                    uri,
+                ),
+            )
+        except (OSError, TypeError, ValueError, RuntimeError):
+            gate = CapabilityQualificationGate(())
+        return CatalogQualificationSnapshot(gate=gate, now=self._checked_now())
+
+    @contextmanager
+    def use_snapshot(self, snapshot: CatalogQualificationSnapshot) -> Iterator[None]:
+        checked = CatalogQualificationSnapshot(
+            gate=snapshot.gate,
+            now=snapshot.now,
+        )
+        token = self._snapshot.set(checked)
+        try:
+            yield
+        finally:
+            self._snapshot.reset(token)
+
+    async def bind_bootstrap(
         self,
         connection: ProviderConnection,
         *,
         normalized_capability: str = _PROFILE_CAPABILITY,
         provider_tool_name: str,
+        deadline: ProviderOperationDeadline | None = None,
     ) -> QualifiedCapabilityBinding:
         checked = ProviderConnection.model_validate(connection)
-        if normalized_capability != _PROFILE_CAPABILITY:
-            raise QualificationGateError("capability_unavailable")
-        return self._gate().bind_current(
-            provider=checked.provider.value,
-            environment=checked.environment,
+        if not _is_exact_flowaccount_oauth_profile_bootstrap(
+            checked,
             normalized_capability=normalized_capability,
             provider_tool_name=provider_tool_name,
-            company_sha256=None,
-            bootstrap=True,
-            now=self._checked_now(),
+        ):
+            raise QualificationGateError("capability_unavailable")
+        snapshot = await self._current_snapshot(deadline)
+        return snapshot.gate._bind_flowaccount_oauth_profile_bootstrap(
+            environment=checked.environment,
+            now=snapshot.now,
         )
 
-    def bind_for_connection(
+    async def bind_for_connection(
         self,
         connection: ProviderConnection,
         *,
         normalized_capability: str,
         provider_tool_name: str,
+        deadline: ProviderOperationDeadline | None = None,
     ) -> QualifiedCapabilityBinding:
         checked = ProviderConnection.model_validate(connection)
-        return self._gate().bind_current(
+        snapshot = await self._current_snapshot(deadline)
+        return snapshot.gate.bind_current(
             provider=checked.provider.value,
             environment=checked.environment,
             normalized_capability=normalized_capability,
             provider_tool_name=provider_tool_name,
             company_sha256=_server_company_sha256(checked),
-            bootstrap=False,
-            now=self._checked_now(),
+            now=snapshot.now,
         )
 
-    def assert_binding(
+    async def assert_binding(
         self,
+        connection: ProviderConnection,
+        binding: QualifiedCapabilityBinding,
+        *,
+        deadline: ProviderOperationDeadline | None = None,
+    ) -> QualifiedCapabilityBinding:
+        snapshot = await self._current_snapshot(deadline)
+        return self._assert_binding(snapshot, connection, binding)
+
+    def _assert_binding(
+        self,
+        snapshot: CatalogQualificationSnapshot,
         connection: ProviderConnection,
         binding: QualifiedCapabilityBinding,
     ) -> QualifiedCapabilityBinding:
@@ -487,59 +604,72 @@ class CatalogQualificationResolver:
         if checked_binding.provider is not checked_connection.provider:
             raise QualificationGateError("capability_unavailable")
         if _is_profile_bootstrap(checked_connection, checked_binding):
-            expected = self.bind_bootstrap(
-                checked_connection,
-                normalized_capability=checked_binding.normalized_capability,
-                provider_tool_name=checked_binding.provider_tool,
+            expected = snapshot.gate._bind_flowaccount_oauth_profile_bootstrap(
+                environment=checked_connection.environment,
+                now=snapshot.now,
             )
         else:
-            expected = self.bind_for_connection(
-                checked_connection,
+            expected = snapshot.gate.bind_current(
+                provider=checked_connection.provider.value,
+                environment=checked_connection.environment,
                 normalized_capability=checked_binding.normalized_capability,
                 provider_tool_name=checked_binding.provider_tool,
+                company_sha256=_server_company_sha256(checked_connection),
+                now=snapshot.now,
             )
         if checked_binding != expected:
             raise QualificationGateError("capability_unavailable")
         return expected
 
-    def verify_binding(
+    async def verify_binding(
         self,
         connection: ProviderConnection,
         binding: QualifiedCapabilityBinding,
         resource_uri_sha256: str,
+        *,
+        deadline: ProviderOperationDeadline | None = None,
     ) -> VerifiedRuntimeBinding:
-        expected = self.assert_binding(connection, binding)
+        snapshot = await self._current_snapshot(deadline)
+        expected = self._assert_binding(snapshot, connection, binding)
         checked_connection = ProviderConnection.model_validate(connection)
-        bootstrap = _is_profile_bootstrap(checked_connection, expected)
-        company_sha256 = None if bootstrap else _server_company_sha256(checked_connection)
-        gate = self._gate()
-        resolution = gate.resolve_current(
-            provider=checked_connection.provider.value,
-            environment=checked_connection.environment,
-            normalized_capability=expected.normalized_capability,
-            provider_tool_name=expected.provider_tool,
-            company_sha256=company_sha256,
-            bootstrap=bootstrap,
-            now=self._checked_now(),
-        )
+        gate = snapshot.gate
+        if _is_profile_bootstrap(checked_connection, expected):
+            resolution = gate._resolve_flowaccount_oauth_profile_bootstrap(
+                environment=checked_connection.environment,
+                now=snapshot.now,
+            )
+        else:
+            resolution = gate.resolve_current(
+                provider=checked_connection.provider.value,
+                environment=checked_connection.environment,
+                normalized_capability=expected.normalized_capability,
+                provider_tool_name=expected.provider_tool,
+                company_sha256=_server_company_sha256(checked_connection),
+                now=snapshot.now,
+            )
         if resolution.status != "enabled" or resolution.qualification is None:
             raise QualificationGateError(resolution.status)
         if gate._binding_from_resolution(resolution) != expected:
             raise QualificationGateError("capability_unavailable")
         return _verified_binding(resolution.qualification, expected, resource_uri_sha256)
 
-    def _gate(self) -> CapabilityQualificationGate:
-        try:
-            qualifications = self._catalog.list_provider_mcp_qualifications()
-            return CapabilityQualificationGate(
-                qualifications,
-                artifact_loader=lambda uri: load_catalog_qualification_artifact(
-                    self._catalog_root,
-                    uri,
-                ),
-            )
-        except (OSError, TypeError, ValueError, RuntimeError):
-            return CapabilityQualificationGate(())
+    async def _current_snapshot(
+        self,
+        deadline: ProviderOperationDeadline | None = None,
+    ) -> CatalogQualificationSnapshot:
+        snapshot = self._snapshot.get()
+        if snapshot is not None:
+            return snapshot
+        return await self.open_snapshot(deadline)
+
+    @staticmethod
+    def _deadline(
+        deadline: ProviderOperationDeadline | None,
+    ) -> ProviderOperationDeadline:
+        selected = deadline or current_provider_operation_deadline()
+        if selected is None:
+            raise QualificationGateError("insufficient_evidence")
+        return selected
 
     def _checked_now(self) -> datetime:
         return _now(self._now())
@@ -821,14 +951,38 @@ def _is_profile_bootstrap(
     connection: ProviderConnection,
     binding: QualifiedCapabilityBinding,
 ) -> bool:
+    return _is_exact_flowaccount_oauth_profile_bootstrap(
+        connection,
+        normalized_capability=binding.normalized_capability,
+        provider_tool_name=binding.provider_tool,
+    )
+
+
+def _is_exact_flowaccount_oauth_profile_bootstrap(
+    connection: ProviderConnection,
+    *,
+    normalized_capability: str,
+    provider_tool_name: str,
+) -> bool:
     return (
-        binding.normalized_capability == _PROFILE_CAPABILITY
+        connection.provider is ProviderId.FLOWACCOUNT
+        and connection.authorization_method is AuthorizationMethod.OAUTH2_PKCE
+        and connection.readiness is ConnectionReadiness.REQUIRES_VALIDATION
+        and normalized_capability == _PROFILE_CAPABILITY
+        and provider_tool_name == _FLOWACCOUNT_PROFILE_TOOL
         and connection.provider_account_id.startswith("oauth-pending-")
     )
 
 
 def _sha256_match(value: str) -> str | None:
     return value if isinstance(value, str) and re.fullmatch(_SHA256, value) else None
+
+
+def _require_company_sha256(value: str) -> str:
+    checked = _sha256_match(value)
+    if checked is None:
+        raise ValueError("qualification_company_invalid")
+    return checked
 
 
 def _json_sha256(value: object) -> str:

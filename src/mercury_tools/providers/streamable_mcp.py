@@ -280,6 +280,31 @@ class _OperationDeadline:
         return remaining
 
 
+# Qualification resolution happens before a hosted provider call is dispatched.
+# Keep the caller's deadline available to that boundary without exposing the
+# runtime's mutable timeout machinery to provider-specific code.
+ProviderOperationDeadline = _OperationDeadline
+_PROVIDER_OPERATION_DEADLINE: ContextVar[ProviderOperationDeadline | None] = ContextVar(
+    "mercury_provider_operation_deadline",
+    default=None,
+)
+
+
+def current_provider_operation_deadline() -> ProviderOperationDeadline | None:
+    return _PROVIDER_OPERATION_DEADLINE.get()
+
+
+@contextmanager
+def provider_operation_deadline(deadline: ProviderOperationDeadline):
+    if not isinstance(deadline, _OperationDeadline):
+        raise TypeError("provider_operation_deadline_invalid")
+    token = _PROVIDER_OPERATION_DEADLINE.set(deadline)
+    try:
+        yield deadline
+    finally:
+        _PROVIDER_OPERATION_DEADLINE.reset(token)
+
+
 class _RequestBoundaryValues:
     __slots__ = ("_values",)
 
@@ -1233,7 +1258,9 @@ class StreamableMCPDriver:
                 resource.uri_sha256,
             )
             if inspect.isawaitable(value):
-                value = await value
+                qualification_deadline = current_provider_operation_deadline() or deadline
+                with provider_operation_deadline(qualification_deadline):
+                    value = await value
             deadline.check()
             if not isinstance(value, VerifiedRuntimeBinding):
                 raise TypeError
@@ -1603,12 +1630,15 @@ def _closed_runtime_error(error: ProviderRuntimeError) -> ProviderRuntimeError:
 __all__ = [
     "BindingVerifier",
     "HeaderFactory",
+    "ProviderOperationDeadline",
     "ProviderAuthHeader",
     "ProviderAuthHeaders",
     "RequestModelResolver",
     "ResponseNormalizer",
     "ResponseModelResolver",
     "StreamableMCPDriver",
+    "current_provider_operation_deadline",
+    "provider_operation_deadline",
     "validation_schema_sha256",
     "wire_schema_sha256",
 ]

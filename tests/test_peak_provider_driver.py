@@ -43,6 +43,7 @@ from mercury_tools.providers.peak import (
     seal_peak_credentials,
 )
 from mercury_tools.providers.registry import build_provider_registry
+from mercury_tools.providers.streamable_mcp import ProviderOperationDeadline
 from mercury_tools.qualification.artifacts import (
     build_qualification_artifact,
     write_qualification_artifact,
@@ -679,10 +680,11 @@ async def test_peak_driver_validates_only_qualified_provider_profile_contract(
     with pytest.raises(ProviderResponseInvalid):
         await driver.call(
             _connection(readiness=ConnectionReadiness.READY),
-            resolver.bind_for_connection(
+            await resolver.bind_for_connection(
                 _connection(readiness=ConnectionReadiness.READY),
                 normalized_capability="provider_profile.get",
                 provider_tool_name=contract.profile_tool,
+                deadline=ProviderOperationDeadline.start(5),
             ),
             ReviewedProfileRequest(),
             uuid4(),

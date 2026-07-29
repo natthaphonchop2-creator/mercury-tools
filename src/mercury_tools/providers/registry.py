@@ -111,8 +111,12 @@ def build_provider_registry(
             raise ValueError("provider_response_normalizer_missing")
         return response_normalizer(binding, structured_content)
 
-    def provider_scoped_verifier(connection, binding, resource_uri_sha256):
-        return qualification_resolver.verify_binding(connection, binding, resource_uri_sha256)
+    async def provider_scoped_verifier(connection, binding, resource_uri_sha256):
+        return await qualification_resolver.verify_binding(
+            connection,
+            binding,
+            resource_uri_sha256,
+        )
 
     def provider_scoped_request_model(binding):
         if binding.provider is ProviderId.PEAK:

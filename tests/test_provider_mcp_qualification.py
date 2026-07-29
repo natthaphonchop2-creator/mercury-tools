@@ -174,7 +174,8 @@ def test_peak_profile_seed_is_not_artifact_evidence_without_a_reviewed_fixture()
                 normalized_capability="provider_profile.get",
                 provider_tool_name="get_provider_profile",
                 capability_version_sha256=peak_profile.capability_version_sha256,
-            )
+            ),
+            company_sha256="a" * 64,
         )
         .status
         == "insufficient_evidence"

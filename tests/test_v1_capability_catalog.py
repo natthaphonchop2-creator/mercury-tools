@@ -103,6 +103,22 @@ def _selection(definition: ProviderMCPQualification, **updates: object) -> Capab
     return CapabilitySelection.model_validate(values)
 
 
+def test_generic_capability_gate_does_not_accept_a_bootstrap_company_bypass() -> None:
+    definition = _definition()
+    gate = CapabilityQualificationGate(
+        (_qualified(definition),),
+        artifacts=(_artifact(definition),),
+    )
+
+    with pytest.raises(TypeError):
+        gate.bind(
+            _selection(definition),
+            company_sha256="a" * 64,
+            bootstrap=True,
+            now=NOW,
+        )
+
+
 def test_existing_catalog_rows_keep_their_immutable_ids() -> None:
     for connector, expected_count in (("flowaccount", 190), ("peak", 64)):
         actions = load_actions(ROOT / "catalog" / "global" / connector / "actions.json")
@@ -187,7 +203,7 @@ def test_schema_change_creates_a_new_unqualified_immutable_version() -> None:
     assert changed.qualification_state is QualificationState.DISCOVERED_UNREVIEWED
     assert (
         CapabilityQualificationGate([enabled, changed], artifacts=(_artifact(enabled),))
-        .resolve(_selection(changed))
+        .resolve(_selection(changed), company_sha256="b" * 64)
         .status
         == "insufficient_evidence"
     )
@@ -196,11 +212,14 @@ def test_schema_change_creates_a_new_unqualified_immutable_version() -> None:
 def test_seed_discovery_rag_skills_and_legacy_observations_cannot_authorize_execution() -> None:
     definition = _definition()
     gate = CapabilityQualificationGate([definition])
-    unqualified = gate.resolve(_selection(definition))
+    unqualified = gate.resolve(_selection(definition), company_sha256="b" * 64)
 
     assert unqualified.status == "insufficient_evidence"
     assert (
-        gate.resolve(_selection(definition, provider_tool_name="discovery_suggested_tool")).status
+        gate.resolve(
+            _selection(definition, provider_tool_name="discovery_suggested_tool"),
+            company_sha256="b" * 64,
+        ).status
         == "capability_unavailable"
     )
 
@@ -314,7 +333,10 @@ def test_execution_lookup_is_exact_and_fails_closed_for_expired_evidence() -> No
 
     assert gate.resolve(_selection(enabled), company_sha256="b" * 64, now=NOW).status == "enabled"
     assert (
-        gate.resolve(_selection(enabled, environment="production")).status
+        gate.resolve(
+            _selection(enabled, environment="production"),
+            company_sha256="b" * 64,
+        ).status
         == "capability_unavailable"
     )
     assert (

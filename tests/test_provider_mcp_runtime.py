@@ -10,7 +10,7 @@ import time
 import tomllib
 import warnings
 from collections.abc import Callable, Mapping
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -2458,10 +2458,11 @@ async def test_registry_injects_trusted_runtime_and_response_schema_boundaries(
 
     result = await registry.get(ProviderId.FLOWACCOUNT).call(
         connection,
-        resolver.bind_for_connection(
+        await resolver.bind_for_connection(
             connection,
             normalized_capability="documents.invoice.get",
             provider_tool_name="get_invoice",
+            deadline=streamable_module.ProviderOperationDeadline.start(5),
         ),
         InvoiceArguments(invoice_id="invoice-123"),
         OPERATION_ID,
@@ -2473,6 +2474,127 @@ async def test_registry_injects_trusted_runtime_and_response_schema_boundaries(
         "initialize",
         "call_tool",
     ]
+
+
+@pytest.mark.asyncio
+async def test_outer_binding_and_runtime_verification_share_one_catalog_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = _catalog_qualification_resolver(
+        tmp_path,
+        connection=_connection(),
+        include_invoice=True,
+        include_profile=False,
+    )
+    row = source._catalog._qualifications[0]
+
+    class CountingCatalog:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def list_provider_mcp_qualifications(self) -> list[ProviderMCPQualification]:
+            self.calls += 1
+            return list(source._catalog._qualifications)
+
+    catalog = CountingCatalog()
+    resolver = CatalogQualificationResolver(
+        catalog=catalog,
+        catalog_root=str(tmp_path),
+        now=lambda: NOW,
+    )
+    registry = build_provider_registry(
+        settings=_settings(),
+        manifest_root=Path(__file__).resolve().parents[1] / "catalog/global",
+        header_factories={
+            AuthorizationMethod.OAUTH2_PKCE: lambda _connection: _auth_headers(),
+        },
+        response_normalizer=_normalize_invoice,
+        request_model_resolver=_resolve_invoice_request_model,
+        response_model_resolver=_resolve_invoice_response_model,
+        qualification_resolver=resolver,
+    )
+    harness = FakeMCPHarness()
+    harness.install(monkeypatch)
+    binding = QualifiedCapabilityBinding(
+        provider=ProviderId.FLOWACCOUNT,
+        environment="sandbox",
+        normalized_capability=row.normalized_capability,
+        provider_tool=row.provider_tool_name,
+        operation_class=ProviderOperationClass.READ,
+        qualification_hash=row.evidence_revision_sha256,
+    )
+
+    result = await registry.get(ProviderId.FLOWACCOUNT).call(
+        _connection(),
+        binding,
+        InvoiceArguments(invoice_id="invoice-123"),
+        OPERATION_ID,
+    )
+
+    assert result.status_class is ProviderStatusClass.SUCCESS
+    assert catalog.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_verifier_catalog_resolution_is_off_loop_and_deadline_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = _catalog_qualification_resolver(
+        tmp_path,
+        connection=_connection(),
+        include_invoice=True,
+        include_profile=False,
+    )
+
+    class SlowCatalog:
+        def list_provider_mcp_qualifications(self) -> list[ProviderMCPQualification]:
+            time.sleep(1.2)
+            return list(source._catalog._qualifications)
+
+    resolver = CatalogQualificationResolver(
+        catalog=SlowCatalog(),
+        catalog_root=str(tmp_path),
+        now=lambda: NOW,
+    )
+    row = source._catalog._qualifications[0]
+    binding = QualifiedCapabilityBinding(
+        provider=ProviderId.FLOWACCOUNT,
+        environment="sandbox",
+        normalized_capability=row.normalized_capability,
+        provider_tool=row.provider_tool_name,
+        operation_class=ProviderOperationClass.READ,
+        qualification_hash=row.evidence_revision_sha256,
+    )
+    harness = FakeMCPHarness()
+    harness.install(monkeypatch)
+    driver = _driver(binding_verifier=resolver.verify_binding)
+    monkeypatch.setattr(driver, "_operation_seconds", lambda _timeout_class: 1)
+    ticks = 0
+
+    async def tick() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker = asyncio.create_task(tick())
+    try:
+        with pytest.raises(ProviderRuntimeError):
+            await driver.call(
+                _connection(),
+                binding,
+                InvoiceArguments(invoice_id="invoice-123"),
+                OPERATION_ID,
+            )
+    finally:
+        ticker.cancel()
+        with suppress(asyncio.CancelledError):
+            await ticker
+
+    assert ticks >= 10
+    assert harness.events == []
 
 
 @pytest.mark.asyncio
