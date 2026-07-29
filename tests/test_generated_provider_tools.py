@@ -555,3 +555,276 @@ async def test_generated_publication_rolls_back_registration_failure_and_cancell
         await pending
     publisher._refresh_lock.release()
     assert {tool.name for tool in await server.list_tools()} == {"mercury_flowaccount_invoice_get"}
+
+
+def test_public_projection_prunes_nested_sensitive_fields_across_refs_and_applicators() -> None:
+    from mercury_tools.mcp.generated_tools import project_provider_read_data, public_output_schema
+
+    schema = {
+        "$defs": {
+            "Line": {
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "string"},
+                    "vat_amount": {"type": "number"},
+                    "contact_email": {"type": "string"},
+                    "sessionToken": {"type": "string"},
+                },
+                "required": ["document_id", "vat_amount", "contact_email", "sessionToken"],
+                "additionalProperties": False,
+            },
+            "Record": {
+                "type": "object",
+                "properties": {
+                    "kind": {"const": "invoice"},
+                    "invoice_id": {"type": "string"},
+                    "tax_amount": {"type": "number"},
+                    "contactEmail": {"type": "string"},
+                    "nested": {
+                        "type": "object",
+                        "properties": {
+                            "document_id": {"type": "string"},
+                            "taxId": {"type": "string"},
+                            "phone_number": {"type": "string"},
+                        },
+                        "required": ["document_id", "taxId", "phone_number"],
+                        "additionalProperties": False,
+                    },
+                    "lines": {"type": "array", "items": {"$ref": "#/$defs/Line"}},
+                },
+                "required": [
+                    "kind",
+                    "invoice_id",
+                    "tax_amount",
+                    "contactEmail",
+                    "nested",
+                    "lines",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "allOf": [{"$ref": "#/$defs/Record"}],
+        "if": {"$ref": "#/$defs/Record"},
+        "then": {"$ref": "#/$defs/Record"},
+    }
+    raw = {
+        "kind": "invoice",
+        "invoice_id": "INV-1",
+        "tax_amount": 7.0,
+        "contactEmail": "person@example.com",
+        "nested": {
+            "document_id": "DOC-1",
+            "taxId": "1234567890123",
+            "phone_number": "+66000000000",
+        },
+        "lines": [
+            {
+                "document_id": "LINE-1",
+                "vat_amount": 0.49,
+                "contact_email": "line@example.com",
+                "sessionToken": "private-session",
+            }
+        ],
+    }
+
+    public_schema = public_output_schema(schema)
+    projected = project_provider_read_data(raw, output_schema=schema)
+
+    assert projected == {
+        "kind": "invoice",
+        "invoice_id": "INV-1",
+        "tax_amount": 7.0,
+        "nested": {"document_id": "DOC-1"},
+        "lines": [{"document_id": "LINE-1", "vat_amount": 0.49}],
+    }
+    rendered = str(public_schema)
+    for forbidden in ("contactEmail", "contact_email", "taxId", "phone_number", "sessionToken"):
+        assert forbidden not in rendered
+
+
+def test_public_projection_supports_root_one_of_local_refs_and_rejects_unknown_semantics() -> None:
+    from mercury_tools.mcp.generated_tools import project_provider_read_data, public_output_schema
+
+    schema = {
+        "$defs": {
+            "Invoice": {
+                "type": "object",
+                "properties": {
+                    "kind": {"const": "invoice"},
+                    "invoice_id": {"type": "string"},
+                    "email": {"type": "string"},
+                },
+                "required": ["kind", "invoice_id", "email"],
+                "additionalProperties": False,
+            },
+            "Document": {
+                "type": "object",
+                "properties": {
+                    "kind": {"const": "document"},
+                    "document_id": {"type": "string"},
+                    "tax_identifier": {"type": "string"},
+                },
+                "required": ["kind", "document_id", "tax_identifier"],
+                "additionalProperties": False,
+            },
+        },
+        "oneOf": [{"$ref": "#/$defs/Invoice"}, {"$ref": "#/$defs/Document"}],
+    }
+
+    assert project_provider_read_data(
+        {"kind": "invoice", "invoice_id": "INV-2", "email": "person@example.com"},
+        output_schema=schema,
+    ) == {"kind": "invoice", "invoice_id": "INV-2"}
+    assert "oneOf" not in public_output_schema(schema)
+
+    unsupported = {
+        "type": "object",
+        "properties": {"invoice_id": {"type": "string"}},
+        "required": ["invoice_id"],
+        "additionalProperties": False,
+        "dependentRequired": {"invoice_id": ["invoice_id"]},
+    }
+    with pytest.raises(ValueError, match="^generated_schema_invalid$"):
+        public_output_schema(unsupported)
+
+
+@pytest.mark.asyncio
+async def test_schema_drift_persistence_failure_quarantines_then_lifecycle_reconciles() -> None:
+    from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
+    from mercury_tools.providers.base import DispatchCertainty, ProviderSchemaChanged
+    from mercury_tools.providers.models import ProviderId
+
+    invoice_get = _qualification("flowaccount", "documents.invoice.get")
+    invoice_list = _qualification("flowaccount", "documents.invoice.list")
+    server = StrictInputFastMCP("Quarantined generated provider drift")
+    dispatches = 0
+    transitions = 0
+    alerts: list[str] = []
+    persisted = False
+
+    async def execute(_context, **_kwargs):
+        nonlocal dispatches
+        dispatches += 1
+        raise ProviderSchemaChanged(
+            ProviderId.FLOWACCOUNT,
+            dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+        )
+
+    async def persist_schema_change(qualification, _context):
+        nonlocal transitions
+        transitions += 1
+        if not persisted:
+            raise RuntimeError("authority unavailable")
+        return (
+            qualification.model_copy(
+                update={
+                    "qualification_state": QualificationState.DISABLED,
+                    "disable_reason": "schema_changed",
+                }
+            ),
+            invoice_list,
+        )
+
+    async def alert(event):
+        assert "PRIVATE_RAW_PROVIDER_TOOL" not in str(event)
+        alerts.append(str(event["input"]["capability_version"]))
+
+    publisher = GeneratedProviderToolPublisher(
+        server,
+        execute=execute,
+        persist_schema_change=persist_schema_change,
+        schema_drift_alert=alert,
+    )
+    await publisher.publish((invoice_get, invoice_list))
+    server.get_context = lambda: SimpleNamespace()
+    arguments = {
+        "workspace_id": str(WORKSPACE_ID),
+        "connection_id": str(CONNECTION_ID),
+        "capability_version": invoice_get.capability_version_sha256,
+        "page_size": 25,
+    }
+
+    _content, first = await server.call_tool("mercury_flowaccount_invoice_get", arguments)
+    _content, repeated = await server.call_tool("mercury_flowaccount_invoice_get", arguments)
+    assert first["error"]["code"] == "capability_unavailable"
+    assert repeated["error"]["code"] == "capability_unavailable"
+    assert dispatches == 1
+    assert transitions == 1
+    assert alerts == [invoice_get.capability_version_sha256]
+    assert "mercury_flowaccount_invoice_get" in {tool.name for tool in await server.list_tools()}
+
+    persisted = True
+    assert await publisher.reconcile((invoice_get, invoice_list)) is True
+    assert transitions == 2
+    assert {tool.name for tool in await server.list_tools()} == {"mercury_flowaccount_invoice_list"}
+
+    restarted = StrictInputFastMCP("Restart sees persisted generated provider drift")
+    restarted_publisher = GeneratedProviderToolPublisher(restarted, execute=execute)
+    assert (
+        await restarted_publisher.publish(
+            (
+                invoice_get.model_copy(
+                    update={
+                        "qualification_state": QualificationState.DISABLED,
+                        "disable_reason": "schema_changed",
+                    }
+                ),
+                invoice_list,
+            )
+        )
+        is True
+    )
+    assert {tool.name for tool in await restarted.list_tools()} == {
+        "mercury_flowaccount_invoice_list"
+    }
+
+
+@pytest.mark.asyncio
+async def test_generated_request_sessions_receive_background_refresh_notification() -> None:
+    from mercury_tools.execution.hosted.read_service import ProviderReadEnvelope
+    from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
+
+    invoice_get = _qualification("flowaccount", "documents.invoice.get")
+    invoice_list = _qualification("flowaccount", "documents.invoice.list")
+    server = StrictInputFastMCP("Generated request session notifications")
+
+    async def execute(_context, **kwargs):
+        return ProviderReadEnvelope(
+            workspace_id=kwargs["workspace_id"],
+            connection_id=kwargs["connection_id"],
+            provider="flowaccount",
+            company_display_name="Example Company",
+            environment="sandbox",
+            capability_id=kwargs["capability_id"],
+            capability_version=kwargs["capability_version"],
+            data={"document_number": "INV-1"},
+        )
+
+    first_notifications: list[str] = []
+    second_notifications: list[str] = []
+    first = SimpleNamespace(
+        session=SimpleNamespace(
+            send_tool_list_changed=lambda: first_notifications.append("tools/list_changed")
+        )
+    )
+    second = SimpleNamespace(
+        session=SimpleNamespace(
+            send_tool_list_changed=lambda: second_notifications.append("tools/list_changed")
+        )
+    )
+    publisher = GeneratedProviderToolPublisher(server, execute=execute)
+    await publisher.publish((invoice_get,))
+    arguments = {
+        "workspace_id": str(WORKSPACE_ID),
+        "connection_id": str(CONNECTION_ID),
+        "capability_version": invoice_get.capability_version_sha256,
+        "page_size": 25,
+    }
+    server.get_context = lambda: first
+    await server.call_tool("mercury_flowaccount_invoice_get", arguments)
+    server.get_context = lambda: second
+    await server.call_tool("mercury_flowaccount_invoice_get", arguments)
+
+    assert await publisher.publish((invoice_get, invoice_list)) is True
+    assert first_notifications == ["tools/list_changed"]
+    assert second_notifications == ["tools/list_changed"]

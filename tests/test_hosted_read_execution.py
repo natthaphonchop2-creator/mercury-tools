@@ -484,6 +484,7 @@ async def test_hosted_read_records_a_sanitized_terminal_audit_for_failure_and_ca
     assert len(failure_audits) == 1
     assert failure_audits[0]["status"] == "error"
     assert failure_audits[0]["output_summary"]["status_class"] == "unavailable"
+    assert failure_audits[0]["output_summary"]["dispatch_certainty"] == "dispatched"
 
     started = asyncio.Event()
 
@@ -516,4 +517,45 @@ async def test_hosted_read_records_a_sanitized_terminal_audit_for_failure_and_ca
         await task
     assert len(cancellation_audits) == 1
     assert cancellation_audits[0]["status"] == "cancelled"
+    assert cancellation_audits[0]["output_summary"]["dispatch_certainty"] == "unknown"
     assert "INV-001" not in str(cancellation_audits[0])
+
+
+@pytest.mark.asyncio
+async def test_hosted_read_retains_dispatch_certainty_after_response_validation_failure() -> None:
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+
+    qualification = _qualification()
+    audits: list[dict[str, object]] = []
+    runtime = _runtime(
+        qualification,
+        FakeDriver(
+            [
+                ProviderCallResult(
+                    provider=ProviderId.FLOWACCOUNT,
+                    status_class=ProviderStatusClass.SUCCESS,
+                    normalized_data={"document_number": "INV-1"},
+                    dispatch_certainty=DispatchCertainty.DISPATCHED,
+                )
+            ]
+        ),
+    )
+    service = HostedReadService(
+        runtime_factory=lambda: runtime,
+        membership_resolver=_membership,
+        audit_recorder=audits.append,
+    )
+
+    with pytest.raises(ValueError, match="^generated_schema_validation_failed$"):
+        await service.execute(
+            _principal(),
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            qualification.normalized_capability,
+            qualification.capability_version_sha256,
+            InvoiceReadInputs(invoice_reference="INV-001"),
+        )
+
+    assert len(audits) == 1
+    assert audits[0]["output_summary"]["status_class"] == "validation_failed"
+    assert audits[0]["output_summary"]["dispatch_certainty"] == "dispatched"

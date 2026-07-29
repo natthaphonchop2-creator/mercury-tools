@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import os
 import re
@@ -84,7 +85,11 @@ from mercury_tools.mcp.schemas import (
     SearchMode,
     WorkspaceFlowMetadata,
 )
-from mercury_tools.mcp.v1_tools import configure_v1_tools, refresh_generated_provider_tools
+from mercury_tools.mcp.v1_tools import (
+    configure_v1_tools,
+    refresh_generated_provider_tools,
+    refresh_generated_provider_tools_until_stopped,
+)
 from mercury_tools.mercury_runtime import (
     get_accounting_skill_schema as runtime_accounting_skill_schema,
 )
@@ -306,6 +311,7 @@ _CLOSED_DESTRUCTIVE_IDEMPOTENT = ToolAnnotations(
     openWorldHint=False,
 )
 _MERCURY_FLOW_SOURCE_ADAPTER = TypeAdapter(MercuryFlowSource)
+_GENERATED_PROVIDER_REFRESH_INTERVAL_SECONDS = 5.0
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -3980,6 +3986,7 @@ def create_test_http_app(
     consent_handoff: ConsentHandoff | None = None,
     consent_http_client: httpx.AsyncClient | None = None,
     generated_provider_runtime: Any | None = None,
+    generated_provider_refresh_interval_seconds: float | None = None,
 ):
     """Build an app with explicit test doubles; production serve never calls this."""
 
@@ -3992,6 +3999,7 @@ def create_test_http_app(
         consent_handoff=consent_handoff,
         consent_http_client=consent_http_client,
         generated_provider_runtime=generated_provider_runtime,
+        generated_provider_refresh_interval_seconds=generated_provider_refresh_interval_seconds,
         test_only_dependencies=True,
     )
 
@@ -4006,6 +4014,7 @@ def _create_http_app(
     consent_handoff: ConsentHandoff | None = None,
     consent_http_client: httpx.AsyncClient | None = None,
     generated_provider_runtime: Any | None = None,
+    generated_provider_refresh_interval_seconds: float | None = None,
     test_only_dependencies: bool = False,
 ):
     settings = load_settings()
@@ -4021,6 +4030,7 @@ def _create_http_app(
             consent_handoff,
             consent_http_client,
             generated_provider_runtime,
+            generated_provider_refresh_interval_seconds,
         )
     ):
         raise V1ConfigurationError("v1_provider_oauth_composition_invalid")
@@ -4081,9 +4091,18 @@ def _create_http_app(
     )
     if settings.v1_enabled:
         _validate_v1_cloud_dependencies(selected_cloud_dependencies)
+    refresh_interval_seconds = (
+        generated_provider_refresh_interval_seconds
+        if generated_provider_refresh_interval_seconds is not None
+        else _GENERATED_PROVIDER_REFRESH_INTERVAL_SECONDS
+    )
+    if refresh_interval_seconds <= 0:
+        raise ValueError("generated_refresh_interval_invalid")
 
     @asynccontextmanager
     async def lifespan(_app):
+        refresh_stop_event: asyncio.Event | None = None
+        refresh_task: asyncio.Task[None] | None = None
         try:
             if selected_composition is not None:
                 await selected_composition.startup()
@@ -4095,9 +4114,26 @@ def _create_http_app(
                     runtime_factory=generated_runtime_factory,
                     close_runtime=not generated_runtime_is_shared,
                 )
+                refresh_stop_event = asyncio.Event()
+                refresh_task = asyncio.create_task(
+                    refresh_generated_provider_tools_until_stopped(
+                        http_mcp,
+                        runtime_factory=generated_runtime_factory,
+                        close_runtime=not generated_runtime_is_shared,
+                        stop_event=refresh_stop_event,
+                        interval_seconds=refresh_interval_seconds,
+                    ),
+                    name="mercury-v1-generated-provider-refresh",
+                )
             async with public_app.router.lifespan_context(public_app):
                 yield
         finally:
+            if refresh_stop_event is not None:
+                refresh_stop_event.set()
+            if refresh_task is not None:
+                refresh_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await refresh_task
             if selected_composition is not None:
                 await selected_composition.aclose()
 

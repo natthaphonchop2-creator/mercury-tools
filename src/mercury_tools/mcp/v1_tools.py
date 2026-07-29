@@ -295,6 +295,7 @@ class GeneratedProviderToolProjection:
             server,
             execute=self._execute,
             persist_schema_change=self._persist_schema_change,
+            schema_drift_alert=self._record_schema_drift_alert,
         )
 
     def reconfigure(
@@ -312,7 +313,7 @@ class GeneratedProviderToolProjection:
         runtime: Any | None = None
         try:
             runtime = await _runtime_from(self._runtime_factory)
-            return await self._publisher.publish(
+            return await self._publisher.reconcile(
                 await _catalog_qualifications(runtime),
                 context=context,
             )
@@ -358,6 +359,12 @@ class GeneratedProviderToolProjection:
             capability_version,
             inputs,
         )
+
+    async def _record_schema_drift_alert(
+        self,
+        event: dict[str, object],
+    ) -> None:
+        await _record_connector_status_audit(event)
 
     async def _persist_schema_change(
         self,
@@ -410,6 +417,40 @@ async def refresh_generated_provider_tools(
             close_runtime=close_runtime,
         )
     return await projection.refresh(context)
+
+
+async def refresh_generated_provider_tools_until_stopped(
+    server: FastMCP,
+    *,
+    runtime_factory: ProviderRuntimeFactory | None = None,
+    service_factory: WorkspaceServiceFactory = _workspace_service,
+    close_runtime: bool = True,
+    stop_event: asyncio.Event,
+    interval_seconds: float,
+) -> None:
+    """Poll catalog authority for the HTTP lifespan without a request context."""
+
+    if interval_seconds <= 0:
+        raise ValueError("generated_refresh_interval_invalid")
+    while not stop_event.is_set():
+        try:
+            await refresh_generated_provider_tools(
+                server,
+                runtime_factory=runtime_factory,
+                service_factory=service_factory,
+                close_runtime=close_runtime,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Initial projection gates readiness. Later authority outages must not
+            # take down an already-serving MCP session; the next bounded poll
+            # reconciles the projection.
+            pass
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+        except TimeoutError:
+            continue
 
 
 def _connection_output(summary: ProviderConnectionSummary) -> ProviderConnectionOutput:
@@ -1353,5 +1394,6 @@ __all__ = [
     "list_provider_capabilities",
     "list_provider_connections",
     "refresh_generated_provider_tools",
+    "refresh_generated_provider_tools_until_stopped",
     "start_provider_connection",
 ]

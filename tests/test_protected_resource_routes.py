@@ -4,6 +4,7 @@ import asyncio
 import base64
 import inspect
 import logging
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -183,7 +184,7 @@ def _principal() -> MercuryPrincipal:
     )
 
 
-def test_http_lifespan_projects_and_refreshes_generated_provider_tools(
+def test_http_lifespan_projects_and_automatically_refreshes_generated_provider_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The serving HTTP MCP instance projects catalog tools before it is ready."""
@@ -300,6 +301,7 @@ def test_http_lifespan_projects_and_refreshes_generated_provider_tools(
         principal_resolver=StubResolver(_principal()),
         cloud_dependencies=PrincipalCloudDependencies(),
         generated_provider_runtime=runtime,
+        generated_provider_refresh_interval_seconds=0.01,
     )
     notifications: list[str] = []
     context = SimpleNamespace(
@@ -328,7 +330,12 @@ def test_http_lifespan_projects_and_refreshes_generated_provider_tools(
         assert structured["data"] == {"invoice_id": "INV-1"}
 
         runtime.qualification_catalog.qualifications = []
-        assert asyncio.run(app.state.refresh_generated_provider_tools(context)) is True
+        for _ in range(50):
+            if "mercury_flowaccount_invoice_get" not in {
+                tool.name for tool in asyncio.run(serving_mcp.list_tools())
+            }:
+                break
+            time.sleep(0.01)
         assert "mercury_flowaccount_invoice_get" not in {
             tool.name for tool in asyncio.run(serving_mcp.list_tools())
         }

@@ -8,6 +8,7 @@ import inspect
 import json
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, TypeAlias
 from uuid import UUID, uuid4
 
@@ -46,6 +47,24 @@ Sleep: TypeAlias = Callable[[float], object | Awaitable[object]]
 _READ_DEADLINE_SECONDS = 5
 _MAX_SAFE_READ_ATTEMPTS = 2
 _RETRY_DELAYS = (0.05,)
+
+
+@dataclass(slots=True)
+class _DispatchState:
+    certainty: DispatchCertainty = DispatchCertainty.NOT_DISPATCHED
+
+
+def _stronger_dispatch_certainty(
+    current: DispatchCertainty,
+    candidate: DispatchCertainty,
+) -> DispatchCertainty:
+    order = {
+        DispatchCertainty.NOT_APPLICABLE: 0,
+        DispatchCertainty.NOT_DISPATCHED: 1,
+        DispatchCertainty.UNKNOWN: 2,
+        DispatchCertainty.DISPATCHED: 3,
+    }
+    return candidate if order[candidate] > order[current] else current
 
 
 async def _await_value(value: Any) -> Any:
@@ -99,16 +118,19 @@ def _retryable_read_failure(error: ProviderRuntimeError) -> bool:
     }
 
 
-def _terminal_status(error: BaseException | None) -> tuple[str, str, str]:
+def _terminal_status(
+    error: BaseException | None,
+    dispatch_certainty: DispatchCertainty,
+) -> tuple[str, str, str]:
     if error is None:
-        return "ok", ProviderStatusClass.SUCCESS.value, DispatchCertainty.DISPATCHED.value
+        return "ok", ProviderStatusClass.SUCCESS.value, dispatch_certainty.value
     if isinstance(error, asyncio.CancelledError):
-        return "cancelled", "cancelled", DispatchCertainty.NOT_DISPATCHED.value
+        return "cancelled", "cancelled", dispatch_certainty.value
     if isinstance(error, ProviderRuntimeError):
         return "error", error.status_class.value, error.dispatch_certainty.value
     if isinstance(error, QualificationGateError):
-        return "denied", error.code, DispatchCertainty.NOT_DISPATCHED.value
-    return "error", "validation_failed", DispatchCertainty.NOT_DISPATCHED.value
+        return "denied", error.code, dispatch_certainty.value
+    return "error", "validation_failed", dispatch_certainty.value
 
 
 def _audit_event(
@@ -120,11 +142,12 @@ def _audit_event(
     inputs: BaseModel,
     qualification: ProviderMCPQualification | None,
     error: BaseException | None,
+    dispatch_certainty: DispatchCertainty,
     retry_count: int,
     latency_ms: int,
     correlation_id: str,
 ) -> dict[str, object]:
-    status, status_class, dispatch_certainty = _terminal_status(error)
+    status, status_class, certainty = _terminal_status(error, dispatch_certainty)
     return {
         "tool_name": "generated_provider_read",
         "input": {
@@ -138,7 +161,7 @@ def _audit_event(
             "provider": qualification.provider if qualification is not None else None,
             "environment": qualification.environment if qualification is not None else None,
             "status_class": status_class,
-            "dispatch_certainty": dispatch_certainty,
+            "dispatch_certainty": certainty,
             "retry_count": retry_count,
             "latency_ms": latency_ms,
             "correlation_id": correlation_id,
@@ -186,6 +209,7 @@ class HostedReadService:
         checked_inputs = inputs
         retry_count = 0
         terminal_error: BaseException | None = None
+        dispatch_state = _DispatchState()
         try:
             membership = WorkspaceMembership.model_validate(
                 await _await_value(self._membership_resolver(principal, workspace_id))
@@ -237,6 +261,7 @@ class HostedReadService:
                     binding=binding,
                     inputs=checked_inputs,
                     deadline=deadline,
+                    dispatch_state=dispatch_state,
                 )
 
             # Provider output must satisfy the exact catalog schema before any public projection.
@@ -271,6 +296,7 @@ class HostedReadService:
                                 inputs=checked_inputs,
                                 qualification=qualification,
                                 error=terminal_error,
+                                dispatch_certainty=dispatch_state.certainty,
                                 retry_count=retry_count,
                                 latency_ms=int((time.monotonic() - started_at) * 1000),
                                 correlation_id=correlation_id,
@@ -290,6 +316,7 @@ class HostedReadService:
         binding: Any,
         inputs: BaseModel,
         deadline: ProviderOperationDeadline,
+        dispatch_state: _DispatchState,
     ) -> tuple[ProviderCallResult, int]:
         driver = runtime.registry.get(connection.provider)
         hosted_read = getattr(driver, "call_hosted_read", None)
@@ -304,10 +331,24 @@ class HostedReadService:
                     uuid4(),
                     deadline=deadline,
                 )
-                if result.status_class is not ProviderStatusClass.SUCCESS:
+                checked = ProviderCallResult.model_validate(result)
+                dispatch_state.certainty = _stronger_dispatch_certainty(
+                    dispatch_state.certainty,
+                    checked.dispatch_certainty,
+                )
+                if checked.status_class is not ProviderStatusClass.SUCCESS:
                     raise ValueError("capability_unavailable")
-                return ProviderCallResult.model_validate(result), attempt
+                return checked, attempt
+            except asyncio.CancelledError:
+                # Once cancellation interrupts an in-flight call, only the driver
+                # could prove non-dispatch. The generic runtime cannot assume it.
+                dispatch_state.certainty = _stronger_dispatch_certainty(
+                    dispatch_state.certainty,
+                    DispatchCertainty.UNKNOWN,
+                )
+                raise
             except ProviderRuntimeError as error:
+                dispatch_state.certainty = error.dispatch_certainty
                 if attempt + 1 >= _MAX_SAFE_READ_ATTEMPTS or not _retryable_read_failure(error):
                     raise
                 delay = _RETRY_DELAYS[attempt]
