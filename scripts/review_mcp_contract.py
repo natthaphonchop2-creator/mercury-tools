@@ -73,6 +73,26 @@ BEHAVIOR_MATRIX: dict[str, ToolBehavior] = {
     ),
 }
 
+V1_BEHAVIOR_MATRIX: dict[str, ToolBehavior] = {
+    "get_mercury_context": ToolBehavior(*_CLOSED_IDEMPOTENT_WRITE, requires_workspace=False),
+    "list_accounting_providers": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
+    "start_provider_connection": ToolBehavior(
+        False,
+        False,
+        False,
+        True,
+        requires_workspace=True,
+    ),
+    "list_provider_connections": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
+    "connector_status": ToolBehavior(False, False, False, False, requires_workspace=True),
+    "list_provider_capabilities": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
+    "get_capability_schema": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
+    "disconnect_provider": ToolBehavior(
+        *_CLOSED_DESTRUCTIVE_IDEMPOTENT,
+        requires_workspace=True,
+    ),
+}
+
 _MUTUALLY_EXCLUSIVE_SOURCE_FIELDS = frozenset(
     {"flow_yaml", "flow_files", "workspace_flow_id"}
 )
@@ -741,7 +761,11 @@ def review_tools(tools: Iterable[object]) -> list[str]:
     issues: list[str] = []
     for tool in sorted(tools, key=lambda item: str(_value(item, "name", ""))):
         tool_name = str(_value(tool, "name", "<unnamed>"))
-        behavior = BEHAVIOR_MATRIX.get(tool_name)
+        metadata = _value(tool, "meta", {})
+        if isinstance(metadata, Mapping) and metadata.get("mercury/surface") == "v1":
+            behavior = V1_BEHAVIOR_MATRIX.get(tool_name)
+        else:
+            behavior = BEHAVIOR_MATRIX.get(tool_name)
         input_schema = _value(tool, "inputSchema", None)
         if not isinstance(input_schema, Mapping):
             issues.append(

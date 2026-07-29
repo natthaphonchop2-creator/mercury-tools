@@ -535,6 +535,7 @@ def test_get_mercury_context_rejects_missing_or_malformed_request_bearer(
 
 
 def test_get_mercury_context_is_gated_and_has_closed_public_schemas() -> None:
+    from mercury_tools.mcp.contracts import V1_HOSTED_TOOL_NAMES
     from mercury_tools.mcp.server import StrictInputFastMCP
     from mercury_tools.mcp.v1_tools import configure_v1_tools
 
@@ -546,8 +547,8 @@ def test_get_mercury_context_is_gated_and_has_closed_public_schemas() -> None:
     tools = asyncio.run(server.list_tools())
     registered_tool = server._tool_manager.get_tool("get_mercury_context")
 
-    assert [tool.name for tool in tools] == ["get_mercury_context"]
-    tool = tools[0]
+    assert {tool.name for tool in tools} == V1_HOSTED_TOOL_NAMES
+    tool = next(tool for tool in tools if tool.name == "get_mercury_context")
     assert tool.inputSchema == {
         "additionalProperties": False,
         "properties": {},
@@ -555,8 +556,13 @@ def test_get_mercury_context_is_gated_and_has_closed_public_schemas() -> None:
         "type": "object",
     }
     assert tool.outputSchema is not None
-    assert tool.outputSchema["additionalProperties"] is False
-    assert set(tool.outputSchema["properties"]) == {
+    assert tool.outputSchema["oneOf"] == [
+        {"$ref": "#/$defs/Success"},
+        {"$ref": "#/$defs/MercuryV1ErrorOutput"},
+    ]
+    success_schema = tool.outputSchema["$defs"]["Success"]
+    assert success_schema["additionalProperties"] is False
+    assert set(success_schema["properties"]) == {
         "status",
         "active_workspace_id",
         "memberships",

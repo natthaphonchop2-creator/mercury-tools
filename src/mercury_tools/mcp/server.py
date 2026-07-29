@@ -157,11 +157,51 @@ class StrictInputFastMCP(FastMCP):
         argument_model.model_rebuild(force=True)
         registered.parameters = argument_model.model_json_schema(by_alias=True)
 
+    def set_tool_input_contract(
+        self,
+        name: str,
+        *,
+        argument_model: type[BaseModel],
+        schema: Mapping[str, Any],
+    ) -> None:
+        """Replace one registered argument model with a closed public contract.
+
+        FastMCP derives an object schema from Python parameters. V1 needs one
+        root-level discriminated provider/environment schema, while retaining
+        a flat argument model for safe handler invocation.
+        """
+
+        registered = self._tool_manager.get_tool(name)
+        if registered is None:
+            raise RuntimeError("FastMCP did not retain the registered tool")
+        if not issubclass(argument_model, BaseModel):
+            raise TypeError("tool_argument_model_invalid")
+        if not callable(getattr(argument_model, "model_dump_one_level", None)):
+            raise TypeError("tool_argument_model_invalid")
+        argument_model.model_config["extra"] = "forbid"
+        argument_model.model_config["hide_input_in_errors"] = True
+        argument_model.model_rebuild(force=True)
+        registered.fn_metadata.arg_model = argument_model
+        registered.parameters = dict(schema)
+
+    def set_tool_output_contract(
+        self,
+        name: str,
+        *,
+        schema: Mapping[str, Any],
+    ) -> None:
+        """Replace one registered output schema without changing its handler model."""
+
+        registered = self._tool_manager.get_tool(name)
+        if registered is None:
+            raise RuntimeError("FastMCP did not retain the registered tool")
+        registered.fn_metadata.output_schema = dict(schema)
+        registered.__dict__.pop("output_schema", None)
+
 
 mcp = StrictInputFastMCP("Mercury Tools")
 _PROCESS_V1_CONFIGURATION_LOCK = threading.Lock()
 _PROCESS_V1_ENABLED = load_settings().v1_enabled
-configure_v1_tools(mcp, enabled=_PROCESS_V1_ENABLED)
 
 
 def _require_process_v1_configuration(enabled: bool) -> None:
@@ -3273,6 +3313,11 @@ def management_report_th() -> str:
 @mcp.prompt()
 def connector_setup_guide_th() -> str:
     return get_prompt("connector_setup_guide_th")
+
+
+# Legacy decorators execute before this final V1 surface selection. Apply the
+# selected surface after registration so /mcp never mixes contracts.
+configure_v1_tools(mcp, enabled=_PROCESS_V1_ENABLED)
 
 
 async def root(request: Request) -> Response:

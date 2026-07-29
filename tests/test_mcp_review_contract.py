@@ -795,6 +795,27 @@ def test_behavior_matrix_is_the_only_workspace_scope_registry() -> None:
         assert isinstance(behavior.requires_workspace, bool), tool_name
 
 
+def test_behavior_matrix_covers_every_stable_v1_tool_with_exact_annotations() -> None:
+    from mercury_tools.mcp.contracts import V1_HOSTED_TOOL_NAMES
+
+    module = _review_module()
+    expected = {
+        "get_mercury_context": (False, False, True, False, False),
+        "list_accounting_providers": (True, False, None, False, False),
+        "start_provider_connection": (False, False, False, True, True),
+        "list_provider_connections": (True, False, None, False, True),
+        "connector_status": (False, False, False, False, True),
+        "list_provider_capabilities": (True, False, None, False, True),
+        "get_capability_schema": (True, False, None, False, True),
+        "disconnect_provider": (False, True, True, False, True),
+    }
+
+    assert V1_HOSTED_TOOL_NAMES == set(module.V1_BEHAVIOR_MATRIX)
+    for name, expected_behavior in expected.items():
+        behavior = module.V1_BEHAVIOR_MATRIX[name]
+        assert (*behavior.annotation_values, behavior.requires_workspace) == expected_behavior
+
+
 def test_future_workspace_matrix_entry_requires_workspace_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
