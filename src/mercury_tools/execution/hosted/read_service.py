@@ -324,6 +324,13 @@ class HostedReadService:
         for attempt in range(_MAX_SAFE_READ_ATTEMPTS):
             deadline.check()
             try:
+                # Crossing into the driver makes dispatch unknowable until the
+                # driver returns explicit evidence.  Generic exceptions and
+                # malformed results must not be reported as non-dispatches.
+                dispatch_state.certainty = _stronger_dispatch_certainty(
+                    dispatch_state.certainty,
+                    DispatchCertainty.UNKNOWN,
+                )
                 result = await call(
                     connection,
                     binding,
@@ -348,7 +355,10 @@ class HostedReadService:
                 )
                 raise
             except ProviderRuntimeError as error:
-                dispatch_state.certainty = error.dispatch_certainty
+                dispatch_state.certainty = _stronger_dispatch_certainty(
+                    dispatch_state.certainty,
+                    error.dispatch_certainty,
+                )
                 if attempt + 1 >= _MAX_SAFE_READ_ATTEMPTS or not _retryable_read_failure(error):
                     raise
                 delay = _RETRY_DELAYS[attempt]

@@ -8,6 +8,9 @@ import hashlib
 import inspect
 import json
 import re
+import time
+import weakref
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar, Literal, TypeAlias
@@ -27,7 +30,8 @@ from mercury_tools.mcp.v1_errors import (
     published_error_output_schema,
 )
 from mercury_tools.mcp.v1_schemas import ProviderReadEnvelope
-from mercury_tools.providers.base import ProviderSchemaChanged
+from mercury_tools.providers.base import DispatchCertainty, ProviderSchemaChanged
+from mercury_tools.providers.finalization import await_cleanup
 
 GeneratedReadExecutor: TypeAlias = Callable[..., Awaitable[ProviderReadEnvelope]]
 PersistSchemaChange: TypeAlias = Callable[
@@ -180,7 +184,26 @@ _PUBLIC_SCALAR_KEYWORDS = frozenset(
     }
 )
 _REF_ANNOTATIONS = _SCHEMA_ANNOTATIONS | {"$ref"}
-_REFRESH_NOTIFICATION_TIMEOUT_SECONDS = 1
+_MAX_REFRESH_SESSIONS = 64
+_REFRESH_SESSION_IDLE_SECONDS = 300
+_REFRESH_NOTIFICATION_TOTAL_TIMEOUT_SECONDS = 1
+
+
+@dataclass(slots=True)
+class _RefreshSession:
+    weak_session: weakref.ReferenceType[object] | None
+    strong_session: object | None
+    last_seen_at: float
+    notified_generation: int
+
+    def resolve(self) -> object | None:
+        return self.weak_session() if self.weak_session is not None else self.strong_session
+
+
+@dataclass(frozen=True, slots=True)
+class _QuarantinedVersion:
+    qualification: ProviderMCPQualification
+    dispatch_certainty: DispatchCertainty
 
 
 def _schema_fingerprint(schema: Mapping[str, Any]) -> str:
@@ -200,6 +223,61 @@ def _schema_allows_object(schema: Mapping[str, Any]) -> bool:
         or (isinstance(value, list | tuple) and "object" in value)
         or "properties" in schema
     )
+
+
+def _schema_may_allow_object(schema: Mapping[str, Any]) -> bool:
+    """Return whether a schema can match an object without assuming a branch."""
+
+    value = schema.get("type")
+    if value == "object" or (isinstance(value, list | tuple) and "object" in value):
+        return True
+    if isinstance(value, str | list | tuple):
+        return False
+    if "properties" in schema:
+        return True
+    return True
+
+
+def _schema_has_closed_object_guard(
+    schema: Mapping[str, Any],
+    *,
+    root: Mapping[str, Any],
+    references: frozenset[str] = frozenset(),
+) -> bool:
+    """Prove a public object is closed independently of conditional branches."""
+
+    reference = schema.get("$ref")
+    if reference is not None:
+        if not isinstance(reference, str) or reference in references:
+            raise ValueError("generated_schema_invalid")
+        return _schema_has_closed_object_guard(
+            _reference_target(reference, root),
+            root=root,
+            references=references | {reference},
+        )
+    if _schema_allows_object(schema):
+        return schema.get("additionalProperties") is False and schema.get(
+            "unevaluatedProperties", False
+        ) in {False, None}
+    all_of = schema.get("allOf")
+    if isinstance(all_of, list | tuple) and any(
+        isinstance(branch, Mapping)
+        and _schema_has_closed_object_guard(branch, root=root, references=references)
+        for branch in all_of
+    ):
+        return True
+    for keyword in ("anyOf", "oneOf"):
+        branches = schema.get(keyword)
+        if isinstance(branches, list | tuple) and branches:
+            return all(
+                isinstance(branch, Mapping)
+                and (
+                    not _schema_may_allow_object(branch)
+                    or _schema_has_closed_object_guard(branch, root=root, references=references)
+                )
+                for branch in branches
+            )
+    return False
 
 
 def _reference_target(reference: str, root: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -304,6 +382,12 @@ def _assert_closed_schema(schema: Mapping[str, Any]) -> None:
         if_condition = node.get("if")
         if if_condition is not None:
             if not isinstance(if_condition, Mapping):
+                raise ValueError("generated_schema_invalid")
+            if _schema_may_allow_object(node) and not _schema_has_closed_object_guard(
+                node,
+                root=schema,
+                references=references,
+            ):
                 raise ValueError("generated_schema_invalid")
             visit(if_condition, references)
             for keyword in ("then", "else"):
@@ -548,14 +632,20 @@ def _public_schema_node(
     if condition is not None:
         if not isinstance(condition, Mapping):
             raise ValueError("generated_schema_invalid")
-        branches = [
-            _public_schema_node(branch, root=root, references=references)
-            for keyword in ("then", "else")
-            if isinstance((branch := schema.get(keyword)), Mapping)
-        ]
         if _schema_mentions_restricted_field(condition, root=root):
-            if branches:
-                result.setdefault("allOf", []).append({"anyOf": branches})
+            then_branch = schema.get("then")
+            else_branch = schema.get("else")
+            # A hidden discriminator leaves the omitted arm unconstrained.  A
+            # lone public branch would make that optional arm mandatory.
+            if isinstance(then_branch, Mapping) and isinstance(else_branch, Mapping):
+                result.setdefault("allOf", []).append(
+                    {
+                        "anyOf": [
+                            _public_schema_node(then_branch, root=root, references=references),
+                            _public_schema_node(else_branch, root=root, references=references),
+                        ]
+                    }
+                )
         else:
             result["if"] = _public_schema_node(condition, root=root, references=references)
             for keyword in ("then", "else"):
@@ -711,6 +801,19 @@ def _schema_change_is_persisted(
         and item.disable_reason == "schema_changed"
         for item in exact
     )
+
+
+def _stronger_dispatch_certainty(
+    current: DispatchCertainty,
+    candidate: DispatchCertainty,
+) -> DispatchCertainty:
+    order = {
+        DispatchCertainty.NOT_APPLICABLE: 0,
+        DispatchCertainty.NOT_DISPATCHED: 1,
+        DispatchCertainty.UNKNOWN: 2,
+        DispatchCertainty.DISPATCHED: 3,
+    }
+    return candidate if order[candidate] > order[current] else current
 
 
 def _rewrite_references(value: Any, names: Mapping[str, str]) -> Any:
@@ -934,14 +1037,15 @@ class GeneratedProviderToolPublisher:
         self._refresh_lock = asyncio.Lock()
         self._requested_generation = 0
         self._committed_generation = 0
-        self._refresh_sessions: dict[int, object] = {}
-        self._quarantined_versions: set[tuple[str, str, str, str, str]] = set()
+        self._refresh_sessions: OrderedDict[int, _RefreshSession] = OrderedDict()
+        self._quarantined_versions: dict[tuple[str, str, str, str, str], _QuarantinedVersion] = {}
 
     async def publish(
         self,
         qualifications: Sequence[ProviderMCPQualification],
         *,
         context: Context | object | None = None,
+        _release_quarantines: Sequence[tuple[str, str, str, str, str]] = (),
     ) -> bool:
         """Stage every branch before one rollback-safe, generation-serialized swap."""
 
@@ -953,8 +1057,11 @@ class GeneratedProviderToolPublisher:
             if request_generation < self._requested_generation:
                 return False
             changed = self._swap(staged)
-            self._committed_generation = request_generation
             if changed:
+                self._committed_generation = request_generation
+            for identity in _release_quarantines:
+                self._quarantined_versions.pop(identity, None)
+            if changed or self._has_pending_refresh_notifications():
                 await self._notify_refresh_sessions()
             return changed
 
@@ -967,24 +1074,42 @@ class GeneratedProviderToolPublisher:
         """Retry safe exact drift transitions before publishing current authority."""
 
         current = tuple(ProviderMCPQualification.model_validate(item) for item in qualifications)
-        for qualification in tuple(current):
-            if (
-                qualification.qualification_state is not QualificationState.ENABLED
-                or _qualification_version_identity(qualification) not in self._quarantined_versions
-            ):
+        release_quarantines: set[tuple[str, str, str, str, str]] = set()
+        for identity, quarantined in tuple(self._quarantined_versions.items()):
+            qualification = quarantined.qualification
+            if _schema_change_is_persisted(current, qualification):
+                release_quarantines.add(identity)
+                continue
+            enabled = next(
+                (
+                    item
+                    for item in current
+                    if _qualification_version_identity(item) == identity
+                    and item.qualification_state is QualificationState.ENABLED
+                ),
+                None,
+            )
+            if enabled is None:
                 continue
             try:
                 current = await self._persist_schema_transition(
-                    qualification,
+                    enabled,
                     context if context is not None else object(),
                 )
             except asyncio.CancelledError:
                 raise
             except Exception:
-                await self._emit_schema_drift_alert(qualification)
+                await self._emit_schema_drift_alert(
+                    qualification,
+                    quarantined.dispatch_certainty,
+                )
             else:
-                self._quarantined_versions.discard(_qualification_version_identity(qualification))
-        return await self.publish(current, context=context)
+                release_quarantines.add(identity)
+        return await self.publish(
+            current,
+            context=context,
+            _release_quarantines=tuple(release_quarantines),
+        )
 
     def clear(self) -> bool:
         """Remove generated tools during static V1 disablement only."""
@@ -995,6 +1120,7 @@ class GeneratedProviderToolPublisher:
                 self._server.remove_tool(name)
             self._published.pop(name, None)
             changed = True
+        self._refresh_sessions.clear()
         return changed
 
     def _stage(
@@ -1104,7 +1230,7 @@ class GeneratedProviderToolPublisher:
                 )
                 return result.model_copy(update={"data": data})
             except ProviderSchemaChanged as error:
-                await self._persist_and_refresh(branch, context)
+                await self._persist_and_refresh(branch, context, error.dispatch_certainty)
                 raise MercuryV1ToolError(public_error_code(error)) from None
             except Exception as error:
                 raise MercuryV1ToolError(public_error_code(error)) from None
@@ -1133,18 +1259,39 @@ class GeneratedProviderToolPublisher:
         self,
         branch: _GeneratedBranch,
         context: Context | object,
+        dispatch_certainty: DispatchCertainty,
     ) -> None:
         identity = _qualification_version_identity(branch.qualification)
-        self._quarantined_versions.add(identity)
+        self._quarantine(branch.qualification, dispatch_certainty)
         try:
             refreshed = await self._persist_schema_transition(branch.qualification, context)
-            await self.publish(refreshed, context=context)
+            await self.publish(
+                refreshed,
+                context=context,
+                _release_quarantines=(identity,),
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
-            await self._emit_schema_drift_alert(branch.qualification)
+            await self._emit_schema_drift_alert(branch.qualification, dispatch_certainty)
             raise MercuryV1ToolError("capability_unavailable") from None
-        self._quarantined_versions.discard(identity)
+
+    def _quarantine(
+        self,
+        qualification: ProviderMCPQualification,
+        dispatch_certainty: DispatchCertainty,
+    ) -> None:
+        identity = _qualification_version_identity(qualification)
+        existing = self._quarantined_versions.get(identity)
+        if existing is not None:
+            dispatch_certainty = _stronger_dispatch_certainty(
+                existing.dispatch_certainty,
+                dispatch_certainty,
+            )
+        self._quarantined_versions[identity] = _QuarantinedVersion(
+            qualification=qualification,
+            dispatch_certainty=dispatch_certainty,
+        )
 
     async def _persist_schema_transition(
         self,
@@ -1164,6 +1311,7 @@ class GeneratedProviderToolPublisher:
     async def _emit_schema_drift_alert(
         self,
         qualification: ProviderMCPQualification,
+        dispatch_certainty: DispatchCertainty,
     ) -> None:
         if self._schema_drift_alert is None:
             return
@@ -1180,7 +1328,7 @@ class GeneratedProviderToolPublisher:
                             "provider": qualification.provider,
                             "environment": qualification.environment,
                             "status_class": "schema_changed",
-                            "dispatch_certainty": "not_dispatched",
+                            "dispatch_certainty": dispatch_certainty.value,
                             "alert": "catalog_transition_unavailable",
                         },
                         "status": "error",
@@ -1193,22 +1341,116 @@ class GeneratedProviderToolPublisher:
 
     def _remember_session(self, context: Context | object | None) -> None:
         session = getattr(context, "session", None)
-        if callable(getattr(session, "send_tool_list_changed", None)):
-            self._refresh_sessions[id(session)] = session
+        if not callable(getattr(session, "send_tool_list_changed", None)):
+            return
+        now = time.monotonic()
+        self._prune_refresh_sessions(now)
+        key = id(session)
+        existing = self._refresh_sessions.get(key)
+        if existing is not None:
+            existing.last_seen_at = now
+            self._refresh_sessions.move_to_end(key)
+            return
+        if _MAX_REFRESH_SESSIONS <= 0:
+            return
+        while len(self._refresh_sessions) >= _MAX_REFRESH_SESSIONS:
+            self._refresh_sessions.popitem(last=False)
+        try:
+            weak_session = weakref.ref(session)
+            strong_session = None
+        except TypeError:
+            # The MCP SDK session is normally weak-referenceable.  Some test and
+            # adapter sessions are not, so retain only a bounded LRU entry.
+            weak_session = None
+            strong_session = session
+        self._refresh_sessions[key] = _RefreshSession(
+            weak_session=weak_session,
+            strong_session=strong_session,
+            last_seen_at=now,
+            notified_generation=self._committed_generation,
+        )
 
-    async def _notify_refresh_sessions(self) -> None:
-        """Bounded best-effort notification for request sessions seen by this server."""
+    def _prune_refresh_sessions(self, now: float | None = None) -> None:
+        checked_at = time.monotonic() if now is None else now
+        for key, entry in tuple(self._refresh_sessions.items()):
+            if (
+                checked_at - entry.last_seen_at > _REFRESH_SESSION_IDLE_SECONDS
+                or entry.resolve() is None
+            ):
+                self._refresh_sessions.pop(key, None)
 
-        for key, session in tuple(self._refresh_sessions.items()):
+    def _has_pending_refresh_notifications(self) -> bool:
+        self._prune_refresh_sessions()
+        return any(
+            entry.notified_generation < self._committed_generation
+            for entry in self._refresh_sessions.values()
+        )
+
+    def _pending_refresh_sessions(self) -> list[tuple[int, object]]:
+        self._prune_refresh_sessions()
+        pending: list[tuple[int, object]] = []
+        for key, entry in tuple(self._refresh_sessions.items()):
+            if entry.notified_generation >= self._committed_generation:
+                continue
+            session = entry.resolve()
+            if session is None:
+                self._refresh_sessions.pop(key, None)
+                continue
+            pending.append((key, session))
+        return pending
+
+    async def _send_refresh_notification(self, session: object) -> None:
+        sender = getattr(session, "send_tool_list_changed", None)
+        if not callable(sender):
+            raise TypeError("generated_refresh_session_invalid")
+        await _await_value(sender())
+
+    async def _settle_notification_tasks(self, tasks: Sequence[asyncio.Task[None]]) -> None:
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _record_notification_results(
+        self,
+        tasks: Mapping[int, asyncio.Task[None]],
+    ) -> None:
+        for key, task in tasks.items():
+            entry = self._refresh_sessions.get(key)
+            if entry is None:
+                continue
+            if task.cancelled():
+                self._refresh_sessions.pop(key, None)
+                continue
             try:
-                result = session.send_tool_list_changed()
-                if inspect.isawaitable(result):
-                    async with asyncio.timeout(_REFRESH_NOTIFICATION_TIMEOUT_SECONDS):
-                        await result
-            except asyncio.CancelledError:
-                raise
+                task.result()
             except Exception:
                 self._refresh_sessions.pop(key, None)
+            else:
+                entry.notified_generation = self._committed_generation
+
+    async def _notify_refresh_sessions(self) -> None:
+        """Notify pending request sessions concurrently within one total deadline."""
+
+        tasks = {
+            key: asyncio.create_task(self._send_refresh_notification(session))
+            for key, session in self._pending_refresh_sessions()
+        }
+        if not tasks:
+            return
+        try:
+            async with asyncio.timeout(_REFRESH_NOTIFICATION_TOTAL_TIMEOUT_SECONDS):
+                await asyncio.gather(*tasks.values(), return_exceptions=True)
+        except asyncio.CancelledError:
+            for task in tasks.values():
+                task.cancel()
+            # The committed generation remains pending so the next lifecycle
+            # refresh retries it.  Required task cleanup survives repeat cancel.
+            await await_cleanup(self._settle_notification_tasks(tuple(tasks.values())))
+            raise
+        except TimeoutError:
+            for task in tasks.values():
+                task.cancel()
+            await await_cleanup(self._settle_notification_tasks(tuple(tasks.values())))
+        self._record_notification_results(tasks)
 
 
 async def _await_value(value: Any) -> Any:

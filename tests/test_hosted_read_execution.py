@@ -559,3 +559,49 @@ async def test_hosted_read_retains_dispatch_certainty_after_response_validation_
     assert len(audits) == 1
     assert audits[0]["output_summary"]["status_class"] == "validation_failed"
     assert audits[0]["output_summary"]["dispatch_certainty"] == "dispatched"
+
+
+@pytest.mark.asyncio
+async def test_hosted_read_marks_generic_and_malformed_provider_call_failures_unknown_once() -> (
+    None
+):
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+
+    qualification = _qualification()
+
+    class MalformedDriver(FakeDriver):
+        async def call(
+            self,
+            connection: ProviderConnection,
+            binding: QualifiedCapabilityBinding,
+            inputs: BaseModel,
+            operation_id: object,
+            *,
+            deadline: object | None = None,
+        ) -> object:
+            del operation_id
+            self.calls.append((connection, binding, inputs, deadline))
+            return {"provider": "flowaccount"}
+
+    for driver in (FakeDriver([RuntimeError("driver failed")]), MalformedDriver([])):
+        audits: list[dict[str, object]] = []
+        service = HostedReadService(
+            runtime_factory=lambda driver=driver: _runtime(qualification, driver),
+            membership_resolver=_membership,
+            audit_recorder=audits.append,
+        )
+
+        with pytest.raises((RuntimeError, ValueError)):
+            await service.execute(
+                _principal(),
+                WORKSPACE_ID,
+                CONNECTION_ID,
+                qualification.normalized_capability,
+                qualification.capability_version_sha256,
+                InvoiceReadInputs(invoice_reference="INV-001"),
+            )
+
+        assert len(audits) == 1
+        assert audits[0]["status"] == "error"
+        assert audits[0]["output_summary"]["status_class"] == "validation_failed"
+        assert audits[0]["output_summary"]["dispatch_certainty"] == "unknown"

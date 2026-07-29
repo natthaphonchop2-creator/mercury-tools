@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import UUID
@@ -688,6 +689,62 @@ def test_public_projection_supports_root_one_of_local_refs_and_rejects_unknown_s
         public_output_schema(unsupported)
 
 
+def test_public_projection_preserves_hidden_optional_conditional_false_path() -> None:
+    from mercury_tools.mcp.generated_tools import project_provider_read_data
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "status": {"enum": ["draft", "approved"]},
+            "contact_email": {"type": "string"},
+            "document_id": {"type": "string"},
+        },
+        "required": ["status"],
+        "additionalProperties": False,
+        "if": {
+            "type": "object",
+            "properties": {"contact_email": {"type": "string"}},
+            "required": ["contact_email"],
+            "additionalProperties": False,
+        },
+        "then": {
+            "type": "object",
+            "properties": {
+                "status": {"const": "approved"},
+                "document_id": {"type": "string"},
+            },
+            "required": ["status", "document_id"],
+            "additionalProperties": False,
+        },
+    }
+
+    assert project_provider_read_data({"status": "draft"}, output_schema=schema) == {
+        "status": "draft"
+    }
+
+
+def test_public_projection_rejects_conditional_only_open_object_contract() -> None:
+    from mercury_tools.mcp.generated_tools import public_output_schema
+
+    conditional_only = {
+        "if": {
+            "type": "object",
+            "properties": {"contactEmail": {"type": "string"}},
+            "required": ["contactEmail"],
+            "additionalProperties": False,
+        },
+        "then": {
+            "type": "object",
+            "properties": {"invoice_id": {"type": "string"}},
+            "required": ["invoice_id"],
+            "additionalProperties": False,
+        },
+    }
+
+    with pytest.raises(ValueError, match="^generated_schema_invalid$"):
+        public_output_schema(conditional_only)
+
+
 @pytest.mark.asyncio
 async def test_schema_drift_persistence_failure_quarantines_then_lifecycle_reconciles() -> None:
     from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
@@ -699,7 +756,7 @@ async def test_schema_drift_persistence_failure_quarantines_then_lifecycle_recon
     server = StrictInputFastMCP("Quarantined generated provider drift")
     dispatches = 0
     transitions = 0
-    alerts: list[str] = []
+    alerts: list[dict[str, object]] = []
     persisted = False
 
     async def execute(_context, **_kwargs):
@@ -707,7 +764,7 @@ async def test_schema_drift_persistence_failure_quarantines_then_lifecycle_recon
         dispatches += 1
         raise ProviderSchemaChanged(
             ProviderId.FLOWACCOUNT,
-            dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+            dispatch_certainty=DispatchCertainty.DISPATCHED,
         )
 
     async def persist_schema_change(qualification, _context):
@@ -727,7 +784,7 @@ async def test_schema_drift_persistence_failure_quarantines_then_lifecycle_recon
 
     async def alert(event):
         assert "PRIVATE_RAW_PROVIDER_TOOL" not in str(event)
-        alerts.append(str(event["input"]["capability_version"]))
+        alerts.append(event)
 
     publisher = GeneratedProviderToolPublisher(
         server,
@@ -750,12 +807,20 @@ async def test_schema_drift_persistence_failure_quarantines_then_lifecycle_recon
     assert repeated["error"]["code"] == "capability_unavailable"
     assert dispatches == 1
     assert transitions == 1
-    assert alerts == [invoice_get.capability_version_sha256]
+    assert [event["input"]["capability_version"] for event in alerts] == [
+        invoice_get.capability_version_sha256
+    ]
+    assert alerts[0]["output_summary"]["dispatch_certainty"] == "dispatched"
     assert "mercury_flowaccount_invoice_get" in {tool.name for tool in await server.list_tools()}
+
+    assert await publisher.reconcile((invoice_get, invoice_list)) is False
+    assert transitions == 2
+    assert len(alerts) == 2
+    assert alerts[1]["output_summary"]["dispatch_certainty"] == "dispatched"
 
     persisted = True
     assert await publisher.reconcile((invoice_get, invoice_list)) is True
-    assert transitions == 2
+    assert transitions == 3
     assert {tool.name for tool in await server.list_tools()} == {"mercury_flowaccount_invoice_list"}
 
     restarted = StrictInputFastMCP("Restart sees persisted generated provider drift")
@@ -828,3 +893,231 @@ async def test_generated_request_sessions_receive_background_refresh_notificatio
     assert await publisher.publish((invoice_get, invoice_list)) is True
     assert first_notifications == ["tools/list_changed"]
     assert second_notifications == ["tools/list_changed"]
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_reconcile_keeps_quarantine_until_publication_commits() -> None:
+    from mercury_tools.execution.hosted.read_service import ProviderReadEnvelope
+    from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
+    from mercury_tools.providers.base import DispatchCertainty, ProviderSchemaChanged
+    from mercury_tools.providers.models import ProviderId
+
+    invoice_get = _qualification("flowaccount", "documents.invoice.get")
+    invoice_list = _qualification("flowaccount", "documents.invoice.list")
+    server = StrictInputFastMCP("Quarantine stays active through publication")
+    dispatches = 0
+    persistence_available = False
+    persisted = asyncio.Event()
+
+    async def execute(_context, **kwargs):
+        nonlocal dispatches
+        dispatches += 1
+        if dispatches == 1:
+            raise ProviderSchemaChanged(
+                ProviderId.FLOWACCOUNT,
+                dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+            )
+        return ProviderReadEnvelope(
+            workspace_id=kwargs["workspace_id"],
+            connection_id=kwargs["connection_id"],
+            provider="flowaccount",
+            company_display_name="Example Company",
+            environment="sandbox",
+            capability_id=kwargs["capability_id"],
+            capability_version=kwargs["capability_version"],
+            data={"document_number": "INV-1"},
+        )
+
+    async def persist_schema_change(qualification, _context):
+        if not persistence_available:
+            raise RuntimeError("catalog unavailable")
+        persisted.set()
+        return (
+            qualification.model_copy(
+                update={
+                    "qualification_state": QualificationState.DISABLED,
+                    "disable_reason": "schema_changed",
+                }
+            ),
+            invoice_list,
+        )
+
+    publisher = GeneratedProviderToolPublisher(
+        server,
+        execute=execute,
+        persist_schema_change=persist_schema_change,
+    )
+    await publisher.publish((invoice_get, invoice_list))
+    server.get_context = lambda: SimpleNamespace()
+    arguments = {
+        "workspace_id": str(WORKSPACE_ID),
+        "connection_id": str(CONNECTION_ID),
+        "capability_version": invoice_get.capability_version_sha256,
+        "page_size": 25,
+    }
+    _content, drift = await server.call_tool("mercury_flowaccount_invoice_get", arguments)
+    assert drift["error"]["code"] == "capability_unavailable"
+    assert dispatches == 1
+
+    persistence_available = True
+    await publisher._refresh_lock.acquire()
+    reconcile = asyncio.create_task(publisher.reconcile((invoice_get, invoice_list)))
+    await persisted.wait()
+    _content, blocked = await server.call_tool("mercury_flowaccount_invoice_get", arguments)
+    assert blocked["error"]["code"] == "capability_unavailable"
+    assert dispatches == 1
+
+    publisher._refresh_lock.release()
+    assert await reconcile is True
+    assert {tool.name for tool in await server.list_tools()} == {"mercury_flowaccount_invoice_list"}
+    assert not publisher._quarantined_versions
+
+
+@pytest.mark.asyncio
+async def test_schema_drift_persistence_alert_retains_dispatch_certainty() -> None:
+    from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
+    from mercury_tools.providers.base import DispatchCertainty, ProviderSchemaChanged
+    from mercury_tools.providers.models import ProviderId
+
+    qualification = _qualification("flowaccount", "documents.invoice.get")
+    server = StrictInputFastMCP("Schema drift alert certainty")
+    alerts: list[dict[str, object]] = []
+
+    async def execute(_context, **_kwargs):
+        raise ProviderSchemaChanged(
+            ProviderId.FLOWACCOUNT,
+            dispatch_certainty=DispatchCertainty.DISPATCHED,
+        )
+
+    async def persist_schema_change(_qualification, _context):
+        raise RuntimeError("catalog unavailable")
+
+    publisher = GeneratedProviderToolPublisher(
+        server,
+        execute=execute,
+        persist_schema_change=persist_schema_change,
+        schema_drift_alert=alerts.append,
+    )
+    await publisher.publish((qualification,))
+    server.get_context = lambda: SimpleNamespace()
+    _content, result = await server.call_tool(
+        "mercury_flowaccount_invoice_get",
+        {
+            "workspace_id": str(WORKSPACE_ID),
+            "connection_id": str(CONNECTION_ID),
+            "capability_version": qualification.capability_version_sha256,
+            "page_size": 25,
+        },
+    )
+
+    assert result["error"]["code"] == "capability_unavailable"
+    assert len(alerts) == 1
+    assert alerts[0]["output_summary"]["dispatch_certainty"] == "dispatched"
+
+
+@pytest.mark.asyncio
+async def test_generated_refresh_session_retention_is_bounded_and_clear_releases_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mercury_tools.mcp.generated_tools as generated_tools
+    from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
+
+    monkeypatch.setattr(generated_tools, "_MAX_REFRESH_SESSIONS", 2, raising=False)
+
+    class NonWeakSession:
+        __slots__ = ("notifications",)
+
+        def __init__(self) -> None:
+            self.notifications = 0
+
+        def send_tool_list_changed(self) -> None:
+            self.notifications += 1
+
+    server = StrictInputFastMCP("Bounded generated refresh sessions")
+
+    async def execute(_context, **_kwargs):
+        raise AssertionError("session retention must not dispatch")
+
+    publisher = GeneratedProviderToolPublisher(server, execute=execute)
+    sessions = [NonWeakSession() for _ in range(3)]
+    for session in sessions:
+        publisher._remember_session(SimpleNamespace(session=session))
+
+    assert len(publisher._refresh_sessions) == 2
+    assert id(sessions[0]) not in publisher._refresh_sessions
+    publisher.clear()
+    assert not publisher._refresh_sessions
+
+
+@pytest.mark.asyncio
+async def test_generated_refresh_notification_has_total_deadline_and_prunes_slow_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mercury_tools.mcp.generated_tools as generated_tools
+    from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
+
+    monkeypatch.setattr(
+        generated_tools,
+        "_REFRESH_NOTIFICATION_TOTAL_TIMEOUT_SECONDS",
+        0.02,
+        raising=False,
+    )
+
+    class SlowSession:
+        async def send_tool_list_changed(self) -> None:
+            await asyncio.Event().wait()
+
+    invoice_get = _qualification("flowaccount", "documents.invoice.get")
+    invoice_list = _qualification("flowaccount", "documents.invoice.list")
+    server = StrictInputFastMCP("Bounded generated refresh notification")
+
+    async def execute(_context, **_kwargs):
+        raise AssertionError("refresh notification must not dispatch")
+
+    publisher = GeneratedProviderToolPublisher(server, execute=execute)
+    await publisher.publish((invoice_get,))
+    sessions = [SlowSession() for _ in range(3)]
+    for session in sessions:
+        publisher._remember_session(SimpleNamespace(session=session))
+
+    started = time.monotonic()
+    assert await asyncio.wait_for(publisher.publish((invoice_get, invoice_list)), timeout=0.1)
+    assert time.monotonic() - started < 0.1
+    assert not publisher._refresh_sessions
+
+
+@pytest.mark.asyncio
+async def test_cancelled_committed_refresh_retries_pending_notification_without_change() -> None:
+    from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
+
+    class BlockingSession:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.notifications = 0
+
+        async def send_tool_list_changed(self) -> None:
+            self.notifications += 1
+            self.started.set()
+            await self.release.wait()
+
+    invoice_get = _qualification("flowaccount", "documents.invoice.get")
+    invoice_list = _qualification("flowaccount", "documents.invoice.list")
+    server = StrictInputFastMCP("Retry generated refresh notification")
+
+    async def execute(_context, **_kwargs):
+        raise AssertionError("refresh notification must not dispatch")
+
+    publisher = GeneratedProviderToolPublisher(server, execute=execute)
+    await publisher.publish((invoice_get,))
+    session = BlockingSession()
+    publisher._remember_session(SimpleNamespace(session=session))
+    refresh = asyncio.create_task(publisher.publish((invoice_get, invoice_list)))
+    await session.started.wait()
+    refresh.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await refresh
+
+    session.release.set()
+    assert await publisher.publish((invoice_get, invoice_list)) is False
+    assert session.notifications == 2
