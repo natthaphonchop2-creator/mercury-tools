@@ -1,4 +1,5 @@
 import hashlib
+import re
 from datetime import UTC, datetime
 from enum import IntEnum, StrEnum
 from typing import Any, Literal
@@ -41,6 +42,28 @@ class ObservedState(StrEnum):
     SUCCESS = "success"
     FAILED = "failed"
     OUTCOME_UNKNOWN = "outcome_unknown"
+
+
+class QualificationState(StrEnum):
+    """The only lifecycle states for a provider-MCP capability version."""
+
+    DISCOVERED_UNREVIEWED = "discovered_unreviewed"
+    SCHEMA_VALIDATED = "schema_validated"
+    NONPRODUCTION_QUALIFIED = "nonproduction_qualified"
+    ENABLED = "enabled"
+    DISABLED = "disabled"
+    SUPERSEDED = "superseded"
+
+
+_PROVIDER_ID = r"^(?:flowaccount|peak)$"
+_CAPABILITY_IDENTIFIER = r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$"
+_PROVIDER_TOOL_NAME = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"
+_ENVIRONMENT = r"^[a-z][a-z0-9_-]{0,63}$"
+_SHA256 = r"^[0-9a-f]{64}$"
+_SAFE_QUALIFICATION_IDENTIFIER = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"
+_CATALOG_EVIDENCE_URI = re.compile(
+    r"^catalog://global/(?:flowaccount|peak)/qualifications/[0-9a-f]{64}\.json$"
+)
 
 
 class CatalogSource(BaseModel):
@@ -96,16 +119,13 @@ class CatalogSource(BaseModel):
         document: dict[str, Any],
         report: dict[str, Any],
         *,
-        source_type: Literal["openapi3", "swagger2", "postman2.1", "documentation"]
-        | None = None,
+        source_type: Literal["openapi3", "swagger2", "postman2.1", "documentation"] | None = None,
     ) -> "CatalogSource":
         sanitized_uri = sanitize_document(uri)
         sanitized_document = sanitize_document(document)
         sanitized_report = sanitize_document(report)
         source_hash = hashlib.sha256(
-            canonical_json(
-                {"document": sanitized_document, "report": sanitized_report}
-            ).encode()
+            canonical_json({"document": sanitized_document, "report": sanitized_report}).encode()
         ).hexdigest()
         return cls(
             source_id=build_source_id(connector_id, sanitized_uri, source_hash),
@@ -184,6 +204,217 @@ class CatalogAction(BaseModel):
         for field_name in type(self).model_fields:
             object.__setattr__(self, field_name, deep_freeze(getattr(self, field_name)))
         return self
+
+
+class ProviderMCPQualification(BaseModel):
+    """An immutable provider-MCP capability version plus its gated state.
+
+    This deliberately does not extend ``CatalogAction``. Existing REST catalog
+    versions keep their historical hash while provider-MCP qualification gets a
+    separately versioned, exact-selection record.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    provider: str = Field(pattern=_PROVIDER_ID)
+    environment: str = Field(pattern=_ENVIRONMENT)
+    provider_tool_name: str = Field(pattern=_PROVIDER_TOOL_NAME)
+    normalized_capability: str = Field(pattern=_CAPABILITY_IDENTIFIER)
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any]
+    schema_hash: str = Field(pattern=_SHA256)
+    response_shape_hash: str = Field(pattern=_SHA256)
+    required_permissions: tuple[str, ...]
+    capability_version_sha256: str = Field(pattern=_SHA256)
+    qualification_state: QualificationState = QualificationState.DISCOVERED_UNREVIEWED
+    qualification_evidence_uri: str | None = None
+    evidence_expires_at: datetime | None = None
+    production_canary_at: datetime | None = None
+    owner_authorized_by: str | None = None
+    disable_reason: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_credentials(cls, value: Any) -> Any:
+        validate_credential_safe(value)
+        validate_credential_safe_paths(value)
+        return value
+
+    @model_validator(mode="after")
+    def validate_qualification_integrity(self) -> "ProviderMCPQualification":
+        if (
+            not self.required_permissions
+            or len(self.required_permissions) != len(set(self.required_permissions))
+            or tuple(sorted(self.required_permissions)) != self.required_permissions
+            or any(
+                re.fullmatch(_SAFE_QUALIFICATION_IDENTIFIER, permission) is None
+                for permission in self.required_permissions
+            )
+        ):
+            raise ValueError("provider_mcp_qualification_invalid")
+
+        expected_schema_hash = _qualification_schema_hash(
+            self.input_schema,
+            self.output_schema,
+        )
+        if self.schema_hash != expected_schema_hash:
+            raise ValueError("provider_mcp_qualification_schema_hash_invalid")
+        expected_version = _provider_mcp_capability_version_sha256(
+            provider=self.provider,
+            environment=self.environment,
+            provider_tool_name=self.provider_tool_name,
+            normalized_capability=self.normalized_capability,
+            input_schema=self.input_schema,
+            output_schema=self.output_schema,
+            schema_hash=self.schema_hash,
+            response_shape_hash=self.response_shape_hash,
+            required_permissions=self.required_permissions,
+        )
+        if self.capability_version_sha256 != expected_version:
+            raise ValueError("provider_mcp_qualification_version_invalid")
+
+        for field_name in (
+            "evidence_expires_at",
+            "production_canary_at",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                if value.tzinfo is None or value.utcoffset() is None:
+                    raise ValueError("provider_mcp_qualification_timestamp_invalid")
+                object.__setattr__(self, field_name, value.astimezone(UTC))
+
+        requires_evidence = self.qualification_state in {
+            QualificationState.NONPRODUCTION_QUALIFIED,
+            QualificationState.ENABLED,
+        }
+        if requires_evidence:
+            if (
+                self.qualification_evidence_uri is None
+                or _CATALOG_EVIDENCE_URI.fullmatch(self.qualification_evidence_uri) is None
+                or not self.qualification_evidence_uri.startswith(
+                    f"catalog://global/{self.provider}/qualifications/"
+                )
+                or self.evidence_expires_at is None
+            ):
+                raise ValueError("provider_mcp_qualification_evidence_required")
+        elif self.qualification_evidence_uri is not None or self.evidence_expires_at is not None:
+            raise ValueError("provider_mcp_qualification_evidence_unexpected")
+
+        if self.qualification_state is QualificationState.ENABLED:
+            if self.environment == "production":
+                if (
+                    self.production_canary_at is None
+                    or self.owner_authorized_by is None
+                    or re.fullmatch(
+                        _SAFE_QUALIFICATION_IDENTIFIER,
+                        self.owner_authorized_by,
+                    )
+                    is None
+                ):
+                    raise ValueError("provider_mcp_qualification_canary_required")
+            elif self.production_canary_at is not None or self.owner_authorized_by is not None:
+                raise ValueError("provider_mcp_qualification_canary_unexpected")
+        elif self.production_canary_at is not None or self.owner_authorized_by is not None:
+            raise ValueError("provider_mcp_qualification_canary_unexpected")
+
+        if self.qualification_state in {
+            QualificationState.DISABLED,
+            QualificationState.SUPERSEDED,
+        }:
+            if (
+                self.disable_reason is None
+                or re.fullmatch(_SAFE_QUALIFICATION_IDENTIFIER, self.disable_reason) is None
+            ):
+                raise ValueError("provider_mcp_qualification_disable_reason_required")
+        elif self.disable_reason is not None:
+            raise ValueError("provider_mcp_qualification_disable_reason_unexpected")
+
+        for field_name in type(self).model_fields:
+            object.__setattr__(self, field_name, deep_freeze(getattr(self, field_name)))
+        return self
+
+    @classmethod
+    def discovered(
+        cls,
+        *,
+        provider: str,
+        environment: str,
+        provider_tool_name: str,
+        normalized_capability: str,
+        input_schema: dict[str, Any],
+        output_schema: dict[str, Any],
+        response_shape_hash: str,
+        required_permissions: tuple[str, ...],
+    ) -> "ProviderMCPQualification":
+        schema_hash = _qualification_schema_hash(input_schema, output_schema)
+        version = _provider_mcp_capability_version_sha256(
+            provider=provider,
+            environment=environment,
+            provider_tool_name=provider_tool_name,
+            normalized_capability=normalized_capability,
+            input_schema=input_schema,
+            output_schema=output_schema,
+            schema_hash=schema_hash,
+            response_shape_hash=response_shape_hash,
+            required_permissions=required_permissions,
+        )
+        return cls(
+            provider=provider,
+            environment=environment,
+            provider_tool_name=provider_tool_name,
+            normalized_capability=normalized_capability,
+            input_schema=input_schema,
+            output_schema=output_schema,
+            schema_hash=schema_hash,
+            response_shape_hash=response_shape_hash,
+            required_permissions=required_permissions,
+            capability_version_sha256=version,
+        )
+
+
+def _qualification_schema_hash(
+    input_schema: dict[str, Any],
+    output_schema: dict[str, Any],
+) -> str:
+    return hashlib.sha256(
+        canonical_json({"input_schema": input_schema, "output_schema": output_schema}).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _provider_mcp_capability_version_sha256(
+    *,
+    provider: str,
+    environment: str,
+    provider_tool_name: str,
+    normalized_capability: str,
+    input_schema: dict[str, Any],
+    output_schema: dict[str, Any],
+    schema_hash: str,
+    response_shape_hash: str,
+    required_permissions: tuple[str, ...],
+) -> str:
+    return hashlib.sha256(
+        canonical_json(
+            {
+                "provider": provider,
+                "environment": environment,
+                "provider_tool_name": provider_tool_name,
+                "normalized_capability": normalized_capability,
+                "input_schema": input_schema,
+                "output_schema": output_schema,
+                "schema_hash": schema_hash,
+                "response_shape_hash": response_shape_hash,
+                "required_permissions": required_permissions,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def revalidate_catalog_source(source: CatalogSource) -> CatalogSource:

@@ -14,6 +14,7 @@ from mercury_tools.catalog.models import (
     CatalogAction,
     CatalogSource,
     HttpMethod,
+    ProviderMCPQualification,
     revalidate_catalog_action,
     revalidate_catalog_source,
 )
@@ -65,8 +66,7 @@ class SupabaseCatalogStore:
             params={"on_conflict": "action_id,version_id"},
             headers={"Prefer": "resolution=ignore-duplicates,return=representation"},
             json=[
-                _version_payload(action, validated_source.source_id)
-                for action in validated_actions
+                _version_payload(action, validated_source.source_id) for action in validated_actions
             ],
         )
         self._request(
@@ -85,9 +85,7 @@ class SupabaseCatalogStore:
 
     def list_active_actions(self, filters: Mapping[str, str] | None = None) -> list[CatalogAction]:
         params = _filter_params(filters)
-        params["select"] = _active_select(
-            method_filtered="erp_action_versions.method" in params
-        )
+        params["select"] = _active_select(method_filtered="erp_action_versions.method" in params)
         rows = self._request("GET", "erp_action_catalog", params=params)
         if not isinstance(rows, list):
             raise RuntimeError("supabase_catalog_response_invalid")
@@ -100,6 +98,33 @@ class SupabaseCatalogStore:
             except (KeyError, TypeError, ValueError):
                 raise ValueError("catalog_active_action_invalid") from None
         return actions
+
+    def list_provider_mcp_qualifications(self) -> list[ProviderMCPQualification]:
+        """Load the separate V1 execution authority; legacy actions are not evidence."""
+
+        rows = self._request(
+            "GET",
+            "mercury_provider_capability_qualifications",
+            params={
+                "select": (
+                    "provider,environment,provider_tool_name,normalized_capability,"
+                    "input_schema,output_schema,schema_hash,response_shape_hash,"
+                    "required_permissions,capability_version_sha256,qualification_state,"
+                    "qualification_evidence_uri,evidence_expires_at,production_canary_at,"
+                    "owner_authorized_by,disable_reason"
+                ),
+                "order": (
+                    "provider.asc,environment.asc,normalized_capability.asc,"
+                    "provider_tool_name.asc,capability_version_sha256.asc"
+                ),
+            },
+        )
+        if not isinstance(rows, list):
+            raise RuntimeError("supabase_catalog_response_invalid")
+        try:
+            return [ProviderMCPQualification.model_validate(row) for row in rows]
+        except (TypeError, ValueError):
+            raise ValueError("catalog_qualification_invalid") from None
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = f"{self.base_url}/{path.lstrip('/')}"
