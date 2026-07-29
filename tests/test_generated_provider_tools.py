@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -1121,3 +1122,72 @@ async def test_cancelled_committed_refresh_retries_pending_notification_without_
     session.release.set()
     assert await publisher.publish((invoice_get, invoice_list)) is False
     assert session.notifications == 2
+
+
+@pytest.mark.asyncio
+async def test_refresh_deadline_detaches_cancellation_resistant_notification_without_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mercury_tools.mcp.generated_tools as generated_tools
+    from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
+
+    monkeypatch.setattr(
+        generated_tools,
+        "_REFRESH_NOTIFICATION_TOTAL_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
+    )
+
+    class ResistantSession:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.finished = asyncio.Event()
+
+        async def send_tool_list_changed(self) -> None:
+            self.started.set()
+            while not self.release.is_set():
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    continue
+            self.finished.set()
+            raise RuntimeError("late notification failure")
+
+    invoice_get = _qualification("flowaccount", "documents.invoice.get")
+    invoice_list = _qualification("flowaccount", "documents.invoice.list")
+    server = StrictInputFastMCP("Cancellation-resistant generated refresh")
+
+    async def execute(_context, **_kwargs):
+        raise AssertionError("refresh notification must not dispatch")
+
+    publisher = GeneratedProviderToolPublisher(server, execute=execute)
+    await publisher.publish((invoice_get,))
+    session = ResistantSession()
+    publisher._remember_session(SimpleNamespace(session=session))
+    loop = asyncio.get_running_loop()
+    exception_contexts: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: exception_contexts.append(context))
+    refresh = asyncio.create_task(publisher.publish((invoice_get, invoice_list)))
+    bounded = False
+    try:
+        await session.started.wait()
+        done, _pending = await asyncio.wait({refresh}, timeout=0.08)
+        bounded = bool(done)
+    finally:
+        session.release.set()
+        await refresh
+        await session.finished.wait()
+        await asyncio.sleep(0)
+        gc.collect()
+        await asyncio.sleep(0)
+        loop.set_exception_handler(previous_handler)
+
+    assert bounded
+    assert not publisher._refresh_sessions
+    assert not [
+        context
+        for context in exception_contexts
+        if "never retrieved" in str(context.get("message", "")).lower()
+    ]

@@ -324,13 +324,6 @@ class HostedReadService:
         for attempt in range(_MAX_SAFE_READ_ATTEMPTS):
             deadline.check()
             try:
-                # Crossing into the driver makes dispatch unknowable until the
-                # driver returns explicit evidence.  Generic exceptions and
-                # malformed results must not be reported as non-dispatches.
-                dispatch_state.certainty = _stronger_dispatch_certainty(
-                    dispatch_state.certainty,
-                    DispatchCertainty.UNKNOWN,
-                )
                 result = await call(
                     connection,
                     binding,
@@ -339,13 +332,6 @@ class HostedReadService:
                     deadline=deadline,
                 )
                 checked = ProviderCallResult.model_validate(result)
-                dispatch_state.certainty = _stronger_dispatch_certainty(
-                    dispatch_state.certainty,
-                    checked.dispatch_certainty,
-                )
-                if checked.status_class is not ProviderStatusClass.SUCCESS:
-                    raise ValueError("capability_unavailable")
-                return checked, attempt
             except asyncio.CancelledError:
                 # Once cancellation interrupts an in-flight call, only the driver
                 # could prove non-dispatch. The generic runtime cannot assume it.
@@ -365,6 +351,22 @@ class HostedReadService:
                 if deadline.remaining() <= delay:
                     raise
                 await _await_value(self._sleep(delay))
+            except Exception:
+                # Call-entry unknown is provisional. Record it only when the
+                # driver supplied no valid explicit result or error evidence.
+                dispatch_state.certainty = _stronger_dispatch_certainty(
+                    dispatch_state.certainty,
+                    DispatchCertainty.UNKNOWN,
+                )
+                raise
+            else:
+                dispatch_state.certainty = _stronger_dispatch_certainty(
+                    dispatch_state.certainty,
+                    checked.dispatch_certainty,
+                )
+                if checked.status_class is not ProviderStatusClass.SUCCESS:
+                    raise ValueError("capability_unavailable")
+                return checked, attempt
         raise ValueError("capability_unavailable")
 
 

@@ -312,6 +312,7 @@ _CLOSED_DESTRUCTIVE_IDEMPOTENT = ToolAnnotations(
 )
 _MERCURY_FLOW_SOURCE_ADAPTER = TypeAdapter(MercuryFlowSource)
 _GENERATED_PROVIDER_REFRESH_INTERVAL_SECONDS = 5.0
+_GENERATED_PROVIDER_SHUTDOWN_TIMEOUT_SECONDS = 1.0
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -4098,6 +4099,17 @@ def _create_http_app(
     )
     if refresh_interval_seconds <= 0:
         raise ValueError("generated_refresh_interval_invalid")
+    detached_refresh_tasks: set[asyncio.Task[None]] = set()
+
+    def detach_refresh_task(task: asyncio.Task[None]) -> None:
+        detached_refresh_tasks.add(task)
+
+        def consume_result(completed: asyncio.Task[None]) -> None:
+            detached_refresh_tasks.discard(completed)
+            with suppress(BaseException):
+                completed.result()
+
+        task.add_done_callback(consume_result)
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -4130,12 +4142,29 @@ def _create_http_app(
         finally:
             if refresh_stop_event is not None:
                 refresh_stop_event.set()
-            if refresh_task is not None:
-                refresh_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await refresh_task
-            if selected_composition is not None:
-                await selected_composition.aclose()
+            try:
+                if refresh_task is not None:
+                    refresh_task.cancel()
+                    try:
+                        _done, pending = await asyncio.wait(
+                            {refresh_task},
+                            timeout=_GENERATED_PROVIDER_SHUTDOWN_TIMEOUT_SECONDS,
+                        )
+                    except asyncio.CancelledError:
+                        detach_refresh_task(refresh_task)
+                        raise
+                    if pending:
+                        detach_refresh_task(refresh_task)
+                    else:
+                        with suppress(asyncio.CancelledError):
+                            refresh_task.result()
+            finally:
+                publisher = getattr(http_mcp, "_mercury_v1_generated_provider_tools", None)
+                clear_publisher = getattr(publisher, "clear", None)
+                if callable(clear_publisher):
+                    clear_publisher()
+                if selected_composition is not None:
+                    await selected_composition.aclose()
 
     routes = [
         *public_app.routes,

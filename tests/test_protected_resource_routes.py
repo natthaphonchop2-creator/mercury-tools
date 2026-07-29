@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gc
 import inspect
 import logging
 import time
@@ -184,6 +185,43 @@ def _principal() -> MercuryPrincipal:
     )
 
 
+def _enabled_invoice_get_qualification() -> ProviderMCPQualification:
+    now = datetime(2026, 7, 30, 12, tzinfo=UTC)
+    definition = ProviderMCPQualification.discovered(
+        provider="flowaccount",
+        environment="sandbox",
+        provider_tool_name="PRIVATE_PROVIDER_INVOICE_GET",
+        normalized_capability="documents.invoice.get",
+        input_schema={
+            "type": "object",
+            "properties": {"invoice_reference": {"type": "string", "minLength": 1}},
+            "required": ["invoice_reference"],
+            "additionalProperties": False,
+        },
+        output_schema={
+            "type": "object",
+            "properties": {"invoice_id": {"type": "string"}},
+            "required": ["invoice_id"],
+            "additionalProperties": False,
+        },
+        response_shape_hash="a" * 64,
+        required_permissions=("documents.read",),
+    )
+    return definition.model_copy(
+        update={
+            "qualification_state": QualificationState.ENABLED,
+            "company_sha256": "b" * 64,
+            "evidence_revision_sha256": "c" * 64,
+            "qualification_evidence_uri": (
+                "catalog://global/flowaccount/qualifications/"
+                f"{definition.capability_version_sha256}-{'c' * 64}.json"
+            ),
+            "evidence_evaluated_at": now,
+            "evidence_expires_at": now + timedelta(days=1),
+        }
+    )
+
+
 def test_http_lifespan_projects_and_automatically_refreshes_generated_provider_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -340,6 +378,89 @@ def test_http_lifespan_projects_and_automatically_refreshes_generated_provider_t
             tool.name for tool in asyncio.run(serving_mcp.list_tools())
         }
         assert notifications == ["tools/list_changed"]
+
+
+@pytest.mark.asyncio
+async def test_http_shutdown_is_bounded_and_clears_cancellation_resistant_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mercury_tools.mcp import server
+
+    monkeypatch.setattr(
+        server,
+        "_GENERATED_PROVIDER_SHUTDOWN_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
+    )
+
+    class Catalog:
+        qualifications: list[ProviderMCPQualification] = []
+
+        def list_provider_mcp_qualifications(self):
+            return list(self.qualifications)
+
+    class ResistantSession:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.finished = asyncio.Event()
+
+        async def send_tool_list_changed(self) -> None:
+            self.started.set()
+            while not self.release.is_set():
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    continue
+            self.finished.set()
+            raise RuntimeError("late shutdown notification failure")
+
+    catalog = Catalog()
+    runtime = SimpleNamespace(qualification_catalog=catalog)
+    app = create_test_http_app(
+        principal_resolver=StubResolver(_principal()),
+        cloud_dependencies=PrincipalCloudDependencies(),
+        generated_provider_runtime=runtime,
+        generated_provider_refresh_interval_seconds=0.01,
+    )
+    lifespan = app.router.lifespan_context(app)
+    await lifespan.__aenter__()
+    publisher = app.state.mercury_mcp._mercury_v1_generated_provider_tools
+    session = ResistantSession()
+    publisher._remember_session(SimpleNamespace(session=session))
+    catalog.qualifications = [_enabled_invoice_get_qualification()]
+    await asyncio.wait_for(session.started.wait(), timeout=0.2)
+
+    loop = asyncio.get_running_loop()
+    exception_contexts: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: exception_contexts.append(context))
+    watchdog_fired = asyncio.Event()
+
+    def release_after_bound() -> None:
+        watchdog_fired.set()
+        session.release.set()
+
+    watchdog = loop.call_later(0.08, release_after_bound)
+    try:
+        await lifespan.__aexit__(None, None, None)
+        bounded = not watchdog_fired.is_set()
+    finally:
+        session.release.set()
+        await session.finished.wait()
+        await asyncio.sleep(0)
+        gc.collect()
+        await asyncio.sleep(0)
+        watchdog.cancel()
+        loop.set_exception_handler(previous_handler)
+
+    assert bounded
+    assert not publisher._refresh_sessions
+    assert not [
+        context
+        for context in exception_contexts
+        if "never retrieved" in str(context.get("message", "")).lower()
+    ]
 
 
 def test_v1_default_http_app_builds_and_runs_production_oauth_composition(

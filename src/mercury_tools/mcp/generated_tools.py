@@ -31,7 +31,6 @@ from mercury_tools.mcp.v1_errors import (
 )
 from mercury_tools.mcp.v1_schemas import ProviderReadEnvelope
 from mercury_tools.providers.base import DispatchCertainty, ProviderSchemaChanged
-from mercury_tools.providers.finalization import await_cleanup
 
 GeneratedReadExecutor: TypeAlias = Callable[..., Awaitable[ProviderReadEnvelope]]
 PersistSchemaChange: TypeAlias = Callable[
@@ -1038,6 +1037,7 @@ class GeneratedProviderToolPublisher:
         self._requested_generation = 0
         self._committed_generation = 0
         self._refresh_sessions: OrderedDict[int, _RefreshSession] = OrderedDict()
+        self._detached_notification_tasks: set[asyncio.Task[None]] = set()
         self._quarantined_versions: dict[tuple[str, str, str, str, str], _QuarantinedVersion] = {}
 
     async def publish(
@@ -1112,7 +1112,7 @@ class GeneratedProviderToolPublisher:
         )
 
     def clear(self) -> bool:
-        """Remove generated tools during static V1 disablement only."""
+        """Remove generated tools and retained sessions during disablement or shutdown."""
 
         changed = False
         for name in tuple(self._published):
@@ -1121,6 +1121,8 @@ class GeneratedProviderToolPublisher:
             self._published.pop(name, None)
             changed = True
         self._refresh_sessions.clear()
+        for task in tuple(self._detached_notification_tasks):
+            task.cancel()
         return changed
 
     def _stage(
@@ -1405,13 +1407,11 @@ class GeneratedProviderToolPublisher:
             raise TypeError("generated_refresh_session_invalid")
         await _await_value(sender())
 
-    async def _settle_notification_tasks(self, tasks: Sequence[asyncio.Task[None]]) -> None:
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
     def _record_notification_results(
         self,
         tasks: Mapping[int, asyncio.Task[None]],
+        *,
+        generation: int,
     ) -> None:
         for key, task in tasks.items():
             entry = self._refresh_sessions.get(key)
@@ -1425,11 +1425,50 @@ class GeneratedProviderToolPublisher:
             except Exception:
                 self._refresh_sessions.pop(key, None)
             else:
-                entry.notified_generation = self._committed_generation
+                entry.notified_generation = max(entry.notified_generation, generation)
+
+    def _finish_detached_notification(
+        self,
+        key: int,
+        generation: int,
+        task: asyncio.Task[None],
+    ) -> None:
+        self._detached_notification_tasks.discard(task)
+        entry = self._refresh_sessions.get(key)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except BaseException:
+            self._refresh_sessions.pop(key, None)
+        else:
+            if entry is not None:
+                entry.notified_generation = max(entry.notified_generation, generation)
+
+    def _detach_notification_tasks(
+        self,
+        tasks: Mapping[int, asyncio.Task[None]],
+        *,
+        generation: int,
+        evict_sessions: bool,
+    ) -> None:
+        for key, task in tasks.items():
+            if evict_sessions:
+                self._refresh_sessions.pop(key, None)
+            task.cancel()
+            self._detached_notification_tasks.add(task)
+            task.add_done_callback(
+                lambda completed, key=key: self._finish_detached_notification(
+                    key,
+                    generation,
+                    completed,
+                )
+            )
 
     async def _notify_refresh_sessions(self) -> None:
         """Notify pending request sessions concurrently within one total deadline."""
 
+        generation = self._committed_generation
         tasks = {
             key: asyncio.create_task(self._send_refresh_notification(session))
             for key, session in self._pending_refresh_sessions()
@@ -1437,20 +1476,31 @@ class GeneratedProviderToolPublisher:
         if not tasks:
             return
         try:
-            async with asyncio.timeout(_REFRESH_NOTIFICATION_TOTAL_TIMEOUT_SECONDS):
-                await asyncio.gather(*tasks.values(), return_exceptions=True)
+            done, pending = await asyncio.wait(
+                tasks.values(),
+                timeout=_REFRESH_NOTIFICATION_TOTAL_TIMEOUT_SECONDS,
+            )
         except asyncio.CancelledError:
-            for task in tasks.values():
-                task.cancel()
-            # The committed generation remains pending so the next lifecycle
-            # refresh retries it.  Required task cleanup survives repeat cancel.
-            await await_cleanup(self._settle_notification_tasks(tuple(tasks.values())))
+            completed = {key: task for key, task in tasks.items() if task.done()}
+            detached = {key: task for key, task in tasks.items() if not task.done()}
+            self._record_notification_results(completed, generation=generation)
+            # Cooperative cancellation remains pending for the next unchanged
+            # refresh. Resistant children are retained only until their eventual
+            # result is consumed.
+            self._detach_notification_tasks(
+                detached,
+                generation=generation,
+                evict_sessions=False,
+            )
             raise
-        except TimeoutError:
-            for task in tasks.values():
-                task.cancel()
-            await await_cleanup(self._settle_notification_tasks(tuple(tasks.values())))
-        self._record_notification_results(tasks)
+        completed = {key: task for key, task in tasks.items() if task in done}
+        detached = {key: task for key, task in tasks.items() if task in pending}
+        self._record_notification_results(completed, generation=generation)
+        self._detach_notification_tasks(
+            detached,
+            generation=generation,
+            evict_sessions=True,
+        )
 
 
 async def _await_value(value: Any) -> Any:

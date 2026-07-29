@@ -605,3 +605,90 @@ async def test_hosted_read_marks_generic_and_malformed_provider_call_failures_un
         assert audits[0]["status"] == "error"
         assert audits[0]["output_summary"]["status_class"] == "validation_failed"
         assert audits[0]["output_summary"]["dispatch_certainty"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_explicit_not_dispatched_result_replaces_call_entry_unknown() -> None:
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+
+    qualification = _qualification()
+    audits: list[dict[str, object]] = []
+    runtime = _runtime(
+        qualification,
+        FakeDriver(
+            [
+                ProviderCallResult(
+                    provider=ProviderId.FLOWACCOUNT,
+                    status_class=ProviderStatusClass.UNAVAILABLE,
+                    normalized_data={},
+                    dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+                )
+            ]
+        ),
+    )
+    service = HostedReadService(
+        runtime_factory=lambda: runtime,
+        membership_resolver=_membership,
+        audit_recorder=audits.append,
+    )
+
+    with pytest.raises(ValueError, match="^capability_unavailable$"):
+        await service.execute(
+            _principal(),
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            qualification.normalized_capability,
+            qualification.capability_version_sha256,
+            InvoiceReadInputs(invoice_reference="INV-001"),
+        )
+
+    assert len(audits) == 1
+    assert audits[0]["output_summary"]["dispatch_certainty"] == "not_dispatched"
+
+
+@pytest.mark.asyncio
+async def test_retry_backoff_cancellation_retains_explicit_pre_dispatch_evidence() -> None:
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+
+    qualification = _qualification()
+    backoff_started = asyncio.Event()
+    audits: list[dict[str, object]] = []
+    driver = FakeDriver(
+        [
+            ProviderUnavailable(
+                ProviderId.FLOWACCOUNT,
+                dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+            )
+        ]
+    )
+
+    async def blocking_backoff(_seconds: float) -> None:
+        backoff_started.set()
+        await asyncio.Event().wait()
+
+    service = HostedReadService(
+        runtime_factory=lambda: _runtime(qualification, driver),
+        membership_resolver=_membership,
+        audit_recorder=audits.append,
+        sleep=blocking_backoff,
+    )
+    read = asyncio.create_task(
+        service.execute(
+            _principal(),
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            qualification.normalized_capability,
+            qualification.capability_version_sha256,
+            InvoiceReadInputs(invoice_reference="INV-001"),
+        )
+    )
+    await backoff_started.wait()
+    read.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await read
+
+    assert len(driver.calls) == 1
+    assert len(audits) == 1
+    assert audits[0]["status"] == "cancelled"
+    assert audits[0]["output_summary"]["dispatch_certainty"] == "not_dispatched"
