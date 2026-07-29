@@ -555,6 +555,35 @@ def test_revocation_marker_clears_only_after_atomic_disconnection() -> None:
     assert store._envelopes == {}
 
 
+def test_completed_revocation_cannot_be_restored_by_a_stale_disconnect() -> None:
+    store = _store()
+    _save_connection(store)
+
+    store.disconnect(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=AUTH_USER_ID,
+        connection_id=CONNECTION_ID,
+        provider_revocation_required=True,
+    )
+    store.complete_revocation(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=AUTH_USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+    stale = store.disconnect(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=AUTH_USER_ID,
+        connection_id=CONNECTION_ID,
+        provider_revocation_required=True,
+    )
+
+    assert stale.already_disconnected is True
+    assert stale.provider_revocation_required is False
+
+
 def test_reconnect_reactivates_only_the_same_disconnected_connection_id() -> None:
     from mercury_tools.providers.models import ConnectionReadiness
     from mercury_tools.providers.store import ProviderStoreError

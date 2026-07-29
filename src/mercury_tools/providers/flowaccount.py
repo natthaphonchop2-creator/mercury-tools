@@ -287,6 +287,21 @@ class FlowAccountOAuthRevocationMaterial(_FlowAccountModel):
     ]
     granted_permissions: tuple[str, ...]
 
+    def clear(self) -> None:
+        """Drop references to server-only revocation material after one use."""
+
+        for field_name in (
+            "tokens",
+            "token_endpoint",
+            "resource_uri",
+            "revocation_endpoint",
+            "client_id",
+            "client_secret",
+            "token_endpoint_auth_method",
+            "granted_permissions",
+        ):
+            object.__setattr__(self, field_name, None)
+
 
 CredentialEnvelopeLoader = Callable[
     [ProviderConnection],

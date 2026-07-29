@@ -21,6 +21,9 @@ OAUTH_GENERATIONS_MIGRATION = (
 PROVIDER_CONNECTION_LOOKUP_MIGRATION = (
     ROOT / "supabase/migrations/20260729110000_mercury_v1_provider_connection_lookup.sql"
 )
+PROVIDER_REVOCATION_STATE_MIGRATION = (
+    ROOT / "supabase/migrations/20260730100000_mercury_v1_provider_revocation_state.sql"
+)
 MIGRATIONS = (
     ROOT / "supabase/migrations/0002_mercury_product_layer.sql",
     ROOT / "supabase/migrations/20260726100000_mercury_v1_identity.sql",
@@ -31,6 +34,7 @@ MIGRATIONS = (
     ROOT / "supabase/migrations/20260728110000_mercury_v1_provider_oauth_attempts.sql",
     OAUTH_GENERATIONS_MIGRATION,
     PROVIDER_CONNECTION_LOOKUP_MIGRATION,
+    PROVIDER_REVOCATION_STATE_MIGRATION,
 )
 AUTH_USER_ID = UUID("33333333-3333-4333-8333-333333333333")
 OTHER_AUTH_USER_ID = UUID("44444444-4444-4444-8444-444444444444")
@@ -311,6 +315,54 @@ def test_task4_migrations_apply_twice_on_postgresql_17(
     assert version.startswith("17")
 
 
+def test_completed_revocation_cannot_be_restored_by_a_stale_backend_disconnect(
+    postgres_context: PostgresContext,
+) -> None:
+    connection_id = uuid4()
+    _psql(
+        postgres_context.container,
+        _service(
+            _save_sql(
+                postgres_context,
+                connection_id=connection_id,
+                envelope_id=uuid4(),
+                account_id=f"settled-revocation-{connection_id}",
+            )
+        ),
+    )
+    disconnect_sql = f"""
+        select pg_catalog.row_to_json(disconnected)::pg_catalog.text
+        from public.disconnect_mercury_provider_connection(
+          '{postgres_context.tenant_id}',
+          '{postgres_context.workspace_id}',
+          '{AUTH_USER_ID}',
+          '{connection_id}',
+          true
+        ) as disconnected;
+    """
+    _psql(postgres_context.container, _service(disconnect_sql))
+    _psql(
+        postgres_context.container,
+        _service(
+            f"""
+            select *
+            from public.complete_mercury_provider_revocation(
+              '{postgres_context.tenant_id}',
+              '{postgres_context.workspace_id}',
+              '{AUTH_USER_ID}',
+              '{connection_id}'
+            );
+            """
+        ),
+    )
+    stale = json.loads(
+        _psql(postgres_context.container, _service(disconnect_sql))
+    )
+
+    assert stale["already_disconnected"] is True
+    assert stale["provider_revocation_required"] is False
+
+
 def test_provider_connection_lookup_requires_exact_bound_accepted_generation(
     postgres_context: PostgresContext,
 ) -> None:
@@ -367,11 +419,62 @@ def test_provider_connection_lookup_requires_exact_bound_accepted_generation(
     assert "ciphertext" not in exact
     assert "nonce" not in exact
 
-    wrong_user = _psql_result(
+    _psql(
         postgres_context.container,
-        _service(lookup_sql(direct_connection_id, auth_user_id=OTHER_AUTH_USER_ID)),
+        _service(
+            f"""
+            insert into public.mercury_workspace_members (
+              workspace_id,
+              email,
+              role,
+              host_app,
+              status,
+              last_seen_at,
+              auth_user_id,
+              tenant_id
+            )
+            values (
+              '{postgres_context.workspace_id}',
+              null,
+              'member',
+              'mercury-v1',
+              'active',
+              pg_catalog.statement_timestamp(),
+              '{OTHER_AUTH_USER_ID}',
+              '{postgres_context.tenant_id}'
+            )
+            on conflict (workspace_id, auth_user_id)
+              where auth_user_id is not null
+            do update set
+              tenant_id = excluded.tenant_id,
+              role = excluded.role,
+              status = 'active',
+              last_seen_at = excluded.last_seen_at;
+            """
+        ),
     )
-    _assert_secret_safe_error(wrong_user, "workspace_access_denied")
+
+    try:
+        wrong_user = _psql_result(
+            postgres_context.container,
+            _service(lookup_sql(direct_connection_id, auth_user_id=OTHER_AUTH_USER_ID)),
+        )
+        _assert_secret_safe_error(
+            wrong_user,
+            "provider_connection_not_found",
+            f"lookup-direct-{direct_connection_id}",
+        )
+    finally:
+        _psql(
+            postgres_context.container,
+            _service(
+                f"""
+                delete from public.mercury_workspace_members
+                where workspace_id = '{postgres_context.workspace_id}'
+                  and auth_user_id = '{OTHER_AUTH_USER_ID}';
+                """
+            ),
+        )
     denied_role = _psql_result(
         postgres_context.container,
         _authenticated(lookup_sql(direct_connection_id)),
@@ -2676,7 +2779,7 @@ def test_base_to_head_upgrade_selects_only_proven_oauth_generation_owners() -> N
               to anon, authenticated, service_role;
             """,
         )
-        for migration in MIGRATIONS[:-2]:
+        for migration in MIGRATIONS[:-3]:
             _psql(container, migration.read_text(encoding="utf-8"))
         payload = json.loads(
             _psql(

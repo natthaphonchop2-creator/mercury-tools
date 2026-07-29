@@ -1536,16 +1536,9 @@ class ProviderConnectionStore:
                 self._connections[connection_id] = disconnected
             else:
                 disconnected = current
-                required = current.provider_revocation_required or provider_revocation_required
-                if required != current.provider_revocation_required:
-                    disconnected = ProviderConnection.model_validate(
-                        {
-                            **self._connection_values(current),
-                            "provider_revocation_required": required,
-                            "updated_at": now,
-                        }
-                    )
-                    self._connections[connection_id] = disconnected
+                # A completed remote revocation is terminal. A stale process that
+                # loaded the former ready connection must not restore its obligation.
+                required = current.provider_revocation_required
 
             return DisconnectResult(
                 connection_id=connection_id,
