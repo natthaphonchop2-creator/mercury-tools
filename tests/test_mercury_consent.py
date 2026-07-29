@@ -39,6 +39,9 @@ class UnusedProviderOAuthService:
     async def complete_callback(self, _callback: object) -> None:
         raise AssertionError("consent tests must not invoke provider OAuth")
 
+    async def disconnect(self, *_args: object) -> None:
+        raise AssertionError("consent tests must not disconnect provider OAuth")
+
 
 class UnusedPeakSetupService:
     async def start(self, *_args: object) -> None:

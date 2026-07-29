@@ -15,6 +15,12 @@ import pytest
 pytestmark = pytest.mark.integration
 
 ROOT = Path(__file__).resolve().parents[2]
+OAUTH_GENERATIONS_MIGRATION = (
+    ROOT / "supabase/migrations/20260728120000_mercury_v1_provider_oauth_generations.sql"
+)
+PROVIDER_CONNECTION_LOOKUP_MIGRATION = (
+    ROOT / "supabase/migrations/20260729110000_mercury_v1_provider_connection_lookup.sql"
+)
 MIGRATIONS = (
     ROOT / "supabase/migrations/0002_mercury_product_layer.sql",
     ROOT / "supabase/migrations/20260726100000_mercury_v1_identity.sql",
@@ -23,7 +29,8 @@ MIGRATIONS = (
     ROOT / "supabase/migrations/20260727100000_mercury_v1_provider_oauth_cleanup.sql",
     ROOT / "supabase/migrations/20260728100000_mercury_v1_provider_oauth_reconnect.sql",
     ROOT / "supabase/migrations/20260728110000_mercury_v1_provider_oauth_attempts.sql",
-    ROOT / "supabase/migrations/20260728120000_mercury_v1_provider_oauth_generations.sql",
+    OAUTH_GENERATIONS_MIGRATION,
+    PROVIDER_CONNECTION_LOOKUP_MIGRATION,
 )
 AUTH_USER_ID = UUID("33333333-3333-4333-8333-333333333333")
 OTHER_AUTH_USER_ID = UUID("44444444-4444-4444-8444-444444444444")
@@ -302,6 +309,245 @@ def test_task4_migrations_apply_twice_on_postgresql_17(
     )
 
     assert version.startswith("17")
+
+
+def test_provider_connection_lookup_requires_exact_bound_accepted_generation(
+    postgres_context: PostgresContext,
+) -> None:
+    def lookup_sql(connection_id: UUID, *, auth_user_id: UUID = AUTH_USER_ID) -> str:
+        return f"""
+          select pg_catalog.row_to_json(connection)::pg_catalog.text
+          from public.load_mercury_provider_connection_backend(
+            '{postgres_context.tenant_id}',
+            '{postgres_context.workspace_id}',
+            '{auth_user_id}',
+            '{connection_id}'
+          ) as connection;
+        """
+
+    def envelope(envelope_id: UUID) -> str:
+        return f"""
+          pg_catalog.jsonb_build_array(
+            pg_catalog.jsonb_build_object(
+              'id', '{envelope_id}',
+              'credential_type', 'access_token',
+              'key_version', 'v1',
+              'nonce', pg_catalog.repeat('ab', 12),
+              'ciphertext', pg_catalog.repeat('cd', 16),
+              'aad_hash', pg_catalog.repeat('ef', 32),
+              'created_at', pg_catalog.statement_timestamp(),
+              'rotated_at', null,
+              'revoked_at', null
+            )
+          )
+        """
+
+    direct_connection_id = uuid4()
+    direct = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(
+                _save_sql(
+                    postgres_context,
+                    connection_id=direct_connection_id,
+                    envelope_id=uuid4(),
+                    account_id=f"lookup-direct-{direct_connection_id}",
+                )
+            ),
+        )
+    )
+    exact = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(lookup_sql(direct_connection_id)),
+        )
+    )
+    assert exact["connection_id"] == direct["connection_id"]
+    assert exact["provider"] == "flowaccount"
+    assert "ciphertext" not in exact
+    assert "nonce" not in exact
+
+    wrong_user = _psql_result(
+        postgres_context.container,
+        _service(lookup_sql(direct_connection_id, auth_user_id=OTHER_AUTH_USER_ID)),
+    )
+    _assert_secret_safe_error(wrong_user, "workspace_access_denied")
+    denied_role = _psql_result(
+        postgres_context.container,
+        _authenticated(lookup_sql(direct_connection_id)),
+    )
+    _assert_secret_safe_error(denied_role, "permission denied")
+    privileges = json.loads(
+        _psql(
+            postgres_context.container,
+            """
+            select pg_catalog.json_build_object(
+              'service_role', pg_catalog.has_function_privilege(
+                'service_role',
+                'public.load_mercury_provider_connection_backend(uuid,uuid,uuid,uuid)'::pg_catalog.regprocedure,
+                'execute'
+              ),
+              'authenticated', pg_catalog.has_function_privilege(
+                'authenticated',
+                'public.load_mercury_provider_connection_backend(uuid,uuid,uuid,uuid)'::pg_catalog.regprocedure,
+                'execute'
+              ),
+              'anon', pg_catalog.has_function_privilege(
+                'anon',
+                'public.load_mercury_provider_connection_backend(uuid,uuid,uuid,uuid)'::pg_catalog.regprocedure,
+                'execute'
+              )
+            )::pg_catalog.text;
+            """,
+        )
+    )
+    assert privileges == {
+        "service_role": True,
+        "authenticated": False,
+        "anon": False,
+    }
+
+    pending_attempt_id = uuid4()
+    _psql(
+        postgres_context.container,
+        _service(
+            f"""
+            select *
+            from public.begin_mercury_provider_oauth_attempt(
+              '{pending_attempt_id}',
+              '{postgres_context.tenant_id}',
+              '{postgres_context.workspace_id}',
+              '{AUTH_USER_ID}',
+              'flowaccount',
+              'sandbox',
+              '["documents.read"]'::pg_catalog.jsonb
+            );
+            select *
+            from public.attach_mercury_provider_oauth_attempt(
+              '{pending_attempt_id}',
+              '{postgres_context.tenant_id}',
+              '{postgres_context.workspace_id}',
+              '{AUTH_USER_ID}',
+              'flowaccount',
+              'sandbox',
+              'oauth-pending-{pending_attempt_id}',
+              'FlowAccount pending',
+              'oauth2_pkce',
+              '["documents.read"]'::pg_catalog.jsonb,
+              'requires_validation',
+              1,
+              null,
+              {envelope(uuid4())}
+            );
+            """
+        ),
+    )
+    pending = _psql_result(
+        postgres_context.container,
+        _service(lookup_sql(pending_attempt_id)),
+    )
+    _assert_secret_safe_error(pending, "provider_connection_not_found")
+
+    _psql(
+        postgres_context.container,
+        _service(
+            f"""
+            update public.mercury_provider_connections
+            set oauth_generation_id = '{pending_attempt_id}'
+            where id = '{direct_connection_id}';
+            """
+        ),
+    )
+    stale = _psql_result(
+        postgres_context.container,
+        _service(lookup_sql(direct_connection_id)),
+    )
+    _assert_secret_safe_error(stale, "provider_connection_not_found")
+
+    finalized_attempt_id = uuid4()
+    finalized_connection_id = uuid4()
+    _psql(
+        postgres_context.container,
+        _service(
+            f"""
+            select *
+            from public.begin_mercury_provider_oauth_attempt(
+              '{finalized_attempt_id}',
+              '{postgres_context.tenant_id}',
+              '{postgres_context.workspace_id}',
+              '{AUTH_USER_ID}',
+              'flowaccount',
+              'sandbox',
+              '["documents.read"]'::pg_catalog.jsonb
+            );
+            select *
+            from public.attach_mercury_provider_oauth_attempt(
+              '{finalized_attempt_id}',
+              '{postgres_context.tenant_id}',
+              '{postgres_context.workspace_id}',
+              '{AUTH_USER_ID}',
+              'flowaccount',
+              'sandbox',
+              'oauth-pending-{finalized_attempt_id}',
+              'FlowAccount pending',
+              'oauth2_pkce',
+              '["documents.read"]'::pg_catalog.jsonb,
+              'requires_validation',
+              1,
+              null,
+              {envelope(uuid4())}
+            );
+            select *
+            from public.finalize_mercury_provider_oauth_attempt(
+              '{finalized_attempt_id}',
+              '{finalized_connection_id}',
+              '{postgres_context.tenant_id}',
+              '{postgres_context.workspace_id}',
+              '{AUTH_USER_ID}',
+              'flowaccount',
+              'sandbox',
+              'lookup-finalized-{finalized_connection_id}',
+              'FlowAccount finalized',
+              'oauth2_pkce',
+              '["documents.read"]'::pg_catalog.jsonb,
+              'requires_validation',
+              1,
+              pg_catalog.statement_timestamp(),
+              {envelope(uuid4())}
+            );
+            """
+        ),
+    )
+    unacknowledged = _psql_result(
+        postgres_context.container,
+        _service(lookup_sql(finalized_connection_id)),
+    )
+    _assert_secret_safe_error(unacknowledged, "provider_connection_not_found")
+
+    _psql(
+        postgres_context.container,
+        _service(
+            f"""
+            select *
+            from public.acknowledge_mercury_provider_oauth_attempt(
+              '{finalized_attempt_id}',
+              '{postgres_context.tenant_id}',
+              '{postgres_context.workspace_id}',
+              '{AUTH_USER_ID}',
+              'flowaccount',
+              'sandbox'
+            );
+            """
+        ),
+    )
+    accepted = json.loads(
+        _psql(
+            postgres_context.container,
+            _service(lookup_sql(finalized_connection_id)),
+        )
+    )
+    assert accepted["connection_id"] == str(finalized_connection_id)
+    assert accepted["provider_account_id"] == f"lookup-finalized-{finalized_connection_id}"
 
 
 def test_disconnect_deletes_envelopes_and_increments_revision_once(
@@ -1935,7 +2181,7 @@ def test_oauth_generation_stays_held_until_ack_and_cleanup_follows_refresh_revis
 
     _psql(
         postgres_context.container,
-        MIGRATIONS[-1].read_text(encoding="utf-8"),
+        OAUTH_GENERATIONS_MIGRATION.read_text(encoding="utf-8"),
     )
     replayed_hold = json.loads(
         _psql(
@@ -2180,7 +2426,7 @@ def test_base_to_head_upgrade_moves_exact_legacy_ghosts_and_replays_cleanly() ->
               to anon, authenticated, service_role;
             """,
         )
-        for migration in MIGRATIONS[:-2]:
+        for migration in MIGRATIONS[:-3]:
             _psql(container, migration.read_text(encoding="utf-8"))
         payload = json.loads(
             _psql(
@@ -2293,7 +2539,7 @@ def test_base_to_head_upgrade_moves_exact_legacy_ghosts_and_replays_cleanly() ->
         )
 
         for _ in range(2):
-            for migration in MIGRATIONS[-2:]:
+            for migration in MIGRATIONS[-3:-1]:
                 _psql(container, migration.read_text(encoding="utf-8"))
 
         upgraded = json.loads(
@@ -2430,7 +2676,7 @@ def test_base_to_head_upgrade_selects_only_proven_oauth_generation_owners() -> N
               to anon, authenticated, service_role;
             """,
         )
-        for migration in MIGRATIONS[:-1]:
+        for migration in MIGRATIONS[:-2]:
             _psql(container, migration.read_text(encoding="utf-8"))
         payload = json.loads(
             _psql(
@@ -2785,7 +3031,7 @@ def test_base_to_head_upgrade_selects_only_proven_oauth_generation_owners() -> N
         )
         fail_attempt(failed_attempt_id)
 
-        head_migration = MIGRATIONS[-1].read_text(encoding="utf-8")
+        head_migration = OAUTH_GENERATIONS_MIGRATION.read_text(encoding="utf-8")
         _psql(container, head_migration)
         _psql(container, head_migration)
 

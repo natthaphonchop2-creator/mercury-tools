@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import inspect
@@ -375,7 +376,7 @@ class ProviderAuthorizationStart(_OAuthModel):
 
 class FlowAccountDisconnectOutcome(_OAuthModel):
     status: Literal["disconnected", "provider_revocation_required"]
-    local_credentials_deleted: bool
+    local_credentials_deleted: Literal[True]
     remote_revocation_status: Literal[
         "revoked",
         "not_supported",
@@ -385,6 +386,23 @@ class FlowAccountDisconnectOutcome(_OAuthModel):
     provider_revocation_required: bool
     deleted_envelope_count: int = Field(ge=0, le=16)
     revision: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def validate_outcome_combination(self) -> FlowAccountDisconnectOutcome:
+        if self.status == "disconnected":
+            valid = (
+                self.provider_revocation_required is False
+                and self.remote_revocation_status
+                in {"revoked", "not_supported", "already_disconnected"}
+            )
+        else:
+            valid = (
+                self.provider_revocation_required is True
+                and self.remote_revocation_status in {"failed", "already_disconnected"}
+            )
+        if not valid:
+            raise ValueError("provider_oauth_state_invalid")
+        return self
 
 
 class _StoredOAuthPayload(_OAuthModel):
@@ -1830,7 +1848,7 @@ class ProviderOAuthService:
             )
 
         remote_revocation_status: Literal["revoked", "not_supported", "failed"] = "not_supported"
-        revoked = False
+        remote_revoke_cancelled: asyncio.CancelledError | None = None
         try:
             material = self._flowaccount_revocation_material(checked_connection)
             if material.revocation_endpoint is not None:
@@ -1839,21 +1857,27 @@ class ProviderOAuthService:
                     tokens=material.tokens,
                 )
                 remote_revocation_status = "revoked" if revoked else "failed"
+        except asyncio.CancelledError as exc:
+            remote_revoke_cancelled = exc
+            remote_revocation_status = "failed"
         except Exception:
             remote_revocation_status = "failed"
-            revoked = False
+
+        provider_revocation_required = remote_revocation_status == "failed"
         try:
             disconnected = self._connection_store.disconnect(
                 tenant_id=membership.tenant_id,
                 workspace_id=workspace_id,
                 auth_user_id=checked_principal.subject,
                 connection_id=connection_id,
-                provider_revocation_required=not revoked,
+                provider_revocation_required=provider_revocation_required,
             )
             if inspect.isawaitable(disconnected):
                 disconnected = await disconnected
         except Exception:
             raise ProviderOAuthError("provider_oauth_state_invalid") from None
+        if remote_revoke_cancelled is not None:
+            raise remote_revoke_cancelled
         return FlowAccountDisconnectOutcome(
             status=(
                 "provider_revocation_required"

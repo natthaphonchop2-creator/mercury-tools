@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
+from pydantic import ValidationError
 from starlette.requests import Request
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -811,6 +813,131 @@ async def test_all_runtime_backed_handlers_preserve_results_when_runtime_close_f
         )
     ).status == "ok"
     assert runtime.close_count == 6
+
+
+@pytest.mark.asyncio
+async def test_runtime_backed_handler_propagates_close_cancellation() -> None:
+    from mercury_tools.mcp.v1_tools import list_provider_connections
+
+    class ConnectionStore:
+        def list_for_workspace(self, **_kwargs: object) -> tuple[object, ...]:
+            return ()
+
+    class Runtime:
+        connection_store = ConnectionStore()
+
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await list_provider_connections(
+            _authenticated_context(),
+            workspace_id=WORKSPACE_ID,
+            service_factory=_workspace_service_type(),
+            runtime_factory=Runtime,
+        )
+
+
+def test_flowaccount_disconnect_public_variants_exclude_contradictory_outcomes() -> None:
+    from mercury_tools.mcp.v1_schemas import (
+        DisconnectProviderOutput,
+        FlowAccountDisconnectedData,
+        FlowAccountRevocationRequiredData,
+    )
+
+    disconnected = [
+        FlowAccountDisconnectedData(
+            provider="flowaccount",
+            status="disconnected",
+            local_credentials_deleted=True,
+            remote_revocation_status=remote_revocation_status,
+            deleted_envelope_count=1,
+            provider_revocation_required=False,
+            revision=2,
+        )
+        for remote_revocation_status in ("revoked", "not_supported", "already_disconnected")
+    ]
+    revocation_required = [
+        FlowAccountRevocationRequiredData(
+            provider="flowaccount",
+            status="provider_revocation_required",
+            local_credentials_deleted=True,
+            remote_revocation_status=remote_revocation_status,
+            deleted_envelope_count=1,
+            provider_revocation_required=True,
+            revision=2,
+        )
+        for remote_revocation_status in ("failed", "already_disconnected")
+    ]
+    local_only = disconnected[1]
+    failed_revoke = revocation_required[0]
+    assert local_only.remote_revocation_status == "not_supported"
+    assert failed_revoke.remote_revocation_status == "failed"
+
+    with pytest.raises(ValidationError):
+        FlowAccountDisconnectedData(
+            provider="flowaccount",
+            status="disconnected",
+            local_credentials_deleted=True,
+            remote_revocation_status="failed",
+            deleted_envelope_count=1,
+            provider_revocation_required=False,
+            revision=2,
+        )
+    with pytest.raises(ValidationError):
+        FlowAccountRevocationRequiredData(
+            provider="flowaccount",
+            status="provider_revocation_required",
+            local_credentials_deleted=True,
+            remote_revocation_status="already_disconnected",
+            deleted_envelope_count=0,
+            provider_revocation_required=False,
+            revision=2,
+        )
+
+    output = DisconnectProviderOutput.model_validate(
+        {
+            "status": "ok",
+            "workspace_id": str(WORKSPACE_ID),
+            "connection_id": str(CONNECTION_ID),
+            "provider": "flowaccount",
+            "environment": "sandbox",
+            "data": local_only.model_dump(),
+            "next_allowed_actions": ["list_provider_connections"],
+        }
+    )
+    assert isinstance(output.data, type(local_only))
+
+
+@pytest.mark.asyncio
+async def test_published_disconnect_schema_uses_only_valid_flowaccount_variants() -> None:
+    from mercury_tools.mcp.server import StrictInputFastMCP
+    from mercury_tools.mcp.v1_tools import configure_v1_tools
+
+    server = StrictInputFastMCP("Mercury V1 disconnect variants")
+    configure_v1_tools(server, enabled=True)
+    tools = {tool.name: tool for tool in await server.list_tools()}
+    output_schema = tools["disconnect_provider"].outputSchema
+    assert output_schema is not None
+    definitions = output_schema["$defs"]
+    assert isinstance(definitions, dict)
+    disconnected = definitions["FlowAccountDisconnectedData"]
+    revocation_required = definitions["FlowAccountRevocationRequiredData"]
+    assert disconnected["properties"]["status"]["const"] == "disconnected"
+    assert disconnected["properties"]["provider_revocation_required"]["const"] is False
+    assert disconnected["properties"]["remote_revocation_status"]["enum"] == [
+        "revoked",
+        "not_supported",
+        "already_disconnected",
+    ]
+    assert revocation_required["properties"]["status"]["const"] == "provider_revocation_required"
+    assert revocation_required["properties"]["provider_revocation_required"]["const"] is True
+    assert revocation_required["properties"]["remote_revocation_status"]["enum"] == [
+        "failed",
+        "already_disconnected",
+    ]
+    data_schema = definitions["Success"]["properties"]["data"]
+    assert data_schema["discriminator"]["propertyName"] == "provider"
 
 
 @pytest.mark.asyncio

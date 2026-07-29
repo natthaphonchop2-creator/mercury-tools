@@ -630,6 +630,146 @@ async def test_disconnect_remotely_revokes_supported_flowaccount_authorization_b
 
 
 @pytest.mark.asyncio
+async def test_disconnect_without_advertised_revocation_endpoint_is_local_only_and_idempotent(
+) -> None:
+    class NoRevocationEndpointClient(FakeOAuthClient):
+        async def start_authorization(self, **kwargs: object) -> OAuthAuthorizationSession:
+            session = await super().start_authorization(**kwargs)  # type: ignore[arg-type]
+            return session.model_copy(update={"revocation_endpoint": None})
+
+    service, oauth_client, _, _, connection_store, _ = _service(
+        oauth_client=NoRevocationEndpointClient()
+    )
+    started = await service.start(
+        _principal(),
+        WORKSPACE_ID,
+        "flowaccount",
+        "sandbox",
+    )
+    state = parse_qs(urlsplit(started.authorization_url).query)["state"][0]
+    connected = await service.complete_callback(
+        OAuthCallback(code="authorization-code", state=state)
+    )
+
+    result = await service.disconnect(_principal(), WORKSPACE_ID, connected.connection_id)
+
+    assert result.status == "disconnected"
+    assert result.local_credentials_deleted is True
+    assert result.remote_revocation_status == "not_supported"
+    assert result.provider_revocation_required is False
+    assert connection_store.store._envelopes == {}
+    assert oauth_client.revocations == 0
+
+    repeated = await service.disconnect(_principal(), WORKSPACE_ID, connected.connection_id)
+
+    assert repeated.status == "disconnected"
+    assert repeated.remote_revocation_status == "already_disconnected"
+    assert repeated.provider_revocation_required is False
+    assert oauth_client.revocations == 0
+
+
+@pytest.mark.asyncio
+async def test_disconnect_records_revocation_obligation_after_remote_failure_and_is_idempotent(
+) -> None:
+    class FailedRevocationClient(FakeOAuthClient):
+        async def revoke(
+            self,
+            *,
+            session: OAuthAuthorizationSession,
+            tokens: FlowAccountOAuthTokens,
+        ) -> bool:
+            assert session.revocation_endpoint == REVOCATION_ENDPOINT
+            assert tokens.token_type == "Bearer"
+            self.revocations += 1
+            return False
+
+    service, oauth_client, _, _, connection_store, _ = _service(
+        oauth_client=FailedRevocationClient()
+    )
+    started = await service.start(
+        _principal(),
+        WORKSPACE_ID,
+        "flowaccount",
+        "sandbox",
+    )
+    state = parse_qs(urlsplit(started.authorization_url).query)["state"][0]
+    connected = await service.complete_callback(
+        OAuthCallback(code="authorization-code", state=state)
+    )
+
+    result = await service.disconnect(_principal(), WORKSPACE_ID, connected.connection_id)
+
+    assert result.status == "provider_revocation_required"
+    assert result.local_credentials_deleted is True
+    assert result.remote_revocation_status == "failed"
+    assert result.provider_revocation_required is True
+    assert connection_store.store._envelopes == {}
+    assert oauth_client.revocations == 1
+
+    repeated = await service.disconnect(_principal(), WORKSPACE_ID, connected.connection_id)
+
+    assert repeated.status == "provider_revocation_required"
+    assert repeated.remote_revocation_status == "already_disconnected"
+    assert repeated.provider_revocation_required is True
+    assert oauth_client.revocations == 1
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancellation_deletes_local_credentials_and_remains_idempotent(
+) -> None:
+    revocation_started = asyncio.Event()
+
+    class BlockingRevocationClient(FakeOAuthClient):
+        async def revoke(
+            self,
+            *,
+            session: OAuthAuthorizationSession,
+            tokens: FlowAccountOAuthTokens,
+        ) -> bool:
+            assert session.revocation_endpoint == REVOCATION_ENDPOINT
+            assert tokens.token_type == "Bearer"
+            self.revocations += 1
+            revocation_started.set()
+            await asyncio.Event().wait()
+            return True
+
+    service, oauth_client, _, _, connection_store, _ = _service(
+        oauth_client=BlockingRevocationClient()
+    )
+    started = await service.start(
+        _principal(),
+        WORKSPACE_ID,
+        "flowaccount",
+        "sandbox",
+    )
+    state = parse_qs(urlsplit(started.authorization_url).query)["state"][0]
+    connected = await service.complete_callback(
+        OAuthCallback(code="authorization-code", state=state)
+    )
+
+    task = asyncio.create_task(
+        service.disconnect(_principal(), WORKSPACE_ID, connected.connection_id)
+    )
+    await revocation_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    disconnected = connection_store.store._connections[connected.connection_id]
+    assert disconnected.readiness is ConnectionReadiness.DISCONNECTED
+    assert disconnected.provider_revocation_required is True
+    assert connection_store.store._envelopes == {}
+    assert oauth_client.revocations == 1
+
+    repeated = await service.disconnect(_principal(), WORKSPACE_ID, connected.connection_id)
+
+    assert repeated.status == "provider_revocation_required"
+    assert repeated.remote_revocation_status == "already_disconnected"
+    assert repeated.provider_revocation_required is True
+    assert oauth_client.revocations == 1
+
+
+@pytest.mark.asyncio
 async def test_supabase_state_store_is_cross_instance_atomic_and_clears_verifier() -> None:
     backend = SharedOAuthStateRPCBackend()
     state_id = UUID("77777777-7777-4777-8777-777777777777")

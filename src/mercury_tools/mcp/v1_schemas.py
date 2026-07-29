@@ -275,19 +275,34 @@ class GetCapabilitySchemaOutput(V1SuccessEnvelope):
     data: ReviewedCapabilitySchemaOutput
 
 
-class FlowAccountDisconnectData(V1PublicModel):
+class FlowAccountDisconnectedData(V1PublicModel):
     provider: Literal["flowaccount"]
-    status: Literal["disconnected", "provider_revocation_required"]
-    local_credentials_deleted: bool
+    status: Literal["disconnected"]
+    local_credentials_deleted: Literal[True]
     remote_revocation_status: Literal[
         "revoked",
         "not_supported",
-        "failed",
         "already_disconnected",
     ]
     deleted_envelope_count: int = Field(ge=0, le=16)
-    provider_revocation_required: bool
+    provider_revocation_required: Literal[False]
     revision: int = Field(ge=1)
+
+
+class FlowAccountRevocationRequiredData(V1PublicModel):
+    provider: Literal["flowaccount"]
+    status: Literal["provider_revocation_required"]
+    local_credentials_deleted: Literal[True]
+    remote_revocation_status: Literal["failed", "already_disconnected"]
+    deleted_envelope_count: int = Field(ge=0, le=16)
+    provider_revocation_required: Literal[True]
+    revision: int = Field(ge=1)
+
+
+FlowAccountDisconnectData: TypeAlias = Annotated[
+    FlowAccountDisconnectedData | FlowAccountRevocationRequiredData,
+    Field(discriminator="status"),
+]
 
 
 class PeakDisconnectData(V1PublicModel):
@@ -321,7 +336,9 @@ __all__ = [
     "DisconnectProviderData",
     "DisconnectProviderInput",
     "DisconnectProviderOutput",
+    "FlowAccountDisconnectedData",
     "FlowAccountDisconnectData",
+    "FlowAccountRevocationRequiredData",
     "FlowAccountConnectionOutput",
     "FlowAccountConnectionStart",
     "FlowAccountConnectionStartData",

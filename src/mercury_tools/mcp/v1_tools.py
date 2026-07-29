@@ -35,8 +35,9 @@ from mercury_tools.mcp.v1_schemas import (
     DisconnectProviderOutput,
     FlowAccountConnectionOutput,
     FlowAccountConnectionStartData,
-    FlowAccountDisconnectData,
+    FlowAccountDisconnectedData,
     FlowAccountProviderOutput,
+    FlowAccountRevocationRequiredData,
     GetCapabilitySchemaOutput,
     GetMercuryContextOutput,
     ListAccountingProvidersOutput,
@@ -207,7 +208,7 @@ async def _close_runtime(runtime: Any) -> None:
     if callable(close):
         try:
             await _await_value(close())
-        except BaseException:
+        except Exception:
             return
 
 
@@ -853,15 +854,26 @@ async def disconnect_provider(
                     connection_id,
                 )
             )
-            data: DisconnectProviderData = FlowAccountDisconnectData(
-                provider="flowaccount",
-                status=disconnected.status,
-                local_credentials_deleted=disconnected.local_credentials_deleted,
-                remote_revocation_status=disconnected.remote_revocation_status,
-                deleted_envelope_count=disconnected.deleted_envelope_count,
-                provider_revocation_required=disconnected.provider_revocation_required,
-                revision=disconnected.revision,
-            )
+            if disconnected.provider_revocation_required:
+                data: DisconnectProviderData = FlowAccountRevocationRequiredData(
+                    provider="flowaccount",
+                    status=disconnected.status,
+                    local_credentials_deleted=disconnected.local_credentials_deleted,
+                    remote_revocation_status=disconnected.remote_revocation_status,
+                    deleted_envelope_count=disconnected.deleted_envelope_count,
+                    provider_revocation_required=disconnected.provider_revocation_required,
+                    revision=disconnected.revision,
+                )
+            else:
+                data = FlowAccountDisconnectedData(
+                    provider="flowaccount",
+                    status=disconnected.status,
+                    local_credentials_deleted=disconnected.local_credentials_deleted,
+                    remote_revocation_status=disconnected.remote_revocation_status,
+                    deleted_envelope_count=disconnected.deleted_envelope_count,
+                    provider_revocation_required=disconnected.provider_revocation_required,
+                    revision=disconnected.revision,
+                )
         else:
             disconnected = await _await_value(
                 runtime.peak_setup_service.disconnect(
