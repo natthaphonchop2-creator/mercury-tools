@@ -87,10 +87,7 @@ V1_BEHAVIOR_MATRIX: dict[str, ToolBehavior] = {
     "connector_status": ToolBehavior(False, False, False, False, requires_workspace=True),
     "list_provider_capabilities": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
     "get_capability_schema": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
-    "disconnect_provider": ToolBehavior(
-        *_CLOSED_DESTRUCTIVE_IDEMPOTENT,
-        requires_workspace=True,
-    ),
+    "disconnect_provider": ToolBehavior(False, True, True, True, requires_workspace=True),
 }
 
 _MUTUALLY_EXCLUSIVE_SOURCE_FIELDS = frozenset(

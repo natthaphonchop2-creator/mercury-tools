@@ -1452,6 +1452,31 @@ class ProviderConnectionStore:
             )
         )
 
+    def load_connection(
+        self,
+        *,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        connection_id: UUID,
+    ) -> ProviderConnection:
+        self._bound_ids(tenant_id, workspace_id, auth_user_id)
+        self._require_uuid(connection_id)
+        with self._lock:
+            connection = self._connections.get(connection_id)
+            if connection is None or (
+                connection.tenant_id,
+                connection.workspace_id,
+                connection.auth_user_id,
+            ) != (tenant_id, workspace_id, auth_user_id):
+                raise ProviderStoreError("provider_connection_not_found")
+            if (
+                connection.provider_account_id == f"oauth-pending-{connection.id}"
+                or not self._connection_generation_is_dispatchable(connection)
+            ):
+                raise ProviderStoreError("provider_connection_not_found")
+            return connection
+
     def _connection_generation_is_dispatchable(
         self,
         connection: ProviderConnection,
@@ -2484,6 +2509,79 @@ class SupabaseProviderConnectionStore:
                     raise ValueError
                 summaries.append(summary)
             return tuple(summaries)
+        except ProviderStoreError:
+            raise
+        except Exception:
+            raise ProviderStoreError("provider_connection_invalid") from None
+
+    def load_connection(
+        self,
+        *,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+        connection_id: UUID,
+    ) -> ProviderConnection:
+        try:
+            ProviderConnectionStore._bound_ids(tenant_id, workspace_id, auth_user_id)
+            ProviderConnectionStore._require_uuid(connection_id)
+            row = self._rpc_one(
+                "load_mercury_provider_connection_backend",
+                {
+                    "p_tenant_id": str(tenant_id),
+                    "p_workspace_id": str(workspace_id),
+                    "p_auth_user_id": str(auth_user_id),
+                    "p_connection_id": str(connection_id),
+                },
+            )
+            expected_keys = {
+                "connection_id",
+                "provider",
+                "environment",
+                "provider_account_id",
+                "account_display_name",
+                "authorization_method",
+                "granted_permissions",
+                "readiness",
+                "revision",
+                "last_validated_at",
+                "credential_envelope_ids",
+                "provider_revocation_required",
+                "disconnected_at",
+                "created_at",
+                "updated_at",
+            }
+            if set(row) != expected_keys:
+                raise ValueError
+            envelope_ids = tuple(UUID(str(item)) for item in row["credential_envelope_ids"])
+            return ProviderConnection(
+                id=UUID(str(row["connection_id"])),
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                auth_user_id=auth_user_id,
+                provider=row["provider"],
+                environment=row["environment"],
+                provider_account_id=row["provider_account_id"],
+                account_display_name=row["account_display_name"],
+                authorization_method=row["authorization_method"],
+                granted_permissions=ProviderConnectionStore._permissions(row["granted_permissions"]),
+                readiness=row["readiness"],
+                revision=row["revision"],
+                last_validated_at=(
+                    _rpc_timestamp(row["last_validated_at"])
+                    if row["last_validated_at"] is not None
+                    else None
+                ),
+                credential_envelope_ids=envelope_ids,
+                provider_revocation_required=row["provider_revocation_required"],
+                disconnected_at=(
+                    _rpc_timestamp(row["disconnected_at"])
+                    if row["disconnected_at"] is not None
+                    else None
+                ),
+                created_at=_rpc_timestamp(row["created_at"]),
+                updated_at=_rpc_timestamp(row["updated_at"]),
+            )
         except ProviderStoreError:
             raise
         except Exception:

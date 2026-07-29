@@ -41,8 +41,10 @@ from mercury_tools.credentials.models import CredentialBinding, CredentialEnvelo
 from mercury_tools.credentials.vault import CredentialVault, CredentialVaultError
 from mercury_tools.providers.base import ProviderStatusClass
 from mercury_tools.providers.flowaccount import (
+    FlowAccountOAuthRevocationMaterial,
     FlowAccountOAuthTokens,
     FlowAccountRefreshRequest,
+    open_flowaccount_revocation_material,
     open_flowaccount_tokens,
     seal_flowaccount_credentials,
 )
@@ -369,6 +371,20 @@ class ProviderAuthorizationStart(_OAuthModel):
     @classmethod
     def validate_expiry(cls, value: datetime) -> datetime:
         return _aware_utc(value, code="provider_oauth_request_invalid")
+
+
+class FlowAccountDisconnectOutcome(_OAuthModel):
+    status: Literal["disconnected", "provider_revocation_required"]
+    local_credentials_deleted: bool
+    remote_revocation_status: Literal[
+        "revoked",
+        "not_supported",
+        "failed",
+        "already_disconnected",
+    ]
+    provider_revocation_required: bool
+    deleted_envelope_count: int = Field(ge=0, le=16)
+    revision: int = Field(ge=1)
 
 
 class _StoredOAuthPayload(_OAuthModel):
@@ -1759,6 +1775,98 @@ class ProviderOAuthService:
             mercury_access_token=access.mercury_access_token,
         )
 
+    async def disconnect(
+        self,
+        principal: MercuryPrincipal,
+        workspace_id: UUID,
+        connection_id: UUID,
+    ) -> FlowAccountDisconnectOutcome:
+        """Revoke supported OAuth authorization, then remove local credentials."""
+
+        try:
+            checked_principal = MercuryPrincipal.model_validate(principal)
+            access_token = self._mercury_access_token(checked_principal)
+            if inspect.isawaitable(access_token):
+                access_token = await access_token
+            if not isinstance(access_token, str) or not access_token:
+                raise ValueError
+            membership = self._workspace_service.require_workspace(
+                checked_principal,
+                access_token,
+                workspace_id,
+                WorkspaceRole.MEMBER,
+            )
+            if inspect.isawaitable(membership):
+                membership = await membership
+            connection = self._connection_store.load_connection(
+                tenant_id=membership.tenant_id,
+                workspace_id=workspace_id,
+                auth_user_id=checked_principal.subject,
+                connection_id=connection_id,
+            )
+            if inspect.isawaitable(connection):
+                connection = await connection
+            checked_connection = ProviderConnection.model_validate(connection)
+            if (
+                checked_connection.provider is not ProviderId.FLOWACCOUNT
+                or checked_connection.authorization_method is not AuthorizationMethod.OAUTH2_PKCE
+            ):
+                raise ValueError
+        except Exception:
+            raise ProviderOAuthError("provider_oauth_state_invalid") from None
+
+        if checked_connection.readiness is ConnectionReadiness.DISCONNECTED:
+            return FlowAccountDisconnectOutcome(
+                status=(
+                    "provider_revocation_required"
+                    if checked_connection.provider_revocation_required
+                    else "disconnected"
+                ),
+                local_credentials_deleted=True,
+                remote_revocation_status="already_disconnected",
+                provider_revocation_required=checked_connection.provider_revocation_required,
+                deleted_envelope_count=0,
+                revision=checked_connection.revision,
+            )
+
+        remote_revocation_status: Literal["revoked", "not_supported", "failed"] = "not_supported"
+        revoked = False
+        try:
+            material = self._flowaccount_revocation_material(checked_connection)
+            if material.revocation_endpoint is not None:
+                revoked = await self._oauth_client.revoke(
+                    session=self._revocation_session(material),
+                    tokens=material.tokens,
+                )
+                remote_revocation_status = "revoked" if revoked else "failed"
+        except Exception:
+            remote_revocation_status = "failed"
+            revoked = False
+        try:
+            disconnected = self._connection_store.disconnect(
+                tenant_id=membership.tenant_id,
+                workspace_id=workspace_id,
+                auth_user_id=checked_principal.subject,
+                connection_id=connection_id,
+                provider_revocation_required=not revoked,
+            )
+            if inspect.isawaitable(disconnected):
+                disconnected = await disconnected
+        except Exception:
+            raise ProviderOAuthError("provider_oauth_state_invalid") from None
+        return FlowAccountDisconnectOutcome(
+            status=(
+                "provider_revocation_required"
+                if disconnected.provider_revocation_required
+                else "disconnected"
+            ),
+            local_credentials_deleted=True,
+            remote_revocation_status=remote_revocation_status,
+            provider_revocation_required=disconnected.provider_revocation_required,
+            deleted_envelope_count=disconnected.deleted_envelope_count,
+            revision=disconnected.revision,
+        )
+
     async def complete_callback(
         self,
         callback: OAuthCallback,
@@ -1888,6 +1996,7 @@ class ProviderOAuthService:
                 client_id=payload.client_id,
                 client_secret=payload.client_secret,
                 token_endpoint_auth_method=payload.token_endpoint_auth_method,
+                revocation_endpoint=payload.revocation_endpoint,
             )
             connection = self._connection_store.attach_oauth_attempt(
                 attempt_id=attempt_id,
@@ -1975,6 +2084,7 @@ class ProviderOAuthService:
                 client_id=payload.client_id,
                 client_secret=payload.client_secret,
                 token_endpoint_auth_method=payload.token_endpoint_auth_method,
+                revocation_endpoint=payload.revocation_endpoint,
             )
             finalize = {
                 "attempt_id": attempt_id,
@@ -2105,6 +2215,36 @@ class ProviderOAuthService:
             vault=self._vault,
             connection=connection,
             envelopes=envelopes,
+        )
+
+    def _flowaccount_revocation_material(
+        self,
+        connection: ProviderConnection,
+    ) -> FlowAccountOAuthRevocationMaterial:
+        envelopes = self._connection_store.load_runtime_envelopes(connection)
+        if inspect.isawaitable(envelopes):
+            raise ProviderOAuthError("provider_oauth_state_invalid")
+        return open_flowaccount_revocation_material(
+            vault=self._vault,
+            connection=connection,
+            envelopes=envelopes,
+        )
+
+    def _revocation_session(
+        self,
+        material: FlowAccountOAuthRevocationMaterial,
+    ) -> OAuthAuthorizationSession:
+        return OAuthAuthorizationSession(
+            authorization_url=material.resource_uri,
+            resource_uri=material.resource_uri,
+            authorization_endpoint=material.resource_uri,
+            token_endpoint=material.token_endpoint,
+            revocation_endpoint=material.revocation_endpoint,
+            callback_uri=_provider_callback_uri(self._settings),
+            client_id=material.client_id,
+            client_secret=material.client_secret,
+            token_endpoint_auth_method=material.token_endpoint_auth_method,
+            granted_permissions=material.granted_permissions,
         )
 
     def _fail_oauth_attempt(
@@ -2478,6 +2618,7 @@ def _oauth_tokens(
 __all__ = [
     "DownstreamMCPOAuthClient",
     "FLOWACCOUNT_CALLBACK_PATH",
+    "FlowAccountDisconnectOutcome",
     "InMemoryProviderOAuthStateStore",
     "OAuthNetworkGuard",
     "OAuthAuthorizationSession",

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import threading
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Annotated, Any, Literal, TypeAlias
 from uuid import UUID
@@ -34,6 +35,7 @@ from mercury_tools.mcp.v1_schemas import (
     DisconnectProviderOutput,
     FlowAccountConnectionOutput,
     FlowAccountConnectionStartData,
+    FlowAccountDisconnectData,
     FlowAccountProviderOutput,
     GetCapabilitySchemaOutput,
     GetMercuryContextOutput,
@@ -42,6 +44,7 @@ from mercury_tools.mcp.v1_schemas import (
     ListProviderConnectionsOutput,
     PeakConnectionOutput,
     PeakConnectionStartData,
+    PeakDisconnectData,
     PeakProviderOutput,
     ProviderCapabilityOutput,
     ProviderConnectionOutput,
@@ -52,10 +55,19 @@ from mercury_tools.mcp.v1_schemas import (
 )
 from mercury_tools.providers.models import (
     ConnectionReadiness,
+    ProviderConnection,
     ProviderConnectionSummary,
     ProviderId,
 )
 from mercury_tools.providers.production import build_provider_oauth_production_composition
+from mercury_tools.providers.streamable_mcp import (
+    ProviderOperationDeadline,
+    provider_operation_deadline,
+)
+from mercury_tools.qualification.provider_mcp import (
+    CapabilityResolution,
+    CapabilitySelection,
+)
 from mercury_tools.workspaces.models import WorkspaceMembership, WorkspaceRole
 from mercury_tools.workspaces.service import WorkspaceService
 
@@ -108,12 +120,13 @@ _DISCONNECT_PROVIDER = ToolAnnotations(
     readOnlyHint=False,
     destructiveHint=True,
     idempotentHint=True,
-    openWorldHint=False,
+    openWorldHint=True,
 )
 _V1_TOOL_META = {
     "mercury/surface": "v1",
     "mercury/error-schema": "mercury.v1.error.v1",
 }
+_V1_CONFIGURATION_LOCK = threading.RLock()
 
 
 def _workspace_service() -> WorkspaceService:
@@ -192,7 +205,10 @@ async def _runtime_from(factory: ProviderRuntimeFactory | None) -> Any:
 async def _close_runtime(runtime: Any) -> None:
     close = getattr(runtime, "aclose", None)
     if callable(close):
-        await _await_value(close())
+        try:
+            await _await_value(close())
+        except BaseException:
+            return
 
 
 async def _record_connector_status_audit(event: dict[str, object]) -> None:
@@ -231,6 +247,26 @@ async def _store_list_connections(
     )
     resolved = await _await_value(result)
     return tuple(ProviderConnectionSummary.model_validate(item) for item in resolved)
+
+
+async def _store_load_connection(
+    runtime: Any,
+    *,
+    membership: WorkspaceMembership,
+    workspace_id: UUID,
+    principal: MercuryPrincipal,
+    connection_id: UUID,
+) -> ProviderConnection:
+    method = runtime.connection_store.load_connection
+    result = await asyncio.to_thread(
+        method,
+        tenant_id=membership.tenant_id,
+        workspace_id=workspace_id,
+        auth_user_id=principal.subject,
+        connection_id=connection_id,
+    )
+    resolved = await _await_value(result)
+    return ProviderConnection.model_validate(resolved)
 
 
 async def _catalog_qualifications(runtime: Any) -> tuple[ProviderMCPQualification, ...]:
@@ -279,32 +315,86 @@ def _qualification_matches(
     )
 
 
-def _missing_qualification_capabilities(
+def _qualification_selection(
+    qualification: ProviderMCPQualification,
+) -> CapabilitySelection:
+    return CapabilitySelection(
+        provider=qualification.provider,
+        environment=qualification.environment,
+        normalized_capability=qualification.normalized_capability,
+        provider_tool_name=qualification.provider_tool_name,
+        capability_version_sha256=qualification.capability_version_sha256,
+    )
+
+
+async def _resolve_qualification(
+    runtime: Any,
+    *,
+    connection: ProviderConnection,
+    qualification: ProviderMCPQualification,
+) -> CapabilityResolution:
+    deadline = ProviderOperationDeadline.start(5)
+    with provider_operation_deadline(deadline):
+        resolved = await _await_value(
+            runtime.qualification_resolver.resolve_for_connection(
+                connection,
+                selection=_qualification_selection(qualification),
+            )
+        )
+    if not isinstance(resolved, CapabilityResolution):
+        raise ValueError("capability_unavailable")
+    return resolved
+
+
+async def _missing_qualification_capabilities(
+    runtime: Any,
     qualifications: Iterable[ProviderMCPQualification],
-    connection: ProviderConnectionSummary,
+    connection: ProviderConnection,
 ) -> list[str]:
-    enabled = {
-        qualification.normalized_capability
-        for qualification in qualifications
-        if _qualification_matches(qualification, connection)
-        and qualification.qualification_state is QualificationState.ENABLED
-    }
+    enabled: set[str] = set()
+    for qualification in qualifications:
+        if not _qualification_matches(qualification, connection):
+            continue
+        resolution = await _resolve_qualification(
+            runtime,
+            connection=connection,
+            qualification=qualification,
+        )
+        if resolution.status == "enabled":
+            enabled.add(qualification.normalized_capability)
     return sorted(_V1_SEED_CAPABILITIES - enabled)
 
 
-def _capability_status_detail(
+async def _capability_status_detail(
+    runtime: Any,
     qualification: ProviderMCPQualification,
-    connection: ProviderConnectionSummary,
-) -> tuple[Literal["enabled", "unavailable"], str]:
+    connection: ProviderConnection,
+) -> tuple[
+    Literal["enabled", "unavailable"],
+    Literal[
+        "enabled",
+        "connection_not_ready",
+        "capability_unavailable",
+        "capability_unreviewed",
+        "insufficient_evidence",
+    ],
+]:
     if connection.readiness is not ConnectionReadiness.READY:
         return "unavailable", "connection_not_ready"
-    if qualification.qualification_state is QualificationState.ENABLED:
+    resolution = await _resolve_qualification(
+        runtime,
+        connection=connection,
+        qualification=qualification,
+    )
+    if resolution.status == "enabled":
         return "enabled", "enabled"
     if qualification.qualification_state in {
         QualificationState.DISCOVERED_UNREVIEWED,
         QualificationState.SCHEMA_VALIDATED,
     }:
         return "unavailable", "capability_unreviewed"
+    if resolution.status == "insufficient_evidence":
+        return "unavailable", "insufficient_evidence"
     return "unavailable", "capability_unavailable"
 
 
@@ -516,10 +606,18 @@ async def connector_status(
             ),
             connection_id,
         )
+        bound_connection = await _store_load_connection(
+            runtime,
+            membership=membership,
+            workspace_id=workspace_id,
+            principal=principal,
+            connection_id=connection_id,
+        )
         qualifications = await _catalog_qualifications(runtime)
-        missing_qualification_capabilities = _missing_qualification_capabilities(
+        missing_qualification_capabilities = await _missing_qualification_capabilities(
+            runtime,
             qualifications,
-            connection,
+            bound_connection,
         )
         response = ConnectorStatusOutput(
             workspace_id=workspace_id,
@@ -576,6 +674,13 @@ async def list_provider_capabilities(
             ),
             connection_id,
         )
+        bound_connection = await _store_load_connection(
+            runtime,
+            membership=membership,
+            workspace_id=workspace_id,
+            principal=principal,
+            connection_id=connection_id,
+        )
         qualifications = sorted(
             (
                 item
@@ -586,7 +691,11 @@ async def list_provider_capabilities(
         )
         data: list[ProviderCapabilityOutput] = []
         for qualification in qualifications:
-            availability, detail = _capability_status_detail(qualification, connection)
+            availability, detail = await _capability_status_detail(
+                runtime,
+                qualification,
+                bound_connection,
+            )
             data.append(
                 ProviderCapabilityOutput(
                     capability_id=qualification.normalized_capability,
@@ -624,49 +733,81 @@ async def get_capability_schema(
 
     runtime: Any | None = None
     try:
-        await _require_workspace(
+        principal, membership = await _require_workspace(
             context,
             workspace_id=workspace_id,
             service_factory=service_factory,
         )
         runtime = await _runtime_from(runtime_factory)
-        qualification = next(
-            (
-                item
-                for item in await _catalog_qualifications(runtime)
-                if item.normalized_capability == capability_id
-                and item.capability_version_sha256 == capability_version
-            ),
-            None,
+        qualifications = tuple(
+            item
+            for item in await _catalog_qualifications(runtime)
+            if item.normalized_capability == capability_id
+            and item.capability_version_sha256 == capability_version
         )
-        if qualification is None:
+        if not qualifications:
             raise ValueError("capability_unavailable")
-        if qualification.qualification_state is QualificationState.DISCOVERED_UNREVIEWED:
-            raise ValueError("capability_unreviewed")
-        return GetCapabilitySchemaOutput(
+        connections = await _store_list_connections(
+            runtime,
+            membership=membership,
             workspace_id=workspace_id,
-            capability_id=capability_id,
-            capability_version=capability_version,
-            data=ReviewedCapabilitySchemaOutput(
-                capability_id=qualification.normalized_capability,
-                capability_version=qualification.capability_version_sha256,
-                qualification_state=qualification.qualification_state,
-                schema_sha256=qualification.schema_hash,
-                response_shape_sha256=qualification.response_shape_hash,
-                input_schema_json=json.dumps(
-                    qualification.model_dump(mode="json")["input_schema"],
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ),
-                output_schema_json=json.dumps(
-                    qualification.model_dump(mode="json")["output_schema"],
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ),
-            ),
+            principal=principal,
         )
+        had_insufficient_evidence = False
+        for summary in connections:
+            for qualification in qualifications:
+                if not _qualification_matches(qualification, summary):
+                    continue
+                connection = await _store_load_connection(
+                    runtime,
+                    membership=membership,
+                    workspace_id=workspace_id,
+                    principal=principal,
+                    connection_id=summary.connection_id,
+                )
+                resolution = await _resolve_qualification(
+                    runtime,
+                    connection=connection,
+                    qualification=qualification,
+                )
+                if resolution.status == "enabled" and resolution.qualification is not None:
+                    qualification = resolution.qualification
+                    return GetCapabilitySchemaOutput(
+                        workspace_id=workspace_id,
+                        capability_id=capability_id,
+                        capability_version=capability_version,
+                        data=ReviewedCapabilitySchemaOutput(
+                            capability_id=qualification.normalized_capability,
+                            capability_version=qualification.capability_version_sha256,
+                            qualification_state=qualification.qualification_state,
+                            schema_sha256=qualification.schema_hash,
+                            response_shape_sha256=qualification.response_shape_hash,
+                            input_schema_json=json.dumps(
+                                qualification.model_dump(mode="json")["input_schema"],
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                            output_schema_json=json.dumps(
+                                qualification.model_dump(mode="json")["output_schema"],
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                        ),
+                    )
+                had_insufficient_evidence = (
+                    had_insufficient_evidence or resolution.status == "insufficient_evidence"
+                )
+        if all(
+            qualification.qualification_state
+            in {QualificationState.DISCOVERED_UNREVIEWED, QualificationState.SCHEMA_VALIDATED}
+            for qualification in qualifications
+        ):
+            raise ValueError("capability_unreviewed")
+        if had_insufficient_evidence:
+            raise ValueError("insufficient_evidence")
+        raise ValueError("capability_unavailable")
     except Exception as error:
         raise MercuryV1ToolError(public_error_code(error)) from None
     finally:
@@ -704,25 +845,43 @@ async def disconnect_provider(
             ),
             connection_id,
         )
-        disconnected = await asyncio.to_thread(
-            runtime.connection_store.disconnect,
-            tenant_id=membership.tenant_id,
-            workspace_id=workspace_id,
-            auth_user_id=principal.subject,
-            connection_id=connection_id,
-            provider_revocation_required=(connection.provider is ProviderId.PEAK),
-        )
-        disconnected = await _await_value(disconnected)
+        if connection.provider is ProviderId.FLOWACCOUNT:
+            disconnected = await _await_value(
+                runtime.provider_oauth_service.disconnect(
+                    principal,
+                    workspace_id,
+                    connection_id,
+                )
+            )
+            data: DisconnectProviderData = FlowAccountDisconnectData(
+                provider="flowaccount",
+                status=disconnected.status,
+                local_credentials_deleted=disconnected.local_credentials_deleted,
+                remote_revocation_status=disconnected.remote_revocation_status,
+                deleted_envelope_count=disconnected.deleted_envelope_count,
+                provider_revocation_required=disconnected.provider_revocation_required,
+                revision=disconnected.revision,
+            )
+        else:
+            disconnected = await _await_value(
+                runtime.peak_setup_service.disconnect(
+                    principal,
+                    workspace_id,
+                    connection_id,
+                )
+            )
+            data = PeakDisconnectData(
+                provider="peak",
+                status=disconnected.status,
+                local_credentials_deleted=disconnected.local_credentials_deleted,
+                instruction=disconnected.instruction,
+            )
         return DisconnectProviderOutput(
             workspace_id=workspace_id,
             connection_id=connection_id,
             provider=connection.provider,
             environment=connection.environment,
-            data=DisconnectProviderData(
-                deleted_envelope_count=disconnected.deleted_envelope_count,
-                provider_revocation_required=disconnected.provider_revocation_required,
-                revision=disconnected.revision,
-            ),
+            data=data,
             next_allowed_actions=["list_provider_connections"],
         )
     except Exception as error:
@@ -798,13 +957,41 @@ def configure_v1_tools(
 ) -> None:
     """Register the stable V1 surface and remove legacy tools when V1 is enabled."""
 
+    with _V1_CONFIGURATION_LOCK:
+        _configure_v1_tools(
+            server,
+            enabled=enabled,
+            service_factory=service_factory,
+            runtime_factory=runtime_factory,
+        )
+
+
+def _configure_v1_tools(
+    server: FastMCP,
+    *,
+    enabled: bool,
+    service_factory: WorkspaceServiceFactory,
+    runtime_factory: ProviderRuntimeFactory | None,
+) -> None:
     if not enabled:
         for name in V1_HOSTED_TOOL_NAMES:
             registered = server._tool_manager.get_tool(name)
             if registered is not None and _is_v1_registered_tool(registered):
                 server.remove_tool(name)
+        legacy_tools = getattr(server, "_mercury_v1_legacy_tools", ())
+        for name, registered in legacy_tools:
+            if server._tool_manager.get_tool(name) is None:
+                server._tool_manager._tools[name] = registered
         return
 
+    if not hasattr(server, "_mercury_v1_legacy_tools"):
+        legacy_tools = tuple(
+            (name, registered)
+            for name in LEGACY_HOSTED_TOOL_NAMES
+            if (registered := server._tool_manager.get_tool(name)) is not None
+            and not _is_v1_registered_tool(registered)
+        )
+        server._mercury_v1_legacy_tools = legacy_tools
     for name in LEGACY_HOSTED_TOOL_NAMES:
         registered = server._tool_manager.get_tool(name)
         if registered is not None and not _is_v1_registered_tool(registered):
@@ -963,9 +1150,9 @@ def configure_v1_tools(
         (
             disconnect_provider_tool,
             DISCONNECT_PROVIDER_TOOL,
-            "Changes: removes usable local provider authorization. External contact: none. "
-            "Omitted options: provider credential values and replacement "
-            "authorization are not accepted.",
+            "Changes: removes usable local provider authorization. External contact: "
+            "revokes supported FlowAccount OAuth authorization. Omitted options: "
+            "provider credential values and replacement authorization are not accepted.",
             _DISCONNECT_PROVIDER,
         ),
     )

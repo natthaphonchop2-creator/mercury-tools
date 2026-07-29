@@ -583,6 +583,29 @@ class CatalogQualificationResolver:
             now=snapshot.now,
         )
 
+    async def resolve_for_connection(
+        self,
+        connection: ProviderConnection,
+        *,
+        selection: CapabilitySelection,
+        deadline: ProviderOperationDeadline | None = None,
+    ) -> CapabilityResolution:
+        """Resolve public status through the same connection-bound gate as dispatch."""
+
+        checked_connection = ProviderConnection.model_validate(connection)
+        checked_selection = CapabilitySelection.model_validate(selection)
+        if (
+            checked_selection.provider != checked_connection.provider.value
+            or checked_selection.environment != checked_connection.environment
+        ):
+            return CapabilityResolution(status="capability_unavailable")
+        snapshot = await self._current_snapshot(deadline)
+        return snapshot.gate.resolve(
+            checked_selection,
+            company_sha256=_server_company_sha256(checked_connection),
+            now=snapshot.now,
+        )
+
     async def assert_binding(
         self,
         connection: ProviderConnection,

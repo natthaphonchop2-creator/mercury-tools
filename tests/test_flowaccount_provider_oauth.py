@@ -325,6 +325,10 @@ class RecordingConnectionStore:
         self.events.append("load_attempt_material")
         return self.store.load_oauth_attempt_envelopes(**kwargs)
 
+    def load_runtime_envelopes(self, connection):
+        self.events.append("load_runtime_material")
+        return self.store.load_runtime_envelopes(connection)
+
     def replace_oauth_attempt_envelopes(self, connection, envelopes):
         self.events.append("replace_attempt_material")
         return self.store.replace_oauth_attempt_envelopes(connection, envelopes)
@@ -358,6 +362,10 @@ class RecordingConnectionStore:
     def complete_revocation(self, **kwargs):
         self.events.append("complete_revocation")
         return self.store.complete_revocation(**kwargs)
+
+    def load_connection(self, **kwargs):
+        self.events.append("load_connection")
+        return self.store.load_connection(**kwargs)
 
 
 class SharedOAuthStateRPCBackend:
@@ -576,6 +584,49 @@ def _service(
         connection_store,
         vault,
     )
+
+
+@pytest.mark.asyncio
+async def test_disconnect_remotely_revokes_supported_flowaccount_authorization_before_returning(
+) -> None:
+    service, oauth_client, _, _, connection_store, _ = _service()
+    started = await service.start(
+        _principal(),
+        WORKSPACE_ID,
+        "flowaccount",
+        "sandbox",
+    )
+    state = parse_qs(urlsplit(started.authorization_url).query)["state"][0]
+    connected = await service.complete_callback(
+        OAuthCallback(code="authorization-code", state=state)
+    )
+
+    result = await service.disconnect(
+        _principal(),
+        WORKSPACE_ID,
+        connected.connection_id,
+    )
+
+    assert result.status == "disconnected"
+    assert result.local_credentials_deleted is True
+    assert result.remote_revocation_status == "revoked"
+    assert result.provider_revocation_required is False
+    assert oauth_client.revocations == 1
+    assert connection_store.store._envelopes == {}
+    assert connection_store.events[-3:] == [
+        "load_connection",
+        "load_runtime_material",
+        "disconnect",
+    ]
+
+    repeated = await service.disconnect(
+        _principal(),
+        WORKSPACE_ID,
+        connected.connection_id,
+    )
+    assert repeated.status == "disconnected"
+    assert repeated.remote_revocation_status == "already_disconnected"
+    assert oauth_client.revocations == 1
 
 
 @pytest.mark.asyncio

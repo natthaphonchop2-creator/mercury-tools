@@ -1,14 +1,23 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
 from mercury_tools.catalog.models import ProviderMCPQualification
+from mercury_tools.providers.models import (
+    AuthorizationMethod,
+    ConnectionReadiness,
+    ProviderConnection,
+    ProviderId,
+)
+from mercury_tools.providers.streamable_mcp import ProviderOperationDeadline
 from mercury_tools.qualification.artifacts import (
     build_qualification_artifact,
     load_catalog_qualification_artifact,
@@ -18,6 +27,9 @@ from mercury_tools.qualification.artifacts import (
 from mercury_tools.qualification.provider_mcp import (
     CapabilityQualificationGate,
     CapabilitySelection,
+    CatalogQualificationResolver,
+    OwnerAuthorizedCanary,
+    transition_qualification,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -197,3 +209,237 @@ def test_qualification_cli_writes_only_controlled_sanitized_artifacts(
 
     assert module.main(["--catalog-root", str(tmp_path), "--input", str(payload)]) == 0
     assert (tmp_path / "flowaccount" / "qualifications" / artifact.filename).is_file()
+
+
+@pytest.mark.asyncio
+async def test_catalog_resolver_status_uses_the_same_connection_bound_gate_as_execution(
+    tmp_path: Path,
+) -> None:
+    definition = _definition()
+    company_id = "company-enabled"
+    artifact = build_qualification_artifact(
+        definition=definition,
+        company_sha256=hashlib.sha256(company_id.encode("utf-8")).hexdigest(),
+        runner_version="test-runner-v1",
+        evaluated_at=NOW,
+        input_sha256="c" * 64,
+        sanitized_result_identifier="result_test_001",
+        checks={"schema_matches": True, "response_shape_matches": True},
+        reviewer="release_reviewer",
+        evidence_expires_at=NOW + timedelta(days=1),
+        passed=True,
+    )
+    schema_validated = transition_qualification(
+        definition,
+        target_state="schema_validated",
+        now=NOW,
+    )
+    nonproduction = transition_qualification(
+        schema_validated,
+        target_state="nonproduction_qualified",
+        evidence=artifact,
+        now=NOW,
+    )
+    enabled = transition_qualification(
+        nonproduction,
+        target_state="enabled",
+        evidence=artifact,
+        now=NOW,
+    )
+    write_qualification_artifact(tmp_path, artifact)
+
+    class Catalog:
+        def __init__(self, qualifications: tuple[ProviderMCPQualification, ...]) -> None:
+            self.qualifications = qualifications
+
+        def list_provider_mcp_qualifications(self) -> tuple[ProviderMCPQualification, ...]:
+            return self.qualifications
+
+    connection = ProviderConnection(
+        id=UUID("11111111-1111-4111-8111-111111111111"),
+        tenant_id=UUID("22222222-2222-4222-8222-222222222222"),
+        workspace_id=UUID("33333333-3333-4333-8333-333333333333"),
+        auth_user_id=UUID("44444444-4444-4444-8444-444444444444"),
+        provider=ProviderId.FLOWACCOUNT,
+        environment="sandbox",
+        provider_account_id="company-mismatch",
+        account_display_name="Sanitized Company",
+        authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+        granted_permissions=("documents.read",),
+        readiness=ConnectionReadiness.READY,
+        revision=1,
+        last_validated_at=NOW,
+        credential_envelope_ids=(UUID("55555555-5555-4555-8555-555555555555"),),
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    selection = CapabilitySelection(
+        provider=enabled.provider,
+        environment=enabled.environment,
+        normalized_capability=enabled.normalized_capability,
+        provider_tool_name=enabled.provider_tool_name,
+        capability_version_sha256=enabled.capability_version_sha256,
+    )
+
+    mismatch_resolver = CatalogQualificationResolver(
+        catalog=Catalog((enabled,)),
+        catalog_root=str(tmp_path),
+        now=lambda: NOW,
+    )
+    mismatch = await mismatch_resolver.resolve_for_connection(
+        connection,
+        selection=selection,
+        deadline=ProviderOperationDeadline.start(5),
+    )
+    assert mismatch.status == "insufficient_evidence"
+
+    expired_resolver = CatalogQualificationResolver(
+        catalog=Catalog((enabled,)),
+        catalog_root=str(tmp_path),
+        now=lambda: NOW + timedelta(days=2),
+    )
+    matching_connection = connection.model_copy(
+        update={"provider_account_id": company_id}
+    )
+    expired = await expired_resolver.resolve_for_connection(
+        matching_connection,
+        selection=selection,
+        deadline=ProviderOperationDeadline.start(5),
+    )
+    assert expired.status == "insufficient_evidence"
+
+    disabled = transition_qualification(
+        enabled,
+        target_state="disabled",
+        disable_reason="reviewed_regression",
+        now=NOW,
+    )
+    disabled_resolver = CatalogQualificationResolver(
+        catalog=Catalog((disabled,)),
+        catalog_root=str(tmp_path),
+        now=lambda: NOW,
+    )
+    terminal = await disabled_resolver.resolve_for_connection(
+        matching_connection,
+        selection=selection,
+        deadline=ProviderOperationDeadline.start(5),
+    )
+    assert terminal.status == "capability_unavailable"
+
+    superseded = transition_qualification(
+        enabled,
+        target_state="superseded",
+        disable_reason="replaced_by_reviewed_version",
+        now=NOW,
+    )
+    superseded_resolver = CatalogQualificationResolver(
+        catalog=Catalog((superseded,)),
+        catalog_root=str(tmp_path),
+        now=lambda: NOW,
+    )
+    superseded_resolution = await superseded_resolver.resolve_for_connection(
+        matching_connection,
+        selection=selection,
+        deadline=ProviderOperationDeadline.start(5),
+    )
+    assert superseded_resolution.status == "capability_unavailable"
+
+    production_definition = ProviderMCPQualification.discovered(
+        provider="flowaccount",
+        environment="production",
+        provider_tool_name="get_invoice",
+        normalized_capability="documents.invoice.get",
+        input_schema={"type": "object", "properties": {}},
+        output_schema={"type": "object", "properties": {"id": {"type": "string"}}},
+        response_shape_hash="a" * 64,
+        required_permissions=("documents.read",),
+    )
+    production_artifact = build_qualification_artifact(
+        definition=production_definition,
+        company_sha256=hashlib.sha256(company_id.encode("utf-8")).hexdigest(),
+        runner_version="test-runner-v1",
+        evaluated_at=NOW,
+        input_sha256="d" * 64,
+        sanitized_result_identifier="result_test_002",
+        checks={"schema_matches": True, "response_shape_matches": True},
+        reviewer="release_reviewer",
+        evidence_expires_at=NOW + timedelta(days=1),
+        passed=True,
+    )
+    production_schema = transition_qualification(
+        production_definition,
+        target_state="schema_validated",
+        now=NOW,
+    )
+    production_nonproduction = transition_qualification(
+        production_schema,
+        target_state="nonproduction_qualified",
+        evidence=production_artifact,
+        nonproduction_evidence=(enabled,),
+        nonproduction_artifacts=(artifact,),
+        now=NOW,
+    )
+    production_enabled = transition_qualification(
+        production_nonproduction,
+        target_state="enabled",
+        evidence=production_artifact,
+        nonproduction_evidence=(enabled,),
+        nonproduction_artifacts=(artifact,),
+        canary=OwnerAuthorizedCanary(
+            provider="flowaccount",
+            environment="production",
+            normalized_capability=production_definition.normalized_capability,
+            provider_tool_name=production_definition.provider_tool_name,
+            capability_version_sha256=production_definition.capability_version_sha256,
+            owner_authorized_by="release_reviewer",
+            authorized_at=NOW,
+        ),
+        now=NOW,
+    )
+    write_qualification_artifact(tmp_path, production_artifact)
+    production_connection = matching_connection.model_copy(update={"environment": "production"})
+    production_selection = CapabilitySelection(
+        provider=production_enabled.provider,
+        environment=production_enabled.environment,
+        normalized_capability=production_enabled.normalized_capability,
+        provider_tool_name=production_enabled.provider_tool_name,
+        capability_version_sha256=production_enabled.capability_version_sha256,
+    )
+    production_resolver = CatalogQualificationResolver(
+        catalog=Catalog((enabled, production_enabled)),
+        catalog_root=str(tmp_path),
+        now=lambda: NOW,
+    )
+    production = await production_resolver.resolve_for_connection(
+        production_connection,
+        selection=production_selection,
+        deadline=ProviderOperationDeadline.start(5),
+    )
+    assert production.status == "enabled"
+
+    missing_reference_resolver = CatalogQualificationResolver(
+        catalog=Catalog((production_enabled,)),
+        catalog_root=str(tmp_path),
+        now=lambda: NOW,
+    )
+    missing_reference = await missing_reference_resolver.resolve_for_connection(
+        production_connection,
+        selection=production_selection,
+        deadline=ProviderOperationDeadline.start(5),
+    )
+    assert missing_reference.status == "insufficient_evidence"
+
+    future_canary = production_enabled.model_copy(
+        update={"production_canary_at": NOW + timedelta(seconds=1)}
+    )
+    future_canary_resolver = CatalogQualificationResolver(
+        catalog=Catalog((enabled, future_canary)),
+        catalog_root=str(tmp_path),
+        now=lambda: NOW,
+    )
+    future_canary_resolution = await future_canary_resolver.resolve_for_connection(
+        production_connection,
+        selection=production_selection,
+        deadline=ProviderOperationDeadline.start(5),
+    )
+    assert future_canary_resolution.status == "insufficient_evidence"

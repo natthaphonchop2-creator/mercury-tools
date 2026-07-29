@@ -26,6 +26,9 @@ OAUTH_ATTEMPT_MIGRATION = (
 OAUTH_GENERATION_MIGRATION = (
     ROOT / "supabase/migrations/20260728120000_mercury_v1_provider_oauth_generations.sql"
 )
+LOOKUP_MIGRATION = (
+    ROOT / "supabase/migrations/20260729110000_mercury_v1_provider_connection_lookup.sql"
+)
 
 TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
 OTHER_TENANT_ID = UUID("22222222-2222-4222-8222-222222222222")
@@ -962,6 +965,31 @@ def test_public_list_filters_only_exact_legacy_oauth_discriminator() -> None:
     assert [item.connection_id for item in listed] == [THIRD_CONNECTION_ID]
 
 
+def test_server_only_connection_lookup_is_bound_and_never_serializes_company_identity() -> None:
+    from mercury_tools.providers.store import ProviderStoreError
+
+    store = _store()
+    _save_connection(store)
+
+    loaded = store.load_connection(
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=AUTH_USER_ID,
+        connection_id=CONNECTION_ID,
+    )
+
+    assert loaded.provider_account_id == "company-123"
+    assert "company-123" not in repr(loaded)
+    assert "company-123" not in loaded.model_dump_json()
+    with pytest.raises(ProviderStoreError, match="^provider_connection_not_found$"):
+        store.load_connection(
+            tenant_id=OTHER_TENANT_ID,
+            workspace_id=WORKSPACE_ID,
+            auth_user_id=AUTH_USER_ID,
+            connection_id=CONNECTION_ID,
+        )
+
+
 @pytest.mark.parametrize(
     ("revision", "environment", "company_or_merchant_id"),
     [
@@ -1068,6 +1096,7 @@ def test_store_interface_requires_explicit_uuid_tenant_user_workspace_binding() 
         "consume_attempt",
         "save_connection",
         "list_for_workspace",
+        "load_connection",
         "disconnect",
     ):
         signature = inspect.signature(getattr(ProviderConnectionStore, method_name))
@@ -1078,6 +1107,19 @@ def test_store_interface_requires_explicit_uuid_tenant_user_workspace_binding() 
 
     signature = inspect.signature(ProviderConnectionStore.list_for_workspace)
     assert "active_workspace_id" not in signature.parameters
+
+
+def test_provider_connection_lookup_migration_is_service_role_only() -> None:
+    sql = _normalized_sql(LOOKUP_MIGRATION)
+
+    assert "security definer" in sql
+    assert "mercury_assert_provider_backend_workspace_access" in sql
+    assert "provider_account_id" in sql
+    assert "credential_envelope_ids" in sql
+    assert "revoke all on function public.load_mercury_provider_connection_backend" in sql
+    assert "from public, anon, authenticated" in sql
+    assert "to service_role" in sql
+    assert "to authenticated" not in sql
 
 
 def test_provider_connection_migration_is_expand_first_and_secretless() -> None:

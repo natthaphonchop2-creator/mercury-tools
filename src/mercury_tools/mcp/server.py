@@ -18,7 +18,8 @@ from urllib.parse import urlparse
 
 import httpx
 from mcp.server.fastmcp import FastMCP
-from mcp.types import ToolAnnotations
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import TextContent, ToolAnnotations
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -197,6 +198,26 @@ class StrictInputFastMCP(FastMCP):
             raise RuntimeError("FastMCP did not retain the registered tool")
         registered.fn_metadata.output_schema = dict(schema)
         registered.__dict__.pop("output_schema", None)
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> Any:
+        """Return V1 failures through their published closed output union."""
+
+        try:
+            return await super().call_tool(name, arguments)
+        except ToolError as error:
+            registered = self._tool_manager.get_tool(name)
+            metadata = getattr(registered, "meta", None)
+            if not isinstance(metadata, Mapping) or metadata.get("mercury/surface") != "v1":
+                raise
+            from mercury_tools.mcp.v1_errors import error_output
+
+            output = error_output(error)
+            payload = output.model_dump(mode="json")
+            return ([TextContent(type="text", text=output.model_dump_json())], payload)
 
 
 mcp = StrictInputFastMCP("Mercury Tools")
@@ -4143,7 +4164,10 @@ def _validate_v1_cloud_dependencies(dependencies: Any) -> None:
     )
     if provider_oauth_service is None:
         raise V1ConfigurationError("v1_provider_oauth_service_missing")
-    if not callable(getattr(provider_oauth_service, "complete_callback", None)):
+    if not all(
+        callable(getattr(provider_oauth_service, method, None))
+        for method in ("complete_callback", "disconnect")
+    ):
         raise V1ConfigurationError("v1_provider_oauth_service_invalid")
     peak_setup_service = getattr(
         dependencies,

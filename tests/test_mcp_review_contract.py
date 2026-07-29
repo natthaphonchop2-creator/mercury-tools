@@ -807,10 +807,10 @@ def test_behavior_matrix_covers_every_stable_v1_tool_with_exact_annotations() ->
         "connector_status": (False, False, False, False, True),
         "list_provider_capabilities": (True, False, None, False, True),
         "get_capability_schema": (True, False, None, False, True),
-        "disconnect_provider": (False, True, True, False, True),
+        "disconnect_provider": (False, True, True, True, True),
     }
 
-    assert V1_HOSTED_TOOL_NAMES == set(module.V1_BEHAVIOR_MATRIX)
+    assert set(module.V1_BEHAVIOR_MATRIX) == V1_HOSTED_TOOL_NAMES
     for name, expected_behavior in expected.items():
         behavior = module.V1_BEHAVIOR_MATRIX[name]
         assert (*behavior.annotation_values, behavior.requires_workspace) == expected_behavior

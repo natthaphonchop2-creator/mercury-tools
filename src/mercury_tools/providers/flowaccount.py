@@ -217,6 +217,7 @@ class FlowAccountRefreshRequest(_FlowAccountModel):
 class _CredentialBundle(_FlowAccountModel):
     token_endpoint: str
     resource_uri: str
+    revocation_endpoint: str | None = None
     client_id: str = Field(min_length=1, max_length=1024)
     token_endpoint_auth_method: Literal[
         "none",
@@ -226,9 +227,11 @@ class _CredentialBundle(_FlowAccountModel):
     expires_at: datetime
     granted_permissions: tuple[str, ...]
 
-    @field_validator("token_endpoint", "resource_uri")
+    @field_validator("token_endpoint", "resource_uri", "revocation_endpoint")
     @classmethod
-    def validate_endpoint(cls, value: str) -> str:
+    def validate_endpoint(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
         return _clean_https_url(value, code="flowaccount_credentials_invalid")
 
     @field_validator("expires_at")
@@ -266,6 +269,23 @@ class _OpenedCredentials:
             if value is not None:
                 with suppress(Exception):
                     value[:] = b"\x00" * len(value)
+
+
+class FlowAccountOAuthRevocationMaterial(_FlowAccountModel):
+    """Server-only credential material required for one OAuth revocation call."""
+
+    tokens: FlowAccountOAuthTokens = Field(repr=False, exclude=True)
+    token_endpoint: str = Field(repr=False, exclude=True)
+    resource_uri: str = Field(repr=False, exclude=True)
+    revocation_endpoint: str | None = Field(default=None, repr=False, exclude=True)
+    client_id: str = Field(repr=False, exclude=True)
+    client_secret: str | None = Field(default=None, repr=False, exclude=True)
+    token_endpoint_auth_method: Literal[
+        "none",
+        "client_secret_basic",
+        "client_secret_post",
+    ]
+    granted_permissions: tuple[str, ...]
 
 
 CredentialEnvelopeLoader = Callable[
@@ -312,6 +332,7 @@ def seal_flowaccount_credentials(
         "client_secret_basic",
         "client_secret_post",
     ],
+    revocation_endpoint: str | None = None,
 ) -> tuple[CredentialEnvelope, ...]:
     """Encrypt every FlowAccount OAuth credential under the company binding."""
 
@@ -321,6 +342,7 @@ def seal_flowaccount_credentials(
         bundle = _CredentialBundle(
             token_endpoint=token_endpoint,
             resource_uri=resource_uri,
+            revocation_endpoint=revocation_endpoint,
             client_id=client_id,
             token_endpoint_auth_method=token_endpoint_auth_method,
             expires_at=checked_tokens.expires_at,
@@ -423,6 +445,48 @@ def open_flowaccount_tokens(
             ),
             token_type="Bearer",
             expires_at=opened.bundle.expires_at,
+            granted_permissions=opened.bundle.granted_permissions,
+        )
+    except (TypeError, UnicodeDecodeError, ValueError, ValidationError):
+        raise FlowAccountCredentialError("flowaccount_credentials_invalid") from None
+    finally:
+        opened.clear()
+
+
+def open_flowaccount_revocation_material(
+    *,
+    vault: CredentialVault,
+    connection: ProviderConnection,
+    envelopes: Sequence[CredentialEnvelope],
+) -> FlowAccountOAuthRevocationMaterial:
+    """Open one connection-bound OAuth bundle without exposing it to callers."""
+
+    opened = _open_flowaccount_credentials(
+        vault=vault,
+        connection=connection,
+        envelopes=envelopes,
+    )
+    try:
+        return FlowAccountOAuthRevocationMaterial(
+            tokens=FlowAccountOAuthTokens(
+                access_token=opened.access_token.decode("utf-8"),
+                refresh_token=(
+                    opened.refresh_token.decode("utf-8")
+                    if opened.refresh_token is not None
+                    else None
+                ),
+                token_type="Bearer",
+                expires_at=opened.bundle.expires_at,
+                granted_permissions=opened.bundle.granted_permissions,
+            ),
+            token_endpoint=opened.bundle.token_endpoint,
+            resource_uri=opened.bundle.resource_uri,
+            revocation_endpoint=opened.bundle.revocation_endpoint,
+            client_id=opened.bundle.client_id,
+            client_secret=(
+                opened.client_secret.decode("utf-8") if opened.client_secret is not None else None
+            ),
+            token_endpoint_auth_method=opened.bundle.token_endpoint_auth_method,
             granted_permissions=opened.bundle.granted_permissions,
         )
     except (TypeError, UnicodeDecodeError, ValueError, ValidationError):
@@ -764,12 +828,14 @@ __all__ = [
     "FlowAccountCredentialError",
     "FlowAccountMCPDriver",
     "FlowAccountOAuthHeaderFactory",
+    "FlowAccountOAuthRevocationMaterial",
     "FlowAccountOAuthTokens",
     "FlowAccountProfile",
     "FlowAccountProfileRequest",
     "FlowAccountRefreshRequest",
     "FlowAccountTokenRefresher",
     "normalize_flowaccount_response",
+    "open_flowaccount_revocation_material",
     "open_flowaccount_tokens",
     "seal_flowaccount_credentials",
 ]

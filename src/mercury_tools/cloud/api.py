@@ -172,6 +172,12 @@ class CloudDependencies:
             and self.provider_oauth_service is None
         ):
             raise V1ConfigurationError("v1_provider_oauth_service_missing")
+        if (
+            self.settings is not None
+            and self.settings.v1_enabled
+            and not callable(getattr(self.provider_oauth_service, "disconnect", None))
+        ):
+            raise V1ConfigurationError("v1_provider_oauth_service_invalid")
         if self.peak_setup_service is not None and not all(
             callable(getattr(self.peak_setup_service, method, None))
             for method in ("start", "exchange", "complete", "disconnect")

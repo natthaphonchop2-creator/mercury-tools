@@ -79,27 +79,40 @@ def published_error_output_schema() -> dict[str, object]:
 def public_error_code(error: BaseException) -> V1ErrorCode:
     """Map foundation failures to the approved V1 error union."""
 
-    if isinstance(error, MercuryV1ToolError):
-        return error.code
-    if isinstance(error, MercuryAuthError):
-        if error.code == "mercury_scope_insufficient":
-            return "mercury_scope_insufficient"
-        return "mercury_auth_required"
-    if isinstance(error, WorkspaceAccessError):
-        return "workspace_access_denied"
-    if isinstance(error, QualificationGateError):
-        return error.code
-    if isinstance(error, ProviderStoreError):
-        if error.code == "provider_connection_not_found":
-            return "provider_connection_required"
-        return "provider_connection_invalid"
-    if isinstance(error, ProviderOAuthError):
-        return _provider_oauth_error_code(error.code)
-    if isinstance(error, PeakSetupError):
-        return _peak_setup_error_code(error.code)
-    if isinstance(error, ValueError) and error.args and error.args[0] in V1_ERROR_CODES:
-        return error.args[0]
+    for current in _error_chain(error):
+        if isinstance(current, MercuryV1ToolError):
+            return current.code
+        if isinstance(current, MercuryAuthError):
+            if current.code == "mercury_scope_insufficient":
+                return "mercury_scope_insufficient"
+            return "mercury_auth_required"
+        if isinstance(current, WorkspaceAccessError):
+            return "workspace_access_denied"
+        if isinstance(current, QualificationGateError):
+            return current.code
+        if isinstance(current, ProviderStoreError):
+            if current.code == "provider_connection_not_found":
+                return "provider_connection_required"
+            return "provider_connection_invalid"
+        if isinstance(current, ProviderOAuthError):
+            return _provider_oauth_error_code(current.code)
+        if isinstance(current, PeakSetupError):
+            return _peak_setup_error_code(current.code)
+        if isinstance(current, ValueError) and current.args and current.args[0] in V1_ERROR_CODES:
+            return current.args[0]
     return "validation_failed"
+
+
+def _error_chain(error: BaseException) -> tuple[BaseException, ...]:
+    """Inspect framework wrappers without incorporating their public text."""
+
+    chain: list[BaseException] = []
+    current: BaseException | None = error
+    while current is not None and id(current) not in {id(item) for item in chain}:
+        chain.append(current)
+        cause = current.__cause__
+        current = cause if isinstance(cause, BaseException) else current.__context__
+    return tuple(chain)
 
 
 def error_output(error: BaseException) -> MercuryV1ErrorOutput:

@@ -246,6 +246,7 @@ class ProviderCapabilityOutput(V1PublicModel):
         "connection_not_ready",
         "capability_unavailable",
         "capability_unreviewed",
+        "insufficient_evidence",
     ]
 
 
@@ -274,10 +275,32 @@ class GetCapabilitySchemaOutput(V1SuccessEnvelope):
     data: ReviewedCapabilitySchemaOutput
 
 
-class DisconnectProviderData(V1PublicModel):
+class FlowAccountDisconnectData(V1PublicModel):
+    provider: Literal["flowaccount"]
+    status: Literal["disconnected", "provider_revocation_required"]
+    local_credentials_deleted: bool
+    remote_revocation_status: Literal[
+        "revoked",
+        "not_supported",
+        "failed",
+        "already_disconnected",
+    ]
     deleted_envelope_count: int = Field(ge=0, le=16)
     provider_revocation_required: bool
     revision: int = Field(ge=1)
+
+
+class PeakDisconnectData(V1PublicModel):
+    provider: Literal["peak"]
+    status: Literal["provider_revocation_required"]
+    local_credentials_deleted: Literal[True]
+    instruction: Literal["Revoke this credential set in PEAK Account."]
+
+
+DisconnectProviderData: TypeAlias = Annotated[
+    FlowAccountDisconnectData | PeakDisconnectData,
+    Field(discriminator="provider"),
+]
 
 
 class DisconnectProviderOutput(V1SuccessEnvelope):
@@ -298,6 +321,7 @@ __all__ = [
     "DisconnectProviderData",
     "DisconnectProviderInput",
     "DisconnectProviderOutput",
+    "FlowAccountDisconnectData",
     "FlowAccountConnectionOutput",
     "FlowAccountConnectionStart",
     "FlowAccountConnectionStartData",
@@ -312,6 +336,7 @@ __all__ = [
     "PeakConnectionOutput",
     "PeakConnectionStart",
     "PeakConnectionStartData",
+    "PeakDisconnectData",
     "PeakProviderOutput",
     "ProviderCapabilityOutput",
     "ProviderConnectionOutput",

@@ -50,6 +50,9 @@ class ConfiguredProviderOAuthService:
     async def complete_callback(self, _callback: object) -> object:
         raise AssertionError("startup wiring test must not dispatch a callback")
 
+    async def disconnect(self, *_args: object) -> object:
+        raise AssertionError("startup wiring test must not disconnect FlowAccount")
+
 
 class ConfiguredPeakSetupService:
     async def start(self, *_args: object) -> object:
@@ -240,6 +243,20 @@ def test_v1_custom_cloud_dependencies_cannot_bypass_oauth_validation() -> None:
         create_test_http_app(
             principal_resolver=StubResolver(_principal()),
             provider_oauth_service=object(),
+        )
+
+    class CallbackOnlyProviderOAuthService:
+        async def complete_callback(self, _callback: object) -> object:
+            raise AssertionError("startup wiring test must not dispatch a callback")
+
+    with pytest.raises(
+        V1ConfigurationError,
+        match="v1_provider_oauth_service_invalid",
+    ):
+        create_test_http_app(
+            principal_resolver=StubResolver(_principal()),
+            provider_oauth_service=CallbackOnlyProviderOAuthService(),
+            peak_setup_service=ConfiguredPeakSetupService(),
         )
 
     missing_peak = PrincipalCloudDependencies()
