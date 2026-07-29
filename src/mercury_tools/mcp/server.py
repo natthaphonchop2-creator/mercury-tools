@@ -3907,6 +3907,7 @@ def create_test_http_app(
     require_auth: bool | None = None,
     cloud_dependencies: CloudDependencies | None = None,
     provider_oauth_service: Any | None = None,
+    peak_setup_service: Any | None = None,
     principal_resolver: PrincipalResolver | None = None,
     consent_handoff: ConsentHandoff | None = None,
     consent_http_client: httpx.AsyncClient | None = None,
@@ -3917,6 +3918,7 @@ def create_test_http_app(
         require_auth=require_auth,
         cloud_dependencies=cloud_dependencies,
         provider_oauth_service=provider_oauth_service,
+        peak_setup_service=peak_setup_service,
         principal_resolver=principal_resolver,
         consent_handoff=consent_handoff,
         consent_http_client=consent_http_client,
@@ -3929,6 +3931,7 @@ def _create_http_app(
     require_auth: bool | None = None,
     cloud_dependencies: CloudDependencies | None = None,
     provider_oauth_service: Any | None = None,
+    peak_setup_service: Any | None = None,
     principal_resolver: PrincipalResolver | None = None,
     consent_handoff: ConsentHandoff | None = None,
     consent_http_client: httpx.AsyncClient | None = None,
@@ -3942,6 +3945,7 @@ def _create_http_app(
         for dependency in (
             cloud_dependencies,
             provider_oauth_service,
+            peak_setup_service,
             principal_resolver,
             consent_handoff,
             consent_http_client,
@@ -3958,6 +3962,7 @@ def _create_http_app(
             selected_composition.validate_for_runtime(settings)
             selected_principal_resolver = selected_composition.principal_resolver
             provider_oauth_service = selected_composition.provider_oauth_service
+            peak_setup_service = selected_composition.peak_setup_service
         else:
             if selected_principal_resolver is None:
                 selected_principal_resolver = validator_from_settings(settings)
@@ -3980,9 +3985,12 @@ def _create_http_app(
     public_app = http_mcp.streamable_http_app()
     if cloud_dependencies is not None and provider_oauth_service is not None:
         raise RuntimeError("provider_oauth_service_dependency_conflict")
+    if cloud_dependencies is not None and peak_setup_service is not None:
+        raise RuntimeError("peak_setup_service_dependency_conflict")
     selected_cloud_dependencies = cloud_dependencies or CloudDependencies(
         settings=settings,
         provider_oauth_service=provider_oauth_service,
+        peak_setup_service=peak_setup_service,
     )
     if settings.v1_enabled:
         _validate_v1_cloud_dependencies(selected_cloud_dependencies)
@@ -4089,8 +4097,23 @@ def _validate_v1_cloud_dependencies(dependencies: Any) -> None:
         raise V1ConfigurationError("v1_provider_oauth_service_missing")
     if not callable(getattr(provider_oauth_service, "complete_callback", None)):
         raise V1ConfigurationError("v1_provider_oauth_service_invalid")
+    peak_setup_service = getattr(
+        dependencies,
+        "peak_setup_service",
+        None,
+    )
+    if peak_setup_service is None:
+        raise V1ConfigurationError("v1_peak_setup_service_missing")
+    if not all(
+        callable(getattr(peak_setup_service, method, None))
+        for method in ("start", "exchange", "complete", "disconnect")
+    ):
+        raise V1ConfigurationError("v1_peak_setup_service_invalid")
     required_handlers = (
         "flowaccount_oauth_callback",
+        "peak_setup_page",
+        "peak_setup_exchange",
+        "peak_setup_submit",
         "list_actions",
         "get_action",
         "resolve_validation",

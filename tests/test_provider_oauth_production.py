@@ -31,6 +31,8 @@ from mercury_tools.providers.oauth import (
     PublicOAuthNetworkGuard,
     SupabaseProviderOAuthStateStore,
 )
+from mercury_tools.providers.peak import PeakMCPDriver
+from mercury_tools.providers.peak_setup import PeakSetupService, SupabasePeakSetupStore
 from mercury_tools.providers.production import (
     build_provider_oauth_production_composition,
     build_test_provider_oauth_production_composition,
@@ -920,7 +922,9 @@ async def test_production_composition_rotates_attempt_material_before_validation
                 state_http_client=state_http,
                 connection_http_client=connection_http,
                 network_guard=network_guard,
-                workspace_service=object(),
+                workspace_service=SimpleNamespace(
+                    require_workspace=lambda *_args: None,
+                ),
             )
             vault = composition.provider_oauth_service._vault
             provisional = ProviderConnection(
@@ -1116,7 +1120,9 @@ async def test_production_composition_binds_durable_stores_guard_and_exact_regis
                 state_http_client=state_http,
                 connection_http_client=connection_http,
                 network_guard=network_guard,
-                workspace_service=object(),
+                workspace_service=SimpleNamespace(
+                    require_workspace=lambda *_args: None,
+                ),
             )
             with pytest.raises(
                 V1ConfigurationError,
@@ -1127,16 +1133,27 @@ async def test_production_composition_binds_durable_stores_guard_and_exact_regis
 
             service = composition.provider_oauth_service
             flowaccount = composition.registry.get(ProviderId.FLOWACCOUNT)
+            peak = composition.registry.get(ProviderId.PEAK)
             assert isinstance(composition.state_store, SupabaseProviderOAuthStateStore)
             assert isinstance(
                 composition.connection_store,
                 SupabaseProviderConnectionStore,
             )
             assert isinstance(flowaccount, FlowAccountMCPDriver)
+            assert isinstance(peak, PeakMCPDriver)
+            assert isinstance(composition.peak_setup_store, SupabasePeakSetupStore)
+            assert isinstance(composition.peak_setup_service, PeakSetupService)
             assert service._state_store is composition.state_store
             assert service._connection_store is composition.connection_store
             assert service._driver is flowaccount
             assert composition.connection_store._vault is service._vault
+            assert composition.peak_setup_store._http is composition.state_http_client
+            assert composition.peak_setup_service._setup_store is composition.peak_setup_store
+            assert composition.peak_setup_service._connection_store is composition.connection_store
+            assert composition.peak_setup_service._vault is service._vault
+            assert composition.peak_setup_service._profile_validator is peak
+            assert composition.peak_setup_service._contract is None
+            assert peak.contract_qualified is False
             assert isinstance(service._oauth_client, DownstreamMCPOAuthClient)
             assert service._oauth_client._network_guard is network_guard
             assert (

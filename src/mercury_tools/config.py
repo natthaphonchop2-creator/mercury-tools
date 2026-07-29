@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import os
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -70,6 +71,7 @@ class Settings:
     peak_mcp_uat_url: str = ""
     peak_mcp_production_url: str = ""
     provider_callback_base_url: str = ""
+    peak_application_code: str = field(default="", repr=False)
 
     @property
     def supabase_configured(self) -> bool:
@@ -158,6 +160,17 @@ class Settings:
             raise V1ConfigurationError("v1_flowaccount_authorization_server_origin_missing")
         if not all(_is_server_only_https_origin(origin) for origin in flowaccount_origins):
             raise V1ConfigurationError("v1_flowaccount_authorization_server_origin_invalid")
+        if not isinstance(self.peak_application_code, str) or (
+            self.peak_application_code
+            and (
+                len(self.peak_application_code) > 8192
+                or any(
+                    character.isspace() or unicodedata.category(character) in {"Cc", "Cf"}
+                    for character in self.peak_application_code
+                )
+            )
+        ):
+            raise V1ConfigurationError("v1_peak_application_code_invalid")
 
 
 def _env_bool(name: str, *, default: bool = False) -> bool:
@@ -332,6 +345,7 @@ def load_settings(*, dotenv_path: str | Path | None = None) -> Settings:
         ).strip(),
         peak_mcp_uat_url=os.environ.get("PEAK_MCP_UAT_URL", "").strip(),
         peak_mcp_production_url=os.environ.get("PEAK_MCP_PRODUCTION_URL", "").strip(),
+        peak_application_code=os.environ.get("PEAK_APPLICATION_CODE", "").strip(),
         provider_callback_base_url=os.environ.get("MERCURY_PROVIDER_CALLBACK_BASE_URL", "").strip(),
     )
 

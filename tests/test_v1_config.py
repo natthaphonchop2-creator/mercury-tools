@@ -33,6 +33,7 @@ V1_ENVIRONMENT_VARIABLES = (
     "FLOWACCOUNT_OAUTH_PRODUCTION_AUTHORIZATION_SERVER_ORIGIN",
     "PEAK_MCP_UAT_URL",
     "PEAK_MCP_PRODUCTION_URL",
+    "PEAK_APPLICATION_CODE",
     "MERCURY_PROVIDER_CALLBACK_BASE_URL",
 )
 
@@ -273,6 +274,34 @@ def test_provider_callback_base_is_an_exact_https_origin(
         monkeypatch,
         code="v1_provider_callback_base_url_invalid",
     )
+
+
+def test_peak_application_code_is_optional_server_owned_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_valid_v1_environment(monkeypatch)
+    monkeypatch.setenv("PEAK_APPLICATION_CODE", "PEAK_APPLICATION_CODE_SENTINEL")
+
+    settings = load_settings()
+    render = yaml.safe_load((Path(__file__).resolve().parents[1] / "render.yaml").read_text())
+    env_vars = {item["key"]: item for item in render["services"][0]["envVars"]}
+
+    settings.validate_v1()
+    assert settings.peak_application_code == "PEAK_APPLICATION_CODE_SENTINEL"
+    assert "PEAK_APPLICATION_CODE_SENTINEL" not in repr(settings)
+    assert env_vars["PEAK_APPLICATION_CODE"] == {
+        "key": "PEAK_APPLICATION_CODE",
+        "sync": False,
+    }
+
+
+def test_peak_application_code_rejects_unsafe_header_material(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_valid_v1_environment(monkeypatch)
+    monkeypatch.setenv("PEAK_APPLICATION_CODE", "unsafe application code")
+
+    _assert_v1_error(monkeypatch, code="v1_peak_application_code_invalid")
 
 
 def test_v1_preview_ttl_is_exactly_thirty_minutes() -> None:

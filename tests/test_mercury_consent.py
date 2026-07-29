@@ -38,9 +38,24 @@ class UnusedProviderOAuthService:
         raise AssertionError("consent tests must not invoke provider OAuth")
 
 
+class UnusedPeakSetupService:
+    async def start(self, *_args: object) -> None:
+        raise AssertionError("consent tests must not start PEAK setup")
+
+    async def exchange(self, *_args: object) -> None:
+        raise AssertionError("consent tests must not exchange PEAK setup")
+
+    async def complete(self, *_args: object) -> None:
+        raise AssertionError("consent tests must not complete PEAK setup")
+
+    async def disconnect(self, *_args: object) -> None:
+        raise AssertionError("consent tests must not disconnect PEAK")
+
+
 def _create_http_app(**kwargs: object):
     return create_test_http_app(
         provider_oauth_service=UnusedProviderOAuthService(),
+        peak_setup_service=UnusedPeakSetupService(),
         **kwargs,
     )
 

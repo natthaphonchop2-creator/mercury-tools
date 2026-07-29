@@ -14,6 +14,10 @@ from mercury_tools.providers.flowaccount import (
 )
 from mercury_tools.providers.manifest import load_provider_manifest
 from mercury_tools.providers.models import AuthorizationMethod, ProviderId
+from mercury_tools.providers.peak import (
+    PeakMCPDriver,
+    QualifiedPeakProviderContract,
+)
 from mercury_tools.providers.streamable_mcp import (
     BindingVerifier,
     HeaderFactory,
@@ -61,6 +65,7 @@ def build_provider_registry(
     request_model_resolver: RequestModelResolver | None = None,
     response_model_resolver: ResponseModelResolver | None = None,
     flowaccount_profile_binding_resolver: (FlowAccountProfileBindingResolver | None) = None,
+    peak_contract: QualifiedPeakProviderContract | None = None,
 ) -> ProviderDriverRegistry:
     """Load the two server-controlled manifests without accepting resource URLs."""
 
@@ -77,8 +82,18 @@ def build_provider_registry(
     )
     if not all(callable(dependency) for dependency in required_callables):
         raise ProviderRegistryError("flowaccount_runtime_dependencies_invalid")
+    peak_header_factory = header_factories.get(AuthorizationMethod.PROVIDER_CREDENTIALS)
+    if peak_contract is not None and (
+        not isinstance(peak_contract, QualifiedPeakProviderContract)
+        or not callable(peak_header_factory)
+    ):
+        raise ProviderRegistryError("peak_runtime_dependencies_invalid")
 
     def provider_scoped_normalizer(binding, structured_content):
+        if binding.provider is ProviderId.PEAK:
+            if peak_contract is None:
+                raise ValueError("peak_provider_contract_unqualified")
+            return peak_contract.normalize_profile(binding, structured_content)
         if (
             binding.provider is ProviderId.FLOWACCOUNT
             and binding.normalized_capability == "provider_profile.get"
@@ -87,6 +102,37 @@ def build_provider_registry(
         if response_normalizer is None:
             raise ValueError("provider_response_normalizer_missing")
         return response_normalizer(binding, structured_content)
+
+    def provider_scoped_verifier(connection, binding, resource_uri_sha256):
+        if connection.provider is ProviderId.PEAK:
+            if peak_contract is None:
+                raise ValueError("peak_provider_contract_unqualified")
+            return peak_contract.verify_binding(
+                connection,
+                binding,
+                resource_uri_sha256,
+            )
+        if binding_verifier is None:
+            raise ValueError("provider_binding_verifier_missing")
+        return binding_verifier(connection, binding, resource_uri_sha256)
+
+    def provider_scoped_request_model(binding):
+        if binding.provider is ProviderId.PEAK:
+            if peak_contract is None:
+                raise ValueError("peak_provider_contract_unqualified")
+            return peak_contract.request_model(binding)
+        if request_model_resolver is None:
+            raise ValueError("provider_request_model_resolver_missing")
+        return request_model_resolver(binding)
+
+    def provider_scoped_response_model(binding):
+        if binding.provider is ProviderId.PEAK:
+            if peak_contract is None:
+                raise ValueError("peak_provider_contract_unqualified")
+            return peak_contract.response_model(binding)
+        if response_model_resolver is None:
+            raise ValueError("provider_response_model_resolver_missing")
+        return response_model_resolver(binding)
 
     root = Path(manifest_root)
     factories = dict(header_factories)
@@ -97,10 +143,10 @@ def build_provider_registry(
             settings=settings,
             manifest=manifest,
             header_factory=factories.get(manifest.auth_adapter),
-            binding_verifier=binding_verifier,
+            binding_verifier=provider_scoped_verifier,
             response_normalizer=provider_scoped_normalizer,
-            request_model_resolver=request_model_resolver,
-            response_model_resolver=response_model_resolver,
+            request_model_resolver=provider_scoped_request_model,
+            response_model_resolver=provider_scoped_response_model,
         )
         if provider is ProviderId.FLOWACCOUNT:
             registry.register(
@@ -111,7 +157,13 @@ def build_provider_registry(
                 )
             )
         else:
-            registry.register(runtime)
+            registry.register(
+                PeakMCPDriver(
+                    runtime=runtime,
+                    manifest=manifest,
+                    contract=peak_contract,
+                )
+            )
     return registry
 
 

@@ -1,4 +1,4 @@
-"""Fail-closed production composition for hosted FlowAccount OAuth."""
+"""Fail-closed production composition for hosted provider authorization."""
 
 from __future__ import annotations
 
@@ -42,6 +42,12 @@ from mercury_tools.providers.oauth import (
     PublicOAuthNetworkGuard,
     SupabaseProviderOAuthStateStore,
 )
+from mercury_tools.providers.peak import (
+    PeakCredentialHeaderFactory,
+    PeakMCPDriver,
+    QualifiedPeakProviderContract,
+)
+from mercury_tools.providers.peak_setup import PeakSetupService, SupabasePeakSetupStore
 from mercury_tools.providers.registry import ProviderDriverRegistry, build_provider_registry
 from mercury_tools.providers.store import SupabaseProviderConnectionStore
 from mercury_tools.providers.streamable_mcp import wire_schema_sha256
@@ -56,7 +62,9 @@ class ProviderOAuthProductionComposition:
     settings: Settings = field(repr=False)
     principal_resolver: PrincipalResolver = field(repr=False)
     provider_oauth_service: ProviderOAuthService
+    peak_setup_service: PeakSetupService
     state_store: SupabaseProviderOAuthStateStore
+    peak_setup_store: SupabasePeakSetupStore
     connection_store: SupabaseProviderConnectionStore
     registry: ProviderDriverRegistry
     network_guard: PublicOAuthNetworkGuard
@@ -111,7 +119,9 @@ class ProviderOAuthProductionComposition:
                 )
                 or not callable(getattr(self.principal_resolver, "resolve", None))
                 or not isinstance(self.provider_oauth_service, ProviderOAuthService)
+                or not isinstance(self.peak_setup_service, PeakSetupService)
                 or not isinstance(self.state_store, SupabaseProviderOAuthStateStore)
+                or not isinstance(self.peak_setup_store, SupabasePeakSetupStore)
                 or not isinstance(
                     self.connection_store,
                     SupabaseProviderConnectionStore,
@@ -127,6 +137,8 @@ class ProviderOAuthProductionComposition:
 
             service = self.provider_oauth_service
             flowaccount = self.registry.get(ProviderId.FLOWACCOUNT)
+            peak = self.registry.get(ProviderId.PEAK)
+            peak_service = self.peak_setup_service
             expected_rest_url = v1_supabase_rest_url(
                 project_url=settings.supabase_url,
                 auth_issuer=settings.supabase_auth_issuer,
@@ -168,10 +180,22 @@ class ProviderOAuthProductionComposition:
                 )
                 or service._manifest != flowaccount._manifest
                 or service._oauth_client._network_guard is not self.network_guard
+                or not isinstance(peak, PeakMCPDriver)
+                or peak_service._settings != settings
+                or peak_service._workspace_service is not service._workspace_service
+                or peak_service._mercury_access_token is not current_mercury_access_token
+                or peak_service._setup_store is not self.peak_setup_store
+                or peak_service._connection_store is not self.connection_store
+                or peak_service._vault is not service._vault
+                or peak_service._contract is not peak._contract
+                or peak_service._profile_validator is not peak
+                or peak_service._manifest != peak._manifest
                 or self.connection_store._vault is not service._vault
                 or self.state_store._http is not self.state_http_client
+                or self.peak_setup_store._http is not self.state_http_client
                 or self.connection_store._http is not self.connection_http_client
                 or self.state_store._base_url != expected_rest_url
+                or self.peak_setup_store._base_url != expected_rest_url
                 or self.connection_store._base_url != expected_rest_url
                 or self.state_store._callback_uri != expected_callback_uri
                 or not secrets.compare_digest(
@@ -186,10 +210,32 @@ class ProviderOAuthProductionComposition:
                     self.connection_store._service_role_key,
                     settings.supabase_service_role_key,
                 )
+                or not secrets.compare_digest(
+                    self.peak_setup_store._publishable_key,
+                    settings.supabase_publishable_key,
+                )
+                or not secrets.compare_digest(
+                    self.peak_setup_store._service_role_key,
+                    settings.supabase_service_role_key,
+                )
                 or service._oauth_client._authorization_server_origins != expected_origins
                 or service._vault._active_key_version != settings.vault_active_key_version
                 or set(service._vault._ciphers) != expected_vault_versions
                 or not callable(getattr(service, "complete_callback", None))
+            ):
+                raise ValueError
+            peak_header_factory = peak._runtime._header_factory
+            if peak._contract is None:
+                if peak_header_factory is not None or peak.contract_qualified:
+                    raise ValueError
+            elif (
+                not allow_test_dependencies
+                or not isinstance(peak_header_factory, PeakCredentialHeaderFactory)
+                or peak_header_factory._contract is not peak._contract
+                or peak_header_factory._vault is not service._vault
+                or peak_header_factory._load_envelopes
+                != self.connection_store.load_runtime_envelopes
+                or peak_header_factory._application_code != settings.peak_application_code
             ):
                 raise ValueError
         except V1ConfigurationError:
@@ -233,6 +279,7 @@ def build_test_provider_oauth_production_composition(
     connection_http_client: httpx.Client | None = None,
     network_guard: PublicOAuthNetworkGuard | None = None,
     workspace_service: WorkspaceService | None = None,
+    peak_contract: QualifiedPeakProviderContract | None = None,
 ) -> ProviderOAuthProductionComposition:
     """Build a typed composition with explicitly test-only dependency overrides."""
 
@@ -243,6 +290,7 @@ def build_test_provider_oauth_production_composition(
         connection_http_client=connection_http_client,
         network_guard=network_guard,
         workspace_service=workspace_service,
+        peak_contract=peak_contract,
         test_only_dependencies=True,
     )
 
@@ -255,6 +303,7 @@ def _build_provider_oauth_composition(
     connection_http_client: httpx.Client | None = None,
     network_guard: PublicOAuthNetworkGuard | None = None,
     workspace_service: WorkspaceService | None = None,
+    peak_contract: QualifiedPeakProviderContract | None = None,
     test_only_dependencies: bool,
 ) -> ProviderOAuthProductionComposition:
     """Compose the hosted path without provider URLs or credentials from input."""
@@ -301,6 +350,10 @@ def _build_provider_oauth_composition(
             vault=vault,
             http_client=selected_connection_http,
         )
+        peak_setup_store = SupabasePeakSetupStore(
+            settings=settings,
+            http_client=selected_state_http,
+        )
         oauth_client = DownstreamMCPOAuthClient(
             network_guard=selected_network_guard,
             authorization_server_origins=origins,
@@ -314,14 +367,26 @@ def _build_provider_oauth_composition(
             connection_store=connection_store,
             oauth_client=oauth_client,
         )
+        if peak_contract is not None:
+            runtime_dependencies["header_factories"] = {
+                **runtime_dependencies["header_factories"],
+                AuthorizationMethod.PROVIDER_CREDENTIALS: PeakCredentialHeaderFactory(
+                    vault=vault,
+                    load_envelopes=connection_store.load_runtime_envelopes,
+                    contract=peak_contract,
+                    application_code=settings.peak_application_code,
+                ),
+            }
+        runtime_dependencies["peak_contract"] = peak_contract
         registry = build_provider_registry(
             settings=settings,
             manifest_root=manifest_root,
             **runtime_dependencies,
         )
+        selected_workspace_service = workspace_service or WorkspaceService.from_settings(settings)
         service = ProviderOAuthService(
             settings=settings,
-            workspace_service=workspace_service or WorkspaceService.from_settings(settings),
+            workspace_service=selected_workspace_service,
             mercury_access_token=current_mercury_access_token,
             principal_resolver=principal_resolver,
             manifest=manifest,
@@ -331,11 +396,23 @@ def _build_provider_oauth_composition(
             vault=vault,
             driver=registry.get(ProviderId.FLOWACCOUNT),
         )
+        peak_setup_service = PeakSetupService(
+            settings=settings,
+            workspace_service=selected_workspace_service,
+            mercury_access_token=current_mercury_access_token,
+            setup_store=peak_setup_store,
+            connection_store=connection_store,
+            vault=vault,
+            contract=peak_contract,
+            profile_validator=registry.get(ProviderId.PEAK),
+        )
         composition = ProviderOAuthProductionComposition(
             settings=settings,
             principal_resolver=principal_resolver,
             provider_oauth_service=service,
+            peak_setup_service=peak_setup_service,
             state_store=state_store,
+            peak_setup_store=peak_setup_store,
             connection_store=connection_store,
             registry=registry,
             network_guard=selected_network_guard,

@@ -46,6 +46,8 @@ services:
         sync: false
       - key: PEAK_MCP_PRODUCTION_URL
         sync: false
+      - key: PEAK_APPLICATION_CODE
+        sync: false
       - key: MERCURY_PROVIDER_CALLBACK_BASE_URL
         sync: false
       - key: MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API

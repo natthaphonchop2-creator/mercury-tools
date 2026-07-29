@@ -11,14 +11,16 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Any
+from urllib.parse import parse_qsl
 
 import httpx
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
 from mercury_tools.auth.consent import IDENTITY_SCOPES
+from mercury_tools.auth.models import MercuryPrincipal
 from mercury_tools.catalog.models import (
     CatalogAction,
     HttpMethod,
@@ -53,6 +55,18 @@ from mercury_tools.providers.oauth import (
     FLOWACCOUNT_CALLBACK_PATH,
     OAuthCallback,
     ProviderOAuthError,
+)
+from mercury_tools.providers.peak_setup import (
+    PEAK_SETUP_EXCHANGE_PATH,
+    PEAK_SETUP_PATH,
+    PeakSetupError,
+    PeakSetupExchangeRequest,
+    PeakSetupSubmission,
+    peak_setup_browser_origin,
+    peak_setup_secret_fields,
+    peak_setup_security_headers,
+    render_peak_setup_form,
+    render_peak_setup_page,
 )
 from mercury_tools.qualification.selection import (
     EvidenceRequest,
@@ -111,6 +125,7 @@ _ORDINARY_DEPENDENCY_ERRORS = (
 _OAUTH_ERROR_DESCRIPTION = re.compile(r"^[\x20-\x21\x23-\x5B\x5D-\x7E]{1,1024}$")
 _OAUTH_ERROR_URI = re.compile(r"^[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]{1,2048}$")
 _OAUTH_ERROR_OPTIONAL_KEYS = frozenset({"error_description", "error_uri"})
+_PEAK_SETUP_MAX_BODY_BYTES = 32 * 1024
 
 
 def _utc_now() -> datetime:
@@ -140,6 +155,7 @@ class CloudDependencies:
     skill_loader: Callable[[str], str | None] = skill_markdown
     clock: Callable[[], datetime] | None = None
     provider_oauth_service: Any | None = None
+    peak_setup_service: Any | None = None
 
     def __post_init__(self) -> None:
         if self.provider_oauth_service is not None and not callable(
@@ -152,6 +168,17 @@ class CloudDependencies:
             and self.provider_oauth_service is None
         ):
             raise V1ConfigurationError("v1_provider_oauth_service_missing")
+        if self.peak_setup_service is not None and not all(
+            callable(getattr(self.peak_setup_service, method, None))
+            for method in ("start", "exchange", "complete", "disconnect")
+        ):
+            raise V1ConfigurationError("v1_peak_setup_service_invalid")
+        if (
+            self.settings is not None
+            and self.settings.v1_enabled
+            and self.peak_setup_service is None
+        ):
+            raise V1ConfigurationError("v1_peak_setup_service_missing")
 
     def _catalog_store(self) -> Any:
         if self.catalog_store is None:
@@ -417,6 +444,142 @@ class CloudDependencies:
             headers=headers,
         )
 
+    async def peak_setup_page(self, request: Request) -> Response:
+        headers = peak_setup_security_headers()
+        try:
+            _request_principal(request)
+            if request.url.query:
+                raise ValueError
+            return HTMLResponse(render_peak_setup_page(), headers=headers)
+        except (AttributeError, TypeError, ValueError):
+            return JSONResponse(
+                {"error": "peak_setup_request_invalid"},
+                status_code=400,
+                headers=headers,
+            )
+        except Exception:
+            return JSONResponse(
+                {"error": "peak_setup_unavailable"},
+                status_code=503,
+                headers=headers,
+            )
+
+    async def peak_setup_exchange(self, request: Request) -> Response:
+        headers = peak_setup_security_headers()
+        if self.peak_setup_service is None:
+            return JSONResponse(
+                {"error": "peak_setup_unavailable"},
+                status_code=503,
+                headers=headers,
+            )
+        try:
+            principal = _request_principal(request)
+            _require_peak_setup_request(
+                request,
+                settings=self.settings,
+                media_type="application/json",
+            )
+            raw = await _bounded_request_body(request)
+            payload = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=_closed_json_object,
+            )
+            exchange_request = PeakSetupExchangeRequest.model_validate(payload)
+            exchange = await self.peak_setup_service.exchange(
+                principal,
+                exchange_request.setup_token.get_secret_value(),
+            )
+            return HTMLResponse(
+                render_peak_setup_form(exchange),
+                headers=headers,
+            )
+        except PeakSetupError as exc:
+            return JSONResponse(
+                {"error": exc.code},
+                status_code=400,
+                headers=headers,
+            )
+        except (AttributeError, TypeError, ValueError, UnicodeDecodeError):
+            return JSONResponse(
+                {"error": "peak_setup_request_invalid"},
+                status_code=400,
+                headers=headers,
+            )
+        except Exception:
+            return JSONResponse(
+                {"error": "peak_setup_unavailable"},
+                status_code=503,
+                headers=headers,
+            )
+        finally:
+            _clear_request_body(request)
+
+    async def peak_setup_submit(self, request: Request) -> Response:
+        headers = {
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        }
+        if self.peak_setup_service is None:
+            return JSONResponse(
+                {"error": "peak_setup_unavailable"},
+                status_code=503,
+                headers=headers,
+            )
+        raw = bytearray()
+        try:
+            principal = _request_principal(request)
+            _require_peak_setup_request(
+                request,
+                settings=self.settings,
+                media_type="application/x-www-form-urlencoded",
+            )
+            raw.extend(await _bounded_request_body(request))
+            _clear_request_body(request)
+            pairs = parse_qsl(
+                raw.decode("utf-8"),
+                keep_blank_values=True,
+                strict_parsing=True,
+            )
+            keys = [key for key, _value in pairs]
+            if tuple(sorted(keys)) != tuple(sorted(peak_setup_secret_fields())) or len(keys) != len(
+                set(keys)
+            ):
+                raise ValueError
+            submission = PeakSetupSubmission.model_validate(dict(pairs))
+            summary = await self.peak_setup_service.complete(principal, submission)
+            return JSONResponse(
+                {
+                    "provider": summary.provider.value,
+                    "merchant_display_name": summary.account_display_name,
+                    "environment": summary.environment,
+                    "readiness": summary.readiness.value,
+                    "instruction": "Return to the Mercury host to continue.",
+                },
+                headers=headers,
+            )
+        except PeakSetupError as exc:
+            return JSONResponse(
+                {"error": exc.code},
+                status_code=400,
+                headers=headers,
+            )
+        except (AttributeError, TypeError, ValueError, UnicodeDecodeError):
+            return JSONResponse(
+                {"error": "peak_setup_request_invalid"},
+                status_code=400,
+                headers=headers,
+            )
+        except Exception:
+            return JSONResponse(
+                {"error": "peak_setup_unavailable"},
+                status_code=503,
+                headers=headers,
+            )
+        finally:
+            raw[:] = b"\x00" * len(raw)
+            _clear_request_body(request)
+
     def _catalog_actions(self) -> list[CatalogAction]:
         rows = self._catalog_store().list_active_actions()
         actions: list[CatalogAction] = []
@@ -468,6 +631,48 @@ class CloudDependencies:
         return sorted(result, key=lambda item: item["skill_id"])
 
 
+def _request_principal(request: Request) -> MercuryPrincipal:
+    return MercuryPrincipal.model_validate(request.state.mercury_principal)
+
+
+def _require_peak_setup_request(
+    request: Request,
+    *,
+    settings: Settings | None,
+    media_type: str,
+) -> None:
+    if settings is None or request.url.query:
+        raise ValueError("peak_setup_request_invalid")
+    origins = request.headers.getlist("origin")
+    content_types = request.headers.getlist("content-type")
+    if (
+        len(origins) != 1
+        or origins[0] != peak_setup_browser_origin(settings)
+        or len(content_types) != 1
+        or content_types[0].partition(";")[0].strip().casefold() != media_type
+    ):
+        raise ValueError("peak_setup_request_invalid")
+
+
+async def _bounded_request_body(request: Request) -> bytes:
+    raw = await request.body()
+    if not raw or len(raw) > _PEAK_SETUP_MAX_BODY_BYTES:
+        raise ValueError("peak_setup_request_invalid")
+    return raw
+
+
+def _closed_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    keys = [key for key, _value in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("peak_setup_request_invalid")
+    return dict(pairs)
+
+
+def _clear_request_body(request: Request) -> None:
+    if hasattr(request, "_body"):
+        request._body = b""
+
+
 def cloud_routes(dependencies: CloudDependencies) -> list[Route]:
     routes = [
         Route("/api/cloud/v1/catalog/actions", dependencies.list_actions, methods=["GET"]),
@@ -510,6 +715,27 @@ def cloud_routes(dependencies: CloudDependencies) -> list[Route]:
                 FLOWACCOUNT_CALLBACK_PATH,
                 dependencies.flowaccount_oauth_callback,
                 methods=["GET"],
+            )
+        )
+    peak_setup_service = getattr(dependencies, "peak_setup_service", None)
+    if peak_setup_service is not None:
+        routes.extend(
+            (
+                Route(
+                    PEAK_SETUP_PATH,
+                    dependencies.peak_setup_page,
+                    methods=["GET"],
+                ),
+                Route(
+                    PEAK_SETUP_EXCHANGE_PATH,
+                    dependencies.peak_setup_exchange,
+                    methods=["POST"],
+                ),
+                Route(
+                    PEAK_SETUP_PATH,
+                    dependencies.peak_setup_submit,
+                    methods=["POST"],
+                ),
             )
         )
     return routes

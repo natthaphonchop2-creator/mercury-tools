@@ -17,6 +17,10 @@ from mercury_tools.auth.supabase_jwt import authorization_server_metadata_url
 from mercury_tools.config import V1ConfigurationError
 from mercury_tools.mcp.server import create_http_app, create_test_http_app
 from mercury_tools.providers.oauth import FLOWACCOUNT_CALLBACK_PATH
+from mercury_tools.providers.peak_setup import (
+    PEAK_SETUP_EXCHANGE_PATH,
+    PEAK_SETUP_PATH,
+)
 from mercury_tools.v1.constants import CANONICAL_MCP_RESOURCE
 
 AUTHORIZATION_SERVER = "https://vbnlkqvauqwnjbxngkas.supabase.co/auth/v1"
@@ -47,9 +51,24 @@ class ConfiguredProviderOAuthService:
         raise AssertionError("startup wiring test must not dispatch a callback")
 
 
+class ConfiguredPeakSetupService:
+    async def start(self, *_args: object) -> object:
+        raise AssertionError("startup wiring test must not start PEAK setup")
+
+    async def exchange(self, *_args: object) -> object:
+        raise AssertionError("startup wiring test must not exchange PEAK setup")
+
+    async def complete(self, *_args: object) -> object:
+        raise AssertionError("startup wiring test must not complete PEAK setup")
+
+    async def disconnect(self, *_args: object) -> object:
+        raise AssertionError("startup wiring test must not disconnect PEAK")
+
+
 class PrincipalCloudDependencies:
     def __init__(self) -> None:
         self.provider_oauth_service = ConfiguredProviderOAuthService()
+        self.peak_setup_service = ConfiguredPeakSetupService()
 
     async def flowaccount_oauth_callback(self, _request: Request) -> JSONResponse:
         raise AssertionError("callback is not exercised by this dependency stub")
@@ -77,6 +96,15 @@ class PrincipalCloudDependencies:
         return await self.list_actions(request)
 
     async def get_document(self, request: Request) -> JSONResponse:
+        return await self.list_actions(request)
+
+    async def peak_setup_page(self, request: Request) -> JSONResponse:
+        return await self.list_actions(request)
+
+    async def peak_setup_exchange(self, request: Request) -> JSONResponse:
+        return await self.list_actions(request)
+
+    async def peak_setup_submit(self, request: Request) -> JSONResponse:
         return await self.list_actions(request)
 
 
@@ -166,7 +194,12 @@ def test_v1_default_http_app_builds_and_runs_production_oauth_composition(
     monkeypatch.setattr(ProviderOAuthProductionComposition, "aclose", close)
     app = create_http_app()
 
-    assert FLOWACCOUNT_CALLBACK_PATH in {getattr(route, "path", None) for route in app.routes}
+    paths = {getattr(route, "path", None) for route in app.routes}
+    assert {
+        FLOWACCOUNT_CALLBACK_PATH,
+        PEAK_SETUP_PATH,
+        PEAK_SETUP_EXCHANGE_PATH,
+    } <= paths
     with TestClient(app):
         assert events == ["build", "startup"]
     assert events == ["build", "startup", "close"]
@@ -185,7 +218,10 @@ def test_v1_custom_cloud_dependencies_cannot_bypass_oauth_validation() -> None:
     incomplete_dependencies = type(
         "IncompleteDependencies",
         (),
-        {"provider_oauth_service": ConfiguredProviderOAuthService()},
+        {
+            "provider_oauth_service": ConfiguredProviderOAuthService(),
+            "peak_setup_service": ConfiguredPeakSetupService(),
+        },
     )()
     with pytest.raises(
         V1ConfigurationError,
@@ -203,6 +239,17 @@ def test_v1_custom_cloud_dependencies_cannot_bypass_oauth_validation() -> None:
         create_test_http_app(
             principal_resolver=StubResolver(_principal()),
             provider_oauth_service=object(),
+        )
+
+    missing_peak = PrincipalCloudDependencies()
+    del missing_peak.peak_setup_service
+    with pytest.raises(
+        V1ConfigurationError,
+        match="v1_peak_setup_service_missing",
+    ):
+        create_test_http_app(
+            principal_resolver=StubResolver(_principal()),
+            cloud_dependencies=missing_peak,
         )
 
 
@@ -398,6 +445,29 @@ def test_missing_or_invalid_bearer_returns_rfc_9728_challenge() -> None:
     )
     assert resolver.tokens == ["invalid-token"]
     assert "invalid-token" not in invalid.text
+
+
+def test_peak_setup_routes_are_protected_by_the_same_mercury_principal() -> None:
+    resolver = StubResolver(_principal())
+    client = TestClient(
+        create_test_http_app(
+            principal_resolver=resolver,
+            cloud_dependencies=PrincipalCloudDependencies(),
+        ),
+        raise_server_exceptions=False,
+    )
+
+    missing = client.get(PEAK_SETUP_PATH)
+    authenticated = client.get(
+        PEAK_SETUP_PATH,
+        headers={"Authorization": "Bearer mercury-principal-token"},
+    )
+
+    assert missing.status_code == 401
+    assert missing.json() == {"error": "mercury_auth_required"}
+    assert authenticated.status_code == 200
+    assert authenticated.json() == {"subject": str(_principal().subject)}
+    assert resolver.tokens == ["mercury-principal-token"]
 
 
 def test_authenticated_but_unauthorized_request_returns_403() -> None:

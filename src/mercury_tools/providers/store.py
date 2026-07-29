@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import secrets
 import threading
+import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -33,6 +34,7 @@ from mercury_tools.providers.models import (
 )
 
 _TOKEN_HASH = re.compile(r"^[0-9a-f]{64}$")
+_PROVIDER_IDENTIFIER = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 _MAX_ATTEMPT_LIFETIME = timedelta(minutes=10)
 _OAUTH_ATTEMPT_STATUSES = frozenset(
     {
@@ -2393,6 +2395,95 @@ class SupabaseProviderConnectionStore:
             if not target.reuses_existing and target.connection_id != proposed_connection_id:
                 raise ValueError
             return target
+        except ProviderStoreError:
+            raise
+        except Exception:
+            raise ProviderStoreError("provider_connection_invalid") from None
+
+    def list_for_workspace(
+        self,
+        *,
+        tenant_id: UUID,
+        workspace_id: UUID,
+        auth_user_id: UUID,
+    ) -> tuple[ProviderConnectionSummary, ...]:
+        try:
+            ProviderConnectionStore._bound_ids(
+                tenant_id,
+                workspace_id,
+                auth_user_id,
+            )
+            rows = self._rpc_rows(
+                "list_mercury_provider_connections_backend",
+                {
+                    "p_tenant_id": str(tenant_id),
+                    "p_workspace_id": str(workspace_id),
+                    "p_auth_user_id": str(auth_user_id),
+                },
+            )
+            summaries: list[ProviderConnectionSummary] = []
+            expected_keys = {
+                "connection_id",
+                "provider",
+                "environment",
+                "account_display_name",
+                "authorization_method",
+                "granted_permissions",
+                "readiness",
+                "revision",
+                "last_validated_at",
+                "provider_revocation_required",
+            }
+            for row in rows:
+                if set(row) != expected_keys:
+                    raise ValueError
+                connection_id = UUID(str(row["connection_id"]))
+                environment = row["environment"]
+                account_display_name = row["account_display_name"]
+                permissions = ProviderConnectionStore._permissions(row["granted_permissions"])
+                revision = row["revision"]
+                revocation_required = row["provider_revocation_required"]
+                last_validated_at = (
+                    _rpc_timestamp(row["last_validated_at"])
+                    if row["last_validated_at"] is not None
+                    else None
+                )
+                if (
+                    connection_id.int == 0
+                    or not isinstance(environment, str)
+                    or _PROVIDER_IDENTIFIER.fullmatch(environment) is None
+                    or len(environment) > 64
+                    or not isinstance(account_display_name, str)
+                    or not 1 <= len(account_display_name) <= 200
+                    or any(
+                        unicodedata.category(character) in {"Cc", "Cf"}
+                        for character in account_display_name
+                    )
+                    or not isinstance(revision, int)
+                    or isinstance(revision, bool)
+                    or revision < 1
+                    or not isinstance(revocation_required, bool)
+                ):
+                    raise ValueError
+                summary = ProviderConnectionSummary(
+                    connection_id=connection_id,
+                    provider=row["provider"],
+                    environment=environment,
+                    account_display_name=account_display_name,
+                    authorization_method=row["authorization_method"],
+                    granted_permissions=permissions,
+                    readiness=row["readiness"],
+                    revision=revision,
+                    last_validated_at=last_validated_at,
+                    provider_revocation_required=revocation_required,
+                )
+                if (
+                    summary.readiness is ConnectionReadiness.READY
+                    and summary.last_validated_at is None
+                ):
+                    raise ValueError
+                summaries.append(summary)
+            return tuple(summaries)
         except ProviderStoreError:
             raise
         except Exception:
