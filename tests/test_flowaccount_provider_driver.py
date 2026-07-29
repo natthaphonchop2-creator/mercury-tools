@@ -110,7 +110,13 @@ class FakeRuntime:
     def __init__(self) -> None:
         self.events: list[tuple[str, object]] = []
 
-    async def discover(self, _connection: ProviderConnection) -> ProviderDiscovery:
+    async def discover(
+        self,
+        _connection: ProviderConnection,
+        *,
+        deadline: object | None = None,
+    ) -> ProviderDiscovery:
+        assert deadline is not None
         self.events.append(("discover", None))
         return ProviderDiscovery(
             provider=ProviderId.FLOWACCOUNT,
@@ -137,7 +143,10 @@ class FakeRuntime:
         binding: QualifiedCapabilityBinding,
         arguments: BaseModel,
         operation_id: UUID,
+        *,
+        deadline: object | None = None,
     ) -> ProviderCallResult:
+        assert deadline is not None
         self.events.append(
             (
                 "call",

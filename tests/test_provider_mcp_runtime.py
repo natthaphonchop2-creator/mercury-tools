@@ -785,6 +785,7 @@ def _catalog_qualification_resolver(
     connection: ProviderConnection,
     include_invoice: bool,
     include_profile: bool,
+    include_invoice_create: bool = False,
 ) -> CatalogQualificationResolver:
     capabilities: list[tuple[str, str, type[BaseModel], type[BaseModel], tuple[str, ...]]] = []
     if include_invoice:
@@ -795,6 +796,16 @@ def _catalog_qualification_resolver(
                 InvoiceArguments,
                 InvoiceResponse,
                 ("documents.read",),
+            )
+        )
+    if include_invoice_create:
+        capabilities.append(
+            (
+                "documents.invoice.create",
+                "create_invoice",
+                InvoiceArguments,
+                InvoiceResponse,
+                ("documents.create",),
             )
         )
     if include_profile:
@@ -2537,6 +2548,87 @@ async def test_outer_binding_and_runtime_verification_share_one_catalog_snapshot
 
 
 @pytest.mark.asyncio
+async def test_flowaccount_create_crossing_inherited_deadline_is_unknown_without_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    connection = _connection()
+    source = _catalog_qualification_resolver(
+        tmp_path,
+        connection=connection,
+        include_invoice=False,
+        include_profile=False,
+        include_invoice_create=True,
+    )
+    row = source._catalog._qualifications[0]
+
+    class SlowCatalog:
+        def list_provider_mcp_qualifications(self) -> list[ProviderMCPQualification]:
+            time.sleep(0.15)
+            return list(source._catalog._qualifications)
+
+    resolver = CatalogQualificationResolver(
+        catalog=SlowCatalog(),
+        catalog_root=str(tmp_path),
+        now=lambda: NOW,
+    )
+
+    def normalize_create(
+        binding: VerifiedRuntimeBinding,
+        structured_content: Mapping[str, Any],
+    ) -> BaseModel:
+        assert binding.normalized_capability == "documents.invoice.create"
+        invoice = structured_content["invoice"]
+        assert isinstance(invoice, Mapping)
+        return InvoiceResponse(invoice_id=invoice["id"])
+
+    registry = build_provider_registry(
+        settings=_settings(),
+        manifest_root=Path(__file__).resolve().parents[1] / "catalog/global",
+        header_factories={
+            AuthorizationMethod.OAUTH2_PKCE: lambda _connection: _auth_headers(),
+        },
+        response_normalizer=normalize_create,
+        request_model_resolver=_resolve_invoice_request_model,
+        response_model_resolver=_resolve_invoice_response_model,
+        qualification_resolver=resolver,
+    )
+    harness = FakeMCPHarness()
+    harness.call_delay = 0.3
+    harness.install(monkeypatch)
+    driver = registry.get(ProviderId.FLOWACCOUNT)
+    monkeypatch.setattr(driver, "_operation_seconds", lambda _timeout_class: 0.4)
+    binding = QualifiedCapabilityBinding(
+        provider=ProviderId.FLOWACCOUNT,
+        environment="sandbox",
+        normalized_capability=row.normalized_capability,
+        provider_tool=row.provider_tool_name,
+        operation_class=ProviderOperationClass.CREATE,
+        qualification_hash=row.evidence_revision_sha256,
+    )
+
+    with pytest.raises(ProviderRuntimeError) as error:
+        await driver.call(
+            connection,
+            binding,
+            InvoiceArguments(invoice_id="invoice-123"),
+            OPERATION_ID,
+        )
+    await asyncio.sleep(0.05)
+
+    _assert_sanitized_error(
+        error.value,
+        code="provider_outcome_unknown",
+        dispatch_certainty=DispatchCertainty.UNKNOWN,
+    )
+    assert error.value.status_class is ProviderStatusClass.OUTCOME_UNKNOWN
+    assert harness.call_count == 1
+    assert [event[0] for event in harness.events].count("call_tool") == 1
+    assert len(harness.clients) == 1
+    assert len(harness.sessions) == 1
+
+
+@pytest.mark.asyncio
 async def test_runtime_verifier_catalog_resolution_is_off_loop_and_deadline_bounded(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3059,6 +3151,32 @@ async def test_discovery_has_one_cumulative_initialize_and_list_deadline(
         code="provider_timeout_pre_dispatch",
         dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["discover", "validate"])
+async def test_inherited_deadline_bounds_predispatch_discovery_and_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    harness = FakeMCPHarness()
+    harness.initialize_delay = 0.2
+    harness.install(monkeypatch)
+    driver = _driver()
+    deadline = streamable_module.ProviderOperationDeadline.start(0.1)
+
+    with pytest.raises(ProviderRuntimeError) as error:
+        if operation == "discover":
+            await driver.discover(_connection(), deadline=deadline)
+        else:
+            await driver.validate_connection(_connection(), deadline=deadline)
+
+    _assert_sanitized_error(
+        error.value,
+        code="provider_timeout_pre_dispatch",
+        dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+    )
+    assert harness.call_count == 0
 
 
 @pytest.mark.asyncio
@@ -3708,6 +3826,40 @@ async def test_create_is_single_attempt_and_possible_dispatch_is_outcome_unknown
         code="provider_outcome_unknown",
         dispatch_certainty=DispatchCertainty.UNKNOWN,
     )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_create_after_possible_dispatch_is_outcome_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = FakeMCPHarness()
+    harness.call_delay = 10
+    harness.install(monkeypatch)
+    operation = asyncio.create_task(
+        _driver().call(
+            _connection(),
+            _binding(ProviderOperationClass.CREATE),
+            InvoiceArguments(invoice_id="invoice-123"),
+            OPERATION_ID,
+        )
+    )
+    for _ in range(100):
+        if harness.call_count == 1:
+            break
+        await asyncio.sleep(0.001)
+    assert harness.call_count == 1
+
+    operation.cancel()
+    with pytest.raises(ProviderRuntimeError) as error:
+        await operation
+
+    _assert_sanitized_error(
+        error.value,
+        code="provider_outcome_unknown",
+        dispatch_certainty=DispatchCertainty.UNKNOWN,
+    )
+    assert error.value.status_class is ProviderStatusClass.OUTCOME_UNKNOWN
+    assert harness.call_count == 1
 
 
 @pytest.mark.asyncio

@@ -21,7 +21,9 @@ from mercury_tools.providers.base import (
     ProviderOperationClass,
     ProviderQualificationState,
     ProviderResponseInvalid,
+    ProviderRuntimeError,
     ProviderStatusClass,
+    ProviderTimeoutPreDispatch,
     QualifiedCapabilityBinding,
     VerifiedRuntimeBinding,
 )
@@ -387,7 +389,13 @@ class RecordingRuntime:
     def __init__(self) -> None:
         self.events: list[str] = []
 
-    async def discover(self, _connection: ProviderConnection) -> ProviderDiscovery:
+    async def discover(
+        self,
+        _connection: ProviderConnection,
+        *,
+        deadline: ProviderOperationDeadline | None = None,
+    ) -> ProviderDiscovery:
+        assert deadline is not None
         self.events.append("discover")
         return ProviderDiscovery(
             provider=ProviderId.PEAK,
@@ -402,7 +410,10 @@ class RecordingRuntime:
         _binding: Any,
         _arguments: BaseModel,
         _operation_id: UUID,
+        *,
+        deadline: ProviderOperationDeadline | None = None,
     ) -> ProviderCallResult:
+        assert deadline is not None
         self.events.append("call")
         return ProviderCallResult(
             provider=ProviderId.PEAK,
@@ -427,10 +438,19 @@ class EnvelopeAwareRuntime(RecordingRuntime):
         binding: Any,
         arguments: BaseModel,
         operation_id: UUID,
+        *,
+        deadline: ProviderOperationDeadline | None = None,
     ) -> ProviderCallResult:
+        assert deadline is not None
         headers = await self._header_factory(connection)
         self.observed_headers = tuple((header.name, header.value) for header in headers.headers)
-        return await super().call(connection, binding, arguments, operation_id)
+        return await super().call(
+            connection,
+            binding,
+            arguments,
+            operation_id,
+            deadline=deadline,
+        )
 
 
 def test_peak_credentials_are_sealed_under_three_canonical_names_and_cleared() -> None:
@@ -692,9 +712,64 @@ async def test_peak_driver_validates_only_qualified_provider_profile_contract(
 
 
 @pytest.mark.asyncio
+async def test_peak_outer_driver_preserves_runtime_dispatch_classification(
+    tmp_path: Path,
+) -> None:
+    class ClassifiedRuntime(RecordingRuntime):
+        async def discover(
+            self,
+            _connection: ProviderConnection,
+            *,
+            deadline: ProviderOperationDeadline | None = None,
+        ) -> ProviderDiscovery:
+            assert deadline is not None
+            raise ProviderTimeoutPreDispatch(
+                ProviderId.PEAK,
+                dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+            )
+
+        async def call(
+            self,
+            _connection: ProviderConnection,
+            _binding: Any,
+            _arguments: BaseModel,
+            _operation_id: UUID,
+            *,
+            deadline: ProviderOperationDeadline | None = None,
+        ) -> ProviderCallResult:
+            assert deadline is not None
+            raise ProviderTimeoutPreDispatch(
+                ProviderId.PEAK,
+                dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+            )
+
+    contract = _contract()
+    driver = PeakMCPDriver(
+        runtime=ClassifiedRuntime(),
+        manifest=MANIFEST,
+        contract=contract,
+        qualification_resolver=_qualified_resolver(
+            tmp_path,
+            connection=_connection(),
+            contract=contract,
+        ),
+    )
+
+    with pytest.raises(ProviderRuntimeError) as discovery_error:
+        await driver.discover(_connection())
+    with pytest.raises(ProviderRuntimeError) as validation_error:
+        await driver.validate_connection(_connection())
+
+    assert type(discovery_error.value) is ProviderTimeoutPreDispatch
+    assert discovery_error.value.dispatch_certainty is DispatchCertainty.NOT_DISPATCHED
+    assert type(validation_error.value) is ProviderTimeoutPreDispatch
+    assert validation_error.value.dispatch_certainty is DispatchCertainty.NOT_DISPATCHED
+
+
+@pytest.mark.asyncio
 async def test_provider_validation_drops_raw_runtime_exception_graph(tmp_path: Path) -> None:
     class FailingRuntime(RecordingRuntime):
-        async def call(self, *_args: object) -> ProviderCallResult:
+        async def call(self, *_args: object, **_kwargs: object) -> ProviderCallResult:
             raw_provider_payload = {"credential": USER_TOKEN}
             raise RuntimeError(raw_provider_payload)
 

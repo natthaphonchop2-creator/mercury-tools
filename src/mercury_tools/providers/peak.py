@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import re
 import unicodedata
@@ -25,6 +24,7 @@ from mercury_tools.providers.base import (
     ProviderOperationClass,
     ProviderQualificationState,
     ProviderResponseInvalid,
+    ProviderRuntimeError,
     ProviderStatusClass,
     ProviderValidation,
     QualifiedCapabilityBinding,
@@ -558,13 +558,15 @@ class PeakMCPDriver:
         contract = self._require_contract()
         checked = self._connection(connection, allow_validation=True)
         try:
-            async with self._qualification_operation(TimeoutClass.DISCOVERY):
+            async with self._qualification_operation(TimeoutClass.DISCOVERY) as deadline:
                 await self._qualification_resolver.bind_for_connection(
                     checked,
                     normalized_capability=_PROFILE_CAPABILITY,
                     provider_tool_name=contract.profile_tool,
                 )
-                return await self._runtime.discover(checked)
+                return await self._runtime.discover(checked, deadline=deadline)
+        except ProviderRuntimeError:
+            raise
         except Exception:
             raise self._invalid() from None
 
@@ -577,7 +579,7 @@ class PeakMCPDriver:
         validation: ProviderValidation | None = None
         failed = False
         try:
-            async with self._qualification_operation(TimeoutClass.READ):
+            async with self._qualification_operation(TimeoutClass.READ) as deadline:
                 binding = await self._qualification_resolver.bind_for_connection(
                     checked,
                     normalized_capability=_PROFILE_CAPABILITY,
@@ -588,6 +590,7 @@ class PeakMCPDriver:
                     binding,
                     contract.profile_request_model(),
                     uuid4(),
+                    deadline=deadline,
                 )
                 if result.status_class is not ProviderStatusClass.SUCCESS:
                     raise ValueError
@@ -601,6 +604,8 @@ class PeakMCPDriver:
                     },
                     dispatch_certainty=DispatchCertainty.NOT_APPLICABLE,
                 )
+        except ProviderRuntimeError:
+            raise
         except Exception:
             failed = True
         if failed or validation is None:
@@ -639,7 +644,7 @@ class PeakMCPDriver:
             if validation.status_class is not ProviderStatusClass.SUCCESS:
                 raise ValueError
             return PeakProfile.model_validate(validation.normalized_data)
-        except ProviderResponseInvalid:
+        except ProviderRuntimeError:
             raise
         except Exception:
             raise self._invalid() from None
@@ -671,13 +676,12 @@ class PeakMCPDriver:
         deadline = ProviderOperationDeadline.start(
             self._manifest.timeout_classes[timeout_class].operation_seconds
         )
-        async with asyncio.timeout_at(deadline.expires_at):
-            snapshot = await self._qualification_resolver.open_snapshot(deadline)
-            with (
-                self._qualification_resolver.use_snapshot(snapshot),
-                provider_operation_deadline(deadline),
-            ):
-                yield
+        snapshot = await self._qualification_resolver.open_snapshot(deadline)
+        with (
+            self._qualification_resolver.use_snapshot(snapshot),
+            provider_operation_deadline(deadline),
+        ):
+            yield deadline
 
     def _connection(
         self,

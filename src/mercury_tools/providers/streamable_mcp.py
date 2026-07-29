@@ -692,10 +692,12 @@ class StreamableMCPDriver:
     async def discover(
         self,
         connection: ProviderConnection,
+        *,
+        deadline: ProviderOperationDeadline | None = None,
     ) -> ProviderDiscovery:
-        deadline = _OperationDeadline.start(
-            self._operation_seconds(TimeoutClass.DISCOVERY),
-            clock=self._monotonic_clock,
+        deadline = self._select_operation_deadline(
+            TimeoutClass.DISCOVERY,
+            deadline,
         )
         runtime_state: _ProviderRuntimeState | None = None
         observed_auth_statuses: set[int] = set()
@@ -773,10 +775,12 @@ class StreamableMCPDriver:
     async def validate_connection(
         self,
         connection: ProviderConnection,
+        *,
+        deadline: ProviderOperationDeadline | None = None,
     ) -> ProviderValidation:
-        deadline = _OperationDeadline.start(
-            self._operation_seconds(TimeoutClass.READ),
-            clock=self._monotonic_clock,
+        deadline = self._select_operation_deadline(
+            TimeoutClass.READ,
+            deadline,
         )
         runtime_state: _ProviderRuntimeState | None = None
         observed_auth_statuses: set[int] = set()
@@ -852,6 +856,8 @@ class StreamableMCPDriver:
         binding: QualifiedCapabilityBinding,
         arguments: BaseModel,
         operation_id: UUID,
+        *,
+        deadline: ProviderOperationDeadline | None = None,
     ) -> ProviderCallResult:
         timeout_class = (
             TimeoutClass.CREATE
@@ -859,9 +865,9 @@ class StreamableMCPDriver:
             and binding.operation_class is ProviderOperationClass.CREATE
             else TimeoutClass.READ
         )
-        deadline = _OperationDeadline.start(
-            self._operation_seconds(timeout_class),
-            clock=self._monotonic_clock,
+        deadline = self._select_operation_deadline(
+            timeout_class,
+            deadline,
         )
         runtime_state: _ProviderRuntimeState | None = None
         possible_dispatch = False
@@ -959,6 +965,18 @@ class StreamableMCPDriver:
                                 dispatch_certainty=DispatchCertainty.DISPATCHED,
                             ) from None
                     deadline.check()
+        except asyncio.CancelledError:
+            if (
+                verified_binding is not None
+                and verified_binding.operation_class is ProviderOperationClass.CREATE
+                and possible_dispatch
+            ):
+                failure = ProviderOutcomeUnknown(
+                    self.provider,
+                    dispatch_certainty=DispatchCertainty.UNKNOWN,
+                )
+            else:
+                raise
         except ProviderRuntimeError as exc:
             if (
                 verified_binding is not None
@@ -1482,6 +1500,23 @@ class StreamableMCPDriver:
 
     def _operation_seconds(self, timeout_class: TimeoutClass) -> int:
         return self._manifest.timeout_classes[timeout_class].operation_seconds
+
+    def _select_operation_deadline(
+        self,
+        timeout_class: TimeoutClass,
+        inherited: ProviderOperationDeadline | None,
+    ) -> ProviderOperationDeadline:
+        if inherited is None:
+            return _OperationDeadline.start(
+                self._operation_seconds(timeout_class),
+                clock=self._monotonic_clock,
+            )
+        if not isinstance(inherited, _OperationDeadline):
+            raise ProviderResponseInvalid(
+                self.provider,
+                dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+            )
+        return inherited
 
     def _predispatch_error(
         self,

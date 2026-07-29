@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import json
 import unicodedata
@@ -30,6 +29,7 @@ from mercury_tools.providers.base import (
     ProviderDiscovery,
     ProviderOperationClass,
     ProviderResponseInvalid,
+    ProviderRuntimeError,
     ProviderStatusClass,
     ProviderValidation,
     QualifiedCapabilityBinding,
@@ -600,9 +600,9 @@ class FlowAccountMCPDriver:
     async def discover(self, connection: ProviderConnection) -> ProviderDiscovery:
         checked = self._connection(connection, allow_validation=True)
         try:
-            async with self._qualification_operation(TimeoutClass.DISCOVERY):
+            async with self._qualification_operation(TimeoutClass.DISCOVERY) as deadline:
                 await self._profile_binding(checked)
-                result = await self._runtime.discover(checked)
+                result = await self._runtime.discover(checked, deadline=deadline)
                 capabilities = result.normalized_data["capabilities"]
                 if isinstance(capabilities, (str, bytes, bytearray)):
                     raise TypeError
@@ -620,6 +620,8 @@ class FlowAccountMCPDriver:
                     },
                     dispatch_certainty=result.dispatch_certainty,
                 )
+        except ProviderRuntimeError:
+            raise
         except Exception:
             raise self._invalid() from None
 
@@ -629,7 +631,7 @@ class FlowAccountMCPDriver:
     ) -> ProviderValidation:
         checked = self._connection(connection, allow_validation=True)
         try:
-            async with self._qualification_operation(TimeoutClass.READ):
+            async with self._qualification_operation(TimeoutClass.READ) as deadline:
                 binding = await self._profile_binding(checked)
                 if (
                     binding.provider is not ProviderId.FLOWACCOUNT
@@ -644,6 +646,7 @@ class FlowAccountMCPDriver:
                     binding,
                     FlowAccountProfileRequest(),
                     uuid4(),
+                    deadline=deadline,
                 )
                 if result.status_class is not ProviderStatusClass.SUCCESS:
                     raise ValueError
@@ -654,7 +657,7 @@ class FlowAccountMCPDriver:
                     normalized_data=profile.model_dump(mode="json"),
                     dispatch_certainty=DispatchCertainty.NOT_APPLICABLE,
                 )
-        except ProviderResponseInvalid:
+        except ProviderRuntimeError:
             raise
         except Exception:
             raise self._invalid() from None
@@ -679,14 +682,17 @@ class FlowAccountMCPDriver:
                 if checked_binding.operation_class is ProviderOperationClass.CREATE
                 else TimeoutClass.READ
             )
-            async with self._qualification_operation(timeout_class):
+            async with self._qualification_operation(timeout_class) as deadline:
                 await self._qualification_resolver.assert_binding(checked, checked_binding)
                 return await self._runtime.call(
                     checked,
                     checked_binding,
                     arguments,
                     operation_id,
+                    deadline=deadline,
                 )
+        except ProviderRuntimeError:
+            raise
         except Exception:
             raise self._invalid() from None
 
@@ -712,13 +718,12 @@ class FlowAccountMCPDriver:
     @asynccontextmanager
     async def _qualification_operation(self, timeout_class: TimeoutClass):
         deadline = ProviderOperationDeadline.start(self._operation_seconds(timeout_class))
-        async with asyncio.timeout_at(deadline.expires_at):
-            snapshot = await self._qualification_resolver.open_snapshot(deadline)
-            with (
-                self._qualification_resolver.use_snapshot(snapshot),
-                provider_operation_deadline(deadline),
-            ):
-                yield
+        snapshot = await self._qualification_resolver.open_snapshot(deadline)
+        with (
+            self._qualification_resolver.use_snapshot(snapshot),
+            provider_operation_deadline(deadline),
+        ):
+            yield deadline
 
     def _operation_seconds(self, timeout_class: TimeoutClass) -> int:
         return self._manifest.timeout_classes[timeout_class].operation_seconds
