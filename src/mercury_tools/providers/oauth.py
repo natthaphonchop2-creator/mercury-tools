@@ -1870,7 +1870,9 @@ class ProviderOAuthService:
                 provider_revocation_required=remote_revocation_status != "not_supported",
             )
             if inspect.isawaitable(disconnected):
-                disconnected = await disconnected
+                with anyio.CancelScope(shield=True):
+                    disconnected = await disconnected
+                await anyio.lowlevel.checkpoint_if_cancelled()
         except Exception:
             if material is not None:
                 material.clear()
@@ -1920,7 +1922,9 @@ class ProviderOAuthService:
                     connection_id=connection_id,
                 )
                 if inspect.isawaitable(completed):
-                    completed = await completed
+                    with anyio.CancelScope(shield=True):
+                        completed = await completed
+                    await anyio.lowlevel.checkpoint_if_cancelled()
             except Exception:
                 raise ProviderOAuthError("provider_oauth_state_invalid") from None
             return FlowAccountDisconnectOutcome(
