@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import inspect
@@ -17,7 +18,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import parse_http_list
 from uuid import UUID, uuid4
@@ -82,6 +83,37 @@ _OAUTH_ERROR_CODES = frozenset(
 _AUTH_TOKEN = r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+"
 _AUTH_CHALLENGE_START = re.compile(rf"^({_AUTH_TOKEN})(?:[ \t]+(.+))?$")
 _AUTH_PARAMETER = re.compile(rf'^({_AUTH_TOKEN})[ \t]*=[ \t]*(?:"([^"\\]*)"|({_AUTH_TOKEN}))$')
+_DurableResultT = TypeVar("_DurableResultT")
+
+
+async def _await_durable_store_operation(
+    operation: Awaitable[_DurableResultT],
+) -> _DurableResultT:
+    """Finish one store mutation before propagating caller cancellation."""
+
+    cancellation: asyncio.CancelledError | None = None
+    with anyio.CancelScope(shield=True):
+        operation_task = asyncio.ensure_future(operation)
+        while True:
+            try:
+                result = await asyncio.shield(operation_task)
+            except asyncio.CancelledError as exc:
+                if operation_task.cancelled():
+                    if cancellation is not None:
+                        raise cancellation from exc
+                    raise
+                if cancellation is None:
+                    cancellation = exc
+                continue
+            except Exception as exc:
+                if cancellation is not None:
+                    raise cancellation from exc
+                raise
+            break
+    if cancellation is not None:
+        raise cancellation
+    await anyio.lowlevel.checkpoint_if_cancelled()
+    return result
 
 
 class _OAuthModel(BaseModel):
@@ -1870,9 +1902,7 @@ class ProviderOAuthService:
                 provider_revocation_required=remote_revocation_status != "not_supported",
             )
             if inspect.isawaitable(disconnected):
-                with anyio.CancelScope(shield=True):
-                    disconnected = await disconnected
-                await anyio.lowlevel.checkpoint_if_cancelled()
+                disconnected = await _await_durable_store_operation(disconnected)
         except Exception:
             if material is not None:
                 material.clear()
@@ -1922,9 +1952,7 @@ class ProviderOAuthService:
                     connection_id=connection_id,
                 )
                 if inspect.isawaitable(completed):
-                    with anyio.CancelScope(shield=True):
-                        completed = await completed
-                    await anyio.lowlevel.checkpoint_if_cancelled()
+                    completed = await _await_durable_store_operation(completed)
             except Exception:
                 raise ProviderOAuthError("provider_oauth_state_invalid") from None
             return FlowAccountDisconnectOutcome(

@@ -948,6 +948,63 @@ async def test_disconnect_persists_awaitable_local_deletion_before_anyio_cancell
 
 
 @pytest.mark.asyncio
+async def test_disconnect_persists_awaitable_local_deletion_before_native_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleared_material: list[FlowAccountOAuthRevocationMaterial] = []
+    clear = FlowAccountOAuthRevocationMaterial.clear
+
+    def capture_clear(material: FlowAccountOAuthRevocationMaterial) -> None:
+        clear(material)
+        cleared_material.append(material)
+
+    monkeypatch.setattr(FlowAccountOAuthRevocationMaterial, "clear", capture_clear)
+    service, oauth_client, _, _, connection_store, _ = _service()
+    blocking_store = BlockingDisconnectStore(connection_store)
+    service._connection_store = blocking_store
+    started = await service.start(
+        _principal(),
+        WORKSPACE_ID,
+        "flowaccount",
+        "sandbox",
+    )
+    state = parse_qs(urlsplit(started.authorization_url).query)["state"][0]
+    connected = await service.complete_callback(
+        OAuthCallback(code="authorization-code", state=state)
+    )
+
+    assert len(connection_store.store._envelopes) == 4
+    task = asyncio.create_task(
+        service.disconnect(_principal(), WORKSPACE_ID, connected.connection_id)
+    )
+    await blocking_store.disconnect_started.wait()
+
+    task.cancel("local-disconnect-cancelled")
+    await asyncio.sleep(0)
+    assert task.done() is False
+    assert blocking_store.disconnect_completed is False
+
+    task.cancel("repeated-local-disconnect-cancelled")
+    await asyncio.sleep(0)
+    assert task.done() is False
+    assert blocking_store.disconnect_completed is False
+
+    blocking_store.allow_disconnect.set()
+    with pytest.raises(asyncio.CancelledError) as cancellation:
+        await task
+
+    assert cancellation.value.args == ("local-disconnect-cancelled",)
+    assert blocking_store.disconnect_completed is True
+    disconnected = connection_store.store._connections[connected.connection_id]
+    assert disconnected.readiness is ConnectionReadiness.DISCONNECTED
+    assert disconnected.provider_revocation_required is True
+    assert connection_store.store._envelopes == {}
+    assert oauth_client.revocations == 0
+    assert len(cleared_material) == 1
+    assert _revocation_material_is_cleared(cleared_material[0])
+
+
+@pytest.mark.asyncio
 async def test_disconnect_completes_awaitable_revocation_before_anyio_cancellation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1020,6 +1077,75 @@ async def test_disconnect_completes_awaitable_revocation_before_anyio_cancellati
     assert state_when_cancelled == [
         (ConnectionReadiness.DISCONNECTED, False, 0),
     ]
+    assert oauth_client.revocations == 1
+
+    repeated = await service.disconnect(_principal(), WORKSPACE_ID, connected.connection_id)
+
+    assert repeated.status == "disconnected"
+    assert repeated.remote_revocation_status == "already_disconnected"
+    assert repeated.provider_revocation_required is False
+    assert oauth_client.revocations == 1
+
+
+@pytest.mark.asyncio
+async def test_disconnect_completes_awaitable_revocation_before_native_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleared_material: list[FlowAccountOAuthRevocationMaterial] = []
+    clear = FlowAccountOAuthRevocationMaterial.clear
+
+    def capture_clear(material: FlowAccountOAuthRevocationMaterial) -> None:
+        clear(material)
+        cleared_material.append(material)
+
+    monkeypatch.setattr(FlowAccountOAuthRevocationMaterial, "clear", capture_clear)
+    service, oauth_client, _, _, connection_store, _ = _service()
+    blocking_store = BlockingCompleteRevocationStore(connection_store)
+    service._connection_store = blocking_store
+    started = await service.start(
+        _principal(),
+        WORKSPACE_ID,
+        "flowaccount",
+        "sandbox",
+    )
+    state = parse_qs(urlsplit(started.authorization_url).query)["state"][0]
+    connected = await service.complete_callback(
+        OAuthCallback(code="authorization-code", state=state)
+    )
+
+    task = asyncio.create_task(
+        service.disconnect(_principal(), WORKSPACE_ID, connected.connection_id)
+    )
+    await blocking_store.completion_started.wait()
+
+    pending = connection_store.store._connections[connected.connection_id]
+    assert pending.readiness is ConnectionReadiness.DISCONNECTED
+    assert pending.provider_revocation_required is True
+    assert connection_store.store._envelopes == {}
+    assert oauth_client.revocations == 1
+    assert len(cleared_material) == 1
+    assert _revocation_material_is_cleared(cleared_material[0])
+
+    task.cancel("revocation-completion-cancelled")
+    await asyncio.sleep(0)
+    assert task.done() is False
+    assert blocking_store.completion_completed is False
+
+    task.cancel("repeated-revocation-completion-cancelled")
+    await asyncio.sleep(0)
+    assert task.done() is False
+    assert blocking_store.completion_completed is False
+
+    blocking_store.allow_completion.set()
+    with pytest.raises(asyncio.CancelledError) as cancellation:
+        await task
+
+    assert cancellation.value.args == ("revocation-completion-cancelled",)
+    assert blocking_store.completion_completed is True
+    disconnected = connection_store.store._connections[connected.connection_id]
+    assert disconnected.readiness is ConnectionReadiness.DISCONNECTED
+    assert disconnected.provider_revocation_required is False
+    assert connection_store.store._envelopes == {}
     assert oauth_client.revocations == 1
 
     repeated = await service.disconnect(_principal(), WORKSPACE_ID, connected.connection_id)
