@@ -5,6 +5,8 @@ import base64
 import inspect
 import logging
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -14,8 +16,22 @@ from starlette.testclient import TestClient
 
 from mercury_tools.auth.models import MercuryAuthError, MercuryPrincipal
 from mercury_tools.auth.supabase_jwt import authorization_server_metadata_url
+from mercury_tools.catalog.models import ProviderMCPQualification, QualificationState
 from mercury_tools.config import V1ConfigurationError
 from mercury_tools.mcp.server import create_http_app, create_test_http_app
+from mercury_tools.providers.base import (
+    DispatchCertainty,
+    ProviderCallResult,
+    ProviderOperationClass,
+    ProviderStatusClass,
+    QualifiedCapabilityBinding,
+)
+from mercury_tools.providers.models import (
+    AuthorizationMethod,
+    ConnectionReadiness,
+    ProviderConnection,
+    ProviderId,
+)
 from mercury_tools.providers.oauth import FLOWACCOUNT_CALLBACK_PATH
 from mercury_tools.providers.peak_setup import (
     PEAK_SETUP_EXCHANGE_PATH,
@@ -167,9 +183,162 @@ def _principal() -> MercuryPrincipal:
     )
 
 
+def test_http_lifespan_projects_and_refreshes_generated_provider_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The serving HTTP MCP instance projects catalog tools before it is ready."""
+
+    from mercury_tools.mcp import v1_tools
+    from mercury_tools.workspaces.models import WorkspaceMembership, WorkspaceRole
+
+    now = datetime(2026, 7, 30, 12, tzinfo=UTC)
+    workspace_id = UUID("12345678-1234-5678-9234-567812345678")
+    connection_id = UUID("87654321-4321-8765-4321-876543218765")
+    tenant_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    definition = ProviderMCPQualification.discovered(
+        provider="flowaccount",
+        environment="sandbox",
+        provider_tool_name="PRIVATE_PROVIDER_INVOICE_GET",
+        normalized_capability="documents.invoice.get",
+        input_schema={
+            "type": "object",
+            "properties": {"invoice_reference": {"type": "string", "minLength": 1}},
+            "required": ["invoice_reference"],
+            "additionalProperties": False,
+        },
+        output_schema={
+            "type": "object",
+            "properties": {"invoice_id": {"type": "string"}},
+            "required": ["invoice_id"],
+            "additionalProperties": False,
+        },
+        response_shape_hash="a" * 64,
+        required_permissions=("documents.read",),
+    )
+    qualification = definition.model_copy(
+        update={
+            "qualification_state": QualificationState.ENABLED,
+            "company_sha256": "b" * 64,
+            "evidence_revision_sha256": "c" * 64,
+            "qualification_evidence_uri": (
+                "catalog://global/flowaccount/qualifications/"
+                f"{definition.capability_version_sha256}-{'c' * 64}.json"
+            ),
+            "evidence_evaluated_at": now,
+            "evidence_expires_at": now + timedelta(days=1),
+        }
+    )
+
+    class Catalog:
+        qualifications = [qualification]
+
+        def list_provider_mcp_qualifications(self):
+            return list(self.qualifications)
+
+    class ConnectionStore:
+        def load_connection(self, **_kwargs):
+            return ProviderConnection(
+                id=connection_id,
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                auth_user_id=_principal().subject,
+                provider=ProviderId.FLOWACCOUNT,
+                environment="sandbox",
+                provider_account_id="company",
+                account_display_name="Example Company",
+                authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+                granted_permissions=("documents.read",),
+                readiness=ConnectionReadiness.READY,
+                revision=1,
+                last_validated_at=now,
+                credential_envelope_ids=(UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),),
+                created_at=now,
+                updated_at=now,
+            )
+
+    class Resolver:
+        async def bind_exact_for_connection(self, _connection, **_kwargs):
+            return qualification, QualifiedCapabilityBinding(
+                provider=ProviderId.FLOWACCOUNT,
+                environment="sandbox",
+                normalized_capability=qualification.normalized_capability,
+                provider_tool="PRIVATE_PROVIDER_INVOICE_GET",
+                operation_class=ProviderOperationClass.READ,
+                qualification_hash="c" * 64,
+            )
+
+    class Driver:
+        async def call(self, *_args, **_kwargs):
+            return ProviderCallResult(
+                provider=ProviderId.FLOWACCOUNT,
+                status_class=ProviderStatusClass.SUCCESS,
+                normalized_data={"invoice_id": "INV-1"},
+                dispatch_certainty=DispatchCertainty.DISPATCHED,
+            )
+
+    runtime = SimpleNamespace(
+        qualification_catalog=Catalog(),
+        connection_store=ConnectionStore(),
+        qualification_resolver=Resolver(),
+        registry=SimpleNamespace(get=lambda _provider: Driver()),
+    )
+    membership = WorkspaceMembership(
+        tenant_id=tenant_id,
+        tenant_display_name="Example Tenant",
+        workspace_id=workspace_id,
+        workspace_display_name="Example Workspace",
+        role=WorkspaceRole.MEMBER,
+    )
+
+    async def require_workspace(_context, *, workspace_id, service_factory):
+        del service_factory
+        assert workspace_id == membership.workspace_id
+        return _principal(), membership
+
+    monkeypatch.setattr(v1_tools, "_require_workspace", require_workspace)
+    app = create_test_http_app(
+        principal_resolver=StubResolver(_principal()),
+        cloud_dependencies=PrincipalCloudDependencies(),
+        generated_provider_runtime=runtime,
+    )
+    notifications: list[str] = []
+    context = SimpleNamespace(
+        session=SimpleNamespace(
+            send_tool_list_changed=lambda: notifications.append("tools/list_changed")
+        )
+    )
+
+    with TestClient(app):
+        serving_mcp = app.state.mercury_mcp
+        assert "mercury_flowaccount_invoice_get" in {
+            tool.name for tool in asyncio.run(serving_mcp.list_tools())
+        }
+        serving_mcp.get_context = lambda: context
+        _content, structured = asyncio.run(
+            serving_mcp.call_tool(
+                "mercury_flowaccount_invoice_get",
+                {
+                    "workspace_id": str(workspace_id),
+                    "connection_id": str(connection_id),
+                    "capability_version": qualification.capability_version_sha256,
+                    "invoice_reference": "INV-1",
+                },
+            )
+        )
+        assert structured["data"] == {"invoice_id": "INV-1"}
+
+        runtime.qualification_catalog.qualifications = []
+        assert asyncio.run(app.state.refresh_generated_provider_tools(context)) is True
+        assert "mercury_flowaccount_invoice_get" not in {
+            tool.name for tool in asyncio.run(serving_mcp.list_tools())
+        }
+        assert notifications == ["tools/list_changed"]
+
+
 def test_v1_default_http_app_builds_and_runs_production_oauth_composition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from mercury_tools.db.catalog import SupabaseCatalogStore
     from mercury_tools.mcp import server
     from mercury_tools.providers.production import ProviderOAuthProductionComposition
 
@@ -196,6 +365,7 @@ def test_v1_default_http_app_builds_and_runs_production_oauth_composition(
     monkeypatch.setattr(server, "build_provider_oauth_production_composition", build)
     monkeypatch.setattr(ProviderOAuthProductionComposition, "startup", startup)
     monkeypatch.setattr(ProviderOAuthProductionComposition, "aclose", close)
+    monkeypatch.setattr(SupabaseCatalogStore, "list_provider_mcp_qualifications", lambda _self: [])
     app = create_http_app()
 
     paths = {getattr(route, "path", None) for route in app.routes}

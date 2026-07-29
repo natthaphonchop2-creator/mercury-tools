@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -21,6 +22,7 @@ from mercury_tools.catalog.models import (
 )
 from mercury_tools.config import Settings, require_supabase
 from mercury_tools.qualification.artifacts import QualificationArtifact
+from mercury_tools.qualification.provider_mcp import transition_qualification
 
 _FILTER_COLUMNS = {
     "capability": "capability",
@@ -145,12 +147,7 @@ class SupabaseCatalogStore:
             )
             if (
                 checked.qualification_state
-                in {
-                    QualificationState.NONPRODUCTION_QUALIFIED,
-                    QualificationState.ENABLED,
-                    QualificationState.DISABLED,
-                    QualificationState.SUPERSEDED,
-                }
+                in {QualificationState.NONPRODUCTION_QUALIFIED, QualificationState.ENABLED}
                 and checked_artifact is None
             ):
                 raise ValueError
@@ -171,6 +168,73 @@ class SupabaseCatalogStore:
         if not isinstance(result, str):
             raise RuntimeError("supabase_catalog_response_invalid")
         return result
+
+    def disable_provider_mcp_capability_version(
+        self,
+        qualification: ProviderMCPQualification,
+    ) -> tuple[ProviderMCPQualification, ...]:
+        """Persist the exact schema-changed terminal transition idempotently.
+
+        The existing SQL mutation allows enabled -> disabled and keeps immutable
+        version evidence intact. Re-reading after a concurrent winner makes this
+        adapter idempotent without widening that transition graph or requiring a
+        database migration.
+        """
+
+        checked = ProviderMCPQualification.model_validate(qualification)
+        identity = (
+            checked.provider,
+            checked.environment,
+            checked.provider_tool_name,
+            checked.normalized_capability,
+            checked.capability_version_sha256,
+        )
+
+        def matching() -> list[ProviderMCPQualification]:
+            return [
+                item
+                for item in self.list_provider_mcp_qualifications()
+                if (
+                    item.provider,
+                    item.environment,
+                    item.provider_tool_name,
+                    item.normalized_capability,
+                    item.capability_version_sha256,
+                )
+                == identity
+            ]
+
+        rows = matching()
+        if not rows:
+            raise ValueError("catalog_qualification_invalid")
+        pending = [item for item in rows if item.qualification_state is QualificationState.ENABLED]
+        terminal = [
+            item
+            for item in rows
+            if item.qualification_state is QualificationState.DISABLED
+            and item.disable_reason == "schema_changed"
+        ]
+        if len(pending) + len(terminal) != len(rows):
+            raise ValueError("catalog_qualification_invalid")
+        for item in pending:
+            disabled = transition_qualification(
+                item,
+                QualificationState.DISABLED,
+                disable_reason="schema_changed",
+                now=datetime.now(UTC),
+            )
+            try:
+                self.publish_provider_mcp_qualification(disabled)
+            except RuntimeError:
+                # A concurrent worker may have committed the exact same terminal state.
+                current = matching()
+                if not current or any(
+                    row.qualification_state is not QualificationState.DISABLED
+                    or row.disable_reason != "schema_changed"
+                    for row in current
+                ):
+                    raise
+        return tuple(self.list_provider_mcp_qualifications())
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = f"{self.base_url}/{path.lstrip('/')}"

@@ -6,8 +6,8 @@ import asyncio
 import hashlib
 import inspect
 import json
+import time
 from collections.abc import Awaitable, Callable
-from contextlib import suppress
 from typing import Any, TypeAlias
 from uuid import UUID, uuid4
 
@@ -15,7 +15,10 @@ from pydantic import BaseModel
 
 from mercury_tools.auth.models import MercuryPrincipal
 from mercury_tools.catalog.models import ProviderMCPQualification
-from mercury_tools.mcp.generated_tools import catalog_wire_model, sanitize_provider_read_data
+from mercury_tools.mcp.generated_tools import (
+    catalog_wire_model,
+    project_provider_read_data,
+)
 from mercury_tools.mcp.v1_schemas import ProviderReadEnvelope
 from mercury_tools.providers.base import (
     DispatchCertainty,
@@ -24,13 +27,13 @@ from mercury_tools.providers.base import (
     ProviderRuntimeError,
     ProviderStatusClass,
 )
+from mercury_tools.providers.finalization import await_cleanup
 from mercury_tools.providers.models import ProviderConnection
 from mercury_tools.providers.streamable_mcp import (
     ProviderOperationDeadline,
     provider_operation_deadline,
 )
 from mercury_tools.qualification.provider_mcp import QualificationGateError
-from mercury_tools.safety.redaction import redact_json
 from mercury_tools.workspaces.models import WorkspaceMembership
 
 RuntimeFactory: TypeAlias = Callable[[], Any | Awaitable[Any]]
@@ -96,35 +99,53 @@ def _retryable_read_failure(error: ProviderRuntimeError) -> bool:
     }
 
 
+def _terminal_status(error: BaseException | None) -> tuple[str, str, str]:
+    if error is None:
+        return "ok", ProviderStatusClass.SUCCESS.value, DispatchCertainty.DISPATCHED.value
+    if isinstance(error, asyncio.CancelledError):
+        return "cancelled", "cancelled", DispatchCertainty.NOT_DISPATCHED.value
+    if isinstance(error, ProviderRuntimeError):
+        return "error", error.status_class.value, error.dispatch_certainty.value
+    if isinstance(error, QualificationGateError):
+        return "denied", error.code, DispatchCertainty.NOT_DISPATCHED.value
+    return "error", "validation_failed", DispatchCertainty.NOT_DISPATCHED.value
+
+
 def _audit_event(
     *,
     workspace_id: UUID,
     connection_id: UUID,
-    qualification: ProviderMCPQualification,
-    envelope: ProviderReadEnvelope,
+    capability_id: str,
+    capability_version: str,
     inputs: BaseModel,
+    qualification: ProviderMCPQualification | None,
+    error: BaseException | None,
+    retry_count: int,
+    latency_ms: int,
+    correlation_id: str,
 ) -> dict[str, object]:
-    return redact_json(
-        {
-            "tool_name": "generated_provider_read",
-            "input": {
-                "workspace_id_sha256": _identifier_sha256(workspace_id),
-                "connection_id_sha256": _identifier_sha256(connection_id),
-                "capability_id": qualification.normalized_capability,
-                "capability_version": qualification.capability_version_sha256,
-                "input_sha256": _input_sha256(inputs),
-            },
-            "output_summary": {
-                "provider": qualification.provider,
-                "environment": qualification.environment,
-                "capability_id": envelope.capability_id,
-                "capability_version": envelope.capability_version,
-                "data_field_count": len(envelope.data),
-            },
-            "status": "ok",
-            "metadata": {"runtime": "mcp", "surface": "v1"},
-        }
-    )
+    status, status_class, dispatch_certainty = _terminal_status(error)
+    return {
+        "tool_name": "generated_provider_read",
+        "input": {
+            "workspace_id_sha256": _identifier_sha256(workspace_id),
+            "connection_id_sha256": _identifier_sha256(connection_id),
+            "capability_id": capability_id,
+            "capability_version": capability_version,
+            "input_sha256": _input_sha256(inputs),
+        },
+        "output_summary": {
+            "provider": qualification.provider if qualification is not None else None,
+            "environment": qualification.environment if qualification is not None else None,
+            "status_class": status_class,
+            "dispatch_certainty": dispatch_certainty,
+            "retry_count": retry_count,
+            "latency_ms": latency_ms,
+            "correlation_id": correlation_id,
+        },
+        "status": status,
+        "metadata": {"runtime": "mcp", "surface": "v1"},
+    }
 
 
 class HostedReadService:
@@ -137,11 +158,13 @@ class HostedReadService:
         membership_resolver: MembershipResolver,
         audit_recorder: AuditRecorder | None = None,
         sleep: Sleep | None = None,
+        close_runtime: bool = True,
     ) -> None:
         self._runtime_factory = runtime_factory
         self._membership_resolver = membership_resolver
         self._audit_recorder = audit_recorder
         self._sleep = sleep or asyncio.sleep
+        self._close_runtime = close_runtime
 
     async def execute(
         self,
@@ -156,13 +179,20 @@ class HostedReadService:
 
         if not isinstance(principal, MercuryPrincipal) or not isinstance(inputs, BaseModel):
             raise ValueError("validation_failed")
-        membership = WorkspaceMembership.model_validate(
-            await _await_value(self._membership_resolver(principal, workspace_id))
-        )
-        if membership.workspace_id != workspace_id:
-            raise ValueError("workspace_access_denied")
-        runtime = await _await_value(self._runtime_factory())
+        started_at = time.monotonic()
+        correlation_id = str(uuid4())
+        runtime: Any | None = None
+        qualification: ProviderMCPQualification | None = None
+        checked_inputs = inputs
+        retry_count = 0
+        terminal_error: BaseException | None = None
         try:
+            membership = WorkspaceMembership.model_validate(
+                await _await_value(self._membership_resolver(principal, workspace_id))
+            )
+            if membership.workspace_id != workspace_id:
+                raise ValueError("workspace_access_denied")
+            runtime = await _await_value(self._runtime_factory())
             connection = await _load_connection(
                 runtime,
                 membership=membership,
@@ -201,7 +231,7 @@ class HostedReadService:
 
                 input_model = catalog_wire_model(qualification.input_schema, kind="input")
                 checked_inputs = input_model.model_validate(inputs)
-                result = await self._call_read(
+                result, retry_count = await self._call_read(
                     runtime,
                     connection=connection,
                     binding=binding,
@@ -209,11 +239,11 @@ class HostedReadService:
                     deadline=deadline,
                 )
 
-            output_model = catalog_wire_model(qualification.output_schema, kind="output")
-            sanitized = sanitize_provider_read_data(result.normalized_data)
-            checked_output = output_model.model_validate(sanitized)
-            data = checked_output.model_dump(mode="json")
-            envelope = ProviderReadEnvelope(
+            # Provider output must satisfy the exact catalog schema before any public projection.
+            raw_output = catalog_wire_model(qualification.output_schema, kind="output")
+            raw_data = raw_output.model_validate(result.normalized_data).model_dump(mode="json")
+            data = project_provider_read_data(raw_data, output_schema=qualification.output_schema)
+            return ProviderReadEnvelope(
                 workspace_id=workspace_id,
                 connection_id=connection_id,
                 provider=connection.provider,
@@ -224,22 +254,33 @@ class HostedReadService:
                 data=data,
                 next_allowed_actions=["list_provider_capabilities"],
             )
+        except BaseException as error:
+            terminal_error = error
+            raise
+        finally:
+            cleanup: list[object] = []
             if self._audit_recorder is not None:
-                with suppress(Exception):
-                    await _await_value(
+                cleanup.append(
+                    _await_value(
                         self._audit_recorder(
                             _audit_event(
                                 workspace_id=workspace_id,
                                 connection_id=connection_id,
-                                qualification=qualification,
-                                envelope=envelope,
+                                capability_id=capability_id,
+                                capability_version=capability_version,
                                 inputs=checked_inputs,
+                                qualification=qualification,
+                                error=terminal_error,
+                                retry_count=retry_count,
+                                latency_ms=int((time.monotonic() - started_at) * 1000),
+                                correlation_id=correlation_id,
                             )
                         )
                     )
-            return envelope
-        finally:
-            await _close_runtime(runtime)
+                )
+            if runtime is not None and self._close_runtime:
+                cleanup.append(_close_runtime(runtime))
+            await await_cleanup(*cleanup)
 
     async def _call_read(
         self,
@@ -249,7 +290,7 @@ class HostedReadService:
         binding: Any,
         inputs: BaseModel,
         deadline: ProviderOperationDeadline,
-    ) -> ProviderCallResult:
+    ) -> tuple[ProviderCallResult, int]:
         driver = runtime.registry.get(connection.provider)
         hosted_read = getattr(driver, "call_hosted_read", None)
         call = hosted_read if callable(hosted_read) else driver.call
@@ -265,7 +306,7 @@ class HostedReadService:
                 )
                 if result.status_class is not ProviderStatusClass.SUCCESS:
                     raise ValueError("capability_unavailable")
-                return ProviderCallResult.model_validate(result)
+                return ProviderCallResult.model_validate(result), attempt
             except ProviderRuntimeError as error:
                 if attempt + 1 >= _MAX_SAFE_READ_ATTEMPTS or not _retryable_read_failure(error):
                     raise

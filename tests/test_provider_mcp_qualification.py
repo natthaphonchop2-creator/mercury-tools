@@ -10,7 +10,7 @@ from uuid import UUID
 
 import pytest
 
-from mercury_tools.catalog.models import ProviderMCPQualification
+from mercury_tools.catalog.models import ProviderMCPQualification, QualificationState
 from mercury_tools.providers.models import (
     AuthorizationMethod,
     ConnectionReadiness,
@@ -29,6 +29,7 @@ from mercury_tools.qualification.provider_mcp import (
     CapabilitySelection,
     CatalogQualificationResolver,
     OwnerAuthorizedCanary,
+    QualificationGateError,
     transition_qualification,
 )
 
@@ -212,6 +213,111 @@ def test_qualification_cli_writes_only_controlled_sanitized_artifacts(
 
 
 @pytest.mark.asyncio
+async def test_exact_bind_and_dispatch_recheck_connection_permissions(tmp_path: Path) -> None:
+    """Required grants are checked when binding and again immediately before dispatch."""
+
+    definition = _definition()
+    company_id = "permission-company"
+    artifact = build_qualification_artifact(
+        definition=definition,
+        company_sha256=hashlib.sha256(company_id.encode("utf-8")).hexdigest(),
+        runner_version="test-runner-v1",
+        evaluated_at=NOW,
+        input_sha256="c" * 64,
+        sanitized_result_identifier="result-permission-001",
+        checks={"schema_matches": True, "permission_matches": True},
+        reviewer="release_reviewer",
+        evidence_expires_at=NOW + timedelta(days=1),
+        passed=True,
+    )
+    qualified = transition_qualification(
+        transition_qualification(definition, QualificationState.SCHEMA_VALIDATED, now=NOW),
+        QualificationState.NONPRODUCTION_QUALIFIED,
+        evidence=artifact,
+        now=NOW,
+    )
+    enabled = transition_qualification(
+        qualified,
+        QualificationState.ENABLED,
+        evidence=artifact,
+        now=NOW,
+    )
+    write_qualification_artifact(tmp_path, artifact)
+
+    class Catalog:
+        def list_provider_mcp_qualifications(self):
+            return [enabled]
+
+    def connection(permissions: tuple[str, ...]) -> ProviderConnection:
+        return ProviderConnection(
+            id=UUID("11111111-1111-4111-8111-111111111111"),
+            tenant_id=UUID("22222222-2222-4222-8222-222222222222"),
+            workspace_id=UUID("33333333-3333-4333-8333-333333333333"),
+            auth_user_id=UUID("44444444-4444-4444-8444-444444444444"),
+            provider=ProviderId.FLOWACCOUNT,
+            environment="sandbox",
+            provider_account_id=company_id,
+            account_display_name="Sanitized Company",
+            authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+            granted_permissions=permissions,
+            readiness=ConnectionReadiness.READY,
+            revision=1,
+            last_validated_at=NOW,
+            credential_envelope_ids=(UUID("55555555-5555-4555-8555-555555555555"),),
+            created_at=NOW,
+            updated_at=NOW,
+        )
+
+    resolver = CatalogQualificationResolver(
+        catalog=Catalog(),
+        catalog_root=str(tmp_path),
+        now=lambda: NOW,
+    )
+    deadline = ProviderOperationDeadline.start(5)
+    with pytest.raises(QualificationGateError, match="^provider_permission_insufficient$"):
+        await resolver.bind_exact_for_connection(
+            connection(("profile.read",)),
+            capability_id=enabled.normalized_capability,
+            capability_version=enabled.capability_version_sha256,
+            deadline=deadline,
+        )
+
+    exact = connection(("documents.read",))
+    qualification, binding = await resolver.bind_exact_for_connection(
+        exact,
+        capability_id=enabled.normalized_capability,
+        capability_version=enabled.capability_version_sha256,
+        deadline=ProviderOperationDeadline.start(5),
+    )
+    assert qualification == enabled
+    await resolver.assert_binding(exact, binding, deadline=ProviderOperationDeadline.start(5))
+
+    superset = connection(("documents.read", "profile.read"))
+    _, superset_binding = await resolver.bind_exact_for_connection(
+        superset,
+        capability_id=enabled.normalized_capability,
+        capability_version=enabled.capability_version_sha256,
+        deadline=ProviderOperationDeadline.start(5),
+    )
+    assert superset_binding == binding
+
+    with pytest.raises(QualificationGateError, match="^provider_permission_insufficient$"):
+        await resolver.assert_binding(
+            connection(("profile.read",)),
+            binding,
+            deadline=ProviderOperationDeadline.start(5),
+        )
+
+    with pytest.raises(QualificationGateError, match="^provider_permission_insufficient$"):
+        await resolver.verify_binding(
+            connection(("profile.read",)),
+            binding,
+            "d" * 64,
+            deadline=ProviderOperationDeadline.start(5),
+        )
+
+
+@pytest.mark.asyncio
 async def test_catalog_resolver_status_uses_the_same_connection_bound_gate_as_execution(
     tmp_path: Path,
 ) -> None:
@@ -298,9 +404,7 @@ async def test_catalog_resolver_status_uses_the_same_connection_bound_gate_as_ex
         catalog_root=str(tmp_path),
         now=lambda: NOW + timedelta(days=2),
     )
-    matching_connection = connection.model_copy(
-        update={"provider_account_id": company_id}
-    )
+    matching_connection = connection.model_copy(update={"provider_account_id": company_id})
     expired = await expired_resolver.resolve_for_connection(
         matching_connection,
         selection=selection,

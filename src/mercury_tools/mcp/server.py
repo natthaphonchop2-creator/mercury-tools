@@ -8,7 +8,7 @@ import ipaddress
 import os
 import re
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from copy import copy
 from pathlib import Path
@@ -84,7 +84,7 @@ from mercury_tools.mcp.schemas import (
     SearchMode,
     WorkspaceFlowMetadata,
 )
-from mercury_tools.mcp.v1_tools import configure_v1_tools
+from mercury_tools.mcp.v1_tools import configure_v1_tools, refresh_generated_provider_tools
 from mercury_tools.mercury_runtime import (
     get_accounting_skill_schema as runtime_accounting_skill_schema,
 )
@@ -206,10 +206,11 @@ class StrictInputFastMCP(FastMCP):
     ) -> Any:
         """Return V1 failures through their published closed output union."""
 
+        registered_before = self._tool_manager.get_tool(name)
         try:
             return await super().call_tool(name, arguments)
         except ToolError as error:
-            registered = self._tool_manager.get_tool(name)
+            registered = self._tool_manager.get_tool(name) or registered_before
             metadata = getattr(registered, "meta", None)
             if not isinstance(metadata, Mapping) or metadata.get("mercury/surface") != "v1":
                 raise
@@ -3978,6 +3979,7 @@ def create_test_http_app(
     principal_resolver: PrincipalResolver | None = None,
     consent_handoff: ConsentHandoff | None = None,
     consent_http_client: httpx.AsyncClient | None = None,
+    generated_provider_runtime: Any | None = None,
 ):
     """Build an app with explicit test doubles; production serve never calls this."""
 
@@ -3989,6 +3991,7 @@ def create_test_http_app(
         principal_resolver=principal_resolver,
         consent_handoff=consent_handoff,
         consent_http_client=consent_http_client,
+        generated_provider_runtime=generated_provider_runtime,
         test_only_dependencies=True,
     )
 
@@ -4002,6 +4005,7 @@ def _create_http_app(
     principal_resolver: PrincipalResolver | None = None,
     consent_handoff: ConsentHandoff | None = None,
     consent_http_client: httpx.AsyncClient | None = None,
+    generated_provider_runtime: Any | None = None,
     test_only_dependencies: bool = False,
 ):
     settings = load_settings()
@@ -4016,11 +4020,14 @@ def _create_http_app(
             principal_resolver,
             consent_handoff,
             consent_http_client,
+            generated_provider_runtime,
         )
     ):
         raise V1ConfigurationError("v1_provider_oauth_composition_invalid")
     selected_principal_resolver = principal_resolver
     selected_composition: ProviderOAuthProductionComposition | None = None
+    generated_runtime_factory: Callable[[], Any] | None = None
+    generated_runtime_is_shared = False
     if settings.v1_enabled:
         if not test_only_dependencies:
             selected_composition = build_provider_oauth_production_composition(
@@ -4030,9 +4037,22 @@ def _create_http_app(
             selected_principal_resolver = selected_composition.principal_resolver
             provider_oauth_service = selected_composition.provider_oauth_service
             peak_setup_service = selected_composition.peak_setup_service
+
+            def selected_runtime() -> Any:
+                return selected_composition
+
+            generated_runtime_factory = selected_runtime
+            generated_runtime_is_shared = True
         else:
             if selected_principal_resolver is None:
                 selected_principal_resolver = validator_from_settings(settings)
+            if generated_provider_runtime is not None:
+
+                def supplied_runtime() -> Any:
+                    return generated_provider_runtime
+
+                generated_runtime_factory = supplied_runtime
+                generated_runtime_is_shared = True
 
     http_mcp = copy(mcp)
     http_mcp.settings = mcp.settings.model_copy(deep=True)
@@ -4067,6 +4087,14 @@ def _create_http_app(
         try:
             if selected_composition is not None:
                 await selected_composition.startup()
+            if settings.v1_enabled and generated_runtime_factory is not None:
+                # Initial projection is part of readiness: no HTTP session accepts
+                # requests until the serving MCP instance has the catalog tools.
+                await refresh_generated_provider_tools(
+                    http_mcp,
+                    runtime_factory=generated_runtime_factory,
+                    close_runtime=not generated_runtime_is_shared,
+                )
             async with public_app.router.lifespan_context(public_app):
                 yield
         finally:
@@ -4080,6 +4108,16 @@ def _create_http_app(
     if settings.v1_enabled:
         routes.extend(protected_resource_routes(settings))
     app = Starlette(routes=routes, lifespan=lifespan)
+    app.state.mercury_mcp = http_mcp
+    if generated_runtime_factory is not None:
+        app.state.refresh_generated_provider_tools = lambda context=None: (
+            refresh_generated_provider_tools(
+                http_mcp,
+                runtime_factory=generated_runtime_factory,
+                context=context,
+                close_runtime=not generated_runtime_is_shared,
+            )
+        )
     app.add_route("/", root, methods=["GET"])
     app.add_route("/api/status", status, methods=["GET"])
     app.add_route("/healthz", healthz, methods=["GET"])

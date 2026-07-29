@@ -56,6 +56,7 @@ from mercury_tools.mcp.v1_schemas import (
     StartProviderConnectionOutput,
     start_provider_connection_input_schema,
 )
+from mercury_tools.providers.finalization import await_cleanup
 from mercury_tools.providers.models import (
     ConnectionReadiness,
     ProviderConnection,
@@ -208,10 +209,7 @@ async def _runtime_from(factory: ProviderRuntimeFactory | None) -> Any:
 async def _close_runtime(runtime: Any) -> None:
     close = getattr(runtime, "aclose", None)
     if callable(close):
-        try:
-            await _await_value(close())
-        except Exception:
-            return
+        await await_cleanup(_await_value(close()))
 
 
 async def _record_connector_status_audit(event: dict[str, object]) -> None:
@@ -278,68 +276,140 @@ async def _catalog_qualifications(runtime: Any) -> tuple[ProviderMCPQualificatio
     return tuple(ProviderMCPQualification.model_validate(item) for item in resolved)
 
 
+class GeneratedProviderToolProjection:
+    """Bind dynamic V1 wrappers to the composition selected by the HTTP lifespan."""
+
+    def __init__(
+        self,
+        server: FastMCP,
+        *,
+        runtime_factory: ProviderRuntimeFactory | None,
+        service_factory: WorkspaceServiceFactory,
+        close_runtime: bool,
+    ) -> None:
+        self._server = server
+        self._runtime_factory = runtime_factory
+        self._service_factory = service_factory
+        self._close_runtime = close_runtime
+        self._publisher = GeneratedProviderToolPublisher(
+            server,
+            execute=self._execute,
+            persist_schema_change=self._persist_schema_change,
+        )
+
+    def reconfigure(
+        self,
+        *,
+        runtime_factory: ProviderRuntimeFactory | None,
+        service_factory: WorkspaceServiceFactory,
+        close_runtime: bool,
+    ) -> None:
+        self._runtime_factory = runtime_factory
+        self._service_factory = service_factory
+        self._close_runtime = close_runtime
+
+    async def refresh(self, context: Context | object | None = None) -> bool:
+        runtime: Any | None = None
+        try:
+            runtime = await _runtime_from(self._runtime_factory)
+            return await self._publisher.publish(
+                await _catalog_qualifications(runtime),
+                context=context,
+            )
+        finally:
+            if runtime is not None and self._close_runtime:
+                await _close_runtime(runtime)
+
+    async def _execute(
+        self,
+        tool_context: Context,
+        *,
+        workspace_id: UUID,
+        connection_id: UUID,
+        capability_id: str,
+        capability_version: str,
+        inputs: BaseModel,
+    ) -> Any:
+        principal, membership = await _require_workspace(
+            tool_context,
+            workspace_id=workspace_id,
+            service_factory=self._service_factory,
+        )
+
+        async def bound_membership(
+            requested_principal: MercuryPrincipal,
+            requested_workspace_id: UUID,
+        ) -> WorkspaceMembership:
+            if requested_principal != principal or requested_workspace_id != workspace_id:
+                raise ValueError("workspace_access_denied")
+            return membership
+
+        service = HostedReadService(
+            runtime_factory=self._runtime_factory or _provider_runtime,
+            membership_resolver=bound_membership,
+            audit_recorder=_record_connector_status_audit,
+            close_runtime=self._close_runtime,
+        )
+        return await service.execute(
+            principal,
+            workspace_id,
+            connection_id,
+            capability_id,
+            capability_version,
+            inputs,
+        )
+
+    async def _persist_schema_change(
+        self,
+        qualification: ProviderMCPQualification,
+        _context: Context | object,
+    ) -> tuple[ProviderMCPQualification, ...]:
+        runtime: Any | None = None
+        try:
+            runtime = await _runtime_from(self._runtime_factory)
+            transition = getattr(
+                runtime.qualification_catalog,
+                "disable_provider_mcp_capability_version",
+                None,
+            )
+            if not callable(transition):
+                raise ValueError("catalog_schema_transition_unavailable")
+            result = await asyncio.to_thread(transition, qualification)
+            await _await_value(result)
+            # Reload only after the authority persistence call has completed.
+            return await _catalog_qualifications(runtime)
+        finally:
+            if runtime is not None and self._close_runtime:
+                await _close_runtime(runtime)
+
+
 async def refresh_generated_provider_tools(
     server: FastMCP,
     *,
     runtime_factory: ProviderRuntimeFactory | None = None,
     service_factory: WorkspaceServiceFactory = _workspace_service,
     context: Context | object | None = None,
+    close_runtime: bool = True,
 ) -> bool:
-    """Publish only enabled catalog read wrappers and notify the active MCP session."""
+    """Refresh the server-scoped projection from the exact catalog authority."""
 
-    publisher = getattr(server, "_mercury_v1_generated_provider_tools", None)
-    if not isinstance(publisher, GeneratedProviderToolPublisher):
-
-        async def execute_generated_read(
-            tool_context: Context,
-            *,
-            workspace_id: UUID,
-            connection_id: UUID,
-            qualification: ProviderMCPQualification,
-            inputs: BaseModel,
-        ) -> Any:
-            principal, membership = await _require_workspace(
-                tool_context,
-                workspace_id=workspace_id,
-                service_factory=service_factory,
-            )
-
-            async def bound_membership(
-                requested_principal: MercuryPrincipal,
-                requested_workspace_id: UUID,
-            ) -> WorkspaceMembership:
-                if (
-                    requested_principal != principal
-                    or requested_workspace_id != workspace_id
-                ):
-                    raise ValueError("workspace_access_denied")
-                return membership
-
-            service = HostedReadService(
-                runtime_factory=runtime_factory or _provider_runtime,
-                membership_resolver=bound_membership,
-                audit_recorder=_record_connector_status_audit,
-            )
-            return await service.execute(
-                principal,
-                workspace_id,
-                connection_id,
-                qualification.normalized_capability,
-                qualification.capability_version_sha256,
-                inputs,
-            )
-
-        publisher = GeneratedProviderToolPublisher(server, execute=execute_generated_read)
-        server._mercury_v1_generated_provider_tools = publisher
-
-    runtime: Any | None = None
-    try:
-        runtime = await _runtime_from(runtime_factory)
-        qualifications = await _catalog_qualifications(runtime)
-        return await publisher.publish(qualifications, context=context)
-    finally:
-        if runtime is not None:
-            await _close_runtime(runtime)
+    projection = getattr(server, "_mercury_v1_generated_provider_projection", None)
+    if not isinstance(projection, GeneratedProviderToolProjection):
+        projection = GeneratedProviderToolProjection(
+            server,
+            runtime_factory=runtime_factory,
+            service_factory=service_factory,
+            close_runtime=close_runtime,
+        )
+        server._mercury_v1_generated_provider_projection = projection
+        server._mercury_v1_generated_provider_tools = projection._publisher
+    else:
+        projection.reconfigure(
+            runtime_factory=runtime_factory,
+            service_factory=service_factory,
+            close_runtime=close_runtime,
+        )
+    return await projection.refresh(context)
 
 
 def _connection_output(summary: ProviderConnectionSummary) -> ProviderConnectionOutput:

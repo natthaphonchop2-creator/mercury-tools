@@ -85,11 +85,11 @@ async def test_generated_read_wrappers_use_stable_mercury_names_and_closed_contr
         return ProviderReadEnvelope(
             workspace_id=kwargs["workspace_id"],
             connection_id=kwargs["connection_id"],
-            provider=kwargs["qualification"].provider,
+            provider="flowaccount",
             company_display_name="Example Company",
-            environment=kwargs["qualification"].environment,
-            capability_id=kwargs["qualification"].normalized_capability,
-            capability_version=kwargs["qualification"].capability_version_sha256,
+            environment="sandbox",
+            capability_id=kwargs["capability_id"],
+            capability_version=kwargs["capability_version"],
             data={"document_number": "INV-001"},
         )
 
@@ -109,10 +109,9 @@ async def test_generated_read_wrappers_use_stable_mercury_names_and_closed_contr
         _assert_closed(tool.inputSchema)
         assert tool.outputSchema is not None
         _assert_closed(tool.outputSchema)
-        success = tool.outputSchema["$defs"]["Success"]
-        data_reference = success["properties"]["data"]["$ref"]
-        assert data_reference.startswith("#/$defs/MercuryData")
-        assert data_reference.rsplit("/", 1)[-1] in tool.outputSchema["$defs"]
+        success = tool.outputSchema["$defs"]["Success0"]
+        assert success["properties"]["capability_version"]["const"]
+        assert success["properties"]["data"]["type"] == "object"
         serialized = str({"input": tool.inputSchema, "output": tool.outputSchema})
         assert "PRIVATE_RAW_PROVIDER_TOOL" not in serialized
         assert "provider_tool_name" not in serialized
@@ -126,6 +125,7 @@ async def test_generated_read_wrappers_use_stable_mercury_names_and_closed_contr
         {
             "workspace_id": str(WORKSPACE_ID),
             "connection_id": str(CONNECTION_ID),
+            "capability_version": qualifications[2].capability_version_sha256,
             "page_size": 25,
         },
     )
@@ -209,23 +209,44 @@ async def test_runtime_schema_drift_removes_affected_wrapper_and_notifies_search
 
     invoice_get = _qualification("flowaccount", "documents.invoice.get")
     invoice_list = _qualification("flowaccount", "documents.invoice.list")
+    drifted = invoice_get.model_copy(
+        update={
+            "qualification_state": QualificationState.DISABLED,
+            "disable_reason": "schema_changed",
+        }
+    )
     server = StrictInputFastMCP("Generated provider tools")
     notifications: list[str] = []
 
     async def execute(_context, **kwargs):
-        if kwargs["qualification"].normalized_capability == "documents.invoice.get":
+        if kwargs["capability_id"] == "documents.invoice.get":
             raise ProviderSchemaChanged(
                 ProviderId.FLOWACCOUNT,
                 dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
             )
         raise AssertionError("only the drifted wrapper is called")
 
+    async def persist_schema_change(qualification, _context):
+        return (
+            qualification.model_copy(
+                update={
+                    "qualification_state": QualificationState.DISABLED,
+                    "disable_reason": "schema_changed",
+                }
+            ),
+            invoice_list,
+        )
+
     context = SimpleNamespace(
         session=SimpleNamespace(
             send_tool_list_changed=lambda: notifications.append("tools/list_changed")
         )
     )
-    publisher = GeneratedProviderToolPublisher(server, execute=execute)
+    publisher = GeneratedProviderToolPublisher(
+        server,
+        execute=execute,
+        persist_schema_change=persist_schema_change,
+    )
     await publisher.publish((invoice_get, invoice_list), context=context)
     notifications.clear()
     server.get_context = lambda: context
@@ -235,15 +256,15 @@ async def test_runtime_schema_drift_removes_affected_wrapper_and_notifies_search
         {
             "workspace_id": str(WORKSPACE_ID),
             "connection_id": str(CONNECTION_ID),
+            "capability_version": invoice_get.capability_version_sha256,
             "page_size": 25,
         },
     )
 
     assert structured["error"]["code"] == "capability_version_changed"
-    await asyncio.sleep(0)
     assert {tool.name for tool in await server.list_tools()} == {"mercury_flowaccount_invoice_list"}
     assert notifications == ["tools/list_changed"]
-    assert await publisher.publish((invoice_get, invoice_list), context=context) is False
+    assert await publisher.publish((drifted, invoice_list), context=context) is False
     assert {tool.name for tool in await server.list_tools()} == {"mercury_flowaccount_invoice_list"}
 
 
@@ -293,3 +314,244 @@ async def test_v1_refresh_publishes_catalog_generated_reads_without_changing_the
         is True
     )
     assert await server.list_tools() == []
+
+
+@pytest.mark.asyncio
+async def test_generated_wrapper_groups_exact_versions_and_projects_only_public_schema() -> None:
+    """One Mercury tool selects a reviewed version without exposing provider fields."""
+
+    from mercury_tools.execution.hosted.read_service import ProviderReadEnvelope
+    from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
+
+    def versioned(maximum: int) -> ProviderMCPQualification:
+        definition = ProviderMCPQualification.discovered(
+            provider="flowaccount",
+            environment="sandbox",
+            provider_tool_name="PRIVATE_RAW_PROVIDER_TOOL",
+            normalized_capability="documents.invoice.get",
+            input_schema={
+                "type": "object",
+                "properties": {"page_size": {"type": "integer", "maximum": maximum}},
+                "required": ["page_size"],
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "invoice_id": {"type": "string"},
+                    "tax_amount": {"type": "number"},
+                    "contactEmail": {"type": "string"},
+                    "taxId": {"type": "string"},
+                    "apiKey": {"type": "string"},
+                    "nested": {
+                        "type": "object",
+                        "properties": {
+                            "document_id": {"type": "string"},
+                            "sessionToken": {"type": "string"},
+                        },
+                        "required": ["document_id", "sessionToken"],
+                        "additionalProperties": False,
+                    },
+                },
+                "required": [
+                    "invoice_id",
+                    "tax_amount",
+                    "contactEmail",
+                    "taxId",
+                    "apiKey",
+                    "nested",
+                ],
+                "additionalProperties": False,
+            },
+            response_shape_hash="a" * 64,
+            required_permissions=("documents.read",),
+        )
+        return definition.model_copy(
+            update={
+                "qualification_state": QualificationState.ENABLED,
+                "company_sha256": "b" * 64,
+                "evidence_revision_sha256": "c" * 64,
+                "qualification_evidence_uri": (
+                    "catalog://global/flowaccount/qualifications/"
+                    f"{definition.capability_version_sha256}-{'c' * 64}.json"
+                ),
+                "evidence_evaluated_at": NOW,
+                "evidence_expires_at": NOW + timedelta(days=1),
+            }
+        )
+
+    first = versioned(50)
+    second = versioned(75)
+    server = StrictInputFastMCP("Grouped generated provider tools")
+    calls: list[dict[str, object]] = []
+
+    async def execute(_context, **kwargs):
+        calls.append(kwargs)
+        return ProviderReadEnvelope(
+            workspace_id=kwargs["workspace_id"],
+            connection_id=kwargs["connection_id"],
+            provider="flowaccount",
+            company_display_name="Example Company",
+            environment="sandbox",
+            capability_id="documents.invoice.get",
+            capability_version=kwargs["capability_version"],
+            data={"invoice_id": "INV-1", "tax_amount": 7.0, "nested": {"document_id": "DOC-1"}},
+        )
+
+    publisher = GeneratedProviderToolPublisher(server, execute=execute)
+    duplicate_first = first.model_copy(update={"id": UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")})
+    assert await publisher.publish((first, duplicate_first, second)) is True
+    tool = (await server.list_tools())[0]
+    assert len(tool.inputSchema["oneOf"]) == 2
+    rendered = str(tool.outputSchema)
+    assert "contactEmail" not in rendered
+    assert "taxId" not in rendered
+    assert "apiKey" not in rendered
+    assert "sessionToken" not in rendered
+    assert "invoice_id" in rendered
+    assert "tax_amount" in rendered
+
+    server.get_context = lambda: SimpleNamespace()
+    _content, structured = await server.call_tool(
+        tool.name,
+        {
+            "workspace_id": str(WORKSPACE_ID),
+            "connection_id": str(CONNECTION_ID),
+            "capability_version": second.capability_version_sha256,
+            "page_size": 25,
+        },
+    )
+
+    assert structured["capability_version"] == second.capability_version_sha256
+    assert structured["data"] == {
+        "invoice_id": "INV-1",
+        "tax_amount": 7.0,
+        "nested": {"document_id": "DOC-1"},
+    }
+    assert calls[0]["capability_version"] == second.capability_version_sha256
+
+
+@pytest.mark.asyncio
+async def test_runtime_schema_drift_persists_then_refreshes_the_exact_version() -> None:
+    from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
+    from mercury_tools.providers.base import DispatchCertainty, ProviderSchemaChanged
+    from mercury_tools.providers.models import ProviderId
+
+    invoice_get = _qualification("flowaccount", "documents.invoice.get")
+    invoice_list = _qualification("flowaccount", "documents.invoice.list")
+    server = StrictInputFastMCP("Persisted generated provider drift")
+    transitions: list[str] = []
+
+    async def execute(_context, **_kwargs):
+        raise ProviderSchemaChanged(
+            ProviderId.FLOWACCOUNT,
+            dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+        )
+
+    async def persist_schema_change(qualification, _context):
+        transitions.append(qualification.capability_version_sha256)
+        return (
+            qualification.model_copy(
+                update={
+                    "qualification_state": QualificationState.DISABLED,
+                    "disable_reason": "schema_changed",
+                }
+            ),
+            invoice_list,
+        )
+
+    publisher = GeneratedProviderToolPublisher(
+        server,
+        execute=execute,
+        persist_schema_change=persist_schema_change,
+    )
+    await publisher.publish((invoice_get, invoice_list))
+    server.get_context = lambda: SimpleNamespace()
+
+    _content, structured = await server.call_tool(
+        "mercury_flowaccount_invoice_get",
+        {
+            "workspace_id": str(WORKSPACE_ID),
+            "connection_id": str(CONNECTION_ID),
+            "capability_version": invoice_get.capability_version_sha256,
+            "page_size": 25,
+        },
+    )
+
+    assert structured["error"]["code"] == "capability_version_changed"
+    assert transitions == [invoice_get.capability_version_sha256]
+    assert {tool.name for tool in await server.list_tools()} == {"mercury_flowaccount_invoice_list"}
+
+
+@pytest.mark.asyncio
+async def test_generated_publication_serializes_refreshes_and_notifies_each_refresh_session() -> (
+    None
+):
+    from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
+
+    invoice_get = _qualification("flowaccount", "documents.invoice.get")
+    invoice_list = _qualification("flowaccount", "documents.invoice.list")
+    server = StrictInputFastMCP("Serialized generated provider publication")
+
+    async def execute(_context, **_kwargs):
+        raise AssertionError("publication test must not dispatch")
+
+    first_notifications: list[str] = []
+    second_notifications: list[str] = []
+    first = SimpleNamespace(
+        session=SimpleNamespace(
+            send_tool_list_changed=lambda: first_notifications.append("tools/list_changed")
+        )
+    )
+    second = SimpleNamespace(
+        session=SimpleNamespace(
+            send_tool_list_changed=lambda: second_notifications.append("tools/list_changed")
+        )
+    )
+    publisher = GeneratedProviderToolPublisher(server, execute=execute)
+
+    assert await publisher.publish((invoice_get,), context=first) is True
+    await asyncio.gather(
+        publisher.publish((invoice_get, invoice_list), context=second),
+        publisher.publish((invoice_get,), context=second),
+    )
+
+    assert {tool.name for tool in await server.list_tools()} == {"mercury_flowaccount_invoice_get"}
+    assert first_notifications == ["tools/list_changed"] * 3
+    assert second_notifications == ["tools/list_changed"] * 2
+
+
+@pytest.mark.asyncio
+async def test_generated_publication_rolls_back_registration_failure_and_cancellation() -> None:
+    from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
+
+    invoice_get = _qualification("flowaccount", "documents.invoice.get")
+    invoice_list = _qualification("flowaccount", "documents.invoice.list")
+    server = StrictInputFastMCP("Rollback generated provider publication")
+
+    async def execute(_context, **_kwargs):
+        raise AssertionError("publication test must not dispatch")
+
+    publisher = GeneratedProviderToolPublisher(server, execute=execute)
+    await publisher.publish((invoice_get,))
+    original_add_tool = server.add_tool
+
+    def fail_invoice_list(fn, *args, **kwargs):
+        if kwargs.get("name") == "mercury_flowaccount_invoice_list":
+            raise RuntimeError("registration_failed")
+        return original_add_tool(fn, *args, **kwargs)
+
+    server.add_tool = fail_invoice_list
+    with pytest.raises(RuntimeError, match="^registration_failed$"):
+        await publisher.publish((invoice_get, invoice_list))
+    server.add_tool = original_add_tool
+    assert {tool.name for tool in await server.list_tools()} == {"mercury_flowaccount_invoice_get"}
+
+    await publisher._refresh_lock.acquire()
+    pending = asyncio.create_task(publisher.publish((invoice_get, invoice_list)))
+    await asyncio.sleep(0)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    publisher._refresh_lock.release()
+    assert {tool.name for tool in await server.list_tools()} == {"mercury_flowaccount_invoice_get"}

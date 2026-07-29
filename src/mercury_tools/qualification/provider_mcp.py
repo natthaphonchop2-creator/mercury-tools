@@ -112,12 +112,44 @@ class CapabilityResolution:
 class QualificationGateError(RuntimeError):
     """Closed execution denial that never contains provider data."""
 
-    def __init__(self, code: Literal["insufficient_evidence", "capability_unavailable"]):
+    def __init__(
+        self,
+        code: Literal[
+            "insufficient_evidence",
+            "capability_unavailable",
+            "provider_permission_insufficient",
+        ],
+    ):
         self.code = code
         super().__init__(code)
 
 
 ArtifactLoader = Callable[[str], QualificationArtifact]
+
+
+def _qualification_equivalence(qualification: ProviderMCPQualification) -> str:
+    """Compare authority content while ignoring the database row identity."""
+
+    return canonical_json(qualification.model_dump(mode="json", exclude={"id"}))
+
+
+def _one_equivalent_qualification(
+    qualifications: Iterable[ProviderMCPQualification],
+) -> ProviderMCPQualification | None:
+    unique: dict[str, ProviderMCPQualification] = {}
+    for qualification in qualifications:
+        unique.setdefault(_qualification_equivalence(qualification), qualification)
+    if len(unique) != 1:
+        return None
+    return next(iter(unique.values()))
+
+
+def _require_connection_permissions(
+    connection: ProviderConnection,
+    qualification: ProviderMCPQualification,
+) -> None:
+    if not set(qualification.required_permissions).issubset(connection.granted_permissions):
+        raise QualificationGateError("provider_permission_insufficient")
 
 
 class CapabilityQualificationGate:
@@ -343,8 +375,9 @@ class CapabilityQualificationGate:
                 now=now,
             )
         ]
-        if len(valid) == 1:
-            return CapabilityResolution(status="enabled", qualification=valid[0])
+        equivalent = _one_equivalent_qualification(valid)
+        if equivalent is not None:
+            return CapabilityResolution(status="enabled", qualification=equivalent)
         if len(valid) > 1:
             return CapabilityResolution(status="insufficient_evidence")
         if any(
@@ -477,6 +510,11 @@ class CapabilityQualificationGate:
 class QualificationCatalog(Protocol):
     def list_provider_mcp_qualifications(self) -> list[ProviderMCPQualification]: ...
 
+    def disable_provider_mcp_capability_version(
+        self,
+        qualification: ProviderMCPQualification,
+    ) -> tuple[ProviderMCPQualification, ...]: ...
+
 
 @dataclass(frozen=True, slots=True)
 class CatalogQualificationSnapshot:
@@ -574,7 +612,7 @@ class CatalogQualificationResolver:
     ) -> QualifiedCapabilityBinding:
         checked = ProviderConnection.model_validate(connection)
         snapshot = await self._current_snapshot(deadline)
-        return snapshot.gate.bind_current(
+        resolution = snapshot.gate.resolve_current(
             provider=checked.provider.value,
             environment=checked.environment,
             normalized_capability=normalized_capability,
@@ -582,6 +620,10 @@ class CatalogQualificationResolver:
             company_sha256=_server_company_sha256(checked),
             now=snapshot.now,
         )
+        if resolution.qualification is None:
+            raise QualificationGateError(resolution.status)
+        _require_connection_permissions(checked, resolution.qualification)
+        return snapshot.gate._binding_from_resolution(resolution)
 
     async def bind_exact_for_connection(
         self,
@@ -611,9 +653,9 @@ class CatalogQualificationResolver:
                 capability_version,
             )
         )
-        if len(candidates) != 1:
+        qualification = _one_equivalent_qualification(candidates)
+        if qualification is None:
             raise QualificationGateError("capability_unavailable")
-        qualification = candidates[0]
         selection = CapabilitySelection(
             provider=qualification.provider,
             environment=qualification.environment,
@@ -621,12 +663,15 @@ class CatalogQualificationResolver:
             provider_tool_name=qualification.provider_tool_name,
             capability_version_sha256=qualification.capability_version_sha256,
         )
-        binding = snapshot.gate.bind(
+        resolution = snapshot.gate.resolve(
             selection,
             company_sha256=_server_company_sha256(checked),
             now=snapshot.now,
         )
-        return qualification, binding
+        if resolution.qualification is None:
+            raise QualificationGateError(resolution.status)
+        _require_connection_permissions(checked, resolution.qualification)
+        return resolution.qualification, snapshot.gate._binding_from_resolution(resolution)
 
     def wire_model_for_binding(
         self,
@@ -653,11 +698,12 @@ class CatalogQualificationResolver:
                 and item.evidence_revision_sha256 == checked.qualification_hash
             )
         )
-        if len(candidates) != 1:
+        qualification = _one_equivalent_qualification(candidates)
+        if qualification is None:
             raise QualificationGateError("capability_unavailable")
         from mercury_tools.mcp.generated_tools import catalog_wire_model
 
-        schema = candidates[0].input_schema if kind == "input" else candidates[0].output_schema
+        schema = qualification.input_schema if kind == "input" else qualification.output_schema
         return catalog_wire_model(schema, kind=kind)
 
     async def resolve_for_connection(
@@ -709,7 +755,7 @@ class CatalogQualificationResolver:
                 now=snapshot.now,
             )
         else:
-            expected = snapshot.gate.bind_current(
+            resolution = snapshot.gate.resolve_current(
                 provider=checked_connection.provider.value,
                 environment=checked_connection.environment,
                 normalized_capability=checked_binding.normalized_capability,
@@ -717,6 +763,10 @@ class CatalogQualificationResolver:
                 company_sha256=_server_company_sha256(checked_connection),
                 now=snapshot.now,
             )
+            if resolution.qualification is None:
+                raise QualificationGateError(resolution.status)
+            _require_connection_permissions(checked_connection, resolution.qualification)
+            expected = snapshot.gate._binding_from_resolution(resolution)
         if checked_binding != expected:
             raise QualificationGateError("capability_unavailable")
         return expected
@@ -749,6 +799,7 @@ class CatalogQualificationResolver:
             )
         if resolution.status != "enabled" or resolution.qualification is None:
             raise QualificationGateError(resolution.status)
+        _require_connection_permissions(checked_connection, resolution.qualification)
         if gate._binding_from_resolution(resolution) != expected:
             raise QualificationGateError("capability_unavailable")
         return _verified_binding(resolution.qualification, expected, resource_uri_sha256)

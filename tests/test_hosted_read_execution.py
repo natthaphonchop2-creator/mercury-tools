@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -310,9 +311,7 @@ async def test_hosted_read_retries_only_pre_dispatch_safe_read_failures_within_d
     assert envelope.capability_version == qualification.capability_version_sha256
     assert envelope.data == {
         "document_number": "INV-001",
-        "invoice_id": "[REDACTED]",
-        "contact_email": "[REDACTED]",
-        "tax_id": "[REDACTED]",
+        "invoice_id": "provider-invoice-id",
     }
     assert len(audits) == 1
     audit_text = str(audits[0])
@@ -447,3 +446,74 @@ async def test_hosted_read_rejects_a_connection_environment_mismatch() -> None:
         )
 
     assert driver.calls == []
+
+
+@pytest.mark.asyncio
+async def test_hosted_read_records_a_sanitized_terminal_audit_for_failure_and_cancellation() -> (
+    None
+):
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+
+    qualification = _qualification()
+    failure_audits: list[dict[str, object]] = []
+    failed_runtime = _runtime(
+        qualification,
+        FakeDriver(
+            [
+                ProviderUnavailable(
+                    ProviderId.FLOWACCOUNT,
+                    dispatch_certainty=DispatchCertainty.DISPATCHED,
+                )
+            ]
+        ),
+    )
+    failed_service = HostedReadService(
+        runtime_factory=lambda: failed_runtime,
+        membership_resolver=_membership,
+        audit_recorder=failure_audits.append,
+    )
+    with pytest.raises(ProviderUnavailable):
+        await failed_service.execute(
+            _principal(),
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            qualification.normalized_capability,
+            qualification.capability_version_sha256,
+            InvoiceReadInputs(invoice_reference="INV-001"),
+        )
+    assert len(failure_audits) == 1
+    assert failure_audits[0]["status"] == "error"
+    assert failure_audits[0]["output_summary"]["status_class"] == "unavailable"
+
+    started = asyncio.Event()
+
+    class BlockingDriver(FakeDriver):
+        async def call(self, *_args: object, **_kwargs: object) -> ProviderCallResult:
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("cancellation must interrupt the provider wait")
+
+    cancellation_audits: list[dict[str, object]] = []
+    cancelled_runtime = _runtime(qualification, BlockingDriver([]))
+    cancelled_service = HostedReadService(
+        runtime_factory=lambda: cancelled_runtime,
+        membership_resolver=_membership,
+        audit_recorder=cancellation_audits.append,
+    )
+    task = asyncio.create_task(
+        cancelled_service.execute(
+            _principal(),
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            qualification.normalized_capability,
+            qualification.capability_version_sha256,
+            InvoiceReadInputs(invoice_reference="INV-001"),
+        )
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(cancellation_audits) == 1
+    assert cancellation_audits[0]["status"] == "cancelled"
+    assert "INV-001" not in str(cancellation_audits[0])

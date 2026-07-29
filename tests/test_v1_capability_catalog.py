@@ -6,6 +6,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 
@@ -519,3 +520,51 @@ def test_catalog_store_loads_only_validated_provider_mcp_qualification_rows(
     assert store.list_provider_mcp_qualifications() == [definition]
     assert calls[0]["method"] == "GET"
     assert str(calls[0]["url"]).endswith("/mercury_provider_capability_qualifications")
+
+
+def test_catalog_store_persists_idempotent_exact_schema_changed_terminal_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = importlib.import_module("mercury_tools.db.catalog")
+    enabled = _qualified(_definition()).model_copy(
+        update={"id": UUID("11111111-1111-4111-8111-111111111111")}
+    )
+    unaffected = _qualified(
+        _definition(
+            normalized_capability="documents.invoice.list",
+            provider_tool_name="list_invoices",
+        )
+    ).model_copy(update={"id": UUID("22222222-2222-4222-8222-222222222222")})
+    rows = [enabled, unaffected]
+    transitions: list[ProviderMCPQualification] = []
+    store = catalog.SupabaseCatalogStore(
+        SimpleNamespace(
+            supabase_url="https://example.supabase.co",
+            supabase_service_role_key="test-service-role-key",
+            supabase_configured=True,
+        )
+    )
+
+    def listed():
+        return list(rows)
+
+    def published(candidate, *, artifact=None):
+        assert artifact is None
+        transitions.append(candidate)
+        rows[:] = [candidate if item.id == candidate.id else item for item in rows]
+        return str(candidate.id)
+
+    monkeypatch.setattr(store, "list_provider_mcp_qualifications", listed)
+    monkeypatch.setattr(store, "publish_provider_mcp_qualification", published)
+
+    first = store.disable_provider_mcp_capability_version(enabled)
+    second = store.disable_provider_mcp_capability_version(enabled)
+
+    assert len(transitions) == 1
+    assert transitions[0].qualification_state is QualificationState.DISABLED
+    assert transitions[0].disable_reason == "schema_changed"
+    assert [item.qualification_state for item in first] == [
+        QualificationState.DISABLED,
+        QualificationState.ENABLED,
+    ]
+    assert second == first

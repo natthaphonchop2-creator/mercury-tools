@@ -9,6 +9,7 @@ import inspect
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, ClassVar, Literal, TypeAlias
 from uuid import UUID
 
@@ -29,6 +30,10 @@ from mercury_tools.mcp.v1_schemas import ProviderReadEnvelope
 from mercury_tools.providers.base import ProviderSchemaChanged
 
 GeneratedReadExecutor: TypeAlias = Callable[..., Awaitable[ProviderReadEnvelope]]
+PersistSchemaChange: TypeAlias = Callable[
+    [ProviderMCPQualification, Context | object],
+    Awaitable[Sequence[ProviderMCPQualification]] | Sequence[ProviderMCPQualification],
+]
 
 _READ_CAPABILITIES = frozenset(
     {
@@ -36,10 +41,6 @@ _READ_CAPABILITIES = frozenset(
         "documents.invoice.list",
         "documents.invoice.get",
     }
-)
-_SENSITIVE_FIELD = re.compile(
-    r"(?:^|_)(?:id|identifier|email|phone|contact|address|tax|tin|vat)(?:$|_)",
-    re.IGNORECASE,
 )
 _V1_GENERATED_META = {
     "mercury/surface": "v1",
@@ -51,6 +52,63 @@ _CLOSED_READ = ToolAnnotations(
     destructiveHint=False,
     openWorldHint=False,
 )
+_PUBLIC_BUSINESS_IDENTIFIERS = frozenset(
+    {
+        "invoiceid",
+        "documentid",
+        "invoiceidentifier",
+        "documentidentifier",
+        "invoicenumber",
+        "documentnumber",
+        "invoicecode",
+        "documentcode",
+        "ordernumber",
+        "referencenumber",
+        "reference",
+    }
+)
+_RESTRICTED_FIELD_PARTS = frozenset(
+    {
+        "access",
+        "address",
+        "authorization",
+        "contact",
+        "cookie",
+        "credential",
+        "email",
+        "password",
+        "phone",
+        "secret",
+        "session",
+        "token",
+    }
+)
+_RESTRICTED_IDENTIFIERS = frozenset(
+    {
+        "accountid",
+        "apikey",
+        "auth",
+        "bearer",
+        "companyid",
+        "connectionid",
+        "customerid",
+        "externalid",
+        "firstname",
+        "fullname",
+        "lastname",
+        "merchantid",
+        "personname",
+        "providerid",
+        "recipientname",
+        "taxid",
+        "taxidentifier",
+        "taxnumber",
+        "tin",
+        "userid",
+        "vatid",
+        "vatnumber",
+    }
+)
 
 
 def _schema_fingerprint(schema: Mapping[str, Any]) -> str:
@@ -58,7 +116,7 @@ def _schema_fingerprint(schema: Mapping[str, Any]) -> str:
 
 
 def _schema_copy(schema: Mapping[str, Any]) -> dict[str, Any]:
-    """Thaw a catalog schema without mutating its deep-frozen authority record."""
+    """Thaw a catalog schema without mutating its immutable authority record."""
 
     return json.loads(canonical_json(dict(schema)))
 
@@ -80,13 +138,11 @@ def _assert_closed_schema(schema: Mapping[str, Any]) -> None:
             not isinstance(reference, str) or not reference.startswith("#/$defs/")
         ):
             raise ValueError("generated_schema_invalid")
-        schema_type = node.get("type")
-        is_object = schema_type == "object" or "properties" in node
-        pattern_properties = node.get("patternProperties")
+        is_object = node.get("type") == "object" or "properties" in node
         if is_object and (
             node.get("additionalProperties") is not False
             or node.get("unevaluatedProperties", False) not in {False, None}
-            or (pattern_properties is not None and pattern_properties != {})
+            or (node.get("patternProperties") is not None and node.get("patternProperties") != {})
         ):
             raise ValueError("generated_schema_invalid")
         for value in node.values():
@@ -104,7 +160,7 @@ def _assert_closed_schema(schema: Mapping[str, Any]) -> None:
 
 
 class _CatalogWireModel(BaseModel):
-    """A frozen model whose wire contract is the reviewed catalog JSON Schema."""
+    """A frozen model whose wire contract is one reviewed catalog JSON Schema."""
 
     model_config = ConfigDict(
         extra="forbid",
@@ -151,7 +207,7 @@ def catalog_wire_model(
     *,
     kind: Literal["input", "output"],
 ) -> type[_CatalogWireModel]:
-    """Return a stable internal model that validates one immutable catalog schema."""
+    """Return a stable internal model that validates one closed schema exactly."""
 
     checked = _schema_copy(schema)
     _assert_closed_schema(checked)
@@ -181,25 +237,202 @@ def catalog_wire_model(
     return model
 
 
-def sanitize_provider_read_data(value: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
-    """Mask provider identifiers and personal or tax data before the public envelope."""
+def _normalized_field_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.casefold())
 
-    def sanitize(item: Any, *, key: str | None = None) -> JsonValue:
-        if key is not None and _SENSITIVE_FIELD.search(key):
-            return "[REDACTED]"
-        if isinstance(item, Mapping):
-            return {
-                str(child_key): sanitize(child, key=str(child_key))
-                for child_key, child in item.items()
+
+def _is_restricted_field(name: str) -> bool:
+    normalized = _normalized_field_name(name)
+    if normalized in _PUBLIC_BUSINESS_IDENTIFIERS:
+        return False
+    if normalized in _RESTRICTED_IDENTIFIERS or normalized == "id":
+        return True
+    if normalized in {"taxamount", "vatamount", "taxrate", "vatrate"}:
+        return False
+    if "tax" in normalized or "vat" in normalized:
+        return True
+    return any(part in normalized for part in _RESTRICTED_FIELD_PARTS)
+
+
+def _dereference(schema: Mapping[str, Any], root: Mapping[str, Any]) -> Mapping[str, Any]:
+    reference = schema.get("$ref")
+    if reference is None:
+        return schema
+    if not isinstance(reference, str) or not reference.startswith("#/$defs/"):
+        raise ValueError("generated_schema_invalid")
+    name = reference.rsplit("/", 1)[-1]
+    definitions = root.get("$defs")
+    if not isinstance(definitions, Mapping) or not isinstance(definitions.get(name), Mapping):
+        raise ValueError("generated_schema_invalid")
+    return definitions[name]
+
+
+def _public_schema_node(
+    schema: Mapping[str, Any],
+    *,
+    root: Mapping[str, Any],
+    references: set[str],
+) -> dict[str, Any]:
+    reference = schema.get("$ref")
+    if reference is not None:
+        if not isinstance(reference, str) or reference in references:
+            raise ValueError("generated_schema_invalid")
+        return _public_schema_node(
+            _dereference(schema, root),
+            root=root,
+            references={*references, reference},
+        )
+    result = {
+        key: copy.deepcopy(value)
+        for key, value in schema.items()
+        if key
+        not in {
+            "$defs",
+            "$ref",
+            "additionalProperties",
+            "description",
+            "examples",
+            "properties",
+            "required",
+            "title",
+            "unevaluatedProperties",
+        }
+    }
+    if schema.get("type") == "object" or "properties" in schema:
+        properties = schema.get("properties")
+        if not isinstance(properties, Mapping):
+            raise ValueError("generated_schema_invalid")
+        public_properties = {
+            str(name): _public_schema_node(value, root=root, references=references)
+            for name, value in properties.items()
+            if isinstance(name, str)
+            and isinstance(value, Mapping)
+            and not _is_restricted_field(name)
+        }
+        required = schema.get("required", [])
+        if not isinstance(required, list | tuple) or any(
+            not isinstance(item, str) for item in required
+        ):
+            raise ValueError("generated_schema_invalid")
+        result.update(
+            {
+                "type": "object",
+                "properties": public_properties,
+                "required": [item for item in required if item in public_properties],
+                "additionalProperties": False,
             }
-        if isinstance(item, list | tuple):
-            return [sanitize(child) for child in item]
-        return item
+        )
+        return result
+    if schema.get("type") == "array":
+        items = schema.get("items")
+        if not isinstance(items, Mapping):
+            raise ValueError("generated_schema_invalid")
+        result["items"] = _public_schema_node(items, root=root, references=references)
+    for keyword in ("allOf", "anyOf", "oneOf"):
+        if keyword in schema:
+            values = schema[keyword]
+            if not isinstance(values, list) or not all(
+                isinstance(item, Mapping) for item in values
+            ):
+                raise ValueError("generated_schema_invalid")
+            result[keyword] = [
+                _public_schema_node(item, root=root, references=references) for item in values
+            ]
+    return result
 
-    sanitized = sanitize(value)
-    if not isinstance(sanitized, dict):
+
+def public_output_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive a closed public value contract from the exact reviewed output schema."""
+
+    source = _schema_copy(schema)
+    _assert_closed_schema(source)
+    projected = _public_schema_node(source, root=source, references=set())
+    _assert_closed_schema(projected)
+    return projected
+
+
+def _matching_schema_branch(
+    value: object,
+    schema: Mapping[str, Any],
+    *,
+    root: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    for keyword in ("oneOf", "anyOf", "allOf"):
+        choices = schema.get(keyword)
+        if not isinstance(choices, list):
+            continue
+        for choice in choices:
+            if not isinstance(choice, Mapping):
+                continue
+            try:
+                Draft202012Validator(
+                    {"$schema": "https://json-schema.org/draft/2020-12/schema", **choice}
+                ).validate(value)
+            except Exception:
+                continue
+            return choice
+    return schema
+
+
+def _project_value(
+    value: JsonValue,
+    schema: Mapping[str, Any],
+    *,
+    root: Mapping[str, Any],
+    references: set[str],
+) -> JsonValue:
+    reference = schema.get("$ref")
+    if reference is not None:
+        if not isinstance(reference, str) or reference in references:
+            raise ValueError("generated_output_invalid")
+        return _project_value(
+            value,
+            _dereference(schema, root),
+            root=root,
+            references={*references, reference},
+        )
+    selected = _matching_schema_branch(value, schema, root=root)
+    if selected is not schema:
+        return _project_value(value, selected, root=root, references=references)
+    if schema.get("type") == "object" or "properties" in schema:
+        if not isinstance(value, Mapping):
+            raise ValueError("generated_output_invalid")
+        properties = schema.get("properties")
+        if not isinstance(properties, Mapping):
+            raise ValueError("generated_output_invalid")
+        return {
+            str(name): _project_value(item, properties[name], root=root, references=references)
+            for name, item in value.items()
+            if isinstance(name, str)
+            and name in properties
+            and isinstance(properties[name], Mapping)
+            and not _is_restricted_field(name)
+        }
+    if schema.get("type") == "array":
+        if not isinstance(value, list | tuple):
+            raise ValueError("generated_output_invalid")
+        items = schema.get("items")
+        if not isinstance(items, Mapping):
+            raise ValueError("generated_output_invalid")
+        return [_project_value(item, items, root=root, references=references) for item in value]
+    return value
+
+
+def project_provider_read_data(
+    value: Mapping[str, JsonValue],
+    *,
+    output_schema: Mapping[str, Any],
+) -> dict[str, JsonValue]:
+    """Project a raw, already exact-schema-validated value into the public contract."""
+
+    if not isinstance(value, Mapping):
         raise ValueError("generated_output_invalid")
-    return sanitized
+    source = _schema_copy(output_schema)
+    public_model = catalog_wire_model(public_output_schema(source), kind="output")
+    projected = _project_value(dict(value), source, root=source, references=set())
+    if not isinstance(projected, Mapping):
+        raise ValueError("generated_output_invalid")
+    return public_model.model_validate(projected).model_dump(mode="json")
 
 
 def _wrapper_name(qualification: ProviderMCPQualification) -> str:
@@ -214,6 +447,18 @@ def _wrapper_name(qualification: ProviderMCPQualification) -> str:
     return f"mercury_{qualification.provider}_{suffix}"
 
 
+def _rewrite_references(value: Any, names: Mapping[str, str]) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _rewrite_references(item, names) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_rewrite_references(item, names) for item in value]
+    if isinstance(value, str) and value.startswith("#/$defs/"):
+        name = value.rsplit("/", 1)[-1]
+        if name in names:
+            return f"#/$defs/{names[name]}"
+    return value
+
+
 def _merge_schema_definitions(
     container: dict[str, Any],
     schema: Mapping[str, Any],
@@ -224,91 +469,135 @@ def _merge_schema_definitions(
     definitions = embedded.pop("$defs", {})
     if not definitions:
         return embedded
-    if not isinstance(definitions, Mapping):
+    if not isinstance(definitions, Mapping) or not all(
+        isinstance(name, str) and isinstance(value, Mapping) for name, value in definitions.items()
+    ):
         raise ValueError("generated_schema_invalid")
-    renamed = {name: f"{prefix}{name}" for name in definitions}
-
-    def rewrite(value: Any) -> Any:
-        if isinstance(value, Mapping):
-            return {str(key): rewrite(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [rewrite(item) for item in value]
-        if isinstance(value, str) and value.startswith("#/$defs/"):
-            name = value.rsplit("/", 1)[-1]
-            if name in renamed:
-                return f"#/$defs/{renamed[name]}"
-        return value
-
-    target_definitions = container.setdefault("$defs", {})
-    if not isinstance(target_definitions, dict):
+    names = {name: f"{prefix}{name}" for name in definitions}
+    target = container.setdefault("$defs", {})
+    if not isinstance(target, dict) or set(target) & set(names.values()):
         raise ValueError("generated_schema_invalid")
     for name, definition in definitions.items():
-        target_definitions[renamed[name]] = rewrite(definition)
-    return rewrite(embedded)
+        target[names[name]] = _rewrite_references(definition, names)
+    return _rewrite_references(embedded, names)
 
 
-def _input_schema(qualification: ProviderMCPQualification) -> dict[str, Any]:
-    source = _schema_copy(qualification.input_schema)
-    _assert_closed_schema(source)
-    properties = source.get("properties")
-    required = source.get("required", [])
-    if (
-        source.get("type") != "object"
-        or not isinstance(properties, Mapping)
-        or not isinstance(required, list | tuple)
-        or {"workspace_id", "connection_id"} & set(properties)
-    ):
-        raise ValueError("generated_schema_invalid")
-    schema: dict[str, Any] = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "workspace_id": {"type": "string", "format": "uuid"},
-            "connection_id": {"type": "string", "format": "uuid"},
-            **copy.deepcopy(dict(properties)),
-        },
-        "required": ["workspace_id", "connection_id", *required],
-        "title": f"{_wrapper_name(qualification)}Arguments",
-    }
-    _merge_schema_definitions(schema, source, prefix="MercuryInput")
-    return schema
+@dataclass(frozen=True, slots=True)
+class _GeneratedBranch:
+    qualification: ProviderMCPQualification
+    input_model: type[_CatalogWireModel]
+    public_output_model: type[_CatalogWireModel]
+    public_output_schema: dict[str, Any]
+
+    @property
+    def capability_version(self) -> str:
+        return self.qualification.capability_version_sha256
+
+    @property
+    def identity(self) -> str:
+        return canonical_json(
+            {
+                "provider": self.qualification.provider,
+                "environment": self.qualification.environment,
+                "capability": self.qualification.normalized_capability,
+                "version": self.qualification.capability_version_sha256,
+                "input": self.qualification.input_schema,
+                "output": self.qualification.output_schema,
+            }
+        )
 
 
-def _output_schema(qualification: ProviderMCPQualification) -> dict[str, Any]:
-    source = _schema_copy(qualification.output_schema)
-    catalog_wire_model(source, kind="output")
-    success = ProviderReadEnvelope.model_json_schema(by_alias=True)
-    properties = success.get("properties")
-    if not isinstance(properties, dict):
-        raise ValueError("generated_schema_invalid")
-    data_schema = _merge_schema_definitions(success, source, prefix="MercuryData")
-    definitions = success.setdefault("$defs", {})
+@dataclass(frozen=True, slots=True)
+class _StagedTool:
+    name: str
+    branches: tuple[_GeneratedBranch, ...]
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any]
+    argument_model: type[_GeneratedArguments]
+
+    @property
+    def identity(self) -> str:
+        return canonical_json(
+            {
+                "branches": [branch.identity for branch in self.branches],
+                "input": self.input_schema,
+                "output": self.output_schema,
+            }
+        )
+
+
+def _branch_input_schema(branches: Sequence[_GeneratedBranch], name: str) -> dict[str, Any]:
+    result: dict[str, Any] = {"$defs": {}}
+    options: list[dict[str, str]] = []
+    for index, branch in enumerate(branches):
+        source = _schema_copy(branch.qualification.input_schema)
+        _assert_closed_schema(source)
+        embedded = _merge_schema_definitions(result, source, prefix=f"Input{index}_")
+        properties = embedded.get("properties")
+        required = embedded.get("required", [])
+        if (
+            embedded.get("type") != "object"
+            or not isinstance(properties, Mapping)
+            or not isinstance(required, list | tuple)
+            or {"workspace_id", "connection_id", "capability_version"} & set(properties)
+        ):
+            raise ValueError("generated_schema_invalid")
+        definition_name = f"Arguments{index}"
+        definitions = result["$defs"]
+        if not isinstance(definitions, dict):
+            raise ValueError("generated_schema_invalid")
+        definitions[definition_name] = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "workspace_id": {"type": "string", "format": "uuid"},
+                "connection_id": {"type": "string", "format": "uuid"},
+                "capability_version": {"const": branch.capability_version},
+                **copy.deepcopy(dict(properties)),
+            },
+            "required": ["workspace_id", "connection_id", "capability_version", *required],
+            "title": f"{name}Version{index}Arguments",
+        }
+        options.append({"$ref": f"#/$defs/{definition_name}"})
+    result["oneOf"] = options
+    _assert_closed_schema(result)
+    return result
+
+
+def _branch_output_schema(branches: Sequence[_GeneratedBranch]) -> dict[str, Any]:
+    result: dict[str, Any] = {"$defs": {}}
+    definitions = result["$defs"]
     if not isinstance(definitions, dict):
         raise ValueError("generated_schema_invalid")
-    data_definition = f"MercuryData{qualification.capability_version_sha256[:12]}"
-    definitions[data_definition] = data_schema
-    properties["data"] = {"$ref": f"#/$defs/{data_definition}"}
+    for index, branch in enumerate(branches):
+        success = _merge_schema_definitions(
+            result,
+            ProviderReadEnvelope.model_json_schema(by_alias=True),
+            prefix=f"Envelope{index}_",
+        )
+        properties = success.get("properties")
+        if not isinstance(properties, dict):
+            raise ValueError("generated_schema_invalid")
+        properties["capability_version"] = {"const": branch.capability_version}
+        properties["data"] = _merge_schema_definitions(
+            result,
+            branch.public_output_schema,
+            prefix=f"PublicData{index}_",
+        )
+        success_name = f"Success{index}"
+        definitions[success_name] = success
     error = published_error_output_schema()
-    success_definitions = success.pop("$defs", {})
-    error_definitions = error.pop("$defs", {})
-    if (
-        not isinstance(success_definitions, Mapping)
-        or not isinstance(error_definitions, Mapping)
-        or set(success_definitions) & set(error_definitions)
-    ):
-        raise ValueError("generated_schema_invalid")
-    return {
-        "$defs": {
-            **success_definitions,
-            **error_definitions,
-            "Success": success,
-            "MercuryV1ErrorOutput": error,
-        },
-        "oneOf": [
-            {"$ref": "#/$defs/Success"},
-            {"$ref": "#/$defs/MercuryV1ErrorOutput"},
-        ],
-    }
+    definitions["MercuryV1ErrorOutput"] = _merge_schema_definitions(
+        result,
+        error,
+        prefix="Error_",
+    )
+    result["oneOf"] = [
+        *[{"$ref": f"#/$defs/Success{index}"} for index in range(len(branches))],
+        {"$ref": "#/$defs/MercuryV1ErrorOutput"},
+    ]
+    _assert_closed_schema(result)
+    return result
 
 
 class _GeneratedArguments(ArgModelBase):
@@ -336,22 +625,29 @@ def _arguments_model(schema: Mapping[str, Any], *, name: str) -> type[_Generated
         {
             "__module__": __name__,
             "__annotations__": {"_validator": ClassVar[Draft202012Validator]},
-            "_validator": Draft202012Validator(
-                dict(schema),
-                format_checker=FormatChecker(),
-            ),
+            "_validator": Draft202012Validator(dict(schema), format_checker=FormatChecker()),
         },
     )
 
 
 class GeneratedProviderToolPublisher:
-    """Publish only exact enabled read versions and remove superseded wrappers."""
+    """Atomically project catalog read authority into one stable Mercury wrapper."""
 
-    def __init__(self, server: FastMCP, *, execute: GeneratedReadExecutor) -> None:
+    def __init__(
+        self,
+        server: FastMCP,
+        *,
+        execute: GeneratedReadExecutor,
+        persist_schema_change: PersistSchemaChange | None = None,
+    ) -> None:
         self._server = server
         self._execute = execute
-        self._published: dict[str, tuple[str, str]] = {}
-        self._drifted_versions: set[str] = set()
+        self._persist_schema_change = persist_schema_change
+        self._published: dict[str, str] = {}
+        self._refresh_lock = asyncio.Lock()
+        self._requested_generation = 0
+        self._committed_generation = 0
+        self._refresh_sessions: dict[int, object] = {}
 
     async def publish(
         self,
@@ -359,30 +655,24 @@ class GeneratedProviderToolPublisher:
         *,
         context: Context | object | None = None,
     ) -> bool:
-        desired = self._desired(qualifications)
-        changed = False
-        for name in sorted(set(self._published) - set(desired)):
-            if self._server._tool_manager.get_tool(name) is not None:
-                self._server.remove_tool(name)
-            self._published.pop(name, None)
-            changed = True
-        for name, qualification in desired.items():
-            identity = (
-                qualification.capability_version_sha256,
-                _schema_fingerprint(qualification.input_schema),
-            )
-            if self._published.get(name) == identity:
-                continue
-            if self._server._tool_manager.get_tool(name) is not None:
-                self._server.remove_tool(name)
-            self._register(name, qualification)
-            self._published[name] = identity
-            changed = True
-        if changed and context is not None:
-            await self._notify(context)
-        return changed
+        """Stage every branch before one rollback-safe, generation-serialized swap."""
+
+        staged = self._stage(qualifications)
+        self._requested_generation += 1
+        request_generation = self._requested_generation
+        self._remember_session(context)
+        async with self._refresh_lock:
+            if request_generation < self._requested_generation:
+                return False
+            changed = self._swap(staged)
+            self._committed_generation = request_generation
+            if changed:
+                await self._notify_refresh_sessions()
+            return changed
 
     def clear(self) -> bool:
+        """Remove generated tools during static V1 disablement only."""
+
         changed = False
         for name in tuple(self._published):
             if self._server._tool_manager.get_tool(name) is not None:
@@ -391,62 +681,118 @@ class GeneratedProviderToolPublisher:
             changed = True
         return changed
 
-    def _desired(
+    def _stage(
         self,
         qualifications: Sequence[ProviderMCPQualification],
-    ) -> dict[str, ProviderMCPQualification]:
-        selected: dict[str, ProviderMCPQualification] = {}
+    ) -> dict[str, _StagedTool]:
+        grouped: dict[str, dict[str, _GeneratedBranch]] = {}
         for item in qualifications:
             qualification = ProviderMCPQualification.model_validate(item)
             if (
                 qualification.qualification_state is not QualificationState.ENABLED
                 or qualification.normalized_capability not in _READ_CAPABILITIES
-                or qualification.capability_version_sha256 in self._drifted_versions
             ):
                 continue
-            name = _wrapper_name(qualification)
-            if name in selected:
+            branch = _GeneratedBranch(
+                qualification=qualification,
+                input_model=catalog_wire_model(qualification.input_schema, kind="input"),
+                public_output_model=catalog_wire_model(
+                    public_output_schema(qualification.output_schema),
+                    kind="output",
+                ),
+                public_output_schema=public_output_schema(qualification.output_schema),
+            )
+            versions = grouped.setdefault(_wrapper_name(qualification), {})
+            existing = versions.get(branch.capability_version)
+            if existing is not None and existing.identity != branch.identity:
                 raise ValueError("generated_capability_ambiguous")
-            catalog_wire_model(qualification.input_schema, kind="input")
-            catalog_wire_model(qualification.output_schema, kind="output")
-            selected[name] = qualification
-        return selected
+            versions.setdefault(branch.capability_version, branch)
+        staged: dict[str, _StagedTool] = {}
+        for name, versions in grouped.items():
+            branches = tuple(
+                branch for _, branch in sorted(versions.items(), key=lambda item: item[0])
+            )
+            input_schema = _branch_input_schema(branches, name)
+            staged[name] = _StagedTool(
+                name=name,
+                branches=branches,
+                input_schema=input_schema,
+                output_schema=_branch_output_schema(branches),
+                argument_model=_arguments_model(input_schema, name=name),
+            )
+        return staged
 
-    def _register(self, name: str, qualification: ProviderMCPQualification) -> None:
-        public_input_schema = _input_schema(qualification)
-        public_output_schema = _output_schema(qualification)
-        input_model = catalog_wire_model(qualification.input_schema, kind="input")
-        argument_model = _arguments_model(public_input_schema, name=name)
+    def _swap(self, staged: Mapping[str, _StagedTool]) -> bool:
+        target_identities = {name: item.identity for name, item in staged.items()}
+        if target_identities == self._published:
+            return False
+        managed_names = set(self._published) | set(staged)
+        previous_tools = {name: self._server._tool_manager.get_tool(name) for name in managed_names}
+        previous_published = dict(self._published)
+        try:
+            for name in sorted(managed_names):
+                registered = self._server._tool_manager.get_tool(name)
+                if registered is not None:
+                    self._server.remove_tool(name)
+            for name in sorted(staged):
+                self._register(staged[name])
+            self._published = target_identities
+        except BaseException:
+            for name in managed_names:
+                if self._server._tool_manager.get_tool(name) is not None:
+                    self._server.remove_tool(name)
+            for name, registered in previous_tools.items():
+                if registered is not None:
+                    self._server._tool_manager._tools[name] = registered
+            self._published = previous_published
+            raise
+        return True
+
+    def _register(self, staged: _StagedTool) -> None:
+        branches = {branch.capability_version: branch for branch in staged.branches}
 
         async def generated_read_tool(
             context: Context,
             arguments: dict[str, JsonValue],
         ) -> ProviderReadEnvelope:
             try:
-                workspace_id = UUID(str(arguments.pop("workspace_id")))
-                connection_id = UUID(str(arguments.pop("connection_id")))
-                inputs = input_model.model_validate(arguments)
-                return await self._execute(
-                    context,
-                    workspace_id=workspace_id,
-                    connection_id=connection_id,
-                    qualification=qualification,
-                    inputs=inputs,
+                values = dict(arguments)
+                workspace_id = UUID(str(values.pop("workspace_id")))
+                connection_id = UUID(str(values.pop("connection_id")))
+                capability_version = str(values.pop("capability_version"))
+                branch = branches.get(capability_version)
+                if branch is None:
+                    raise ValueError("generated_schema_validation_failed")
+                inputs = branch.input_model.model_validate(values)
+                result = ProviderReadEnvelope.model_validate(
+                    await self._execute(
+                        context,
+                        workspace_id=workspace_id,
+                        connection_id=connection_id,
+                        capability_id=branch.qualification.normalized_capability,
+                        capability_version=branch.capability_version,
+                        inputs=inputs,
+                    )
                 )
+                if (
+                    result.capability_id != branch.qualification.normalized_capability
+                    or result.capability_version != branch.capability_version
+                ):
+                    raise ValueError("generated_output_invalid")
+                data = branch.public_output_model.model_validate(result.data).model_dump(
+                    mode="json"
+                )
+                return result.model_copy(update={"data": data})
             except ProviderSchemaChanged as error:
-                await self._unpublish_drifted(
-                    name,
-                    qualification.capability_version_sha256,
-                    context,
-                )
+                await self._persist_and_refresh(branch, context)
                 raise MercuryV1ToolError(public_error_code(error)) from None
             except Exception as error:
                 raise MercuryV1ToolError(public_error_code(error)) from None
 
-        generated_read_tool.__name__ = name
+        generated_read_tool.__name__ = staged.name
         self._server.add_tool(
             generated_read_tool,
-            name=name,
+            name=staged.name,
             description=(
                 "Changes: none. External contact: a qualified provider read. "
                 "Omitted options: provider credentials, provider routing, and mutations "
@@ -460,56 +806,56 @@ class GeneratedProviderToolPublisher:
         set_output = getattr(self._server, "set_tool_output_contract", None)
         if not callable(set_input) or not callable(set_output):
             raise TypeError("generated_tool_server_invalid")
-        set_input(name, argument_model=argument_model, schema=public_input_schema)
-        set_output(name, schema=public_output_schema)
+        set_input(staged.name, argument_model=staged.argument_model, schema=staged.input_schema)
+        set_output(staged.name, schema=staged.output_schema)
 
-    async def _unpublish_drifted(
+    async def _persist_and_refresh(
         self,
-        name: str,
-        capability_version: str,
-        context: Context,
+        branch: _GeneratedBranch,
+        context: Context | object,
     ) -> None:
-        asyncio.get_running_loop().call_soon(
-            self._remove_drifted,
-            name,
-            capability_version,
-            context,
+        if self._persist_schema_change is None:
+            raise ValueError("catalog_schema_transition_unavailable")
+        refreshed = await _await_value(self._persist_schema_change(branch.qualification, context))
+        if not isinstance(refreshed, Sequence):
+            raise ValueError("catalog_schema_transition_unavailable")
+        await self.publish(
+            tuple(ProviderMCPQualification.model_validate(item) for item in refreshed),
+            context=context,
         )
 
-    def _remove_drifted(
-        self,
-        name: str,
-        capability_version: str,
-        context: Context,
-    ) -> None:
-        published = self._published.get(name)
-        if published is None or published[0] != capability_version:
-            return
-        if self._server._tool_manager.get_tool(name) is not None:
-            self._server.remove_tool(name)
-        self._published.pop(name, None)
-        self._drifted_versions.add(capability_version)
+    def _remember_session(self, context: Context | object | None) -> None:
         session = getattr(context, "session", None)
-        notifier = getattr(session, "send_tool_list_changed", None)
-        if not callable(notifier):
-            return
-        notification = notifier()
-        if inspect.isawaitable(notification):
-            asyncio.get_running_loop().create_task(notification)
+        if callable(getattr(session, "send_tool_list_changed", None)):
+            self._refresh_sessions[id(session)] = session
 
-    @staticmethod
-    async def _notify(context: Context | object) -> None:
-        session = getattr(context, "session", None)
-        notifier = getattr(session, "send_tool_list_changed", None)
-        if not callable(notifier):
-            return
-        result = notifier()
-        if inspect.isawaitable(result):
-            await result
+    async def _notify_refresh_sessions(self) -> None:
+        """Notify sessions that actually initiated a refresh; new sessions list current tools.
+
+        FastMCP exposes ``send_tool_list_changed`` only on the request Context.
+        Its public session manager has no broadcast or active-session enumeration
+        API, so this server-scoped registry deliberately retains only sessions that
+        have supplied a refresh Context.
+        """
+
+        for session in tuple(self._refresh_sessions.values()):
+            try:
+                result = session.send_tool_list_changed()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                continue
+
+
+async def _await_value(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 __all__ = [
     "GeneratedProviderToolPublisher",
     "catalog_wire_model",
-    "sanitize_provider_read_data",
+    "project_provider_read_data",
+    "public_output_schema",
 ]
