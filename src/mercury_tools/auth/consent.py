@@ -8,7 +8,7 @@ import html
 import os
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from importlib import resources
 from string import Template
 from typing import Protocol
@@ -109,38 +109,46 @@ class OAuthSessionCookie:
         self._cipher = AESGCM(key)
 
     def seal(self, access_token: SecretStr) -> str:
-        raw = access_token.get_secret_value()
-        if not raw or len(raw) > 16_384:
+        sealed: str | None = None
+        failed = False
+        try:
+            raw = access_token.get_secret_value()
+            if not raw or len(raw) > 16_384:
+                raise ValueError
+            issued_at = int(time.time()).to_bytes(_SESSION_TIMESTAMP_BYTES, "big")
+            nonce = os.urandom(_SESSION_NONCE_BYTES)
+            ciphertext = self._cipher.encrypt(
+                nonce,
+                _SESSION_PREFIX + raw.encode("utf-8"),
+                _SESSION_AAD + issued_at,
+            )
+            sealed = base64.urlsafe_b64encode(issued_at + nonce + ciphertext).decode("ascii")
+        except Exception:
+            failed = True
+        if failed or sealed is None:
+            if "raw" in locals():
+                del raw
+            del access_token
+            del self
             raise ConsentError()
-        issued_at = int(time.time()).to_bytes(_SESSION_TIMESTAMP_BYTES, "big")
-        nonce = os.urandom(_SESSION_NONCE_BYTES)
-        ciphertext = self._cipher.encrypt(
-            nonce,
-            _SESSION_PREFIX + raw.encode("utf-8"),
-            _SESSION_AAD,
-        )
-        return base64.urlsafe_b64encode(
-            issued_at + nonce + ciphertext
-        ).decode("ascii")
+        return sealed
 
     def open(self, sealed: str) -> str:
         if not sealed or len(sealed) > 32_768:
             raise ConsentAuthenticationRequired()
+        token: str | None = None
+        failed = False
         try:
             payload = base64.b64decode(
                 sealed.encode("ascii"),
                 altchars=b"-_",
                 validate=True,
             )
-            minimum_length = (
-                _SESSION_TIMESTAMP_BYTES + _SESSION_NONCE_BYTES + 16
-            )
+            minimum_length = _SESSION_TIMESTAMP_BYTES + _SESSION_NONCE_BYTES + 16
             if len(payload) < minimum_length:
                 raise ValueError
-            issued_at = int.from_bytes(
-                payload[:_SESSION_TIMESTAMP_BYTES],
-                "big",
-            )
+            issued_at_bytes = payload[:_SESSION_TIMESTAMP_BYTES]
+            issued_at = int.from_bytes(issued_at_bytes, "big")
             age = int(time.time()) - issued_at
             if age < 0 or age > OAUTH_SESSION_TTL_SECONDS:
                 raise ValueError
@@ -150,7 +158,7 @@ class OAuthSessionCookie:
             plaintext = self._cipher.decrypt(
                 nonce,
                 payload[nonce_end:],
-                _SESSION_AAD,
+                _SESSION_AAD + issued_at_bytes,
             )
             if not plaintext.startswith(_SESSION_PREFIX):
                 raise ValueError
@@ -162,8 +170,14 @@ class OAuthSessionCookie:
             UnicodeEncodeError,
             ValueError,
         ):
-            raise ConsentAuthenticationRequired() from None
-        if not token:
+            failed = True
+        if failed or not token:
+            if "plaintext" in locals():
+                del plaintext
+            if "payload" in locals():
+                del payload
+            del sealed
+            del self
             raise ConsentAuthenticationRequired()
         return token
 
@@ -321,11 +335,13 @@ class MercuryConsent:
         canonical_resource: str,
         browser_origin: str,
         session_cookie: OAuthSessionCookie,
+        additional_session_cookie_paths: Sequence[str] = (),
     ) -> None:
         self.handoff = handoff
         self.canonical_resource = canonical_resource
         self.browser_origin = _origin(browser_origin)
         self.session_cookie = session_cookie
+        self.session_cookie_paths = _session_cookie_paths(additional_session_cookie_paths)
 
     async def show(self, request: Request) -> Response:
         authorization_id = _query_authorization_id(request)
@@ -350,7 +366,11 @@ class MercuryConsent:
                 canonical_resource=self.canonical_resource,
             )
         except ConsentAuthenticationRequired:
-            return _sign_in_redirect(authorization_id, clear_cookie=True)
+            return _sign_in_redirect(
+                authorization_id,
+                clear_cookie=True,
+                cookie_paths=self.session_cookie_paths,
+            )
         except (ConsentError, OSError, ValidationError, TypeError, ValueError):
             return _oauth_error()
         return HTMLResponse(content, headers=OAUTH_HEADERS)
@@ -384,15 +404,16 @@ class MercuryConsent:
                 status_code=303,
                 headers=OAUTH_HEADERS,
             )
-            response.set_cookie(
-                OAUTH_SESSION_COOKIE,
-                sealed,
-                max_age=max_age,
-                path=OAUTH_SESSION_COOKIE_PATH,
-                secure=True,
-                httponly=True,
-                samesite="lax",
-            )
+            for cookie_path in self.session_cookie_paths:
+                response.set_cookie(
+                    OAUTH_SESSION_COOKIE,
+                    sealed,
+                    max_age=max_age,
+                    path=cookie_path,
+                    secure=True,
+                    httponly=True,
+                    samesite="lax",
+                )
             return response
         except (ConsentError, ValidationError, TypeError, ValueError):
             try:
@@ -432,7 +453,11 @@ class MercuryConsent:
             if not _redirect_matches(result.redirect_uri, redirect_url):
                 raise ConsentError()
         except ConsentAuthenticationRequired:
-            return _sign_in_redirect(authorization_id, clear_cookie=True)
+            return _sign_in_redirect(
+                authorization_id,
+                clear_cookie=True,
+                cookie_paths=self.session_cookie_paths,
+            )
         except (ConsentError, ValidationError, TypeError, ValueError):
             return _oauth_error()
         return RedirectResponse(
@@ -473,10 +498,10 @@ async def _parse_decision_form(request: Request) -> dict[str, str] | None:
     )
     if form is None:
         return None
-    if (
-        not _AUTHORIZATION_ID_RE.fullmatch(form["authorization_id"])
-        or form["decision"] not in {"approve", "deny"}
-    ):
+    if not _AUTHORIZATION_ID_RE.fullmatch(form["authorization_id"]) or form["decision"] not in {
+        "approve",
+        "deny",
+    }:
         return None
     return form
 
@@ -519,12 +544,7 @@ def _safe_registered_redirect(value: str) -> bool:
     if not _safe_redirect_base(value):
         return False
     parsed = urlsplit(value)
-    return bool(
-        not parsed.query
-        and not parsed.fragment
-        and "?" not in value
-        and "#" not in value
-    )
+    return bool(not parsed.query and not parsed.fragment and "?" not in value and "#" not in value)
 
 
 def _safe_final_redirect(value: str) -> bool:
@@ -572,8 +592,7 @@ def _render_consent(
 ) -> str:
     template = Template(_read_template("consent.html"))
     scope_items = "\n".join(
-        f"<li><code>{html.escape(scope)}</code></li>"
-        for scope in ("openid", "email", "profile")
+        f"<li><code>{html.escape(scope)}</code></li>" for scope in ("openid", "email", "profile")
     )
     return template.substitute(
         client_name=html.escape(details.client_name),
@@ -630,12 +649,7 @@ def _supabase_session_token(
 
 def _origin(value: str) -> str:
     parsed = urlsplit(value)
-    if (
-        parsed.scheme != "https"
-        or not parsed.hostname
-        or parsed.username
-        or parsed.password
-    ):
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError("mercury_browser_origin_invalid")
     return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
@@ -654,6 +668,7 @@ def _sign_in_redirect(
     authorization_id: str,
     *,
     clear_cookie: bool,
+    cookie_paths: Sequence[str] = (OAUTH_SESSION_COOKIE_PATH,),
 ) -> RedirectResponse:
     response = RedirectResponse(
         f"/oauth/sign-in?authorization_id={authorization_id}",
@@ -661,14 +676,29 @@ def _sign_in_redirect(
         headers=OAUTH_HEADERS,
     )
     if clear_cookie:
-        response.delete_cookie(
-            OAUTH_SESSION_COOKIE,
-            path=OAUTH_SESSION_COOKIE_PATH,
-            secure=True,
-            httponly=True,
-            samesite="lax",
-        )
+        for cookie_path in cookie_paths:
+            response.delete_cookie(
+                OAUTH_SESSION_COOKIE,
+                path=cookie_path,
+                secure=True,
+                httponly=True,
+                samesite="lax",
+            )
     return response
+
+
+def _session_cookie_paths(additional_paths: Sequence[str]) -> tuple[str, ...]:
+    paths = (OAUTH_SESSION_COOKIE_PATH, *tuple(additional_paths))
+    if any(
+        not isinstance(path, str)
+        or not path.startswith("/")
+        or path.startswith("//")
+        or path.endswith("/")
+        or urlsplit(path) != urlsplit(path)._replace(query="", fragment="")
+        for path in paths
+    ):
+        raise ValueError("mercury_oauth_session_cookie_path_invalid")
+    return tuple(dict.fromkeys(paths))
 
 
 def _oauth_error() -> JSONResponse:

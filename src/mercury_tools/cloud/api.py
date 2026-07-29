@@ -19,7 +19,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
-from mercury_tools.auth.consent import IDENTITY_SCOPES
+from mercury_tools.auth.consent import IDENTITY_SCOPES, OAUTH_SESSION_COOKIE
 from mercury_tools.auth.models import MercuryPrincipal
 from mercury_tools.catalog.models import (
     CatalogAction,
@@ -57,8 +57,11 @@ from mercury_tools.providers.oauth import (
     ProviderOAuthError,
 )
 from mercury_tools.providers.peak_setup import (
+    PEAK_SETUP_BROWSER_COOKIE,
     PEAK_SETUP_EXCHANGE_PATH,
     PEAK_SETUP_PATH,
+    PeakBrowserSessionBinding,
+    PeakBrowserSessionManager,
     PeakSetupError,
     PeakSetupExchangeRequest,
     PeakSetupSubmission,
@@ -67,6 +70,7 @@ from mercury_tools.providers.peak_setup import (
     peak_setup_security_headers,
     render_peak_setup_form,
     render_peak_setup_page,
+    render_peak_setup_retry_form,
 )
 from mercury_tools.qualification.selection import (
     EvidenceRequest,
@@ -447,7 +451,6 @@ class CloudDependencies:
     async def peak_setup_page(self, request: Request) -> Response:
         headers = peak_setup_security_headers()
         try:
-            _request_principal(request)
             if request.url.query:
                 raise ValueError
             return HTMLResponse(render_peak_setup_page(), headers=headers)
@@ -489,10 +492,30 @@ class CloudDependencies:
                 principal,
                 exchange_request.setup_token.get_secret_value(),
             )
-            return HTMLResponse(
+            response = HTMLResponse(
                 render_peak_setup_form(exchange),
                 headers=headers,
             )
+            manager = getattr(
+                request.state,
+                "peak_browser_session_manager",
+                None,
+            )
+            if isinstance(manager, PeakBrowserSessionManager):
+                sealed_binding, max_age = manager.seal_binding(
+                    principal,
+                    exchange,
+                )
+                response.set_cookie(
+                    PEAK_SETUP_BROWSER_COOKIE,
+                    sealed_binding,
+                    max_age=max_age,
+                    path=PEAK_SETUP_PATH,
+                    secure=True,
+                    httponly=True,
+                    samesite="strict",
+                )
+            return response
         except PeakSetupError as exc:
             return JSONResponse(
                 {"error": exc.code},
@@ -515,11 +538,7 @@ class CloudDependencies:
             _clear_request_body(request)
 
     async def peak_setup_submit(self, request: Request) -> Response:
-        headers = {
-            "Cache-Control": "no-store",
-            "Referrer-Policy": "no-referrer",
-            "X-Content-Type-Options": "nosniff",
-        }
+        headers = peak_setup_security_headers()
         if self.peak_setup_service is None:
             return JSONResponse(
                 {"error": "peak_setup_unavailable"},
@@ -547,8 +566,24 @@ class CloudDependencies:
             ):
                 raise ValueError
             submission = PeakSetupSubmission.model_validate(dict(pairs))
+            binding = getattr(
+                request.state,
+                "peak_browser_session_binding",
+                None,
+            )
+            manager = getattr(
+                request.state,
+                "peak_browser_session_manager",
+                None,
+            )
+            if (
+                not isinstance(binding, PeakBrowserSessionBinding)
+                or not isinstance(manager, PeakBrowserSessionManager)
+                or not manager.matches(binding, submission.setup_session)
+            ):
+                raise ValueError
             summary = await self.peak_setup_service.complete(principal, submission)
-            return JSONResponse(
+            response = JSONResponse(
                 {
                     "provider": summary.provider.value,
                     "merchant_display_name": summary.account_display_name,
@@ -558,7 +593,31 @@ class CloudDependencies:
                 },
                 headers=headers,
             )
+            response.delete_cookie(
+                PEAK_SETUP_BROWSER_COOKIE,
+                path=PEAK_SETUP_PATH,
+                secure=True,
+                httponly=True,
+                samesite="strict",
+            )
+            response.delete_cookie(
+                OAUTH_SESSION_COOKIE,
+                path=PEAK_SETUP_PATH,
+                secure=True,
+                httponly=True,
+                samesite="lax",
+            )
+            return response
         except PeakSetupError as exc:
+            if exc.code == "peak_setup_validation_failed" and "submission" in locals():
+                return HTMLResponse(
+                    render_peak_setup_retry_form(
+                        submission.setup_session,
+                        submission.csrf_token,
+                    ),
+                    status_code=422,
+                    headers=headers,
+                )
             return JSONResponse(
                 {"error": exc.code},
                 status_code=400,
@@ -649,7 +708,7 @@ def _require_peak_setup_request(
         len(origins) != 1
         or origins[0] != peak_setup_browser_origin(settings)
         or len(content_types) != 1
-        or content_types[0].partition(";")[0].strip().casefold() != media_type
+        or content_types[0] != media_type
     ):
         raise ValueError("peak_setup_request_invalid")
 

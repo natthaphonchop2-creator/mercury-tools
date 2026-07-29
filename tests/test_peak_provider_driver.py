@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from types import ModuleType, TracebackType
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -128,6 +130,87 @@ def _material() -> PeakCredentialMaterial:
     )
 
 
+def _assert_no_internal_secret_references(
+    error: BaseException,
+    *sentinels: str,
+) -> None:
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    pending: list[object] = [error]
+    seen: set[int] = set()
+    rendered: list[str] = []
+    while pending:
+        value = pending.pop()
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        if isinstance(value, str):
+            rendered.append(value)
+        elif isinstance(value, (bytes, bytearray)):
+            rendered.append(bytes(value).decode("utf-8", errors="ignore"))
+        elif isinstance(value, TracebackType):
+            if "/src/mercury_tools/" in value.tb_frame.f_code.co_filename:
+                pending.extend(value.tb_frame.f_locals.values())
+            if value.tb_next is not None:
+                pending.append(value.tb_next)
+        elif isinstance(value, BaseException):
+            pending.extend(value.args)
+            if value.__cause__ is not None:
+                pending.append(value.__cause__)
+            if value.__context__ is not None:
+                pending.append(value.__context__)
+            if value.__traceback__ is not None:
+                pending.append(value.__traceback__)
+        elif isinstance(value, Mapping):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value, Sequence) and not isinstance(value, str):
+            pending.extend(value)
+        elif (
+            not isinstance(value, (ModuleType, type))
+            and not callable(value)
+            and hasattr(value, "__dict__")
+        ):
+            pending.extend(vars(value).values())
+    combined = "\n".join(rendered)
+    assert all(sentinel not in combined for sentinel in sentinels)
+
+
+class FailingSealVault(CredentialVault):
+    def __init__(self) -> None:
+        super().__init__(
+            active_key_version="v1",
+            keys={"v1": b"k" * 32},
+            clock=lambda: NOW,
+            nonce_factory=lambda _size: b"z" * 12,
+        )
+        self.observed_plaintexts: list[bytes | bytearray] = []
+
+    def seal(self, binding, plaintext):
+        self.observed_plaintexts.append(plaintext)
+        raise RuntimeError(USER_TOKEN)
+
+
+class FailingOpenVault(CredentialVault):
+    def __init__(self) -> None:
+        super().__init__(
+            active_key_version="v1",
+            keys={"v1": b"k" * 32},
+            clock=lambda: NOW,
+            nonce_factory=lambda _size: b"y" * 12,
+        )
+        self.opened: list[bytearray] = []
+        self.calls = 0
+
+    def open(self, binding, envelope):
+        self.calls += 1
+        if self.calls == 2:
+            raise RuntimeError(CONNECT_KEY)
+        plaintext = super().open(binding, envelope)
+        self.opened.append(plaintext)
+        return plaintext
+
+
 def _contract() -> QualifiedPeakProviderContract:
     resource_hash = hashlib.sha256(_settings().peak_mcp_production_url.encode("utf-8")).hexdigest()
     return QualifiedPeakProviderContract(
@@ -241,6 +324,117 @@ def test_peak_credentials_are_sealed_under_three_canonical_names_and_cleared() -
     assert material.cleared
 
 
+def test_sealing_failure_clears_mutable_inputs_and_drops_secret_exception_graph() -> None:
+    vault = FailingSealVault()
+    material = _material()
+
+    with pytest.raises(PeakCredentialError, match="^peak_credentials_invalid$") as caught:
+        seal_peak_credentials(
+            vault=vault,
+            connection=_connection(),
+            credentials=material,
+        )
+
+    assert material.cleared
+    assert vault.observed_plaintexts
+    assert all(isinstance(value, bytearray) for value in vault.observed_plaintexts)
+    assert all(value == bytearray(len(value)) for value in vault.observed_plaintexts)
+    _assert_no_internal_secret_references(
+        caught.value,
+        USER_TOKEN,
+        CONNECT_ID,
+        CONNECT_KEY,
+    )
+
+
+def test_credential_material_failure_clears_partial_buffers_and_drops_inputs() -> None:
+    with pytest.raises(PeakCredentialError, match="^peak_credentials_invalid$") as caught:
+        PeakCredentialMaterial.from_values(
+            user_token=USER_TOKEN,
+            connect_id="\ud800",
+            connect_key=CONNECT_KEY,
+        )
+
+    _assert_no_internal_secret_references(
+        caught.value,
+        USER_TOKEN,
+        CONNECT_KEY,
+    )
+
+
+def test_opening_failure_clears_partial_plaintext_and_drops_secret_exception_graph() -> None:
+    material = _material()
+    envelopes = seal_peak_credentials(
+        vault=_vault(),
+        connection=_connection(),
+        credentials=material,
+    )
+    material.clear()
+    vault = FailingOpenVault()
+
+    with (
+        pytest.raises(PeakCredentialError, match="^peak_credentials_invalid$") as caught,
+        open_peak_credentials(
+            vault=vault,
+            connection=_connection(),
+            envelopes=envelopes,
+        ),
+    ):
+        pytest.fail("opening must fail before yielding credentials")
+
+    assert vault.opened
+    assert all(value == bytearray(len(value)) for value in vault.opened)
+    _assert_no_internal_secret_references(
+        caught.value,
+        USER_TOKEN,
+        CONNECT_ID,
+        CONNECT_KEY,
+    )
+
+
+def test_profile_normalization_drops_raw_payload_exception_graph() -> None:
+    contract = _contract()
+    connection = _connection()
+    binding = contract.profile_binding(connection)
+    verified = contract.verify_binding(
+        connection,
+        binding,
+        hashlib.sha256(_settings().peak_mcp_production_url.encode("utf-8")).hexdigest(),
+    )
+    payload = {
+        "reviewed_merchant_identifier": "merchant-123",
+        "reviewed_display_name": "PEAK Test Merchant",
+        "unexpected_secret": USER_TOKEN,
+    }
+
+    with pytest.raises(ValueError, match="^peak_profile_invalid$") as caught:
+        contract.normalize_profile(verified, payload)
+
+    _assert_no_internal_secret_references(caught.value, USER_TOKEN)
+
+
+def test_auth_header_failure_clears_material_and_drops_decoded_secret_graph() -> None:
+    material = PeakCredentialMaterial(
+        user_token=bytearray(USER_TOKEN.encode("utf-8")),
+        connect_id=bytearray(CONNECT_ID.encode("utf-8")),
+        connect_key=bytearray(b"\xff"),
+    )
+
+    with pytest.raises(PeakCredentialError, match="^peak_credentials_invalid$") as caught:
+        _contract().authorization_headers(
+            material,
+            application_code=APPLICATION_CODE,
+        )
+
+    assert material.cleared
+    _assert_no_internal_secret_references(
+        caught.value,
+        USER_TOKEN,
+        CONNECT_ID,
+        APPLICATION_CODE,
+    )
+
+
 @pytest.mark.asyncio
 async def test_qualified_fixture_alone_supplies_auth_mapping_and_application_code() -> None:
     vault = _vault()
@@ -315,6 +509,25 @@ async def test_peak_driver_validates_only_qualified_provider_profile_contract() 
             ReviewedProfileRequest(),
             uuid4(),
         )
+
+
+@pytest.mark.asyncio
+async def test_provider_validation_drops_raw_runtime_exception_graph() -> None:
+    class FailingRuntime(RecordingRuntime):
+        async def call(self, *_args: object) -> ProviderCallResult:
+            raw_provider_payload = {"credential": USER_TOKEN}
+            raise RuntimeError(raw_provider_payload)
+
+    driver = PeakMCPDriver(
+        runtime=FailingRuntime(),
+        manifest=MANIFEST,
+        contract=_contract(),
+    )
+
+    with pytest.raises(ProviderResponseInvalid) as caught:
+        await driver.validate_connection(_connection())
+
+    _assert_no_internal_secret_references(caught.value, USER_TOKEN)
 
 
 @pytest.mark.asyncio

@@ -99,7 +99,8 @@ class PrincipalCloudDependencies:
         return await self.list_actions(request)
 
     async def peak_setup_page(self, request: Request) -> JSONResponse:
-        return await self.list_actions(request)
+        del request
+        return JSONResponse({"public_fragment_page": True})
 
     async def peak_setup_exchange(self, request: Request) -> JSONResponse:
         return await self.list_actions(request)
@@ -447,7 +448,7 @@ def test_missing_or_invalid_bearer_returns_rfc_9728_challenge() -> None:
     assert "invalid-token" not in invalid.text
 
 
-def test_peak_setup_routes_are_protected_by_the_same_mercury_principal() -> None:
+def test_peak_setup_page_is_public_but_posts_require_the_browser_session() -> None:
     resolver = StubResolver(_principal())
     client = TestClient(
         create_test_http_app(
@@ -457,17 +458,29 @@ def test_peak_setup_routes_are_protected_by_the_same_mercury_principal() -> None
         raise_server_exceptions=False,
     )
 
-    missing = client.get(PEAK_SETUP_PATH)
-    authenticated = client.get(
+    page = client.get(PEAK_SETUP_PATH)
+    missing_exchange = client.post(PEAK_SETUP_EXCHANGE_PATH)
+    authenticated_exchange = client.post(
+        PEAK_SETUP_EXCHANGE_PATH,
+        headers={"Authorization": "Bearer mercury-principal-token"},
+    )
+    missing_submit = client.post(PEAK_SETUP_PATH)
+    authenticated_submit = client.post(
         PEAK_SETUP_PATH,
         headers={"Authorization": "Bearer mercury-principal-token"},
     )
 
-    assert missing.status_code == 401
-    assert missing.json() == {"error": "mercury_auth_required"}
-    assert authenticated.status_code == 200
-    assert authenticated.json() == {"subject": str(_principal().subject)}
-    assert resolver.tokens == ["mercury-principal-token"]
+    assert page.status_code == 200
+    assert page.json() == {"public_fragment_page": True}
+    assert missing_exchange.status_code == missing_submit.status_code == 401
+    assert missing_exchange.json() == missing_submit.json() == {"error": "mercury_auth_required"}
+    assert authenticated_exchange.status_code == authenticated_submit.status_code == 401
+    assert (
+        authenticated_exchange.json()
+        == authenticated_submit.json()
+        == {"error": "mercury_token_invalid"}
+    )
+    assert resolver.tokens == []
 
 
 def test_authenticated_but_unauthorized_request_returns_403() -> None:

@@ -29,7 +29,12 @@ from pydantic import (
     field_validator,
 )
 
-from mercury_tools.auth.models import MercuryPrincipal
+from mercury_tools.auth.consent import OAUTH_SESSION_TTL_SECONDS, OAuthSessionCookie
+from mercury_tools.auth.models import (
+    MercuryAuthError,
+    MercuryPrincipal,
+    PrincipalResolver,
+)
 from mercury_tools.config import Settings, v1_supabase_rest_url
 from mercury_tools.credentials.models import CredentialEnvelope
 from mercury_tools.credentials.vault import CredentialVault
@@ -61,8 +66,10 @@ from mercury_tools.workspaces.models import WorkspaceRole
 
 PEAK_SETUP_PATH = "/auth/providers/peak/setup"
 PEAK_SETUP_EXCHANGE_PATH = "/auth/providers/peak/setup/exchange"
+PEAK_SETUP_BROWSER_COOKIE = "__Secure-mercury-peak-setup-session"
 PEAK_SETUP_LIFETIME = timedelta(minutes=10)
 PEAK_REVOCATION_INSTRUCTION = "Revoke this credential set in PEAK Account."
+_PEAK_BROWSER_BINDING_PREFIX = "mercury-peak-setup-browser-v1"
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
@@ -192,6 +199,149 @@ class PeakSetupSessionRecord:
     expires_at: datetime
     consumed_at: datetime | None
     created_at: datetime
+
+
+@dataclass(frozen=True, repr=False)
+class PeakBrowserSessionBinding:
+    subject: UUID
+    session_id: UUID
+    session_hash: str
+    expires_at: datetime
+
+
+class PeakBrowserSessionManager:
+    """Authenticate and bind the first-party PEAK browser handoff."""
+
+    def __init__(
+        self,
+        *,
+        encoded_key: str,
+        principal_resolver: PrincipalResolver,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if not callable(getattr(principal_resolver, "resolve", None)):
+            raise ValueError("peak_browser_session_configuration_invalid")
+        self._cookie = OAuthSessionCookie(encoded_key)
+        self._principal_resolver = principal_resolver
+        self._clock = clock or (lambda: datetime.now(UTC))
+
+    def __repr__(self) -> str:
+        return "PeakBrowserSessionManager()"
+
+    async def authenticate(
+        self,
+        sealed_session: str,
+    ) -> tuple[MercuryPrincipal, str]:
+        principal: MercuryPrincipal | None = None
+        bearer_token: str | None = None
+        error_code: str | None = None
+        try:
+            bearer_token = self._cookie.open(sealed_session)
+            principal = MercuryPrincipal.model_validate(
+                await self._principal_resolver.resolve(bearer_token)
+            )
+        except MercuryAuthError as caught:
+            error_code = caught.code
+            del caught
+        except Exception:
+            error_code = "mercury_token_invalid"
+        if error_code is not None or principal is None or bearer_token is None:
+            if bearer_token is not None:
+                del bearer_token
+            del sealed_session
+            del self
+            raise MercuryAuthError(error_code or "mercury_token_invalid")
+        return principal, bearer_token
+
+    async def authenticate_bound(
+        self,
+        sealed_session: str,
+        sealed_binding: str,
+    ) -> tuple[MercuryPrincipal, str, PeakBrowserSessionBinding]:
+        principal, bearer_token = await self.authenticate(sealed_session)
+        binding: PeakBrowserSessionBinding | None = None
+        failed = False
+        try:
+            raw_binding = self._cookie.open(sealed_binding)
+            binding = self._parse_binding(raw_binding)
+            if binding.subject != principal.subject:
+                raise ValueError
+        except Exception:
+            failed = True
+        if failed or binding is None:
+            if "raw_binding" in locals():
+                del raw_binding
+            del bearer_token
+            del principal
+            del sealed_session
+            del sealed_binding
+            del self
+            raise MercuryAuthError("mercury_token_invalid")
+        return principal, bearer_token, binding
+
+    def seal_binding(
+        self,
+        principal: MercuryPrincipal,
+        exchange: PeakSetupExchange,
+    ) -> tuple[str, int]:
+        checked_principal = MercuryPrincipal.model_validate(principal)
+        checked_exchange = PeakSetupExchange.model_validate(exchange)
+        expires_at = _aware_utc(checked_exchange.expires_at)
+        remaining = int((expires_at - _aware_utc(self._clock())).total_seconds())
+        if remaining <= 0:
+            raise PeakSetupError("peak_setup_state_invalid")
+        session_hash = _token_hash(checked_exchange.setup_session.get_secret_value())
+        payload = SecretStr(
+            "|".join(
+                (
+                    _PEAK_BROWSER_BINDING_PREFIX,
+                    str(checked_principal.subject),
+                    str(checked_exchange.session_id),
+                    session_hash,
+                    str(int(expires_at.timestamp())),
+                )
+            )
+        )
+        sealed = self._cookie.seal(payload)
+        return sealed, min(remaining, OAUTH_SESSION_TTL_SECONDS)
+
+    def matches(
+        self,
+        binding: PeakBrowserSessionBinding,
+        setup_session: SecretStr,
+    ) -> bool:
+        try:
+            checked = PeakBrowserSessionBinding(
+                subject=binding.subject,
+                session_id=binding.session_id,
+                session_hash=binding.session_hash,
+                expires_at=_aware_utc(binding.expires_at),
+            )
+            submitted_hash = _token_hash(setup_session.get_secret_value())
+            return bool(
+                checked.expires_at > _aware_utc(self._clock())
+                and secrets.compare_digest(checked.session_hash, submitted_hash)
+            )
+        except Exception:
+            return False
+
+    def _parse_binding(self, raw: str) -> PeakBrowserSessionBinding:
+        prefix, subject, session_id, session_hash, expires_at = raw.split("|")
+        if prefix != _PEAK_BROWSER_BINDING_PREFIX or _HASH_RE.fullmatch(session_hash) is None:
+            raise ValueError
+        binding = PeakBrowserSessionBinding(
+            subject=UUID(subject),
+            session_id=UUID(session_id),
+            session_hash=session_hash,
+            expires_at=datetime.fromtimestamp(int(expires_at), tz=UTC),
+        )
+        if (
+            binding.subject.int == 0
+            or binding.session_id.int == 0
+            or binding.expires_at <= _aware_utc(self._clock())
+        ):
+            raise ValueError
+        return binding
 
 
 class PeakSetupProfileValidator(Protocol):
@@ -463,23 +613,24 @@ class SupabasePeakSetupStore:
         mercury_access_token: str,
         attempt_id: UUID,
     ) -> SetupAttempt:
-        row = await self._rpc_one(
-            "create_mercury_provider_setup_attempt",
-            payload={
-                "p_attempt_id": str(attempt_id),
-                "p_tenant_id": str(tenant_id),
-                "p_workspace_id": str(workspace_id),
-                "p_auth_user_id": str(auth_user_id),
-                "p_provider": provider.value,
-                "p_environment": environment,
-                "p_token_hash": token_hash,
-                "p_expires_at": expires_at.isoformat(),
-            },
-            bearer_token=mercury_access_token,
-        )
-        failure: PeakSetupError | None = None
+        row: dict[str, Any] | None = None
         attempt: SetupAttempt | None = None
+        failed = False
         try:
+            row = await self._rpc_one(
+                "create_mercury_provider_setup_attempt",
+                payload={
+                    "p_attempt_id": str(attempt_id),
+                    "p_tenant_id": str(tenant_id),
+                    "p_workspace_id": str(workspace_id),
+                    "p_auth_user_id": str(auth_user_id),
+                    "p_provider": provider.value,
+                    "p_environment": environment,
+                    "p_token_hash": token_hash,
+                    "p_expires_at": expires_at.isoformat(),
+                },
+                bearer_token=mercury_access_token,
+            )
             expected_keys = {
                 "attempt_id",
                 "tenant_id",
@@ -516,10 +667,12 @@ class SupabasePeakSetupStore:
             ):
                 raise ValueError
         except Exception:
-            failure = PeakSetupError("peak_setup_state_invalid")
-        if failure is not None:
-            raise failure
-        if attempt is None:
+            failed = True
+        if failed or attempt is None:
+            if row is not None:
+                del row
+            del mercury_access_token
+            del self
             raise PeakSetupError("peak_setup_state_invalid")
         return attempt
 
@@ -533,23 +686,35 @@ class SupabasePeakSetupStore:
         csrf_hash: str,
         mercury_access_token: str,
     ) -> PeakSetupSessionRecord:
-        row = await self._rpc_one(
-            "exchange_mercury_peak_setup_attempt",
-            payload={
-                "p_session_id": str(session_id),
-                "p_auth_user_id": str(auth_user_id),
-                "p_token_hash": token_hash,
-                "p_session_hash": session_hash,
-                "p_csrf_hash": csrf_hash,
-            },
-            bearer_token=mercury_access_token,
-        )
-        session = _session_from_row(
-            row,
-            session_hash=session_hash,
-            csrf_hash=csrf_hash,
-        )
-        if session.id != session_id or session.auth_user_id != auth_user_id:
+        row: dict[str, Any] | None = None
+        session: PeakSetupSessionRecord | None = None
+        failed = False
+        try:
+            row = await self._rpc_one(
+                "exchange_mercury_peak_setup_attempt",
+                payload={
+                    "p_session_id": str(session_id),
+                    "p_auth_user_id": str(auth_user_id),
+                    "p_token_hash": token_hash,
+                    "p_session_hash": session_hash,
+                    "p_csrf_hash": csrf_hash,
+                },
+                bearer_token=mercury_access_token,
+            )
+            session = _session_from_row(
+                row,
+                session_hash=session_hash,
+                csrf_hash=csrf_hash,
+            )
+            if session.id != session_id or session.auth_user_id != auth_user_id:
+                raise ValueError
+        except Exception:
+            failed = True
+        if failed or session is None:
+            if row is not None:
+                del row
+            del mercury_access_token
+            del self
             raise PeakSetupError("peak_setup_state_invalid")
         return session
 
@@ -559,15 +724,26 @@ class SupabasePeakSetupStore:
         auth_user_id: UUID,
         session_hash: str,
     ) -> PeakSetupSessionRecord:
-        row = await self._rpc_one(
-            "peek_mercury_peak_setup_session",
-            payload={
-                "p_auth_user_id": str(auth_user_id),
-                "p_session_hash": session_hash,
-            },
-        )
-        session = _session_from_row(row, session_hash=session_hash)
-        if session.auth_user_id != auth_user_id:
+        row: dict[str, Any] | None = None
+        session: PeakSetupSessionRecord | None = None
+        failed = False
+        try:
+            row = await self._rpc_one(
+                "peek_mercury_peak_setup_session",
+                payload={
+                    "p_auth_user_id": str(auth_user_id),
+                    "p_session_hash": session_hash,
+                },
+            )
+            session = _session_from_row(row, session_hash=session_hash)
+            if session.auth_user_id != auth_user_id:
+                raise ValueError
+        except Exception:
+            failed = True
+        if failed or session is None:
+            if row is not None:
+                del row
+            del self
             raise PeakSetupError("peak_setup_state_invalid")
         return session
 
@@ -582,13 +758,15 @@ class SupabasePeakSetupStore:
     ) -> ProviderConnection:
         checked_connection: ProviderConnection | None = None
         checked_envelopes: tuple[CredentialEnvelope, ...] | None = None
-        binding_valid = False
+        finalized: ProviderConnection | None = None
+        row: dict[str, Any] | None = None
+        failed = False
         try:
             checked_connection = ProviderConnection.model_validate(connection)
             checked_envelopes = tuple(
                 CredentialEnvelope.model_validate(envelope) for envelope in envelopes
             )
-            binding_valid = not (
+            if (
                 session.tenant_id != checked_connection.tenant_id
                 or session.workspace_id != checked_connection.workspace_id
                 or session.auth_user_id != checked_connection.auth_user_id
@@ -604,36 +782,29 @@ class SupabasePeakSetupStore:
                 or len(checked_envelopes) != 3
                 or {item.credential_type for item in checked_envelopes}
                 != {"user_token", "connect_id", "connect_key"}
+            ):
+                raise ValueError
+            row = await self._rpc_one(
+                "finalize_mercury_peak_setup",
+                payload={
+                    "p_tenant_id": str(checked_connection.tenant_id),
+                    "p_workspace_id": str(checked_connection.workspace_id),
+                    "p_auth_user_id": str(checked_connection.auth_user_id),
+                    "p_session_hash": session_hash,
+                    "p_csrf_hash": csrf_hash,
+                    "p_connection_id": str(checked_connection.id),
+                    "p_provider": checked_connection.provider.value,
+                    "p_environment": checked_connection.environment,
+                    "p_provider_account_id": checked_connection.provider_account_id,
+                    "p_account_display_name": checked_connection.account_display_name,
+                    "p_granted_permissions": list(checked_connection.granted_permissions),
+                    "p_revision": checked_connection.revision,
+                    "p_last_validated_at": checked_connection.last_validated_at.isoformat()
+                    if checked_connection.last_validated_at is not None
+                    else None,
+                    "p_envelopes": [envelope.storage_record() for envelope in checked_envelopes],
+                },
             )
-        except Exception:
-            pass
-        if not binding_valid or checked_connection is None or checked_envelopes is None:
-            raise PeakSetupError("peak_setup_state_invalid")
-
-        row = await self._rpc_one(
-            "finalize_mercury_peak_setup",
-            payload={
-                "p_tenant_id": str(checked_connection.tenant_id),
-                "p_workspace_id": str(checked_connection.workspace_id),
-                "p_auth_user_id": str(checked_connection.auth_user_id),
-                "p_session_hash": session_hash,
-                "p_csrf_hash": csrf_hash,
-                "p_connection_id": str(checked_connection.id),
-                "p_provider": checked_connection.provider.value,
-                "p_environment": checked_connection.environment,
-                "p_provider_account_id": checked_connection.provider_account_id,
-                "p_account_display_name": checked_connection.account_display_name,
-                "p_granted_permissions": list(checked_connection.granted_permissions),
-                "p_revision": checked_connection.revision,
-                "p_last_validated_at": checked_connection.last_validated_at.isoformat()
-                if checked_connection.last_validated_at is not None
-                else None,
-                "p_envelopes": [envelope.storage_record() for envelope in checked_envelopes],
-            },
-        )
-        failure: PeakSetupError | None = None
-        finalized: ProviderConnection | None = None
-        try:
             if set(row) != {
                 "connection_id",
                 "revision",
@@ -656,10 +827,16 @@ class SupabasePeakSetupStore:
             ):
                 raise ValueError
         except Exception:
-            failure = PeakSetupError("peak_setup_state_invalid")
-        if failure is not None:
-            raise failure
-        if finalized is None:
+            failed = True
+        if failed or finalized is None:
+            if row is not None:
+                del row
+            if checked_envelopes is not None:
+                del checked_envelopes
+            del envelopes
+            del connection
+            del session
+            del self
             raise PeakSetupError("peak_setup_state_invalid")
         return finalized
 
@@ -678,8 +855,8 @@ class SupabasePeakSetupStore:
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
-        failure: PeakSetupError | None = None
         row: dict[str, Any] | None = None
+        failed = False
         try:
             response = await self._http.post(
                 f"{self._base_url}/rpc/{function}",
@@ -695,10 +872,19 @@ class SupabasePeakSetupStore:
                 raise ValueError
             row = rows[0]
         except Exception:
-            failure = PeakSetupError("peak_setup_state_invalid")
-        if failure is not None:
-            raise failure
-        if row is None:
+            failed = True
+        if failed or row is None:
+            for name in tuple(headers):
+                headers[name] = ""
+            headers.clear()
+            if "response" in locals():
+                del response
+            if "rows" in locals():
+                del rows
+            del token
+            del bearer_token
+            del payload
+            del self
             raise PeakSetupError("peak_setup_state_invalid")
         return row
 
@@ -769,6 +955,8 @@ class PeakSetupService:
         provider: ProviderId | str,
         environment: str,
     ) -> PeakSetupStart:
+        result: PeakSetupStart | None = None
+        error_code: str | None = None
         try:
             checked_principal = MercuryPrincipal.model_validate(principal)
             if ProviderId(provider) is not ProviderId.PEAK:
@@ -806,7 +994,7 @@ class PeakSetupService:
                     attempt_id=attempt_id,
                 )
             )
-            return PeakSetupStart(
+            result = PeakSetupStart(
                 setup_url=(
                     f"{self._settings.provider_callback_base_url.rstrip('/')}"
                     f"{PEAK_SETUP_PATH}#{token}"
@@ -814,16 +1002,32 @@ class PeakSetupService:
                 environment=environment,
                 expires_at=expires_at,
             )
-        except PeakSetupError:
-            raise
+        except PeakSetupError as caught:
+            error_code = caught.code
+            del caught
         except Exception:
-            raise PeakSetupError("peak_setup_request_invalid") from None
+            error_code = "peak_setup_request_invalid"
+        if error_code is not None or result is None:
+            if "access_token" in locals():
+                del access_token
+            if "token" in locals():
+                del token
+            if "checked_principal" in locals():
+                del checked_principal
+            if "membership" in locals():
+                del membership
+            del principal
+            del self
+            raise PeakSetupError(error_code or "peak_setup_unavailable")
+        return result
 
     async def exchange(
         self,
         principal: MercuryPrincipal,
         setup_token: str,
     ) -> PeakSetupExchange:
+        result: PeakSetupExchange | None = None
+        error_code: str | None = None
         try:
             checked_principal = MercuryPrincipal.model_validate(principal)
             checked_token = _raw_token(setup_token)
@@ -851,23 +1055,55 @@ class PeakSetupService:
             )
             if membership.tenant_id != record.tenant_id or record.provider is not ProviderId.PEAK:
                 raise ValueError
-            return PeakSetupExchange(
+            result = PeakSetupExchange(
                 session_id=record.id,
                 setup_session=SecretStr(setup_session),
                 csrf_token=SecretStr(csrf_token),
                 expires_at=record.expires_at,
             )
-        except PeakSetupError:
-            raise
+        except PeakSetupError as caught:
+            error_code = caught.code
+            del caught
         except Exception:
-            raise PeakSetupError("peak_setup_state_invalid") from None
+            error_code = "peak_setup_state_invalid"
+        if error_code is not None or result is None:
+            if "access_token" in locals():
+                del access_token
+            if "checked_token" in locals():
+                del checked_token
+            if "setup_session" in locals():
+                del setup_session
+            if "csrf_token" in locals():
+                del csrf_token
+            if "checked_principal" in locals():
+                del checked_principal
+            del setup_token
+            del principal
+            del self
+            raise PeakSetupError(error_code or "peak_setup_unavailable")
+        return result
 
     async def complete(
         self,
         principal: MercuryPrincipal,
         submission: PeakSetupSubmission,
     ) -> ProviderConnectionSummary:
+        summary, error_code = await self._complete(principal, submission)
+        if error_code is not None or summary is None:
+            del submission
+            del principal
+            del self
+            raise PeakSetupError(error_code or "peak_setup_unavailable")
+        return summary
+
+    async def _complete(
+        self,
+        principal: MercuryPrincipal,
+        submission: PeakSetupSubmission,
+    ) -> tuple[ProviderConnectionSummary | None, str | None]:
         material: PeakCredentialMaterial | None = None
+        summary: ProviderConnectionSummary | None = None
+        error_code: str | None = None
         try:
             checked_principal = MercuryPrincipal.model_validate(principal)
             checked = PeakSetupSubmission.model_validate(submission)
@@ -926,14 +1162,12 @@ class PeakSetupService:
                 validated_at=None,
                 envelope_ids=tuple(item.id for item in provisional_envelopes),
             )
-            try:
-                profile = await self._profile_validator.validate_setup(
-                    provisional,
-                    provisional_envelopes,
-                )
-                profile = PeakProfile.model_validate(profile)
-            except Exception:
-                raise PeakSetupError("peak_setup_validation_failed") from None
+            profile = await self._validated_profile(
+                provisional,
+                provisional_envelopes,
+            )
+            if profile is None:
+                return None, "peak_setup_validation_failed"
 
             target = await _await_value(
                 self._connection_store.resolve_connection_target(
@@ -983,16 +1217,48 @@ class PeakSetupService:
                     envelopes=envelopes,
                 )
             )
-            return ProviderConnection.model_validate(finalized).summary()
-        except PeakSetupError:
-            raise
-        except (ProviderStoreError, TypeError, ValueError, ValidationError):
-            raise PeakSetupError("peak_setup_state_invalid") from None
+            summary = ProviderConnection.model_validate(finalized).summary()
+        except PeakSetupError as caught:
+            error_code = caught.code
+            del caught
+        except (
+            PermissionError,
+            ProviderStoreError,
+            TypeError,
+            ValueError,
+            ValidationError,
+        ):
+            error_code = "peak_setup_state_invalid"
         except Exception:
-            raise PeakSetupError("peak_setup_unavailable") from None
+            error_code = "peak_setup_unavailable"
         finally:
             if material is not None:
                 material.clear()
+            if "checked" in locals():
+                del checked
+            del submission
+        return summary, error_code
+
+    async def _validated_profile(
+        self,
+        connection: ProviderConnection,
+        envelopes: Sequence[CredentialEnvelope],
+    ) -> PeakProfile | None:
+        profile: PeakProfile | None = None
+        failed = False
+        try:
+            raw_profile = await self._profile_validator.validate_setup(
+                connection,
+                envelopes,
+            )
+            profile = PeakProfile.model_validate(raw_profile)
+        except Exception:
+            failed = True
+        if failed:
+            if "raw_profile" in locals():
+                del raw_profile
+            return None
+        return profile
 
     async def disconnect(
         self,
@@ -1000,6 +1266,8 @@ class PeakSetupService:
         workspace_id: UUID,
         connection_id: UUID,
     ) -> PeakDisconnectOutcome:
+        result: PeakDisconnectOutcome | None = None
+        failed = False
         try:
             checked_principal = MercuryPrincipal.model_validate(principal)
             access_token = await _await_value(self._mercury_access_token(checked_principal))
@@ -1042,9 +1310,18 @@ class PeakSetupService:
                 or not disconnected.provider_revocation_required
             ):
                 raise ValueError
-            return PeakDisconnectOutcome()
+            result = PeakDisconnectOutcome()
         except Exception:
-            raise PeakSetupError("peak_setup_state_invalid") from None
+            failed = True
+        if failed or result is None:
+            if "access_token" in locals():
+                del access_token
+            if "checked_principal" in locals():
+                del checked_principal
+            del principal
+            del self
+            raise PeakSetupError("peak_setup_state_invalid")
+        return result
 
     def _connection(
         self,
@@ -1108,16 +1385,43 @@ def render_peak_setup_page() -> str:
 
 def render_peak_setup_form(exchange: PeakSetupExchange) -> str:
     checked = PeakSetupExchange.model_validate(exchange)
-    setup_session = escape(
-        checked.setup_session.get_secret_value(),
-        quote=True,
+    return _render_peak_setup_form(
+        setup_session=checked.setup_session,
+        csrf_token=checked.csrf_token,
+        validation_failed=False,
     )
-    csrf_token = escape(checked.csrf_token.get_secret_value(), quote=True)
+
+
+def render_peak_setup_retry_form(
+    setup_session: SecretStr,
+    csrf_token: SecretStr,
+) -> str:
+    return _render_peak_setup_form(
+        setup_session=setup_session,
+        csrf_token=csrf_token,
+        validation_failed=True,
+    )
+
+
+def _render_peak_setup_form(
+    *,
+    setup_session: SecretStr,
+    csrf_token: SecretStr,
+    validation_failed: bool,
+) -> str:
+    safe_session = escape(setup_session.get_secret_value(), quote=True)
+    safe_csrf = escape(csrf_token.get_secret_value(), quote=True)
+    error = (
+        '<p class="error">PEAK could not validate those credentials. Try again.</p>'
+        if validation_failed
+        else ""
+    )
     return f"""<h1>Connect PEAK</h1>
     <p>Enter the PEAK credentials for this Mercury workspace.</p>
+    {error}
     <form method="post" action="{PEAK_SETUP_PATH}" autocomplete="off">
-      <input type="hidden" name="setup_session" value="{setup_session}">
-      <input type="hidden" name="csrf_token" value="{csrf_token}">
+      <input type="hidden" name="setup_session" value="{safe_session}">
+      <input type="hidden" name="csrf_token" value="{safe_csrf}">
       <label>User Token
         <input type="password" name="user_token" autocomplete="off" required>
       </label>
@@ -1305,9 +1609,12 @@ async def _await_value(value: Any) -> Any:
 __all__ = [
     "InMemoryPeakSetupStore",
     "PEAK_REVOCATION_INSTRUCTION",
+    "PEAK_SETUP_BROWSER_COOKIE",
     "PEAK_SETUP_EXCHANGE_PATH",
     "PEAK_SETUP_LIFETIME",
     "PEAK_SETUP_PATH",
+    "PeakBrowserSessionBinding",
+    "PeakBrowserSessionManager",
     "PeakDisconnectOutcome",
     "PeakSetupError",
     "PeakSetupExchange",
@@ -1324,4 +1631,5 @@ __all__ = [
     "peak_setup_security_headers",
     "render_peak_setup_form",
     "render_peak_setup_page",
+    "render_peak_setup_retry_form",
 ]

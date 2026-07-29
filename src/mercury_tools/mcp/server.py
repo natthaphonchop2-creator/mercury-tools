@@ -99,6 +99,7 @@ from mercury_tools.product import (
     verify_client_token,
 )
 from mercury_tools.prompts import get_prompt
+from mercury_tools.providers.peak_setup import PEAK_SETUP_PATH
 from mercury_tools.providers.production import (
     ProviderOAuthProductionComposition,
     build_provider_oauth_production_composition,
@@ -4037,6 +4038,7 @@ def _create_http_app(
             canonical_resource=settings.canonical_mcp_resource,
             browser_origin=(settings.provider_callback_base_url or settings.canonical_mcp_resource),
             session_cookie=session_cookie,
+            additional_session_cookie_paths=(PEAK_SETUP_PATH,),
         )
         app.add_route("/oauth/consent", consent.show, methods=["GET"])
         app.add_route("/oauth/consent", consent.decide, methods=["POST"])
@@ -4074,6 +4076,7 @@ def _create_http_app(
             principal_resolver=selected_principal_resolver,
             canonical_resource=settings.canonical_mcp_resource,
             mcp_path=settings.mcp_path,
+            peak_browser_session_key=settings.vault_active_key,
         )
     elif should_require_auth:
         if not settings.http_auth_configured:

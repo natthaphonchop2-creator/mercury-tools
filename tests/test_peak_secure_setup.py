@@ -1,21 +1,30 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlsplit
+from types import ModuleType, TracebackType
+from urllib.parse import urlencode, urlsplit
 from uuid import UUID
 
 import httpx
 import pytest
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, SecretStr
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
+from mercury_tools.auth.consent import (
+    OAUTH_SESSION_COOKIE,
+    MercuryConsent,
+    OAuthSession,
+    OAuthSessionCookie,
+)
 from mercury_tools.auth.middleware import MercuryOAuthMiddleware
 from mercury_tools.auth.models import MercuryPrincipal
 from mercury_tools.cloud.api import CloudDependencies, cloud_routes
@@ -34,6 +43,7 @@ from mercury_tools.providers.peak import (
     seal_peak_credentials,
 )
 from mercury_tools.providers.peak_setup import (
+    PEAK_SETUP_BROWSER_COOKIE,
     PEAK_SETUP_EXCHANGE_PATH,
     PEAK_SETUP_PATH,
     InMemoryPeakSetupStore,
@@ -52,6 +62,7 @@ from mercury_tools.workspaces.models import WorkspaceMembership, WorkspaceRole
 ROOT = Path(__file__).resolve().parents[1]
 NOW = datetime(2026, 7, 29, 4, 0, tzinfo=UTC)
 TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
+OTHER_TENANT_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 WORKSPACE_ID = UUID("22222222-2222-4222-8222-222222222222")
 OTHER_WORKSPACE_ID = UUID("33333333-3333-4333-8333-333333333333")
 USER_ID = UUID("44444444-4444-4444-8444-444444444444")
@@ -94,6 +105,7 @@ def _settings() -> Settings:
         peak_mcp_production_url="https://mcp.peakaccount.com/mcp",
         peak_application_code=APPLICATION_CODE,
         provider_callback_base_url=ORIGIN,
+        vault_active_key=base64.b64encode(b"k" * 32).decode("ascii"),
     )
 
 
@@ -151,6 +163,8 @@ class FixedRandom:
 class FakeWorkspaceService:
     def __init__(self) -> None:
         self.calls: list[tuple[UUID, UUID, WorkspaceRole]] = []
+        self.allowed_workspaces = {WORKSPACE_ID, OTHER_WORKSPACE_ID}
+        self.tenant_id = TENANT_ID
 
     def require_workspace(
         self,
@@ -160,11 +174,11 @@ class FakeWorkspaceService:
         required_role: WorkspaceRole,
     ) -> WorkspaceMembership:
         assert access_token == MERCURY_ACCESS_TOKEN
-        if workspace_id not in {WORKSPACE_ID, OTHER_WORKSPACE_ID}:
+        if workspace_id not in self.allowed_workspaces:
             raise PermissionError("workspace_access_denied")
         self.calls.append((principal.subject, workspace_id, required_role))
         return WorkspaceMembership(
-            tenant_id=TENANT_ID,
+            tenant_id=self.tenant_id,
             tenant_display_name="Mercury Test Tenant",
             workspace_id=workspace_id,
             workspace_display_name="Mercury Test Workspace",
@@ -173,14 +187,19 @@ class FakeWorkspaceService:
 
 
 class FakeProfileValidator:
-    def __init__(self, *, fail: bool = False) -> None:
-        self.fail = fail
+    def __init__(self, *, fail: bool = False, failures_remaining: int = 0) -> None:
+        self.failures_remaining = max(failures_remaining, int(fail))
         self.calls = 0
 
     async def validate_setup(self, _connection, _envelopes) -> PeakProfile:
         self.calls += 1
-        if self.fail:
-            raise RuntimeError("DOWNSTREAM_SECRET_MUST_NOT_ESCAPE")
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raw_provider_failure = {
+                "provider_payload": "DOWNSTREAM_SECRET_MUST_NOT_ESCAPE",
+                "credential": USER_TOKEN,
+            }
+            raise RuntimeError(raw_provider_failure)
         return PeakProfile(
             merchant_id="merchant-123",
             merchant_display_name="PEAK Test Merchant",
@@ -192,6 +211,7 @@ def _service(
     clock=None,
     contract: QualifiedPeakProviderContract | None = None,
     validator: FakeProfileValidator | None = None,
+    workspace_service: FakeWorkspaceService | None = None,
 ) -> tuple[
     PeakSetupService,
     InMemoryPeakSetupStore,
@@ -208,7 +228,7 @@ def _service(
     selected_validator = validator or FakeProfileValidator()
     service = PeakSetupService(
         settings=_settings(),
-        workspace_service=FakeWorkspaceService(),
+        workspace_service=workspace_service or FakeWorkspaceService(),
         mercury_access_token=lambda _principal: MERCURY_ACCESS_TOKEN,
         setup_store=store,
         connection_store=connections,
@@ -219,6 +239,52 @@ def _service(
         random_bytes=FixedRandom(),
     )
     return service, store, connections, selected_validator
+
+
+def _assert_no_internal_secret_references(
+    error: BaseException,
+    *sentinels: str,
+) -> None:
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    pending: list[object] = [error]
+    seen: set[int] = set()
+    rendered: list[str] = []
+    while pending:
+        value = pending.pop()
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        if isinstance(value, str):
+            rendered.append(value)
+        elif isinstance(value, (bytes, bytearray)):
+            rendered.append(bytes(value).decode("utf-8", errors="ignore"))
+        elif isinstance(value, TracebackType):
+            if "/src/mercury_tools/" in value.tb_frame.f_code.co_filename:
+                pending.extend(value.tb_frame.f_locals.values())
+            if value.tb_next is not None:
+                pending.append(value.tb_next)
+        elif isinstance(value, BaseException):
+            pending.extend(value.args)
+            if value.__cause__ is not None:
+                pending.append(value.__cause__)
+            if value.__context__ is not None:
+                pending.append(value.__context__)
+            if value.__traceback__ is not None:
+                pending.append(value.__traceback__)
+        elif isinstance(value, Mapping):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value, Sequence) and not isinstance(value, str):
+            pending.extend(value)
+        elif (
+            not isinstance(value, (ModuleType, type))
+            and not callable(value)
+            and hasattr(value, "__dict__")
+        ):
+            pending.extend(vars(value).values())
+    combined = "\n".join(rendered)
+    assert all(sentinel not in combined for sentinel in sentinels)
 
 
 def _submission(exchange) -> PeakSetupSubmission:
@@ -317,7 +383,10 @@ async def test_validation_and_encryption_precede_atomic_consumption_and_failure_
     started = await service.start(_principal(), WORKSPACE_ID, "peak", "production")
     exchange = await service.exchange(_principal(), urlsplit(started.setup_url).fragment)
 
-    with pytest.raises(PeakSetupError, match="^peak_setup_validation_failed$"):
+    with pytest.raises(
+        PeakSetupError,
+        match="^peak_setup_validation_failed$",
+    ) as caught:
         await service.complete(_principal(), _submission(exchange))
 
     assert failing.calls == 1
@@ -325,6 +394,13 @@ async def test_validation_and_encryption_precede_atomic_consumption_and_failure_
     assert store.sessions[exchange.session_id].consumed_at is None
     assert connections._connections == {}
     assert connections._envelopes == {}
+    _assert_no_internal_secret_references(
+        caught.value,
+        "DOWNSTREAM_SECRET_MUST_NOT_ESCAPE",
+        USER_TOKEN,
+        CONNECT_ID,
+        CONNECT_KEY,
+    )
 
 
 @pytest.mark.asyncio
@@ -367,7 +443,7 @@ async def test_concurrent_finalization_has_exactly_one_winner() -> None:
 
 
 @pytest.mark.asyncio
-async def test_expired_setup_and_cross_workspace_replay_fail_closed() -> None:
+async def test_expired_setup_fails_closed_without_consuming_attempt() -> None:
     now = [NOW]
     service, store, connections, _ = _service(
         clock=lambda: now[0],
@@ -384,8 +460,60 @@ async def test_expired_setup_and_cross_workspace_replay_fail_closed() -> None:
     assert connections._connections == {}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("revoked_before", ("exchange", "completion"))
+async def test_workspace_membership_revocation_fails_without_consumption(
+    revoked_before: str,
+) -> None:
+    workspace_service = FakeWorkspaceService()
+    service, store, connections, _ = _service(
+        contract=_contract(),
+        workspace_service=workspace_service,
+    )
+    started = await service.start(_principal(), WORKSPACE_ID, "peak", "production")
+    raw_token = urlsplit(started.setup_url).fragment
+    if revoked_before == "exchange":
+        workspace_service.allowed_workspaces.remove(WORKSPACE_ID)
+        with pytest.raises(PeakSetupError, match="^peak_setup_state_invalid$"):
+            await service.exchange(_principal(), raw_token)
+    else:
+        exchange = await service.exchange(_principal(), raw_token)
+        workspace_service.allowed_workspaces.remove(WORKSPACE_ID)
+        with pytest.raises(PeakSetupError, match="^peak_setup_state_invalid$"):
+            await service.complete(_principal(), _submission(exchange))
+
+    assert next(iter(store.attempts.values())).consumed_at is None
+    assert all(session.consumed_at is None for session in store.sessions.values())
+    assert connections._connections == {}
+    assert connections._envelopes == {}
+
+
+@pytest.mark.asyncio
+async def test_workspace_membership_tenant_mismatch_fails_without_consumption() -> None:
+    workspace_service = FakeWorkspaceService()
+    service, store, connections, _ = _service(
+        contract=_contract(),
+        workspace_service=workspace_service,
+    )
+    started = await service.start(_principal(), WORKSPACE_ID, "peak", "production")
+    exchange = await service.exchange(_principal(), urlsplit(started.setup_url).fragment)
+    workspace_service.tenant_id = OTHER_TENANT_ID
+
+    with pytest.raises(PeakSetupError, match="^peak_setup_state_invalid$"):
+        await service.complete(_principal(), _submission(exchange))
+
+    assert next(iter(store.attempts.values())).consumed_at is None
+    assert store.sessions[exchange.session_id].consumed_at is None
+    assert connections._connections == {}
+    assert connections._envelopes == {}
+
+
 class HeaderPrincipalResolver:
+    def __init__(self) -> None:
+        self.tokens: list[str] = []
+
     async def resolve(self, bearer_token: str) -> MercuryPrincipal:
+        self.tokens.append(bearer_token)
         if bearer_token == MERCURY_ACCESS_TOKEN:
             return _principal()
         if bearer_token == "OTHER_USER_TOKEN":
@@ -393,28 +521,121 @@ class HeaderPrincipalResolver:
         raise RuntimeError("invalid")
 
 
-def _client(service: PeakSetupService) -> TestClient:
+class BrowserSignInHandoff:
+    async def sign_in(self, email: str, password: str) -> OAuthSession:
+        assert email == "owner@example.com"
+        assert password == "browser-password"
+        return OAuthSession(
+            access_token=SecretStr(MERCURY_ACCESS_TOKEN),
+            expires_in=600,
+        )
+
+
+def _client(
+    service: PeakSetupService,
+    *,
+    principal_resolver: HeaderPrincipalResolver | None = None,
+    browser_sign_in: bool = False,
+) -> TestClient:
+    resolver = principal_resolver or HeaderPrincipalResolver()
     dependencies = CloudDependencies(
         settings=_settings(),
         peak_setup_service=service,
     )
     app = Starlette(routes=cloud_routes(dependencies))
+    if browser_sign_in:
+        session_cookie = OAuthSessionCookie(_settings().vault_active_key)
+        consent = MercuryConsent(
+            handoff=BrowserSignInHandoff(),
+            canonical_resource="https://mercury-tools-mcp.onrender.com/mcp",
+            browser_origin=ORIGIN,
+            session_cookie=session_cookie,
+            additional_session_cookie_paths=(PEAK_SETUP_PATH,),
+        )
+        app.add_route("/oauth/sign-in", consent.sign_in, methods=["POST"])
     app.add_middleware(
         MercuryOAuthMiddleware,
-        principal_resolver=HeaderPrincipalResolver(),
+        principal_resolver=resolver,
         canonical_resource="https://mercury-tools-mcp.onrender.com/mcp",
+        peak_browser_session_key=_settings().vault_active_key,
+        peak_browser_session_clock=lambda: NOW,
     )
-    return TestClient(app, raise_server_exceptions=False)
+    return TestClient(app, base_url=ORIGIN, raise_server_exceptions=False)
+
+
+def _browser_sign_in(client: TestClient) -> httpx.Response:
+    return client.post(
+        "/oauth/sign-in",
+        data={
+            "authorization_id": "peak_setup_browser_0123456789",
+            "email": "owner@example.com",
+            "password": "browser-password",
+        },
+        headers={"Origin": ORIGIN},
+        follow_redirects=False,
+    )
+
+
+def _hidden_form_value(response: httpx.Response, name: str) -> str:
+    return response.text.split(f'name="{name}"', 1)[1].split('value="', 1)[1].split('"', 1)[0]
+
+
+def _browser_exchange(
+    service: PeakSetupService,
+    *,
+    resolver: HeaderPrincipalResolver | None = None,
+) -> tuple[TestClient, HeaderPrincipalResolver, str, httpx.Response]:
+    selected_resolver = resolver or HeaderPrincipalResolver()
+    client = _client(
+        service,
+        principal_resolver=selected_resolver,
+        browser_sign_in=True,
+    )
+    signed_in = _browser_sign_in(client)
+    assert signed_in.status_code == 303
+    assert "Authorization" not in signed_in.request.headers
+    assert any(
+        f"Path={PEAK_SETUP_PATH}" in cookie for cookie in signed_in.headers.get_list("set-cookie")
+    )
+    started = asyncio.run(service.start(_principal(), WORKSPACE_ID, "peak", "production"))
+    raw_token = urlsplit(started.setup_url).fragment
+    page = client.get(f"{PEAK_SETUP_PATH}#{raw_token}")
+    response = client.post(
+        PEAK_SETUP_EXCHANGE_PATH,
+        json={"setup_token": raw_token},
+        headers={"Origin": ORIGIN},
+    )
+    assert page.status_code == 200
+    assert raw_token not in page.text
+    assert response.status_code == 200
+    return client, selected_resolver, raw_token, response
+
+
+def _browser_submission(response: httpx.Response) -> dict[str, str]:
+    return {
+        "setup_session": _hidden_form_value(response, "setup_session"),
+        "csrf_token": _hidden_form_value(response, "csrf_token"),
+        "user_token": USER_TOKEN,
+        "connect_id": CONNECT_ID,
+        "connect_key": CONNECT_KEY,
+    }
+
+
+def _setup_cookie_value(client: TestClient, name: str) -> str:
+    matches = [
+        cookie.value
+        for cookie in client.cookies.jar
+        if cookie.name == name and cookie.path == PEAK_SETUP_PATH
+    ]
+    assert len(matches) == 1
+    return matches[0]
 
 
 def test_setup_page_clears_fragment_before_network_and_has_strict_browser_policy() -> None:
     service, *_ = _service()
     client = _client(service)
 
-    response = client.get(
-        PEAK_SETUP_PATH,
-        headers={"Authorization": f"Bearer {MERCURY_ACCESS_TOKEN}"},
-    )
+    response = client.get(PEAK_SETUP_PATH)
 
     assert response.status_code == 200
     assert response.headers["Cache-Control"] == "no-store"
@@ -444,21 +665,25 @@ def test_exchange_requires_origin_same_principal_and_renders_exact_password_form
     service, *_ = _service(contract=_contract())
     started = asyncio.run(service.start(_principal(), WORKSPACE_ID, "peak", "production"))
     raw_token = urlsplit(started.setup_url).fragment
-    client = _client(service)
-    headers = {
-        "Authorization": f"Bearer {MERCURY_ACCESS_TOKEN}",
-        "Origin": ORIGIN,
-    }
+    client = _client(service, browser_sign_in=True)
+    assert _browser_sign_in(client).status_code == 303
+    headers = {"Origin": ORIGIN}
 
     wrong_origin = client.post(
         PEAK_SETUP_EXCHANGE_PATH,
         json={"setup_token": raw_token},
         headers={**headers, "Origin": "https://attacker.example"},
     )
-    wrong_user = client.post(
+    wrong_user_cookie = OAuthSessionCookie(_settings().vault_active_key).seal(
+        SecretStr("OTHER_USER_TOKEN")
+    )
+    wrong_user = _client(service).post(
         PEAK_SETUP_EXCHANGE_PATH,
         json={"setup_token": raw_token},
-        headers={**headers, "Authorization": "Bearer OTHER_USER_TOKEN"},
+        headers={
+            **headers,
+            "Cookie": f"{OAUTH_SESSION_COOKIE}={wrong_user_cookie}",
+        },
     )
     response = client.post(
         PEAK_SETUP_EXCHANGE_PATH,
@@ -483,25 +708,160 @@ def test_exchange_requires_origin_same_principal_and_renders_exact_password_form
     assert APPLICATION_CODE not in response.text
 
 
+def test_browser_cookie_lifecycle_completes_without_request_authorization_headers() -> None:
+    service, store, connections, _ = _service(contract=_contract())
+    resolver = HeaderPrincipalResolver()
+    client, resolver, _raw_token, exchange = _browser_exchange(
+        service,
+        resolver=resolver,
+    )
+
+    assert exchange.status_code == 200
+    assert "Authorization" not in exchange.request.headers
+    assert "HttpOnly" in exchange.headers["set-cookie"]
+    assert "Secure" in exchange.headers["set-cookie"]
+    assert f"Path={PEAK_SETUP_PATH}" in exchange.headers["set-cookie"]
+    assert "SameSite=strict" in exchange.headers["set-cookie"]
+    session = next(iter(store.sessions.values()))
+    fields = _browser_submission(exchange)
+
+    completed = client.post(
+        PEAK_SETUP_PATH,
+        data=fields,
+        headers={"Origin": ORIGIN},
+    )
+
+    assert completed.status_code == 200
+    assert "Authorization" not in completed.request.headers
+    assert completed.json()["readiness"] == "ready"
+    assert resolver.tokens == [MERCURY_ACCESS_TOKEN, MERCURY_ACCESS_TOKEN]
+    assert session.consumed_at is None
+    assert next(iter(store.sessions.values())).consumed_at == NOW
+    assert len(connections._envelopes) == 3
+    deleted = completed.headers.get_list("set-cookie")
+    assert len(deleted) == 2
+    assert any(cookie.startswith(f"{OAUTH_SESSION_COOKIE}=") for cookie in deleted)
+    assert any(cookie.startswith(f"{PEAK_SETUP_BROWSER_COOKIE}=") for cookie in deleted)
+    assert all("Max-Age=0" in cookie and f"Path={PEAK_SETUP_PATH}" in cookie for cookie in deleted)
+    assert all(
+        cookie.name not in {OAUTH_SESSION_COOKIE, PEAK_SETUP_BROWSER_COOKIE}
+        or cookie.path != PEAK_SETUP_PATH
+        for cookie in client.cookies.jar
+    )
+
+
+def test_bearer_only_final_submit_cannot_bypass_browser_session_binding() -> None:
+    service, store, connections, validator = _service(contract=_contract())
+    started = asyncio.run(service.start(_principal(), WORKSPACE_ID, "peak", "production"))
+    exchange = asyncio.run(service.exchange(_principal(), urlsplit(started.setup_url).fragment))
+    client = _client(service)
+
+    response = client.post(
+        PEAK_SETUP_PATH,
+        data={
+            "setup_session": exchange.setup_session.get_secret_value(),
+            "csrf_token": exchange.csrf_token.get_secret_value(),
+            "user_token": USER_TOKEN,
+            "connect_id": CONNECT_ID,
+            "connect_key": CONNECT_KEY,
+        },
+        headers={
+            "Authorization": f"Bearer {MERCURY_ACCESS_TOKEN}",
+            "Origin": ORIGIN,
+        },
+    )
+
+    assert response.status_code == 401
+    assert validator.calls == 0
+    assert next(iter(store.attempts.values())).consumed_at is None
+    assert store.sessions[exchange.session_id].consumed_at is None
+    assert connections._connections == {}
+    assert connections._envelopes == {}
+
+
+@pytest.mark.parametrize("duplicate_name", (OAUTH_SESSION_COOKIE, PEAK_SETUP_BROWSER_COOKIE))
+def test_duplicate_peak_browser_cookies_fail_closed_without_consumption(
+    duplicate_name: str,
+) -> None:
+    service, store, connections, validator = _service(contract=_contract())
+    client, _resolver, _raw_token, exchange = _browser_exchange(service)
+    session_cookie = _setup_cookie_value(client, OAUTH_SESSION_COOKIE)
+    binding_cookie = _setup_cookie_value(client, PEAK_SETUP_BROWSER_COOKIE)
+    cookies = {
+        OAUTH_SESSION_COOKIE: [session_cookie],
+        PEAK_SETUP_BROWSER_COOKIE: [binding_cookie],
+    }
+    cookies[duplicate_name].append(cookies[duplicate_name][0])
+    cookie_header = "; ".join(
+        f"{name}={value}" for name, values in cookies.items() for value in values
+    )
+    fresh_client = _client(service)
+
+    response = fresh_client.post(
+        PEAK_SETUP_PATH,
+        data=_browser_submission(exchange),
+        headers={
+            "Cookie": cookie_header,
+            "Origin": ORIGIN,
+        },
+    )
+
+    assert response.status_code == 401
+    assert validator.calls == 0
+    assert next(iter(store.attempts.values())).consumed_at is None
+    assert all(session.consumed_at is None for session in store.sessions.values())
+    assert connections._connections == {}
+    assert connections._envelopes == {}
+    assert len(response.headers.get_list("set-cookie")) == 2
+
+
+@pytest.mark.parametrize(
+    ("session_state", "expected_error"),
+    (
+        ("missing", "mercury_auth_required"),
+        ("expired", "mercury_token_invalid"),
+    ),
+)
+def test_missing_or_expired_peak_browser_session_clears_setup_cookies(
+    monkeypatch: pytest.MonkeyPatch,
+    session_state: str,
+    expected_error: str,
+) -> None:
+    service, store, *_ = _service(contract=_contract())
+    started = asyncio.run(service.start(_principal(), WORKSPACE_ID, "peak", "production"))
+    raw_token = urlsplit(started.setup_url).fragment
+    headers = {"Origin": ORIGIN}
+    if session_state == "expired":
+        monkeypatch.setattr("mercury_tools.auth.consent.time.time", lambda: 1_000)
+        sealed = OAuthSessionCookie(_settings().vault_active_key).seal(
+            SecretStr(MERCURY_ACCESS_TOKEN)
+        )
+        monkeypatch.setattr("mercury_tools.auth.consent.time.time", lambda: 1_601)
+        headers["Cookie"] = f"{OAUTH_SESSION_COOKIE}={sealed}"
+    client = _client(service)
+
+    response = client.post(
+        PEAK_SETUP_EXCHANGE_PATH,
+        json={"setup_token": raw_token},
+        headers=headers,
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"error": expected_error}
+    deleted = response.headers.get_list("set-cookie")
+    assert len(deleted) == 2
+    assert all("Max-Age=0" in cookie and f"Path={PEAK_SETUP_PATH}" in cookie for cookie in deleted)
+    assert next(iter(store.attempts.values())).consumed_at is None
+    assert store.sessions == {}
+
+
 def test_final_post_accepts_exact_five_fields_and_never_leaks_secrets(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     service, *_ = _service(contract=_contract())
-    started = asyncio.run(service.start(_principal(), WORKSPACE_ID, "peak", "production"))
-    raw_token = urlsplit(started.setup_url).fragment
-    exchange = asyncio.run(service.exchange(_principal(), raw_token))
-    client = _client(service)
-    fields = {
-        "setup_session": exchange.setup_session.get_secret_value(),
-        "csrf_token": exchange.csrf_token.get_secret_value(),
-        "user_token": USER_TOKEN,
-        "connect_id": CONNECT_ID,
-        "connect_key": CONNECT_KEY,
-    }
-    headers = {
-        "Authorization": f"Bearer {MERCURY_ACCESS_TOKEN}",
-        "Origin": ORIGIN,
-    }
+    client, _resolver, raw_token, exchange = _browser_exchange(service)
+    fields = _browser_submission(exchange)
+    headers = {"Origin": ORIGIN}
     caplog.set_level(logging.DEBUG)
 
     extra = client.post(
@@ -531,6 +891,105 @@ def test_final_post_accepts_exact_five_fields_and_never_leaks_secrets(
             APPLICATION_CODE,
         )
     )
+
+
+@pytest.mark.parametrize(
+    ("path", "canonical", "near_match"),
+    (
+        (PEAK_SETUP_EXCHANGE_PATH, "application/json", "application/json-patch+json"),
+        (
+            PEAK_SETUP_PATH,
+            "application/x-www-form-urlencoded",
+            "application/x-www-form-urlencode",
+        ),
+    ),
+)
+def test_peak_post_routes_reject_content_type_parameters_duplicates_and_near_matches(
+    path: str,
+    canonical: str,
+    near_match: str,
+) -> None:
+    service, *_ = _service(contract=_contract())
+    if path == PEAK_SETUP_EXCHANGE_PATH:
+        started = asyncio.run(service.start(_principal(), WORKSPACE_ID, "peak", "production"))
+        raw_token = urlsplit(started.setup_url).fragment
+        body = json.dumps({"setup_token": raw_token})
+        base_headers = [("Origin", ORIGIN)]
+        client = _client(service, browser_sign_in=True)
+        assert _browser_sign_in(client).status_code == 303
+    else:
+        client, _resolver, _raw_token, exchange = _browser_exchange(service)
+        body = urlencode(_browser_submission(exchange))
+        base_headers = [("Origin", ORIGIN)]
+
+    parameterized = client.post(
+        path,
+        content=body,
+        headers=[*base_headers, ("Content-Type", f"{canonical}; unexpected=value")],
+    )
+    duplicated = client.post(
+        path,
+        content=body,
+        headers=[
+            *base_headers,
+            ("Content-Type", canonical),
+            ("Content-Type", canonical),
+        ],
+    )
+    near = client.post(
+        path,
+        content=body,
+        headers=[*base_headers, ("Content-Type", near_match)],
+    )
+    case_variant = client.post(
+        path,
+        content=body,
+        headers=[*base_headers, ("Content-Type", canonical.upper())],
+    )
+
+    assert (
+        parameterized.status_code
+        == duplicated.status_code
+        == near.status_code
+        == case_variant.status_code
+        == 400
+    )
+
+
+def test_failed_http_validation_returns_blank_retry_form_and_same_session_can_succeed() -> None:
+    validator = FakeProfileValidator(failures_remaining=1)
+    service, store, connections, _ = _service(
+        contract=_contract(),
+        validator=validator,
+    )
+    client, _resolver, _raw_token, exchange = _browser_exchange(service)
+    fields = _browser_submission(exchange)
+    headers = {"Origin": ORIGIN}
+
+    failed = client.post(PEAK_SETUP_PATH, data=fields, headers=headers)
+
+    assert failed.status_code == 422
+    assert failed.headers["Content-Type"].startswith("text/html")
+    assert failed.text.count('type="hidden"') == 2
+    assert failed.text.count('type="password"') == 3
+    assert fields["setup_session"] in failed.text
+    assert fields["csrf_token"] in failed.text
+    assert all(secret not in failed.text for secret in (USER_TOKEN, CONNECT_ID, CONNECT_KEY))
+    assert 'value="' not in failed.text.split('name="user_token"', 1)[1].split(">", 1)[0]
+    assert next(iter(store.attempts.values())).consumed_at is None
+    assert next(iter(store.sessions.values())).consumed_at is None
+    assert "Authorization" not in failed.request.headers
+    assert _setup_cookie_value(client, OAUTH_SESSION_COOKIE)
+    assert _setup_cookie_value(client, PEAK_SETUP_BROWSER_COOKIE)
+
+    corrected = client.post(PEAK_SETUP_PATH, data=fields, headers=headers)
+
+    assert corrected.status_code == 200
+    assert "Authorization" not in corrected.request.headers
+    assert corrected.json()["readiness"] == "ready"
+    assert validator.calls == 2
+    assert next(iter(store.attempts.values())).consumed_at == NOW
+    assert len(connections._envelopes) == 3
 
 
 @pytest.mark.asyncio
@@ -852,10 +1311,33 @@ async def test_supabase_setup_store_drops_raw_network_exception_context() -> Non
                 auth_user_id=USER_ID,
                 session_hash="e" * 64,
             )
+        with pytest.raises(PeakSetupError, match="^peak_setup_state_invalid$") as bearer_error:
+            await store.create_attempt(
+                tenant_id=TENANT_ID,
+                workspace_id=WORKSPACE_ID,
+                auth_user_id=USER_ID,
+                provider=ProviderId.PEAK,
+                environment="production",
+                token_hash="d" * 64,
+                expires_at=NOW + timedelta(minutes=5),
+                mercury_access_token=MERCURY_ACCESS_TOKEN,
+                attempt_id=UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            )
 
     assert USER_TOKEN not in f"{error.value!s} {error.value!r}"
-    assert error.value.__cause__ is None
-    assert error.value.__context__ is None
+    _assert_no_internal_secret_references(
+        error.value,
+        USER_TOKEN,
+        "PUBLISHABLE_SENTINEL",
+        "SERVICE_ROLE_SENTINEL",
+    )
+    _assert_no_internal_secret_references(
+        bearer_error.value,
+        USER_TOKEN,
+        MERCURY_ACCESS_TOKEN,
+        "PUBLISHABLE_SENTINEL",
+        "SERVICE_ROLE_SENTINEL",
+    )
 
 
 def test_setup_public_models_and_errors_hide_all_secret_inputs() -> None:

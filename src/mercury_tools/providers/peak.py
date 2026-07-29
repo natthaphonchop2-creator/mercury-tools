@@ -14,10 +14,10 @@ from types import MappingProxyType
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from mercury_tools.credentials.models import CredentialBinding, CredentialEnvelope
-from mercury_tools.credentials.vault import CredentialVault, CredentialVaultError
+from mercury_tools.credentials.vault import CredentialVault
 from mercury_tools.providers.base import (
     DispatchCertainty,
     ProviderCallResult,
@@ -108,14 +108,23 @@ class PeakCredentialMaterial:
         connect_id: str,
         connect_key: str,
     ) -> PeakCredentialMaterial:
+        values: dict[str, bytearray] = {}
+        failed = False
         try:
-            values = {
-                "user_token": _credential_bytes(user_token),
-                "connect_id": _credential_bytes(connect_id),
-                "connect_key": _credential_bytes(connect_key),
-            }
-        except (TypeError, UnicodeEncodeError, ValueError):
-            raise PeakCredentialError("peak_credentials_invalid") from None
+            values["user_token"] = _credential_bytes(user_token)
+            values["connect_id"] = _credential_bytes(connect_id)
+            values["connect_key"] = _credential_bytes(connect_key)
+        except Exception:
+            failed = True
+        if failed:
+            for value in values.values():
+                with suppress(Exception):
+                    value[:] = b"\x00" * len(value)
+            values.clear()
+            del user_token
+            del connect_id
+            del connect_key
+            raise PeakCredentialError("peak_credentials_invalid")
         return cls(**values)
 
     @property
@@ -229,21 +238,21 @@ class QualifiedPeakProviderContract:
         *,
         application_code: str,
     ) -> ProviderAuthHeaders:
+        result: ProviderAuthHeaders | None = None
+        values: dict[str, str] = {}
+        headers: list[ProviderAuthHeader] = []
+        failed = False
         try:
             if credentials.cleared:
                 raise ValueError
-            values = {
-                "user_token": _decode_credential(credentials.user_token),
-                "connect_id": _decode_credential(credentials.connect_id),
-                "connect_key": _decode_credential(credentials.connect_key),
-            }
-            headers = [
-                ProviderAuthHeader(
-                    name=self.credential_header_names[credential_type],
-                    value=values[credential_type],
+            for credential_type in _CREDENTIAL_TYPES:
+                values[credential_type] = _decode_credential(getattr(credentials, credential_type))
+                headers.append(
+                    ProviderAuthHeader(
+                        name=self.credential_header_names[credential_type],
+                        value=values[credential_type],
+                    )
                 )
-                for credential_type in _CREDENTIAL_TYPES
-            ]
             if self.application_code_header_name is not None:
                 if not isinstance(application_code, str) or not application_code:
                     raise ValueError
@@ -253,13 +262,22 @@ class QualifiedPeakProviderContract:
                         value=application_code,
                     )
                 )
-            return ProviderAuthHeaders(
+            result = ProviderAuthHeaders(
                 provider=ProviderId.PEAK,
                 authorization_method=AuthorizationMethod.PROVIDER_CREDENTIALS,
                 headers=tuple(sorted(headers, key=lambda item: item.name.casefold())),
             )
         except Exception:
-            raise PeakCredentialError("peak_credentials_invalid") from None
+            failed = True
+        if failed or result is None:
+            credentials.clear()
+            values.clear()
+            headers.clear()
+            del credentials
+            del application_code
+            del self
+            raise PeakCredentialError("peak_credentials_invalid")
+        return result
 
     def profile_binding(self, connection: ProviderConnection) -> QualifiedCapabilityBinding:
         checked = _peak_connection(connection, allow_validation=True)
@@ -315,11 +333,20 @@ class QualifiedPeakProviderContract:
         structured_content: Mapping[str, Any],
     ) -> PeakProfile:
         self._require_profile_binding(binding)
+        normalized: PeakProfile | None = None
+        failed = False
         try:
             response = self.profile_response_model.model_validate(structured_content)
-            return PeakProfile.model_validate(self.profile_normalizer(response))
+            normalized = PeakProfile.model_validate(self.profile_normalizer(response))
         except Exception:
-            raise ValueError("peak_profile_invalid") from None
+            failed = True
+        if failed or normalized is None:
+            if "response" in locals():
+                del response
+            del structured_content
+            del self
+            raise ValueError("peak_profile_invalid")
+        return normalized
 
     def _require_profile_binding(self, binding: VerifiedRuntimeBinding) -> None:
         expected_resource = self.resource_uri_sha256_by_environment.get(binding.environment)
@@ -352,24 +379,31 @@ def seal_peak_credentials(
 ) -> tuple[CredentialEnvelope, ...]:
     """Seal the three canonical PEAK MCP credentials under one merchant binding."""
 
+    result: tuple[CredentialEnvelope, ...] | None = None
+    failed = False
     try:
         checked = _peak_connection(connection, allow_validation=True)
         if not isinstance(credentials, PeakCredentialMaterial) or credentials.cleared:
             raise ValueError
-        plaintexts = {
-            "connect_id": bytes(credentials.connect_id),
-            "connect_key": bytes(credentials.connect_key),
-            "user_token": bytes(credentials.user_token),
-        }
-        return tuple(
+        result = tuple(
             vault.seal(
                 _credential_binding(checked, credential_type),
-                plaintexts[credential_type],
+                getattr(credentials, credential_type),
             )
             for credential_type in _CREDENTIAL_TYPES
         )
-    except (CredentialVaultError, PeakCredentialError, TypeError, ValueError):
-        raise PeakCredentialError("peak_credentials_invalid") from None
+    except Exception:
+        failed = True
+    if failed or result is None:
+        if isinstance(credentials, PeakCredentialMaterial):
+            credentials.clear()
+        if result is not None:
+            del result
+        del credentials
+        del connection
+        del vault
+        raise PeakCredentialError("peak_credentials_invalid")
+    return result
 
 
 @contextmanager
@@ -383,6 +417,7 @@ def open_peak_credentials(
 
     opened: dict[str, bytearray] = {}
     material: PeakCredentialMaterial | None = None
+    failed = False
     try:
         checked_connection = _peak_connection(connection, allow_validation=True)
         checked_envelopes = tuple(
@@ -403,14 +438,28 @@ def open_peak_credentials(
             connect_id=opened.pop("connect_id"),
             connect_key=opened.pop("connect_key"),
         )
-        yield material
-    except PeakCredentialError:
-        raise
-    except (CredentialVaultError, KeyError, TypeError, ValueError, ValidationError):
-        raise PeakCredentialError("peak_credentials_invalid") from None
-    finally:
+    except Exception:
+        failed = True
+    if failed or material is None:
         if material is not None:
             material.clear()
+        for value in opened.values():
+            with suppress(Exception):
+                value[:] = b"\x00" * len(value)
+        if "checked_envelopes" in locals():
+            del checked_envelopes
+        if "checked_connection" in locals():
+            del checked_connection
+        del opened
+        del material
+        del envelopes
+        del connection
+        del vault
+        raise PeakCredentialError("peak_credentials_invalid")
+    try:
+        yield material
+    finally:
+        material.clear()
         for value in opened.values():
             with suppress(Exception):
                 value[:] = b"\x00" * len(value)
@@ -446,6 +495,8 @@ class PeakCredentialHeaderFactory:
         return "PeakCredentialHeaderFactory()"
 
     async def __call__(self, connection: ProviderConnection) -> ProviderAuthHeaders:
+        result: ProviderAuthHeaders | None = None
+        failed = False
         try:
             checked = _peak_connection(connection, allow_validation=True)
             request_envelopes = self._request_envelopes.get()
@@ -462,14 +513,24 @@ class PeakCredentialHeaderFactory:
                 connection=checked,
                 envelopes=envelopes,
             ) as credentials:
-                return self._contract.authorization_headers(
+                result = self._contract.authorization_headers(
                     credentials,
                     application_code=self._application_code,
                 )
-        except PeakCredentialError:
-            raise
         except Exception:
-            raise PeakCredentialError("peak_credentials_invalid") from None
+            failed = True
+        if failed or result is None:
+            if "credentials" in locals():
+                credentials.clear()
+                del credentials
+            if "envelopes" in locals():
+                del envelopes
+            if "checked" in locals():
+                del checked
+            del connection
+            del self
+            raise PeakCredentialError("peak_credentials_invalid")
+        return result
 
     @contextmanager
     def use_request_envelopes(
@@ -538,6 +599,8 @@ class PeakMCPDriver:
     ) -> ProviderValidation:
         contract = self._require_contract()
         checked = self._connection(connection, allow_validation=True)
+        validation: ProviderValidation | None = None
+        failed = False
         try:
             binding = contract.profile_binding(checked)
             result = await self._runtime.call(
@@ -549,7 +612,7 @@ class PeakMCPDriver:
             if result.status_class is not ProviderStatusClass.SUCCESS:
                 raise ValueError
             profile = PeakProfile.model_validate(result.normalized_data)
-            return ProviderValidation(
+            validation = ProviderValidation(
                 provider=ProviderId.PEAK,
                 status_class=ProviderStatusClass.SUCCESS,
                 normalized_data={
@@ -558,10 +621,22 @@ class PeakMCPDriver:
                 },
                 dispatch_certainty=DispatchCertainty.NOT_APPLICABLE,
             )
-        except ProviderResponseInvalid:
-            raise
         except Exception:
-            raise self._invalid() from None
+            failed = True
+        if failed or validation is None:
+            if "result" in locals():
+                del result
+            if "profile" in locals():
+                del profile
+            if "binding" in locals():
+                del binding
+            del checked
+            del contract
+            del connection
+            error = self._invalid()
+            del self
+            raise error
+        return validation
 
     async def validate_setup(
         self,

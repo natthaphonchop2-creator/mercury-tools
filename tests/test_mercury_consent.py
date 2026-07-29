@@ -18,9 +18,11 @@ from starlette.testclient import TestClient
 from mercury_tools.auth import consent as consent_module
 from mercury_tools.auth.consent import (
     AuthorizationRedirect,
+    ConsentAuthenticationRequired,
     ConsentDetails,
     ConsentError,
     OAuthSession,
+    OAuthSessionCookie,
 )
 from mercury_tools.auth.models import MercuryPrincipal
 from mercury_tools.mcp.server import create_test_http_app
@@ -85,6 +87,21 @@ class StubConsentHandoff:
     async def sign_in(self, email: str, password: str) -> OAuthSession:
         self.sign_ins.append((email, password))
         return OAuthSession(access_token="session-access-token", expires_in=600)
+
+
+def test_oauth_session_cookie_authenticates_its_issued_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cookie = OAuthSessionCookie(base64.b64encode(b"k" * 32).decode("ascii"))
+    monkeypatch.setattr(consent_module.time, "time", lambda: 1_000)
+    sealed = cookie.seal(OAuthSession(access_token="browser-bearer", expires_in=600).access_token)
+    payload = bytearray(base64.urlsafe_b64decode(sealed))
+    payload[:8] = (10_000).to_bytes(8, "big")
+    tampered = base64.urlsafe_b64encode(payload).decode("ascii")
+    monkeypatch.setattr(consent_module.time, "time", lambda: 10_000)
+
+    with pytest.raises(ConsentAuthenticationRequired):
+        cookie.open(tampered)
 
 
 @pytest.fixture(autouse=True)
@@ -510,14 +527,16 @@ def test_default_browser_sign_in_session_details_and_decision_handoff(
         assert signed_in.headers["location"] == (
             f"/oauth/consent?authorization_id={AUTHORIZATION_ID}"
         )
-        cookie = signed_in.headers["set-cookie"]
-        assert "HttpOnly" in cookie
-        assert "Secure" in cookie
-        assert "SameSite=lax" in cookie
-        assert "Path=/oauth" in cookie
-        assert "Max-Age=600" in cookie
-        assert access_token not in cookie
-        assert refresh_token not in cookie
+        cookies = signed_in.headers.get_list("set-cookie")
+        assert len(cookies) == 2
+        assert any("Path=/oauth" in cookie for cookie in cookies)
+        assert any("Path=/auth/providers/peak/setup" in cookie for cookie in cookies)
+        assert all("HttpOnly" in cookie for cookie in cookies)
+        assert all("Secure" in cookie for cookie in cookies)
+        assert all("SameSite=lax" in cookie for cookie in cookies)
+        assert all("Max-Age=600" in cookie for cookie in cookies)
+        assert all(access_token not in cookie for cookie in cookies)
+        assert all(refresh_token not in cookie for cookie in cookies)
         assert "owner@example.com" not in signed_in.text
         assert "correct horse battery staple" not in signed_in.text
 

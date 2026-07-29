@@ -142,10 +142,10 @@ class CredentialVault:
     def seal(
         self,
         binding: CredentialBinding,
-        plaintext: bytes,
+        plaintext: bytes | bytearray,
     ) -> CredentialEnvelope:
         checked_binding = self._binding(binding)
-        if not isinstance(plaintext, bytes) or not plaintext:
+        if not isinstance(plaintext, (bytes, bytearray)) or not plaintext:
             raise CredentialVaultError("credential_plaintext_invalid")
         mutable = bytearray(plaintext)
         try:
