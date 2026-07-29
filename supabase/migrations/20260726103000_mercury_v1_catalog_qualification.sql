@@ -219,6 +219,20 @@ begin
     raise exception 'mercury_provider_capability_transition_invalid';
   end if;
 
+  if existing.qualification_state = 'nonproduction_qualified'
+    and candidate.qualification_state = 'enabled'
+    and (
+      candidate.company_sha256 is distinct from existing.company_sha256
+      or candidate.evidence_revision_sha256 is distinct from existing.evidence_revision_sha256
+      or candidate.qualification_evidence_uri is distinct from existing.qualification_evidence_uri
+      or candidate.evidence_evaluated_at is distinct from existing.evidence_evaluated_at
+      or candidate.evidence_expires_at is distinct from existing.evidence_expires_at
+      or candidate.nonproduction_evidence_revision_sha256 is distinct from existing.nonproduction_evidence_revision_sha256
+      or candidate.nonproduction_company_sha256 is distinct from existing.nonproduction_company_sha256
+    ) then
+    raise exception 'mercury_provider_capability_evidence_identity_mismatch';
+  end if;
+
   if candidate.qualification_state in ('nonproduction_qualified', 'enabled') then
     if jsonb_typeof(p_artifact) <> 'object'
       or candidate.company_sha256 is null
@@ -262,8 +276,15 @@ begin
   elsif candidate.qualification_state in ('disabled', 'superseded') then
     if candidate.disable_reason is null
       or candidate.disable_reason !~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$'
+      or candidate.company_sha256 is distinct from existing.company_sha256
       or candidate.evidence_revision_sha256 is distinct from existing.evidence_revision_sha256
-      or candidate.qualification_evidence_uri is distinct from existing.qualification_evidence_uri then
+      or candidate.qualification_evidence_uri is distinct from existing.qualification_evidence_uri
+      or candidate.evidence_evaluated_at is distinct from existing.evidence_evaluated_at
+      or candidate.evidence_expires_at is distinct from existing.evidence_expires_at
+      or candidate.nonproduction_evidence_revision_sha256 is distinct from existing.nonproduction_evidence_revision_sha256
+      or candidate.nonproduction_company_sha256 is distinct from existing.nonproduction_company_sha256
+      or candidate.production_canary_at is distinct from existing.production_canary_at
+      or candidate.owner_authorized_by is distinct from existing.owner_authorized_by then
       raise exception 'mercury_provider_capability_terminal_invalid';
     end if;
   end if;
