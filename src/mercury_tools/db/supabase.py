@@ -6,11 +6,16 @@ import hashlib
 import json
 import math
 from typing import Any
+from uuid import UUID
 
 import httpx
 
 from mercury_tools.config import Settings, require_supabase
 from mercury_tools.rag.models import KnowledgeChunk, KnowledgeDocument, SearchFilters, SearchResult
+from mercury_tools.rag.routing import (
+    normalize_v1_knowledge_filters,
+    validate_v1_search_mode,
+)
 from mercury_tools.safety.redaction import redact_json
 
 CHUNK_UPLOAD_BATCH_SIZE = 10
@@ -92,6 +97,37 @@ def _search_result_from_row(row: dict[str, Any]) -> SearchResult:
         )
     except (TypeError, ValueError, OverflowError):
         raise RuntimeError("supabase_rag_response_invalid") from None
+
+
+def _identity_uuid(value: UUID | str) -> str:
+    try:
+        parsed = UUID(str(value))
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("workspace_identity_invalid") from None
+    return str(parsed)
+
+
+def _published_skill_projection_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    string_fields = (
+        "skill_id",
+        "skill_version",
+        "projection_sha256",
+        "git_source_path",
+    )
+    if (
+        any(not isinstance(row.get(field), str) or not row[field] for field in string_fields)
+        or not isinstance(row.get("projection"), dict)
+        or row.get("publication_status") != "published"
+    ):
+        raise RuntimeError("supabase_rag_response_invalid")
+    return {
+        "skill_id": row["skill_id"],
+        "skill_version": row["skill_version"],
+        "projection": row["projection"],
+        "projection_sha256": row["projection_sha256"],
+        "git_source_path": row["git_source_path"],
+        "publication_status": "published",
+    }
 
 
 class SupabaseRagStore:
@@ -248,10 +284,96 @@ class SupabaseRagStore:
             "search_mode": mode,
             **filters.to_rpc_payload(),
         }
+        rows = _response_rows(self._request("POST", "rpc/match_knowledge_chunks", json=payload))
+        return [_search_result_from_row(row) for row in rows]
+
+    def search_workspace_knowledge(
+        self,
+        *,
+        tenant_id: UUID | str,
+        workspace_id: UUID | str,
+        auth_user_id: UUID | str,
+        query: str,
+        filters: dict[str, Any] | None,
+        top_k: int,
+        mode: str,
+    ) -> list[SearchResult]:
+        """Run the service-role query with the authenticated identity predicate."""
+
+        query_text = query.strip() if isinstance(query, str) else ""
+        if (
+            not query_text
+            or len(query_text) > 2_000
+            or isinstance(top_k, bool)
+            or not isinstance(top_k, int)
+            or not 1 <= top_k <= 20
+        ):
+            raise ValueError("knowledge_search_invalid")
+        normalized_filters = normalize_v1_knowledge_filters(filters)
+        search_mode = validate_v1_search_mode(mode)
+        payload = {
+            "p_tenant_id": _identity_uuid(tenant_id),
+            "p_workspace_id": _identity_uuid(workspace_id),
+            "p_auth_user_id": _identity_uuid(auth_user_id),
+            "query_text": query_text,
+            "match_count": top_k,
+            "search_mode": search_mode,
+            **{
+                f"filter_{field}": normalized_filters.get(field)
+                for field in (
+                    "jurisdiction",
+                    "provider",
+                    "doc_type",
+                    "review_status",
+                    "effective_on",
+                    "source_id",
+                    "capability_version",
+                )
+            },
+        }
         rows = _response_rows(
-            self._request("POST", "rpc/match_knowledge_chunks", json=payload)
+            self._request(
+                "POST",
+                "rpc/search_mercury_v1_knowledge",
+                json=payload,
+            )
         )
         return [_search_result_from_row(row) for row in rows]
+
+    def get_published_skill_projection(
+        self,
+        *,
+        tenant_id: UUID | str,
+        workspace_id: UUID | str,
+        auth_user_id: UUID | str,
+        skill_id: str,
+        skill_version: str,
+    ) -> dict[str, Any] | None:
+        """Resolve one exact published projection without treating it as source."""
+
+        if (
+            not isinstance(skill_id, str)
+            or not skill_id
+            or not isinstance(skill_version, str)
+            or not skill_version
+        ):
+            raise ValueError("published_skill_identity_invalid")
+        rows = _response_rows(
+            self._request(
+                "POST",
+                "rpc/resolve_mercury_v1_published_skill",
+                json={
+                    "p_tenant_id": _identity_uuid(tenant_id),
+                    "p_workspace_id": _identity_uuid(workspace_id),
+                    "p_auth_user_id": _identity_uuid(auth_user_id),
+                    "p_skill_id": skill_id,
+                    "p_skill_version": skill_version,
+                },
+            )
+        )
+        if len(rows) > 1:
+            raise RuntimeError("supabase_rag_response_invalid")
+        return _published_skill_projection_from_row(rows[0]) if rows else None
 
     def get_document(self, document_id: str) -> dict | None:
         rows = self._request(

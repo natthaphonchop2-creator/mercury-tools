@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, TypeAlias
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic.json_schema import SkipJsonSchema
+
+from mercury_tools.catalog.identity import canonical_json
 
 SkillConnectorId = Literal["flowaccount", "peak", "express", "custom", "generic_mcp"]
 SkillConnectionMode = Literal["native_mcp", "api_driver", "local_bridge"]
@@ -19,22 +25,164 @@ SkillEnvironment = Literal[
     "gateway",
     "user_supplied",
 ]
+HostEvidenceSource = Literal[
+    "google_sheets",
+    "google_drive",
+    "gmail",
+    "host_mcp",
+]
+HostEvidenceType = Literal[
+    "business_record",
+    "document_excerpt",
+    "message_fact",
+]
+_V1_SKILL_READ_CAPABILITY_ROUTES = MappingProxyType(
+    {
+        "company.read": ("provider_profile.get",),
+        "documents.invoice.read": ("documents.invoice.get",),
+        "provider_profile.get": ("provider_profile.get",),
+        "documents.invoice.list": ("documents.invoice.list",),
+        "documents.invoice.get": ("documents.invoice.get",),
+    }
+)
+
+
+def v1_skill_read_capabilities(capability: str) -> tuple[str, ...]:
+    """Map one provider-neutral Skill requirement to exact V1 read authority."""
+
+    if not isinstance(capability, str):
+        return ()
+    return _V1_SKILL_READ_CAPABILITY_ROUTES.get(capability.strip(), ())
+
+
+class _HostBusinessFactInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+
+class HostAmountFactInput(_HostBusinessFactInput):
+    field: Literal[
+        "invoice_total",
+        "subtotal_amount",
+        "tax_amount",
+        "withholding_tax_amount",
+        "paid_amount",
+        "outstanding_amount",
+    ]
+    value: Decimal = Field(
+        ge=Decimal("-999999999999999.9999"),
+        le=Decimal("999999999999999.9999"),
+        max_digits=19,
+        decimal_places=4,
+        allow_inf_nan=False,
+    )
+
+
+class HostRateFactInput(_HostBusinessFactInput):
+    field: Literal["vat_rate", "withholding_tax_rate"]
+    value: Decimal = Field(
+        ge=Decimal("0"),
+        le=Decimal("100"),
+        max_digits=7,
+        decimal_places=4,
+        allow_inf_nan=False,
+    )
+
+
+class HostDateFactInput(_HostBusinessFactInput):
+    field: Literal[
+        "document_date",
+        "due_date",
+        "payment_date",
+        "period_start",
+        "period_end",
+    ]
+    value: date
+
+
+class HostCountFactInput(_HostBusinessFactInput):
+    field: Literal["document_count", "line_item_count", "days_overdue"]
+    value: int = Field(ge=0, le=1_000_000_000)
+
+
+class HostBooleanFactInput(_HostBusinessFactInput):
+    field: Literal["is_paid", "is_overdue", "is_tax_invoice"]
+    value: bool
+
+
+class HostCurrencyFactInput(_HostBusinessFactInput):
+    field: Literal["currency_code"]
+    value: str = Field(pattern=r"^[A-Z]{3}$")
+
+
+class HostDocumentTypeFactInput(_HostBusinessFactInput):
+    field: Literal["document_type"]
+    value: Literal[
+        "invoice",
+        "tax_invoice",
+        "receipt",
+        "credit_note",
+        "debit_note",
+        "withholding_tax",
+        "journal",
+        "settlement",
+    ]
+
+
+class HostStatusFactInput(_HostBusinessFactInput):
+    field: Literal["document_status", "payment_status"]
+    value: Literal[
+        "draft",
+        "issued",
+        "sent",
+        "paid",
+        "partially_paid",
+        "overdue",
+        "void",
+        "cancelled",
+        "unknown",
+    ]
+
+
+HostBusinessFactInput: TypeAlias = Annotated[
+    HostAmountFactInput
+    | HostRateFactInput
+    | HostDateFactInput
+    | HostCountFactInput
+    | HostBooleanFactInput
+    | HostCurrencyFactInput
+    | HostDocumentTypeFactInput
+    | HostStatusFactInput,
+    Field(discriminator="field"),
+]
+
+
+class HostConnectedEvidenceInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    source: HostEvidenceSource
+    evidence_type: HostEvidenceType
+    source_reference: UUID = Field(description="Host-owned evidence record UUID.")
+    facts: list[HostBusinessFactInput] = Field(min_length=1, max_length=100)
 
 
 class _StrictSkillInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     query: str = Field(min_length=1, max_length=20_000)
-    connector_id: SkillConnectorId | None = None
-    connection_mode: SkillConnectionMode | None = None
-    environment: SkillEnvironment | None = None
-    company_name: str | None = Field(default=None, max_length=500)
-    notes: str | None = Field(default=None, max_length=10_000)
+    connector_id: SkillConnectorId | SkipJsonSchema[None] = None
+    connection_mode: SkillConnectionMode | SkipJsonSchema[None] = None
+    environment: SkillEnvironment | SkipJsonSchema[None] = None
+    company_name: str | SkipJsonSchema[None] = Field(default=None, max_length=500)
+    notes: str | SkipJsonSchema[None] = Field(default=None, max_length=10_000)
+    host_evidence: list[HostConnectedEvidenceInput] = Field(
+        default_factory=list,
+        max_length=100,
+    )
 
 
 class _PeriodRangeSkillInput(_StrictSkillInput):
-    period_start: date | None = None
-    period_end: date | None = None
+    period_start: date | SkipJsonSchema[None] = None
+    period_end: date | SkipJsonSchema[None] = None
 
     @model_validator(mode="after")
     def validate_period(self) -> _PeriodRangeSkillInput:
@@ -52,7 +200,7 @@ class CompanyHealthSkillInput(_PeriodRangeSkillInput):
 
 
 class VatSummarySkillInput(_PeriodRangeSkillInput):
-    month: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}$")
+    month: str | SkipJsonSchema[None] = Field(default=None, pattern=r"^\d{4}-\d{2}$")
 
 
 class InvoiceReviewSkillInput(_PeriodRangeSkillInput):
@@ -60,7 +208,7 @@ class InvoiceReviewSkillInput(_PeriodRangeSkillInput):
 
 
 class ManagementReportSkillInput(_PeriodRangeSkillInput):
-    objective: str | None = Field(default=None, max_length=5_000)
+    objective: str | SkipJsonSchema[None] = Field(default=None, max_length=5_000)
 
 
 class ConnectorSetupSkillInput(_StrictSkillInput):
@@ -68,24 +216,24 @@ class ConnectorSetupSkillInput(_StrictSkillInput):
 
 
 class FlowRunnerSkillInput(_StrictSkillInput):
-    objective: str | None = Field(default=None, max_length=5_000)
+    objective: str | SkipJsonSchema[None] = Field(default=None, max_length=5_000)
 
 
 class JournalPostingSkillInput(_PeriodRangeSkillInput):
     document_ids: list[str] = Field(default_factory=list, max_length=200)
-    objective: str | None = Field(default=None, max_length=5_000)
+    objective: str | SkipJsonSchema[None] = Field(default=None, max_length=5_000)
 
 
 class ReconciliationSkillInput(_PeriodRangeSkillInput):
-    source_reference: str | None = Field(default=None, max_length=500)
+    source_reference: str | SkipJsonSchema[None] = Field(default=None, max_length=500)
 
 
 class MarketplaceSettlementSkillInput(ReconciliationSkillInput):
-    marketplace_source: str | None = Field(default=None, max_length=200)
+    marketplace_source: str | SkipJsonSchema[None] = Field(default=None, max_length=200)
 
 
 class MonthEndEvidenceSkillInput(_StrictSkillInput):
-    month: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}$")
+    month: str | SkipJsonSchema[None] = Field(default=None, pattern=r"^\d{4}-\d{2}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +247,75 @@ class AccountingSkillDefinition:
     required_connectors: tuple[str, ...]
     input_schema: type[BaseModel]
     output_schema_name: str
+    skill_version: str = "0.1.0"
+    allowed_action_classes: tuple[str, ...] = ("provider_read",)
+    blocked_action_classes: tuple[str, ...] = (
+        "provider_create",
+        "provider_update",
+        "provider_delete",
+    )
+    evidence_requirements: tuple[str, ...] = (
+        "business_fact",
+        "knowledge_source",
+        "citation",
+    )
+    knowledge_filters: tuple[tuple[str, str], ...] = (
+        ("jurisdiction", "TH"),
+        ("review_status", "reviewed"),
+    )
+
+    @property
+    def git_source_path(self) -> str:
+        return f"plugins/mercury-finance/skills/{self.skill_id}/SKILL.md"
+
+    @property
+    def v1_capability_routes(self) -> dict[str, list[str]]:
+        declared = dict.fromkeys((*self.required_capabilities, *self.optional_capabilities))
+        return {capability: list(v1_skill_read_capabilities(capability)) for capability in declared}
+
+    def published_projection(self) -> dict[str, Any]:
+        return {
+            "skill_id": self.skill_id,
+            "skill_version": self.skill_version,
+            "title": self.title,
+            "category": self.category,
+            "summary": self.summary,
+            "input_schema": self.input_schema.model_json_schema(),
+            "output_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "output_schema_name": {"const": self.output_schema_name},
+                    "facts": {
+                        "type": "array",
+                        "items": {"type": "string", "maxLength": 2_000},
+                        "maxItems": 500,
+                    },
+                    "citations": {
+                        "type": "array",
+                        "items": {"type": "string", "maxLength": 2_000},
+                        "maxItems": 100,
+                    },
+                },
+                "required": ["output_schema_name", "facts", "citations"],
+            },
+            "required_capabilities": list(self.required_capabilities),
+            "optional_capabilities": list(self.optional_capabilities),
+            "v1_capability_routes": self.v1_capability_routes,
+            "required_connectors": list(self.required_connectors),
+            "allowed_action_classes": list(self.allowed_action_classes),
+            "blocked_action_classes": list(self.blocked_action_classes),
+            "evidence_requirements": list(self.evidence_requirements),
+            "knowledge_filters": dict(self.knowledge_filters),
+            "citation_required": "citation" in self.evidence_requirements,
+            "git_source_path": self.git_source_path,
+        }
+
+    @property
+    def projection_sha256(self) -> str:
+        return hashlib.sha256(
+            canonical_json(self.published_projection()).encode("utf-8")
+        ).hexdigest()
 
 
 ACCOUNTING_SKILL_CATALOG: tuple[AccountingSkillDefinition, ...] = (
@@ -280,6 +497,9 @@ ACCOUNTING_SKILL_IDS = tuple(skill.skill_id for skill in ACCOUNTING_SKILL_CATALO
 _ACCOUNTING_SKILL_BY_ID = MappingProxyType(
     {skill.skill_id: skill for skill in ACCOUNTING_SKILL_CATALOG}
 )
+_PUBLISHED_ACCOUNTING_SKILL_BY_ID_VERSION = MappingProxyType(
+    {(skill.skill_id, skill.skill_version): skill for skill in ACCOUNTING_SKILL_CATALOG}
+)
 if len(_ACCOUNTING_SKILL_BY_ID) != len(ACCOUNTING_SKILL_CATALOG):
     raise RuntimeError("accounting_skill_catalog_duplicate")
 
@@ -338,6 +558,17 @@ def accounting_skill_by_id(skill_id: str) -> AccountingSkillDefinition | None:
     return _ACCOUNTING_SKILL_BY_ID.get(skill_id.strip())
 
 
+def published_accounting_skill(
+    skill_id: str,
+    skill_version: str,
+) -> AccountingSkillDefinition | None:
+    """Resolve exactly one Git-canonical first-party Skill version."""
+
+    if not isinstance(skill_id, str) or not isinstance(skill_version, str):
+        return None
+    return _PUBLISHED_ACCOUNTING_SKILL_BY_ID_VERSION.get((skill_id.strip(), skill_version.strip()))
+
+
 def accounting_skill_input_schema(skill_id: str) -> dict[str, Any] | None:
     skill = accounting_skill_by_id(skill_id)
     return skill.input_schema.model_json_schema() if skill else None
@@ -347,6 +578,7 @@ def accounting_skill_summaries() -> list[dict[str, Any]]:
     return [
         {
             "skill_id": skill.skill_id,
+            "skill_version": skill.skill_version,
             "title": skill.title,
             "category": skill.category,
             "summary": skill.summary,
@@ -367,7 +599,7 @@ def _skill_catalog_seed() -> list[dict[str, Any]]:
             "category": skill.category,
             "summary": skill.summary,
             "status": "available",
-            "version": "0.1.0",
+            "version": skill.skill_version,
             "required_capabilities": list(skill.required_capabilities),
             "required_connectors": list(skill.required_connectors),
             "tags": list(_BACKWARD_COMPATIBLE_TAGS[skill.skill_id]),

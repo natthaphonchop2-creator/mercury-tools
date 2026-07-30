@@ -45,6 +45,9 @@ V1_HOSTED_TOOL_NAMES = frozenset(
         "connector_status",
         "list_provider_capabilities",
         "get_capability_schema",
+        "search_knowledge",
+        "retrieve_context_pack",
+        "run_accounting_skill",
         "disconnect_provider",
     }
 )

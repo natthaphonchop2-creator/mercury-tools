@@ -7,7 +7,8 @@ import hashlib
 import inspect
 import json
 import threading
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from datetime import date
 from typing import Annotated, Any, Literal, TypeAlias
 from uuid import UUID
 
@@ -42,6 +43,10 @@ from mercury_tools.mcp.v1_schemas import (
     FlowAccountRevocationRequiredData,
     GetCapabilitySchemaOutput,
     GetMercuryContextOutput,
+    HostConnectedEvidenceInput,
+    KnowledgeCitationOutput,
+    KnowledgeFiltersInput,
+    KnowledgeResultOutput,
     ListAccountingProvidersOutput,
     ListProviderCapabilitiesOutput,
     ListProviderConnectionsOutput,
@@ -51,9 +56,17 @@ from mercury_tools.mcp.v1_schemas import (
     PeakProviderOutput,
     ProviderCapabilityOutput,
     ProviderConnectionOutput,
+    RetrieveContextPackOutput,
     ReviewedCapabilitySchemaOutput,
+    RunAccountingSkillArguments,
+    RunAccountingSkillData,
+    RunAccountingSkillOutput,
+    SearchKnowledgeOutput,
+    SkillCapabilityBindingOutput,
     StartProviderConnectionArguments,
     StartProviderConnectionOutput,
+    non_nullable_public_schema,
+    run_accounting_skill_input_schema,
     start_provider_connection_input_schema,
 )
 from mercury_tools.providers.finalization import await_cleanup
@@ -72,6 +85,17 @@ from mercury_tools.qualification.provider_mcp import (
     CapabilityResolution,
     CapabilitySelection,
 )
+from mercury_tools.rag.models import SearchResult
+from mercury_tools.rag.routing import normalize_v1_knowledge_filters
+from mercury_tools.skills.catalog import (
+    AccountingSkillDefinition,
+    published_accounting_skill,
+    v1_skill_read_capabilities,
+)
+from mercury_tools.skills.routing import (
+    published_projection_matches,
+    resolve_published_skill_route,
+)
 from mercury_tools.workspaces.models import WorkspaceMembership, WorkspaceRole
 from mercury_tools.workspaces.service import WorkspaceService
 
@@ -82,11 +106,15 @@ LIST_PROVIDER_CONNECTIONS_TOOL = "list_provider_connections"
 CONNECTOR_STATUS_TOOL = "connector_status"
 LIST_PROVIDER_CAPABILITIES_TOOL = "list_provider_capabilities"
 GET_CAPABILITY_SCHEMA_TOOL = "get_capability_schema"
+SEARCH_KNOWLEDGE_TOOL = "search_knowledge"
+RETRIEVE_CONTEXT_PACK_TOOL = "retrieve_context_pack"
+RUN_ACCOUNTING_SKILL_TOOL = "run_accounting_skill"
 DISCONNECT_PROVIDER_TOOL = "disconnect_provider"
 
 WorkspaceServiceFactory = Callable[[], WorkspaceService]
 ProviderRuntimeFactory: TypeAlias = Callable[[], Any | Awaitable[Any]]
 AuditRecorder: TypeAlias = Callable[[dict[str, object]], object | Awaitable[object]]
+RagStoreFactory: TypeAlias = Callable[[], SupabaseRagStore]
 
 _V1_SEED_CAPABILITIES = frozenset(
     {
@@ -126,6 +154,12 @@ _DISCONNECT_PROVIDER = ToolAnnotations(
     idempotentHint=True,
     openWorldHint=True,
 )
+_SKILL_RUN = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+)
 _V1_TOOL_META = {
     "mercury/surface": "v1",
     "mercury/error-schema": "mercury.v1.error.v1",
@@ -135,6 +169,10 @@ _V1_CONFIGURATION_LOCK = threading.RLock()
 
 def _workspace_service() -> WorkspaceService:
     return WorkspaceService.from_settings(load_settings())
+
+
+def _rag_store() -> SupabaseRagStore:
+    return SupabaseRagStore(load_settings())
 
 
 async def _provider_runtime() -> Any:
@@ -580,6 +618,62 @@ def _sha256_identifier(value: UUID) -> str:
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
 
 
+def _knowledge_filters_payload(
+    filters: KnowledgeFiltersInput | Mapping[str, Any] | None,
+) -> dict[str, str]:
+    if filters is None:
+        return {}
+    if isinstance(filters, KnowledgeFiltersInput):
+        values = filters.model_dump(mode="json", exclude_none=True)
+    elif isinstance(filters, Mapping):
+        values = dict(filters)
+    else:
+        raise ValueError("knowledge_filters_invalid")
+    return normalize_v1_knowledge_filters(values)
+
+
+def _knowledge_result_output(result: SearchResult) -> KnowledgeResultOutput:
+    metadata = result.metadata
+    citation = result.citation
+    if (
+        not isinstance(metadata, Mapping)
+        or metadata.get("review_status") != "reviewed"
+        or not isinstance(citation, Mapping)
+    ):
+        raise ValueError("insufficient_evidence")
+    try:
+        return KnowledgeResultOutput(
+            chunk_id=UUID(result.chunk_id),
+            document_id=UUID(result.document_id),
+            document_uri=result.document_uri,
+            chunk_uri=result.chunk_uri,
+            text=result.text,
+            score=result.score,
+            jurisdiction=metadata.get("jurisdiction"),
+            provider=metadata.get("provider"),
+            doc_type=metadata.get("doc_type"),
+            review_status="reviewed",
+            effective_on=metadata.get("effective_on"),
+            citation=KnowledgeCitationOutput(
+                source_id=UUID(str(metadata["source_id"])),
+                source_title=result.source_title,
+                source_uri=result.source_uri,
+                source_url=result.source_url,
+                heading=citation.get("heading"),
+            ),
+        )
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("insufficient_evidence") from None
+
+
+def _knowledge_result_outputs(
+    results: Sequence[SearchResult],
+) -> list[KnowledgeResultOutput]:
+    if not results:
+        raise ValueError("insufficient_evidence")
+    return [_knowledge_result_output(result) for result in results]
+
+
 def _connector_status_audit_event(
     *,
     workspace_id: UUID,
@@ -598,6 +692,65 @@ def _connector_status_audit_event(
             "environment": connection.environment,
             "readiness": connection.readiness.value,
             "missing_qualification_count": len(missing_qualification_capabilities),
+        },
+        "status": "ok",
+        "metadata": {"runtime": "mcp", "surface": "v1"},
+    }
+
+
+def _knowledge_audit_event(
+    *,
+    tool_name: Literal["search_knowledge", "retrieve_context_pack"],
+    workspace_id: UUID,
+    query: str,
+    filters: Mapping[str, str],
+    result_count: int,
+    skill: AccountingSkillDefinition | None = None,
+) -> dict[str, object]:
+    audit_input: dict[str, object] = {
+        "workspace_id_sha256": _sha256_identifier(workspace_id),
+        "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+        "filter_fields": sorted(filters),
+    }
+    if skill is not None:
+        audit_input.update(
+            skill_id=skill.skill_id,
+            skill_version=skill.skill_version,
+        )
+    return {
+        "tool_name": tool_name,
+        "input": audit_input,
+        "output_summary": {"result_count": result_count},
+        "status": "ok",
+        "metadata": {"runtime": "mcp", "surface": "v1"},
+    }
+
+
+def _skill_audit_event(
+    *,
+    workspace_id: UUID,
+    connection_id: UUID | None,
+    skill: AccountingSkillDefinition,
+    query: str,
+    capability_count: int,
+    knowledge_count: int,
+    host_evidence_count: int,
+) -> dict[str, object]:
+    audit_input: dict[str, object] = {
+        "workspace_id_sha256": _sha256_identifier(workspace_id),
+        "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+        "skill_id": skill.skill_id,
+        "skill_version": skill.skill_version,
+    }
+    if connection_id is not None:
+        audit_input["connection_id_sha256"] = _sha256_identifier(connection_id)
+    return {
+        "tool_name": RUN_ACCOUNTING_SKILL_TOOL,
+        "input": audit_input,
+        "output_summary": {
+            "capability_count": capability_count,
+            "knowledge_count": knowledge_count,
+            "host_evidence_count": host_evidence_count,
         },
         "status": "ok",
         "metadata": {"runtime": "mcp", "surface": "v1"},
@@ -993,6 +1146,295 @@ async def get_capability_schema(
             await _close_runtime(runtime)
 
 
+async def search_knowledge(
+    context: Context,
+    *,
+    workspace_id: UUID,
+    query: str,
+    filters: KnowledgeFiltersInput | Mapping[str, Any] | None = None,
+    top_k: int = 8,
+    mode: Literal["keyword", "hybrid"] = "hybrid",
+    service_factory: WorkspaceServiceFactory = _workspace_service,
+    store_factory: RagStoreFactory = _rag_store,
+    audit_recorder: AuditRecorder = _record_connector_status_audit,
+) -> SearchKnowledgeOutput:
+    """Search reviewed knowledge through an exact workspace-bound predicate."""
+
+    try:
+        principal, membership = await _require_workspace(
+            context,
+            workspace_id=workspace_id,
+            service_factory=service_factory,
+        )
+        normalized_filters = _knowledge_filters_payload(filters)
+        results = await asyncio.to_thread(
+            store_factory().search_workspace_knowledge,
+            tenant_id=membership.tenant_id,
+            workspace_id=workspace_id,
+            auth_user_id=principal.subject,
+            query=query,
+            filters=normalized_filters,
+            top_k=top_k,
+            mode=mode,
+        )
+        response = SearchKnowledgeOutput(
+            workspace_id=workspace_id,
+            query=query,
+            data=_knowledge_result_outputs(results),
+            next_allowed_actions=["retrieve_context_pack"],
+        )
+        await _write_audit(
+            audit_recorder,
+            _knowledge_audit_event(
+                tool_name=SEARCH_KNOWLEDGE_TOOL,
+                workspace_id=workspace_id,
+                query=query,
+                filters=normalized_filters,
+                result_count=len(response.data),
+            ),
+        )
+        return response
+    except Exception as error:
+        raise MercuryV1ToolError(public_error_code(error)) from None
+
+
+async def retrieve_context_pack(
+    context: Context,
+    *,
+    workspace_id: UUID,
+    query: str,
+    skill_id: str | None = None,
+    skill_version: str | None = None,
+    filters: KnowledgeFiltersInput | Mapping[str, Any] | None = None,
+    max_chunks: int = 12,
+    service_factory: WorkspaceServiceFactory = _workspace_service,
+    store_factory: RagStoreFactory = _rag_store,
+    audit_recorder: AuditRecorder = _record_connector_status_audit,
+) -> RetrieveContextPackOutput:
+    """Retrieve cited context without allowing Skill or RAG authority expansion."""
+
+    try:
+        principal, membership = await _require_workspace(
+            context,
+            workspace_id=workspace_id,
+            service_factory=service_factory,
+        )
+        if (skill_id is None) != (skill_version is None):
+            raise ValueError("insufficient_evidence")
+        store = store_factory()
+        normalized_filters = _knowledge_filters_payload(filters)
+        skill: AccountingSkillDefinition | None = None
+        if skill_id is not None and skill_version is not None:
+            skill = published_accounting_skill(skill_id, skill_version)
+            if skill is None:
+                raise ValueError("insufficient_evidence")
+            projection = await asyncio.to_thread(
+                store.get_published_skill_projection,
+                tenant_id=membership.tenant_id,
+                workspace_id=workspace_id,
+                auth_user_id=principal.subject,
+                skill_id=skill.skill_id,
+                skill_version=skill.skill_version,
+            )
+            if not published_projection_matches(skill, projection):
+                raise ValueError("insufficient_evidence")
+            normalized_filters.update(dict(skill.knowledge_filters))
+        results = await asyncio.to_thread(
+            store.search_workspace_knowledge,
+            tenant_id=membership.tenant_id,
+            workspace_id=workspace_id,
+            auth_user_id=principal.subject,
+            query=query,
+            filters=normalized_filters,
+            top_k=max_chunks,
+            mode="hybrid",
+        )
+        response = RetrieveContextPackOutput(
+            workspace_id=workspace_id,
+            query=query,
+            skill_id=skill_id,
+            skill_version=skill_version,
+            data=_knowledge_result_outputs(results),
+            next_allowed_actions=["run_accounting_skill"] if skill_id else [],
+        )
+        await _write_audit(
+            audit_recorder,
+            _knowledge_audit_event(
+                tool_name=RETRIEVE_CONTEXT_PACK_TOOL,
+                workspace_id=workspace_id,
+                query=query,
+                filters=normalized_filters,
+                result_count=len(response.data),
+                skill=skill,
+            ),
+        )
+        return response
+    except Exception as error:
+        raise MercuryV1ToolError(public_error_code(error)) from None
+
+
+async def _enabled_skill_capability_bindings(
+    runtime: Any,
+    *,
+    skill: AccountingSkillDefinition,
+    membership: WorkspaceMembership,
+    workspace_id: UUID,
+    principal: MercuryPrincipal,
+    connection_id: UUID,
+) -> tuple[tuple[SkillCapabilityBindingOutput, ...], tuple[str, ...]]:
+    connection = await _store_load_connection(
+        runtime,
+        membership=membership,
+        workspace_id=workspace_id,
+        principal=principal,
+        connection_id=connection_id,
+    )
+    qualifications = tuple(
+        item
+        for item in await _catalog_qualifications(runtime)
+        if item.provider == connection.provider.value and item.environment == connection.environment
+    )
+    bindings: list[SkillCapabilityBindingOutput] = []
+    enabled_skill_capabilities: list[str] = []
+    declared_capabilities = dict.fromkeys(
+        (*skill.required_capabilities, *skill.optional_capabilities)
+    )
+    for skill_capability in declared_capabilities:
+        catalog_capabilities = frozenset(v1_skill_read_capabilities(skill_capability))
+        enabled = []
+        for qualification in qualifications:
+            if qualification.normalized_capability not in catalog_capabilities:
+                continue
+            resolution = await _resolve_qualification(
+                runtime,
+                connection=connection,
+                qualification=qualification,
+            )
+            if (
+                resolution.status == "enabled"
+                and resolution.qualification is not None
+                and resolution.qualification.normalized_capability
+                == qualification.normalized_capability
+                and resolution.qualification.normalized_capability in catalog_capabilities
+            ):
+                enabled.append(resolution.qualification)
+        if len(enabled) == 1:
+            enabled_skill_capabilities.append(skill_capability)
+            bindings.append(
+                SkillCapabilityBindingOutput(
+                    skill_capability=skill_capability,
+                    capability_id=enabled[0].normalized_capability,
+                    capability_version=enabled[0].capability_version_sha256,
+                )
+            )
+    return tuple(bindings), tuple(enabled_skill_capabilities)
+
+
+async def run_accounting_skill(
+    context: Context,
+    *,
+    arguments: RunAccountingSkillArguments,
+    service_factory: WorkspaceServiceFactory = _workspace_service,
+    store_factory: RagStoreFactory = _rag_store,
+    runtime_factory: ProviderRuntimeFactory | None = None,
+    audit_recorder: AuditRecorder = _record_connector_status_audit,
+) -> RunAccountingSkillOutput:
+    """Resolve one exact Skill using evidence and enabled catalog authority only."""
+
+    runtime: Any | None = None
+    try:
+        principal, membership = await _require_workspace(
+            context,
+            workspace_id=arguments.workspace_id,
+            service_factory=service_factory,
+        )
+        skill = published_accounting_skill(arguments.skill_id, arguments.skill_version)
+        if skill is None:
+            raise ValueError("insufficient_evidence")
+        store = store_factory()
+        projection = await asyncio.to_thread(
+            store.get_published_skill_projection,
+            tenant_id=membership.tenant_id,
+            workspace_id=arguments.workspace_id,
+            auth_user_id=principal.subject,
+            skill_id=skill.skill_id,
+            skill_version=skill.skill_version,
+        )
+        if not published_projection_matches(skill, projection):
+            raise ValueError("insufficient_evidence")
+
+        bindings: tuple[SkillCapabilityBindingOutput, ...] = ()
+        enabled_capabilities: tuple[str, ...] = ()
+        if arguments.connection_id is not None:
+            runtime = await _runtime_from(runtime_factory)
+            bindings, enabled_capabilities = await _enabled_skill_capability_bindings(
+                runtime,
+                skill=skill,
+                membership=membership,
+                workspace_id=arguments.workspace_id,
+                principal=principal,
+                connection_id=arguments.connection_id,
+            )
+
+        knowledge_results: Sequence[SearchResult] = ()
+        if {"knowledge_source", "citation"}.intersection(skill.evidence_requirements):
+            knowledge_results = await asyncio.to_thread(
+                store.search_workspace_knowledge,
+                tenant_id=membership.tenant_id,
+                workspace_id=arguments.workspace_id,
+                auth_user_id=principal.subject,
+                query=arguments.query,
+                filters=dict(skill.knowledge_filters),
+                top_k=12,
+                mode="hybrid",
+            )
+        knowledge = _knowledge_result_outputs(knowledge_results) if knowledge_results else []
+        route = resolve_published_skill_route(
+            skill,
+            projection=projection,
+            enabled_capabilities=enabled_capabilities,
+            business_fact_count=sum(len(evidence.facts) for evidence in arguments.host_evidence),
+            knowledge_source_count=len({item.citation.source_id for item in knowledge}),
+            citation_count=len(knowledge),
+        )
+        if route["status"] != "ready":
+            raise ValueError("insufficient_evidence")
+        response = RunAccountingSkillOutput(
+            workspace_id=arguments.workspace_id,
+            connection_id=arguments.connection_id,
+            data=RunAccountingSkillData(
+                skill_id=skill.skill_id,
+                skill_version=skill.skill_version,
+                output_schema_name=skill.output_schema_name,
+                capability_bindings=list(bindings),
+                knowledge=knowledge,
+                host_evidence_count=len(arguments.host_evidence),
+                allowed_action_classes=list(skill.allowed_action_classes),
+                blocked_action_classes=list(skill.blocked_action_classes),
+            ),
+            accountant_review_points=[],
+            next_allowed_actions=[],
+        )
+        await _write_audit(
+            audit_recorder,
+            _skill_audit_event(
+                workspace_id=arguments.workspace_id,
+                connection_id=arguments.connection_id,
+                skill=skill,
+                query=arguments.query,
+                capability_count=len(bindings),
+                knowledge_count=len(knowledge),
+                host_evidence_count=len(arguments.host_evidence),
+            ),
+        )
+        return response
+    except Exception as error:
+        raise MercuryV1ToolError(public_error_code(error)) from None
+    finally:
+        if runtime is not None:
+            await _close_runtime(runtime)
+
+
 async def disconnect_provider(
     context: Context,
     *,
@@ -1111,18 +1553,20 @@ def _published_output_contract(success_schema: Mapping[str, Any]) -> dict[str, o
     duplicate_definitions = set(success_definitions) & set(error_definitions)
     if duplicate_definitions:
         raise RuntimeError("mercury_v1_output_schema_invalid")
-    return {
-        "$defs": {
-            **success_definitions,
-            **error_definitions,
-            "Success": success,
-            "MercuryV1ErrorOutput": error,
-        },
-        "oneOf": [
-            {"$ref": "#/$defs/Success"},
-            {"$ref": "#/$defs/MercuryV1ErrorOutput"},
-        ],
-    }
+    return non_nullable_public_schema(
+        {
+            "$defs": {
+                **success_definitions,
+                **error_definitions,
+                "Success": success,
+                "MercuryV1ErrorOutput": error,
+            },
+            "oneOf": [
+                {"$ref": "#/$defs/Success"},
+                {"$ref": "#/$defs/MercuryV1ErrorOutput"},
+            ],
+        }
+    )
 
 
 def _success_output_schema(registered: Any) -> dict[str, Any]:
@@ -1143,6 +1587,7 @@ def configure_v1_tools(
     enabled: bool,
     service_factory: WorkspaceServiceFactory = _workspace_service,
     runtime_factory: ProviderRuntimeFactory | None = None,
+    store_factory: RagStoreFactory = _rag_store,
 ) -> None:
     """Register the stable V1 surface and remove legacy tools when V1 is enabled."""
 
@@ -1152,6 +1597,7 @@ def configure_v1_tools(
             enabled=enabled,
             service_factory=service_factory,
             runtime_factory=runtime_factory,
+            store_factory=store_factory,
         )
 
 
@@ -1161,6 +1607,7 @@ def _configure_v1_tools(
     enabled: bool,
     service_factory: WorkspaceServiceFactory,
     runtime_factory: ProviderRuntimeFactory | None,
+    store_factory: RagStoreFactory,
 ) -> None:
     if not enabled:
         publisher = getattr(server, "_mercury_v1_generated_provider_tools", None)
@@ -1270,6 +1717,102 @@ def _configure_v1_tools(
             runtime_factory=runtime_factory,
         )
 
+    async def search_knowledge_tool(
+        context: Context,
+        workspace_id: UUID,
+        query: Annotated[str, Field(min_length=1, max_length=2_000)],
+        filters: KnowledgeFiltersInput = None,  # type: ignore[assignment]
+        top_k: Annotated[int, Field(ge=1, le=20)] = 8,
+        mode: Literal["keyword", "hybrid"] = "hybrid",
+    ) -> SearchKnowledgeOutput:
+        return await search_knowledge(
+            context,
+            workspace_id=workspace_id,
+            query=query,
+            filters=filters,
+            top_k=top_k,
+            mode=mode,
+            service_factory=service_factory,
+            store_factory=store_factory,
+        )
+
+    async def retrieve_context_pack_tool(
+        context: Context,
+        workspace_id: UUID,
+        query: Annotated[str, Field(min_length=1, max_length=2_000)],
+        skill_id: Annotated[str | None, Field(max_length=200)] = None,
+        skill_version: Annotated[str | None, Field(max_length=64)] = None,
+        filters: KnowledgeFiltersInput = None,  # type: ignore[assignment]
+        max_chunks: Annotated[int, Field(ge=1, le=20)] = 12,
+    ) -> RetrieveContextPackOutput:
+        return await retrieve_context_pack(
+            context,
+            workspace_id=workspace_id,
+            query=query,
+            skill_id=skill_id,
+            skill_version=skill_version,
+            filters=filters,
+            max_chunks=max_chunks,
+            service_factory=service_factory,
+            store_factory=store_factory,
+        )
+
+    async def run_accounting_skill_tool(
+        context: Context,
+        workspace_id: UUID,
+        skill_id: str,
+        skill_version: str,
+        query: str,
+        connection_id: UUID | None = None,
+        connector_id: str | None = None,
+        connection_mode: str | None = None,
+        environment: str | None = None,
+        company_name: str | None = None,
+        notes: str | None = None,
+        host_evidence: list[HostConnectedEvidenceInput] | None = None,
+        period_start: date | None = None,
+        period_end: date | None = None,
+        month: str | None = None,
+        document_ids: list[str] | None = None,
+        objective: str | None = None,
+        source_reference: str | None = None,
+        marketplace_source: str | None = None,
+    ) -> RunAccountingSkillOutput:
+        values: dict[str, Any] = {
+            "workspace_id": workspace_id,
+            "skill_id": skill_id,
+            "skill_version": skill_version,
+            "query": query,
+        }
+        optional_values = {
+            "connection_id": connection_id,
+            "connector_id": connector_id,
+            "connection_mode": connection_mode,
+            "environment": environment,
+            "company_name": company_name,
+            "notes": notes,
+            "period_start": period_start,
+            "period_end": period_end,
+            "month": month,
+            "objective": objective,
+            "source_reference": source_reference,
+            "marketplace_source": marketplace_source,
+        }
+        values.update(
+            {field: value for field, value in optional_values.items() if value is not None}
+        )
+        if host_evidence:
+            values["host_evidence"] = host_evidence
+        if document_ids:
+            values["document_ids"] = document_ids
+        return await run_accounting_skill(
+            context,
+            arguments=RunAccountingSkillArguments.model_validate(values),
+            service_factory=service_factory,
+            store_factory=store_factory,
+            runtime_factory=runtime_factory,
+        )
+
     async def disconnect_provider_tool(
         context: Context,
         workspace_id: UUID,
@@ -1340,6 +1883,30 @@ def _configure_v1_tools(
             _CLOSED_READ,
         ),
         (
+            search_knowledge_tool,
+            SEARCH_KNOWLEDGE_TOOL,
+            "Changes: records a sanitized knowledge audit. External contact: "
+            "Mercury's PostgreSQL knowledge store only. Omitted options: vector-only "
+            "retrieval and unknown filters are not accepted.",
+            _AUDIT_ONLY,
+        ),
+        (
+            retrieve_context_pack_tool,
+            RETRIEVE_CONTEXT_PACK_TOOL,
+            "Changes: records a sanitized context audit. External contact: "
+            "Mercury's PostgreSQL knowledge store only. Omitted options: unpublished "
+            "Skill versions and uncited context are not returned.",
+            _AUDIT_ONLY,
+        ),
+        (
+            run_accounting_skill_tool,
+            RUN_ACCOUNTING_SKILL_TOOL,
+            "Changes: validates evidence and records a sanitized Skill audit. "
+            "External contact: qualified provider reads may be used. Omitted options: "
+            "provider create, capability discovery, qualification, and enablement.",
+            _SKILL_RUN,
+        ),
+        (
             disconnect_provider_tool,
             DISCONNECT_PROVIDER_TOOL,
             "Changes: removes usable local provider authorization. External contact: "
@@ -1363,10 +1930,20 @@ def _configure_v1_tools(
         argument_model=StartProviderConnectionArguments,
         schema=start_provider_connection_input_schema(),
     )
+    server.set_tool_input_contract(
+        RUN_ACCOUNTING_SKILL_TOOL,
+        argument_model=RunAccountingSkillArguments,
+        schema=run_accounting_skill_input_schema(),
+    )
     for name in V1_HOSTED_TOOL_NAMES:
         registered = server._tool_manager.get_tool(name)
         if registered is None:
             raise RuntimeError("mercury_v1_output_schema_invalid")
+        server.set_tool_input_contract(
+            name,
+            argument_model=registered.fn_metadata.arg_model,
+            schema=non_nullable_public_schema(registered.parameters),
+        )
         server.set_tool_output_contract(
             name,
             schema=_published_output_contract(_success_output_schema(registered)),
@@ -1383,6 +1960,10 @@ __all__ = [
     "LIST_PROVIDER_CAPABILITIES_TOOL",
     "LIST_PROVIDER_CONNECTIONS_TOOL",
     "ProviderRuntimeFactory",
+    "RETRIEVE_CONTEXT_PACK_TOOL",
+    "RUN_ACCOUNTING_SKILL_TOOL",
+    "RagStoreFactory",
+    "SEARCH_KNOWLEDGE_TOOL",
     "START_PROVIDER_CONNECTION_TOOL",
     "WorkspaceServiceFactory",
     "configure_v1_tools",
@@ -1395,5 +1976,8 @@ __all__ = [
     "list_provider_connections",
     "refresh_generated_provider_tools",
     "refresh_generated_provider_tools_until_stopped",
+    "retrieve_context_pack",
+    "run_accounting_skill",
+    "search_knowledge",
     "start_provider_connection",
 ]

@@ -2,17 +2,35 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Annotated, Literal, TypeAlias
+from collections.abc import Mapping
+from copy import deepcopy
+from datetime import date, datetime
+from typing import Annotated, Any, Literal, TypeAlias
 from uuid import UUID
 
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    TypeAdapter,
+    create_model,
+    model_validator,
+)
 
 from mercury_tools.catalog.models import QualificationState
 from mercury_tools.providers.models import (
     ConnectionReadiness,
     ProviderId,
+)
+from mercury_tools.skills.catalog import (
+    ACCOUNTING_SKILL_CATALOG,
+    HostConnectedEvidenceInput,
+    SkillConnectionMode,
+    SkillConnectorId,
+    SkillEnvironment,
+    published_accounting_skill,
 )
 from mercury_tools.workspaces.models import NextAllowedAction, WorkspaceRole
 
@@ -23,6 +41,39 @@ HTTPS_URL_PATTERN = r"^https://[^\s]+$"
 
 class V1PublicModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+
+def non_nullable_public_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
+    """Publish optional properties by omission without accepting JSON null."""
+
+    def normalize(value: Any) -> Any:
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+
+        normalized = {key: normalize(item) for key, item in value.items()}
+        variants = normalized.get("anyOf")
+        if isinstance(variants, list):
+            non_null = [
+                variant
+                for variant in variants
+                if not (isinstance(variant, dict) and variant.get("type") == "null")
+            ]
+            if len(non_null) != len(variants):
+                normalized.pop("default", None)
+                if len(non_null) == 1 and isinstance(non_null[0], dict):
+                    annotations = {key: item for key, item in normalized.items() if key != "anyOf"}
+                    return {**non_null[0], **annotations}
+                normalized["anyOf"] = non_null
+        schema_type = normalized.get("type")
+        if isinstance(schema_type, list) and "null" in schema_type:
+            non_null_types = [item for item in schema_type if item != "null"]
+            normalized.pop("default", None)
+            normalized["type"] = non_null_types[0] if len(non_null_types) == 1 else non_null_types
+        return normalized
+
+    return normalize(deepcopy(dict(schema)))
 
 
 class GetMercuryContextInput(V1PublicModel):
@@ -107,10 +158,6 @@ class CapabilitySchemaInput(V1PublicModel):
     capability_version: str = Field(pattern=SHA256_PATTERN)
 
 
-class DisconnectProviderInput(ConnectionInput):
-    confirmation: Literal["DISCONNECT"]
-
-
 class V1Notice(V1PublicModel):
     code: str = Field(min_length=1, max_length=100, pattern=r"^[a-z][a-z0-9_]*$")
     message: str = Field(min_length=1, max_length=500)
@@ -124,6 +171,211 @@ class V1SuccessEnvelope(V1PublicModel):
         default_factory=list,
         max_length=20,
     )
+
+
+class KnowledgeFiltersInput(V1PublicModel):
+    jurisdiction: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+    )
+    provider: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+    )
+    doc_type: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+    )
+    review_status: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+    )
+    effective_on: date | None = None
+    source_id: UUID | None = None
+    capability_version: str | None = Field(
+        default=None,
+        pattern=SHA256_PATTERN,
+    )
+
+
+class KnowledgeCitationOutput(V1PublicModel):
+    source_id: UUID
+    source_title: str = Field(min_length=1, max_length=500)
+    source_uri: str = Field(min_length=1, max_length=2_000)
+    source_url: str | None = Field(default=None, max_length=4_000)
+    heading: str | None = Field(default=None, max_length=1_000)
+
+
+class KnowledgeResultOutput(V1PublicModel):
+    chunk_id: UUID
+    document_id: UUID
+    document_uri: str = Field(min_length=1, max_length=2_000)
+    chunk_uri: str = Field(min_length=1, max_length=2_000)
+    text: str = Field(min_length=1, max_length=100_000)
+    score: float = Field(ge=0)
+    jurisdiction: str | None = Field(default=None, max_length=200)
+    provider: str | None = Field(default=None, max_length=200)
+    doc_type: str | None = Field(default=None, max_length=200)
+    review_status: Literal["reviewed"]
+    effective_on: date | None = None
+    citation: KnowledgeCitationOutput
+
+
+class SearchKnowledgeOutput(V1SuccessEnvelope):
+    workspace_id: UUID
+    query: str = Field(min_length=1, max_length=2_000)
+    data: list[KnowledgeResultOutput] = Field(min_length=1, max_length=20)
+
+
+class RetrieveContextPackOutput(V1SuccessEnvelope):
+    workspace_id: UUID
+    query: str = Field(min_length=1, max_length=2_000)
+    skill_id: str | None = Field(default=None, max_length=200)
+    skill_version: str | None = Field(default=None, max_length=64)
+    data: list[KnowledgeResultOutput] = Field(min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def require_complete_skill_identity(self) -> RetrieveContextPackOutput:
+        if (self.skill_id is None) != (self.skill_version is None):
+            raise ValueError("published_skill_identity_invalid")
+        return self
+
+
+class SkillCapabilityBindingOutput(V1PublicModel):
+    skill_capability: str = Field(pattern=CAPABILITY_ID_PATTERN, max_length=200)
+    capability_id: str = Field(pattern=CAPABILITY_ID_PATTERN, max_length=200)
+    capability_version: str = Field(pattern=SHA256_PATTERN)
+
+
+class RunAccountingSkillData(V1PublicModel):
+    skill_id: str = Field(min_length=1, max_length=200)
+    skill_version: str = Field(min_length=1, max_length=64)
+    output_schema_name: str = Field(min_length=1, max_length=200)
+    capability_bindings: list[SkillCapabilityBindingOutput] = Field(max_length=100)
+    knowledge: list[KnowledgeResultOutput] = Field(max_length=20)
+    host_evidence_count: int = Field(ge=0, le=100)
+    allowed_action_classes: list[Literal["provider_read"]] = Field(max_length=10)
+    blocked_action_classes: list[
+        Literal["provider_create", "provider_update", "provider_delete"]
+    ] = Field(max_length=10)
+
+
+class RunAccountingSkillOutput(V1SuccessEnvelope):
+    workspace_id: UUID
+    connection_id: UUID | None = None
+    data: RunAccountingSkillData
+
+
+class RunAccountingSkillArguments(ArgModelBase):
+    """Flat runtime model validated against one exact published Skill branch."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    workspace_id: UUID
+    connection_id: UUID | None = None
+    skill_id: str
+    skill_version: str
+    query: str = Field(min_length=1, max_length=20_000)
+    connector_id: SkillConnectorId | None = None
+    connection_mode: SkillConnectionMode | None = None
+    environment: SkillEnvironment | None = None
+    company_name: str | None = Field(default=None, max_length=500)
+    notes: str | None = Field(default=None, max_length=10_000)
+    host_evidence: list[HostConnectedEvidenceInput] = Field(
+        default_factory=list,
+        max_length=100,
+    )
+    period_start: date | None = None
+    period_end: date | None = None
+    month: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}$")
+    document_ids: list[str] = Field(default_factory=list, max_length=200)
+    objective: str | None = Field(default=None, max_length=5_000)
+    source_reference: str | None = Field(default=None, max_length=500)
+    marketplace_source: str | None = Field(default=None, max_length=200)
+
+    @model_validator(mode="after")
+    def validate_exact_published_branch(self) -> RunAccountingSkillArguments:
+        skill = published_accounting_skill(self.skill_id, self.skill_version)
+        if skill is None:
+            raise ValueError("published_skill_not_found")
+        if skill.required_capabilities and self.connection_id is None:
+            raise ValueError("provider_connection_required")
+
+        controls = {"workspace_id", "connection_id", "skill_id", "skill_version"}
+        unexpected = self.model_fields_set - controls - set(skill.input_schema.model_fields)
+        if unexpected:
+            raise ValueError("published_skill_input_invalid")
+        values = {
+            field: getattr(self, field)
+            for field in skill.input_schema.model_fields
+            if field in self.model_fields_set or field in {"query", "host_evidence"}
+        }
+        skill.input_schema.model_validate(values)
+        return self
+
+
+def _published_skill_branch_models() -> tuple[type[BaseModel], ...]:
+    models: list[type[BaseModel]] = []
+    for skill in ACCOUNTING_SKILL_CATALOG:
+        model_name = "".join(part.title() for part in skill.skill_id.split("-"))
+        connection_field: tuple[Any, Any] = (
+            (UUID, ...) if skill.required_capabilities else (UUID | None, None)
+        )
+        models.append(
+            create_model(
+                f"{model_name}V{skill.skill_version.replace('.', '_')}Input",
+                __base__=skill.input_schema,
+                workspace_id=(UUID, ...),
+                connection_id=connection_field,
+                skill_id=(Literal[skill.skill_id], ...),
+                skill_version=(Literal[skill.skill_version], ...),
+            )
+        )
+    return tuple(models)
+
+
+def run_accounting_skill_input_schema() -> dict[str, object]:
+    """Generate the root oneOf from the same immutable Skill input models."""
+
+    definitions: dict[str, object] = {}
+    branches: list[dict[str, str]] = []
+    discriminator_mapping: dict[str, str] = {}
+    for model in _published_skill_branch_models():
+        schema = model.model_json_schema()
+        nested = schema.pop("$defs", {})
+        for name, definition in nested.items():
+            existing = definitions.get(name)
+            if existing is not None and existing != definition:
+                raise RuntimeError("published_skill_schema_collision")
+            definitions[name] = definition
+        definitions[model.__name__] = schema
+        reference = f"#/$defs/{model.__name__}"
+        branches.append({"$ref": reference})
+        skill_id = schema["properties"]["skill_id"]["const"]
+        discriminator_mapping[skill_id] = reference
+    return non_nullable_public_schema(
+        {
+            "$defs": definitions,
+            "discriminator": {
+                "propertyName": "skill_id",
+                "mapping": discriminator_mapping,
+            },
+            "oneOf": branches,
+            "title": "run_accounting_skillArguments",
+        }
+    )
+
+
+class DisconnectProviderInput(ConnectionInput):
+    confirmation: Literal["DISCONNECT"]
 
 
 class ProviderReadEnvelope(V1SuccessEnvelope):
@@ -360,6 +612,10 @@ __all__ = [
     "GetMercuryContextInput",
     "GetMercuryContextOutput",
     "HTTPS_URL_PATTERN",
+    "HostConnectedEvidenceInput",
+    "KnowledgeCitationOutput",
+    "KnowledgeFiltersInput",
+    "KnowledgeResultOutput",
     "ListAccountingProvidersOutput",
     "ListProviderCapabilitiesOutput",
     "ListProviderConnectionsOutput",
@@ -373,7 +629,13 @@ __all__ = [
     "ProviderReadEnvelope",
     "ProviderConnectionStart",
     "ReviewedCapabilitySchemaOutput",
+    "RetrieveContextPackOutput",
+    "RunAccountingSkillArguments",
+    "RunAccountingSkillData",
+    "RunAccountingSkillOutput",
     "SHA256_PATTERN",
+    "SearchKnowledgeOutput",
+    "SkillCapabilityBindingOutput",
     "StartProviderConnectionArguments",
     "StartProviderConnectionOutput",
     "V1Notice",
@@ -381,5 +643,7 @@ __all__ = [
     "V1SuccessEnvelope",
     "WorkspaceInput",
     "WorkspaceMembershipOutput",
+    "non_nullable_public_schema",
+    "run_accounting_skill_input_schema",
     "start_provider_connection_input_schema",
 ]

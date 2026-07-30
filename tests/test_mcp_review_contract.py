@@ -338,9 +338,7 @@ def test_review_resolves_strict_root_refs(definitions_key: str) -> None:
 def test_review_rejects_unconstrained_nested_refs_at_the_use_path(
     definitions_key: str,
 ) -> None:
-    schema = _strict_root(
-        {"filters": {"$ref": f"#/{definitions_key}/LooseFilter"}}
-    )
+    schema = _strict_root({"filters": {"$ref": f"#/{definitions_key}/LooseFilter"}})
     schema[definitions_key] = {"LooseFilter": {}}
 
     _assert_issue(
@@ -362,9 +360,7 @@ def test_review_rejects_cyclic_local_refs_with_an_actionable_use_path() -> None:
 
 def test_review_resolves_local_pointer_through_array_indexes() -> None:
     schema = _strict_root({"choice": {"$ref": "#/$defs/Choice/anyOf/0"}})
-    schema["$defs"] = {
-        "Choice": {"anyOf": [{"type": "string"}, {"type": "integer"}]}
-    }
+    schema["$defs"] = {"Choice": {"anyOf": [{"type": "string"}, {"type": "integer"}]}}
 
     assert _issues(_tool(schema=schema)) == []
 
@@ -392,18 +388,13 @@ def test_review_rejects_invalid_or_external_local_pointer_references(
     message: str,
 ) -> None:
     schema = _strict_root({"choice": {"$ref": reference}})
-    schema["$defs"] = {
-        "Choice": {"anyOf": [{"type": "string"}, {"type": "integer"}]}
-    }
+    schema["$defs"] = {"Choice": {"anyOf": [{"type": "string"}, {"type": "integer"}]}}
 
     _assert_issue(_tool(schema=schema), "choice.$ref", message)
 
 
 def test_review_caps_local_ref_depth_with_an_actionable_use_path() -> None:
-    definitions = {
-        f"Level{index}": {"$ref": f"#/$defs/Level{index + 1}"}
-        for index in range(33)
-    }
+    definitions = {f"Level{index}": {"$ref": f"#/$defs/Level{index + 1}"} for index in range(33)}
     definitions["Level33"] = {"type": "string"}
     schema = _strict_root({"filters": {"$ref": "#/$defs/Level0"}})
     schema["$defs"] = definitions
@@ -807,6 +798,9 @@ def test_behavior_matrix_covers_every_stable_v1_tool_with_exact_annotations() ->
         "connector_status": (False, False, False, False, True),
         "list_provider_capabilities": (True, False, None, False, True),
         "get_capability_schema": (True, False, None, False, True),
+        "search_knowledge": (False, False, False, False, True),
+        "retrieve_context_pack": (False, False, False, False, True),
+        "run_accounting_skill": (False, False, False, True, True),
         "disconnect_provider": (False, True, True, True, True),
     }
 
