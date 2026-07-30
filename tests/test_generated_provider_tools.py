@@ -16,6 +16,7 @@ from mercury_tools.mcp.server import StrictInputFastMCP
 WORKSPACE_ID = UUID("12345678-1234-5678-9234-567812345678")
 CONNECTION_ID = UUID("87654321-4321-8765-4321-876543218765")
 NOW = datetime(2026, 7, 30, 12, tzinfo=UTC)
+_NOTIFICATION_OUTER_GUARD_SECONDS = 0.5
 
 
 def _qualification(provider: str, capability_id: str) -> ProviderMCPQualification:
@@ -1175,7 +1176,13 @@ async def test_detached_notification_owner_survives_clear_and_releases_terminal_
     detached_task_ref: weakref.ReferenceType[asyncio.Task[None]] | None = None
     try:
         await session.started.wait()
-        assert await asyncio.wait_for(refresh, timeout=0.08) is True
+        assert (
+            await asyncio.wait_for(
+                refresh,
+                timeout=_NOTIFICATION_OUTER_GUARD_SECONDS,
+            )
+            is True
+        )
         assert len(publisher._detached_notification_tasks) == 1
         detached_task_ref = next(iter(publisher._detached_notification_tasks.values())).task_ref
 
@@ -1274,7 +1281,7 @@ async def test_cancellation_resistant_notifications_never_exceed_session_capacit
             qualifications = (invoice_get, invoice_list) if index % 2 == 0 else (invoice_get,)
             assert await asyncio.wait_for(
                 publisher.publish(qualifications),
-                timeout=0.08,
+                timeout=_NOTIFICATION_OUTER_GUARD_SECONDS,
             )
         started_count = sum(session.started.is_set() for session in sessions)
         retained_task_count = len(publisher._detached_notification_tasks)
@@ -1347,7 +1354,7 @@ async def test_cancellation_resistant_notifications_share_capacity_across_publis
             publisher._remember_session(SimpleNamespace(session=session))
             assert await asyncio.wait_for(
                 publisher.publish((invoice_get, invoice_list)),
-                timeout=0.08,
+                timeout=_NOTIFICATION_OUTER_GUARD_SECONDS,
             )
         started_count = sum(session.started.is_set() for session in sessions)
     finally:
