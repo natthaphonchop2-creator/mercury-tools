@@ -685,9 +685,7 @@ def _service(
 
 
 @pytest.mark.asyncio
-async def test_disconnect_remotely_revokes_supported_flowaccount_authorization_before_returning() -> (
-    None
-):
+async def test_disconnect_revokes_supported_flowaccount_authorization_before_returning() -> None:
     service, oauth_client, _, _, connection_store, _ = _service()
     started = await service.start(
         _principal(),
@@ -770,9 +768,7 @@ async def test_disconnect_without_advertised_revocation_endpoint_is_local_only_a
 
 
 @pytest.mark.asyncio
-async def test_disconnect_records_revocation_obligation_after_remote_failure_and_is_idempotent() -> (
-    None
-):
+async def test_disconnect_records_revocation_obligation_after_remote_failure_idempotently() -> None:
     class FailedRevocationClient(FakeOAuthClient):
         async def revoke(
             self,
