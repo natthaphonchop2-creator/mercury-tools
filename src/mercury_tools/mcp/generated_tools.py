@@ -13,6 +13,7 @@ import weakref
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, ClassVar, Literal, TypeAlias
 from uuid import UUID
 
@@ -197,6 +198,12 @@ class _RefreshSession:
 
     def resolve(self) -> object | None:
         return self.weak_session() if self.weak_session is not None else self.strong_session
+
+
+@dataclass(frozen=True, slots=True)
+class _DetachedNotificationTask:
+    task_ref: weakref.ReferenceType[asyncio.Task[None]]
+    generation: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1037,7 +1044,8 @@ class GeneratedProviderToolPublisher:
         self._requested_generation = 0
         self._committed_generation = 0
         self._refresh_sessions: OrderedDict[int, _RefreshSession] = OrderedDict()
-        self._detached_notification_tasks: set[asyncio.Task[None]] = set()
+        self._detached_notification_tasks: dict[int, _DetachedNotificationTask] = {}
+        self._notification_retention_closed = False
         self._quarantined_versions: dict[tuple[str, str, str, str, str], _QuarantinedVersion] = {}
 
     async def publish(
@@ -1114,6 +1122,7 @@ class GeneratedProviderToolPublisher:
     def clear(self) -> bool:
         """Remove generated tools and retained sessions during disablement or shutdown."""
 
+        self._notification_retention_closed = True
         changed = False
         for name in tuple(self._published):
             if self._server._tool_manager.get_tool(name) is not None:
@@ -1121,8 +1130,13 @@ class GeneratedProviderToolPublisher:
             self._published.pop(name, None)
             changed = True
         self._refresh_sessions.clear()
-        for task in tuple(self._detached_notification_tasks):
-            task.cancel()
+        detached = tuple(
+            tracked.task_ref() for tracked in self._detached_notification_tasks.values()
+        )
+        self._detached_notification_tasks.clear()
+        for task in detached:
+            if task is not None:
+                task.cancel()
         return changed
 
     def _stage(
@@ -1342,12 +1356,16 @@ class GeneratedProviderToolPublisher:
             return
 
     def _remember_session(self, context: Context | object | None) -> None:
+        if self._notification_retention_closed:
+            return
         session = getattr(context, "session", None)
         if not callable(getattr(session, "send_tool_list_changed", None)):
             return
         now = time.monotonic()
         self._prune_refresh_sessions(now)
         key = id(session)
+        if key in self._active_detached_notification_keys():
+            return
         existing = self._refresh_sessions.get(key)
         if existing is not None:
             existing.last_seen_at = now
@@ -1382,6 +1400,8 @@ class GeneratedProviderToolPublisher:
                 self._refresh_sessions.pop(key, None)
 
     def _has_pending_refresh_notifications(self) -> bool:
+        if self._notification_retention_closed:
+            return False
         self._prune_refresh_sessions()
         return any(
             entry.notified_generation < self._committed_generation
@@ -1389,6 +1409,8 @@ class GeneratedProviderToolPublisher:
         )
 
     def _pending_refresh_sessions(self) -> list[tuple[int, object]]:
+        if self._notification_retention_closed:
+            return []
         self._prune_refresh_sessions()
         pending: list[tuple[int, object]] = []
         for key, entry in tuple(self._refresh_sessions.items()):
@@ -1401,7 +1423,8 @@ class GeneratedProviderToolPublisher:
             pending.append((key, session))
         return pending
 
-    async def _send_refresh_notification(self, session: object) -> None:
+    @staticmethod
+    async def _send_refresh_notification(session: object) -> None:
         sender = getattr(session, "send_tool_list_changed", None)
         if not callable(sender):
             raise TypeError("generated_refresh_session_invalid")
@@ -1414,18 +1437,21 @@ class GeneratedProviderToolPublisher:
         generation: int,
     ) -> None:
         for key, task in tasks.items():
-            entry = self._refresh_sessions.get(key)
-            if entry is None:
-                continue
             if task.cancelled():
-                self._refresh_sessions.pop(key, None)
+                if not self._notification_retention_closed:
+                    self._refresh_sessions.pop(key, None)
                 continue
             try:
                 task.result()
             except Exception:
-                self._refresh_sessions.pop(key, None)
+                if not self._notification_retention_closed:
+                    self._refresh_sessions.pop(key, None)
             else:
-                entry.notified_generation = max(entry.notified_generation, generation)
+                if self._notification_retention_closed:
+                    continue
+                entry = self._refresh_sessions.get(key)
+                if entry is not None:
+                    entry.notified_generation = max(entry.notified_generation, generation)
 
     def _finish_detached_notification(
         self,
@@ -1433,17 +1459,32 @@ class GeneratedProviderToolPublisher:
         generation: int,
         task: asyncio.Task[None],
     ) -> None:
-        self._detached_notification_tasks.discard(task)
-        entry = self._refresh_sessions.get(key)
+        tracked = self._detached_notification_tasks.get(key)
+        is_current = tracked is not None and tracked.task_ref() is task
+        if is_current:
+            self._detached_notification_tasks.pop(key, None)
         if task.cancelled():
             return
         try:
             task.result()
         except BaseException:
-            self._refresh_sessions.pop(key, None)
+            if is_current and not self._notification_retention_closed:
+                self._refresh_sessions.pop(key, None)
         else:
-            if entry is not None:
+            if is_current and not self._notification_retention_closed:
+                entry = self._refresh_sessions.get(key)
+                if entry is None:
+                    return
                 entry.notified_generation = max(entry.notified_generation, generation)
+
+    def _active_detached_notification_keys(self) -> set[int]:
+        for key, tracked in tuple(self._detached_notification_tasks.items()):
+            task = tracked.task_ref()
+            if task is None:
+                self._detached_notification_tasks.pop(key, None)
+            elif task.done():
+                self._finish_detached_notification(key, tracked.generation, task)
+        return set(self._detached_notification_tasks)
 
     def _detach_notification_tasks(
         self,
@@ -1455,23 +1496,41 @@ class GeneratedProviderToolPublisher:
         for key, task in tasks.items():
             if evict_sessions:
                 self._refresh_sessions.pop(key, None)
+            else:
+                entry = self._refresh_sessions.get(key)
+                if entry is not None and entry.weak_session is None:
+                    self._refresh_sessions.pop(key, None)
             task.cancel()
-            self._detached_notification_tasks.add(task)
+            if not self._notification_retention_closed:
+                self._detached_notification_tasks[key] = _DetachedNotificationTask(
+                    task_ref=weakref.ref(task),
+                    generation=generation,
+                )
             task.add_done_callback(
-                lambda completed, key=key: self._finish_detached_notification(
+                partial(
+                    _consume_detached_notification,
+                    weakref.ref(self),
                     key,
                     generation,
-                    completed,
                 )
             )
 
     async def _notify_refresh_sessions(self) -> None:
         """Notify pending request sessions concurrently within one total deadline."""
 
+        if self._notification_retention_closed:
+            return
         generation = self._committed_generation
+        active_keys = self._active_detached_notification_keys()
+        available = max(0, _MAX_REFRESH_SESSIONS - len(active_keys))
+        admitted = [
+            (key, session)
+            for key, session in self._pending_refresh_sessions()
+            if key not in active_keys
+        ][:available]
         tasks = {
             key: asyncio.create_task(self._send_refresh_notification(session))
-            for key, session in self._pending_refresh_sessions()
+            for key, session in admitted
         }
         if not tasks:
             return
@@ -1501,6 +1560,24 @@ class GeneratedProviderToolPublisher:
             generation=generation,
             evict_sessions=True,
         )
+
+
+def _consume_detached_notification(
+    publisher_ref: weakref.ReferenceType[GeneratedProviderToolPublisher],
+    key: int,
+    generation: int,
+    task: asyncio.Task[None],
+) -> None:
+    publisher = publisher_ref()
+    if publisher is not None:
+        publisher._finish_detached_notification(key, generation, task)
+        return
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except BaseException:
+        return
 
 
 async def _await_value(value: Any) -> Any:
