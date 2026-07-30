@@ -16,6 +16,9 @@ ROOT = Path(__file__).resolve().parents[2]
 TASK_11_MIGRATION = (
     ROOT / "supabase/migrations/20260726104000_mercury_v1_workspace_knowledge_scope.sql"
 )
+TASK_11_PUBLICATION_MIGRATION = (
+    ROOT / "supabase/migrations/20260731100000_mercury_v1_publish_first_party_skills.sql"
+)
 MIGRATIONS = (
     ROOT / "supabase/migrations/0001_mercury_tools_rag.sql",
     ROOT / "supabase/migrations/0003_match_knowledge_chunks_null_embedding.sql",
@@ -41,8 +44,11 @@ class PostgresContext:
     other_workspace_id: UUID
 
 
-def test_task11_migration_exists_before_postgres_setup() -> None:
+def test_task11_migrations_exist_before_postgres_setup() -> None:
     assert TASK_11_MIGRATION.exists(), "Task 11 migration is missing"
+    assert TASK_11_PUBLICATION_MIGRATION.exists(), (
+        "Task 11 first-party Skill publication migration is missing"
+    )
 
 
 def _docker_available() -> bool:
@@ -153,8 +159,8 @@ def _search_sql(
 def postgres_context() -> PostgresContext:
     if os.environ.get(_OPT_IN) != "1":
         pytest.skip(f"set {_OPT_IN}=1 to run disposable PostgreSQL regression")
-    if not TASK_11_MIGRATION.exists():
-        pytest.skip("Task 11 migration is missing")
+    if not TASK_11_MIGRATION.exists() or not TASK_11_PUBLICATION_MIGRATION.exists():
+        pytest.skip("Task 11 migration or publication path is missing")
     if not _docker_available():
         pytest.skip("Docker is unavailable for disposable PostgreSQL regression")
 
@@ -242,6 +248,9 @@ def postgres_context() -> PostgresContext:
         task_11_sql = TASK_11_MIGRATION.read_text(encoding="utf-8")
         _psql(container, task_11_sql)
         _psql(container, task_11_sql)
+        task_11_publication_sql = TASK_11_PUBLICATION_MIGRATION.read_text(encoding="utf-8")
+        _psql(container, task_11_publication_sql)
+        _psql(container, task_11_publication_sql)
 
         first_context = json.loads(
             _psql(
@@ -637,51 +646,160 @@ def test_only_exact_published_skill_versions_are_executable(
 def test_git_canonical_skill_projection_matches_postgres_hash_authority(
     postgres_context: PostgresContext,
 ) -> None:
-    from mercury_tools.skills.catalog import published_accounting_skill
+    from mercury_tools.skills.catalog import ACCOUNTING_SKILL_CATALOG
 
-    skill = published_accounting_skill("company-health-check-th", "0.1.0")
-    assert skill is not None
-    projection = json.dumps(
-        skill.published_projection(),
-        ensure_ascii=False,
-        sort_keys=True,
+    for skill in ACCOUNTING_SKILL_CATALOG:
+        rows = json.loads(
+            _psql(
+                postgres_context.container,
+                _service(
+                    f"""
+                    select coalesce(jsonb_agg(skill), '[]'::jsonb)::text
+                    from public.resolve_mercury_v1_published_skill(
+                      '{postgres_context.tenant_id}',
+                      '{postgres_context.workspace_id}',
+                      '{AUTH_USER_ID}',
+                      '{skill.skill_id}',
+                      '{skill.skill_version}'
+                    ) as skill;
+                    """
+                ),
+            )
+        )
+
+        assert rows == [
+            {
+                "skill_id": skill.skill_id,
+                "skill_version": skill.skill_version,
+                "projection": skill.published_projection(),
+                "projection_sha256": skill.projection_sha256,
+                "git_source_path": skill.git_source_path,
+                "publication_status": "published",
+            }
+        ]
+
+
+def test_release_publication_path_is_idempotent(
+    postgres_context: PostgresContext,
+) -> None:
+    from mercury_tools.skills.catalog import ACCOUNTING_SKILL_CATALOG
+
+    skill_ids = ", ".join(f"'{skill.skill_id}'" for skill in ACCOUNTING_SKILL_CATALOG)
+    query = _service(
+        f"""
+        select coalesce(
+          jsonb_agg(to_jsonb(skill) order by skill.skill_id),
+          '[]'::jsonb
+        )::text
+        from public.mercury_published_skills as skill
+        where skill.visibility_scope = 'global'
+          and skill.tenant_id is null
+          and skill.workspace_id is null
+          and skill.skill_id in ({skill_ids});
+        """
     )
+    before = json.loads(_psql(postgres_context.container, query))
+
     _psql(
         postgres_context.container,
-        f"""
-        insert into public.mercury_published_skills (
-          visibility_scope, tenant_id, workspace_id, skill_id,
-          skill_version, publication_status, projection,
-          projection_sha256, git_source_path
-        ) values (
-          'global', null, null, '{skill.skill_id}',
-          '{skill.skill_version}', 'published',
-          $projection${projection}$projection$::jsonb,
-          '{skill.projection_sha256}', '{skill.git_source_path}'
-        );
-        """,
+        TASK_11_PUBLICATION_MIGRATION.read_text(encoding="utf-8"),
+    )
+    after = json.loads(_psql(postgres_context.container, query))
+
+    assert after == before
+    assert len(after) == len(ACCOUNTING_SKILL_CATALOG)
+
+
+def test_release_publication_path_fails_closed_on_projection_mismatch(
+    postgres_context: PostgresContext,
+) -> None:
+    from mercury_tools.skills.catalog import ACCOUNTING_SKILL_CATALOG
+
+    skill = ACCOUNTING_SKILL_CATALOG[0]
+    projection = skill.published_projection()
+    projection["summary"] = "deliberately mismatched release projection"
+    serialized = json.dumps(projection, ensure_ascii=False, sort_keys=True)
+    identity_predicate = (
+        "visibility_scope = 'global' "
+        "and tenant_id is null "
+        "and workspace_id is null "
+        f"and skill_id = '{skill.skill_id}' "
+        f"and skill_version = '{skill.skill_version}'"
     )
 
-    rows = json.loads(
+    try:
         _psql(
             postgres_context.container,
-            _service(
-                f"""
-                select coalesce(jsonb_agg(skill), '[]'::jsonb)::text
-                from public.resolve_mercury_v1_published_skill(
-                  '{postgres_context.tenant_id}',
-                  '{postgres_context.workspace_id}',
-                  '{AUTH_USER_ID}',
-                  '{skill.skill_id}',
-                  '{skill.skill_version}'
-                ) as skill;
-                """
-            ),
+            f"""
+            delete from public.mercury_published_skills
+            where {identity_predicate};
+            insert into public.mercury_published_skills (
+              visibility_scope, tenant_id, workspace_id, skill_id,
+              skill_version, publication_status, projection,
+              projection_sha256, git_source_path
+            ) values (
+              'global', null, null, '{skill.skill_id}',
+              '{skill.skill_version}', 'published',
+              $projection${serialized}$projection$::jsonb,
+              encode(digest(
+                public.mercury_canonical_jsonb(
+                  $projection${serialized}$projection$::jsonb
+                ),
+                'sha256'
+              ), 'hex'),
+              '{skill.git_source_path}'
+            );
+            """,
         )
+
+        result = _psql_result(
+            postgres_context.container,
+            TASK_11_PUBLICATION_MIGRATION.read_text(encoding="utf-8"),
+        )
+
+        assert result.returncode != 0
+        assert "mercury_first_party_skill_publication_mismatch" in result.stderr
+        stored_summary = _psql(
+            postgres_context.container,
+            f"""
+            select projection ->> 'summary'
+            from public.mercury_published_skills
+            where {identity_predicate};
+            """,
+        )
+        assert stored_summary == "deliberately mismatched release projection"
+    finally:
+        _psql(
+            postgres_context.container,
+            f"""
+            delete from public.mercury_published_skills
+            where {identity_predicate};
+            """,
+        )
+        _psql(
+            postgres_context.container,
+            TASK_11_PUBLICATION_MIGRATION.read_text(encoding="utf-8"),
+        )
+
+
+def test_runtime_roles_cannot_mutate_published_skills(
+    postgres_context: PostgresContext,
+) -> None:
+    statements = (
+        "insert into public.mercury_published_skills default values;",
+        """
+        update public.mercury_published_skills
+        set publication_status = publication_status
+        where false;
+        """,
+        "delete from public.mercury_published_skills where false;",
     )
 
-    assert len(rows) == 1
-    assert rows[0]["skill_id"] == skill.skill_id
-    assert rows[0]["skill_version"] == skill.skill_version
-    assert rows[0]["projection_sha256"] == skill.projection_sha256
-    assert rows[0]["git_source_path"] == skill.git_source_path
+    for role in ("anon", "authenticated", "service_role"):
+        for statement in statements:
+            result = _psql_result(
+                postgres_context.container,
+                f"set role {role};\n{statement}",
+            )
+            assert result.returncode != 0
+            assert "permission denied for table mercury_published_skills" in result.stderr
