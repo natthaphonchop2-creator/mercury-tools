@@ -14,6 +14,7 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
+from threading import Lock
 from typing import Any, ClassVar, Literal, TypeAlias
 from uuid import UUID
 
@@ -204,6 +205,50 @@ class _RefreshSession:
 class _DetachedNotificationTask:
     task_ref: weakref.ReferenceType[asyncio.Task[None]]
     generation: int
+
+
+class _RefreshNotificationTaskOwner:
+    """Bound and consume notification tasks without retaining their publishers."""
+
+    def __init__(self) -> None:
+        self._tasks: set[asyncio.Task[None]] = set()
+        self._lock = Lock()
+
+    def create_task(
+        self,
+        coroutine_factory: Callable[[], Awaitable[None]],
+    ) -> asyncio.Task[None] | None:
+        with self._lock:
+            self._consume_completed_locked()
+            if len(self._tasks) >= max(0, _MAX_REFRESH_SESSIONS):
+                return None
+            task = asyncio.create_task(coroutine_factory())
+            self._tasks.add(task)
+        task.add_done_callback(self._consume)
+        return task
+
+    def _consume_completed_locked(self) -> None:
+        for task in tuple(self._tasks):
+            if task.done():
+                self._consume_result(task)
+                self._tasks.discard(task)
+
+    def _consume(self, task: asyncio.Task[None]) -> None:
+        self._consume_result(task)
+        with self._lock:
+            self._tasks.discard(task)
+
+    @staticmethod
+    def _consume_result(task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except BaseException:
+            return
+
+
+_REFRESH_NOTIFICATION_TASK_OWNER = _RefreshNotificationTaskOwner()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1528,10 +1573,14 @@ class GeneratedProviderToolPublisher:
             for key, session in self._pending_refresh_sessions()
             if key not in active_keys
         ][:available]
-        tasks = {
-            key: asyncio.create_task(self._send_refresh_notification(session))
-            for key, session in admitted
-        }
+        tasks: dict[int, asyncio.Task[None]] = {}
+        for key, session in admitted:
+            task = _REFRESH_NOTIFICATION_TASK_OWNER.create_task(
+                partial(GeneratedProviderToolPublisher._send_refresh_notification, session)
+            )
+            if task is None:
+                break
+            tasks[key] = task
         if not tasks:
             return
         try:

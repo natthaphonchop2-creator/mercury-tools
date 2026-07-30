@@ -1126,7 +1126,7 @@ async def test_cancelled_committed_refresh_retries_pending_notification_without_
 
 
 @pytest.mark.asyncio
-async def test_clear_releases_detached_notification_ownership_and_consumes_late_failure(
+async def test_detached_notification_owner_survives_clear_and_releases_terminal_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import mercury_tools.mcp.generated_tools as generated_tools
@@ -1165,15 +1165,19 @@ async def test_clear_releases_detached_notification_ownership_and_consumes_late_
     publisher = GeneratedProviderToolPublisher(server, execute=execute)
     await publisher.publish((invoice_get,))
     session = ResistantSession()
+    session_ref = weakref.ref(session)
     publisher._remember_session(SimpleNamespace(session=session))
     loop = asyncio.get_running_loop()
     exception_contexts: list[dict[str, object]] = []
     previous_handler = loop.get_exception_handler()
     loop.set_exception_handler(lambda _loop, context: exception_contexts.append(context))
     refresh = asyncio.create_task(publisher.publish((invoice_get, invoice_list)))
+    detached_task_ref: weakref.ReferenceType[asyncio.Task[None]] | None = None
     try:
         await session.started.wait()
         assert await asyncio.wait_for(refresh, timeout=0.08) is True
+        assert len(publisher._detached_notification_tasks) == 1
+        detached_task_ref = next(iter(publisher._detached_notification_tasks.values())).task_ref
 
         publisher.clear()
         assert not publisher._refresh_sessions
@@ -1183,23 +1187,41 @@ async def test_clear_releases_detached_notification_ownership_and_consumes_late_
         assert not publisher._refresh_sessions
 
         publisher_ref = weakref.ref(publisher)
+        await asyncio.sleep(0)
         del publisher
+        del session
         gc.collect()
         assert publisher_ref() is None
+        assert detached_task_ref() is not None
+        assert session_ref() is not None
     finally:
-        session.release.set()
+        retained_session = session_ref()
+        if retained_session is not None:
+            retained_session.release.set()
         if not refresh.done():
             await refresh
-        await asyncio.wait_for(session.finished.wait(), timeout=0.1)
-        await asyncio.sleep(0)
-        gc.collect()
-        await asyncio.sleep(0)
+        if (
+            retained_session is not None
+            and detached_task_ref is not None
+            and detached_task_ref() is not None
+        ):
+            await asyncio.wait_for(retained_session.finished.wait(), timeout=0.1)
+        del retained_session
+        for _ in range(3):
+            await asyncio.sleep(0)
+            gc.collect()
         loop.set_exception_handler(previous_handler)
 
+    assert detached_task_ref is not None
+    assert detached_task_ref() is None
+    assert session_ref() is None
     assert not [
         context
         for context in exception_contexts
-        if "never retrieved" in str(context.get("message", "")).lower()
+        if any(
+            marker in str(context.get("message", "")).lower()
+            for marker in ("destroyed but it is pending", "never retrieved")
+        )
     ]
 
 
@@ -1271,6 +1293,78 @@ async def test_cancellation_resistant_notifications_never_exceed_session_capacit
 
     assert started_count <= 2
     assert retained_task_count <= 2
+
+
+@pytest.mark.asyncio
+async def test_cancellation_resistant_notifications_share_capacity_across_publishers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mercury_tools.mcp.generated_tools as generated_tools
+    from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
+
+    monkeypatch.setattr(generated_tools, "_MAX_REFRESH_SESSIONS", 2, raising=False)
+    monkeypatch.setattr(
+        generated_tools,
+        "_REFRESH_NOTIFICATION_TOTAL_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
+    )
+
+    class ResistantSession:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.finished = asyncio.Event()
+
+        async def send_tool_list_changed(self) -> None:
+            self.started.set()
+            while not self.release.is_set():
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    continue
+            self.finished.set()
+
+    invoice_get = _qualification("flowaccount", "documents.invoice.get")
+    invoice_list = _qualification("flowaccount", "documents.invoice.list")
+
+    async def execute(_context, **_kwargs):
+        raise AssertionError("refresh notification must not dispatch")
+
+    publishers = [
+        GeneratedProviderToolPublisher(
+            StrictInputFastMCP(f"Globally bounded generated refresh {index}"),
+            execute=execute,
+        )
+        for index in range(3)
+    ]
+    for publisher in publishers:
+        await publisher.publish((invoice_get,))
+    sessions = [ResistantSession() for _ in publishers]
+    started_count = 0
+    try:
+        for publisher, session in zip(publishers, sessions, strict=True):
+            publisher._remember_session(SimpleNamespace(session=session))
+            assert await asyncio.wait_for(
+                publisher.publish((invoice_get, invoice_list)),
+                timeout=0.08,
+            )
+        started_count = sum(session.started.is_set() for session in sessions)
+    finally:
+        for publisher in publishers:
+            publisher.clear()
+        for session in sessions:
+            session.release.set()
+        await asyncio.gather(
+            *(
+                asyncio.wait_for(session.finished.wait(), timeout=0.1)
+                for session in sessions
+                if session.started.is_set()
+            )
+        )
+        await asyncio.sleep(0)
+
+    assert started_count == 2
 
 
 @pytest.mark.asyncio
