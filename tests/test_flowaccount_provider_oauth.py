@@ -685,8 +685,9 @@ def _service(
 
 
 @pytest.mark.asyncio
-async def test_disconnect_remotely_revokes_supported_flowaccount_authorization_before_returning(
-) -> None:
+async def test_disconnect_remotely_revokes_supported_flowaccount_authorization_before_returning() -> (
+    None
+):
     service, oauth_client, _, _, connection_store, _ = _service()
     started = await service.start(
         _principal(),
@@ -729,8 +730,9 @@ async def test_disconnect_remotely_revokes_supported_flowaccount_authorization_b
 
 
 @pytest.mark.asyncio
-async def test_disconnect_without_advertised_revocation_endpoint_is_local_only_and_idempotent(
-) -> None:
+async def test_disconnect_without_advertised_revocation_endpoint_is_local_only_and_idempotent() -> (
+    None
+):
     class NoRevocationEndpointClient(FakeOAuthClient):
         async def start_authorization(self, **kwargs: object) -> OAuthAuthorizationSession:
             session = await super().start_authorization(**kwargs)  # type: ignore[arg-type]
@@ -768,8 +770,9 @@ async def test_disconnect_without_advertised_revocation_endpoint_is_local_only_a
 
 
 @pytest.mark.asyncio
-async def test_disconnect_records_revocation_obligation_after_remote_failure_and_is_idempotent(
-) -> None:
+async def test_disconnect_records_revocation_obligation_after_remote_failure_and_is_idempotent() -> (
+    None
+):
     class FailedRevocationClient(FakeOAuthClient):
         async def revoke(
             self,
@@ -814,8 +817,7 @@ async def test_disconnect_records_revocation_obligation_after_remote_failure_and
 
 
 @pytest.mark.asyncio
-async def test_disconnect_cancellation_deletes_local_credentials_and_remains_idempotent(
-) -> None:
+async def test_disconnect_cancellation_deletes_local_credentials_and_remains_idempotent() -> None:
     revocation_started = asyncio.Event()
 
     class BlockingRevocationClient(FakeOAuthClient):
@@ -1157,8 +1159,7 @@ async def test_disconnect_completes_awaitable_revocation_before_native_cancellat
 
 
 @pytest.mark.asyncio
-async def test_concurrent_disconnect_failure_reconciles_after_another_service_revokes(
-) -> None:
+async def test_concurrent_disconnect_failure_reconciles_after_another_service_revokes() -> None:
     class FailedRevocationClient(FakeOAuthClient):
         def __init__(self) -> None:
             super().__init__()
@@ -1234,9 +1235,7 @@ async def test_concurrent_disconnect_failure_reconciles_after_another_service_re
     )
 
     async def successful_disconnect():
-        return await success_service.disconnect(
-            _principal(), WORKSPACE_ID, connected.connection_id
-        )
+        return await success_service.disconnect(_principal(), WORKSPACE_ID, connected.connection_id)
 
     failed, succeeded = await asyncio.wait_for(
         asyncio.gather(

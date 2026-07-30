@@ -427,10 +427,10 @@ class FlowAccountDisconnectOutcome(_OAuthModel):
                 in {"revoked", "not_supported", "already_disconnected"}
             )
         else:
-            valid = (
-                self.provider_revocation_required is True
-                and self.remote_revocation_status in {"failed", "already_disconnected"}
-            )
+            valid = self.provider_revocation_required is True and self.remote_revocation_status in {
+                "failed",
+                "already_disconnected",
+            }
         if not valid:
             raise ValueError("provider_oauth_state_invalid")
         return self
@@ -1884,9 +1884,7 @@ class ProviderOAuthService:
         try:
             material = self._flowaccount_revocation_material(checked_connection)
             remote_revocation_status = (
-                "not_supported"
-                if material.revocation_endpoint is None
-                else "failed"
+                "not_supported" if material.revocation_endpoint is None else "failed"
             )
         except Exception:
             # A malformed or unreadable bound credential cannot be revoked, but its

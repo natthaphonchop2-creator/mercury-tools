@@ -355,9 +355,7 @@ def test_completed_revocation_cannot_be_restored_by_a_stale_backend_disconnect(
             """
         ),
     )
-    stale = json.loads(
-        _psql(postgres_context.container, _service(disconnect_sql))
-    )
+    stale = json.loads(_psql(postgres_context.container, _service(disconnect_sql)))
 
     assert stale["already_disconnected"] is True
     assert stale["provider_revocation_required"] is False

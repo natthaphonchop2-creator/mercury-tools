@@ -2557,7 +2557,9 @@ class SupabaseProviderConnectionStore:
                 provider_account_id=row["provider_account_id"],
                 account_display_name=row["account_display_name"],
                 authorization_method=row["authorization_method"],
-                granted_permissions=ProviderConnectionStore._permissions(row["granted_permissions"]),
+                granted_permissions=ProviderConnectionStore._permissions(
+                    row["granted_permissions"]
+                ),
                 readiness=row["readiness"],
                 revision=row["revision"],
                 last_validated_at=(

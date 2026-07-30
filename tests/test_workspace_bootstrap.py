@@ -18,9 +18,7 @@ from mercury_tools.auth.models import MercuryAuthError, MercuryPrincipal
 from mercury_tools.config import Settings, V1ConfigurationError
 
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATION_PATH = (
-    ROOT / "supabase/migrations/20260726100000_mercury_v1_identity.sql"
-)
+MIGRATION_PATH = ROOT / "supabase/migrations/20260726100000_mercury_v1_identity.sql"
 PRODUCT_LAYER_PATH = ROOT / "supabase/migrations/0002_mercury_product_layer.sql"
 
 SUBJECT = UUID("11111111-1111-4111-8111-111111111111")
@@ -269,9 +267,7 @@ def test_supabase_user_client_uses_publishable_key_and_end_user_bearer_only() ->
     assert payload["active_workspace_id"] == str(WORKSPACE_ID)
     assert len(seen) == 1
     request = seen[0]
-    assert request.url == (
-        "https://isolated.supabase.co/rest/v1/rpc/bootstrap_mercury_context"
-    )
+    assert request.url == ("https://isolated.supabase.co/rest/v1/rpc/bootstrap_mercury_context")
     assert request.headers["authorization"] == f"Bearer {ACCESS_TOKEN}"
     assert request.headers["apikey"] == "sb_publishable_isolated"
     assert "must-not-be-used" not in str(request.headers)
@@ -342,9 +338,7 @@ def test_supabase_user_client_refuses_redirects_from_injected_following_client()
     assert str(exc_info.value) == "supabase_user_request_failed"
     assert [request.url.host for request in seen] == ["isolated.supabase.co"]
     assert [
-        request.headers.get("apikey")
-        for request in seen
-        if request.url.host == "attacker.example"
+        request.headers.get("apikey") for request in seen if request.url.host == "attacker.example"
     ] == []
     assert ACCESS_TOKEN not in repr(exc_info.value)
 
@@ -459,12 +453,8 @@ def test_get_mercury_context_reads_actual_request_and_isolates_concurrent_tokens
         ) -> MercuryContext:
             with lock:
                 calls.append((principal.subject, access_token))
-            workspace_id = (
-                WORKSPACE_ID if principal.subject == SUBJECT else OTHER_WORKSPACE_ID
-            )
-            return MercuryContext.model_validate(
-                _context_payload(workspace_id=workspace_id)
-            )
+            workspace_id = WORKSPACE_ID if principal.subject == SUBJECT else OTHER_WORKSPACE_ID
+            return MercuryContext.model_validate(_context_payload(workspace_id=workspace_id))
 
     async def run() -> tuple[object, object]:
         return await asyncio.gather(
@@ -618,9 +608,7 @@ def test_enabled_registry_is_stable_during_concurrent_list_and_call(
             )
             return await super().list_tools()
 
-    server = RepeatedStartupConfigurationFastMCP(
-        "Mercury V1 concurrency contract"
-    )
+    server = RepeatedStartupConfigurationFastMCP("Mercury V1 concurrency contract")
     configure_v1_tools(server, enabled=True, service_factory=StubService)
     original_remove_tool = server.remove_tool
     original_add_tool = server.add_tool
@@ -646,15 +634,11 @@ def test_enabled_registry_is_stable_during_concurrent_list_and_call(
     def run_worker(worker_index: int) -> None:
         for operation_index in range(30):
             if (worker_index + operation_index) % 2 == 0:
-                names = {
-                    tool.name for tool in asyncio.run(server.list_tools())
-                }
+                names = {tool.name for tool in asyncio.run(server.list_tools())}
                 with result_lock:
                     listed_tools.append(names)
             else:
-                result = asyncio.run(
-                    server.call_tool(GET_MERCURY_CONTEXT_TOOL, {})
-                )
+                result = asyncio.run(server.call_tool(GET_MERCURY_CONTEXT_TOOL, {}))
                 with result_lock:
                     call_results.append(result)
 
@@ -710,20 +694,12 @@ def test_identity_migration_enforces_idempotent_personal_workspace_uniqueness() 
     body = _function_body(sql, "bootstrap_mercury_context")
 
     assert "create table if not exists public.mercury_tenants" in sql
+    assert "create unique index if not exists mercury_tenants_one_personal_per_auth_user_idx" in sql
     assert (
         "create unique index if not exists "
-        "mercury_tenants_one_personal_per_auth_user_idx"
-        in sql
+        "mercury_workspaces_one_automatic_default_per_auth_user_idx" in sql
     )
-    assert (
-        "create unique index if not exists "
-        "mercury_workspaces_one_automatic_default_per_auth_user_idx"
-        in sql
-    )
-    assert (
-        "create unique index if not exists mercury_workspace_members_auth_user_idx"
-        in sql
-    )
+    assert "create unique index if not exists mercury_workspace_members_auth_user_idx" in sql
     assert body.count("insert into public.mercury_tenants") == 1
     assert body.count("insert into public.mercury_workspaces") == 1
     assert body.count("insert into public.mercury_workspace_members") == 1
@@ -747,8 +723,7 @@ def test_identity_migration_enforces_idempotent_personal_workspace_uniqueness() 
         assert f"{field} = excluded.{field}" in workspace_conflict
     assert "updated_at = pg_catalog.statement_timestamp()" in workspace_conflict
     membership_conflict = body.split(
-        "on conflict (workspace_id, auth_user_id) "
-        "where auth_user_id is not null",
+        "on conflict (workspace_id, auth_user_id) where auth_user_id is not null",
         1,
     )[1].split("select coalesce(", 1)[0]
     assert "host_app = excluded.host_app" in membership_conflict
@@ -786,13 +761,9 @@ def test_identity_migration_rls_and_rpc_derive_identity_only_from_auth_uid() -> 
         sql,
     )
     assert (
-        "revoke all on function public.bootstrap_mercury_context() "
-        "from public, anon, authenticated"
+        "revoke all on function public.bootstrap_mercury_context() from public, anon, authenticated"
     ) in sql
-    assert (
-        "grant execute on function public.bootstrap_mercury_context() "
-        "to authenticated"
-    ) in sql
+    assert ("grant execute on function public.bootstrap_mercury_context() to authenticated") in sql
     assert "grant execute on function public.bootstrap_mercury_context() to anon" not in sql
     assert (
         "grant select on table public.mercury_tenants, "
