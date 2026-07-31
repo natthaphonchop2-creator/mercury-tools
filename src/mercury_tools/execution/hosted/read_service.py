@@ -45,6 +45,7 @@ MembershipResolver: TypeAlias = Callable[
 ]
 AuditRecorder: TypeAlias = Callable[[dict[str, object]], object | Awaitable[object]]
 Sleep: TypeAlias = Callable[[float], object | Awaitable[object]]
+DispatchGuard: TypeAlias = Callable[[ProviderMCPQualification], None]
 
 _MAX_SAFE_READ_ATTEMPTS = 2
 _RETRY_DELAYS = (0.05,)
@@ -192,12 +193,14 @@ class HostedReadService:
         membership_resolver: MembershipResolver,
         audit_recorder: AuditRecorder | None = None,
         sleep: Sleep | None = None,
+        dispatch_guard: DispatchGuard | None = None,
         close_runtime: bool = True,
     ) -> None:
         self._runtime_factory = runtime_factory
         self._membership_resolver = membership_resolver
         self._audit_recorder = audit_recorder
         self._sleep = sleep or asyncio.sleep
+        self._dispatch_guard = dispatch_guard
         self._close_runtime = close_runtime
 
     async def execute(
@@ -273,6 +276,7 @@ class HostedReadService:
                     driver,
                     connection=connection,
                     binding=binding,
+                    qualification=qualification,
                     inputs=checked_inputs,
                     deadline=deadline,
                     dispatch_state=dispatch_state,
@@ -338,6 +342,7 @@ class HostedReadService:
         *,
         connection: ProviderConnection,
         binding: Any,
+        qualification: ProviderMCPQualification,
         inputs: BaseModel,
         deadline: ProviderOperationDeadline,
         dispatch_state: _DispatchState,
@@ -346,6 +351,8 @@ class HostedReadService:
         call = hosted_read if callable(hosted_read) else driver.call
         for attempt in range(_MAX_SAFE_READ_ATTEMPTS):
             deadline.check()
+            if self._dispatch_guard is not None:
+                self._dispatch_guard(qualification)
             try:
                 result = await call(
                     connection,

@@ -402,6 +402,7 @@ class GeneratedProviderToolProjection:
             runtime_factory=self._runtime_factory or _provider_runtime,
             membership_resolver=bound_membership,
             audit_recorder=_record_connector_status_audit,
+            dispatch_guard=self.ensure_dispatch_allowed,
             close_runtime=self._close_runtime,
         )
         return await service.execute(
@@ -1580,6 +1581,7 @@ async def run_accounting_skill(
                 runtime_factory=lambda: runtime,
                 membership_resolver=resolve_membership,
                 audit_recorder=audit_recorder,
+                dispatch_guard=schema_change_guard,
                 close_runtime=False,
             )
             for mapping, binding in required_reads:

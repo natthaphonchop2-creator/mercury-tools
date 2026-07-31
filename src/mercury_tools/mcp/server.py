@@ -11,7 +11,6 @@ import re
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager, suppress
-from copy import copy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -240,6 +239,49 @@ class StrictInputFastMCP(FastMCP):
         except (LookupError, RuntimeError):
             return
         register(context)
+
+
+def _create_isolated_serving_mcp(
+    source: StrictInputFastMCP,
+    *,
+    streamable_http_path: str,
+) -> StrictInputFastMCP:
+    """Compose an HTTP registry whose protocol handlers close over itself."""
+
+    settings = source.settings.model_copy(deep=True)
+    serving = StrictInputFastMCP(
+        name=source.name,
+        instructions=source.instructions,
+        website_url=source.website_url,
+        icons=list(source.icons) if source.icons else None,
+        auth_server_provider=source._auth_server_provider,
+        token_verifier=source._token_verifier,
+        event_store=source._event_store,
+        retry_interval=source._retry_interval,
+        tools=list(source._tool_manager._tools.values()),
+        debug=settings.debug,
+        log_level=settings.log_level,
+        host=settings.host,
+        port=settings.port,
+        mount_path=settings.mount_path,
+        sse_path=settings.sse_path,
+        message_path=settings.message_path,
+        streamable_http_path=streamable_http_path,
+        json_response=settings.json_response,
+        stateless_http=settings.stateless_http,
+        warn_on_duplicate_resources=settings.warn_on_duplicate_resources,
+        warn_on_duplicate_tools=settings.warn_on_duplicate_tools,
+        warn_on_duplicate_prompts=settings.warn_on_duplicate_prompts,
+        dependencies=list(settings.dependencies),
+        lifespan=settings.lifespan,
+        auth=settings.auth,
+        transport_security=settings.transport_security,
+    )
+    serving._resource_manager._resources.update(source._resource_manager._resources)
+    serving._resource_manager._templates.update(source._resource_manager._templates)
+    serving._prompt_manager._prompts.update(source._prompt_manager._prompts)
+    serving._custom_starlette_routes.extend(source._custom_starlette_routes)
+    return serving
 
 
 mcp = StrictInputFastMCP("Mercury Tools")
@@ -4081,10 +4123,10 @@ def _create_http_app(
                 generated_runtime_factory = supplied_runtime
                 generated_runtime_is_shared = True
 
-    http_mcp = copy(mcp)
-    http_mcp.settings = mcp.settings.model_copy(deep=True)
-    http_mcp._session_manager = None
-    http_mcp.settings.streamable_http_path = settings.mcp_path
+    http_mcp = _create_isolated_serving_mcp(
+        mcp,
+        streamable_http_path=settings.mcp_path,
+    )
     if settings.public_base_url:
         public_url = urlparse(settings.public_base_url)
         allowed_host = public_url.netloc

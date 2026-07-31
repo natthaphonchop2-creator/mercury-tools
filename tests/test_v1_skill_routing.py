@@ -40,6 +40,7 @@ async def _execute_read_backed_skill(
     schema_drift_once: bool = False,
     schema_persistence_started: threading.Event | None = None,
     release_schema_persistence: threading.Event | None = None,
+    schema_persistence_failures: int = 0,
     route_through_server: bool = False,
     defer_server_call: bool = False,
 ):
@@ -211,6 +212,7 @@ async def _execute_read_backed_skill(
         def __init__(self) -> None:
             self.items = list(qualifications)
             self.transitions: list[str] = []
+            self.transition_attempts = 0
 
         def list_provider_mcp_qualifications(self):
             return tuple(self.items)
@@ -219,10 +221,13 @@ async def _execute_read_backed_skill(
             self,
             qualification_value: ProviderMCPQualification,
         ) -> ProviderMCPQualification:
+            self.transition_attempts += 1
             if schema_persistence_started is not None:
                 schema_persistence_started.set()
             if release_schema_persistence is not None:
                 assert release_schema_persistence.wait(timeout=2)
+            if self.transition_attempts <= schema_persistence_failures:
+                raise RuntimeError("simulated_catalog_transition_failure")
             self.transitions.append(qualification_value.capability_version_sha256)
             disabled = qualification_value.model_copy(
                 update={
@@ -397,7 +402,14 @@ async def _execute_read_backed_skill(
                 )
             ]
 
-    async def require_workspace(*_args: object, **_kwargs: object):
+    request_fastmcp: list[object | None] = []
+
+    async def require_workspace(*args: object, **_kwargs: object):
+        context = args[0] if args else None
+        try:
+            request_fastmcp.append(context.fastmcp)
+        except (AttributeError, ValueError):
+            request_fastmcp.append(None)
         return principal, membership
 
     monkeypatch.setattr(v1_tools, "_require_workspace", require_workspace)
@@ -426,6 +438,7 @@ async def _execute_read_backed_skill(
         audits=audits,
         qualifications=by_capability,
         qualification_catalog=qualification_catalog,
+        request_fastmcp=request_fastmcp,
         runtime_factory=Runtime,
         store_factory=Store,
         wire_arguments=arguments.model_dump(
@@ -684,12 +697,19 @@ async def test_read_backed_skill_missing_or_failed_read_returns_closed_error(
 
 
 @pytest.mark.asyncio
-async def test_production_http_skill_drift_uses_serving_copy_projection(
+async def test_production_http_lowlevel_skill_drift_is_owned_by_isolated_serving_mcp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import inspect
+
+    from mcp.server.lowlevel.server import request_ctx
+    from mcp.shared.context import RequestContext
+    from mcp.types import CallToolRequest, CallToolRequestParams
+
     from mercury_tools.config import Settings
     from mercury_tools.mcp import server as server_module
     from mercury_tools.mcp import v1_tools
+    from mercury_tools.mcp.v1_errors import MercuryV1ToolError
     from mercury_tools.v1.constants import CANONICAL_MCP_RESOURCE
 
     observed: dict[str, object] = {}
@@ -699,6 +719,8 @@ async def test_production_http_skill_drift_uses_serving_copy_projection(
         expected_capabilities=("provider_profile.get", "documents.invoice.list"),
         observed=observed,
         schema_drift_capability="provider_profile.get",
+        schema_drift_once=True,
+        schema_persistence_failures=1,
         defer_server_call=True,
     )
     runtime = observed["runtime_factory"]()
@@ -713,6 +735,9 @@ async def test_production_http_skill_drift_uses_serving_copy_projection(
         _recorder: object,
         event: dict[str, object],
     ) -> None:
+        observed["audits"].append(event)
+
+    async def capture_runtime_audit(event: dict[str, object]) -> None:
         observed["audits"].append(event)
 
     provider_oauth_service = SimpleNamespace(
@@ -755,29 +780,93 @@ async def test_production_http_skill_drift_uses_serving_copy_projection(
         peak_mcp_production_url="https://peak.example/mcp",
         provider_callback_base_url="https://mercury-tools-mcp.example",
     )
-    original_tools = dict(server_module.mcp._tool_manager._tools)
-    projection_attributes = (
+    source = server_module.mcp
+    original_tools = dict(source._tool_manager._tools)
+    lifecycle_attributes = (
         "_mercury_v1_generated_provider_projection",
         "_mercury_v1_generated_provider_tools",
+        "_mercury_v1_legacy_tools",
     )
     missing = object()
-    original_projection_attributes = {
-        name: getattr(server_module.mcp, name, missing) for name in projection_attributes
+    original_lifecycle_attributes = {
+        name: getattr(source, name, missing) for name in lifecycle_attributes
     }
     serving = None
+
+    async def registry_contract(instance: object) -> dict[str, object]:
+        return {
+            "tools": {
+                tool.name: tool.model_dump(mode="json", by_alias=True)
+                for tool in await instance.list_tools()
+            },
+            "resources": sorted(
+                resource.model_dump_json(by_alias=True)
+                for resource in await instance.list_resources()
+            ),
+            "resource_templates": sorted(
+                template.model_dump_json(by_alias=True)
+                for template in await instance.list_resource_templates()
+            ),
+            "prompts": sorted(
+                prompt.model_dump_json(by_alias=True) for prompt in await instance.list_prompts()
+            ),
+        }
+
+    def lowlevel_call_tool_owner(instance: object) -> object:
+        handler = instance._mcp_server.request_handlers[CallToolRequest]
+        bindings = [
+            cell.cell_contents
+            for cell in (handler.__closure__ or ())
+            if inspect.ismethod(cell.cell_contents) and cell.cell_contents.__name__ == "call_tool"
+        ]
+        assert len(bindings) == 1
+        return bindings[0].__self__
+
+    notifications: list[str] = []
+
+    class RequestSession:
+        async def send_tool_list_changed(self) -> None:
+            notifications.append("tools/list_changed")
+
+    session = RequestSession()
+
+    async def call_lowlevel(handler: object, request_id: int) -> dict[str, object]:
+        token = request_ctx.set(
+            RequestContext(
+                request_id=request_id,
+                meta=None,
+                session=session,
+                lifespan_context=None,
+            )
+        )
+        try:
+            result = await handler(
+                CallToolRequest(
+                    params=CallToolRequestParams(
+                        name="run_accounting_skill",
+                        arguments=observed["wire_arguments"],
+                    )
+                )
+            )
+        finally:
+            request_ctx.reset(token)
+        assert result.root.structuredContent is not None
+        return result.root.structuredContent
+
     try:
-        v1_tools.configure_v1_tools(server_module.mcp, enabled=False)
-        for name in projection_attributes:
-            if hasattr(server_module.mcp, name):
-                delattr(server_module.mcp, name)
+        v1_tools.configure_v1_tools(source, enabled=False)
+        for name in lifecycle_attributes:
+            if hasattr(source, name):
+                delattr(source, name)
         v1_tools.configure_v1_tools(
-            server_module.mcp,
+            source,
             enabled=True,
             service_factory=lambda: object(),
             runtime_factory=lambda: runtime,
             store_factory=observed["store_factory"],
         )
         monkeypatch.setattr(v1_tools, "_write_audit", capture_terminal_audit)
+        monkeypatch.setattr(v1_tools, "_record_connector_status_audit", capture_runtime_audit)
         monkeypatch.setattr(server_module, "_PROCESS_V1_ENABLED", True)
         monkeypatch.setattr(server_module, "load_settings", lambda: settings)
         monkeypatch.setattr(
@@ -788,54 +877,75 @@ async def test_production_http_skill_drift_uses_serving_copy_projection(
 
         app = server_module.create_http_app(require_auth=False)
         serving = app.state.mercury_mcp
-        notifications: list[str] = []
-        context = SimpleNamespace(
-            fastmcp=serving,
-            session=SimpleNamespace(
-                send_tool_list_changed=lambda: notifications.append("tools/list_changed")
-            ),
-        )
-        serving.get_context = lambda: context
+        source_contract = await registry_contract(source)
+        source_settings = source.settings.model_dump(mode="python")
+
+        assert serving is not source
+        assert serving._mcp_server is not source._mcp_server
+        assert serving._tool_manager is not source._tool_manager
+        assert serving._resource_manager is not source._resource_manager
+        assert serving._prompt_manager is not source._prompt_manager
+        assert serving._tool_manager._tools is not source._tool_manager._tools
+        assert serving._resource_manager._resources is not source._resource_manager._resources
+        assert serving._resource_manager._templates is not source._resource_manager._templates
+        assert serving._prompt_manager._prompts is not source._prompt_manager._prompts
+        assert serving._session_manager is not source._session_manager
+        assert lowlevel_call_tool_owner(serving) is serving
+        assert await registry_contract(serving) == source_contract
+        assert serving._custom_starlette_routes == source._custom_starlette_routes
+        assert serving._custom_starlette_routes is not source._custom_starlette_routes
 
         async with app.router.lifespan_context(app):
             projection = serving._mercury_v1_generated_provider_projection
             assert projection._server is serving
-            assert serving is not server_module.mcp
-            assert (
-                getattr(server_module.mcp, "_mercury_v1_generated_provider_projection", None)
-                is not projection
-            )
+            assert getattr(source, "_mercury_v1_generated_provider_projection", None) is None
+            assert "mercury_flowaccount_provider_profile_get" not in source._tool_manager._tools
+            assert "mercury_flowaccount_provider_profile_get" in serving._tool_manager._tools
 
-            _content, first = await serving.call_tool(
-                "run_accounting_skill",
-                observed["wire_arguments"],
-            )
-            _content, repeated = await serving.call_tool(
-                "run_accounting_skill",
-                observed["wire_arguments"],
+            handler = serving._mcp_server.request_handlers[CallToolRequest]
+            first = await call_lowlevel(handler, 1)
+            qualification = observed["qualifications"]["provider_profile.get"]
+            with pytest.raises(MercuryV1ToolError, match="^capability_unavailable$"):
+                projection.ensure_dispatch_allowed(qualification)
+            repeated = await call_lowlevel(handler, 2)
+            changed = await app.state.refresh_generated_provider_tools(
+                SimpleNamespace(session=session)
             )
             published_tools = {tool.name for tool in await serving.list_tools()}
 
         qualification = observed["qualifications"]["provider_profile.get"]
         catalog = observed["qualification_catalog"]
-        assert first["error"]["code"] == "capability_version_changed"
-        assert repeated["error"]["code"] == "insufficient_evidence"
+        alerts = [
+            event
+            for event in observed["audits"]
+            if event.get("output_summary", {}).get("alert") == "catalog_transition_unavailable"
+        ]
+        assert first["error"]["code"] == "capability_unavailable"
+        assert repeated["error"]["code"] == "capability_unavailable"
+        assert changed is True
+        assert catalog.transition_attempts == 2
         assert catalog.transitions == [qualification.capability_version_sha256]
         assert "mercury_flowaccount_provider_profile_get" not in published_tools
         assert "mercury_flowaccount_invoice_list" in published_tools
         assert notifications == ["tools/list_changed"]
         assert len(observed["driver"].calls) == 1
+        assert observed["request_fastmcp"] == [serving, serving]
+        assert len(alerts) == 1
+        assert alerts[0]["output_summary"]["dispatch_certainty"] == "dispatched"
+        assert await registry_contract(source) == source_contract
+        assert source.settings.model_dump(mode="python") == source_settings
+        assert projection._publisher._published == {}
+        assert projection._publisher._refresh_sessions == {}
+        assert projection._publisher._notification_retention_closed is True
+        assert await registry_contract(serving) == source_contract
     finally:
-        if serving is not None:
-            serving._tool_manager._tools.clear()
-            serving._tool_manager._tools.update(original_tools)
-        server_module.mcp._tool_manager._tools.clear()
-        server_module.mcp._tool_manager._tools.update(original_tools)
-        for name, value in original_projection_attributes.items():
-            if hasattr(server_module.mcp, name):
-                delattr(server_module.mcp, name)
+        source._tool_manager._tools.clear()
+        source._tool_manager._tools.update(original_tools)
+        for name, value in original_lifecycle_attributes.items():
+            if hasattr(source, name):
+                delattr(source, name)
             if value is not missing:
-                setattr(server_module.mcp, name, value)
+                setattr(source, name, value)
 
 
 @pytest.mark.asyncio
@@ -896,10 +1006,14 @@ async def test_skill_observed_schema_drift_demotes_exact_version_and_blocks_repe
 
 
 @pytest.mark.asyncio
-async def test_skill_quarantine_blocks_concurrent_repeat_before_persistence(
+@pytest.mark.parametrize("surface", ("skill", "generated"))
+async def test_quarantine_rechecks_after_resolution_before_provider_dispatch(
     monkeypatch: pytest.MonkeyPatch,
+    surface: str,
 ) -> None:
     from mercury_tools.catalog.models import QualificationState
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+    from mercury_tools.mcp.v1_errors import MercuryV1ToolError
 
     persistence_started = threading.Event()
     release_persistence = threading.Event()
@@ -917,42 +1031,107 @@ async def test_skill_quarantine_blocks_concurrent_repeat_before_persistence(
         defer_server_call=True,
     )
     server = observed["server"]
-    first_task = asyncio.create_task(
-        server.call_tool(
-            "run_accounting_skill",
-            observed["wire_arguments"],
-        )
-    )
-    try:
-        assert await asyncio.to_thread(persistence_started.wait, 1)
-        _content, repeated = await server.call_tool(
-            "run_accounting_skill",
-            observed["wire_arguments"],
-        )
-        unrelated_arguments = dict(observed["wire_arguments"])
-        unrelated_arguments.update(
+    qualification = observed["qualifications"]["provider_profile.get"]
+    repeat_at_dispatch_boundary = asyncio.Event()
+    release_repeat = asyncio.Event()
+    repeat_task_name = f"{surface}-pre-dispatch-repeat"
+    original_call_read = HostedReadService._call_read
+
+    async def gated_call_read(self, *args: object, **kwargs: object):
+        binding = kwargs["binding"]
+        task = asyncio.current_task()
+        if (
+            task is not None
+            and task.get_name() == repeat_task_name
+            and binding.normalized_capability == "provider_profile.get"
+        ):
+            repeat_at_dispatch_boundary.set()
+            await release_repeat.wait()
+        return await original_call_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(HostedReadService, "_call_read", gated_call_read)
+
+    async def call_profile() -> dict[str, object]:
+        if surface == "skill":
+            _content, structured = await server.call_tool(
+                "run_accounting_skill",
+                observed["wire_arguments"],
+            )
+            return structured
+        _content, structured = await server.call_tool(
+            "mercury_flowaccount_provider_profile_get",
             {
-                "skill_id": "vat-summary-th",
-                "query": "Summarize VAT from the unrelated exact version",
-            }
+                "workspace_id": observed["wire_arguments"]["workspace_id"],
+                "connection_id": observed["wire_arguments"]["connection_id"],
+                "capability_version": qualification.capability_version_sha256,
+            },
         )
-        _content, unrelated = await server.call_tool(
-            "run_accounting_skill",
-            unrelated_arguments,
+        return structured
+
+    async def call_unrelated() -> dict[str, object]:
+        if surface == "skill":
+            arguments = dict(observed["wire_arguments"])
+            arguments.update(
+                {
+                    "skill_id": "vat-summary-th",
+                    "query": "Summarize VAT from the unrelated exact version",
+                }
+            )
+            _content, structured = await server.call_tool(
+                "run_accounting_skill",
+                arguments,
+            )
+            return structured
+        unrelated = observed["qualifications"]["documents.invoice.list"]
+        _content, structured = await server.call_tool(
+            "mercury_flowaccount_invoice_list",
+            {
+                "workspace_id": observed["wire_arguments"]["workspace_id"],
+                "connection_id": observed["wire_arguments"]["connection_id"],
+                "capability_version": unrelated.capability_version_sha256,
+            },
+        )
+        return structured
+
+    repeat_task = asyncio.create_task(call_profile(), name=repeat_task_name)
+    first_task: asyncio.Task[dict[str, object]] | None = None
+    try:
+        await asyncio.wait_for(repeat_at_dispatch_boundary.wait(), timeout=1)
+        first_task = asyncio.create_task(call_profile(), name=f"{surface}-drift")
+        assert await asyncio.to_thread(persistence_started.wait, 1)
+        projection = server._mercury_v1_generated_provider_projection
+        try:
+            projection.ensure_dispatch_allowed(qualification)
+        except MercuryV1ToolError:
+            quarantine_active = True
+        else:
+            quarantine_active = False
+
+        release_repeat.set()
+        repeated = await asyncio.wait_for(repeat_task, timeout=1)
+        unrelated = await asyncio.wait_for(call_unrelated(), timeout=1)
+        profile_dispatches_before_persistence_release = len(
+            [call for call in observed["driver"].calls if call[0] == "provider_profile.get"]
         )
     finally:
+        release_repeat.set()
         release_persistence.set()
-    _content, first = await first_task
+    assert first_task is not None
+    first = await asyncio.wait_for(first_task, timeout=1)
 
-    qualification = observed["qualifications"]["provider_profile.get"]
     catalog = observed["qualification_catalog"]
     profile_dispatches = [
         call for call in observed["driver"].calls if call[0] == "provider_profile.get"
     ]
 
+    assert quarantine_active is True
     assert first["error"]["code"] == "capability_version_changed"
     assert repeated.get("error", {}).get("code") == "capability_unavailable"
-    assert unrelated["skill_id"] == "vat-summary-th"
+    if surface == "skill":
+        assert unrelated["skill_id"] == "vat-summary-th"
+    else:
+        assert unrelated["capability_id"] == "documents.invoice.list"
+    assert profile_dispatches_before_persistence_release == 1
     assert len(profile_dispatches) == 1
     assert catalog.transitions == [qualification.capability_version_sha256]
     assert catalog.items[0].qualification_state is QualificationState.DISABLED

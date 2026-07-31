@@ -333,6 +333,63 @@ async def test_hosted_read_retries_only_pre_dispatch_safe_read_failures_within_d
 
 
 @pytest.mark.asyncio
+async def test_hosted_read_rechecks_dispatch_guard_before_every_provider_attempt() -> None:
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+    from mercury_tools.qualification.provider_mcp import QualificationGateError
+
+    qualification = _qualification()
+    driver = FakeDriver(
+        [
+            ProviderUnavailable(
+                ProviderId.FLOWACCOUNT,
+                dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+            ),
+            ProviderCallResult(
+                provider=ProviderId.FLOWACCOUNT,
+                status_class=ProviderStatusClass.SUCCESS,
+                normalized_data={
+                    "document_number": "INV-001",
+                    "invoice_id": "provider-invoice-id",
+                    "contact_email": "person@example.com",
+                    "tax_id": "1234567890123",
+                },
+                dispatch_certainty=DispatchCertainty.DISPATCHED,
+            ),
+        ]
+    )
+    runtime = _runtime(qualification, driver)
+    guarded_versions: list[str] = []
+
+    def dispatch_guard(resolved: ProviderMCPQualification) -> None:
+        guarded_versions.append(resolved.capability_version_sha256)
+        if len(guarded_versions) == 2:
+            raise QualificationGateError("capability_unavailable")
+
+    service = HostedReadService(
+        runtime_factory=lambda: runtime,
+        membership_resolver=_membership,
+        sleep=lambda _seconds: None,
+        dispatch_guard=dispatch_guard,
+    )
+
+    with pytest.raises(QualificationGateError, match="^capability_unavailable$"):
+        await service.execute(
+            _principal(),
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            qualification.normalized_capability,
+            qualification.capability_version_sha256,
+            InvoiceReadInputs(invoice_reference="INV-001"),
+        )
+
+    assert guarded_versions == [
+        qualification.capability_version_sha256,
+        qualification.capability_version_sha256,
+    ]
+    assert len(driver.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_hosted_read_never_retries_a_possibly_dispatched_failure() -> None:
     from mercury_tools.execution.hosted.read_service import HostedReadService
 
