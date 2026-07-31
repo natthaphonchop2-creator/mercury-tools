@@ -1452,11 +1452,7 @@ class GeneratedProviderToolPublisher:
                 branch = branches.get(capability_version)
                 if branch is None:
                     raise ValueError("generated_schema_validation_failed")
-                if (
-                    _qualification_version_identity(branch.qualification)
-                    in self._quarantined_versions
-                ):
-                    raise MercuryV1ToolError("capability_unavailable")
+                self.ensure_dispatch_allowed(branch.qualification)
                 inputs = branch.input_model.model_validate(values)
                 result = ProviderReadEnvelope.model_validate(
                     await self._execute(
@@ -1561,6 +1557,15 @@ class GeneratedProviderToolPublisher:
         """Immediately block repeat dispatch while durable authority catches up."""
 
         self._quarantine(qualification, dispatch_certainty)
+
+    def ensure_dispatch_allowed(
+        self,
+        qualification: ProviderMCPQualification,
+    ) -> None:
+        """Fail closed while one exact capability version is quarantined."""
+
+        if _qualification_version_identity(qualification) in self._quarantined_versions:
+            raise MercuryV1ToolError("capability_unavailable")
 
     def _quarantine(
         self,

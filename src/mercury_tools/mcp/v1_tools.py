@@ -126,6 +126,7 @@ SchemaChangeHandler: TypeAlias = Callable[
     [ProviderMCPQualification, Context | object, DispatchCertainty],
     Awaitable[None],
 ]
+SchemaChangeGuard: TypeAlias = Callable[[ProviderMCPQualification], None]
 
 _V1_SEED_CAPABILITIES = frozenset(
     {
@@ -434,6 +435,12 @@ class GeneratedProviderToolProjection:
                 context,
                 dispatch_certainty,
             )
+
+    def ensure_dispatch_allowed(
+        self,
+        qualification: ProviderMCPQualification,
+    ) -> None:
+        self._publisher.ensure_dispatch_allowed(qualification)
 
     async def _persist_schema_change(
         self,
@@ -1465,6 +1472,7 @@ async def run_accounting_skill(
     runtime_factory: ProviderRuntimeFactory | None = None,
     audit_recorder: AuditRecorder = _record_connector_status_audit,
     schema_change_handler: SchemaChangeHandler | None = None,
+    schema_change_guard: SchemaChangeGuard | None = None,
 ) -> RunAccountingSkillOutput:
     """Execute one exact published Skill from qualified reads and reviewed evidence."""
 
@@ -1582,6 +1590,8 @@ async def run_accounting_skill(
                     "status": "error",
                 }
                 try:
+                    if schema_change_guard is not None:
+                        schema_change_guard(qualification)
                     inputs = _skill_read_inputs(mapping, qualification, arguments)
                     result = await read_service.execute(
                         principal,
@@ -2070,8 +2080,14 @@ def _configure_v1_tools(
             values["host_evidence"] = host_evidence
         if document_ids:
             values["document_ids"] = document_ids
+        try:
+            projection_server = context.fastmcp
+        except (AttributeError, ValueError):
+            projection_server = server
+        if not isinstance(projection_server, FastMCP):
+            projection_server = server
         projection = getattr(
-            server,
+            projection_server,
             "_mercury_v1_generated_provider_projection",
             None,
         )
@@ -2083,6 +2099,11 @@ def _configure_v1_tools(
             runtime_factory=runtime_factory,
             schema_change_handler=(
                 projection.handle_schema_change
+                if isinstance(projection, GeneratedProviderToolProjection)
+                else None
+            ),
+            schema_change_guard=(
+                projection.ensure_dispatch_allowed
                 if isinstance(projection, GeneratedProviderToolProjection)
                 else None
             ),
