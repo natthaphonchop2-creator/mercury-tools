@@ -38,6 +38,10 @@ PersistSchemaChange: TypeAlias = Callable[
     [ProviderMCPQualification, Context | object],
     Awaitable[Sequence[ProviderMCPQualification]] | Sequence[ProviderMCPQualification],
 ]
+SchemaChangeHandler: TypeAlias = Callable[
+    [ProviderMCPQualification, Context | object, DispatchCertainty],
+    Awaitable[None],
+]
 SchemaDriftAlert: TypeAlias = Callable[[dict[str, object]], Awaitable[object] | object]
 
 _READ_CAPABILITIES = frozenset(
@@ -1235,11 +1239,13 @@ class GeneratedProviderToolPublisher:
         *,
         execute: GeneratedReadExecutor,
         persist_schema_change: PersistSchemaChange | None = None,
+        schema_change_handler: SchemaChangeHandler | None = None,
         schema_drift_alert: SchemaDriftAlert | None = None,
     ) -> None:
         self._server = server
         self._execute = execute
         self._persist_schema_change = persist_schema_change
+        self._schema_change_handler = schema_change_handler
         self._schema_drift_alert = schema_drift_alert
         self._published: dict[str, str] = {}
         self._refresh_lock = asyncio.Lock()
@@ -1472,7 +1478,11 @@ class GeneratedProviderToolPublisher:
                 )
                 return result.model_copy(update={"data": data})
             except ProviderSchemaChanged as error:
-                await self._persist_and_refresh(branch, context, error.dispatch_certainty)
+                await self._route_schema_change(
+                    branch.qualification,
+                    context,
+                    error.dispatch_certainty,
+                )
                 raise MercuryV1ToolError(public_error_code(error)) from None
             except Exception as error:
                 raise MercuryV1ToolError(public_error_code(error)) from None
@@ -1497,16 +1507,37 @@ class GeneratedProviderToolPublisher:
         set_input(staged.name, argument_model=staged.argument_model, schema=staged.input_schema)
         set_output(staged.name, schema=staged.output_schema)
 
-    async def _persist_and_refresh(
+    async def _route_schema_change(
         self,
-        branch: _GeneratedBranch,
+        qualification: ProviderMCPQualification,
         context: Context | object,
         dispatch_certainty: DispatchCertainty,
     ) -> None:
-        identity = _qualification_version_identity(branch.qualification)
-        self._quarantine(branch.qualification, dispatch_certainty)
+        if self._schema_change_handler is not None:
+            await self._schema_change_handler(
+                qualification,
+                context,
+                dispatch_certainty,
+            )
+            return
+        await self.handle_schema_change(
+            qualification,
+            context,
+            dispatch_certainty,
+        )
+
+    async def handle_schema_change(
+        self,
+        qualification: ProviderMCPQualification,
+        context: Context | object,
+        dispatch_certainty: DispatchCertainty,
+    ) -> None:
+        """Quarantine, durably demote, and publish one exact drifted version."""
+
+        identity = _qualification_version_identity(qualification)
+        self.quarantine_schema_change(qualification, dispatch_certainty)
         try:
-            refreshed = await self._persist_schema_transition(branch.qualification, context)
+            refreshed = await self._persist_schema_transition(qualification, context)
             await self.publish(
                 refreshed,
                 context=context,
@@ -1515,8 +1546,21 @@ class GeneratedProviderToolPublisher:
         except asyncio.CancelledError:
             raise
         except Exception:
-            await self._emit_schema_drift_alert(branch.qualification, dispatch_certainty)
+            quarantined = self._quarantined_versions.get(identity)
+            strongest_certainty = (
+                quarantined.dispatch_certainty if quarantined is not None else dispatch_certainty
+            )
+            await self._emit_schema_drift_alert(qualification, strongest_certainty)
             raise MercuryV1ToolError("capability_unavailable") from None
+
+    def quarantine_schema_change(
+        self,
+        qualification: ProviderMCPQualification,
+        dispatch_certainty: DispatchCertainty,
+    ) -> None:
+        """Immediately block repeat dispatch while durable authority catches up."""
+
+        self._quarantine(qualification, dispatch_certainty)
 
     def _quarantine(
         self,

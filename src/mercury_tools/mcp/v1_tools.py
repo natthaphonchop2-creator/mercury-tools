@@ -73,6 +73,7 @@ from mercury_tools.mcp.v1_schemas import (
     run_accounting_skill_input_schema,
     start_provider_connection_input_schema,
 )
+from mercury_tools.providers.base import DispatchCertainty, ProviderSchemaChanged
 from mercury_tools.providers.finalization import await_cleanup
 from mercury_tools.providers.models import (
     ConnectionReadiness,
@@ -121,6 +122,10 @@ WorkspaceServiceFactory = Callable[[], WorkspaceService]
 ProviderRuntimeFactory: TypeAlias = Callable[[], Any | Awaitable[Any]]
 AuditRecorder: TypeAlias = Callable[[dict[str, object]], object | Awaitable[object]]
 RagStoreFactory: TypeAlias = Callable[[], SupabaseRagStore]
+SchemaChangeHandler: TypeAlias = Callable[
+    [ProviderMCPQualification, Context | object, DispatchCertainty],
+    Awaitable[None],
+]
 
 _V1_SEED_CAPABILITIES = frozenset(
     {
@@ -340,6 +345,7 @@ class GeneratedProviderToolProjection:
             server,
             execute=self._execute,
             persist_schema_change=self._persist_schema_change,
+            schema_change_handler=self.handle_schema_change,
             schema_drift_alert=self._record_schema_drift_alert,
         )
 
@@ -411,6 +417,23 @@ class GeneratedProviderToolProjection:
         event: dict[str, object],
     ) -> None:
         await _record_connector_status_audit(event)
+
+    async def handle_schema_change(
+        self,
+        qualification: ProviderMCPQualification,
+        context: Context | object,
+        dispatch_certainty: DispatchCertainty,
+    ) -> None:
+        self._publisher.quarantine_schema_change(
+            qualification,
+            dispatch_certainty,
+        )
+        async with self._authority_lock:
+            await self._publisher.handle_schema_change(
+                qualification,
+                context,
+                dispatch_certainty,
+            )
 
     async def _persist_schema_change(
         self,
@@ -580,6 +603,8 @@ async def _missing_qualification_capabilities(
     for qualification in qualifications:
         if not _qualification_matches(qualification, connection):
             continue
+        if qualification.public_output_field_paths is None:
+            continue
         resolution = await _resolve_qualification(
             runtime,
             connection=connection,
@@ -604,6 +629,8 @@ async def _capability_status_detail(
         "insufficient_evidence",
     ],
 ]:
+    if qualification.public_output_field_paths is None:
+        return "unavailable", "capability_unreviewed"
     if connection.readiness is not ConnectionReadiness.READY:
         return "unavailable", "connection_not_ready"
     resolution = await _resolve_qualification(
@@ -1437,6 +1464,7 @@ async def run_accounting_skill(
     store_factory: RagStoreFactory = _rag_store,
     runtime_factory: ProviderRuntimeFactory | None = None,
     audit_recorder: AuditRecorder = _record_connector_status_audit,
+    schema_change_handler: SchemaChangeHandler | None = None,
 ) -> RunAccountingSkillOutput:
     """Execute one exact published Skill from qualified reads and reviewed evidence."""
 
@@ -1566,6 +1594,18 @@ async def run_accounting_skill(
                 except asyncio.CancelledError:
                     outcome["status"] = "cancelled"
                     read_outcomes.append(outcome)
+                    raise
+                except ProviderSchemaChanged as error:
+                    outcome["error_code"] = public_error_code(error)
+                    outcome["dispatch_certainty"] = error.dispatch_certainty.value
+                    read_outcomes.append(outcome)
+                    if schema_change_handler is None:
+                        raise MercuryV1ToolError("capability_unavailable") from None
+                    await schema_change_handler(
+                        qualification,
+                        context,
+                        error.dispatch_certainty,
+                    )
                     raise
                 except Exception as error:
                     outcome["error_code"] = public_error_code(error)
@@ -2030,12 +2070,22 @@ def _configure_v1_tools(
             values["host_evidence"] = host_evidence
         if document_ids:
             values["document_ids"] = document_ids
+        projection = getattr(
+            server,
+            "_mercury_v1_generated_provider_projection",
+            None,
+        )
         return await run_accounting_skill(
             context,
             arguments=RunAccountingSkillArguments.model_validate(values),
             service_factory=service_factory,
             store_factory=store_factory,
             runtime_factory=runtime_factory,
+            schema_change_handler=(
+                projection.handle_schema_change
+                if isinstance(projection, GeneratedProviderToolProjection)
+                else None
+            ),
         )
 
     async def disconnect_provider_tool(

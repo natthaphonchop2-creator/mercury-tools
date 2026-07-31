@@ -33,6 +33,8 @@ async def _execute_read_backed_skill(
     observed: dict[str, object],
     failed_capability: str | None = None,
     omitted_capability: str | None = None,
+    schema_drift_capability: str | None = None,
+    route_through_server: bool = False,
 ):
     from datetime import UTC, datetime, timedelta
     from pathlib import Path
@@ -45,6 +47,7 @@ async def _execute_read_backed_skill(
         DispatchCertainty,
         ProviderCallResult,
         ProviderOperationClass,
+        ProviderSchemaChanged,
         ProviderStatusClass,
         ProviderUnavailable,
         QualifiedCapabilityBinding,
@@ -147,9 +150,12 @@ async def _execute_read_backed_skill(
             }
         )
 
+    qualification_capabilities = list(dict.fromkeys(expected_capabilities))
+    if route_through_server and "documents.invoice.list" not in qualification_capabilities:
+        qualification_capabilities.append("documents.invoice.list")
     qualifications = tuple(
         qualification(capability_id)
-        for capability_id in dict.fromkeys(expected_capabilities)
+        for capability_id in qualification_capabilities
         if capability_id != omitted_capability
     )
     by_capability = {item.normalized_capability: item for item in qualifications}
@@ -195,8 +201,39 @@ async def _execute_read_backed_skill(
             return connection
 
     class QualificationCatalog:
+        def __init__(self) -> None:
+            self.items = list(qualifications)
+            self.transitions: list[str] = []
+
         def list_provider_mcp_qualifications(self):
-            return qualifications
+            return tuple(self.items)
+
+        def disable_provider_mcp_capability_version(
+            self,
+            qualification_value: ProviderMCPQualification,
+        ) -> ProviderMCPQualification:
+            self.transitions.append(qualification_value.capability_version_sha256)
+            disabled = qualification_value.model_copy(
+                update={
+                    "qualification_state": QualificationState.DISABLED,
+                    "disable_reason": "schema_changed",
+                }
+            )
+            self.items = [
+                disabled
+                if (
+                    item.provider == qualification_value.provider
+                    and item.environment == qualification_value.environment
+                    and item.normalized_capability == qualification_value.normalized_capability
+                    and item.capability_version_sha256
+                    == qualification_value.capability_version_sha256
+                )
+                else item
+                for item in self.items
+            ]
+            return disabled
+
+    qualification_catalog = QualificationCatalog()
 
     class Resolver:
         async def resolve_for_connection(
@@ -207,11 +244,17 @@ async def _execute_read_backed_skill(
             deadline: object,
         ):
             del deadline
-            selected = by_capability.get(selection.normalized_capability)
-            if (
-                selected is None
-                or selected.capability_version_sha256 != selection.capability_version_sha256
-            ):
+            selected = next(
+                (
+                    item
+                    for item in qualification_catalog.items
+                    if item.normalized_capability == selection.normalized_capability
+                    and item.capability_version_sha256 == selection.capability_version_sha256
+                    and item.qualification_state is QualificationState.ENABLED
+                ),
+                None,
+            )
+            if selected is None:
                 return CapabilityResolution(status="capability_unavailable")
             return CapabilityResolution(status="enabled", qualification=selected)
 
@@ -224,8 +267,17 @@ async def _execute_read_backed_skill(
             deadline: object,
         ):
             del deadline
-            selected = by_capability.get(capability_id)
-            if selected is None or selected.capability_version_sha256 != capability_version:
+            selected = next(
+                (
+                    item
+                    for item in qualification_catalog.items
+                    if item.normalized_capability == capability_id
+                    and item.capability_version_sha256 == capability_version
+                    and item.qualification_state is QualificationState.ENABLED
+                ),
+                None,
+            )
+            if selected is None:
                 raise QualificationGateError("capability_unavailable")
             return selected, QualifiedCapabilityBinding(
                 provider=ProviderId.FLOWACCOUNT,
@@ -269,6 +321,11 @@ async def _execute_read_backed_skill(
                     ProviderId.FLOWACCOUNT,
                     dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
                 )
+            if binding.normalized_capability == schema_drift_capability:
+                raise ProviderSchemaChanged(
+                    ProviderId.FLOWACCOUNT,
+                    dispatch_certainty=DispatchCertainty.DISPATCHED,
+                )
             data = {
                 "provider_profile.get": {"profile_status": "ready"},
                 "documents.invoice.list": {"document_count": 2},
@@ -285,9 +342,11 @@ async def _execute_read_backed_skill(
 
     class Runtime:
         connection_store = ConnectionStore()
-        qualification_catalog = QualificationCatalog()
         qualification_resolver = Resolver()
         registry = SimpleNamespace(get=lambda _provider: driver)
+
+        def __init__(self) -> None:
+            self.qualification_catalog = qualification_catalog
 
         async def aclose(self) -> None:
             return None
@@ -347,7 +406,57 @@ async def _execute_read_backed_skill(
         driver=driver,
         audits=audits,
         qualifications=by_capability,
+        qualification_catalog=qualification_catalog,
     )
+    if route_through_server:
+        from mercury_tools.mcp.server import StrictInputFastMCP
+
+        notifications: list[str] = []
+
+        async def capture_terminal_audit(
+            _recorder: object,
+            event: dict[str, object],
+        ) -> None:
+            audits.append(event)
+
+        async def capture_runtime_audit(event: dict[str, object]) -> None:
+            audits.append(event)
+
+        monkeypatch.setattr(v1_tools, "_write_audit", capture_terminal_audit)
+        monkeypatch.setattr(v1_tools, "_record_connector_status_audit", capture_runtime_audit)
+        server = StrictInputFastMCP("Skill-observed schema drift")
+        v1_tools.configure_v1_tools(
+            server,
+            enabled=True,
+            service_factory=lambda: object(),
+            runtime_factory=Runtime,
+            store_factory=Store,
+        )
+        await v1_tools.refresh_generated_provider_tools(
+            server,
+            runtime_factory=Runtime,
+        )
+        context = SimpleNamespace(
+            session=SimpleNamespace(
+                send_tool_list_changed=lambda: notifications.append("tools/list_changed")
+            )
+        )
+        server.get_context = lambda: context
+        wire_arguments = arguments.model_dump(
+            mode="json",
+            exclude_none=True,
+            exclude_unset=True,
+        )
+        observed.update(
+            server=server,
+            wire_arguments=wire_arguments,
+            notifications=notifications,
+        )
+        _content, structured = await server.call_tool(
+            "run_accounting_skill",
+            wire_arguments,
+        )
+        return structured
     return await v1_tools.run_accounting_skill(
         SimpleNamespace(),
         arguments=arguments,
@@ -547,6 +656,63 @@ async def test_read_backed_skill_missing_or_failed_read_returns_closed_error(
     terminal = [event for event in audits if event["tool_name"] == "run_accounting_skill"]
     assert len(terminal) == 1
     assert terminal[0]["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_skill_observed_schema_drift_demotes_exact_version_and_blocks_repeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mercury_tools.catalog.models import QualificationState
+
+    observed: dict[str, object] = {}
+    first = await _execute_read_backed_skill(
+        monkeypatch,
+        skill_id="company-health-check-th",
+        expected_capabilities=("provider_profile.get",),
+        observed=observed,
+        schema_drift_capability="provider_profile.get",
+        route_through_server=True,
+    )
+
+    server = observed["server"]
+    _content, repeated = await server.call_tool(
+        "run_accounting_skill",
+        observed["wire_arguments"],
+    )
+    qualification = observed["qualifications"]["provider_profile.get"]
+    catalog = observed["qualification_catalog"]
+    terminal = [
+        event for event in observed["audits"] if event["tool_name"] == "run_accounting_skill"
+    ]
+
+    assert first["error"]["code"] == "capability_version_changed"
+    assert repeated["error"]["code"] == "insufficient_evidence"
+    assert catalog.transitions == [qualification.capability_version_sha256]
+    assert [
+        (item.normalized_capability, item.qualification_state, item.disable_reason)
+        for item in catalog.items
+    ] == [
+        ("provider_profile.get", QualificationState.DISABLED, "schema_changed"),
+        ("documents.invoice.list", QualificationState.ENABLED, None),
+    ]
+    assert {tool.name for tool in await server.list_tools()} >= {
+        "run_accounting_skill",
+        "mercury_flowaccount_invoice_list",
+    }
+    assert "mercury_flowaccount_provider_profile_get" not in {
+        tool.name for tool in await server.list_tools()
+    }
+    assert observed["notifications"] == ["tools/list_changed"]
+    assert len(observed["driver"].calls) == 1
+    assert terminal[0]["output_summary"]["read_outcomes"] == [
+        {
+            "capability_id": "provider_profile.get",
+            "capability_version": qualification.capability_version_sha256,
+            "status": "error",
+            "error_code": "capability_version_changed",
+            "dispatch_certainty": "dispatched",
+        }
+    ]
 
 
 def test_git_projection_routes_skill_requirements_to_exact_v1_read_capabilities() -> None:

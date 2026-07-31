@@ -1004,6 +1004,166 @@ async def test_public_capability_status_uses_the_connection_bound_catalog_resolv
 
 
 @pytest.mark.asyncio
+async def test_legacy_enabled_null_classification_is_unreviewed_on_every_v1_read_surface() -> None:
+    from pydantic import BaseModel
+
+    from mercury_tools.auth.models import MercuryPrincipal
+    from mercury_tools.catalog.identity import canonical_json
+    from mercury_tools.catalog.models import ProviderMCPQualification
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+    from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
+    from mercury_tools.mcp.server import StrictInputFastMCP
+    from mercury_tools.mcp.v1_tools import connector_status, list_provider_capabilities
+    from mercury_tools.providers.base import ProviderOperationClass, QualifiedCapabilityBinding
+    from mercury_tools.providers.manifest import load_provider_manifest
+    from mercury_tools.providers.models import ProviderId
+    from mercury_tools.qualification.provider_mcp import (
+        CapabilityResolution,
+        QualificationGateError,
+    )
+
+    connection = _flowaccount_connection()
+    reviewed = _enabled_flowaccount_qualification()
+    legacy_values = reviewed.model_dump(mode="python")
+    legacy_values["public_output_field_paths"] = None
+    version_payload = {
+        field: legacy_values[field]
+        for field in (
+            "provider",
+            "environment",
+            "provider_tool_name",
+            "normalized_capability",
+            "input_schema",
+            "output_schema",
+            "schema_hash",
+            "response_shape_hash",
+            "required_permissions",
+        )
+    }
+    legacy_version = hashlib.sha256(canonical_json(version_payload).encode("utf-8")).hexdigest()
+    legacy_values["capability_version_sha256"] = legacy_version
+    legacy_values["qualification_evidence_uri"] = (
+        "catalog://global/flowaccount/qualifications/"
+        f"{legacy_version}-{legacy_values['evidence_revision_sha256']}.json"
+    )
+    legacy = ProviderMCPQualification.model_validate(legacy_values)
+
+    class ConnectionStore:
+        def list_for_workspace(self, **_kwargs: object) -> tuple[object, ...]:
+            return (connection.summary(),)
+
+        def load_connection(self, **_kwargs: object):
+            return connection
+
+    class QualificationCatalog:
+        def list_provider_mcp_qualifications(self) -> tuple[object, ...]:
+            return (legacy,)
+
+    class Resolver:
+        async def resolve_for_connection(
+            self,
+            _connection: object,
+            *,
+            selection: object,
+            deadline: object,
+        ) -> CapabilityResolution:
+            assert selection.capability_version_sha256 == legacy_version
+            assert deadline is not None
+            return CapabilityResolution(status="enabled", qualification=legacy)
+
+        async def bind_exact_for_connection(
+            self,
+            _connection: object,
+            *,
+            capability_id: str,
+            capability_version: str,
+            deadline: object,
+        ):
+            assert capability_id == legacy.normalized_capability
+            assert capability_version == legacy_version
+            assert deadline is not None
+            return legacy, QualifiedCapabilityBinding(
+                provider=ProviderId.FLOWACCOUNT,
+                environment="sandbox",
+                normalized_capability=legacy.normalized_capability,
+                provider_tool=legacy.provider_tool_name,
+                operation_class=ProviderOperationClass.READ,
+                qualification_hash="c" * 64,
+            )
+
+    class Driver:
+        _manifest = load_provider_manifest(
+            ROOT / "catalog" / "global" / "flowaccount" / "driver.json"
+        )
+        calls = 0
+
+        async def call(self, *_args: object, **_kwargs: object):
+            self.calls += 1
+            raise AssertionError("unreviewed capability must not dispatch")
+
+    driver = Driver()
+    runtime = SimpleNamespace(
+        connection_store=ConnectionStore(),
+        qualification_catalog=QualificationCatalog(),
+        qualification_resolver=Resolver(),
+        registry=SimpleNamespace(get=lambda _provider: driver),
+    )
+    status = await connector_status(
+        _authenticated_context(),
+        workspace_id=WORKSPACE_ID,
+        connection_id=CONNECTION_ID,
+        service_factory=_workspace_service_type(),
+        runtime_factory=lambda: runtime,
+        audit_recorder=lambda _event: None,
+    )
+    capabilities = await list_provider_capabilities(
+        _authenticated_context(),
+        workspace_id=WORKSPACE_ID,
+        connection_id=CONNECTION_ID,
+        service_factory=_workspace_service_type(),
+        runtime_factory=lambda: runtime,
+    )
+
+    server = StrictInputFastMCP("Legacy unclassified publication")
+
+    async def execute(_context: object, **_kwargs: object):
+        raise AssertionError("unreviewed capability must not publish")
+
+    publisher = GeneratedProviderToolPublisher(server, execute=execute)
+    await publisher.publish((legacy,))
+
+    class EmptyInputs(BaseModel):
+        pass
+
+    principal = MercuryPrincipal(
+        subject=connection.auth_user_id,
+        client_id="test-client",
+        scopes=frozenset(),
+    )
+    membership = _workspace_service_type()().require_workspace()
+    read_service = HostedReadService(
+        runtime_factory=lambda: runtime,
+        membership_resolver=lambda *_args: membership,
+        close_runtime=False,
+    )
+    with pytest.raises(QualificationGateError, match="^capability_unreviewed$"):
+        await read_service.execute(
+            principal,
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            legacy.normalized_capability,
+            legacy.capability_version_sha256,
+            EmptyInputs(),
+        )
+
+    assert legacy.normalized_capability in status.data.missing_qualification_capabilities
+    assert capabilities.data[0].availability == "unavailable"
+    assert capabilities.data[0].status_detail == "capability_unreviewed"
+    assert await server.list_tools() == []
+    assert driver.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_public_capability_schema_refuses_terminal_or_unverified_catalog_rows() -> None:
     from mercury_tools.mcp.v1_errors import MercuryV1ToolError
     from mercury_tools.mcp.v1_tools import get_capability_schema

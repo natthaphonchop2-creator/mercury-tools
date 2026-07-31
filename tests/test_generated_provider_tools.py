@@ -833,6 +833,122 @@ async def test_older_delayed_catalog_load_cannot_replace_newer_publication() -> 
 
 
 @pytest.mark.asyncio
+async def test_delayed_refresh_cannot_replace_schema_drift_demotion_publication() -> None:
+    from mercury_tools.mcp.v1_tools import refresh_generated_provider_tools
+    from mercury_tools.providers.base import DispatchCertainty, ProviderSchemaChanged
+    from mercury_tools.providers.models import ProviderId
+
+    invoice_get = _qualification("flowaccount", "documents.invoice.get")
+    invoice_list = _qualification("flowaccount", "documents.invoice.list")
+    current = [invoice_get, invoice_list]
+    delayed_load_started = threading.Event()
+    release_delayed_load = threading.Event()
+    drift_persisted = threading.Event()
+    drift_observed = asyncio.Event()
+    dispatches = 0
+
+    class InterleavedCatalog:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.lock = threading.Lock()
+
+        def list_provider_mcp_qualifications(self):
+            with self.lock:
+                self.calls += 1
+                call = self.calls
+                snapshot = tuple(current)
+            if call == 2:
+                delayed_load_started.set()
+                assert release_delayed_load.wait(timeout=2)
+            return snapshot
+
+        def disable_provider_mcp_capability_version(
+            self,
+            qualification: ProviderMCPQualification,
+        ) -> ProviderMCPQualification:
+            disabled = qualification.model_copy(
+                update={
+                    "qualification_state": QualificationState.DISABLED,
+                    "disable_reason": "schema_changed",
+                }
+            )
+            with self.lock:
+                current[:] = [
+                    disabled
+                    if item.capability_version_sha256 == qualification.capability_version_sha256
+                    else item
+                    for item in current
+                ]
+            drift_persisted.set()
+            return disabled
+
+    runtime = SimpleNamespace(qualification_catalog=InterleavedCatalog())
+    server = StrictInputFastMCP("Schema drift authority serialization")
+    await refresh_generated_provider_tools(
+        server,
+        runtime_factory=lambda: runtime,
+        close_runtime=False,
+    )
+    projection = server._mercury_v1_generated_provider_projection
+
+    async def drifted_execute(_context, **_kwargs):
+        nonlocal dispatches
+        dispatches += 1
+        drift_observed.set()
+        raise ProviderSchemaChanged(
+            ProviderId.FLOWACCOUNT,
+            dispatch_certainty=DispatchCertainty.DISPATCHED,
+        )
+
+    projection._publisher._execute = drifted_execute
+    server.get_context = lambda: SimpleNamespace()
+    delayed_refresh = asyncio.create_task(
+        refresh_generated_provider_tools(
+            server,
+            runtime_factory=lambda: runtime,
+            close_runtime=False,
+        )
+    )
+    assert await asyncio.to_thread(delayed_load_started.wait, 1)
+    drift = asyncio.create_task(
+        server.call_tool(
+            "mercury_flowaccount_invoice_get",
+            {
+                "workspace_id": str(WORKSPACE_ID),
+                "connection_id": str(CONNECTION_ID),
+                "capability_version": invoice_get.capability_version_sha256,
+                "page_size": 25,
+            },
+        )
+    )
+    await drift_observed.wait()
+    repeated = asyncio.create_task(
+        server.call_tool(
+            "mercury_flowaccount_invoice_get",
+            {
+                "workspace_id": str(WORKSPACE_ID),
+                "connection_id": str(CONNECTION_ID),
+                "capability_version": invoice_get.capability_version_sha256,
+                "page_size": 25,
+            },
+        )
+    )
+    await asyncio.to_thread(drift_persisted.wait, 0.1)
+    release_delayed_load.set()
+    (_content, drift_result), (_content, repeated_result), _refresh_result = await asyncio.gather(
+        drift,
+        repeated,
+        delayed_refresh,
+    )
+
+    assert drift_result["error"]["code"] == "capability_version_changed"
+    assert repeated_result["error"]["code"] == "capability_unavailable"
+    assert dispatches == 1
+    assert current[0].qualification_state is QualificationState.DISABLED
+    assert {tool.name for tool in await server.list_tools()} == {"mercury_flowaccount_invoice_list"}
+
+
+@pytest.mark.asyncio
 async def test_generated_publication_rolls_back_registration_failure_and_cancellation() -> None:
     from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
 
