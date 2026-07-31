@@ -14,7 +14,7 @@ import unicodedata
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import quote, unquote
 
 import httpx
@@ -29,8 +29,10 @@ from mercury_tools.execution.policy import (
     RiskDecision,
     effective_risk,
 )
-from mercury_tools.local.repository import RepositoryContext
 from mercury_tools.safety.redaction import redact_json
+
+if TYPE_CHECKING:
+    from mercury_tools.local.repository import RepositoryContext
 
 PREVIEW_TTL = timedelta(minutes=15)
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -123,11 +125,10 @@ class RequestState(StrEnum):
     OUTCOME_UNKNOWN = "outcome_unknown"
 
 
-def canonical_payload_hash(payload: Mapping[str, Any]) -> str:
-    """Return the SHA-256 hash of canonical, JSON-safe bound request data."""
-
+def canonical_payload_json(payload: Mapping[str, Any]) -> str:
+    """Return canonical JSON for JSON-safe bound request data."""
     try:
-        canonical = json.dumps(
+        return json.dumps(
             payload,
             ensure_ascii=False,
             sort_keys=True,
@@ -136,7 +137,18 @@ def canonical_payload_hash(payload: Mapping[str, Any]) -> str:
         )
     except (TypeError, ValueError) as exc:
         raise ValueError("payload_not_canonicalizable") from exc
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def canonical_payload_bytes(payload: Mapping[str, Any]) -> bytes:
+    """Return canonical UTF-8 bytes for hashing or authenticated encryption."""
+
+    return canonical_payload_json(payload).encode("utf-8")
+
+
+def canonical_payload_hash(payload: Mapping[str, Any]) -> str:
+    """Return the SHA-256 hash of canonical, JSON-safe bound request data."""
+
+    return hashlib.sha256(canonical_payload_bytes(payload)).hexdigest()
 
 
 def _binding_payload(
@@ -312,13 +324,9 @@ class PreparedRequest(BaseModel):
         if not secrets.compare_digest(self.payload_hash, expected_hash):
             raise ValueError("payload_hash_mismatch")
         if (
-            self.method == "DELETE"
-            and self.mutation_class is not MutationClass.SENSITIVE
-        ) or (
-            self.method == "POST" and self.mutation_class is MutationClass.UPDATE
-        ) or (
-            self.method in {"PUT", "PATCH"}
-            and self.mutation_class is MutationClass.CREATE
+            (self.method == "DELETE" and self.mutation_class is not MutationClass.SENSITIVE)
+            or (self.method == "POST" and self.mutation_class is MutationClass.UPDATE)
+            or (self.method in {"PUT", "PATCH"} and self.mutation_class is MutationClass.CREATE)
         ):
             raise ValueError("invalid_mutation_class")
 
@@ -379,6 +387,8 @@ class PreparedRequest(BaseModel):
         credential_revision: str,
         preflight_actions: Sequence[PreflightActionBinding],
     ) -> PreparedRequest:
+        from mercury_tools.local.repository import RepositoryContext
+
         if not isinstance(repository, RepositoryContext):
             raise ValueError("invalid_repository_context")
         try:
