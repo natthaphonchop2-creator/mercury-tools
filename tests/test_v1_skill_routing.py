@@ -41,6 +41,7 @@ async def _execute_read_backed_skill(
     schema_persistence_started: threading.Event | None = None,
     release_schema_persistence: threading.Event | None = None,
     schema_persistence_failures: int = 0,
+    retry_once_task_name: str | None = None,
     route_through_server: bool = False,
     defer_server_call: bool = False,
 ):
@@ -316,6 +317,7 @@ async def _execute_read_backed_skill(
         def __init__(self) -> None:
             self.calls: list[tuple[str, dict[str, object]]] = []
             self.schema_drift_calls = 0
+            self.retry_calls = 0
 
         async def call(
             self,
@@ -333,6 +335,18 @@ async def _execute_read_backed_skill(
                     inputs.model_dump(mode="json"),
                 )
             )
+            task = asyncio.current_task()
+            if (
+                retry_once_task_name is not None
+                and task is not None
+                and task.get_name() == retry_once_task_name
+            ):
+                self.retry_calls += 1
+                if self.retry_calls == 1:
+                    raise ProviderUnavailable(
+                        ProviderId.FLOWACCOUNT,
+                        dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+                    )
             if binding.normalized_capability == failed_capability:
                 raise ProviderUnavailable(
                     ProviderId.FLOWACCOUNT,
@@ -709,7 +723,7 @@ async def test_production_http_lowlevel_skill_drift_is_owned_by_isolated_serving
     from mercury_tools.config import Settings
     from mercury_tools.mcp import server as server_module
     from mercury_tools.mcp import v1_tools
-    from mercury_tools.mcp.v1_errors import MercuryV1ToolError
+    from mercury_tools.qualification.provider_mcp import QualificationGateError
     from mercury_tools.v1.constants import CANONICAL_MCP_RESOURCE
 
     observed: dict[str, object] = {}
@@ -905,7 +919,7 @@ async def test_production_http_lowlevel_skill_drift_is_owned_by_isolated_serving
             handler = serving._mcp_server.request_handlers[CallToolRequest]
             first = await call_lowlevel(handler, 1)
             qualification = observed["qualifications"]["provider_profile.get"]
-            with pytest.raises(MercuryV1ToolError, match="^capability_unavailable$"):
+            with pytest.raises(QualificationGateError, match="^capability_unavailable$"):
                 projection.ensure_dispatch_allowed(qualification)
             repeated = await call_lowlevel(handler, 2)
             changed = await app.state.refresh_generated_provider_tools(
@@ -1007,16 +1021,20 @@ async def test_skill_observed_schema_drift_demotes_exact_version_and_blocks_repe
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ("skill", "generated"))
-async def test_quarantine_rechecks_after_resolution_before_provider_dispatch(
+@pytest.mark.parametrize("dispatch_boundary", ("initial", "retry"))
+async def test_tombstone_blocks_stale_resolved_dispatch_after_durable_demotion(
     monkeypatch: pytest.MonkeyPatch,
     surface: str,
+    dispatch_boundary: str,
 ) -> None:
     from mercury_tools.catalog.models import QualificationState
     from mercury_tools.execution.hosted.read_service import HostedReadService
-    from mercury_tools.mcp.v1_errors import MercuryV1ToolError
 
     persistence_started = threading.Event()
     release_persistence = threading.Event()
+    stale_at_dispatch_boundary = asyncio.Event()
+    release_stale = asyncio.Event()
+    stale_task_name = f"{surface}-{dispatch_boundary}-stale"
     observed: dict[str, object] = {}
     await _execute_read_backed_skill(
         monkeypatch,
@@ -1027,29 +1045,42 @@ async def test_quarantine_rechecks_after_resolution_before_provider_dispatch(
         schema_drift_once=True,
         schema_persistence_started=persistence_started,
         release_schema_persistence=release_persistence,
+        retry_once_task_name=stale_task_name if dispatch_boundary == "retry" else None,
         route_through_server=True,
         defer_server_call=True,
     )
     server = observed["server"]
     qualification = observed["qualifications"]["provider_profile.get"]
-    repeat_at_dispatch_boundary = asyncio.Event()
-    release_repeat = asyncio.Event()
-    repeat_task_name = f"{surface}-pre-dispatch-repeat"
     original_call_read = HostedReadService._call_read
+    original_init = HostedReadService.__init__
 
     async def gated_call_read(self, *args: object, **kwargs: object):
         binding = kwargs["binding"]
         task = asyncio.current_task()
         if (
             task is not None
-            and task.get_name() == repeat_task_name
+            and task.get_name() == stale_task_name
             and binding.normalized_capability == "provider_profile.get"
         ):
-            repeat_at_dispatch_boundary.set()
-            await release_repeat.wait()
+            stale_at_dispatch_boundary.set()
+            await release_stale.wait()
         return await original_call_read(self, *args, **kwargs)
 
-    monkeypatch.setattr(HostedReadService, "_call_read", gated_call_read)
+    async def gated_retry_pause(seconds: float) -> None:
+        task = asyncio.current_task()
+        assert seconds == 0.05
+        assert task is not None and task.get_name() == stale_task_name
+        stale_at_dispatch_boundary.set()
+        await release_stale.wait()
+
+    def init_with_gated_retry(self, *args: object, **kwargs: object) -> None:
+        original_init(self, *args, **kwargs)
+        self._sleep = gated_retry_pause
+
+    if dispatch_boundary == "initial":
+        monkeypatch.setattr(HostedReadService, "_call_read", gated_call_read)
+    else:
+        monkeypatch.setattr(HostedReadService, "__init__", init_with_gated_retry)
 
     async def call_profile() -> dict[str, object]:
         if surface == "skill":
@@ -1093,52 +1124,48 @@ async def test_quarantine_rechecks_after_resolution_before_provider_dispatch(
         )
         return structured
 
-    repeat_task = asyncio.create_task(call_profile(), name=repeat_task_name)
-    first_task: asyncio.Task[dict[str, object]] | None = None
+    stale_task = asyncio.create_task(call_profile(), name=stale_task_name)
+    drift_task: asyncio.Task[dict[str, object]] | None = None
     try:
-        await asyncio.wait_for(repeat_at_dispatch_boundary.wait(), timeout=1)
-        first_task = asyncio.create_task(call_profile(), name=f"{surface}-drift")
+        await asyncio.wait_for(stale_at_dispatch_boundary.wait(), timeout=1)
+        drift_task = asyncio.create_task(call_profile(), name=f"{surface}-drift")
         assert await asyncio.to_thread(persistence_started.wait, 1)
         projection = server._mercury_v1_generated_provider_projection
-        try:
-            projection.ensure_dispatch_allowed(qualification)
-        except MercuryV1ToolError:
-            quarantine_active = True
-        else:
-            quarantine_active = False
-
-        release_repeat.set()
-        repeated = await asyncio.wait_for(repeat_task, timeout=1)
+        quarantine_active = bool(projection._publisher._quarantined_versions)
+        release_persistence.set()
+        drift = await asyncio.wait_for(drift_task, timeout=1)
+        transient_quarantine_released = not projection._publisher._quarantined_versions
+        published_tools_after_demotion = {tool.name for tool in await server.list_tools()}
         unrelated = await asyncio.wait_for(call_unrelated(), timeout=1)
-        profile_dispatches_before_persistence_release = len(
+        profile_dispatches_before_stale_release = len(
             [call for call in observed["driver"].calls if call[0] == "provider_profile.get"]
         )
+        release_stale.set()
+        stale = await asyncio.wait_for(stale_task, timeout=1)
     finally:
-        release_repeat.set()
+        release_stale.set()
         release_persistence.set()
-    assert first_task is not None
-    first = await asyncio.wait_for(first_task, timeout=1)
 
     catalog = observed["qualification_catalog"]
     profile_dispatches = [
         call for call in observed["driver"].calls if call[0] == "provider_profile.get"
     ]
+    expected_profile_dispatches = 1 if dispatch_boundary == "initial" else 2
 
     assert quarantine_active is True
-    assert first["error"]["code"] == "capability_version_changed"
-    assert repeated.get("error", {}).get("code") == "capability_unavailable"
+    assert drift["error"]["code"] == "capability_version_changed"
+    assert transient_quarantine_released is True
+    assert stale.get("error", {}).get("code") == "capability_unavailable"
     if surface == "skill":
         assert unrelated["skill_id"] == "vat-summary-th"
     else:
         assert unrelated["capability_id"] == "documents.invoice.list"
-    assert profile_dispatches_before_persistence_release == 1
-    assert len(profile_dispatches) == 1
+    assert profile_dispatches_before_stale_release == expected_profile_dispatches
+    assert len(profile_dispatches) == expected_profile_dispatches
     assert catalog.transitions == [qualification.capability_version_sha256]
     assert catalog.items[0].qualification_state is QualificationState.DISABLED
-    assert "mercury_flowaccount_provider_profile_get" not in {
-        tool.name for tool in await server.list_tools()
-    }
-    assert "mercury_flowaccount_invoice_list" in {tool.name for tool in await server.list_tools()}
+    assert "mercury_flowaccount_provider_profile_get" not in published_tools_after_demotion
+    assert "mercury_flowaccount_invoice_list" in published_tools_after_demotion
 
 
 def test_git_projection_routes_skill_requirements_to_exact_v1_read_capabilities() -> None:

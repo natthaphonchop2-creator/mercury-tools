@@ -390,6 +390,55 @@ async def test_hosted_read_rechecks_dispatch_guard_before_every_provider_attempt
 
 
 @pytest.mark.asyncio
+async def test_projection_guard_denial_preserves_public_code_and_denied_audit() -> None:
+    from mcp.server.fastmcp import FastMCP
+
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+    from mercury_tools.mcp.v1_errors import public_error_code
+    from mercury_tools.mcp.v1_tools import GeneratedProviderToolProjection
+    from mercury_tools.qualification.provider_mcp import QualificationGateError
+
+    qualification = _qualification()
+    driver = FakeDriver([])
+    runtime = _runtime(qualification, driver)
+    audits: list[dict[str, object]] = []
+    projection = GeneratedProviderToolProjection(
+        FastMCP("Projection guard audit"),
+        runtime_factory=lambda: runtime,
+        service_factory=lambda: object(),
+        close_runtime=False,
+    )
+    projection._publisher.quarantine_schema_change(
+        qualification,
+        DispatchCertainty.NOT_DISPATCHED,
+    )
+    service = HostedReadService(
+        runtime_factory=lambda: runtime,
+        membership_resolver=_membership,
+        audit_recorder=audits.append,
+        dispatch_guard=projection.ensure_dispatch_allowed,
+        close_runtime=False,
+    )
+
+    with pytest.raises(QualificationGateError, match="^capability_unavailable$") as caught:
+        await service.execute(
+            _principal(),
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            qualification.normalized_capability,
+            qualification.capability_version_sha256,
+            InvoiceReadInputs(invoice_reference="INV-001"),
+        )
+
+    assert public_error_code(caught.value) == "capability_unavailable"
+    assert driver.calls == []
+    assert len(audits) == 1
+    assert audits[0]["status"] == "denied"
+    assert audits[0]["output_summary"]["status_class"] == "capability_unavailable"
+    assert audits[0]["output_summary"]["dispatch_certainty"] == "not_dispatched"
+
+
+@pytest.mark.asyncio
 async def test_hosted_read_never_retries_a_possibly_dispatched_failure() -> None:
     from mercury_tools.execution.hosted.read_service import HostedReadService
 

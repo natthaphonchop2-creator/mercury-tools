@@ -1255,6 +1255,7 @@ class GeneratedProviderToolPublisher:
         self._detached_notification_tasks: dict[int, _DetachedNotificationTask] = {}
         self._notification_retention_closed = False
         self._quarantined_versions: dict[tuple[str, str, str, str, str], _QuarantinedVersion] = {}
+        self._dispatch_tombstones: set[tuple[str, str, str, str, str]] = set()
 
     async def publish(
         self,
@@ -1562,9 +1563,10 @@ class GeneratedProviderToolPublisher:
         self,
         qualification: ProviderMCPQualification,
     ) -> None:
-        """Fail closed while one exact capability version is quarantined."""
+        """Fail closed for a quarantined or process-tombstoned exact version."""
 
-        if _qualification_version_identity(qualification) in self._quarantined_versions:
+        identity = _qualification_version_identity(qualification)
+        if identity in self._quarantined_versions or identity in self._dispatch_tombstones:
             raise MercuryV1ToolError("capability_unavailable")
 
     def _quarantine(
@@ -1573,6 +1575,7 @@ class GeneratedProviderToolPublisher:
         dispatch_certainty: DispatchCertainty,
     ) -> None:
         identity = _qualification_version_identity(qualification)
+        self._dispatch_tombstones.add(identity)
         existing = self._quarantined_versions.get(identity)
         if existing is not None:
             dispatch_certainty = _stronger_dispatch_certainty(

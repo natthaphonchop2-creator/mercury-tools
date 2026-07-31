@@ -89,6 +89,7 @@ from mercury_tools.providers.streamable_mcp import (
 from mercury_tools.qualification.provider_mcp import (
     CapabilityResolution,
     CapabilitySelection,
+    QualificationGateError,
 )
 from mercury_tools.rag.models import SearchResult
 from mercury_tools.rag.routing import normalize_v1_knowledge_filters
@@ -441,7 +442,12 @@ class GeneratedProviderToolProjection:
         self,
         qualification: ProviderMCPQualification,
     ) -> None:
-        self._publisher.ensure_dispatch_allowed(qualification)
+        try:
+            self._publisher.ensure_dispatch_allowed(qualification)
+        except MercuryV1ToolError as error:
+            if error.code != "capability_unavailable":
+                raise
+            raise QualificationGateError("capability_unavailable") from None
 
     async def _persist_schema_change(
         self,
