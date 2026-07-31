@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS = (
     ROOT / "supabase/migrations/20260711090000_erp_action_catalog.sql",
     ROOT / "supabase/migrations/20260726103000_mercury_v1_catalog_qualification.sql",
+    ROOT / "supabase/migrations/20260731110000_mercury_v1_public_output_classification.sql",
 )
 _OPT_IN = "MERCURY_V1_POSTGRES_TEST"
 _TABLE = "public.mercury_provider_capability_qualifications"
@@ -154,6 +155,7 @@ def _definition(
         normalized_capability=f"documents.{case_name}.get",
         input_schema={"type": "object", "properties": {}},
         output_schema={"type": "object", "properties": {"id": {"type": "string"}}},
+        public_output_field_paths=("/id",),
         response_shape_hash="a" * 64,
         required_permissions=("documents.read",),
     )

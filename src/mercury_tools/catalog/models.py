@@ -229,6 +229,7 @@ class ProviderMCPQualification(BaseModel):
     normalized_capability: str = Field(pattern=_CAPABILITY_IDENTIFIER)
     input_schema: dict[str, Any]
     output_schema: dict[str, Any]
+    public_output_field_paths: tuple[str, ...] | None = None
     schema_hash: str = Field(pattern=_SHA256)
     response_shape_hash: str = Field(pattern=_SHA256)
     required_permissions: tuple[str, ...]
@@ -256,6 +257,13 @@ class ProviderMCPQualification(BaseModel):
 
     @model_validator(mode="after")
     def validate_qualification_integrity(self) -> "ProviderMCPQualification":
+        if self.public_output_field_paths is not None and (
+            tuple(sorted(set(self.public_output_field_paths))) != self.public_output_field_paths
+            or any(
+                not _valid_public_output_field_path(path) for path in self.public_output_field_paths
+            )
+        ):
+            raise ValueError("provider_mcp_public_output_field_paths_invalid")
         if (
             not self.required_permissions
             or len(self.required_permissions) != len(set(self.required_permissions))
@@ -280,6 +288,7 @@ class ProviderMCPQualification(BaseModel):
             normalized_capability=self.normalized_capability,
             input_schema=self.input_schema,
             output_schema=self.output_schema,
+            public_output_field_paths=self.public_output_field_paths,
             schema_hash=self.schema_hash,
             response_shape_hash=self.response_shape_hash,
             required_permissions=self.required_permissions,
@@ -405,9 +414,15 @@ class ProviderMCPQualification(BaseModel):
         normalized_capability: str,
         input_schema: dict[str, Any],
         output_schema: dict[str, Any],
+        public_output_field_paths: tuple[str, ...] = (),
         response_shape_hash: str,
         required_permissions: tuple[str, ...],
     ) -> "ProviderMCPQualification":
+        checked_public_paths = tuple(sorted(set(public_output_field_paths)))
+        if len(checked_public_paths) != len(public_output_field_paths) or any(
+            not _valid_public_output_field_path(path) for path in checked_public_paths
+        ):
+            raise ValueError("provider_mcp_public_output_field_paths_invalid")
         schema_hash = _qualification_schema_hash(input_schema, output_schema)
         version = _provider_mcp_capability_version_sha256(
             provider=provider,
@@ -416,6 +431,7 @@ class ProviderMCPQualification(BaseModel):
             normalized_capability=normalized_capability,
             input_schema=input_schema,
             output_schema=output_schema,
+            public_output_field_paths=checked_public_paths,
             schema_hash=schema_hash,
             response_shape_hash=response_shape_hash,
             required_permissions=required_permissions,
@@ -427,6 +443,7 @@ class ProviderMCPQualification(BaseModel):
             normalized_capability=normalized_capability,
             input_schema=input_schema,
             output_schema=output_schema,
+            public_output_field_paths=checked_public_paths,
             schema_hash=schema_hash,
             response_shape_hash=response_shape_hash,
             required_permissions=required_permissions,
@@ -465,25 +482,42 @@ def _provider_mcp_capability_version_sha256(
     normalized_capability: str,
     input_schema: dict[str, Any],
     output_schema: dict[str, Any],
+    public_output_field_paths: tuple[str, ...] | None,
     schema_hash: str,
     response_shape_hash: str,
     required_permissions: tuple[str, ...],
 ) -> str:
-    return hashlib.sha256(
-        canonical_json(
-            {
-                "provider": provider,
-                "environment": environment,
-                "provider_tool_name": provider_tool_name,
-                "normalized_capability": normalized_capability,
-                "input_schema": input_schema,
-                "output_schema": output_schema,
-                "schema_hash": schema_hash,
-                "response_shape_hash": response_shape_hash,
-                "required_permissions": required_permissions,
-            }
-        ).encode("utf-8")
-    ).hexdigest()
+    payload = {
+        "provider": provider,
+        "environment": environment,
+        "provider_tool_name": provider_tool_name,
+        "normalized_capability": normalized_capability,
+        "input_schema": input_schema,
+        "output_schema": output_schema,
+        "schema_hash": schema_hash,
+        "response_shape_hash": response_shape_hash,
+        "required_permissions": required_permissions,
+    }
+    if public_output_field_paths is not None:
+        payload["public_output_field_paths"] = public_output_field_paths
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _valid_public_output_field_path(path: object) -> bool:
+    if not isinstance(path, str) or not path.startswith("/") or path == "/":
+        return False
+    for segment in path[1:].split("/"):
+        if not segment or ("*" in segment and segment != "*"):
+            return False
+        index = 0
+        while index < len(segment):
+            if segment[index] != "~":
+                index += 1
+                continue
+            if index + 1 >= len(segment) or segment[index + 1] not in {"0", "1"}:
+                return False
+            index += 2
+    return True
 
 
 def revalidate_catalog_source(source: CatalogSource) -> CatalogSource:

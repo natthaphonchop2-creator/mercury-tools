@@ -28,6 +28,7 @@ MIGRATIONS = (
     ROOT / "supabase/migrations/20260726100000_mercury_v1_identity.sql",
     ROOT / "supabase/migrations/20260711090000_erp_action_catalog.sql",
     ROOT / "supabase/migrations/20260726103000_mercury_v1_catalog_qualification.sql",
+    ROOT / "supabase/migrations/20260731110000_mercury_v1_public_output_classification.sql",
 )
 AUTH_USER_ID = UUID("11111111-1111-4111-8111-111111111111")
 OTHER_AUTH_USER_ID = UUID("22222222-2222-4222-8222-222222222222")

@@ -212,6 +212,7 @@ class StrictInputFastMCP(FastMCP):
         """Return V1 failures through their published closed output union."""
 
         registered_before = self._tool_manager.get_tool(name)
+        self._register_active_v1_session()
         try:
             return await super().call_tool(name, arguments)
         except ToolError as error:
@@ -224,6 +225,21 @@ class StrictInputFastMCP(FastMCP):
             output = error_output(error)
             payload = output.model_dump(mode="json")
             return ([TextContent(type="text", text=output.model_dump_json())], payload)
+
+    async def list_tools(self) -> list[Any]:
+        self._register_active_v1_session()
+        return await super().list_tools()
+
+    def _register_active_v1_session(self) -> None:
+        publisher = getattr(self, "_mercury_v1_generated_provider_tools", None)
+        register = getattr(publisher, "register_session", None)
+        if not callable(register):
+            return
+        try:
+            context = self.get_context()
+        except (LookupError, RuntimeError):
+            return
+        register(context)
 
 
 mcp = StrictInputFastMCP("Mercury Tools")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import threading
 import time
 import weakref
 from datetime import UTC, datetime, timedelta
@@ -37,6 +38,7 @@ def _qualification(provider: str, capability_id: str) -> ProviderMCPQualificatio
             "required": ["document_number"],
             "additionalProperties": False,
         },
+        public_output_field_paths=("/document_number",),
         response_shape_hash="a" * 64,
         required_permissions=("documents.read",),
     )
@@ -206,6 +208,219 @@ async def test_generated_wrapper_rejects_unknown_fields_before_execution() -> No
 
 
 @pytest.mark.asyncio
+async def test_generated_input_preserves_root_one_of_and_local_references() -> None:
+    from mercury_tools.execution.hosted.read_service import ProviderReadEnvelope
+    from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
+
+    definition = ProviderMCPQualification.discovered(
+        provider="flowaccount",
+        environment="sandbox",
+        provider_tool_name="PRIVATE_RAW_PROVIDER_TOOL",
+        normalized_capability="documents.invoice.get",
+        input_schema={
+            "$defs": {
+                "ById": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {"const": "by_id"},
+                        "invoice_id": {"type": "string"},
+                    },
+                    "required": ["mode", "invoice_id"],
+                    "additionalProperties": False,
+                },
+                "ByNumber": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {"const": "by_number"},
+                        "document_number": {"type": "string"},
+                    },
+                    "required": ["mode", "document_number"],
+                    "additionalProperties": False,
+                },
+            },
+            "oneOf": [{"$ref": "#/$defs/ById"}, {"$ref": "#/$defs/ByNumber"}],
+        },
+        output_schema={
+            "type": "object",
+            "properties": {"document_number": {"type": "string"}},
+            "required": ["document_number"],
+            "additionalProperties": False,
+        },
+        public_output_field_paths=("/document_number",),
+        response_shape_hash="a" * 64,
+        required_permissions=("documents.read",),
+    )
+    qualification = definition.model_copy(
+        update={
+            "qualification_state": QualificationState.ENABLED,
+            "company_sha256": "b" * 64,
+            "evidence_revision_sha256": "c" * 64,
+            "qualification_evidence_uri": (
+                "catalog://global/flowaccount/qualifications/"
+                f"{definition.capability_version_sha256}-{'c' * 64}.json"
+            ),
+            "evidence_evaluated_at": NOW,
+            "evidence_expires_at": NOW + timedelta(days=1),
+        }
+    )
+    received: list[dict[str, object]] = []
+
+    async def execute(_context, **kwargs):
+        received.append(kwargs["inputs"].model_dump(mode="json"))
+        return ProviderReadEnvelope(
+            workspace_id=kwargs["workspace_id"],
+            connection_id=kwargs["connection_id"],
+            provider="flowaccount",
+            company_display_name="Example Company",
+            environment="sandbox",
+            capability_id="documents.invoice.get",
+            capability_version=kwargs["capability_version"],
+            data={"document_number": "INV-001"},
+        )
+
+    server = StrictInputFastMCP("Root oneOf generated provider input")
+    publisher = GeneratedProviderToolPublisher(server, execute=execute)
+    assert await publisher.publish((qualification,)) is True
+    tool = (await server.list_tools())[0]
+    rendered = str(tool.inputSchema)
+    assert "ById" in rendered
+    assert "ByNumber" in rendered
+    assert "oneOf" in rendered
+
+    server.get_context = lambda: SimpleNamespace()
+    _content, structured = await server.call_tool(
+        tool.name,
+        {
+            "workspace_id": str(WORKSPACE_ID),
+            "connection_id": str(CONNECTION_ID),
+            "capability_version": qualification.capability_version_sha256,
+            "mode": "by_id",
+            "invoice_id": "invoice-1",
+        },
+    )
+
+    assert structured["status"] == "ok"
+    assert received == [{"mode": "by_id", "invoice_id": "invoice-1"}]
+
+
+@pytest.mark.asyncio
+async def test_generated_input_preserves_root_if_then_else_runtime_parity() -> None:
+    from mercury_tools.execution.hosted.read_service import ProviderReadEnvelope
+    from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
+
+    branch_properties = {
+        "mode": {"enum": ["paged", "cursor"]},
+        "page_size": {"type": "integer", "minimum": 1},
+        "cursor": {"type": "string", "minLength": 1},
+    }
+    input_schema = {
+        "type": "object",
+        "properties": branch_properties,
+        "required": ["mode"],
+        "additionalProperties": False,
+        "if": {
+            "type": "object",
+            "properties": {
+                **branch_properties,
+                "mode": {"const": "paged"},
+            },
+            "required": ["mode"],
+            "additionalProperties": False,
+        },
+        "then": {
+            "type": "object",
+            "properties": branch_properties,
+            "required": ["mode", "page_size"],
+            "additionalProperties": False,
+        },
+        "else": {
+            "type": "object",
+            "properties": branch_properties,
+            "required": ["mode", "cursor"],
+            "additionalProperties": False,
+        },
+    }
+    definition = ProviderMCPQualification.discovered(
+        provider="flowaccount",
+        environment="sandbox",
+        provider_tool_name="PRIVATE_RAW_PROVIDER_TOOL",
+        normalized_capability="documents.invoice.list",
+        input_schema=input_schema,
+        output_schema={
+            "type": "object",
+            "properties": {"document_number": {"type": "string"}},
+            "required": ["document_number"],
+            "additionalProperties": False,
+        },
+        public_output_field_paths=("/document_number",),
+        response_shape_hash="a" * 64,
+        required_permissions=("documents.read",),
+    )
+    qualification = definition.model_copy(
+        update={
+            "qualification_state": QualificationState.ENABLED,
+            "company_sha256": "b" * 64,
+            "evidence_revision_sha256": "c" * 64,
+            "qualification_evidence_uri": (
+                "catalog://global/flowaccount/qualifications/"
+                f"{definition.capability_version_sha256}-{'c' * 64}.json"
+            ),
+            "evidence_evaluated_at": NOW,
+            "evidence_expires_at": NOW + timedelta(days=1),
+        }
+    )
+    received: list[dict[str, object]] = []
+
+    async def execute(_context, **kwargs):
+        received.append(kwargs["inputs"].model_dump(mode="json"))
+        return ProviderReadEnvelope(
+            workspace_id=kwargs["workspace_id"],
+            connection_id=kwargs["connection_id"],
+            provider="flowaccount",
+            company_display_name="Example Company",
+            environment="sandbox",
+            capability_id="documents.invoice.list",
+            capability_version=kwargs["capability_version"],
+            data={"document_number": "INV-001"},
+        )
+
+    server = StrictInputFastMCP("Root conditional generated provider input")
+    publisher = GeneratedProviderToolPublisher(server, execute=execute)
+    await publisher.publish((qualification,))
+    tool = (await server.list_tools())[0]
+    rendered = str(tool.inputSchema)
+    assert "'if':" in rendered
+    assert "'then':" in rendered
+    assert "'else':" in rendered
+    server.get_context = lambda: SimpleNamespace()
+
+    _content, valid = await server.call_tool(
+        tool.name,
+        {
+            "workspace_id": str(WORKSPACE_ID),
+            "connection_id": str(CONNECTION_ID),
+            "capability_version": qualification.capability_version_sha256,
+            "mode": "paged",
+            "page_size": 25,
+        },
+    )
+    _content, invalid = await server.call_tool(
+        tool.name,
+        {
+            "workspace_id": str(WORKSPACE_ID),
+            "connection_id": str(CONNECTION_ID),
+            "capability_version": qualification.capability_version_sha256,
+            "mode": "paged",
+            "cursor": "not-valid-for-paged",
+        },
+    )
+
+    assert valid["status"] == "ok"
+    assert invalid["error"]["code"] == "validation_failed"
+    assert received == [{"mode": "paged", "page_size": 25}]
+
+
+@pytest.mark.asyncio
 async def test_runtime_schema_drift_removes_affected_wrapper_and_notifies_search() -> None:
     from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
     from mercury_tools.providers.base import DispatchCertainty, ProviderSchemaChanged
@@ -367,6 +582,11 @@ async def test_generated_wrapper_groups_exact_versions_and_projects_only_public_
                 ],
                 "additionalProperties": False,
             },
+            public_output_field_paths=(
+                "/invoice_id",
+                "/nested/document_id",
+                "/tax_amount",
+            ),
             response_shape_hash="a" * 64,
             required_permissions=("documents.read",),
         )
@@ -526,6 +746,93 @@ async def test_generated_publication_serializes_refreshes_and_notifies_each_refr
 
 
 @pytest.mark.asyncio
+async def test_stable_core_only_session_receives_background_tool_list_changed() -> None:
+    from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
+
+    server = StrictInputFastMCP("Stable session generated refresh")
+
+    async def stable_core_tool() -> str:
+        return "ok"
+
+    server.add_tool(
+        stable_core_tool,
+        name="stable_core_tool",
+        meta={"mercury/surface": "v1"},
+    )
+
+    async def execute(_context, **_kwargs):
+        raise AssertionError("session registration test must not dispatch")
+
+    publisher = GeneratedProviderToolPublisher(server, execute=execute)
+    server._mercury_v1_generated_provider_tools = publisher
+    invoice_get = _qualification("flowaccount", "documents.invoice.get")
+    invoice_list = _qualification("flowaccount", "documents.invoice.list")
+    await publisher.publish((invoice_get,))
+
+    notifications: list[str] = []
+    server.get_context = lambda: SimpleNamespace(
+        session=SimpleNamespace(
+            send_tool_list_changed=lambda: notifications.append("tools/list_changed")
+        )
+    )
+    await server.list_tools()
+
+    assert await publisher.publish((invoice_get, invoice_list)) is True
+    assert notifications == ["tools/list_changed"]
+
+
+@pytest.mark.asyncio
+async def test_older_delayed_catalog_load_cannot_replace_newer_publication() -> None:
+    from mercury_tools.mcp.v1_tools import refresh_generated_provider_tools
+
+    older = (_qualification("flowaccount", "documents.invoice.get"),)
+    newer = (*older, _qualification("flowaccount", "documents.invoice.list"))
+    first_load_started = threading.Event()
+    release_first_load = threading.Event()
+
+    class DelayedCatalog:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.lock = threading.Lock()
+
+        def list_provider_mcp_qualifications(self):
+            with self.lock:
+                self.calls += 1
+                call = self.calls
+            if call == 1:
+                first_load_started.set()
+                assert release_first_load.wait(timeout=2)
+                return older
+            return newer
+
+    runtime = SimpleNamespace(qualification_catalog=DelayedCatalog())
+    server = StrictInputFastMCP("Monotonic generated publication")
+    first = asyncio.create_task(
+        refresh_generated_provider_tools(
+            server,
+            runtime_factory=lambda: runtime,
+            close_runtime=False,
+        )
+    )
+    assert await asyncio.to_thread(first_load_started.wait, 1)
+    second = asyncio.create_task(
+        refresh_generated_provider_tools(
+            server,
+            runtime_factory=lambda: runtime,
+            close_runtime=False,
+        )
+    )
+    await asyncio.sleep(0.05)
+    release_first_load.set()
+    await asyncio.gather(first, second)
+
+    assert {tool.name for tool in await server.list_tools()} == {
+        "mercury_flowaccount_invoice_get",
+        "mercury_flowaccount_invoice_list",
+    }
+
+
+@pytest.mark.asyncio
 async def test_generated_publication_rolls_back_registration_failure_and_cancellation() -> None:
     from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
 
@@ -561,6 +868,76 @@ async def test_generated_publication_rolls_back_registration_failure_and_cancell
     assert {tool.name for tool in await server.list_tools()} == {"mercury_flowaccount_invoice_get"}
 
 
+@pytest.mark.asyncio
+async def test_many_immutable_versions_keep_wire_model_cache_bounded_and_clearable() -> None:
+    import mercury_tools.mcp.generated_tools as generated_tools
+
+    generated_tools._clear_wire_model_cache()
+    server = StrictInputFastMCP("Bounded generated wire models")
+
+    async def execute(_context, **_kwargs):
+        raise AssertionError("cache lifecycle test must not dispatch")
+
+    publisher = generated_tools.GeneratedProviderToolPublisher(server, execute=execute)
+    retained_model = None
+    for maximum in range(generated_tools._MAX_WIRE_MODEL_CACHE_SIZE + 12):
+        definition = ProviderMCPQualification.discovered(
+            provider="flowaccount",
+            environment="sandbox",
+            provider_tool_name="PRIVATE_RAW_PROVIDER_TOOL",
+            normalized_capability="documents.invoice.get",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "page_size": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": maximum + 1,
+                    }
+                },
+                "required": ["page_size"],
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "properties": {"document_number": {"type": "string"}},
+                "required": ["document_number"],
+                "additionalProperties": False,
+            },
+            public_output_field_paths=("/document_number",),
+            response_shape_hash="a" * 64,
+            required_permissions=("documents.read",),
+        )
+        qualification = definition.model_copy(
+            update={
+                "qualification_state": QualificationState.ENABLED,
+                "company_sha256": "b" * 64,
+                "evidence_revision_sha256": "c" * 64,
+                "qualification_evidence_uri": (
+                    "catalog://global/flowaccount/qualifications/"
+                    f"{definition.capability_version_sha256}-{'c' * 64}.json"
+                ),
+                "evidence_evaluated_at": NOW,
+                "evidence_expires_at": NOW + timedelta(days=1),
+            }
+        )
+        await publisher.publish((qualification,))
+        if retained_model is None:
+            retained_model = generated_tools.catalog_wire_model(
+                qualification.input_schema,
+                kind="input",
+            )
+
+    assert len(generated_tools._WIRE_MODEL_CACHE) <= (generated_tools._MAX_WIRE_MODEL_CACHE_SIZE)
+    assert retained_model is not None
+    assert retained_model.model_validate({"page_size": 1}).model_dump(mode="json") == {
+        "page_size": 1
+    }
+
+    publisher.clear()
+    assert generated_tools._WIRE_MODEL_CACHE == {}
+
+
 def test_public_projection_prunes_nested_sensitive_fields_across_refs_and_applicators() -> None:
     from mercury_tools.mcp.generated_tools import project_provider_read_data, public_output_schema
 
@@ -582,16 +959,24 @@ def test_public_projection_prunes_nested_sensitive_fields_across_refs_and_applic
                 "properties": {
                     "kind": {"const": "invoice"},
                     "invoice_id": {"type": "string"},
+                    "invoiceAlias": {"type": "string"},
                     "tax_amount": {"type": "number"},
                     "contactEmail": {"type": "string"},
+                    "เลขที่เอกสาร": {"type": "string"},
                     "nested": {
                         "type": "object",
                         "properties": {
                             "document_id": {"type": "string"},
+                            "customerName": {"type": "string"},
                             "taxId": {"type": "string"},
                             "phone_number": {"type": "string"},
                         },
-                        "required": ["document_id", "taxId", "phone_number"],
+                        "required": [
+                            "document_id",
+                            "customerName",
+                            "taxId",
+                            "phone_number",
+                        ],
                         "additionalProperties": False,
                     },
                     "lines": {"type": "array", "items": {"$ref": "#/$defs/Line"}},
@@ -599,8 +984,10 @@ def test_public_projection_prunes_nested_sensitive_fields_across_refs_and_applic
                 "required": [
                     "kind",
                     "invoice_id",
+                    "invoiceAlias",
                     "tax_amount",
                     "contactEmail",
+                    "เลขที่เอกสาร",
                     "nested",
                     "lines",
                 ],
@@ -614,10 +1001,13 @@ def test_public_projection_prunes_nested_sensitive_fields_across_refs_and_applic
     raw = {
         "kind": "invoice",
         "invoice_id": "INV-1",
+        "invoiceAlias": "ALIAS-1",
         "tax_amount": 7.0,
         "contactEmail": "person@example.com",
+        "เลขที่เอกสาร": "เอกสาร-1",
         "nested": {
             "document_id": "DOC-1",
+            "customerName": "Private Customer",
             "taxId": "1234567890123",
             "phone_number": "+66000000000",
         },
@@ -630,9 +1020,24 @@ def test_public_projection_prunes_nested_sensitive_fields_across_refs_and_applic
             }
         ],
     }
+    public_fields = (
+        "/invoice_id",
+        "/kind",
+        "/lines/*/document_id",
+        "/lines/*/vat_amount",
+        "/nested/document_id",
+        "/tax_amount",
+    )
 
-    public_schema = public_output_schema(schema)
-    projected = project_provider_read_data(raw, output_schema=schema)
+    public_schema = public_output_schema(
+        schema,
+        public_output_field_paths=public_fields,
+    )
+    projected = project_provider_read_data(
+        raw,
+        output_schema=schema,
+        public_output_field_paths=public_fields,
+    )
 
     assert projected == {
         "kind": "invoice",
@@ -642,7 +1047,16 @@ def test_public_projection_prunes_nested_sensitive_fields_across_refs_and_applic
         "lines": [{"document_id": "LINE-1", "vat_amount": 0.49}],
     }
     rendered = str(public_schema)
-    for forbidden in ("contactEmail", "contact_email", "taxId", "phone_number", "sessionToken"):
+    for forbidden in (
+        "contactEmail",
+        "contact_email",
+        "customerName",
+        "invoiceAlias",
+        "taxId",
+        "phone_number",
+        "sessionToken",
+        "เลขที่เอกสาร",
+    ):
         assert forbidden not in rendered
 
 
@@ -678,8 +1092,12 @@ def test_public_projection_supports_root_one_of_local_refs_and_rejects_unknown_s
     assert project_provider_read_data(
         {"kind": "invoice", "invoice_id": "INV-2", "email": "person@example.com"},
         output_schema=schema,
+        public_output_field_paths=("/invoice_id", "/kind"),
     ) == {"kind": "invoice", "invoice_id": "INV-2"}
-    assert "oneOf" not in public_output_schema(schema)
+    assert "oneOf" not in public_output_schema(
+        schema,
+        public_output_field_paths=("/invoice_id", "/kind"),
+    )
 
     unsupported = {
         "type": "object",
@@ -689,7 +1107,10 @@ def test_public_projection_supports_root_one_of_local_refs_and_rejects_unknown_s
         "dependentRequired": {"invoice_id": ["invoice_id"]},
     }
     with pytest.raises(ValueError, match="^generated_schema_invalid$"):
-        public_output_schema(unsupported)
+        public_output_schema(
+            unsupported,
+            public_output_field_paths=("/invoice_id",),
+        )
 
 
 def test_public_projection_preserves_hidden_optional_conditional_false_path() -> None:
@@ -721,9 +1142,11 @@ def test_public_projection_preserves_hidden_optional_conditional_false_path() ->
         },
     }
 
-    assert project_provider_read_data({"status": "draft"}, output_schema=schema) == {
-        "status": "draft"
-    }
+    assert project_provider_read_data(
+        {"status": "draft"},
+        output_schema=schema,
+        public_output_field_paths=("/document_id", "/status"),
+    ) == {"status": "draft"}
 
 
 def test_public_projection_rejects_conditional_only_open_object_contract() -> None:
@@ -745,7 +1168,10 @@ def test_public_projection_rejects_conditional_only_open_object_contract() -> No
     }
 
     with pytest.raises(ValueError, match="^generated_schema_invalid$"):
-        public_output_schema(conditional_only)
+        public_output_schema(
+            conditional_only,
+            public_output_field_paths=("/invoice_id",),
+        )
 
 
 @pytest.mark.asyncio

@@ -36,6 +36,7 @@ def _definition(
     provider_tool_name: str = "get_invoice",
     input_schema: dict[str, object] | None = None,
     output_schema: dict[str, object] | None = None,
+    public_output_field_paths: tuple[str, ...] = (),
 ) -> ProviderMCPQualification:
     return ProviderMCPQualification.discovered(
         provider=provider,
@@ -44,6 +45,7 @@ def _definition(
         normalized_capability=normalized_capability,
         input_schema=input_schema or {"type": "object", "properties": {}},
         output_schema=output_schema or {"type": "object", "properties": {"id": {"type": "string"}}},
+        public_output_field_paths=public_output_field_paths,
         response_shape_hash="a" * 64,
         required_permissions=("documents.read",),
     )
@@ -490,11 +492,68 @@ def test_provider_mcp_catalog_definition_hashes_are_deterministic() -> None:
     )
 
 
+def test_public_output_field_classification_is_explicit_and_version_bound() -> None:
+    from mercury_tools.catalog.identity import canonical_json
+
+    output_schema = {
+        "type": "object",
+        "properties": {
+            "invoice_id": {"type": "string"},
+            "customerName": {"type": "string"},
+        },
+        "required": ["invoice_id", "customerName"],
+        "additionalProperties": False,
+    }
+    private_by_default = _definition(output_schema=output_schema)
+    reviewed_public = ProviderMCPQualification.discovered(
+        provider=private_by_default.provider,
+        environment=private_by_default.environment,
+        provider_tool_name=private_by_default.provider_tool_name,
+        normalized_capability=private_by_default.normalized_capability,
+        input_schema=private_by_default.input_schema,
+        output_schema=private_by_default.output_schema,
+        public_output_field_paths=("/invoice_id",),
+        response_shape_hash=private_by_default.response_shape_hash,
+        required_permissions=private_by_default.required_permissions,
+    )
+
+    assert private_by_default.public_output_field_paths == ()
+    assert reviewed_public.public_output_field_paths == ("/invoice_id",)
+    assert reviewed_public.capability_version_sha256 != private_by_default.capability_version_sha256
+
+    invalid = reviewed_public.model_dump(mode="python")
+    invalid["public_output_field_paths"] = ("/invoice_id", "/invoice_id")
+    with pytest.raises(
+        ValueError,
+        match="provider_mcp_public_output_field_paths_invalid",
+    ):
+        ProviderMCPQualification.model_validate(invalid)
+
+    legacy = private_by_default.model_dump(mode="python")
+    legacy.pop("public_output_field_paths")
+    legacy["capability_version_sha256"] = hashlib.sha256(
+        canonical_json(
+            {
+                "provider": private_by_default.provider,
+                "environment": private_by_default.environment,
+                "provider_tool_name": private_by_default.provider_tool_name,
+                "normalized_capability": private_by_default.normalized_capability,
+                "input_schema": private_by_default.input_schema,
+                "output_schema": private_by_default.output_schema,
+                "schema_hash": private_by_default.schema_hash,
+                "response_shape_hash": private_by_default.response_shape_hash,
+                "required_permissions": private_by_default.required_permissions,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+    assert ProviderMCPQualification.model_validate(legacy).public_output_field_paths is None
+
+
 def test_catalog_store_loads_only_validated_provider_mcp_qualification_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     catalog = importlib.import_module("mercury_tools.db.catalog")
-    definition = _qualified(_definition())
+    definition = _qualified(_definition(public_output_field_paths=("/id",)))
     calls: list[dict[str, object]] = []
 
     class Response:
@@ -520,6 +579,21 @@ def test_catalog_store_loads_only_validated_provider_mcp_qualification_rows(
     assert store.list_provider_mcp_qualifications() == [definition]
     assert calls[0]["method"] == "GET"
     assert str(calls[0]["url"]).endswith("/mercury_provider_capability_qualifications")
+    assert "public_output_field_paths" in calls[0]["params"]["select"]
+
+
+def test_public_output_classification_migration_is_version_bound_and_legacy_nullable() -> None:
+    migration = (
+        ROOT
+        / "supabase"
+        / "migrations"
+        / "20260731110000_mercury_v1_public_output_classification.sql"
+    ).read_text()
+
+    assert "add column if not exists public_output_field_paths jsonb" in migration
+    assert "'public_output_field_paths', candidate.public_output_field_paths" in migration
+    assert "candidate.public_output_field_paths is not null" in migration
+    assert "existing.public_output_field_paths" in migration
 
 
 def test_catalog_store_persists_idempotent_exact_schema_changed_terminal_state(

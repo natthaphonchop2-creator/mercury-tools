@@ -1465,6 +1465,14 @@ class StreamableMCPDriver:
                 raise TypeError
             if type(normalized) is not response_contract.model:
                 raise TypeError
+        except _OperationDeadlineExpired:
+            raise
+        except Exception:
+            raise ProviderResponseInvalid(
+                self.provider,
+                dispatch_certainty=DispatchCertainty.DISPATCHED,
+            ) from None
+        try:
             revalidated = response_contract.model.model_validate(
                 normalized,
                 by_alias=True,
@@ -1473,14 +1481,38 @@ class StreamableMCPDriver:
             deadline.check()
             if type(revalidated) is not response_contract.model:
                 raise TypeError
+        except _OperationDeadlineExpired:
+            raise
+        except Exception:
+            raise ProviderSchemaChanged(
+                self.provider,
+                dispatch_certainty=DispatchCertainty.DISPATCHED,
+            ) from None
+        try:
             serialized = revalidated.model_dump(
                 by_alias=True,
                 mode="json",
                 warnings="error",
             )
             deadline.check()
+        except _OperationDeadlineExpired:
+            raise
+        except Exception:
+            raise ProviderResponseInvalid(
+                self.provider,
+                dispatch_certainty=DispatchCertainty.DISPATCHED,
+            ) from None
+        try:
             response_contract.validate(serialized)
             deadline.check()
+        except _OperationDeadlineExpired:
+            raise
+        except Exception:
+            raise ProviderSchemaChanged(
+                self.provider,
+                dispatch_certainty=DispatchCertainty.DISPATCHED,
+            ) from None
+        try:
             if boundary.rejects(serialized):
                 raise ValueError
             deadline.check()

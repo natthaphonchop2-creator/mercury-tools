@@ -7,7 +7,6 @@ import copy
 import hashlib
 import inspect
 import json
-import re
 import time
 import weakref
 from collections import OrderedDict
@@ -57,63 +56,6 @@ _CLOSED_READ = ToolAnnotations(
     readOnlyHint=True,
     destructiveHint=False,
     openWorldHint=False,
-)
-_PUBLIC_BUSINESS_IDENTIFIERS = frozenset(
-    {
-        "invoiceid",
-        "documentid",
-        "invoiceidentifier",
-        "documentidentifier",
-        "invoicenumber",
-        "documentnumber",
-        "invoicecode",
-        "documentcode",
-        "ordernumber",
-        "referencenumber",
-        "reference",
-    }
-)
-_RESTRICTED_FIELD_PARTS = frozenset(
-    {
-        "access",
-        "address",
-        "authorization",
-        "contact",
-        "cookie",
-        "credential",
-        "email",
-        "password",
-        "phone",
-        "secret",
-        "session",
-        "token",
-    }
-)
-_RESTRICTED_IDENTIFIERS = frozenset(
-    {
-        "accountid",
-        "apikey",
-        "auth",
-        "bearer",
-        "companyid",
-        "connectionid",
-        "customerid",
-        "externalid",
-        "firstname",
-        "fullname",
-        "lastname",
-        "merchantid",
-        "personname",
-        "providerid",
-        "recipientname",
-        "taxid",
-        "taxidentifier",
-        "taxnumber",
-        "tin",
-        "userid",
-        "vatid",
-        "vatnumber",
-    }
 )
 _SCHEMA_ANNOTATIONS = frozenset(
     {
@@ -188,6 +130,7 @@ _REF_ANNOTATIONS = _SCHEMA_ANNOTATIONS | {"$ref"}
 _MAX_REFRESH_SESSIONS = 64
 _REFRESH_SESSION_IDLE_SECONDS = 300
 _REFRESH_NOTIFICATION_TOTAL_TIMEOUT_SECONDS = 1
+_MAX_WIRE_MODEL_CACHE_SIZE = 128
 
 
 @dataclass(slots=True)
@@ -504,7 +447,11 @@ class _CatalogWireModel(BaseModel):
         return copy.deepcopy(self._payload)
 
 
-_WIRE_MODEL_CACHE: dict[tuple[str, Literal["input", "output"]], type[_CatalogWireModel]] = {}
+_WIRE_MODEL_CACHE: OrderedDict[
+    tuple[str, Literal["input", "output"]],
+    type[_CatalogWireModel],
+] = OrderedDict()
+_WIRE_MODEL_CACHE_LOCK = Lock()
 
 
 def catalog_wire_model(
@@ -518,45 +465,74 @@ def catalog_wire_model(
     _assert_closed_schema(checked)
     fingerprint = _schema_fingerprint(checked)
     key = (fingerprint, kind)
-    cached = _WIRE_MODEL_CACHE.get(key)
-    if cached is not None:
-        return cached
-    validation_schema = {"$schema": "https://json-schema.org/draft/2020-12/schema", **checked}
-    model = type(
-        f"MercuryCatalog{kind.title()}{fingerprint[:12]}",
-        (_CatalogWireModel,),
-        {
-            "__module__": __name__,
-            "__annotations__": {
-                "_schema": ClassVar[dict[str, Any]],
-                "_validator": ClassVar[Draft202012Validator],
+    with _WIRE_MODEL_CACHE_LOCK:
+        cached = _WIRE_MODEL_CACHE.get(key)
+        if cached is not None:
+            _WIRE_MODEL_CACHE.move_to_end(key)
+            return cached
+        validation_schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            **checked,
+        }
+        model = type(
+            f"MercuryCatalog{kind.title()}{fingerprint[:12]}",
+            (_CatalogWireModel,),
+            {
+                "__module__": __name__,
+                "__annotations__": {
+                    "_schema": ClassVar[dict[str, Any]],
+                    "_validator": ClassVar[Draft202012Validator],
+                },
+                "_schema": checked,
+                "_validator": Draft202012Validator(
+                    validation_schema,
+                    format_checker=FormatChecker(),
+                ),
             },
-            "_schema": checked,
-            "_validator": Draft202012Validator(
-                validation_schema,
-                format_checker=FormatChecker(),
-            ),
-        },
-    )
-    _WIRE_MODEL_CACHE[key] = model
-    return model
+        )
+        _WIRE_MODEL_CACHE[key] = model
+        while len(_WIRE_MODEL_CACHE) > _MAX_WIRE_MODEL_CACHE_SIZE:
+            _WIRE_MODEL_CACHE.popitem(last=False)
+        return model
 
 
-def _normalized_field_name(name: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", name.casefold())
+def _prune_wire_model_cache(
+    retained: frozenset[tuple[str, Literal["input", "output"]]],
+) -> None:
+    with _WIRE_MODEL_CACHE_LOCK:
+        for key in tuple(_WIRE_MODEL_CACHE):
+            if key not in retained:
+                _WIRE_MODEL_CACHE.pop(key, None)
 
 
-def _is_restricted_field(name: str) -> bool:
-    normalized = _normalized_field_name(name)
-    if normalized in _PUBLIC_BUSINESS_IDENTIFIERS:
-        return False
-    if normalized in _RESTRICTED_IDENTIFIERS or normalized == "id":
-        return True
-    if normalized in {"taxamount", "vatamount", "taxrate", "vatrate"}:
-        return False
-    if "tax" in normalized or "vat" in normalized:
-        return True
-    return any(part in normalized for part in _RESTRICTED_FIELD_PARTS)
+def _clear_wire_model_cache() -> None:
+    with _WIRE_MODEL_CACHE_LOCK:
+        _WIRE_MODEL_CACHE.clear()
+
+
+def _public_field_path(path: str) -> tuple[str, ...]:
+    return tuple(segment.replace("~1", "/").replace("~0", "~") for segment in path[1:].split("/"))
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicOutputClassification:
+    paths: frozenset[tuple[str, ...]]
+
+    @classmethod
+    def from_paths(cls, paths: Sequence[str]) -> _PublicOutputClassification:
+        return cls(paths=frozenset(_public_field_path(path) for path in paths))
+
+    def is_public(self, path: tuple[str, ...]) -> bool:
+        return path in self.paths
+
+    def has_public_descendant(self, path: tuple[str, ...]) -> bool:
+        return any(
+            len(candidate) > len(path) and candidate[: len(path)] == path
+            for candidate in self.paths
+        )
+
+    def exposes(self, path: tuple[str, ...]) -> bool:
+        return self.is_public(path) or self.has_public_descendant(path)
 
 
 def _dereference(schema: Mapping[str, Any], root: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -568,19 +544,23 @@ def _dereference(schema: Mapping[str, Any], root: Mapping[str, Any]) -> Mapping[
     return _reference_target(reference, root)
 
 
-def _schema_mentions_restricted_field(
+def _schema_mentions_private_field(
     schema: Mapping[str, Any],
     *,
     root: Mapping[str, Any],
+    classification: _PublicOutputClassification,
+    path: tuple[str, ...],
     references: frozenset[str] = frozenset(),
 ) -> bool:
     reference = schema.get("$ref")
     if reference is not None:
         if not isinstance(reference, str) or reference in references:
             raise ValueError("generated_schema_invalid")
-        return _schema_mentions_restricted_field(
+        return _schema_mentions_private_field(
             _dereference(schema, root),
             root=root,
+            classification=classification,
+            path=path,
             references=references | {reference},
         )
     properties = schema.get("properties")
@@ -588,41 +568,63 @@ def _schema_mentions_restricted_field(
         for name, child in properties.items():
             if not isinstance(name, str) or not isinstance(child, Mapping):
                 raise ValueError("generated_schema_invalid")
-            if _is_restricted_field(name) or _schema_mentions_restricted_field(
+            child_path = (*path, name)
+            if not classification.exposes(child_path) or _schema_mentions_private_field(
                 child,
                 root=root,
+                classification=classification,
+                path=child_path,
                 references=references,
             ):
                 return True
+    required = schema.get("required")
+    if isinstance(required, list | tuple) and any(
+        isinstance(name, str) and not classification.exposes((*path, name)) for name in required
+    ):
+        return True
     for keyword in ("allOf", "anyOf", "oneOf"):
         values = schema.get(keyword, ())
         if not isinstance(values, list | tuple):
             continue
         if any(
-            _schema_mentions_restricted_field(
+            _schema_mentions_private_field(
                 item,
                 root=root,
+                classification=classification,
+                path=path,
                 references=references,
             )
             for item in values
             if isinstance(item, Mapping)
         ):
             return True
-    for keyword in ("if", "then", "else", "items"):
+    for keyword in ("if", "then", "else"):
         child = schema.get(keyword)
-        if isinstance(child, Mapping) and _schema_mentions_restricted_field(
+        if isinstance(child, Mapping) and _schema_mentions_private_field(
             child,
             root=root,
+            classification=classification,
+            path=path,
             references=references,
         ):
             return True
-    return False
+    items = schema.get("items")
+    return isinstance(items, Mapping) and _schema_mentions_private_field(
+        items,
+        root=root,
+        classification=classification,
+        path=(*path, "*"),
+        references=references,
+    )
 
 
 def _public_schema_node(
     schema: Mapping[str, Any],
     *,
     root: Mapping[str, Any],
+    classification: _PublicOutputClassification,
+    path: tuple[str, ...],
+    matched_paths: set[tuple[str, ...]],
     references: set[str],
 ) -> dict[str, Any]:
     reference = schema.get("$ref")
@@ -632,6 +634,9 @@ def _public_schema_node(
         return _public_schema_node(
             _dereference(schema, root),
             root=root,
+            classification=classification,
+            path=path,
+            matched_paths=matched_paths,
             references={*references, reference},
         )
     result = {
@@ -641,13 +646,23 @@ def _public_schema_node(
         properties = schema.get("properties", {})
         if not isinstance(properties, Mapping):
             raise ValueError("generated_schema_invalid")
-        public_properties = {
-            str(name): _public_schema_node(value, root=root, references=references)
-            for name, value in properties.items()
-            if isinstance(name, str)
-            and isinstance(value, Mapping)
-            and not _is_restricted_field(name)
-        }
+        public_properties: dict[str, Any] = {}
+        for name, value in properties.items():
+            if not isinstance(name, str) or not isinstance(value, Mapping):
+                raise ValueError("generated_schema_invalid")
+            child_path = (*path, name)
+            if not classification.exposes(child_path):
+                continue
+            if classification.is_public(child_path):
+                matched_paths.add(child_path)
+            public_properties[name] = _public_schema_node(
+                value,
+                root=root,
+                classification=classification,
+                path=child_path,
+                matched_paths=matched_paths,
+                references=references,
+            )
         required = schema.get("required", [])
         if not isinstance(required, list | tuple) or any(
             not isinstance(item, str) for item in required
@@ -665,7 +680,17 @@ def _public_schema_node(
         items = schema.get("items")
         if not isinstance(items, Mapping):
             raise ValueError("generated_schema_invalid")
-        result["items"] = _public_schema_node(items, root=root, references=references)
+        item_path = (*path, "*")
+        if classification.is_public(item_path):
+            matched_paths.add(item_path)
+        result["items"] = _public_schema_node(
+            items,
+            root=root,
+            classification=classification,
+            path=item_path,
+            matched_paths=matched_paths,
+            references=references,
+        )
     for keyword in ("allOf", "anyOf", "oneOf"):
         if keyword in schema:
             values = schema[keyword]
@@ -674,16 +699,29 @@ def _public_schema_node(
             ):
                 raise ValueError("generated_schema_invalid")
             transformed = [
-                _public_schema_node(item, root=root, references=references) for item in values
+                _public_schema_node(
+                    item,
+                    root=root,
+                    classification=classification,
+                    path=path,
+                    matched_paths=matched_paths,
+                    references=references,
+                )
+                for item in values
             ]
-            # Removing restricted branch discriminators can make an exact source
+            # Removing private branch discriminators can make an exact source
             # ``oneOf`` ambiguous. The public contract is the safe branch union.
             result["anyOf" if keyword == "oneOf" else keyword] = transformed
     condition = schema.get("if")
     if condition is not None:
         if not isinstance(condition, Mapping):
             raise ValueError("generated_schema_invalid")
-        if _schema_mentions_restricted_field(condition, root=root):
+        if _schema_mentions_private_field(
+            condition,
+            root=root,
+            classification=classification,
+            path=path,
+        ):
             then_branch = schema.get("then")
             else_branch = schema.get("else")
             # A hidden discriminator leaves the omitted arm unconstrained.  A
@@ -692,30 +730,69 @@ def _public_schema_node(
                 result.setdefault("allOf", []).append(
                     {
                         "anyOf": [
-                            _public_schema_node(then_branch, root=root, references=references),
-                            _public_schema_node(else_branch, root=root, references=references),
+                            _public_schema_node(
+                                then_branch,
+                                root=root,
+                                classification=classification,
+                                path=path,
+                                matched_paths=matched_paths,
+                                references=references,
+                            ),
+                            _public_schema_node(
+                                else_branch,
+                                root=root,
+                                classification=classification,
+                                path=path,
+                                matched_paths=matched_paths,
+                                references=references,
+                            ),
                         ]
                     }
                 )
         else:
-            result["if"] = _public_schema_node(condition, root=root, references=references)
+            result["if"] = _public_schema_node(
+                condition,
+                root=root,
+                classification=classification,
+                path=path,
+                matched_paths=matched_paths,
+                references=references,
+            )
             for keyword in ("then", "else"):
                 branch = schema.get(keyword)
                 if isinstance(branch, Mapping):
                     result[keyword] = _public_schema_node(
                         branch,
                         root=root,
+                        classification=classification,
+                        path=path,
+                        matched_paths=matched_paths,
                         references=references,
                     )
     return result
 
 
-def public_output_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
+def public_output_schema(
+    schema: Mapping[str, Any],
+    *,
+    public_output_field_paths: Sequence[str] = (),
+) -> dict[str, Any]:
     """Derive a closed public value contract from the exact reviewed output schema."""
 
     source = _schema_copy(schema)
     _assert_closed_schema(source)
-    projected = _public_schema_node(source, root=source, references=set())
+    classification = _PublicOutputClassification.from_paths(public_output_field_paths)
+    matched_paths: set[tuple[str, ...]] = set()
+    projected = _public_schema_node(
+        source,
+        root=source,
+        classification=classification,
+        path=(),
+        matched_paths=matched_paths,
+        references=set(),
+    )
+    if matched_paths != set(classification.paths):
+        raise ValueError("generated_public_classification_invalid")
     _assert_closed_schema(projected)
     return projected
 
@@ -760,6 +837,8 @@ def _project_value(
     schemas: Sequence[Mapping[str, Any]],
     *,
     root: Mapping[str, Any],
+    classification: _PublicOutputClassification,
+    path: tuple[str, ...],
 ) -> JsonValue:
     nodes = _schema_nodes(schemas, root=root)
     properties: dict[str, list[Mapping[str, Any]]] = {}
@@ -778,18 +857,42 @@ def _project_value(
             return {}
         projected: dict[str, JsonValue] = {}
         for name, item in value.items():
-            if not isinstance(name, str) or _is_restricted_field(name) or name not in properties:
+            if not isinstance(name, str) or name not in properties:
+                continue
+            child_path = (*path, name)
+            if isinstance(item, Mapping | list | tuple):
+                visible = classification.exposes(child_path)
+            else:
+                visible = classification.is_public(child_path)
+            if not visible:
                 continue
             projected[name] = _project_value(
                 item,
                 tuple(properties[name]),
                 root=root,
+                classification=classification,
+                path=child_path,
             )
         return projected
     if isinstance(value, list | tuple):
         if not item_schemas:
             return []
-        return [_project_value(item, tuple(item_schemas), root=root) for item in value]
+        item_path = (*path, "*")
+        return [
+            _project_value(
+                item,
+                tuple(item_schemas),
+                root=root,
+                classification=classification,
+                path=item_path,
+            )
+            for item in value
+            if (
+                classification.exposes(item_path)
+                if isinstance(item, Mapping | list | tuple)
+                else classification.is_public(item_path)
+            )
+        ]
     return value
 
 
@@ -797,6 +900,7 @@ def project_provider_read_data(
     value: Mapping[str, JsonValue],
     *,
     output_schema: Mapping[str, Any],
+    public_output_field_paths: Sequence[str] = (),
 ) -> dict[str, JsonValue]:
     """Project a raw, already exact-schema-validated value into the public contract."""
 
@@ -807,8 +911,21 @@ def project_provider_read_data(
     raw_value = (
         catalog_wire_model(source, kind="output").model_validate(value).model_dump(mode="json")
     )
-    public_model = catalog_wire_model(public_output_schema(source), kind="output")
-    projected = _project_value(raw_value, (source,), root=source)
+    classification = _PublicOutputClassification.from_paths(public_output_field_paths)
+    public_model = catalog_wire_model(
+        public_output_schema(
+            source,
+            public_output_field_paths=public_output_field_paths,
+        ),
+        kind="output",
+    )
+    projected = _project_value(
+        raw_value,
+        (source,),
+        root=source,
+        classification=classification,
+        path=(),
+    )
     if not isinstance(projected, Mapping):
         raise ValueError("generated_output_invalid")
     return public_model.model_validate(projected).model_dump(mode="json")
@@ -902,6 +1019,61 @@ def _merge_schema_definitions(
     return _rewrite_references(embedded, names)
 
 
+_ROUTING_FIELD_NAMES = ("workspace_id", "connection_id", "capability_version")
+
+
+def _inject_routing_fields(
+    schema: dict[str, Any],
+    *,
+    capability_version: str,
+) -> None:
+    routing_properties = {
+        "workspace_id": {"type": "string", "format": "uuid"},
+        "connection_id": {"type": "string", "format": "uuid"},
+        "capability_version": {"const": capability_version},
+    }
+    visited: set[int] = set()
+
+    def visit(node: Mapping[str, Any]) -> None:
+        reference = node.get("$ref")
+        if reference is not None:
+            if not isinstance(reference, str):
+                raise ValueError("generated_schema_invalid")
+            visit(_reference_target(reference, schema))
+            return
+        node_id = id(node)
+        if node_id in visited:
+            return
+        visited.add(node_id)
+        if _schema_allows_object(node):
+            if not isinstance(node, dict):
+                raise ValueError("generated_schema_invalid")
+            properties = node.setdefault("properties", {})
+            required = node.setdefault("required", [])
+            if (
+                not isinstance(properties, dict)
+                or not isinstance(required, list)
+                or set(_ROUTING_FIELD_NAMES) & set(properties)
+            ):
+                raise ValueError("generated_schema_invalid")
+            properties.update(copy.deepcopy(routing_properties))
+            for field_name in _ROUTING_FIELD_NAMES:
+                if field_name not in required:
+                    required.append(field_name)
+        for keyword in ("allOf", "anyOf", "oneOf"):
+            branches = node.get(keyword)
+            if isinstance(branches, list):
+                for branch in branches:
+                    if isinstance(branch, Mapping):
+                        visit(branch)
+        for keyword in ("if", "then", "else"):
+            branch = node.get(keyword)
+            if isinstance(branch, Mapping):
+                visit(branch)
+
+    visit(schema)
+
+
 @dataclass(frozen=True, slots=True)
 class _GeneratedBranch:
     qualification: ProviderMCPQualification
@@ -952,32 +1124,17 @@ def _branch_input_schema(branches: Sequence[_GeneratedBranch], name: str) -> dic
     for index, branch in enumerate(branches):
         source = _schema_copy(branch.qualification.input_schema)
         _assert_closed_schema(source)
+        _inject_routing_fields(
+            source,
+            capability_version=branch.capability_version,
+        )
         embedded = _merge_schema_definitions(result, source, prefix=f"Input{index}_")
-        properties = embedded.get("properties")
-        required = embedded.get("required", [])
-        if (
-            embedded.get("type") != "object"
-            or not isinstance(properties, Mapping)
-            or not isinstance(required, list | tuple)
-            or {"workspace_id", "connection_id", "capability_version"} & set(properties)
-        ):
-            raise ValueError("generated_schema_invalid")
         definition_name = f"Arguments{index}"
         definitions = result["$defs"]
         if not isinstance(definitions, dict):
             raise ValueError("generated_schema_invalid")
-        definitions[definition_name] = {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "workspace_id": {"type": "string", "format": "uuid"},
-                "connection_id": {"type": "string", "format": "uuid"},
-                "capability_version": {"const": branch.capability_version},
-                **copy.deepcopy(dict(properties)),
-            },
-            "required": ["workspace_id", "connection_id", "capability_version", *required],
-            "title": f"{name}Version{index}Arguments",
-        }
+        embedded.setdefault("title", f"{name}Version{index}Arguments")
+        definitions[definition_name] = embedded
         options.append({"$ref": f"#/$defs/{definition_name}"})
     result["oneOf"] = options
     _assert_closed_schema(result)
@@ -1110,6 +1267,20 @@ class GeneratedProviderToolPublisher:
             if request_generation < self._requested_generation:
                 return False
             changed = self._swap(staged)
+            retained_wire_models = frozenset(
+                (
+                    _schema_fingerprint(
+                        branch.qualification.input_schema
+                        if kind == "input"
+                        else branch.public_output_schema
+                    ),
+                    kind,
+                )
+                for tool in staged.values()
+                for branch in tool.branches
+                for kind in ("input", "output")
+            )
+            _prune_wire_model_cache(retained_wire_models)
             if changed:
                 self._committed_generation = request_generation
             for identity in _release_quarantines:
@@ -1182,7 +1353,13 @@ class GeneratedProviderToolPublisher:
         for task in detached:
             if task is not None:
                 task.cancel()
+        _clear_wire_model_cache()
         return changed
+
+    def register_session(self, context: Context | object | None) -> None:
+        """Retain one active MCP session for bounded catalog refresh notification."""
+
+        self._remember_session(context)
 
     def _stage(
         self,
@@ -1194,9 +1371,13 @@ class GeneratedProviderToolPublisher:
             if (
                 qualification.qualification_state is not QualificationState.ENABLED
                 or qualification.normalized_capability not in _READ_CAPABILITIES
+                or qualification.public_output_field_paths is None
             ):
                 continue
-            public_schema = public_output_schema(qualification.output_schema)
+            public_schema = public_output_schema(
+                qualification.output_schema,
+                public_output_field_paths=qualification.public_output_field_paths,
+            )
             branch = _GeneratedBranch(
                 qualification=qualification,
                 input_model=catalog_wire_model(qualification.input_schema, kind="input"),
@@ -1403,7 +1584,10 @@ class GeneratedProviderToolPublisher:
     def _remember_session(self, context: Context | object | None) -> None:
         if self._notification_retention_closed:
             return
-        session = getattr(context, "session", None)
+        try:
+            session = getattr(context, "session", None)
+        except Exception:
+            return
         if not callable(getattr(session, "send_tool_list_changed", None)):
             return
         now = time.monotonic()

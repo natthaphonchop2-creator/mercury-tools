@@ -26,9 +26,11 @@ from mercury_tools.providers.base import (
     ProviderCallResult,
     ProviderOperationClass,
     ProviderRuntimeError,
+    ProviderSchemaChanged,
     ProviderStatusClass,
 )
 from mercury_tools.providers.finalization import await_cleanup
+from mercury_tools.providers.manifest import ProviderDriverManifest, TimeoutClass
 from mercury_tools.providers.models import ProviderConnection
 from mercury_tools.providers.streamable_mcp import (
     ProviderOperationDeadline,
@@ -44,7 +46,6 @@ MembershipResolver: TypeAlias = Callable[
 AuditRecorder: TypeAlias = Callable[[dict[str, object]], object | Awaitable[object]]
 Sleep: TypeAlias = Callable[[float], object | Awaitable[object]]
 
-_READ_DEADLINE_SECONDS = 5
 _MAX_SAFE_READ_ATTEMPTS = 2
 _RETRY_DELAYS = (0.05,)
 
@@ -116,6 +117,16 @@ def _retryable_read_failure(error: ProviderRuntimeError) -> bool:
         ProviderStatusClass.UNAVAILABLE,
         ProviderStatusClass.TIMEOUT,
     }
+
+
+def _read_operation_seconds(driver: Any, connection: ProviderConnection) -> int:
+    source = getattr(driver, "_manifest", None)
+    if isinstance(source, ProviderDriverManifest):
+        source = source.model_dump(mode="json")
+    manifest = ProviderDriverManifest.model_validate(source)
+    if manifest.provider is not connection.provider:
+        raise ValueError("provider_manifest_invalid")
+    return manifest.timeout_classes[TimeoutClass.READ].operation_seconds
 
 
 def _terminal_status(
@@ -232,7 +243,8 @@ class HostedReadService:
             ):
                 raise ValueError("provider_connection_required")
 
-            deadline = ProviderOperationDeadline.start(_READ_DEADLINE_SECONDS)
+            driver = runtime.registry.get(connection.provider)
+            deadline = ProviderOperationDeadline.start(_read_operation_seconds(driver, connection))
             with provider_operation_deadline(deadline):
                 (
                     qualification,
@@ -244,6 +256,8 @@ class HostedReadService:
                     deadline=deadline,
                 )
                 qualification = ProviderMCPQualification.model_validate(qualification)
+                if qualification.public_output_field_paths is None:
+                    raise QualificationGateError("capability_unreviewed")
                 if (
                     qualification.provider != connection.provider.value
                     or qualification.environment != connection.environment
@@ -256,7 +270,7 @@ class HostedReadService:
                 input_model = catalog_wire_model(qualification.input_schema, kind="input")
                 checked_inputs = input_model.model_validate(inputs)
                 result, retry_count = await self._call_read(
-                    runtime,
+                    driver,
                     connection=connection,
                     binding=binding,
                     inputs=checked_inputs,
@@ -266,8 +280,18 @@ class HostedReadService:
 
             # Provider output must satisfy the exact catalog schema before any public projection.
             raw_output = catalog_wire_model(qualification.output_schema, kind="output")
-            raw_data = raw_output.model_validate(result.normalized_data).model_dump(mode="json")
-            data = project_provider_read_data(raw_data, output_schema=qualification.output_schema)
+            try:
+                raw_data = raw_output.model_validate(result.normalized_data).model_dump(mode="json")
+            except ValueError:
+                raise ProviderSchemaChanged(
+                    connection.provider,
+                    dispatch_certainty=dispatch_state.certainty,
+                ) from None
+            data = project_provider_read_data(
+                raw_data,
+                output_schema=qualification.output_schema,
+                public_output_field_paths=qualification.public_output_field_paths,
+            )
             return ProviderReadEnvelope(
                 workspace_id=workspace_id,
                 connection_id=connection_id,
@@ -310,7 +334,7 @@ class HostedReadService:
 
     async def _call_read(
         self,
-        runtime: Any,
+        driver: Any,
         *,
         connection: ProviderConnection,
         binding: Any,
@@ -318,7 +342,6 @@ class HostedReadService:
         deadline: ProviderOperationDeadline,
         dispatch_state: _DispatchState,
     ) -> tuple[ProviderCallResult, int]:
-        driver = runtime.registry.get(connection.provider)
         hosted_read = getattr(driver, "call_hosted_read", None)
         call = hosted_read if callable(hosted_read) else driver.call
         for attempt in range(_MAX_SAFE_READ_ATTEMPTS):
@@ -366,6 +389,10 @@ class HostedReadService:
                 )
                 if checked.status_class is not ProviderStatusClass.SUCCESS:
                     raise ValueError("capability_unavailable")
+                dispatch_state.certainty = _stronger_dispatch_certainty(
+                    dispatch_state.certainty,
+                    DispatchCertainty.DISPATCHED,
+                )
                 return checked, attempt
         raise ValueError("capability_unavailable")
 

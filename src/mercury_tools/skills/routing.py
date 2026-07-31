@@ -6,7 +6,9 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from mercury_tools.catalog.identity import canonical_json
+from jsonschema import Draft202012Validator
+
+from mercury_tools.catalog.identity import canonical_json, validate_credential_safe
 from mercury_tools.connectors.catalog import CapabilityState, connector_by_id
 from mercury_tools.skills.catalog import AccountingSkillDefinition
 
@@ -104,6 +106,52 @@ def resolve_published_skill_route(
         "allowed_action_classes": list(skill.allowed_action_classes),
         "blocked_action_classes": list(skill.blocked_action_classes),
     }
+
+
+def build_published_skill_output(
+    skill: AccountingSkillDefinition,
+    *,
+    host_facts: Sequence[Mapping[str, Any]],
+    provider_results: Sequence[tuple[str, Mapping[str, Any]]],
+    citations: Sequence[str],
+) -> dict[str, Any]:
+    """Build and validate the exact Git-canonical output from reviewed evidence."""
+
+    facts: list[str] = []
+    for fact in host_facts:
+        if not isinstance(fact, Mapping):
+            raise ValueError("skill_evidence_invalid")
+        facts.append(f"host_fact:{canonical_json(dict(fact))}")
+    for fact_name, result in provider_results:
+        if (
+            not isinstance(fact_name, str)
+            or not re.fullmatch(r"[a-z][a-z0-9_]{0,99}", fact_name)
+            or not isinstance(result, Mapping)
+        ):
+            raise ValueError("skill_evidence_invalid")
+        facts.append(f"{fact_name}:{canonical_json(dict(result))}")
+    unique_citations = list(dict.fromkeys(citations))
+    if (
+        len(facts) > 500
+        or len(unique_citations) > 100
+        or any(not fact or len(fact) > 2_000 for fact in facts)
+        or any(
+            not isinstance(citation, str) or not citation or len(citation) > 2_000
+            for citation in unique_citations
+        )
+    ):
+        raise ValueError("skill_evidence_invalid")
+    output = {
+        "output_schema_name": skill.output_schema_name,
+        "facts": facts,
+        "citations": unique_citations,
+    }
+    validate_credential_safe(output)
+    try:
+        Draft202012Validator(skill.published_projection()["output_schema"]).validate(output)
+    except Exception:
+        raise ValueError("skill_output_invalid") from None
+    return output
 
 
 def _safe_external_server_name(value: Any) -> str | None:

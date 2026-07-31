@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -20,6 +21,7 @@ from mercury_tools.providers.base import (
     ProviderUnavailable,
     QualifiedCapabilityBinding,
 )
+from mercury_tools.providers.manifest import load_provider_manifest
 from mercury_tools.providers.models import (
     AuthorizationMethod,
     ConnectionReadiness,
@@ -33,6 +35,7 @@ CONNECTION_ID = UUID("87654321-4321-8765-4321-876543218765")
 TENANT_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 USER_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 NOW = datetime(2026, 7, 30, 12, tzinfo=UTC)
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class InvoiceReadInputs(BaseModel):
@@ -68,6 +71,7 @@ def _qualification(
             "required": ["document_number", "invoice_id", "contact_email", "tax_id"],
             "additionalProperties": False,
         },
+        public_output_field_paths=("/document_number", "/invoice_id"),
         response_shape_hash="a" * 64,
         required_permissions=("documents.read",),
     )
@@ -156,6 +160,9 @@ class FakeResolver:
 class FakeDriver:
     def __init__(self, outcomes: list[object]) -> None:
         self.outcomes = outcomes
+        self._manifest = load_provider_manifest(
+            ROOT / "catalog" / "global" / "flowaccount" / "driver.json"
+        )
         self.calls: list[
             tuple[ProviderConnection, QualifiedCapabilityBinding, BaseModel, object]
         ] = []
@@ -535,7 +542,7 @@ async def test_hosted_read_retains_dispatch_certainty_after_response_validation_
                     provider=ProviderId.FLOWACCOUNT,
                     status_class=ProviderStatusClass.SUCCESS,
                     normalized_data={"document_number": "INV-1"},
-                    dispatch_certainty=DispatchCertainty.DISPATCHED,
+                    dispatch_certainty=DispatchCertainty.UNKNOWN,
                 )
             ]
         ),
@@ -546,7 +553,7 @@ async def test_hosted_read_retains_dispatch_certainty_after_response_validation_
         audit_recorder=audits.append,
     )
 
-    with pytest.raises(ValueError, match="^generated_schema_validation_failed$"):
+    with pytest.raises(ProviderSchemaChanged) as caught:
         await service.execute(
             _principal(),
             WORKSPACE_ID,
@@ -556,9 +563,64 @@ async def test_hosted_read_retains_dispatch_certainty_after_response_validation_
             InvoiceReadInputs(invoice_reference="INV-001"),
         )
 
+    assert caught.value.dispatch_certainty is DispatchCertainty.DISPATCHED
     assert len(audits) == 1
-    assert audits[0]["output_summary"]["status_class"] == "validation_failed"
+    assert audits[0]["output_summary"]["status_class"] == "schema_changed"
     assert audits[0]["output_summary"]["dispatch_certainty"] == "dispatched"
+
+
+@pytest.mark.asyncio
+async def test_hosted_read_uses_exact_manifest_read_deadline_beyond_five_seconds() -> None:
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+
+    qualification = _qualification()
+
+    class AfterFiveSecondsDriver(FakeDriver):
+        async def call(
+            self,
+            connection: ProviderConnection,
+            binding: QualifiedCapabilityBinding,
+            inputs: BaseModel,
+            operation_id: object,
+            *,
+            deadline: object | None = None,
+        ) -> ProviderCallResult:
+            del operation_id
+            self.calls.append((connection, binding, inputs, deadline))
+            assert deadline is not None
+            assert deadline.expires_at - deadline.started_at == 30
+            deadline._clock = lambda: deadline.started_at + 6
+            deadline.check()
+            return ProviderCallResult(
+                provider=ProviderId.FLOWACCOUNT,
+                status_class=ProviderStatusClass.SUCCESS,
+                normalized_data={
+                    "document_number": "INV-001",
+                    "invoice_id": "provider-invoice-id",
+                    "contact_email": "person@example.com",
+                    "tax_id": "1234567890123",
+                },
+                dispatch_certainty=DispatchCertainty.DISPATCHED,
+            )
+
+    driver = AfterFiveSecondsDriver([])
+    runtime = _runtime(qualification, driver)
+    service = HostedReadService(
+        runtime_factory=lambda: runtime,
+        membership_resolver=_membership,
+    )
+
+    envelope = await service.execute(
+        _principal(),
+        WORKSPACE_ID,
+        CONNECTION_ID,
+        qualification.normalized_capability,
+        qualification.capability_version_sha256,
+        InvoiceReadInputs(invoice_reference="INV-001"),
+    )
+
+    assert envelope.data["document_number"] == "INV-001"
+    assert len(driver.calls) == 1
 
 
 @pytest.mark.asyncio

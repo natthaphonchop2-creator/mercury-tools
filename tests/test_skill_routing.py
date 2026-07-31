@@ -245,6 +245,7 @@ def test_native_provider_unavailable_write_does_not_block_unrelated_read_skill()
         skill_id="invoice-create-test",
         required_capabilities=("documents.invoice.create",),
         optional_capabilities=(),
+        read_mappings=(),
     )
     native_profile = ready_profile(
         "flowaccount",
@@ -296,16 +297,16 @@ def test_native_route_preserves_server_case_and_includes_only_observed_optional_
 
     assert route["status"] == "ready"
     assert route["ordered_steps"] == [
-            {
-                "step": 1,
-                "action": "invoke_connected_provider_capability",
+        {
+            "step": 1,
+            "action": "invoke_connected_provider_capability",
             "capability": "company.read",
             "provider_capabilities": ["company.info.read"],
             "required": True,
         },
-            {
-                "step": 2,
-                "action": "invoke_connected_provider_capability",
+        {
+            "step": 2,
+            "action": "invoke_connected_provider_capability",
             "capability": "documents.invoice.list",
             "provider_capabilities": ["documents.invoice.list"],
             "required": False,
@@ -383,9 +384,7 @@ def test_observed_provider_alias_resolves_observed_optional_canonical_capability
 
     assert route["status"] == "ready"
     optional_resolution = next(
-        item
-        for item in route["capability_resolution"]
-        if item["capability"] == optional_capability
+        item for item in route["capability_resolution"] if item["capability"] == optional_capability
     )
     assert optional_resolution == {
         "capability": optional_capability,

@@ -256,21 +256,16 @@ class SkillCapabilityBindingOutput(V1PublicModel):
 
 
 class RunAccountingSkillData(V1PublicModel):
-    skill_id: str = Field(min_length=1, max_length=200)
-    skill_version: str = Field(min_length=1, max_length=64)
     output_schema_name: str = Field(min_length=1, max_length=200)
-    capability_bindings: list[SkillCapabilityBindingOutput] = Field(max_length=100)
-    knowledge: list[KnowledgeResultOutput] = Field(max_length=20)
-    host_evidence_count: int = Field(ge=0, le=100)
-    allowed_action_classes: list[Literal["provider_read"]] = Field(max_length=10)
-    blocked_action_classes: list[
-        Literal["provider_create", "provider_update", "provider_delete"]
-    ] = Field(max_length=10)
+    facts: list[Annotated[str, Field(max_length=2_000)]] = Field(max_length=500)
+    citations: list[Annotated[str, Field(max_length=2_000)]] = Field(max_length=100)
 
 
 class RunAccountingSkillOutput(V1SuccessEnvelope):
     workspace_id: UUID
     connection_id: UUID | None = None
+    skill_id: str = Field(min_length=1, max_length=200)
+    skill_version: str = Field(min_length=1, max_length=64)
     data: RunAccountingSkillData
 
 

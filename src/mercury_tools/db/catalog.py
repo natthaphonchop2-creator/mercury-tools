@@ -112,7 +112,8 @@ class SupabaseCatalogStore:
             params={
                 "select": (
                     "id,provider,environment,provider_tool_name,normalized_capability,"
-                    "input_schema,output_schema,schema_hash,response_shape_hash,"
+                    "input_schema,output_schema,public_output_field_paths,"
+                    "schema_hash,response_shape_hash,"
                     "required_permissions,capability_version_sha256,qualification_state,"
                     "company_sha256,evidence_revision_sha256,qualification_evidence_uri,"
                     "evidence_evaluated_at,evidence_expires_at,"

@@ -8,6 +8,7 @@ import logging
 import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -28,6 +29,7 @@ from mercury_tools.providers.base import (
     ProviderStatusClass,
     QualifiedCapabilityBinding,
 )
+from mercury_tools.providers.manifest import load_provider_manifest
 from mercury_tools.providers.models import (
     AuthorizationMethod,
     ConnectionReadiness,
@@ -45,6 +47,7 @@ AUTHORIZATION_SERVER = "https://vbnlkqvauqwnjbxngkas.supabase.co/auth/v1"
 RESOURCE_METADATA_URL = (
     "https://mercury-tools-mcp.onrender.com/.well-known/oauth-protected-resource/mcp"
 )
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class StubResolver:
@@ -204,6 +207,7 @@ def _enabled_invoice_get_qualification() -> ProviderMCPQualification:
             "required": ["invoice_id"],
             "additionalProperties": False,
         },
+        public_output_field_paths=("/invoice_id",),
         response_shape_hash="a" * 64,
         required_permissions=("documents.read",),
     )
@@ -251,6 +255,7 @@ def test_http_lifespan_projects_and_automatically_refreshes_generated_provider_t
             "required": ["invoice_id"],
             "additionalProperties": False,
         },
+        public_output_field_paths=("/invoice_id",),
         response_shape_hash="a" * 64,
         required_permissions=("documents.read",),
     )
@@ -307,6 +312,10 @@ def test_http_lifespan_projects_and_automatically_refreshes_generated_provider_t
             )
 
     class Driver:
+        _manifest = load_provider_manifest(
+            ROOT / "catalog" / "global" / "flowaccount" / "driver.json"
+        )
+
         async def call(self, *_args, **_kwargs):
             return ProviderCallResult(
                 provider=ProviderId.FLOWACCOUNT,

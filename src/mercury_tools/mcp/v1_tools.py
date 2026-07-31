@@ -8,6 +8,7 @@ import inspect
 import json
 import threading
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date
 from typing import Annotated, Any, Literal, TypeAlias
 from uuid import UUID
@@ -23,7 +24,10 @@ from mercury_tools.config import load_settings
 from mercury_tools.db.supabase import SupabaseRagStore
 from mercury_tools.execution.hosted.read_service import HostedReadService
 from mercury_tools.mcp.contracts import LEGACY_HOSTED_TOOL_NAMES, V1_HOSTED_TOOL_NAMES
-from mercury_tools.mcp.generated_tools import GeneratedProviderToolPublisher
+from mercury_tools.mcp.generated_tools import (
+    GeneratedProviderToolPublisher,
+    catalog_wire_model,
+)
 from mercury_tools.mcp.v1_errors import (
     MercuryV1ToolError,
     public_error_code,
@@ -89,10 +93,12 @@ from mercury_tools.rag.models import SearchResult
 from mercury_tools.rag.routing import normalize_v1_knowledge_filters
 from mercury_tools.skills.catalog import (
     AccountingSkillDefinition,
+    SkillReadMapping,
     published_accounting_skill,
     v1_skill_read_capabilities,
 )
 from mercury_tools.skills.routing import (
+    build_published_skill_output,
     published_projection_matches,
     resolve_published_skill_route,
 )
@@ -329,6 +335,7 @@ class GeneratedProviderToolProjection:
         self._runtime_factory = runtime_factory
         self._service_factory = service_factory
         self._close_runtime = close_runtime
+        self._authority_lock = asyncio.Lock()
         self._publisher = GeneratedProviderToolPublisher(
             server,
             execute=self._execute,
@@ -348,16 +355,17 @@ class GeneratedProviderToolProjection:
         self._close_runtime = close_runtime
 
     async def refresh(self, context: Context | object | None = None) -> bool:
-        runtime: Any | None = None
-        try:
-            runtime = await _runtime_from(self._runtime_factory)
-            return await self._publisher.reconcile(
-                await _catalog_qualifications(runtime),
-                context=context,
-            )
-        finally:
-            if runtime is not None and self._close_runtime:
-                await _close_runtime(runtime)
+        async with self._authority_lock:
+            runtime: Any | None = None
+            try:
+                runtime = await _runtime_from(self._runtime_factory)
+                return await self._publisher.reconcile(
+                    await _catalog_qualifications(runtime),
+                    context=context,
+                )
+            finally:
+                if runtime is not None and self._close_runtime:
+                    await _close_runtime(runtime)
 
     async def _execute(
         self,
@@ -555,6 +563,7 @@ async def _resolve_qualification(
             runtime.qualification_resolver.resolve_for_connection(
                 connection,
                 selection=_qualification_selection(qualification),
+                deadline=deadline,
             )
         )
     if not isinstance(resolved, CapabilityResolution):
@@ -732,9 +741,11 @@ def _skill_audit_event(
     connection_id: UUID | None,
     skill: AccountingSkillDefinition,
     query: str,
-    capability_count: int,
+    read_outcomes: Sequence[Mapping[str, str]],
     knowledge_count: int,
-    host_evidence_count: int,
+    host_fact_count: int,
+    status: Literal["ok", "error", "cancelled"],
+    error_code: str | None = None,
 ) -> dict[str, object]:
     audit_input: dict[str, object] = {
         "workspace_id_sha256": _sha256_identifier(workspace_id),
@@ -744,15 +755,18 @@ def _skill_audit_event(
     }
     if connection_id is not None:
         audit_input["connection_id_sha256"] = _sha256_identifier(connection_id)
+    output_summary: dict[str, object] = {
+        "read_outcomes": [dict(outcome) for outcome in read_outcomes],
+        "knowledge_count": knowledge_count,
+        "host_fact_count": host_fact_count,
+    }
+    if error_code is not None:
+        output_summary["error_code"] = error_code
     return {
         "tool_name": RUN_ACCOUNTING_SKILL_TOOL,
         "input": audit_input,
-        "output_summary": {
-            "capability_count": capability_count,
-            "knowledge_count": knowledge_count,
-            "host_evidence_count": host_evidence_count,
-        },
-        "status": "ok",
+        "output_summary": output_summary,
+        "status": status,
         "metadata": {"runtime": "mcp", "surface": "v1"},
     }
 
@@ -928,15 +942,6 @@ async def connector_status(
             service_factory=service_factory,
         )
         runtime = await _runtime_from(runtime_factory)
-        connection = _selected_connection(
-            await _store_list_connections(
-                runtime,
-                membership=membership,
-                workspace_id=workspace_id,
-                principal=principal,
-            ),
-            connection_id,
-        )
         bound_connection = await _store_load_connection(
             runtime,
             membership=membership,
@@ -944,6 +949,14 @@ async def connector_status(
             principal=principal,
             connection_id=connection_id,
         )
+        if (
+            bound_connection.id != connection_id
+            or bound_connection.tenant_id != membership.tenant_id
+            or bound_connection.workspace_id != workspace_id
+            or bound_connection.auth_user_id != principal.subject
+        ):
+            raise ValueError("provider_connection_required")
+        connection = bound_connection.summary()
         qualifications = await _catalog_qualifications(runtime)
         missing_qualification_capabilities = await _missing_qualification_capabilities(
             runtime,
@@ -1273,7 +1286,13 @@ async def retrieve_context_pack(
         raise MercuryV1ToolError(public_error_code(error)) from None
 
 
-async def _enabled_skill_capability_bindings(
+@dataclass(frozen=True, slots=True)
+class _EnabledSkillReadBinding:
+    skill_capability: str
+    qualification: ProviderMCPQualification
+
+
+async def _enabled_skill_read_bindings(
     runtime: Any,
     *,
     skill: AccountingSkillDefinition,
@@ -1281,7 +1300,7 @@ async def _enabled_skill_capability_bindings(
     workspace_id: UUID,
     principal: MercuryPrincipal,
     connection_id: UUID,
-) -> tuple[tuple[SkillCapabilityBindingOutput, ...], tuple[str, ...]]:
+) -> tuple[tuple[_EnabledSkillReadBinding, ...], tuple[str, ...]]:
     connection = await _store_load_connection(
         runtime,
         membership=membership,
@@ -1289,12 +1308,19 @@ async def _enabled_skill_capability_bindings(
         principal=principal,
         connection_id=connection_id,
     )
+    if (
+        connection.id != connection_id
+        or connection.tenant_id != membership.tenant_id
+        or connection.workspace_id != workspace_id
+        or connection.auth_user_id != principal.subject
+    ):
+        raise ValueError("provider_connection_required")
     qualifications = tuple(
         item
         for item in await _catalog_qualifications(runtime)
         if item.provider == connection.provider.value and item.environment == connection.environment
     )
-    bindings: list[SkillCapabilityBindingOutput] = []
+    bindings: list[_EnabledSkillReadBinding] = []
     enabled_skill_capabilities: list[str] = []
     declared_capabilities = dict.fromkeys(
         (*skill.required_capabilities, *skill.optional_capabilities)
@@ -1313,6 +1339,7 @@ async def _enabled_skill_capability_bindings(
             if (
                 resolution.status == "enabled"
                 and resolution.qualification is not None
+                and resolution.qualification.public_output_field_paths is not None
                 and resolution.qualification.normalized_capability
                 == qualification.normalized_capability
                 and resolution.qualification.normalized_capability in catalog_capabilities
@@ -1321,13 +1348,85 @@ async def _enabled_skill_capability_bindings(
         if len(enabled) == 1:
             enabled_skill_capabilities.append(skill_capability)
             bindings.append(
-                SkillCapabilityBindingOutput(
+                _EnabledSkillReadBinding(
                     skill_capability=skill_capability,
-                    capability_id=enabled[0].normalized_capability,
-                    capability_version=enabled[0].capability_version_sha256,
+                    qualification=enabled[0],
                 )
             )
     return tuple(bindings), tuple(enabled_skill_capabilities)
+
+
+async def _enabled_skill_capability_bindings(
+    runtime: Any,
+    *,
+    skill: AccountingSkillDefinition,
+    membership: WorkspaceMembership,
+    workspace_id: UUID,
+    principal: MercuryPrincipal,
+    connection_id: UUID,
+) -> tuple[tuple[SkillCapabilityBindingOutput, ...], tuple[str, ...]]:
+    bindings, enabled_capabilities = await _enabled_skill_read_bindings(
+        runtime,
+        skill=skill,
+        membership=membership,
+        workspace_id=workspace_id,
+        principal=principal,
+        connection_id=connection_id,
+    )
+    return (
+        tuple(
+            SkillCapabilityBindingOutput(
+                skill_capability=binding.skill_capability,
+                capability_id=binding.qualification.normalized_capability,
+                capability_version=binding.qualification.capability_version_sha256,
+            )
+            for binding in bindings
+        ),
+        enabled_capabilities,
+    )
+
+
+def _skill_read_inputs(
+    mapping: SkillReadMapping,
+    qualification: ProviderMCPQualification,
+    arguments: RunAccountingSkillArguments,
+) -> BaseModel:
+    serialized_arguments = arguments.model_dump(mode="json")
+    if mapping.request_kind == "empty":
+        payload: dict[str, object] = {}
+    elif mapping.request_kind == "invoice_list":
+        payload = {
+            field: serialized_arguments[field]
+            for field in ("period_start", "period_end", "month")
+            if serialized_arguments[field] is not None
+        }
+    elif mapping.request_kind == "invoice_get":
+        if not arguments.document_ids:
+            raise ValueError("insufficient_evidence")
+        payload = {"document_id": arguments.document_ids[0]}
+    else:
+        raise ValueError("insufficient_evidence")
+    try:
+        return catalog_wire_model(
+            qualification.input_schema,
+            kind="input",
+        ).model_validate(payload)
+    except ValueError:
+        raise ValueError("insufficient_evidence") from None
+
+
+def _skill_host_facts(
+    evidence: Sequence[HostConnectedEvidenceInput],
+) -> tuple[Mapping[str, object], ...]:
+    return tuple(
+        {
+            "source": item.source,
+            "evidence_type": item.evidence_type,
+            "fact": fact.model_dump(mode="json"),
+        }
+        for item in evidence
+        for fact in item.facts
+    )
 
 
 async def run_accounting_skill(
@@ -1339,9 +1438,14 @@ async def run_accounting_skill(
     runtime_factory: ProviderRuntimeFactory | None = None,
     audit_recorder: AuditRecorder = _record_connector_status_audit,
 ) -> RunAccountingSkillOutput:
-    """Resolve one exact Skill using evidence and enabled catalog authority only."""
+    """Execute one exact published Skill from qualified reads and reviewed evidence."""
 
     runtime: Any | None = None
+    skill: AccountingSkillDefinition | None = None
+    read_outcomes: list[dict[str, str]] = []
+    knowledge_count = 0
+    host_facts = _skill_host_facts(arguments.host_evidence)
+    audit_eligible = False
     try:
         principal, membership = await _require_workspace(
             context,
@@ -1351,6 +1455,7 @@ async def run_accounting_skill(
         skill = published_accounting_skill(arguments.skill_id, arguments.skill_version)
         if skill is None:
             raise ValueError("insufficient_evidence")
+        audit_eligible = True
         store = store_factory()
         projection = await asyncio.to_thread(
             store.get_published_skill_projection,
@@ -1363,11 +1468,11 @@ async def run_accounting_skill(
         if not published_projection_matches(skill, projection):
             raise ValueError("insufficient_evidence")
 
-        bindings: tuple[SkillCapabilityBindingOutput, ...] = ()
+        read_bindings: tuple[_EnabledSkillReadBinding, ...] = ()
         enabled_capabilities: tuple[str, ...] = ()
         if arguments.connection_id is not None:
             runtime = await _runtime_from(runtime_factory)
-            bindings, enabled_capabilities = await _enabled_skill_capability_bindings(
+            read_bindings, enabled_capabilities = await _enabled_skill_read_bindings(
                 runtime,
                 skill=skill,
                 membership=membership,
@@ -1389,29 +1494,116 @@ async def run_accounting_skill(
                 mode="hybrid",
             )
         knowledge = _knowledge_result_outputs(knowledge_results) if knowledge_results else []
+        knowledge_count = len(knowledge)
+
+        exact_bindings = {binding.skill_capability: binding for binding in read_bindings}
+        required_reads: list[tuple[SkillReadMapping, _EnabledSkillReadBinding]] = []
+        for mapping in skill.read_mappings:
+            binding = exact_bindings.get(mapping.skill_capability)
+            if (
+                binding is None
+                or binding.qualification.normalized_capability != mapping.capability_id
+            ):
+                read_outcomes.append(
+                    {
+                        "capability_id": mapping.capability_id,
+                        "status": "missing",
+                    }
+                )
+                raise ValueError("insufficient_evidence")
+            required_reads.append((mapping, binding))
+
+        preflight = resolve_published_skill_route(
+            skill,
+            projection=projection,
+            enabled_capabilities=enabled_capabilities,
+            business_fact_count=len(host_facts) + len(required_reads),
+            knowledge_source_count=len({item.citation.source_id for item in knowledge}),
+            citation_count=len(knowledge),
+        )
+        if preflight["status"] != "ready":
+            raise ValueError("insufficient_evidence")
+
+        provider_results: list[tuple[str, Mapping[str, object]]] = []
+        if required_reads:
+            if runtime is None or arguments.connection_id is None:
+                raise ValueError("insufficient_evidence")
+
+            async def resolve_membership(
+                read_principal: MercuryPrincipal,
+                read_workspace_id: UUID,
+            ) -> WorkspaceMembership:
+                if (
+                    read_principal.subject != principal.subject
+                    or read_workspace_id != arguments.workspace_id
+                ):
+                    raise ValueError("workspace_access_denied")
+                return membership
+
+            read_service = HostedReadService(
+                runtime_factory=lambda: runtime,
+                membership_resolver=resolve_membership,
+                audit_recorder=audit_recorder,
+                close_runtime=False,
+            )
+            for mapping, binding in required_reads:
+                qualification = binding.qualification
+                outcome = {
+                    "capability_id": qualification.normalized_capability,
+                    "capability_version": qualification.capability_version_sha256,
+                    "status": "error",
+                }
+                try:
+                    inputs = _skill_read_inputs(mapping, qualification, arguments)
+                    result = await read_service.execute(
+                        principal,
+                        arguments.workspace_id,
+                        arguments.connection_id,
+                        qualification.normalized_capability,
+                        qualification.capability_version_sha256,
+                        inputs,
+                    )
+                except asyncio.CancelledError:
+                    outcome["status"] = "cancelled"
+                    read_outcomes.append(outcome)
+                    raise
+                except Exception as error:
+                    outcome["error_code"] = public_error_code(error)
+                    read_outcomes.append(outcome)
+                    raise
+                if (
+                    result.capability_id != qualification.normalized_capability
+                    or result.capability_version != qualification.capability_version_sha256
+                ):
+                    outcome["error_code"] = "capability_unavailable"
+                    read_outcomes.append(outcome)
+                    raise ValueError("capability_unavailable")
+                outcome["status"] = "ok"
+                read_outcomes.append(outcome)
+                provider_results.append((mapping.result_fact_name, result.data))
+
         route = resolve_published_skill_route(
             skill,
             projection=projection,
             enabled_capabilities=enabled_capabilities,
-            business_fact_count=sum(len(evidence.facts) for evidence in arguments.host_evidence),
+            business_fact_count=len(host_facts) + len(provider_results),
             knowledge_source_count=len({item.citation.source_id for item in knowledge}),
             citation_count=len(knowledge),
         )
         if route["status"] != "ready":
             raise ValueError("insufficient_evidence")
+        published_output = build_published_skill_output(
+            skill,
+            host_facts=host_facts,
+            provider_results=provider_results,
+            citations=[item.citation.source_uri for item in knowledge],
+        )
         response = RunAccountingSkillOutput(
             workspace_id=arguments.workspace_id,
             connection_id=arguments.connection_id,
-            data=RunAccountingSkillData(
-                skill_id=skill.skill_id,
-                skill_version=skill.skill_version,
-                output_schema_name=skill.output_schema_name,
-                capability_bindings=list(bindings),
-                knowledge=knowledge,
-                host_evidence_count=len(arguments.host_evidence),
-                allowed_action_classes=list(skill.allowed_action_classes),
-                blocked_action_classes=list(skill.blocked_action_classes),
-            ),
+            skill_id=skill.skill_id,
+            skill_version=skill.skill_version,
+            data=RunAccountingSkillData.model_validate(published_output),
             accountant_review_points=[],
             next_allowed_actions=[],
         )
@@ -1422,14 +1614,47 @@ async def run_accounting_skill(
                 connection_id=arguments.connection_id,
                 skill=skill,
                 query=arguments.query,
-                capability_count=len(bindings),
-                knowledge_count=len(knowledge),
-                host_evidence_count=len(arguments.host_evidence),
+                read_outcomes=read_outcomes,
+                knowledge_count=knowledge_count,
+                host_fact_count=len(host_facts),
+                status="ok",
             ),
         )
         return response
+    except asyncio.CancelledError:
+        if skill is not None and audit_eligible:
+            await _write_audit(
+                audit_recorder,
+                _skill_audit_event(
+                    workspace_id=arguments.workspace_id,
+                    connection_id=arguments.connection_id,
+                    skill=skill,
+                    query=arguments.query,
+                    read_outcomes=read_outcomes,
+                    knowledge_count=knowledge_count,
+                    host_fact_count=len(host_facts),
+                    status="cancelled",
+                ),
+            )
+        raise
     except Exception as error:
-        raise MercuryV1ToolError(public_error_code(error)) from None
+        error_code = public_error_code(error)
+        if skill is not None and audit_eligible:
+            await _write_audit(
+                audit_recorder,
+                _skill_audit_event(
+                    workspace_id=arguments.workspace_id,
+                    connection_id=arguments.connection_id,
+                    skill=skill,
+                    query=arguments.query,
+                    read_outcomes=read_outcomes,
+                    knowledge_count=knowledge_count,
+                    host_fact_count=len(host_facts),
+                    status="error",
+                    error_code=error_code,
+                ),
+            )
+        raise MercuryV1ToolError(error_code) from None
     finally:
         if runtime is not None:
             await _close_runtime(runtime)

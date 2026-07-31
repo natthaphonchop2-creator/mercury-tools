@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -45,6 +46,13 @@ _V1_SKILL_READ_CAPABILITY_ROUTES = MappingProxyType(
         "documents.invoice.get": ("documents.invoice.get",),
     }
 )
+_V1_SKILL_REQUEST_KIND = MappingProxyType(
+    {
+        "provider_profile.get": "empty",
+        "documents.invoice.list": "invoice_list",
+        "documents.invoice.get": "invoice_get",
+    }
+)
 
 
 def v1_skill_read_capabilities(capability: str) -> tuple[str, ...]:
@@ -53,6 +61,36 @@ def v1_skill_read_capabilities(capability: str) -> tuple[str, ...]:
     if not isinstance(capability, str):
         return ()
     return _V1_SKILL_READ_CAPABILITY_ROUTES.get(capability.strip(), ())
+
+
+@dataclass(frozen=True, slots=True)
+class SkillReadMapping:
+    """One Git-canonical required Skill read and its deterministic result fact."""
+
+    skill_capability: str
+    capability_id: Literal[
+        "provider_profile.get",
+        "documents.invoice.list",
+        "documents.invoice.get",
+    ]
+    request_kind: Literal["empty", "invoice_list", "invoice_get"]
+    result_fact_name: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.capability_id not in v1_skill_read_capabilities(self.skill_capability)
+            or self.request_kind != _V1_SKILL_REQUEST_KIND[self.capability_id]
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,99}", self.result_fact_name) is None
+        ):
+            raise ValueError("skill_read_mapping_invalid")
+
+    def published_projection(self) -> dict[str, str]:
+        return {
+            "skill_capability": self.skill_capability,
+            "capability_id": self.capability_id,
+            "request_kind": self.request_kind,
+            "result_fact_name": self.result_fact_name,
+        }
 
 
 class _HostBusinessFactInput(BaseModel):
@@ -247,6 +285,7 @@ class AccountingSkillDefinition:
     required_connectors: tuple[str, ...]
     input_schema: type[BaseModel]
     output_schema_name: str
+    read_mappings: tuple[SkillReadMapping, ...] = ()
     skill_version: str = "0.1.0"
     allowed_action_classes: tuple[str, ...] = ("provider_read",)
     blocked_action_classes: tuple[str, ...] = (
@@ -263,6 +302,19 @@ class AccountingSkillDefinition:
         ("jurisdiction", "TH"),
         ("review_status", "reviewed"),
     )
+
+    def __post_init__(self) -> None:
+        mapped_capabilities = tuple(mapping.skill_capability for mapping in self.read_mappings)
+        expected = tuple(
+            capability
+            for capability in self.required_capabilities
+            if v1_skill_read_capabilities(capability)
+        )
+        if (
+            len(mapped_capabilities) != len(set(mapped_capabilities))
+            or mapped_capabilities != expected
+        ):
+            raise ValueError("skill_read_mapping_invalid")
 
     @property
     def git_source_path(self) -> str:
@@ -302,6 +354,7 @@ class AccountingSkillDefinition:
             "required_capabilities": list(self.required_capabilities),
             "optional_capabilities": list(self.optional_capabilities),
             "v1_capability_routes": self.v1_capability_routes,
+            "read_mappings": [mapping.published_projection() for mapping in self.read_mappings],
             "required_connectors": list(self.required_connectors),
             "allowed_action_classes": list(self.allowed_action_classes),
             "blocked_action_classes": list(self.blocked_action_classes),
@@ -329,6 +382,14 @@ ACCOUNTING_SKILL_CATALOG: tuple[AccountingSkillDefinition, ...] = (
         required_connectors=(),
         input_schema=CompanyHealthSkillInput,
         output_schema_name="company_health_result",
+        read_mappings=(
+            SkillReadMapping(
+                skill_capability="company.read",
+                capability_id="provider_profile.get",
+                request_kind="empty",
+                result_fact_name="company_profile",
+            ),
+        ),
     ),
     AccountingSkillDefinition(
         skill_id="vat-summary-th",
@@ -340,6 +401,14 @@ ACCOUNTING_SKILL_CATALOG: tuple[AccountingSkillDefinition, ...] = (
         required_connectors=(),
         input_schema=VatSummarySkillInput,
         output_schema_name="vat_summary_result",
+        read_mappings=(
+            SkillReadMapping(
+                skill_capability="documents.invoice.list",
+                capability_id="documents.invoice.list",
+                request_kind="invoice_list",
+                result_fact_name="invoice_list",
+            ),
+        ),
     ),
     AccountingSkillDefinition(
         skill_id="invoice-review-th",
@@ -351,6 +420,20 @@ ACCOUNTING_SKILL_CATALOG: tuple[AccountingSkillDefinition, ...] = (
         required_connectors=(),
         input_schema=InvoiceReviewSkillInput,
         output_schema_name="invoice_review_result",
+        read_mappings=(
+            SkillReadMapping(
+                skill_capability="documents.invoice.list",
+                capability_id="documents.invoice.list",
+                request_kind="invoice_list",
+                result_fact_name="invoice_list",
+            ),
+            SkillReadMapping(
+                skill_capability="documents.invoice.read",
+                capability_id="documents.invoice.get",
+                request_kind="invoice_get",
+                result_fact_name="invoice_detail",
+            ),
+        ),
     ),
     AccountingSkillDefinition(
         skill_id="management-report-th",
@@ -362,6 +445,20 @@ ACCOUNTING_SKILL_CATALOG: tuple[AccountingSkillDefinition, ...] = (
         required_connectors=(),
         input_schema=ManagementReportSkillInput,
         output_schema_name="management_report_result",
+        read_mappings=(
+            SkillReadMapping(
+                skill_capability="company.read",
+                capability_id="provider_profile.get",
+                request_kind="empty",
+                result_fact_name="company_profile",
+            ),
+            SkillReadMapping(
+                skill_capability="documents.invoice.list",
+                capability_id="documents.invoice.list",
+                request_kind="invoice_list",
+                result_fact_name="invoice_list",
+            ),
+        ),
     ),
     AccountingSkillDefinition(
         skill_id="connector-setup-guide-th",
@@ -442,6 +539,14 @@ ACCOUNTING_SKILL_CATALOG: tuple[AccountingSkillDefinition, ...] = (
         required_connectors=(),
         input_schema=ReconciliationSkillInput,
         output_schema_name="reconciliation_result",
+        read_mappings=(
+            SkillReadMapping(
+                skill_capability="documents.invoice.list",
+                capability_id="documents.invoice.list",
+                request_kind="invoice_list",
+                result_fact_name="invoice_list",
+            ),
+        ),
     ),
     AccountingSkillDefinition(
         skill_id="accounts-payable-reconciliation-th",

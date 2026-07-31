@@ -462,7 +462,6 @@ async def test_workspace_membership_is_resolved_before_provider_connection_store
 
 @pytest.mark.asyncio
 async def test_connector_status_writes_only_a_sanitized_local_audit_event() -> None:
-    from datetime import UTC, datetime
 
     from mercury_tools.auth.models import MercuryPrincipal
     from mercury_tools.mcp.v1_tools import connector_status
@@ -484,25 +483,31 @@ async def test_connector_status_writes_only_a_sanitized_local_audit_event() -> N
                 role=WorkspaceRole.MEMBER,
             )
 
-    connection = ProviderConnectionSummary(
+    stale_connection = ProviderConnectionSummary(
         connection_id=CONNECTION_ID,
         provider=ProviderId.FLOWACCOUNT,
-        environment="sandbox",
-        account_display_name="Sanitized Account",
+        environment="production",
+        account_display_name="Stale Account",
         authorization_method=AuthorizationMethod.OAUTH2_PKCE,
         granted_permissions=("accounting.read",),
-        readiness=ConnectionReadiness.READY,
-        revision=3,
-        last_validated_at=datetime.now(UTC),
+        readiness=ConnectionReadiness.REQUIRES_VALIDATION,
+        revision=1,
+        last_validated_at=None,
         provider_revocation_required=False,
     )
+    current_connection = _flowaccount_connection()
 
     class ConnectionStore:
+        list_calls = 0
+        load_calls = 0
+
         def list_for_workspace(self, **_kwargs: object) -> tuple[ProviderConnectionSummary, ...]:
-            return (connection,)
+            self.list_calls += 1
+            return (stale_connection,)
 
         def load_connection(self, **_kwargs: object):
-            return _flowaccount_connection()
+            self.load_calls += 1
+            return current_connection
 
     class QualificationCatalog:
         def list_provider_mcp_qualifications(self) -> tuple[object, ...]:
@@ -539,6 +544,10 @@ async def test_connector_status_writes_only_a_sanitized_local_audit_event() -> N
     )
 
     assert result.status == "ok"
+    assert result.data.connection.revision == current_connection.revision
+    assert result.data.connection.readiness == current_connection.readiness.value
+    assert runtime.connection_store.list_calls == 0
+    assert runtime.connection_store.load_calls == 1
     assert audit_events == [
         {
             "tool_name": "connector_status",
@@ -963,7 +972,14 @@ async def test_public_capability_status_uses_the_connection_bound_catalog_resolv
         def __init__(self) -> None:
             self.calls: list[tuple[object, object]] = []
 
-        async def resolve_for_connection(self, connection_value: object, *, selection: object):
+        async def resolve_for_connection(
+            self,
+            connection_value: object,
+            *,
+            selection: object,
+            deadline: object,
+        ):
+            assert deadline is not None
             self.calls.append((connection_value, selection))
             return CapabilityResolution(status="insufficient_evidence")
 
@@ -1008,7 +1024,14 @@ async def test_public_capability_schema_refuses_terminal_or_unverified_catalog_r
             return (qualification,)
 
     class Resolver:
-        async def resolve_for_connection(self, _connection: object, *, selection: object):
+        async def resolve_for_connection(
+            self,
+            _connection: object,
+            *,
+            selection: object,
+            deadline: object,
+        ):
+            assert deadline is not None
             return CapabilityResolution(status="capability_unavailable")
 
     runtime = SimpleNamespace(

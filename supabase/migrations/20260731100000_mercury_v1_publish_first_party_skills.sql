@@ -486,6 +486,14 @@ begin
         ],
         "type": "object"
       },
+      "read_mappings": [
+        {
+          "capability_id": "provider_profile.get",
+          "request_kind": "empty",
+          "result_fact_name": "company_profile",
+          "skill_capability": "company.read"
+        }
+      ],
       "required_capabilities": [
         "company.read"
       ],
@@ -504,7 +512,7 @@ begin
         "tax.vat.summary.read": []
       }
     },
-    "projection_sha256": "ec14d9987527324b5c3d3006aaca27bed188e35f209add23025de17283d5f83d",
+    "projection_sha256": "5928430700db60ef9ae55f7af5e1059b45f19ffea3b9e7be9f0e742a1f6c91d5",
     "publication_status": "published",
     "skill_id": "company-health-check-th",
     "skill_version": "0.1.0",
@@ -990,6 +998,14 @@ begin
         ],
         "type": "object"
       },
+      "read_mappings": [
+        {
+          "capability_id": "documents.invoice.list",
+          "request_kind": "invoice_list",
+          "result_fact_name": "invoice_list",
+          "skill_capability": "documents.invoice.list"
+        }
+      ],
       "required_capabilities": [
         "documents.invoice.list"
       ],
@@ -1005,7 +1021,7 @@ begin
         "tax.vat.summary.read": []
       }
     },
-    "projection_sha256": "fa33eaf94d998c674a333784a103581bae69a208bb14333d1e9f7331fb1291a3",
+    "projection_sha256": "99131146cea3c5ceffacd0b5a5f3c4c7af39564ee41d90b8ae1ff466c8a9f985",
     "publication_status": "published",
     "skill_id": "vat-summary-th",
     "skill_version": "0.1.0",
@@ -1494,6 +1510,20 @@ begin
         ],
         "type": "object"
       },
+      "read_mappings": [
+        {
+          "capability_id": "documents.invoice.list",
+          "request_kind": "invoice_list",
+          "result_fact_name": "invoice_list",
+          "skill_capability": "documents.invoice.list"
+        },
+        {
+          "capability_id": "documents.invoice.get",
+          "request_kind": "invoice_get",
+          "result_fact_name": "invoice_detail",
+          "skill_capability": "documents.invoice.read"
+        }
+      ],
       "required_capabilities": [
         "documents.invoice.list",
         "documents.invoice.read"
@@ -1513,7 +1543,7 @@ begin
         ]
       }
     },
-    "projection_sha256": "7e8cfc464654ffafe1dd64b6c5f0d445e7c182a25e588c6c18253f0c6872a5c7",
+    "projection_sha256": "e92cf60d1cce7b3d67e30ca3d0d8da09578c03335596f4973de3e546ac318352",
     "publication_status": "published",
     "skill_id": "invoice-review-th",
     "skill_version": "0.1.0",
@@ -2001,6 +2031,20 @@ begin
         ],
         "type": "object"
       },
+      "read_mappings": [
+        {
+          "capability_id": "provider_profile.get",
+          "request_kind": "empty",
+          "result_fact_name": "company_profile",
+          "skill_capability": "company.read"
+        },
+        {
+          "capability_id": "documents.invoice.list",
+          "request_kind": "invoice_list",
+          "result_fact_name": "invoice_list",
+          "skill_capability": "documents.invoice.list"
+        }
+      ],
       "required_capabilities": [
         "company.read",
         "documents.invoice.list"
@@ -2021,7 +2065,7 @@ begin
         "payments.read": []
       }
     },
-    "projection_sha256": "ae67de14a8405542309eeb7cf286848bcc39fdd94128b5152d4b889252a7b747",
+    "projection_sha256": "2e0f7607415a4677af59536ac085f29fe1c91f29c288274f5c5c4eaabdb0cfb9",
     "publication_status": "published",
     "skill_id": "management-report-th",
     "skill_version": "0.1.0",
@@ -2488,6 +2532,7 @@ begin
         ],
         "type": "object"
       },
+      "read_mappings": [],
       "required_capabilities": [],
       "required_connectors": [],
       "skill_id": "connector-setup-guide-th",
@@ -2496,7 +2541,7 @@ begin
       "title": "Connector Setup Guide TH",
       "v1_capability_routes": {}
     },
-    "projection_sha256": "9f90cddaadc0d18014e6bfa3554a25bb40427c71dd034237cc5c97e9c33688d3",
+    "projection_sha256": "f95704c0b451894afd20c87e240f7ca9dc0d94513e7b68affffb952e14021721",
     "publication_status": "published",
     "skill_id": "connector-setup-guide-th",
     "skill_version": "0.1.0",
@@ -2963,6 +3008,7 @@ begin
         ],
         "type": "object"
       },
+      "read_mappings": [],
       "required_capabilities": [],
       "required_connectors": [],
       "skill_id": "connector-credential-setup-th",
@@ -2971,7 +3017,7 @@ begin
       "title": "Connector Credential Setup TH",
       "v1_capability_routes": {}
     },
-    "projection_sha256": "6de7b21e964eba605896c040a6bb38a0a75b9d6b03a3bfc4eb4f4494e93ff874",
+    "projection_sha256": "7c4c7d86cd4649cf392bdcd6fe7415794b9aa767b20cf95e6ad66d8c4926e047",
     "publication_status": "published",
     "skill_id": "connector-credential-setup-th",
     "skill_version": "0.1.0",
@@ -3438,6 +3484,7 @@ begin
         ],
         "type": "object"
       },
+      "read_mappings": [],
       "required_capabilities": [],
       "required_connectors": [
         "flowaccount"
@@ -3448,7 +3495,7 @@ begin
       "title": "FlowAccount Connector Setup TH",
       "v1_capability_routes": {}
     },
-    "projection_sha256": "9da22f9967d45c53d4649ec766a873fcd67bee8285a13187d0f142846b055e59",
+    "projection_sha256": "acb76c8ccef98861198e9969befffea4a341c5e2c10afbca6d13d41ec8068966",
     "publication_status": "published",
     "skill_id": "flowaccount-connector-setup-th",
     "skill_version": "0.1.0",
@@ -3915,6 +3962,7 @@ begin
         ],
         "type": "object"
       },
+      "read_mappings": [],
       "required_capabilities": [],
       "required_connectors": [
         "peak"
@@ -3925,7 +3973,7 @@ begin
       "title": "PEAK Connector Setup TH",
       "v1_capability_routes": {}
     },
-    "projection_sha256": "dbb079d8ea884c913bc14d190c72c4c84c933e490b9747363a5cd580474fb078",
+    "projection_sha256": "f74f89a4c2cf99f776850456ce0fb51555fe466e47e2475eb874b0b9ae7e2876",
     "publication_status": "published",
     "skill_id": "peak-connector-setup-th",
     "skill_version": "0.1.0",
@@ -4398,6 +4446,7 @@ begin
         ],
         "type": "object"
       },
+      "read_mappings": [],
       "required_capabilities": [],
       "required_connectors": [],
       "skill_id": "mercury-flow-runner",
@@ -4406,7 +4455,7 @@ begin
       "title": "Mercury Flow Runner",
       "v1_capability_routes": {}
     },
-    "projection_sha256": "2384613a9bd733c1424679a10b4c5a3a9c0795b514e8573732559db294bbe06f",
+    "projection_sha256": "09831c6d1c4c257d30131a0d9b7f136399028540704f5694f3de75b11c804c67",
     "publication_status": "published",
     "skill_id": "mercury-flow-runner",
     "skill_version": "0.1.0",
@@ -4899,6 +4948,7 @@ begin
         ],
         "type": "object"
       },
+      "read_mappings": [],
       "required_capabilities": [
         "journal.draft.create"
       ],
@@ -4913,7 +4963,7 @@ begin
         "journal.draft.create": []
       }
     },
-    "projection_sha256": "6137308e058a1ad3652a7783331dec0316a51a43965b84642e3281e5f4eb2821",
+    "projection_sha256": "066d6bd67296309e9f6330604fdc3104650b59b13708e7f1c15ea0f3ba24cf11",
     "publication_status": "published",
     "skill_id": "flowaccount-journal-posting-th",
     "skill_version": "0.1.0",
@@ -5400,6 +5450,14 @@ begin
         ],
         "type": "object"
       },
+      "read_mappings": [
+        {
+          "capability_id": "documents.invoice.list",
+          "request_kind": "invoice_list",
+          "result_fact_name": "invoice_list",
+          "skill_capability": "documents.invoice.list"
+        }
+      ],
       "required_capabilities": [
         "documents.invoice.list"
       ],
@@ -5415,7 +5473,7 @@ begin
         "payments.read": []
       }
     },
-    "projection_sha256": "9ec0c4e48944f7b339757d10e3485b140cd505d910c08cff8415480b5bc46f2c",
+    "projection_sha256": "78f9d2ce8a4780db6d10bf68ed3237a3a4c79d3f0ee74145143368dffc3e54a2",
     "publication_status": "published",
     "skill_id": "accounts-receivable-reconciliation-th",
     "skill_version": "0.1.0",
@@ -5902,6 +5960,7 @@ begin
         ],
         "type": "object"
       },
+      "read_mappings": [],
       "required_capabilities": [
         "documents.expense.list"
       ],
@@ -5915,7 +5974,7 @@ begin
         "payments.read": []
       }
     },
-    "projection_sha256": "75c0053d257bef15d407d39c4ea3874fe963297170f55227da555bc5afdc799e",
+    "projection_sha256": "3fcde8ac391ecc17bba09243c42c782d945dc8a6cf50ce68c081aecf0227b566",
     "publication_status": "published",
     "skill_id": "accounts-payable-reconciliation-th",
     "skill_version": "0.1.0",
@@ -6402,6 +6461,7 @@ begin
         ],
         "type": "object"
       },
+      "read_mappings": [],
       "required_capabilities": [],
       "required_connectors": [],
       "skill_id": "bank-settlement-reconciliation-th",
@@ -6412,7 +6472,7 @@ begin
         "payments.read": []
       }
     },
-    "projection_sha256": "a81a66b2ed640b69881a7d238f6d6a45946767867cda269749c6c75784d7a47e",
+    "projection_sha256": "84a07ba24e156af5c70e1785cc045ab6fcbd0b4af4a74baa4317e2c5df3a127a",
     "publication_status": "published",
     "skill_id": "bank-settlement-reconciliation-th",
     "skill_version": "0.1.0",
@@ -6906,6 +6966,7 @@ begin
         ],
         "type": "object"
       },
+      "read_mappings": [],
       "required_capabilities": [],
       "required_connectors": [],
       "skill_id": "marketplace-settlement-review-th",
@@ -6919,7 +6980,7 @@ begin
         "payments.read": []
       }
     },
-    "projection_sha256": "41df517d8b1b06b460f7fa31f90e5b3dfe69557c389bd782b3158bb9b026b888",
+    "projection_sha256": "fedb84423a1c1e8ae0201ea08ea7a21ed5c48d2acbf126c26b2069f0ba3fe37f",
     "publication_status": "published",
     "skill_id": "marketplace-settlement-review-th",
     "skill_version": "0.1.0",
@@ -7395,6 +7456,7 @@ begin
         ],
         "type": "object"
       },
+      "read_mappings": [],
       "required_capabilities": [],
       "required_connectors": [],
       "skill_id": "month-end-evidence-gathering-th",
@@ -7411,7 +7473,7 @@ begin
         ]
       }
     },
-    "projection_sha256": "93803789f33be57ec7579b7066fa61e9e0ece9b6ad6b4198b341117ff16ccb2e",
+    "projection_sha256": "6b5f04a7fac0afa9b48cab38e7170fdabb90b3823320099ab6b8448dd7863069",
     "publication_status": "published",
     "skill_id": "month-end-evidence-gathering-th",
     "skill_version": "0.1.0",

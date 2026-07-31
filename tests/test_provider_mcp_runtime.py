@@ -1548,31 +1548,37 @@ async def test_alias_policy_is_identical_for_wire_schema_request_and_response(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("response_model", "normalized"),
+    ("response_model", "normalized", "expected_code"),
     [
         (
             UnsafeSerializedResponse,
             UnsafeSerializedResponse(invoice_id="invoice-123"),
+            "provider_response_invalid",
         ),
         (
             InvalidNestedTupleSerializedResponse,
             InvalidNestedTupleSerializedResponse(payload=InvalidNestedTuplePayload(values=(1,))),
+            "provider_schema_changed",
         ),
         (
             HiddenOpenObjectLocalRefWireModel,
             HiddenOpenObjectLocalRefWireModel(value={"safe": True}),
+            "provider_schema_changed",
         ),
         (
             NestedResourceLocalRefWireModel,
             NestedResourceLocalRefWireModel(value={"safe": True}),
+            "provider_schema_changed",
         ),
         (
             InheritedDraft202012LocalRefTupleModel,
             InheritedDraft202012LocalRefTupleModel(values=(1,)),
+            "provider_schema_changed",
         ),
         (
             ExplicitDraft202012LocalRefTupleModel,
             ExplicitDraft202012LocalRefTupleModel(values=(1,)),
+            "provider_schema_changed",
         ),
     ],
     ids=[
@@ -1588,6 +1594,7 @@ async def test_custom_response_serializer_cannot_escape_bound_wire_schema(
     monkeypatch: pytest.MonkeyPatch,
     response_model: type[BaseModel],
     normalized: BaseModel,
+    expected_code: str,
 ) -> None:
     harness = FakeMCPHarness()
     harness.install(monkeypatch)
@@ -1618,7 +1625,7 @@ async def test_custom_response_serializer_cannot_escape_bound_wire_schema(
     assert harness.call_count == 1
     _assert_sanitized_error(
         error.value,
-        code="provider_response_invalid",
+        code=expected_code,
         dispatch_certainty=DispatchCertainty.DISPATCHED,
     )
 
@@ -3894,11 +3901,12 @@ async def test_read_response_schema_and_normalizer_failures_are_closed(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("normalizer", "response_model_resolver", "expected_certainty"),
+    ("normalizer", "response_model_resolver", "expected_code", "expected_certainty"),
     [
         (
             lambda _binding, _content: {"invoice_id": "invoice-123"},
             _resolve_invoice_response_model,
+            "provider_response_invalid",
             DispatchCertainty.DISPATCHED,
         ),
         (
@@ -3907,16 +3915,19 @@ async def test_read_response_schema_and_normalizer_failures_are_closed(
                 metadata=BoundaryMetadata(alias="safe"),
             ),
             _resolve_invoice_response_model,
+            "provider_response_invalid",
             DispatchCertainty.DISPATCHED,
         ),
         (
             lambda _binding, _content: InvoiceResponse.model_construct(invoice_id=123),
             _resolve_invoice_response_model,
+            "provider_schema_changed",
             DispatchCertainty.DISPATCHED,
         ),
         (
             _normalize_invoice,
             None,
+            "provider_response_invalid",
             DispatchCertainty.NOT_DISPATCHED,
         ),
     ],
@@ -3931,6 +3942,7 @@ async def test_response_normalizer_requires_revalidated_exact_catalog_response_m
     monkeypatch: pytest.MonkeyPatch,
     normalizer: Callable[[VerifiedRuntimeBinding, Mapping[str, Any]], object],
     response_model_resolver: Callable[[VerifiedRuntimeBinding], object] | None,
+    expected_code: str,
     expected_certainty: DispatchCertainty,
 ) -> None:
     harness = FakeMCPHarness()
@@ -3949,7 +3961,7 @@ async def test_response_normalizer_requires_revalidated_exact_catalog_response_m
 
     _assert_sanitized_error(
         error.value,
-        code="provider_response_invalid",
+        code=expected_code,
         dispatch_certainty=expected_certainty,
     )
 
