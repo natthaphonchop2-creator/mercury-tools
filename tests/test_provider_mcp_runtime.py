@@ -3210,10 +3210,10 @@ async def test_call_has_one_cumulative_initialize_and_dispatch_deadline(
 ) -> None:
     harness = FakeMCPHarness()
     harness.initialize_delay = 0.04
-    harness.call_delay = 0.04
+    harness.call_delay = 0.08
     harness.install(monkeypatch)
     driver = _driver()
-    monkeypatch.setattr(driver, "_operation_seconds", lambda _timeout_class: 0.05)
+    monkeypatch.setattr(driver, "_operation_seconds", lambda _timeout_class: 0.1)
     started = time.monotonic()
 
     with pytest.raises(ProviderRuntimeError) as error:
