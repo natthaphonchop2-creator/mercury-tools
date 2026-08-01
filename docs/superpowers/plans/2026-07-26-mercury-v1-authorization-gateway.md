@@ -1,5 +1,14 @@
 # Mercury V1 Authorization Gateway Implementation Plan
 
+> **Status: Superseded.** Do not execute remaining unchecked tasks in this
+> Render/Supabase and create-only plan. The approved AWS-primary authority is
+> `docs/superpowers/specs/2026-08-01-mercury-v1-aws-primary-agentcore-design.md`;
+> Wave order is controlled by
+> `docs/superpowers/plans/2026-08-01-mercury-v1-aws-primary-wave-index.md`.
+> Existing tested domain contracts remain reusable when they satisfy the new
+> design, but this plan no longer authorizes infrastructure, identity,
+> deployment, cutover, or capability-scope work.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ship Mercury Finance `v1.0.0` as one hosted, OAuth-protected MCP that can connect one authorized workspace to FlowAccount or PEAK, run qualified invoice reads, and create qualified invoices only through immutable preview, explicit confirmation, provider dispatch, and sanitized audit.
