@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import json
 import re
-import unicodedata
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Annotated, Any, Literal, TypeAlias
 from uuid import UUID
@@ -22,11 +21,19 @@ from pydantic import (
     model_validator,
 )
 
+from mercury_tools.canonical import canonical_payload_bytes, canonical_payload_hash
 from mercury_tools.catalog.identity import deep_freeze
 from mercury_tools.credentials.models import CredentialEnvelope
-from mercury_tools.execution.models import canonical_payload_bytes, canonical_payload_hash
 from mercury_tools.providers.models import ConnectionReadiness, ProviderId
 from mercury_tools.v1.constants import MAX_BATCH_DOCUMENTS, PREVIEW_TTL_SECONDS
+
+from .sanitization import require_safe_public_identifier, sanitize_public_text
+from .transitions import (
+    OperationItemState,
+    ParentOperationState,
+    item_operation_transition_allowed,
+    parent_operation_transition_allowed,
+)
 
 UNCONFIRMED_PAYLOAD_RETENTION = timedelta(hours=24)
 CONFIRMED_PAYLOAD_RETENTION = timedelta(days=30)
@@ -63,14 +70,17 @@ def _parse_decimal_string(value: object) -> Decimal:
         raise ValueError("decimal_string_required")
     if not candidate.is_finite() or abs(candidate) > _MAX_DECIMAL:
         raise ValueError("decimal_string_required")
-    exponent = candidate.as_tuple().exponent
-    if exponent < -4:
+    if candidate.as_tuple().exponent < -4:
         raise ValueError("decimal_string_required")
     return candidate
 
 
 def _decimal_text(value: Decimal) -> str:
     return format(value, "f")
+
+
+def _round_money(value: Decimal, minor_units: int) -> Decimal:
+    return value.quantize(Decimal(1).scaleb(-minor_units), rounding=ROUND_HALF_UP)
 
 
 DecimalString = Annotated[
@@ -80,10 +90,7 @@ DecimalString = Annotated[
 ]
 NonnegativeDecimalString = Annotated[DecimalString, Field(ge=Decimal("0"))]
 PositiveDecimalString = Annotated[DecimalString, Field(gt=Decimal("0"))]
-RateDecimalString = Annotated[
-    DecimalString,
-    Field(ge=Decimal("0"), le=Decimal("100")),
-]
+RateDecimalString = Annotated[DecimalString, Field(ge=Decimal("0"), le=Decimal("100"))]
 
 
 def _aware_utc(value: datetime, code: str) -> datetime:
@@ -94,12 +101,6 @@ def _aware_utc(value: datetime, code: str) -> datetime:
 
 def _non_nil(value: UUID, code: str) -> UUID:
     if value.int == 0:
-        raise ValueError(code)
-    return value
-
-
-def _safe_text(value: str, code: str) -> str:
-    if any(unicodedata.category(character) in {"Cc", "Cf"} for character in value):
         raise ValueError(code)
     return value
 
@@ -120,9 +121,10 @@ def _json_copy(value: Any) -> Any:
 
 
 class DocumentLineAmounts(_HostedModel):
-    """Provider-neutral line arithmetic used only for review and cross-checks."""
+    """Deterministic money values derived by one reviewed projector."""
 
     currency: str = Field(pattern=_CURRENCY.pattern)
+    minor_units: int = Field(default=2, ge=0, le=4, exclude=True, repr=False)
     quantity: PositiveDecimalString
     unit_price: NonnegativeDecimalString
     discount_amount: NonnegativeDecimalString = Decimal("0")
@@ -134,24 +136,33 @@ class DocumentLineAmounts(_HostedModel):
 
     @model_validator(mode="after")
     def cross_check_line(self) -> DocumentLineAmounts:
-        subtotal = self.quantity * self.unit_price
+        subtotal = _round_money(self.quantity * self.unit_price, self.minor_units)
+        if self.discount_amount != _round_money(self.discount_amount, self.minor_units):
+            raise ValueError("line_currency_precision_invalid")
         if self.discount_amount > subtotal:
             raise ValueError("line_discount_mismatch")
         taxable = subtotal - self.discount_amount
-        if self.vat_amount != taxable * self.vat_rate / Decimal("100"):
+        expected_vat = _round_money(taxable * self.vat_rate / Decimal("100"), self.minor_units)
+        expected_withholding = _round_money(
+            taxable * self.withholding_rate / Decimal("100"), self.minor_units
+        )
+        expected_total = _round_money(
+            taxable + expected_vat - expected_withholding, self.minor_units
+        )
+        if self.vat_amount != expected_vat:
             raise ValueError("line_vat_mismatch")
-        if self.withholding_amount != taxable * self.withholding_rate / Decimal("100"):
+        if self.withholding_amount != expected_withholding:
             raise ValueError("line_withholding_mismatch")
-        expected_total = taxable + self.vat_amount - self.withholding_amount
         if self.line_total != expected_total:
             raise ValueError("line_total_mismatch")
         return self
 
 
 class DocumentFinancials(_HostedModel):
-    """Deterministic decimal totals for one document preview."""
+    """Currency-rounded totals for one document preview."""
 
     currency: str = Field(pattern=_CURRENCY.pattern)
+    minor_units: int = Field(default=2, ge=0, le=4, exclude=True, repr=False)
     lines: tuple[DocumentLineAmounts, ...] = Field(min_length=1, max_length=2500)
     subtotal: NonnegativeDecimalString
     discount_total: NonnegativeDecimalString = Decimal("0")
@@ -161,56 +172,61 @@ class DocumentFinancials(_HostedModel):
 
     @model_validator(mode="after")
     def cross_check_document(self) -> DocumentFinancials:
-        if any(line.currency != self.currency for line in self.lines):
+        if any(
+            line.currency != self.currency or line.minor_units != self.minor_units
+            for line in self.lines
+        ):
             raise ValueError("document_currency_mismatch")
-        if self.subtotal != sum(
-            (line.quantity * line.unit_price for line in self.lines),
-            start=Decimal("0"),
-        ):
+        expected = {
+            "subtotal": _round_money(
+                sum((line.quantity * line.unit_price for line in self.lines), Decimal("0")),
+                self.minor_units,
+            ),
+            "discount_total": _round_money(
+                sum((line.discount_amount for line in self.lines), Decimal("0")), self.minor_units
+            ),
+            "vat_total": _round_money(
+                sum((line.vat_amount for line in self.lines), Decimal("0")), self.minor_units
+            ),
+            "withholding_tax_total": _round_money(
+                sum((line.withholding_amount for line in self.lines), Decimal("0")),
+                self.minor_units,
+            ),
+            "grand_total": _round_money(
+                sum((line.line_total for line in self.lines), Decimal("0")), self.minor_units
+            ),
+        }
+        if self.subtotal != expected["subtotal"]:
             raise ValueError("document_subtotal_mismatch")
-        if self.discount_total != sum(
-            (line.discount_amount for line in self.lines),
-            start=Decimal("0"),
-        ):
+        if self.discount_total != expected["discount_total"]:
             raise ValueError("document_discount_mismatch")
-        if self.vat_total != sum(
-            (line.vat_amount for line in self.lines),
-            start=Decimal("0"),
-        ):
+        if self.vat_total != expected["vat_total"]:
             raise ValueError("document_vat_mismatch")
-        if self.withholding_tax_total != sum(
-            (line.withholding_amount for line in self.lines),
-            start=Decimal("0"),
-        ):
+        if self.withholding_tax_total != expected["withholding_tax_total"]:
             raise ValueError("document_withholding_mismatch")
-        expected_total = (
-            self.subtotal - self.discount_total + self.vat_total - self.withholding_tax_total
+        if self.grand_total != expected["grand_total"]:
+            raise ValueError("document_grand_total_mismatch")
+        calculated_total = _round_money(
+            self.subtotal - self.discount_total + self.vat_total - self.withholding_tax_total,
+            self.minor_units,
         )
-        if self.grand_total != expected_total or self.grand_total != sum(
-            (line.line_total for line in self.lines),
-            start=Decimal("0"),
-        ):
+        if self.grand_total != calculated_total:
             raise ValueError("document_grand_total_mismatch")
         return self
 
 
 class DocumentCreateDraft(_HostedModel):
-    """Internal exact provider payload plus separately safe review fields."""
+    """Unexposed provider arguments plus safe review-code metadata."""
 
     client_item_id: str = Field(min_length=1, max_length=200, pattern=_IDENTIFIER.pattern)
-    document_type: str = Field(min_length=1, max_length=64, pattern=_DOCUMENT_TYPE.pattern)
-    counterparty_display: str | None = Field(default=None, min_length=1, max_length=200)
-    issue_date: date | None = None
-    due_date: date | None = None
-    provider_payload: dict[str, Any] = Field(repr=False, exclude=True)
-    financials: DocumentFinancials
+    provider_arguments: dict[str, Any] = Field(repr=False, exclude=True)
     warnings: tuple[str, ...] = Field(default=(), max_length=100)
     accountant_review_points: tuple[str, ...] = Field(default=(), max_length=100)
 
-    @field_validator("counterparty_display")
+    @field_validator("client_item_id")
     @classmethod
-    def validate_display(cls, value: str | None) -> str | None:
-        return None if value is None else _safe_text(value, "document_preview_summary_invalid")
+    def validate_client_item_id(cls, value: str) -> str:
+        return require_safe_public_identifier(value, code="document_review_metadata_invalid")
 
     @field_validator("warnings", "accountant_review_points")
     @classmethod
@@ -219,44 +235,23 @@ class DocumentCreateDraft(_HostedModel):
             _IDENTIFIER.fullmatch(item) is None for item in value
         ):
             raise ValueError("document_review_metadata_invalid")
+        for item in value:
+            require_safe_public_identifier(item, code="document_review_metadata_invalid")
         return value
 
     @model_validator(mode="after")
-    def freeze_payload(self) -> DocumentCreateDraft:
-        copied = _json_copy(self.provider_payload)
+    def freeze_provider_arguments(self) -> DocumentCreateDraft:
+        copied = _json_copy(self.provider_arguments)
         if not isinstance(copied, dict):
             raise ValueError("document_payload_invalid")
-        canonical_payload_hash(copied)
-        object.__setattr__(self, "provider_payload", deep_freeze(copied))
-        if (
-            self.due_date is not None
-            and self.issue_date is not None
-            and self.due_date < self.issue_date
-        ):
-            raise ValueError("document_due_date_invalid")
+        object.__setattr__(self, "provider_arguments", deep_freeze(copied))
         return self
 
-    def provider_payload_copy(self) -> dict[str, Any]:
-        copied = _json_copy(self.provider_payload)
+    def provider_arguments_copy(self) -> dict[str, Any]:
+        copied = _json_copy(self.provider_arguments)
         if not isinstance(copied, dict):
             raise ValueError("document_payload_invalid")
         return copied
-
-    def authoritative_payload(self) -> dict[str, Any]:
-        return {
-            "accountant_review_points": list(self.accountant_review_points),
-            "counterparty_display": self.counterparty_display,
-            "document_type": self.document_type,
-            "issue_date": self.issue_date.isoformat() if self.issue_date is not None else None,
-            "due_date": self.due_date.isoformat() if self.due_date is not None else None,
-            "financials": self.financials.model_dump(mode="json"),
-            "provider_payload": self.provider_payload_copy(),
-            "warnings": list(self.warnings),
-        }
-
-    @property
-    def payload_hash(self) -> str:
-        return canonical_payload_hash(self.authoritative_payload())
 
 
 class SingleDocumentCreate(_HostedModel):
@@ -295,12 +290,7 @@ class PreviewState(StrEnum):
 
 _PREVIEW_TRANSITIONS: Mapping[PreviewState, frozenset[PreviewState]] = {
     PreviewState.PREPARED: frozenset(
-        {
-            PreviewState.AWAITING_CONFIRMATION,
-            PreviewState.CONFIRMED,
-            PreviewState.EXPIRED,
-            PreviewState.CANCELLED,
-        }
+        {PreviewState.AWAITING_CONFIRMATION, PreviewState.EXPIRED, PreviewState.CANCELLED}
     ),
     PreviewState.AWAITING_CONFIRMATION: frozenset(
         {PreviewState.CONFIRMED, PreviewState.EXPIRED, PreviewState.CANCELLED}
@@ -323,17 +313,20 @@ class PreviewPayloadBinding(_HostedModel):
     provider: ProviderId
     provider_account_sha256: str = Field(pattern=_SHA256.pattern)
     environment: str = Field(pattern=_ENVIRONMENT.pattern)
-    qualification_id: UUID | None
+    qualification_id: UUID
     provider_tool_name: str = Field(pattern=_IDENTIFIER.pattern)
     capability_id: str = Field(pattern=_CAPABILITY.pattern)
     capability_version: str = Field(pattern=_SHA256.pattern)
     schema_hash: str = Field(pattern=_SHA256.pattern)
     evidence_revision_sha256: str = Field(pattern=_SHA256.pattern)
+    projector_id: str = Field(pattern=_IDENTIFIER.pattern)
+    projector_version: str = Field(pattern=_SHA256.pattern)
     connection_revision: int = Field(ge=1)
     connection_readiness: ConnectionReadiness
     preview_state_version: int = Field(ge=1)
     client_item_id: str = Field(pattern=_IDENTIFIER.pattern)
-    payload_hash: str = Field(pattern=_SHA256.pattern)
+    provider_call_hash: str = Field(pattern=_SHA256.pattern)
+    preview_integrity_hash: str = Field(pattern=_SHA256.pattern)
     created_at: datetime
     expires_at: datetime
 
@@ -351,10 +344,9 @@ class PreviewPayloadBinding(_HostedModel):
             self.auth_user_id,
             self.workspace_id,
             self.connection_id,
+            self.qualification_id,
         ):
             _non_nil(value, "preview_payload_binding_invalid")
-        if self.qualification_id is not None:
-            _non_nil(self.qualification_id, "preview_payload_binding_invalid")
         if self.expires_at != self.created_at + timedelta(seconds=PREVIEW_TTL_SECONDS):
             raise ValueError("preview_payload_binding_invalid")
         return self
@@ -362,6 +354,37 @@ class PreviewPayloadBinding(_HostedModel):
     @property
     def vault_company_binding(self) -> str:
         return canonical_payload_hash(self.model_dump(mode="json"))
+
+
+def preview_item_integrity_hash(
+    *,
+    client_item_id: str,
+    provider_call_hash: str,
+    projector_id: str,
+    projector_version: str,
+    document_type: str,
+    counterparty_display: str,
+    issue_date: date,
+    due_date: date,
+    financials: DocumentFinancials,
+    warnings: Sequence[str],
+    accountant_review_points: Sequence[str],
+) -> str:
+    return canonical_payload_hash(
+        {
+            "client_item_id": client_item_id,
+            "provider_call_hash": provider_call_hash,
+            "projector_id": projector_id,
+            "projector_version": projector_version,
+            "document_type": document_type,
+            "counterparty_display": counterparty_display,
+            "issue_date": issue_date.isoformat(),
+            "due_date": due_date.isoformat(),
+            "financials": financials.model_dump(mode="json"),
+            "warnings": list(warnings),
+            "accountant_review_points": list(accountant_review_points),
+        }
+    )
 
 
 class StoredPreviewItem(_HostedModel):
@@ -373,17 +396,37 @@ class StoredPreviewItem(_HostedModel):
     connection_id: UUID
     item_index: int = Field(ge=0, lt=MAX_BATCH_DOCUMENTS)
     client_item_id: str = Field(pattern=_IDENTIFIER.pattern)
-    payload_hash: str = Field(pattern=_SHA256.pattern)
+    provider_call_hash: str = Field(pattern=_SHA256.pattern)
+    preview_integrity_hash: str = Field(pattern=_SHA256.pattern)
     document_type: str = Field(pattern=_DOCUMENT_TYPE.pattern)
-    counterparty_display: str | None = Field(default=None, min_length=1, max_length=200)
-    issue_date: date | None
-    due_date: date | None
+    counterparty_display: str = Field(min_length=1, max_length=200)
+    issue_date: date
+    due_date: date
     financials: DocumentFinancials
     warnings: tuple[str, ...] = Field(default=(), max_length=100)
     accountant_review_points: tuple[str, ...] = Field(default=(), max_length=100)
     payload_envelope: CredentialEnvelope = Field(repr=False, exclude=True)
     created_at: datetime
     payload_purge_after: datetime
+
+    @field_validator("client_item_id")
+    @classmethod
+    def validate_client_item_id(cls, value: str) -> str:
+        return require_safe_public_identifier(value, code="preview_item_binding_invalid")
+
+    @field_validator("counterparty_display")
+    @classmethod
+    def validate_counterparty(cls, value: str) -> str:
+        return sanitize_public_text(value, code="preview_item_binding_invalid")
+
+    @field_validator("warnings", "accountant_review_points")
+    @classmethod
+    def validate_review_codes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)) or any(
+            _IDENTIFIER.fullmatch(item) is None for item in value
+        ):
+            raise ValueError("preview_item_binding_invalid")
+        return value
 
     @field_validator("created_at", "payload_purge_after")
     @classmethod
@@ -401,6 +444,8 @@ class StoredPreviewItem(_HostedModel):
             self.connection_id,
         ):
             _non_nil(value, "preview_item_binding_invalid")
+        if self.due_date < self.issue_date:
+            raise ValueError("preview_item_binding_invalid")
         unconfirmed_purge = (
             self.created_at + timedelta(seconds=PREVIEW_TTL_SECONDS) + UNCONFIRMED_PAYLOAD_RETENTION
         )
@@ -422,6 +467,12 @@ class StoredPreviewItem(_HostedModel):
             raise ValueError("preview_item_envelope_invalid")
         return self
 
+    @property
+    def payload_hash(self) -> str:
+        """Compatibility alias for prior internal callers."""
+
+        return self.provider_call_hash
+
     def storage_record(self) -> dict[str, Any]:
         envelope = self.payload_envelope
         return {
@@ -433,14 +484,15 @@ class StoredPreviewItem(_HostedModel):
             "connection_id": str(self.connection_id),
             "item_index": self.item_index,
             "client_item_id": self.client_item_id,
-            "payload_hash": self.payload_hash,
+            "provider_call_hash": self.provider_call_hash,
+            "preview_integrity_hash": self.preview_integrity_hash,
             "document_type": self.document_type,
             "sanitized_summary": self.public_record(),
             "payload_envelope_id": str(envelope.id),
             "payload_key_version": envelope.key_version,
-            "payload_nonce": envelope.nonce.hex(),
-            "payload_ciphertext": envelope.ciphertext.hex(),
-            "payload_aad_hash": envelope.aad_hash.hex(),
+            "payload_nonce": f"\\x{envelope.nonce.hex()}",
+            "payload_ciphertext": f"\\x{envelope.ciphertext.hex()}",
+            "payload_aad_hash": f"\\x{envelope.aad_hash.hex()}",
             "payload_envelope_created_at": envelope.created_at.isoformat(),
             "created_at": self.created_at.isoformat(),
             "payload_purge_after": self.payload_purge_after.isoformat(),
@@ -449,53 +501,102 @@ class StoredPreviewItem(_HostedModel):
     def public_record(self) -> dict[str, Any]:
         return {
             "client_item_id": self.client_item_id,
+            "provider_call_hash": self.provider_call_hash,
+            "preview_integrity_hash": self.preview_integrity_hash,
             "document_type": self.document_type,
             "counterparty_display": self.counterparty_display,
-            "issue_date": self.issue_date.isoformat() if self.issue_date is not None else None,
-            "due_date": self.due_date.isoformat() if self.due_date is not None else None,
+            "issue_date": self.issue_date.isoformat(),
+            "due_date": self.due_date.isoformat(),
             "financials": self.financials.model_dump(mode="json"),
             "warnings": list(self.warnings),
             "accountant_review_points": list(self.accountant_review_points),
         }
 
 
-def preview_payload_hash(
+def preview_provider_call_hash(
     *,
-    preview_id: UUID,
-    tenant_id: UUID,
-    auth_user_id: UUID,
-    workspace_id: UUID,
-    connection_id: UUID,
     provider: ProviderId,
-    provider_account_sha256: str,
     environment: str,
+    provider_tool_name: str,
     capability_id: str,
     capability_version: str,
-    connection_revision: int,
-    connection_readiness: ConnectionReadiness,
+    schema_hash: str,
     items: Sequence[StoredPreviewItem],
+) -> str:
+    return preview_provider_call_hash_for_hashes(
+        provider=provider,
+        environment=environment,
+        provider_tool_name=provider_tool_name,
+        capability_id=capability_id,
+        capability_version=capability_version,
+        schema_hash=schema_hash,
+        item_provider_call_hashes=tuple(item.provider_call_hash for item in items),
+    )
+
+
+def preview_provider_call_hash_for_hashes(
+    *,
+    provider: ProviderId,
+    environment: str,
+    provider_tool_name: str,
+    capability_id: str,
+    capability_version: str,
+    schema_hash: str,
+    item_provider_call_hashes: Sequence[str],
 ) -> str:
     return canonical_payload_hash(
         {
-            "preview_id": str(preview_id),
-            "tenant_id": str(tenant_id),
-            "auth_user_id": str(auth_user_id),
-            "workspace_id": str(workspace_id),
-            "connection_id": str(connection_id),
             "provider": provider.value,
-            "provider_account_sha256": provider_account_sha256,
             "environment": environment,
+            "provider_tool_name": provider_tool_name,
             "capability_id": capability_id,
             "capability_version": capability_version,
-            "connection_revision": connection_revision,
-            "connection_readiness": connection_readiness.value,
-            "items": [
-                {
-                    "client_item_id": item.client_item_id,
-                    "payload_hash": item.payload_hash,
-                }
-                for item in items
-            ],
+            "schema_hash": schema_hash,
+            "item_provider_call_hashes": list(item_provider_call_hashes),
+        }
+    )
+
+
+def preview_integrity_hash(
+    *,
+    provider_call_hash: str,
+    account_display_name: str,
+    projector_id: str,
+    projector_version: str,
+    items: Sequence[StoredPreviewItem],
+    warnings: Sequence[str],
+    accountant_review_points: Sequence[str],
+) -> str:
+    return preview_integrity_hash_for_hashes(
+        provider_call_hash=provider_call_hash,
+        account_display_name=account_display_name,
+        projector_id=projector_id,
+        projector_version=projector_version,
+        item_preview_integrity_hashes=tuple(item.preview_integrity_hash for item in items),
+        warnings=warnings,
+        accountant_review_points=accountant_review_points,
+    )
+
+
+def preview_integrity_hash_for_hashes(
+    *,
+    provider_call_hash: str,
+    account_display_name: str,
+    projector_id: str,
+    projector_version: str,
+    item_preview_integrity_hashes: Sequence[str],
+    warnings: Sequence[str],
+    accountant_review_points: Sequence[str],
+) -> str:
+    return canonical_payload_hash(
+        {
+            "provider_call_hash": provider_call_hash,
+            "account_display_name": account_display_name,
+            "projector_id": projector_id,
+            "projector_version": projector_version,
+            "item_preview_integrity_hashes": list(item_preview_integrity_hashes),
+            "warnings": list(warnings),
+            "accountant_review_points": list(accountant_review_points),
         }
     )
 
@@ -510,16 +611,19 @@ class DocumentPreview(_HostedModel):
     provider_account_sha256: str = Field(pattern=_SHA256.pattern)
     account_display_name: str = Field(min_length=1, max_length=200)
     environment: str = Field(pattern=_ENVIRONMENT.pattern)
-    qualification_id: UUID | None
+    qualification_id: UUID
     provider_tool_name: str = Field(pattern=_IDENTIFIER.pattern)
     capability_id: str = Field(pattern=_CAPABILITY.pattern)
     capability_version: str = Field(pattern=_SHA256.pattern)
     schema_hash: str = Field(pattern=_SHA256.pattern)
     response_shape_hash: str = Field(pattern=_SHA256.pattern)
     evidence_revision_sha256: str = Field(pattern=_SHA256.pattern)
+    projector_id: str = Field(pattern=_IDENTIFIER.pattern)
+    projector_version: str = Field(pattern=_SHA256.pattern)
     connection_revision: int = Field(ge=1)
     connection_readiness: ConnectionReadiness
-    payload_hash: str = Field(pattern=_SHA256.pattern)
+    provider_call_hash: str = Field(pattern=_SHA256.pattern)
+    preview_integrity_hash: str = Field(pattern=_SHA256.pattern)
     state: PreviewState
     state_version: int = Field(ge=1)
     currency: str = Field(pattern=_CURRENCY.pattern)
@@ -548,7 +652,16 @@ class DocumentPreview(_HostedModel):
     @field_validator("account_display_name")
     @classmethod
     def validate_account_display(cls, value: str) -> str:
-        return _safe_text(value, "preview_binding_invalid")
+        return sanitize_public_text(value, code="preview_binding_invalid")
+
+    @field_validator("warnings", "accountant_review_points")
+    @classmethod
+    def validate_review_codes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)) or any(
+            _IDENTIFIER.fullmatch(item) is None for item in value
+        ):
+            raise ValueError("preview_binding_invalid")
+        return value
 
     @model_validator(mode="after")
     def validate_preview(self) -> DocumentPreview:
@@ -558,22 +671,20 @@ class DocumentPreview(_HostedModel):
             self.auth_user_id,
             self.workspace_id,
             self.connection_id,
+            self.qualification_id,
         ):
             _non_nil(value, "preview_binding_invalid")
-        for value in (self.qualification_id, self.supersedes_preview_id):
-            if value is not None:
-                _non_nil(value, "preview_binding_invalid")
+        if self.supersedes_preview_id is not None:
+            _non_nil(self.supersedes_preview_id, "preview_binding_invalid")
         if self.expires_at != self.created_at + timedelta(seconds=PREVIEW_TTL_SECONDS):
             raise ValueError("preview_ttl_invalid")
         if self.connection_readiness is not ConnectionReadiness.READY:
             raise ValueError("preview_binding_invalid")
-        if (
-            self.state in {PreviewState.PREPARED, PreviewState.AWAITING_CONFIRMATION}
-            and self.state_version != 1
-        ) or (
-            self.state in {PreviewState.CONFIRMED, PreviewState.EXPIRED, PreviewState.CANCELLED}
-            and self.state_version != 2
-        ):
+        if self.state in {PreviewState.PREPARED, PreviewState.AWAITING_CONFIRMATION}:
+            valid_state_version = self.state_version == 1
+        else:
+            valid_state_version = self.state_version == 2
+        if not valid_state_version:
             raise ValueError("preview_state_invalid")
         unconfirmed_purge = self.expires_at + UNCONFIRMED_PAYLOAD_RETENTION
         if self.state in {PreviewState.PREPARED, PreviewState.AWAITING_CONFIRMATION}:
@@ -608,11 +719,13 @@ class DocumentPreview(_HostedModel):
 
         client_ids = tuple(item.client_item_id for item in self.items)
         item_ids = tuple(item.preview_item_id for item in self.items)
-        item_hashes = tuple(item.payload_hash for item in self.items)
+        provider_hashes = tuple(item.provider_call_hash for item in self.items)
+        integrity_hashes = tuple(item.preview_integrity_hash for item in self.items)
         if (
             len(client_ids) != len(set(client_ids))
             or len(item_ids) != len(set(item_ids))
-            or len(item_hashes) != len(set(item_hashes))
+            or len(provider_hashes) != len(set(provider_hashes))
+            or len(integrity_hashes) != len(set(integrity_hashes))
         ):
             raise ValueError("preview_items_not_unique")
         if tuple(item.item_index for item in self.items) != tuple(range(len(self.items))):
@@ -631,6 +744,20 @@ class DocumentPreview(_HostedModel):
                 or envelope.environment != self.environment
             ):
                 raise ValueError("preview_item_binding_invalid")
+            if item.preview_integrity_hash != preview_item_integrity_hash(
+                client_item_id=item.client_item_id,
+                provider_call_hash=item.provider_call_hash,
+                projector_id=self.projector_id,
+                projector_version=self.projector_version,
+                document_type=item.document_type,
+                counterparty_display=item.counterparty_display,
+                issue_date=item.issue_date,
+                due_date=item.due_date,
+                financials=item.financials,
+                warnings=item.warnings,
+                accountant_review_points=item.accountant_review_points,
+            ):
+                raise ValueError("preview_item_integrity_hash_invalid")
         if any(item.financials.currency != self.currency for item in self.items):
             raise ValueError("document_currency_mismatch")
         totals = {
@@ -646,24 +773,33 @@ class DocumentPreview(_HostedModel):
         }
         if any(getattr(self, name) != value for name, value in totals.items()):
             raise ValueError("preview_total_mismatch")
-        expected_hash = preview_payload_hash(
-            preview_id=self.preview_id,
-            tenant_id=self.tenant_id,
-            auth_user_id=self.auth_user_id,
-            workspace_id=self.workspace_id,
-            connection_id=self.connection_id,
+        if self.provider_call_hash != preview_provider_call_hash(
             provider=self.provider,
-            provider_account_sha256=self.provider_account_sha256,
             environment=self.environment,
+            provider_tool_name=self.provider_tool_name,
             capability_id=self.capability_id,
             capability_version=self.capability_version,
-            connection_revision=self.connection_revision,
-            connection_readiness=self.connection_readiness,
+            schema_hash=self.schema_hash,
             items=self.items,
-        )
-        if self.payload_hash != expected_hash:
-            raise ValueError("preview_payload_hash_invalid")
+        ):
+            raise ValueError("preview_provider_call_hash_invalid")
+        if self.preview_integrity_hash != preview_integrity_hash(
+            provider_call_hash=self.provider_call_hash,
+            account_display_name=self.account_display_name,
+            projector_id=self.projector_id,
+            projector_version=self.projector_version,
+            items=self.items,
+            warnings=self.warnings,
+            accountant_review_points=self.accountant_review_points,
+        ):
+            raise ValueError("preview_integrity_hash_invalid")
         return self
+
+    @property
+    def payload_hash(self) -> str:
+        """Compatibility alias for prior internal callers."""
+
+        return self.provider_call_hash
 
     def payload_binding(self, item: StoredPreviewItem) -> PreviewPayloadBinding:
         if item not in self.items:
@@ -684,11 +820,14 @@ class DocumentPreview(_HostedModel):
             capability_version=self.capability_version,
             schema_hash=self.schema_hash,
             evidence_revision_sha256=self.evidence_revision_sha256,
+            projector_id=self.projector_id,
+            projector_version=self.projector_version,
             connection_revision=self.connection_revision,
             connection_readiness=self.connection_readiness,
             preview_state_version=1,
             client_item_id=item.client_item_id,
-            payload_hash=item.payload_hash,
+            provider_call_hash=item.provider_call_hash,
+            preview_integrity_hash=item.preview_integrity_hash,
             created_at=self.created_at,
             expires_at=self.expires_at,
         )
@@ -714,29 +853,27 @@ class DocumentPreview(_HostedModel):
             purge_after = (
                 self.payload_purge_after
                 if confirmed_payload_purge_after is None
-                else _aware_utc(
-                    confirmed_payload_purge_after,
-                    "preview_timestamp_invalid",
-                )
+                else _aware_utc(confirmed_payload_purge_after, "preview_timestamp_invalid")
             )
         elif confirmed_payload_purge_after is not None:
             raise ValueError("preview_state_invalid")
         else:
             purge_after = self.payload_purge_after
-        transitioned = self.model_copy(
-            update={
-                "state": target,
-                "state_version": self.state_version + 1,
-                "confirmed_at": timestamp if target is PreviewState.CONFIRMED else None,
-                "cancelled_at": timestamp if target is PreviewState.CANCELLED else None,
-                "payload_purge_after": purge_after,
-                "items": tuple(
-                    item.model_copy(update={"payload_purge_after": purge_after})
-                    for item in self.items
-                ),
-            }
+        return DocumentPreview.model_validate(
+            self.model_copy(
+                update={
+                    "state": target,
+                    "state_version": self.state_version + 1,
+                    "confirmed_at": timestamp if target is PreviewState.CONFIRMED else None,
+                    "cancelled_at": timestamp if target is PreviewState.CANCELLED else None,
+                    "payload_purge_after": purge_after,
+                    "items": tuple(
+                        item.model_copy(update={"payload_purge_after": purge_after})
+                        for item in self.items
+                    ),
+                }
+            )
         )
-        return DocumentPreview.model_validate(transitioned)
 
     def storage_record(self) -> dict[str, Any]:
         return {
@@ -749,16 +886,19 @@ class DocumentPreview(_HostedModel):
             "provider_account_sha256": self.provider_account_sha256,
             "account_display_name": self.account_display_name,
             "environment": self.environment,
-            "qualification_id": str(self.qualification_id) if self.qualification_id else None,
+            "qualification_id": str(self.qualification_id),
             "provider_tool_name": self.provider_tool_name,
             "capability_id": self.capability_id,
             "capability_version": self.capability_version,
             "schema_hash": self.schema_hash,
             "response_shape_hash": self.response_shape_hash,
             "evidence_revision_sha256": self.evidence_revision_sha256,
+            "projector_id": self.projector_id,
+            "projector_version": self.projector_version,
             "connection_revision": self.connection_revision,
             "connection_readiness": self.connection_readiness.value,
-            "payload_hash": self.payload_hash,
+            "provider_call_hash": self.provider_call_hash,
+            "preview_integrity_hash": self.preview_integrity_hash,
             "status": self.state.value,
             "state_version": self.state_version,
             "document_count": len(self.items),
@@ -807,14 +947,19 @@ class DocumentPreview(_HostedModel):
 
 class PreparedPreviewItem(_HostedModel):
     client_item_id: str
-    payload_hash: str = Field(pattern=_SHA256.pattern)
+    provider_call_hash: str = Field(pattern=_SHA256.pattern)
+    preview_integrity_hash: str = Field(pattern=_SHA256.pattern)
     document_type: str
-    counterparty_display: str | None
-    issue_date: date | None
-    due_date: date | None
+    counterparty_display: str
+    issue_date: date
+    due_date: date
     financials: DocumentFinancials
     warnings: tuple[str, ...]
     accountant_review_points: tuple[str, ...]
+
+    @property
+    def payload_hash(self) -> str:
+        return self.provider_call_hash
 
 
 class PreparedDocumentPreview(_HostedModel):
@@ -844,6 +989,11 @@ class PreparedDocumentPreview(_HostedModel):
         "render_document_preview",
     )
 
+    @field_validator("company_display_name")
+    @classmethod
+    def validate_company_display(cls, value: str) -> str:
+        return sanitize_public_text(value, code="preview_binding_invalid")
+
     @classmethod
     def from_preview(cls, preview: DocumentPreview) -> PreparedDocumentPreview:
         checked = DocumentPreview.model_validate(preview)
@@ -871,7 +1021,8 @@ class PreparedDocumentPreview(_HostedModel):
             items=tuple(
                 PreparedPreviewItem(
                     client_item_id=item.client_item_id,
-                    payload_hash=item.payload_hash,
+                    provider_call_hash=item.provider_call_hash,
+                    preview_integrity_hash=item.preview_integrity_hash,
                     document_type=item.document_type,
                     counterparty_display=item.counterparty_display,
                     issue_date=item.issue_date,
@@ -889,18 +1040,18 @@ class PreparedDocumentPreview(_HostedModel):
 class OpenedPreviewItem(_HostedModel):
     preview_item_id: UUID
     client_item_id: str
-    provider_payload: dict[str, Any] = Field(repr=False, exclude=True)
+    provider_arguments: dict[str, Any] = Field(repr=False, exclude=True)
 
     @model_validator(mode="after")
-    def freeze_payload(self) -> OpenedPreviewItem:
-        copied = _json_copy(self.provider_payload)
+    def freeze_arguments(self) -> OpenedPreviewItem:
+        copied = _json_copy(self.provider_arguments)
         if not isinstance(copied, dict):
             raise ValueError("preview_payload_changed")
-        object.__setattr__(self, "provider_payload", deep_freeze(copied))
+        object.__setattr__(self, "provider_arguments", deep_freeze(copied))
         return self
 
-    def provider_payload_copy(self) -> dict[str, Any]:
-        copied = _json_copy(self.provider_payload)
+    def provider_arguments_copy(self) -> dict[str, Any]:
+        copied = _json_copy(self.provider_arguments)
         if not isinstance(copied, dict):
             raise ValueError("preview_payload_changed")
         return copied
@@ -908,11 +1059,11 @@ class OpenedPreviewItem(_HostedModel):
 
 class ConfirmableDocumentPreview(_HostedModel):
     preview: DocumentPreview
-    opened_items: tuple[OpenedPreviewItem, ...] = Field(repr=False)
+    opened_items: tuple[OpenedPreviewItem, ...] = Field(repr=False, exclude=True)
 
-    def provider_payload_for(self, client_item_id: str) -> dict[str, Any]:
+    def provider_arguments_for(self, client_item_id: str) -> dict[str, Any]:
         matches = [
-            item.provider_payload_copy()
+            item.provider_arguments_copy()
             for item in self.opened_items
             if item.client_item_id == client_item_id
         ]
@@ -920,47 +1071,10 @@ class ConfirmableDocumentPreview(_HostedModel):
             raise ValueError("preview_item_not_found")
         return matches[0]
 
+    def provider_payload_for(self, client_item_id: str) -> dict[str, Any]:
+        """Compatibility alias for the Task 13 handoff."""
 
-class OperationState(StrEnum):
-    AWAITING_CONFIRMATION = "awaiting_confirmation"
-    DISPATCHING = "dispatching"
-    SUCCEEDED = "succeeded"
-    FAILED_PRE_DISPATCH = "failed_pre_dispatch"
-    PROVIDER_REJECTED = "provider_rejected"
-    OUTCOME_UNKNOWN = "outcome_unknown"
-    NEEDS_MANUAL_REVIEW = "needs_manual_review"
-    NOT_DISPATCHED = "not_dispatched"
-    CANCELLED = "cancelled"
-
-
-_OPERATION_TRANSITIONS: Mapping[OperationState, frozenset[OperationState]] = {
-    OperationState.AWAITING_CONFIRMATION: frozenset(
-        {
-            OperationState.DISPATCHING,
-            OperationState.FAILED_PRE_DISPATCH,
-            OperationState.NOT_DISPATCHED,
-            OperationState.CANCELLED,
-        }
-    ),
-    OperationState.FAILED_PRE_DISPATCH: frozenset(
-        {OperationState.DISPATCHING, OperationState.CANCELLED}
-    ),
-    OperationState.DISPATCHING: frozenset(
-        {
-            OperationState.SUCCEEDED,
-            OperationState.PROVIDER_REJECTED,
-            OperationState.OUTCOME_UNKNOWN,
-        }
-    ),
-    OperationState.OUTCOME_UNKNOWN: frozenset(
-        {OperationState.SUCCEEDED, OperationState.NEEDS_MANUAL_REVIEW}
-    ),
-    OperationState.SUCCEEDED: frozenset(),
-    OperationState.PROVIDER_REJECTED: frozenset(),
-    OperationState.NEEDS_MANUAL_REVIEW: frozenset(),
-    OperationState.NOT_DISPATCHED: frozenset(),
-    OperationState.CANCELLED: frozenset(),
-}
+        return self.provider_arguments_for(client_item_id)
 
 
 class OperationItem(_HostedModel):
@@ -968,8 +1082,9 @@ class OperationItem(_HostedModel):
     preview_item_id: UUID
     item_index: int = Field(ge=0, lt=MAX_BATCH_DOCUMENTS)
     client_item_id: str = Field(pattern=_IDENTIFIER.pattern)
-    payload_hash: str = Field(pattern=_SHA256.pattern)
-    state: OperationState
+    provider_call_hash: str = Field(pattern=_SHA256.pattern)
+    preview_integrity_hash: str = Field(pattern=_SHA256.pattern)
+    state: OperationItemState
     state_version: int = Field(ge=1)
     provider_result_identifier: str | None = Field(default=None, min_length=1, max_length=200)
     created_at: datetime
@@ -986,32 +1101,45 @@ class OperationItem(_HostedModel):
         _non_nil(self.preview_item_id, "operation_items_invalid")
         if self.updated_at < self.created_at:
             raise ValueError("operation_timestamp_invalid")
+        if (self.state is OperationItemState.SUCCEEDED) != (
+            self.provider_result_identifier is not None
+        ):
+            raise ValueError("operation_transition_invalid")
         if self.provider_result_identifier is not None:
-            _safe_text(self.provider_result_identifier, "operation_transition_invalid")
+            sanitize_public_text(
+                self.provider_result_identifier, code="operation_transition_invalid"
+            )
         return self
+
+    @property
+    def payload_hash(self) -> str:
+        return self.provider_call_hash
 
     def transition(
         self,
         *,
-        target_state: OperationState,
+        target_state: OperationItemState,
         occurred_at: datetime,
         provider_result_identifier: str | None = None,
+        parent_state: ParentOperationState,
     ) -> OperationItem:
-        target = OperationState(target_state)
-        if target not in _OPERATION_TRANSITIONS[self.state]:
+        target = OperationItemState(target_state)
+        if not item_operation_transition_allowed(self.state, target, parent_state=parent_state):
             raise ValueError("operation_transition_invalid")
         timestamp = _aware_utc(occurred_at, "operation_timestamp_invalid")
         if timestamp < self.updated_at:
             raise ValueError("operation_timestamp_invalid")
-        if (target is OperationState.SUCCEEDED) != (provider_result_identifier is not None):
+        if (target is OperationItemState.SUCCEEDED) != (provider_result_identifier is not None):
             raise ValueError("operation_transition_invalid")
-        return self.model_copy(
-            update={
-                "state": target,
-                "state_version": self.state_version + 1,
-                "provider_result_identifier": provider_result_identifier,
-                "updated_at": timestamp,
-            }
+        return OperationItem.model_validate(
+            self.model_copy(
+                update={
+                    "state": target,
+                    "state_version": self.state_version + 1,
+                    "provider_result_identifier": provider_result_identifier,
+                    "updated_at": timestamp,
+                }
+            )
         )
 
 
@@ -1019,8 +1147,8 @@ class OperationEvent(_HostedModel):
     event_id: UUID
     operation_id: UUID
     operation_item_id: UUID | None = None
-    from_state: OperationState | None
-    to_state: OperationState
+    from_state: str | None
+    to_state: str
     state_version: int = Field(ge=1)
     sanitized_reason: str = Field(min_length=1, max_length=200, pattern=_IDENTIFIER.pattern)
     occurred_at: datetime
@@ -1029,6 +1157,15 @@ class OperationEvent(_HostedModel):
     @classmethod
     def validate_timestamp(cls, value: datetime) -> datetime:
         return _aware_utc(value, "operation_event_timestamp_invalid")
+
+    @model_validator(mode="after")
+    def validate_states(self) -> OperationEvent:
+        allowed = {state.value for state in (*ParentOperationState, *OperationItemState)}
+        if self.to_state not in allowed or (
+            self.from_state is not None and self.from_state not in allowed
+        ):
+            raise ValueError("operation_event_invalid")
+        return self
 
 
 class HostedOperation(_HostedModel):
@@ -1043,8 +1180,9 @@ class HostedOperation(_HostedModel):
     capability_id: str = Field(pattern=_CAPABILITY.pattern)
     capability_version: str = Field(pattern=_SHA256.pattern)
     connection_revision: int = Field(ge=1)
-    payload_hash: str = Field(pattern=_SHA256.pattern)
-    state: OperationState
+    provider_call_hash: str = Field(pattern=_SHA256.pattern)
+    preview_integrity_hash: str = Field(pattern=_SHA256.pattern)
+    state: ParentOperationState
     state_version: int = Field(ge=1)
     items: tuple[OperationItem, ...] = Field(min_length=1, max_length=MAX_BATCH_DOCUMENTS)
     events: tuple[OperationEvent, ...] = Field(min_length=1)
@@ -1089,7 +1227,7 @@ class HostedOperation(_HostedModel):
         if (
             not parent_events
             or parent_events[-1].state_version != self.state_version
-            or parent_events[-1].to_state is not self.state
+            or parent_events[-1].to_state != self.state.value
         ):
             raise ValueError("operation_event_invalid")
         item_by_id = {item.operation_item_id: item for item in self.items}
@@ -1102,10 +1240,25 @@ class HostedOperation(_HostedModel):
             )
             if item_events and (
                 item_events[-1].state_version != item.state_version
-                or item_events[-1].to_state is not item.state
+                or item_events[-1].to_state != item.state.value
             ):
                 raise ValueError("operation_event_invalid")
+        if self.state in {
+            ParentOperationState.SUCCEEDED,
+            ParentOperationState.PROVIDER_REJECTED,
+            ParentOperationState.OUTCOME_UNKNOWN,
+            ParentOperationState.NEEDS_MANUAL_REVIEW,
+        } and not parent_operation_transition_allowed(
+            ParentOperationState.DISPATCHING,
+            self.state,
+            child_states=tuple(item.state for item in self.items),
+        ):
+            raise ValueError("operation_transition_invalid")
         return self
+
+    @property
+    def payload_hash(self) -> str:
+        return self.provider_call_hash
 
     @classmethod
     def from_preview(
@@ -1127,8 +1280,9 @@ class HostedOperation(_HostedModel):
                 preview_item_id=preview_item.preview_item_id,
                 item_index=item_index,
                 client_item_id=preview_item.client_item_id,
-                payload_hash=preview_item.payload_hash,
-                state=OperationState.AWAITING_CONFIRMATION,
+                provider_call_hash=preview_item.provider_call_hash,
+                preview_integrity_hash=preview_item.preview_integrity_hash,
+                state=OperationItemState.AWAITING_CONFIRMATION,
                 state_version=1,
                 created_at=timestamp,
                 updated_at=timestamp,
@@ -1141,7 +1295,7 @@ class HostedOperation(_HostedModel):
             event_id=event_id,
             operation_id=operation_id,
             from_state=None,
-            to_state=OperationState.AWAITING_CONFIRMATION,
+            to_state=ParentOperationState.AWAITING_CONFIRMATION.value,
             state_version=1,
             sanitized_reason="explicit_confirmation",
             occurred_at=timestamp,
@@ -1158,8 +1312,9 @@ class HostedOperation(_HostedModel):
             capability_id=checked.capability_id,
             capability_version=checked.capability_version,
             connection_revision=checked.connection_revision,
-            payload_hash=checked.payload_hash,
-            state=OperationState.AWAITING_CONFIRMATION,
+            provider_call_hash=checked.provider_call_hash,
+            preview_integrity_hash=checked.preview_integrity_hash,
+            state=ParentOperationState.AWAITING_CONFIRMATION,
             state_version=1,
             items=items,
             events=(event,),
@@ -1171,12 +1326,17 @@ class HostedOperation(_HostedModel):
     def transition(
         self,
         *,
-        target_state: OperationState,
+        target_state: ParentOperationState,
         event_id: UUID,
         occurred_at: datetime,
         sanitized_reason: str,
     ) -> HostedOperation:
-        if target_state not in _OPERATION_TRANSITIONS[self.state]:
+        target = ParentOperationState(target_state)
+        if not parent_operation_transition_allowed(
+            self.state,
+            target,
+            child_states=tuple(item.state for item in self.items),
+        ):
             raise ValueError("operation_transition_invalid")
         timestamp = _aware_utc(occurred_at, "operation_timestamp_invalid")
         if timestamp < self.updated_at:
@@ -1185,26 +1345,28 @@ class HostedOperation(_HostedModel):
         event = OperationEvent(
             event_id=event_id,
             operation_id=self.operation_id,
-            from_state=self.state,
-            to_state=target_state,
+            from_state=self.state.value,
+            to_state=target.value,
             state_version=next_version,
             sanitized_reason=sanitized_reason,
             occurred_at=timestamp,
         )
-        return self.model_copy(
-            update={
-                "state": target_state,
-                "state_version": next_version,
-                "events": (*self.events, event),
-                "updated_at": timestamp,
-            }
+        return HostedOperation.model_validate(
+            self.model_copy(
+                update={
+                    "state": target,
+                    "state_version": next_version,
+                    "events": (*self.events, event),
+                    "updated_at": timestamp,
+                }
+            )
         )
 
     def transition_item(
         self,
         *,
         operation_item_id: UUID,
-        target_state: OperationState,
+        target_state: OperationItemState,
         event_id: UUID,
         occurred_at: datetime,
         sanitized_reason: str,
@@ -1219,33 +1381,47 @@ class HostedOperation(_HostedModel):
             raise ValueError("operation_transition_invalid")
         index, current = matches[0]
         transitioned = current.transition(
-            target_state=target_state,
+            target_state=OperationItemState(target_state),
             occurred_at=occurred_at,
             provider_result_identifier=provider_result_identifier,
+            parent_state=self.state,
         )
         event = OperationEvent(
             event_id=event_id,
             operation_id=self.operation_id,
             operation_item_id=operation_item_id,
-            from_state=current.state,
-            to_state=transitioned.state,
+            from_state=current.state.value,
+            to_state=transitioned.state.value,
             state_version=transitioned.state_version,
             sanitized_reason=sanitized_reason,
             occurred_at=transitioned.updated_at,
         )
         items = list(self.items)
         items[index] = transitioned
-        return self.model_copy(
-            update={
-                "items": tuple(items),
-                "events": (*self.events, event),
-                "updated_at": max(self.updated_at, transitioned.updated_at),
-            }
+        return HostedOperation.model_validate(
+            self.model_copy(
+                update={
+                    "items": tuple(items),
+                    "events": (*self.events, event),
+                    "updated_at": max(self.updated_at, transitioned.updated_at),
+                }
+            )
         )
 
 
+OperationState = ParentOperationState
+
+
 def authoritative_payload_bytes(draft: DocumentCreateDraft) -> bytes:
-    return canonical_payload_bytes(draft.authoritative_payload())
+    """Serialize only exact provider arguments for the encrypted boundary."""
+
+    return canonical_payload_bytes(draft.provider_arguments_copy())
+
+
+def preview_payload_hash(**kwargs: Any) -> str:
+    """Compatibility wrapper for the earlier hosted parent hash name."""
+
+    return preview_provider_call_hash(**kwargs)
 
 
 __all__ = [
@@ -1261,7 +1437,9 @@ __all__ = [
     "OpenedPreviewItem",
     "OperationEvent",
     "OperationItem",
+    "OperationItemState",
     "OperationState",
+    "ParentOperationState",
     "PrepareDocumentCreate",
     "PreparedDocumentPreview",
     "PreparedPreviewItem",
@@ -1271,5 +1449,12 @@ __all__ = [
     "StoredPreviewItem",
     "UNCONFIRMED_PAYLOAD_RETENTION",
     "authoritative_payload_bytes",
+    "item_operation_transition_allowed",
+    "parent_operation_transition_allowed",
+    "preview_integrity_hash",
+    "preview_integrity_hash_for_hashes",
+    "preview_item_integrity_hash",
     "preview_payload_hash",
+    "preview_provider_call_hash",
+    "preview_provider_call_hash_for_hashes",
 ]

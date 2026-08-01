@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from datetime import UTC, date, datetime
@@ -17,7 +18,6 @@ from mercury_tools.catalog.models import ProviderMCPQualification, Qualification
 from mercury_tools.config import Settings, v1_supabase_rest_url
 from mercury_tools.credentials.models import CredentialBinding, CredentialEnvelope
 from mercury_tools.credentials.vault import CredentialVault, CredentialVaultError
-from mercury_tools.execution.models import canonical_payload_hash
 from mercury_tools.providers.models import ConnectionReadiness, ProviderConnection, ProviderId
 
 from .models import (
@@ -29,18 +29,22 @@ from .models import (
     OpenedPreviewItem,
     OperationEvent,
     OperationItem,
-    OperationState,
+    OperationItemState,
+    ParentOperationState,
     PreviewPayloadBinding,
     PreviewState,
     StoredPreviewItem,
+    preview_item_integrity_hash,
 )
+from .projectors import DocumentProjectorRegistry, ProjectorError, provider_call_hash
 
 _PREVIEW_ERROR_CODES = frozenset(
     {
         "capability_unavailable",
+        "capability_unreviewed",
         "document_payload_invalid",
         "document_schema_invalid",
-        "duplicate_payload_hash",
+        "duplicate_provider_call",
         "operation_conflict",
         "operation_not_found",
         "operation_state_stale",
@@ -56,6 +60,8 @@ _PREVIEW_ERROR_CODES = frozenset(
         "workspace_access_denied",
     }
 )
+
+AuthorityResolver = Callable[[DocumentPreview], tuple[ProviderConnection, ProviderMCPQualification]]
 
 
 class HostedPreviewError(RuntimeError):
@@ -110,6 +116,16 @@ class HostedPayloadVault:
 
 class HostedPreviewStore(Protocol):
     def create_preview(self, preview: DocumentPreview) -> DocumentPreview: ...
+
+    def find_preview_by_provider_call(
+        self,
+        *,
+        tenant_id: UUID,
+        auth_user_id: UUID,
+        workspace_id: UUID,
+        connection_id: UUID,
+        provider_call_hash: str,
+    ) -> DocumentPreview | None: ...
 
     def get_preview(
         self,
@@ -169,7 +185,7 @@ class HostedPreviewStore(Protocol):
         workspace_id: UUID,
         operation_id: UUID,
         expected_state_version: int,
-        target_state: OperationState,
+        target_state: ParentOperationState,
         event_id: UUID,
         occurred_at: datetime,
         sanitized_reason: str,
@@ -184,7 +200,7 @@ class HostedPreviewStore(Protocol):
         operation_id: UUID,
         operation_item_id: UUID,
         expected_state_version: int,
-        target_state: OperationState,
+        target_state: OperationItemState,
         event_id: UUID,
         occurred_at: datetime,
         sanitized_reason: str,
@@ -217,17 +233,29 @@ def _check_scope(
         raise HostedPreviewError("preview_not_found")
 
 
-def _qualification_matches(
+def _connection_matches(preview: DocumentPreview, connection: ProviderConnection) -> bool:
+    return (
+        connection.id == preview.connection_id
+        and connection.tenant_id == preview.tenant_id
+        and connection.auth_user_id == preview.auth_user_id
+        and connection.workspace_id == preview.workspace_id
+        and connection.provider is preview.provider
+        and connection.environment == preview.environment
+        and connection.revision == preview.connection_revision
+        and connection.readiness is ConnectionReadiness.READY
+        and connection.readiness is preview.connection_readiness
+        and _provider_account_sha256(connection) == preview.provider_account_sha256
+    )
+
+
+def _qualification_identity_matches(
     preview: DocumentPreview,
     qualification: ProviderMCPQualification,
-    *,
-    now: datetime,
 ) -> bool:
     return (
-        qualification.qualification_state is QualificationState.ENABLED
+        qualification.id == preview.qualification_id
         and qualification.provider == preview.provider.value
         and qualification.environment == preview.environment
-        and qualification.id == preview.qualification_id
         and qualification.provider_tool_name == preview.provider_tool_name
         and qualification.normalized_capability == preview.capability_id
         and qualification.capability_version_sha256 == preview.capability_version
@@ -235,15 +263,57 @@ def _qualification_matches(
         and qualification.response_shape_hash == preview.response_shape_hash
         and qualification.evidence_revision_sha256 == preview.evidence_revision_sha256
         and qualification.company_sha256 == preview.provider_account_sha256
-        and qualification.evidence_expires_at is not None
-        and qualification.evidence_expires_at > now
     )
 
 
-def _operation_matches_preview(
-    operation: HostedOperation,
-    preview: DocumentPreview,
+def _qualification_is_current(
+    qualification: ProviderMCPQualification,
+    connection: ProviderConnection,
+    *,
+    now: datetime,
 ) -> bool:
+    return (
+        qualification.qualification_state is QualificationState.ENABLED
+        and qualification.evidence_evaluated_at is not None
+        and qualification.evidence_evaluated_at <= now
+        and qualification.evidence_expires_at is not None
+        and qualification.evidence_expires_at > now
+        and set(qualification.required_permissions).issubset(connection.granted_permissions)
+    )
+
+
+def _validate_authority(
+    preview: DocumentPreview,
+    *,
+    connection: ProviderConnection,
+    qualification: ProviderMCPQualification,
+    projector_registry: DocumentProjectorRegistry,
+    now: datetime,
+    require_projector: bool = True,
+) -> ProviderMCPQualification:
+    try:
+        checked_connection = ProviderConnection.model_validate(connection)
+        checked_qualification = ProviderMCPQualification.model_validate(qualification)
+    except (TypeError, ValueError, ValidationError):
+        raise HostedPreviewError("preview_binding_changed") from None
+    if not _connection_matches(preview, checked_connection):
+        raise HostedPreviewError("preview_binding_changed")
+    if not _qualification_identity_matches(preview, checked_qualification):
+        raise HostedPreviewError("preview_binding_changed")
+    if not _qualification_is_current(checked_qualification, checked_connection, now=now):
+        raise HostedPreviewError("capability_unavailable")
+    if require_projector:
+        projector = projector_registry.resolve(checked_qualification)
+        if (
+            projector is None
+            or projector.projector_id != preview.projector_id
+            or projector.projector_version != preview.projector_version
+        ):
+            raise HostedPreviewError("capability_unavailable")
+    return checked_qualification
+
+
+def _operation_matches_preview(operation: HostedOperation, preview: DocumentPreview) -> bool:
     if (
         operation.preview_id != preview.preview_id
         or operation.tenant_id != preview.tenant_id
@@ -255,8 +325,9 @@ def _operation_matches_preview(
         or operation.capability_id != preview.capability_id
         or operation.capability_version != preview.capability_version
         or operation.connection_revision != preview.connection_revision
-        or operation.payload_hash != preview.payload_hash
-        or operation.state is not OperationState.AWAITING_CONFIRMATION
+        or operation.provider_call_hash != preview.provider_call_hash
+        or operation.preview_integrity_hash != preview.preview_integrity_hash
+        or operation.state is not ParentOperationState.AWAITING_CONFIRMATION
         or operation.state_version != 1
         or operation.created_at < preview.created_at
         or operation.created_at >= preview.expires_at
@@ -270,7 +341,7 @@ def _operation_matches_preview(
     if (
         event.operation_item_id is not None
         or event.from_state is not None
-        or event.to_state is not OperationState.AWAITING_CONFIRMATION
+        or event.to_state != ParentOperationState.AWAITING_CONFIRMATION.value
         or event.state_version != 1
         or event.occurred_at != operation.created_at
     ):
@@ -279,8 +350,9 @@ def _operation_matches_preview(
         operation_item.preview_item_id == preview_item.preview_item_id
         and operation_item.item_index == preview_item.item_index
         and operation_item.client_item_id == preview_item.client_item_id
-        and operation_item.payload_hash == preview_item.payload_hash
-        and operation_item.state is OperationState.AWAITING_CONFIRMATION
+        and operation_item.provider_call_hash == preview_item.provider_call_hash
+        and operation_item.preview_integrity_hash == preview_item.preview_integrity_hash
+        and operation_item.state is OperationItemState.AWAITING_CONFIRMATION
         and operation_item.state_version == 1
         and operation_item.provider_result_identifier is None
         and operation_item.created_at == operation.created_at
@@ -289,10 +361,7 @@ def _operation_matches_preview(
     )
 
 
-def _same_confirmation_identity(
-    left: HostedOperation,
-    right: HostedOperation,
-) -> bool:
+def _same_confirmation_identity(left: HostedOperation, right: HostedOperation) -> bool:
     return (
         left.preview_id == right.preview_id
         and left.tenant_id == right.tenant_id
@@ -304,13 +373,26 @@ def _same_confirmation_identity(
         and left.capability_id == right.capability_id
         and left.capability_version == right.capability_version
         and left.connection_revision == right.connection_revision
-        and left.payload_hash == right.payload_hash
+        and left.provider_call_hash == right.provider_call_hash
+        and left.preview_integrity_hash == right.preview_integrity_hash
         and tuple(
-            (item.item_index, item.preview_item_id, item.client_item_id, item.payload_hash)
+            (
+                item.item_index,
+                item.preview_item_id,
+                item.client_item_id,
+                item.provider_call_hash,
+                item.preview_integrity_hash,
+            )
             for item in left.items
         )
         == tuple(
-            (item.item_index, item.preview_item_id, item.client_item_id, item.payload_hash)
+            (
+                item.item_index,
+                item.preview_item_id,
+                item.client_item_id,
+                item.provider_call_hash,
+                item.preview_integrity_hash,
+            )
             for item in right.items
         )
     )
@@ -320,6 +402,7 @@ def _load_confirmable(
     preview: DocumentPreview,
     *,
     payload_vault: HostedPayloadVault,
+    projector_registry: DocumentProjectorRegistry,
     tenant_id: UUID,
     auth_user_id: UUID,
     workspace_id: UUID,
@@ -345,68 +428,69 @@ def _load_confirmable(
         raise HostedPreviewError("preview_state_invalid")
     if preview.expires_at <= checked_now:
         raise HostedPreviewError("preview_expired")
-    try:
-        checked_connection = ProviderConnection.model_validate(connection)
-        checked_qualification = ProviderMCPQualification.model_validate(qualification)
-    except (TypeError, ValueError, ValidationError):
-        raise HostedPreviewError("preview_binding_changed") from None
-    if (
-        checked_connection.id != preview.connection_id
-        or checked_connection.tenant_id != preview.tenant_id
-        or checked_connection.auth_user_id != preview.auth_user_id
-        or checked_connection.workspace_id != preview.workspace_id
-        or checked_connection.provider is not preview.provider
-        or checked_connection.environment != preview.environment
-        or checked_connection.revision != preview.connection_revision
-        or checked_connection.readiness is not ConnectionReadiness.READY
-        or checked_connection.readiness is not preview.connection_readiness
-        or _provider_account_sha256(checked_connection) != preview.provider_account_sha256
-        or not _qualification_matches(preview, checked_qualification, now=checked_now)
-    ):
-        raise HostedPreviewError("preview_binding_changed")
+    checked_qualification = _validate_authority(
+        preview,
+        connection=connection,
+        qualification=qualification,
+        projector_registry=projector_registry,
+        now=checked_now,
+        require_projector=False,
+    )
+    projector = projector_registry.resolve(checked_qualification)
+    if projector is None:
+        raise HostedPreviewError("capability_unavailable")
 
     opened_items: list[OpenedPreviewItem] = []
     for item in preview.items:
         opened: bytearray | None = None
         try:
             opened = payload_vault.open(preview.payload_binding(item), item.payload_envelope)
-            authoritative = json.loads(bytes(opened).decode("utf-8"))
+            provider_arguments = json.loads(bytes(opened).decode("utf-8"))
+            if not isinstance(provider_arguments, dict):
+                raise ValueError
+            projection = projector.project(provider_arguments)
+            expected_provider_hash = provider_call_hash(
+                provider=preview.provider.value,
+                environment=preview.environment,
+                provider_tool_name=preview.provider_tool_name,
+                capability_id=preview.capability_id,
+                capability_version=preview.capability_version,
+                schema_hash=preview.schema_hash,
+                provider_arguments=provider_arguments,
+            )
+            expected_integrity_hash = preview_item_integrity_hash(
+                client_item_id=item.client_item_id,
+                provider_call_hash=expected_provider_hash,
+                projector_id=preview.projector_id,
+                projector_version=preview.projector_version,
+                document_type=projection.document_type,
+                counterparty_display=projection.counterparty_display,
+                issue_date=projection.issue_date,
+                due_date=projection.due_date,
+                financials=projection.financials,
+                warnings=item.warnings,
+                accountant_review_points=item.accountant_review_points,
+            )
             if (
-                not isinstance(authoritative, dict)
-                or set(authoritative)
-                != {
-                    "accountant_review_points",
-                    "counterparty_display",
-                    "document_type",
-                    "due_date",
-                    "financials",
-                    "issue_date",
-                    "provider_payload",
-                    "warnings",
-                }
-                or canonical_payload_hash(authoritative) != item.payload_hash
-                or authoritative["document_type"] != item.document_type
-                or authoritative["counterparty_display"] != item.counterparty_display
-                or authoritative["issue_date"]
-                != (item.issue_date.isoformat() if item.issue_date is not None else None)
-                or authoritative["due_date"]
-                != (item.due_date.isoformat() if item.due_date is not None else None)
-                or authoritative["financials"] != item.financials.model_dump(mode="json")
-                or authoritative["warnings"] != list(item.warnings)
-                or authoritative["accountant_review_points"] != list(item.accountant_review_points)
-                or not isinstance(authoritative["provider_payload"], dict)
+                expected_provider_hash != item.provider_call_hash
+                or expected_integrity_hash != item.preview_integrity_hash
+                or projection.document_type != item.document_type
+                or projection.counterparty_display != item.counterparty_display
+                or projection.issue_date != item.issue_date
+                or projection.due_date != item.due_date
+                or projection.financials != item.financials
             ):
                 raise ValueError
             opened_items.append(
                 OpenedPreviewItem(
                     preview_item_id=item.preview_item_id,
                     client_item_id=item.client_item_id,
-                    provider_payload=authoritative["provider_payload"],
+                    provider_arguments=provider_arguments,
                 )
             )
         except HostedPreviewError:
             raise
-        except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+        except (ProjectorError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
             raise HostedPreviewError("preview_payload_changed") from None
         finally:
             if opened is not None:
@@ -421,44 +505,79 @@ class InMemoryHostedPreviewStore:
         self,
         *,
         payload_vault: HostedPayloadVault,
+        projector_registry: DocumentProjectorRegistry | None = None,
+        authority_resolver: AuthorityResolver | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if not isinstance(payload_vault, HostedPayloadVault):
             raise TypeError("hosted_preview_store_invalid")
         self._payload_vault = payload_vault
+        self._projector_registry = projector_registry or DocumentProjectorRegistry(())
+        self._authority_resolver = authority_resolver
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._lock = threading.RLock()
         self._previews: dict[UUID, DocumentPreview] = {}
-        self._preview_hashes: set[tuple[UUID, UUID, str]] = set()
-        self._item_hashes: set[tuple[UUID, UUID, str]] = set()
+        self._preview_provider_calls: dict[tuple[UUID, UUID, str], UUID] = {}
+        self._item_provider_calls: set[tuple[UUID, UUID, str]] = set()
         self._operations: dict[UUID, HostedOperation] = {}
         self._operation_by_preview: dict[UUID, UUID] = {}
 
     def __repr__(self) -> str:
-        return (
-            "InMemoryHostedPreviewStore("
-            f"preview_count={len(self._previews)}, operation_count={len(self._operations)})"
-        )
+        with self._lock:
+            return (
+                "InMemoryHostedPreviewStore("
+                f"preview_count={len(self._previews)}, operation_count={len(self._operations)})"
+            )
 
     def create_preview(self, preview: DocumentPreview) -> DocumentPreview:
         try:
             checked = DocumentPreview.model_validate(preview)
         except (TypeError, ValueError, ValidationError):
             raise HostedPreviewError("preview_conflict") from None
-        preview_key = (checked.workspace_id, checked.connection_id, checked.payload_hash)
-        item_keys = {
-            (checked.workspace_id, checked.connection_id, item.payload_hash)
-            for item in checked.items
-        }
-        if (
-            checked.preview_id in self._previews
-            or preview_key in self._preview_hashes
-            or item_keys & self._item_hashes
-        ):
-            raise HostedPreviewError("preview_conflict")
-        self._previews[checked.preview_id] = checked
-        self._preview_hashes.add(preview_key)
-        self._item_hashes.update(item_keys)
-        return DocumentPreview.model_validate(checked)
+        with self._lock:
+            key = (checked.workspace_id, checked.connection_id, checked.provider_call_hash)
+            existing_id = self._preview_provider_calls.get(key)
+            if existing_id is not None:
+                existing = self._previews[existing_id]
+                if existing.preview_integrity_hash == checked.preview_integrity_hash:
+                    return DocumentPreview.model_validate(existing)
+                raise HostedPreviewError("duplicate_provider_call")
+            item_keys = {
+                (checked.workspace_id, checked.connection_id, item.provider_call_hash)
+                for item in checked.items
+            }
+            if checked.preview_id in self._previews:
+                raise HostedPreviewError("preview_conflict")
+            if item_keys & self._item_provider_calls:
+                raise HostedPreviewError("duplicate_provider_call")
+            self._previews[checked.preview_id] = checked
+            self._preview_provider_calls[key] = checked.preview_id
+            self._item_provider_calls.update(item_keys)
+            return DocumentPreview.model_validate(checked)
+
+    def find_preview_by_provider_call(
+        self,
+        *,
+        tenant_id: UUID,
+        auth_user_id: UUID,
+        workspace_id: UUID,
+        connection_id: UUID,
+        provider_call_hash: str,
+    ) -> DocumentPreview | None:
+        with self._lock:
+            preview_id = self._preview_provider_calls.get(
+                (workspace_id, connection_id, provider_call_hash)
+            )
+            if preview_id is None:
+                return None
+            preview = self._previews[preview_id]
+            _check_scope(
+                preview,
+                tenant_id=tenant_id,
+                auth_user_id=auth_user_id,
+                workspace_id=workspace_id,
+            )
+            return DocumentPreview.model_validate(preview)
 
     def get_preview(
         self,
@@ -468,16 +587,17 @@ class InMemoryHostedPreviewStore:
         workspace_id: UUID,
         preview_id: UUID,
     ) -> DocumentPreview:
-        preview = self._previews.get(preview_id)
-        if preview is None:
-            raise HostedPreviewError("preview_not_found")
-        _check_scope(
-            preview,
-            tenant_id=tenant_id,
-            auth_user_id=auth_user_id,
-            workspace_id=workspace_id,
-        )
-        return DocumentPreview.model_validate(preview)
+        with self._lock:
+            preview = self._previews.get(preview_id)
+            if preview is None:
+                raise HostedPreviewError("preview_not_found")
+            _check_scope(
+                preview,
+                tenant_id=tenant_id,
+                auth_user_id=auth_user_id,
+                workspace_id=workspace_id,
+            )
+            return DocumentPreview.model_validate(preview)
 
     def load_confirmable(
         self,
@@ -491,23 +611,25 @@ class InMemoryHostedPreviewStore:
         qualification: ProviderMCPQualification,
         now: datetime,
     ) -> ConfirmableDocumentPreview:
-        preview = self.get_preview(
-            tenant_id=tenant_id,
-            auth_user_id=auth_user_id,
-            workspace_id=workspace_id,
-            preview_id=preview_id,
-        )
-        return _load_confirmable(
-            preview,
-            payload_vault=self._payload_vault,
-            tenant_id=tenant_id,
-            auth_user_id=auth_user_id,
-            workspace_id=workspace_id,
-            expected_state_version=expected_state_version,
-            connection=connection,
-            qualification=qualification,
-            now=now,
-        )
+        with self._lock:
+            preview = self.get_preview(
+                tenant_id=tenant_id,
+                auth_user_id=auth_user_id,
+                workspace_id=workspace_id,
+                preview_id=preview_id,
+            )
+            return _load_confirmable(
+                preview,
+                payload_vault=self._payload_vault,
+                projector_registry=self._projector_registry,
+                tenant_id=tenant_id,
+                auth_user_id=auth_user_id,
+                workspace_id=workspace_id,
+                expected_state_version=expected_state_version,
+                connection=connection,
+                qualification=qualification,
+                now=now,
+            )
 
     def transition_preview(
         self,
@@ -520,30 +642,33 @@ class InMemoryHostedPreviewStore:
         target_state: PreviewState,
         occurred_at: datetime,
     ) -> DocumentPreview:
-        preview = self.get_preview(
-            tenant_id=tenant_id,
-            auth_user_id=auth_user_id,
-            workspace_id=workspace_id,
-            preview_id=preview_id,
-        )
-        if (
-            isinstance(expected_state_version, bool)
-            or not isinstance(expected_state_version, int)
-            or preview.state_version != expected_state_version
-        ):
-            raise HostedPreviewError("preview_state_stale")
-        if PreviewState(target_state) is PreviewState.CONFIRMED:
-            raise HostedPreviewError("preview_state_invalid")
-        try:
-            transitioned = preview.transition(
-                target_state=PreviewState(target_state),
-                occurred_at=occurred_at,
+        with self._lock:
+            preview = self.get_preview(
+                tenant_id=tenant_id,
+                auth_user_id=auth_user_id,
+                workspace_id=workspace_id,
+                preview_id=preview_id,
             )
-        except (TypeError, ValueError, ValidationError) as exc:
-            code = "preview_expired" if str(exc) == "preview_expired" else "preview_state_invalid"
-            raise HostedPreviewError(code) from None
-        self._previews[preview_id] = transitioned
-        return DocumentPreview.model_validate(transitioned)
+            if (
+                isinstance(expected_state_version, bool)
+                or not isinstance(expected_state_version, int)
+                or preview.state_version != expected_state_version
+            ):
+                raise HostedPreviewError("preview_state_stale")
+            if PreviewState(target_state) is PreviewState.CONFIRMED:
+                raise HostedPreviewError("preview_state_invalid")
+            try:
+                transitioned = preview.transition(
+                    target_state=PreviewState(target_state),
+                    occurred_at=occurred_at,
+                )
+            except (TypeError, ValueError, ValidationError) as exc:
+                code = (
+                    "preview_expired" if str(exc) == "preview_expired" else "preview_state_invalid"
+                )
+                raise HostedPreviewError(code) from None
+            self._previews[preview_id] = transitioned
+            return DocumentPreview.model_validate(transitioned)
 
     def create_operation(
         self,
@@ -555,41 +680,60 @@ class InMemoryHostedPreviewStore:
             checked = HostedOperation.model_validate(operation)
         except (TypeError, ValueError, ValidationError):
             raise HostedPreviewError("operation_conflict") from None
-        preview = self._previews.get(checked.preview_id)
-        if preview is None:
-            raise HostedPreviewError("operation_conflict")
-        existing_id = self._operation_by_preview.get(checked.preview_id)
-        if existing_id is not None:
-            existing = self._operations[existing_id]
-            if not _same_confirmation_identity(existing, checked):
+        with self._lock:
+            preview = self._previews.get(checked.preview_id)
+            if preview is None:
                 raise HostedPreviewError("operation_conflict")
-            return HostedOperation.model_validate(existing)
-        if not _operation_matches_preview(checked, preview):
-            raise HostedPreviewError("operation_conflict")
-        if checked.operation_id in self._operations:
-            raise HostedPreviewError("operation_conflict")
-        if (
-            isinstance(expected_preview_state_version, bool)
-            or not isinstance(expected_preview_state_version, int)
-            or preview.state_version != expected_preview_state_version
-        ):
-            raise HostedPreviewError("preview_state_stale")
-        now = _timestamp(self._clock(), "preview_state_invalid")
-        if preview.expires_at <= now:
-            raise HostedPreviewError("preview_expired")
+            existing_id = self._operation_by_preview.get(checked.preview_id)
+            if existing_id is not None:
+                existing = self._operations[existing_id]
+                if not _same_confirmation_identity(existing, checked):
+                    raise HostedPreviewError("operation_conflict")
+                return HostedOperation.model_validate(existing)
+            self._revalidate_operation_authority(preview)
+            if not _operation_matches_preview(checked, preview):
+                raise HostedPreviewError("operation_conflict")
+            if checked.operation_id in self._operations:
+                raise HostedPreviewError("operation_conflict")
+            if (
+                isinstance(expected_preview_state_version, bool)
+                or not isinstance(expected_preview_state_version, int)
+                or preview.state_version != expected_preview_state_version
+            ):
+                raise HostedPreviewError("preview_state_stale")
+            now = _timestamp(self._clock(), "preview_state_invalid")
+            if preview.expires_at <= now:
+                raise HostedPreviewError("preview_expired")
+            try:
+                confirmed = preview.transition(
+                    target_state=PreviewState.CONFIRMED,
+                    occurred_at=checked.created_at,
+                    confirmed_payload_purge_after=checked.payload_purge_after,
+                )
+            except (TypeError, ValueError, ValidationError) as exc:
+                code = "preview_expired" if str(exc) == "preview_expired" else "operation_conflict"
+                raise HostedPreviewError(code) from None
+            self._previews[preview.preview_id] = confirmed
+            self._operations[checked.operation_id] = checked
+            self._operation_by_preview[checked.preview_id] = checked.operation_id
+            return HostedOperation.model_validate(checked)
+
+    def _revalidate_operation_authority(self, preview: DocumentPreview) -> None:
+        if self._authority_resolver is None:
+            raise HostedPreviewError("preview_binding_changed")
         try:
-            confirmed = preview.transition(
-                target_state=PreviewState.CONFIRMED,
-                occurred_at=checked.created_at,
-                confirmed_payload_purge_after=checked.payload_purge_after,
-            )
-        except (TypeError, ValueError, ValidationError) as exc:
-            code = "preview_expired" if str(exc) == "preview_expired" else "operation_conflict"
-            raise HostedPreviewError(code) from None
-        self._previews[preview.preview_id] = confirmed
-        self._operations[checked.operation_id] = checked
-        self._operation_by_preview[checked.preview_id] = checked.operation_id
-        return HostedOperation.model_validate(checked)
+            connection, qualification = self._authority_resolver(preview)
+        except HostedPreviewError:
+            raise
+        except Exception:
+            raise HostedPreviewError("preview_binding_changed") from None
+        _validate_authority(
+            preview,
+            connection=connection,
+            qualification=qualification,
+            projector_registry=self._projector_registry,
+            now=_timestamp(self._clock(), "preview_state_invalid"),
+        )
 
     def get_operation(
         self,
@@ -599,15 +743,16 @@ class InMemoryHostedPreviewStore:
         workspace_id: UUID,
         operation_id: UUID,
     ) -> HostedOperation:
-        operation = self._operations.get(operation_id)
-        if (
-            operation is None
-            or operation.tenant_id != tenant_id
-            or operation.auth_user_id != auth_user_id
-            or operation.workspace_id != workspace_id
-        ):
-            raise HostedPreviewError("operation_not_found")
-        return HostedOperation.model_validate(operation)
+        with self._lock:
+            operation = self._operations.get(operation_id)
+            if (
+                operation is None
+                or operation.tenant_id != tenant_id
+                or operation.auth_user_id != auth_user_id
+                or operation.workspace_id != workspace_id
+            ):
+                raise HostedPreviewError("operation_not_found")
+            return HostedOperation.model_validate(operation)
 
     def transition_operation(
         self,
@@ -617,30 +762,37 @@ class InMemoryHostedPreviewStore:
         workspace_id: UUID,
         operation_id: UUID,
         expected_state_version: int,
-        target_state: OperationState,
+        target_state: ParentOperationState,
         event_id: UUID,
         occurred_at: datetime,
         sanitized_reason: str,
     ) -> HostedOperation:
-        operation = self.get_operation(
-            tenant_id=tenant_id,
-            auth_user_id=auth_user_id,
-            workspace_id=workspace_id,
-            operation_id=operation_id,
-        )
-        if operation.state_version != expected_state_version:
-            raise HostedPreviewError("operation_state_stale")
-        try:
-            transitioned = operation.transition(
-                target_state=OperationState(target_state),
-                event_id=event_id,
-                occurred_at=occurred_at,
-                sanitized_reason=sanitized_reason,
+        with self._lock:
+            operation = self.get_operation(
+                tenant_id=tenant_id,
+                auth_user_id=auth_user_id,
+                workspace_id=workspace_id,
+                operation_id=operation_id,
             )
-        except (TypeError, ValueError, ValidationError):
-            raise HostedPreviewError("operation_transition_invalid") from None
-        self._operations[operation_id] = transitioned
-        return HostedOperation.model_validate(transitioned)
+            if operation.state_version != expected_state_version:
+                raise HostedPreviewError("operation_state_stale")
+            target = ParentOperationState(target_state)
+            if target is ParentOperationState.DISPATCHING:
+                preview = self._previews.get(operation.preview_id)
+                if preview is None:
+                    raise HostedPreviewError("operation_not_found")
+                self._revalidate_operation_authority(preview)
+            try:
+                transitioned = operation.transition(
+                    target_state=target,
+                    event_id=event_id,
+                    occurred_at=occurred_at,
+                    sanitized_reason=sanitized_reason,
+                )
+            except (TypeError, ValueError, ValidationError):
+                raise HostedPreviewError("operation_transition_invalid") from None
+            self._operations[operation_id] = transitioned
+            return HostedOperation.model_validate(transitioned)
 
     def transition_operation_item(
         self,
@@ -651,39 +803,39 @@ class InMemoryHostedPreviewStore:
         operation_id: UUID,
         operation_item_id: UUID,
         expected_state_version: int,
-        target_state: OperationState,
+        target_state: OperationItemState,
         event_id: UUID,
         occurred_at: datetime,
         sanitized_reason: str,
         provider_result_identifier: str | None = None,
     ) -> HostedOperation:
-        operation = self.get_operation(
-            tenant_id=tenant_id,
-            auth_user_id=auth_user_id,
-            workspace_id=workspace_id,
-            operation_id=operation_id,
-        )
-        matches = tuple(
-            item for item in operation.items if item.operation_item_id == operation_item_id
-        )
-        if len(matches) != 1:
-            raise HostedPreviewError("operation_not_found")
-        if matches[0].state_version != expected_state_version:
-            raise HostedPreviewError("operation_state_stale")
-        try:
-            transitioned = operation.transition_item(
-                operation_item_id=operation_item_id,
-                target_state=OperationState(target_state),
-                event_id=event_id,
-                occurred_at=occurred_at,
-                sanitized_reason=sanitized_reason,
-                provider_result_identifier=provider_result_identifier,
+        with self._lock:
+            operation = self.get_operation(
+                tenant_id=tenant_id,
+                auth_user_id=auth_user_id,
+                workspace_id=workspace_id,
+                operation_id=operation_id,
             )
-            transitioned = HostedOperation.model_validate(transitioned)
-        except (TypeError, ValueError, ValidationError):
-            raise HostedPreviewError("operation_transition_invalid") from None
-        self._operations[operation_id] = transitioned
-        return transitioned
+            matches = tuple(
+                item for item in operation.items if item.operation_item_id == operation_item_id
+            )
+            if len(matches) != 1:
+                raise HostedPreviewError("operation_not_found")
+            if matches[0].state_version != expected_state_version:
+                raise HostedPreviewError("operation_state_stale")
+            try:
+                transitioned = operation.transition_item(
+                    operation_item_id=operation_item_id,
+                    target_state=OperationItemState(target_state),
+                    event_id=event_id,
+                    occurred_at=occurred_at,
+                    sanitized_reason=sanitized_reason,
+                    provider_result_identifier=provider_result_identifier,
+                )
+            except (TypeError, ValueError, ValidationError):
+                raise HostedPreviewError("operation_transition_invalid") from None
+            self._operations[operation_id] = transitioned
+            return HostedOperation.model_validate(transitioned)
 
 
 class SupabaseHostedPreviewStore:
@@ -695,6 +847,7 @@ class SupabaseHostedPreviewStore:
         settings: Settings,
         payload_vault: HostedPayloadVault,
         http_client: httpx.Client,
+        projector_registry: DocumentProjectorRegistry | None = None,
     ) -> None:
         try:
             self._base_url = v1_supabase_rest_url(
@@ -711,6 +864,7 @@ class SupabaseHostedPreviewStore:
             raise HostedPreviewError("preview_store_unavailable") from None
         self._service_role_key = settings.supabase_service_role_key
         self._payload_vault = payload_vault
+        self._projector_registry = projector_registry or DocumentProjectorRegistry(())
         self._http = http_client
 
     def __repr__(self) -> str:
@@ -727,13 +881,53 @@ class SupabaseHostedPreviewStore:
                 },
             )
             stored = _preview_from_rpc(row)
-            if stored != checked:
-                raise ValueError
+            if (
+                stored.provider_call_hash != checked.provider_call_hash
+                or stored.preview_integrity_hash != checked.preview_integrity_hash
+            ):
+                raise HostedPreviewError("duplicate_provider_call")
             return stored
         except HostedPreviewError:
             raise
         except (TypeError, ValueError, ValidationError):
             raise HostedPreviewError("preview_store_unavailable") from None
+
+    def find_preview_by_provider_call(
+        self,
+        *,
+        tenant_id: UUID,
+        auth_user_id: UUID,
+        workspace_id: UUID,
+        connection_id: UUID,
+        provider_call_hash: str,
+    ) -> DocumentPreview | None:
+        rows = self._rpc_rows(
+            "find_mercury_document_preview_by_provider_call",
+            {
+                "p_tenant_id": str(tenant_id),
+                "p_workspace_id": str(workspace_id),
+                "p_auth_user_id": str(auth_user_id),
+                "p_connection_id": str(connection_id),
+                "p_provider_call_hash": provider_call_hash,
+            },
+        )
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise HostedPreviewError("preview_store_unavailable")
+        preview = _preview_from_rpc(rows[0])
+        _check_scope(
+            preview,
+            tenant_id=tenant_id,
+            auth_user_id=auth_user_id,
+            workspace_id=workspace_id,
+        )
+        if (
+            preview.connection_id != connection_id
+            or preview.provider_call_hash != provider_call_hash
+        ):
+            raise HostedPreviewError("preview_store_unavailable")
+        return preview
 
     def get_preview(
         self,
@@ -789,6 +983,7 @@ class SupabaseHostedPreviewStore:
         return _load_confirmable(
             preview,
             payload_vault=self._payload_vault,
+            projector_registry=self._projector_registry,
             tenant_id=tenant_id,
             auth_user_id=auth_user_id,
             workspace_id=workspace_id,
@@ -845,7 +1040,7 @@ class SupabaseHostedPreviewStore:
         row = self._rpc_one(
             "save_mercury_operation",
             {
-                **_operation_rpc_payload(checked),
+                **operation_rpc_payload(checked),
                 "p_expected_preview_state_version": expected_preview_state_version,
             },
         )
@@ -889,7 +1084,7 @@ class SupabaseHostedPreviewStore:
         workspace_id: UUID,
         operation_id: UUID,
         expected_state_version: int,
-        target_state: OperationState,
+        target_state: ParentOperationState,
         event_id: UUID,
         occurred_at: datetime,
         sanitized_reason: str,
@@ -902,7 +1097,7 @@ class SupabaseHostedPreviewStore:
                 "p_auth_user_id": str(auth_user_id),
                 "p_operation_id": str(operation_id),
                 "p_expected_state_version": expected_state_version,
-                "p_target_state": OperationState(target_state).value,
+                "p_target_state": ParentOperationState(target_state).value,
                 "p_event_id": str(event_id),
                 "p_occurred_at": _timestamp(occurred_at).isoformat(),
                 "p_sanitized_reason": sanitized_reason,
@@ -927,7 +1122,7 @@ class SupabaseHostedPreviewStore:
         operation_id: UUID,
         operation_item_id: UUID,
         expected_state_version: int,
-        target_state: OperationState,
+        target_state: OperationItemState,
         event_id: UUID,
         occurred_at: datetime,
         sanitized_reason: str,
@@ -942,7 +1137,7 @@ class SupabaseHostedPreviewStore:
                 "p_operation_id": str(operation_id),
                 "p_operation_item_id": str(operation_item_id),
                 "p_expected_state_version": expected_state_version,
-                "p_target_state": OperationState(target_state).value,
+                "p_target_state": OperationItemState(target_state).value,
                 "p_event_id": str(event_id),
                 "p_occurred_at": _timestamp(occurred_at).isoformat(),
                 "p_sanitized_reason": sanitized_reason,
@@ -1006,9 +1201,7 @@ def _parse_timestamp(value: Any) -> datetime:
     return parsed.astimezone(UTC)
 
 
-def _parse_date(value: Any) -> date | None:
-    if value is None:
-        return None
+def _parse_date(value: Any) -> date:
     if not isinstance(value, str):
         raise ValueError
     return date.fromisoformat(value)
@@ -1035,7 +1228,6 @@ def _preview_from_rpc(row: Mapping[str, Any]) -> DocumentPreview:
         summary = item_row.get("sanitized_summary")
         if not isinstance(summary, Mapping):
             raise ValueError
-        financials = DocumentFinancials.model_validate(summary["financials"])
         envelope = CredentialEnvelope(
             id=UUID(str(item_row["payload_envelope_id"])),
             tenant_id=UUID(str(item_row["tenant_id"])),
@@ -1061,12 +1253,13 @@ def _preview_from_rpc(row: Mapping[str, Any]) -> DocumentPreview:
                 connection_id=UUID(str(item_row["connection_id"])),
                 item_index=item_row["item_index"],
                 client_item_id=item_row["client_item_id"],
-                payload_hash=item_row["payload_hash"],
+                provider_call_hash=item_row["provider_call_hash"],
+                preview_integrity_hash=item_row["preview_integrity_hash"],
                 document_type=item_row["document_type"],
-                counterparty_display=summary.get("counterparty_display"),
-                issue_date=_parse_date(summary.get("issue_date")),
-                due_date=_parse_date(summary.get("due_date")),
-                financials=financials,
+                counterparty_display=summary["counterparty_display"],
+                issue_date=_parse_date(summary["issue_date"]),
+                due_date=_parse_date(summary["due_date"]),
+                financials=DocumentFinancials.model_validate(summary["financials"]),
                 warnings=tuple(summary.get("warnings", ())),
                 accountant_review_points=tuple(summary.get("accountant_review_points", ())),
                 payload_envelope=envelope,
@@ -1074,7 +1267,6 @@ def _preview_from_rpc(row: Mapping[str, Any]) -> DocumentPreview:
                 payload_purge_after=_parse_timestamp(item_row["payload_purge_after"]),
             )
         )
-    qualification_id = preview.get("qualification_id")
     return DocumentPreview(
         preview_id=UUID(str(preview["id"])),
         tenant_id=UUID(str(preview["tenant_id"])),
@@ -1085,16 +1277,19 @@ def _preview_from_rpc(row: Mapping[str, Any]) -> DocumentPreview:
         provider_account_sha256=preview["provider_account_sha256"],
         account_display_name=preview["account_display_name"],
         environment=environment,
-        qualification_id=UUID(str(qualification_id)) if qualification_id else None,
+        qualification_id=UUID(str(preview["qualification_id"])),
         provider_tool_name=preview["provider_tool_name"],
         capability_id=preview["capability_id"],
         capability_version=preview["capability_version"],
         schema_hash=preview["schema_hash"],
         response_shape_hash=preview["response_shape_hash"],
         evidence_revision_sha256=preview["evidence_revision_sha256"],
+        projector_id=preview["projector_id"],
+        projector_version=preview["projector_version"],
         connection_revision=preview["connection_revision"],
         connection_readiness=ConnectionReadiness(preview["connection_readiness"]),
-        payload_hash=preview["payload_hash"],
+        provider_call_hash=preview["provider_call_hash"],
+        preview_integrity_hash=preview["preview_integrity_hash"],
         state=PreviewState(preview["status"]),
         state_version=preview["state_version"],
         currency=preview["currency"],
@@ -1123,7 +1318,7 @@ def _preview_from_rpc(row: Mapping[str, Any]) -> DocumentPreview:
     )
 
 
-def _operation_rpc_payload(operation: HostedOperation) -> dict[str, Any]:
+def operation_rpc_payload(operation: HostedOperation) -> dict[str, Any]:
     return {
         "p_operation": {
             "id": str(operation.operation_id),
@@ -1137,7 +1332,8 @@ def _operation_rpc_payload(operation: HostedOperation) -> dict[str, Any]:
             "capability_id": operation.capability_id,
             "capability_version": operation.capability_version,
             "connection_revision": operation.connection_revision,
-            "payload_hash": operation.payload_hash,
+            "provider_call_hash": operation.provider_call_hash,
+            "preview_integrity_hash": operation.preview_integrity_hash,
             "status": operation.state.value,
             "state_version": operation.state_version,
             "created_at": operation.created_at.isoformat(),
@@ -1156,7 +1352,8 @@ def _operation_rpc_payload(operation: HostedOperation) -> dict[str, Any]:
                 "connection_id": str(operation.connection_id),
                 "item_index": item.item_index,
                 "client_item_id": item.client_item_id,
-                "payload_hash": item.payload_hash,
+                "provider_call_hash": item.provider_call_hash,
+                "preview_integrity_hash": item.preview_integrity_hash,
                 "status": item.state.value,
                 "state_version": item.state_version,
                 "provider_result_identifier": item.provider_result_identifier,
@@ -1176,8 +1373,8 @@ def _operation_rpc_payload(operation: HostedOperation) -> dict[str, Any]:
                 "auth_user_id": str(operation.auth_user_id),
                 "workspace_id": str(operation.workspace_id),
                 "connection_id": str(operation.connection_id),
-                "from_state": event.from_state.value if event.from_state else None,
-                "to_state": event.to_state.value,
+                "from_state": event.from_state,
+                "to_state": event.to_state,
                 "state_version": event.state_version,
                 "sanitized_reason": event.sanitized_reason,
                 "occurred_at": event.occurred_at.isoformat(),
@@ -1203,8 +1400,9 @@ def _operation_from_rpc(row: Mapping[str, Any]) -> HostedOperation:
             preview_item_id=UUID(str(item["preview_item_id"])),
             item_index=item["item_index"],
             client_item_id=item["client_item_id"],
-            payload_hash=item["payload_hash"],
-            state=OperationState(item["status"]),
+            provider_call_hash=item["provider_call_hash"],
+            preview_integrity_hash=item["preview_integrity_hash"],
+            state=OperationItemState(item["status"]),
             state_version=item["state_version"],
             provider_result_identifier=item.get("provider_result_identifier"),
             created_at=_parse_timestamp(item["created_at"]),
@@ -1219,8 +1417,8 @@ def _operation_from_rpc(row: Mapping[str, Any]) -> HostedOperation:
             operation_item_id=(
                 UUID(str(event["operation_item_id"])) if event.get("operation_item_id") else None
             ),
-            from_state=(OperationState(event["from_state"]) if event.get("from_state") else None),
-            to_state=OperationState(event["to_state"]),
+            from_state=event.get("from_state"),
+            to_state=event["to_state"],
             state_version=event["state_version"],
             sanitized_reason=event["sanitized_reason"],
             occurred_at=_parse_timestamp(event["occurred_at"]),
@@ -1239,8 +1437,9 @@ def _operation_from_rpc(row: Mapping[str, Any]) -> HostedOperation:
         capability_id=operation["capability_id"],
         capability_version=operation["capability_version"],
         connection_revision=operation["connection_revision"],
-        payload_hash=operation["payload_hash"],
-        state=OperationState(operation["status"]),
+        provider_call_hash=operation["provider_call_hash"],
+        preview_integrity_hash=operation["preview_integrity_hash"],
+        state=ParentOperationState(operation["status"]),
         state_version=operation["state_version"],
         items=items,
         events=events,
@@ -1250,10 +1449,14 @@ def _operation_from_rpc(row: Mapping[str, Any]) -> HostedOperation:
     )
 
 
+_operation_rpc_payload = operation_rpc_payload
+
+
 __all__ = [
     "HostedPayloadVault",
     "HostedPreviewError",
     "HostedPreviewStore",
     "InMemoryHostedPreviewStore",
     "SupabaseHostedPreviewStore",
+    "operation_rpc_payload",
 ]

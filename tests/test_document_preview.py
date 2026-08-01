@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 
@@ -72,6 +72,8 @@ def _input_schema() -> dict[str, object]:
         "properties": {
             "reference": {"type": "string", "minLength": 1},
             "counterparty_name": {"type": "string", "minLength": 1},
+            "issue_date": {"type": "string", "format": "date"},
+            "due_date": {"type": "string", "format": "date"},
             "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
             "lines": {"type": "array", "items": line, "minItems": 1, "maxItems": 100},
             "subtotal": nonnegative,
@@ -83,6 +85,8 @@ def _input_schema() -> dict[str, object]:
         "required": [
             "reference",
             "counterparty_name",
+            "issue_date",
+            "due_date",
             "currency",
             "lines",
             "subtotal",
@@ -99,6 +103,8 @@ def _payload(*, reference: str = "INV-DRAFT-001", currency: str = "THB") -> dict
     return {
         "reference": reference,
         "counterparty_name": SECRET_COUNTERPARTY,
+        "issue_date": "2026-07-31",
+        "due_date": "2026-08-30",
         "currency": currency,
         "lines": [
             {
@@ -162,20 +168,20 @@ def _draft(
     client_item_id: str = "client-item-1",
     reference: str = "INV-DRAFT-001",
     currency: str = "THB",
-    financials=None,
+    provider_updates: dict[str, object] | None = None,
+    warnings: tuple[str, ...] = ("withholding_tax_requires_review",),
+    accountant_review_points: tuple[str, ...] = ("confirm_counterparty_tax_treatment",),
 ):
     from mercury_tools.execution.hosted.models import DocumentCreateDraft
 
+    provider_arguments = _payload(reference=reference, currency=currency)
+    if provider_updates:
+        provider_arguments.update(provider_updates)
     return DocumentCreateDraft(
         client_item_id=client_item_id,
-        document_type="invoice",
-        counterparty_display="Customer ending 0991",
-        issue_date=date(2026, 7, 31),
-        due_date=date(2026, 8, 30),
-        provider_payload=_payload(reference=reference, currency=currency),
-        financials=financials or _financials(currency=currency),
-        warnings=("withholding_tax_requires_review",),
-        accountant_review_points=("confirm_counterparty_tax_treatment",),
+        provider_arguments=provider_arguments,
+        warnings=warnings,
+        accountant_review_points=accountant_review_points,
     )
 
 
@@ -257,22 +263,73 @@ def _membership(_principal: MercuryPrincipal, workspace_id: UUID) -> WorkspaceMe
     )
 
 
-def _payload_vault():
+def _payload_vault(*, clock=None):
     from mercury_tools.execution.hosted.store import HostedPayloadVault
 
     return HostedPayloadVault(
-        CredentialVault(active_key_version="v1", keys={"v1": KEY}, clock=lambda: NOW)
+        CredentialVault(
+            active_key_version="v1",
+            keys={"v1": KEY},
+            clock=clock or (lambda: NOW),
+        )
     )
 
 
-def _service(*, connection=None, qualification=None, ids=None):
+def _projector_registry(qualification: ProviderMCPQualification):
+    from mercury_tools.execution.hosted.projectors import (
+        DocumentProjectorRegistry,
+        ReviewedInvoiceProjector,
+    )
+
+    projector = ReviewedInvoiceProjector(
+        projector_id="mercury.test.invoice",
+        projector_version="c" * 64,
+        provider=qualification.provider,
+        environment=qualification.environment,
+        provider_tool_name=qualification.provider_tool_name,
+        capability_id=qualification.normalized_capability,
+        capability_version=qualification.capability_version_sha256,
+        schema_hash=qualification.schema_hash,
+        currency_minor_units={"THB": 2, "USD": 2},
+    )
+    return DocumentProjectorRegistry((projector,))
+
+
+def _service(
+    *,
+    connection=None,
+    qualification=None,
+    ids=None,
+    authority_state: dict[str, object] | None = None,
+    projector_registry=None,
+    store_factory=None,
+    clock=None,
+):
     from mercury_tools.execution.hosted.preview_service import HostedPreviewService
     from mercury_tools.execution.hosted.store import InMemoryHostedPreviewStore
 
     checked_connection = connection or _connection()
     checked_qualification = qualification or _qualification()
-    payload_vault = _payload_vault()
-    store = InMemoryHostedPreviewStore(payload_vault=payload_vault, clock=lambda: NOW)
+    current_authority = authority_state or {
+        "connection": checked_connection,
+        "qualification": checked_qualification,
+    }
+    registry = projector_registry or _projector_registry(checked_qualification)
+    selected_clock = clock or (lambda: NOW)
+    payload_vault = _payload_vault(clock=selected_clock)
+    store = (
+        store_factory(payload_vault, registry, current_authority)
+        if store_factory is not None
+        else InMemoryHostedPreviewStore(
+            payload_vault=payload_vault,
+            projector_registry=registry,
+            authority_resolver=lambda _preview: (
+                current_authority["connection"],
+                current_authority["qualification"],
+            ),
+            clock=selected_clock,
+        )
+    )
     id_values = iter(ids or (PREVIEW_ID, ITEM_ID))
     provider_calls: list[object] = []
 
@@ -302,7 +359,8 @@ def _service(*, connection=None, qualification=None, ids=None):
         membership_resolver=_membership,
         connection_resolver=resolve_connection,
         qualification_resolver=resolve_qualification,
-        clock=lambda: NOW,
+        projector_registry=registry,
+        clock=selected_clock,
         uuid_factory=lambda: next(id_values),
     )
     return service, store, checked_connection, checked_qualification, provider_calls
@@ -322,8 +380,9 @@ def test_hosted_preview_contracts_are_closed_frozen_and_secret_safe() -> None:
     rendered = repr(draft)
     assert SECRET_COUNTERPARTY not in serialized
     assert SECRET_COUNTERPARTY not in rendered
-    assert "provider_payload" not in serialized
-    assert draft.financials.model_dump(mode="json")["grand_total"] == "197.60"
+    assert "provider_arguments" not in serialized
+    assert "financials" not in type(draft).model_fields
+    assert draft.provider_arguments_copy()["grand_total"] == "197.60"
 
 
 @pytest.mark.parametrize(
@@ -388,7 +447,12 @@ async def test_prepare_binds_every_identity_and_performs_no_provider_call() -> N
     assert stored.evidence_revision_sha256 == qualification.evidence_revision_sha256
     assert stored.state_version == 1
     assert len(stored.items) == 1
-    assert stored.items[0].payload_hash == result.items[0].payload_hash
+    assert stored.items[0].provider_call_hash == result.items[0].provider_call_hash
+    assert stored.items[0].preview_integrity_hash
+    assert stored.provider_call_hash
+    assert stored.preview_integrity_hash
+    assert stored.projector_id == "mercury.test.invoice"
+    assert stored.projector_version == "c" * 64
     assert stored.expires_at == NOW + timedelta(seconds=1800)
     assert stored.payload_purge_after == stored.expires_at + timedelta(hours=24)
     assert provider_calls == []
@@ -488,7 +552,12 @@ async def test_prepare_accepts_only_exact_enabled_document_create_schema(
     draft = _draft()
     if payload_updates:
         draft = draft.model_copy(
-            update={"provider_payload": {**draft.provider_payload_copy(), **payload_updates}}
+            update={
+                "provider_arguments": {
+                    **draft.provider_arguments_copy(),
+                    **payload_updates,
+                }
+            }
         )
     with pytest.raises(HostedPreviewError, match=f"^{error}$"):
         await service.prepare_document_create(
@@ -523,7 +592,7 @@ async def test_prepare_rejects_an_enabled_but_open_document_schema() -> None:
 
 
 @pytest.mark.asyncio
-async def test_batch_rejects_size_duplicate_client_ids_and_duplicate_payload_hashes() -> None:
+async def test_batch_rejects_size_duplicate_client_ids_and_duplicate_provider_calls() -> None:
     from mercury_tools.execution.hosted.models import BatchDocumentCreate
     from mercury_tools.execution.hosted.store import HostedPreviewError
 
@@ -557,7 +626,7 @@ async def test_batch_rejects_size_duplicate_client_ids_and_duplicate_payload_has
             _draft(client_item_id="second"),
         ),
     )
-    with pytest.raises(HostedPreviewError, match="^duplicate_payload_hash$"):
+    with pytest.raises(HostedPreviewError, match="^duplicate_provider_call$"):
         await service.prepare_document_create(
             _principal(),
             WORKSPACE_ID,
@@ -612,7 +681,7 @@ async def test_edit_creates_a_new_immutable_preview_without_mutating_the_origina
     assert edited.preview_id != first.preview_id
     assert replacement.supersedes_preview_id == original.preview_id
     assert original.supersedes_preview_id is None
-    assert original.items[0].payload_hash != replacement.items[0].payload_hash
+    assert original.items[0].provider_call_hash != replacement.items[0].provider_call_hash
     assert original.state_version == 1
 
 

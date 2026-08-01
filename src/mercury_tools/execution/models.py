@@ -6,8 +6,6 @@ store. Callers that need model-visible data must use ``public_dict``.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 import secrets
 import unicodedata
@@ -20,6 +18,9 @@ from urllib.parse import quote, unquote
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from mercury_tools.canonical import (
+    canonical_payload_hash,
+)
 from mercury_tools.catalog.identity import deep_freeze
 from mercury_tools.catalog.models import CatalogAction, RiskTier, revalidate_catalog_action
 from mercury_tools.drivers.models import AuthContext
@@ -123,32 +124,6 @@ class RequestState(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     OUTCOME_UNKNOWN = "outcome_unknown"
-
-
-def canonical_payload_json(payload: Mapping[str, Any]) -> str:
-    """Return canonical JSON for JSON-safe bound request data."""
-    try:
-        return json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError("payload_not_canonicalizable") from exc
-
-
-def canonical_payload_bytes(payload: Mapping[str, Any]) -> bytes:
-    """Return canonical UTF-8 bytes for hashing or authenticated encryption."""
-
-    return canonical_payload_json(payload).encode("utf-8")
-
-
-def canonical_payload_hash(payload: Mapping[str, Any]) -> str:
-    """Return the SHA-256 hash of canonical, JSON-safe bound request data."""
-
-    return hashlib.sha256(canonical_payload_bytes(payload)).hexdigest()
 
 
 def _binding_payload(

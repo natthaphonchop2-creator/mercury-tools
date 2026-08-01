@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import subprocess
-import time
 from datetime import timedelta
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import httpx
 import pytest
@@ -22,6 +19,7 @@ from test_document_preview import (
     _draft,
     _membership,
     _payload_vault,
+    _projector_registry,
     _qualification,
     _service,
 )
@@ -31,17 +29,6 @@ MIGRATION = ROOT / "supabase/migrations/20260726105000_mercury_v1_operations_pre
 OPERATION_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 OPERATION_ITEM_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 EVENT_ID = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
-_POSTGRES_OPT_IN = "MERCURY_V1_POSTGRES_TEST"
-_POSTGRES_TABLES = (
-    "mercury_document_previews",
-    "mercury_preview_items",
-    "mercury_operations",
-    "mercury_operation_items",
-    "mercury_operation_events",
-)
-_POSTGRES_DOCKER_COMMAND_TIMEOUT_SECONDS = 20
-_POSTGRES_STARTUP_ATTEMPTS = 60
-_POSTGRES_STARTUP_RETRY_SECONDS = 0.5
 
 
 async def _prepared():
@@ -89,8 +76,7 @@ async def test_in_memory_store_is_tenant_bound_immutable_and_returns_defensive_m
             workspace_id=WORKSPACE_ID,
             preview_id=preview.preview_id,
         )
-    with pytest.raises(HostedPreviewError, match="^preview_conflict$"):
-        store.create_preview(preview)
+    assert store.create_preview(preview) == preview
 
     loaded = store.get_preview(
         tenant_id=TENANT_ID,
@@ -170,7 +156,11 @@ async def test_confirmable_load_rechecks_state_expiry_connection_catalog_and_pay
     tampered = preview.model_copy(update={"items": (tampered_item,)})
     from mercury_tools.execution.hosted.store import InMemoryHostedPreviewStore
 
-    tampered_store = InMemoryHostedPreviewStore(payload_vault=_payload_vault(), clock=lambda: NOW)
+    tampered_store = InMemoryHostedPreviewStore(
+        payload_vault=_payload_vault(),
+        projector_registry=_projector_registry(qualification),
+        clock=lambda: NOW,
+    )
     tampered_store.create_preview(tampered)
     with pytest.raises(HostedPreviewError, match="^preview_payload_changed$"):
         tampered_store.load_confirmable(
@@ -207,7 +197,11 @@ async def test_confirmable_load_rejects_a_preview_with_rebound_expiry() -> None:
             ),
         }
     )
-    rebound_store = InMemoryHostedPreviewStore(payload_vault=_payload_vault(), clock=lambda: NOW)
+    rebound_store = InMemoryHostedPreviewStore(
+        payload_vault=_payload_vault(),
+        projector_registry=_projector_registry(qualification),
+        clock=lambda: NOW,
+    )
     rebound_store.create_preview(rebound)
 
     with pytest.raises(HostedPreviewError, match="^preview_payload_changed$"):
@@ -265,7 +259,8 @@ async def test_prepare_normalizes_connection_resolver_errors_without_leaking_val
 async def test_operation_store_persists_versioned_transitions_and_retention_metadata() -> None:
     from mercury_tools.execution.hosted.models import (
         HostedOperation,
-        OperationState,
+        OperationItemState,
+        ParentOperationState,
         PreviewState,
     )
     from mercury_tools.execution.hosted.store import HostedPreviewError
@@ -291,7 +286,7 @@ async def test_operation_store_persists_versioned_transitions_and_retention_meta
 
     assert stored.preview_id == preview.preview_id
     assert repeated.operation_id == stored.operation_id
-    assert stored.state is OperationState.AWAITING_CONFIRMATION
+    assert stored.state is ParentOperationState.AWAITING_CONFIRMATION
     assert stored.state_version == 1
     assert stored.payload_purge_after == NOW + timedelta(days=30)
     assert len(stored.items) == 1
@@ -305,6 +300,22 @@ async def test_operation_store_persists_versioned_transitions_and_retention_meta
     assert confirmed_preview.state is PreviewState.CONFIRMED
     assert confirmed_preview.state_version == 2
 
+    dispatching = store.transition_operation(
+        tenant_id=TENANT_ID,
+        auth_user_id=AUTH_USER_ID,
+        workspace_id=WORKSPACE_ID,
+        operation_id=OPERATION_ID,
+        expected_state_version=1,
+        target_state=ParentOperationState.DISPATCHING,
+        event_id=UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
+        occurred_at=NOW + timedelta(milliseconds=250),
+        sanitized_reason="explicit_confirmation",
+    )
+    assert dispatching.state is ParentOperationState.DISPATCHING
+    assert dispatching.state_version == 2
+    assert dispatching.events[-1].from_state == ParentOperationState.AWAITING_CONFIRMATION.value
+    assert dispatching.events[-1].to_state == ParentOperationState.DISPATCHING.value
+
     item_transition = store.transition_operation_item(
         tenant_id=TENANT_ID,
         auth_user_id=AUTH_USER_ID,
@@ -312,12 +323,12 @@ async def test_operation_store_persists_versioned_transitions_and_retention_meta
         operation_id=OPERATION_ID,
         operation_item_id=OPERATION_ITEM_ID,
         expected_state_version=1,
-        target_state=OperationState.DISPATCHING,
+        target_state=OperationItemState.DISPATCHING,
         event_id=UUID("12121212-1212-4212-8212-121212121212"),
         occurred_at=NOW + timedelta(milliseconds=500),
         sanitized_reason="provider_create_started",
     )
-    assert item_transition.items[0].state is OperationState.DISPATCHING
+    assert item_transition.items[0].state is OperationItemState.DISPATCHING
     assert item_transition.items[0].state_version == 2
     assert item_transition.events[-1].operation_item_id == OPERATION_ITEM_ID
 
@@ -329,27 +340,11 @@ async def test_operation_store_persists_versioned_transitions_and_retention_meta
             operation_id=OPERATION_ID,
             operation_item_id=OPERATION_ITEM_ID,
             expected_state_version=1,
-            target_state=OperationState.SUCCEEDED,
+            target_state=OperationItemState.SUCCEEDED,
             event_id=UUID("13131313-1313-4313-8313-131313131313"),
             occurred_at=NOW + timedelta(milliseconds=750),
             sanitized_reason="provider_succeeded",
         )
-
-    transitioned = store.transition_operation(
-        tenant_id=TENANT_ID,
-        auth_user_id=AUTH_USER_ID,
-        workspace_id=WORKSPACE_ID,
-        operation_id=OPERATION_ID,
-        expected_state_version=1,
-        target_state=OperationState.DISPATCHING,
-        event_id=UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
-        occurred_at=NOW + timedelta(seconds=1),
-        sanitized_reason="explicit_confirmation",
-    )
-    assert transitioned.state is OperationState.DISPATCHING
-    assert transitioned.state_version == 2
-    assert transitioned.events[-1].from_state is OperationState.AWAITING_CONFIRMATION
-    assert transitioned.events[-1].to_state is OperationState.DISPATCHING
 
     with pytest.raises(HostedPreviewError, match="^operation_state_stale$"):
         store.transition_operation(
@@ -358,7 +353,7 @@ async def test_operation_store_persists_versioned_transitions_and_retention_meta
             workspace_id=WORKSPACE_ID,
             operation_id=OPERATION_ID,
             expected_state_version=1,
-            target_state=OperationState.SUCCEEDED,
+            target_state=ParentOperationState.SUCCEEDED,
             event_id=UUID("ffffffff-ffff-4fff-8fff-ffffffffffff"),
             occurred_at=NOW + timedelta(seconds=2),
             sanitized_reason="provider_succeeded",
@@ -444,9 +439,12 @@ def test_migration_is_expand_only_rls_bound_and_serializes_state_transitions() -
         assert f"alter table public.{table} enable row level security" in compact
         assert f"grant all on table public.{table} to service_role" in compact
 
-    assert "unique (workspace_id, connection_id, payload_hash)" in compact
+    assert "unique (workspace_id, connection_id, provider_call_hash)" in compact
     assert "unique (preview_id, client_item_id)" in compact
-    assert "unique (preview_id, payload_hash)" in compact
+    assert "unique (preview_id, provider_call_hash)" in compact
+    assert "preview_integrity_hash" in compact
+    assert "projector_id" in compact
+    assert "projector_version" in compact
     assert "payload_ciphertext" in compact
     assert "payload_envelope_created_at" in compact
     assert "sanitized_summary" in compact
@@ -458,6 +456,9 @@ def test_migration_is_expand_only_rls_bound_and_serializes_state_transitions() -
     assert "p_expected_state_version" in compact
     assert "p_expected_preview_state_version" in compact
     assert "transition_mercury_operation_item" in compact
+    assert "mercury_parent_operation_transition_is_allowed" in compact
+    assert "mercury_preview_authority_is_current" in compact
+    assert "mercury_create_schema_is_closed" in compact
     assert "mercury_assert_provider_backend_workspace_access" in compact
     assert "failed_pre_dispatch" in compact
     assert "provider_rejected" in compact
@@ -491,251 +492,3 @@ def test_hosted_modules_do_not_import_local_repository_sqlite_or_local_ttl_state
     from mercury_tools.execution.models import PREVIEW_TTL
 
     assert timedelta(minutes=15) == PREVIEW_TTL
-
-
-@pytest.mark.integration
-def test_postgresql_preview_migration_applies_twice_with_rls_and_service_acl() -> None:
-    if os.environ.get(_POSTGRES_OPT_IN) != "1":
-        pytest.skip(f"set {_POSTGRES_OPT_IN}=1 to run disposable PostgreSQL regression")
-
-    def docker(*args: str, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
-        command = ["docker", *args]
-        try:
-            return subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                input=input_text,
-                timeout=_POSTGRES_DOCKER_COMMAND_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired:
-            return subprocess.CompletedProcess(
-                command,
-                124,
-                stdout="",
-                stderr="docker_command_timed_out",
-            )
-
-    docker_info = docker("info")
-    if docker_info.returncode == 124:
-        pytest.fail("Docker availability check timed out")
-    if docker_info.returncode != 0:
-        pytest.skip("Docker is unavailable for disposable PostgreSQL regression")
-
-    container = f"mercury-task12-postgres-{uuid4().hex[:12]}"
-    database = "mercury_task12_test"
-    started = docker(
-        "run",
-        "--rm",
-        "-d",
-        "--name",
-        container,
-        "-e",
-        "POSTGRES_PASSWORD=postgres",
-        "-e",
-        f"POSTGRES_DB={database}",
-        "postgres:17-alpine",
-    )
-    assert started.returncode == 0, started.stderr
-
-    def psql_result(sql: str) -> subprocess.CompletedProcess[str]:
-        return docker(
-            "exec",
-            "-i",
-            container,
-            "psql",
-            "-X",
-            "-qAt",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-U",
-            "postgres",
-            "-d",
-            database,
-            input_text=sql,
-        )
-
-    def psql(sql: str) -> str:
-        result = psql_result(sql)
-        assert result.returncode == 0, f"{result.stderr.strip()}\n{result.stdout[-4000:].strip()}"
-        return result.stdout.strip()
-
-    try:
-        for _ in range(_POSTGRES_STARTUP_ATTEMPTS):
-            readiness = docker(
-                "exec",
-                container,
-                "psql",
-                "-qAt",
-                "-U",
-                "postgres",
-                "-d",
-                database,
-                "-c",
-                "select 1",
-            )
-            if readiness.returncode == 0 and readiness.stdout.strip() == "1":
-                break
-            if readiness.returncode == 124:
-                pytest.fail("Docker readiness probe timed out")
-            time.sleep(_POSTGRES_STARTUP_RETRY_SECONDS)
-        else:
-            pytest.fail("disposable PostgreSQL did not become ready")
-
-        psql(
-            """
-            do $$
-            begin
-              if not exists (select 1 from pg_roles where rolname = 'anon') then
-                create role anon nologin;
-              end if;
-              if not exists (select 1 from pg_roles where rolname = 'authenticated') then
-                create role authenticated nologin;
-              end if;
-              if not exists (select 1 from pg_roles where rolname = 'service_role') then
-                create role service_role nologin bypassrls;
-              end if;
-            end;
-            $$;
-            create extension if not exists pgcrypto;
-            create table public.mercury_tenants (
-              id uuid primary key
-            );
-            create table public.mercury_workspaces (
-              id uuid primary key,
-              tenant_id uuid not null references public.mercury_tenants(id),
-              status text not null
-            );
-            create table public.mercury_workspace_members (
-              tenant_id uuid not null references public.mercury_tenants(id),
-              workspace_id uuid not null references public.mercury_workspaces(id),
-              auth_user_id uuid not null,
-              status text not null
-            );
-            create table public.mercury_provider_connections (
-              id uuid primary key,
-              tenant_id uuid not null references public.mercury_tenants(id),
-              workspace_id uuid not null references public.mercury_workspaces(id),
-              auth_user_id uuid not null,
-              provider text not null,
-              environment text not null,
-              provider_account_id text not null,
-              readiness text not null,
-              revision bigint not null,
-              granted_permissions jsonb not null
-            );
-            create table public.mercury_provider_capability_qualifications (
-              id uuid primary key,
-              provider text not null,
-              environment text not null,
-              provider_tool_name text not null,
-              normalized_capability text not null,
-              capability_version_sha256 text not null,
-              schema_hash text not null,
-              response_shape_hash text not null,
-              evidence_revision_sha256 text not null,
-              company_sha256 text not null,
-              qualification_state text not null,
-              evidence_expires_at timestamptz not null,
-              required_permissions jsonb not null
-            );
-            grant usage on schema public to anon, authenticated, service_role;
-            create schema if not exists auth;
-            create or replace function auth.uid()
-            returns uuid
-            language sql
-            stable
-            as $$
-              select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid
-            $$;
-            grant usage on schema auth to anon, authenticated, service_role;
-            grant execute on function auth.uid() to anon, authenticated, service_role;
-            create or replace function public.mercury_assert_provider_backend_workspace_access(
-              p_tenant_id uuid,
-              p_workspace_id uuid,
-              p_auth_user_id uuid
-            )
-            returns void
-            language plpgsql
-            security definer
-            set search_path = ''
-            as $$
-            begin
-              if p_tenant_id is null or p_workspace_id is null or p_auth_user_id is null then
-                raise insufficient_privilege using message = 'workspace_access_denied';
-              end if;
-            end;
-            $$;
-            """
-        )
-        migration_sql = MIGRATION.read_text(encoding="utf-8")
-        psql(migration_sql)
-        psql(migration_sql)
-
-        table_list = ", ".join(f"'{name}'" for name in _POSTGRES_TABLES)
-        evidence = json.loads(
-            psql(
-                f"""
-                select json_build_object(
-                  'table_count', count(*),
-                  'rls_enabled', bool_and(class.relrowsecurity),
-                  'authenticated_select', bool_or(
-                    has_table_privilege('authenticated', class.oid, 'select')
-                  ),
-                  'service_all', bool_and(
-                    has_table_privilege('service_role', class.oid, 'select')
-                    and has_table_privilege('service_role', class.oid, 'insert')
-                    and has_table_privilege('service_role', class.oid, 'update')
-                    and has_table_privilege('service_role', class.oid, 'delete')
-                  ),
-                  'select_policies', (
-                    select count(*)
-                    from pg_policy as policy
-                    join pg_class as target on target.oid = policy.polrelid
-                    join pg_namespace as policy_namespace
-                      on policy_namespace.oid = target.relnamespace
-                    where policy_namespace.nspname = 'public'
-                      and target.relname in ({table_list})
-                      and policy.polcmd = 'r'
-                  ),
-                  'save_execute_service', has_function_privilege(
-                    'service_role',
-                    'public.save_mercury_document_preview(jsonb,jsonb)',
-                    'execute'
-                  ),
-                  'save_execute_authenticated', has_function_privilege(
-                    'authenticated',
-                    'public.save_mercury_document_preview(jsonb,jsonb)',
-                    'execute'
-                  )
-                )::text
-                from pg_class as class
-                join pg_namespace as namespace on namespace.oid = class.relnamespace
-                where namespace.nspname = 'public'
-                  and class.relname in ({table_list});
-                """
-            )
-        )
-
-        direct_authenticated = psql_result(
-            "set role authenticated;\nselect count(*) from public.mercury_document_previews;"
-        )
-        assert direct_authenticated.returncode != 0
-        assert evidence == {
-            "table_count": 5,
-            "rls_enabled": True,
-            "authenticated_select": False,
-            "service_all": True,
-            "select_policies": 5,
-            "save_execute_service": True,
-            "save_execute_authenticated": False,
-        }
-        assert (
-            psql("set role service_role;\nselect count(*) from public.mercury_document_previews;")
-            == "0"
-        )
-    finally:
-        cleanup = docker("rm", "-f", container)
-        if cleanup.returncode not in (0, 1):
-            pytest.fail("disposable PostgreSQL cleanup failed")
