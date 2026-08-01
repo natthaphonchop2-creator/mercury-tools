@@ -11,8 +11,8 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    FiniteFloat,
     StrictBool,
-    StrictFloat,
     StrictInt,
     StrictStr,
     model_validator,
@@ -39,7 +39,7 @@ _REQUIRED_SERVICE_PROBES = (
 )
 _STABLE_IDENTIFIER_RE = re.compile(_STABLE_IDENTIFIER)
 
-ScalarDetail = StrictStr | StrictBool | StrictInt | StrictFloat
+ScalarDetail = StrictStr | StrictBool | StrictInt | FiniteFloat
 SafeDetails = Annotated[dict[str, ScalarDetail], Field(default_factory=dict)]
 
 
