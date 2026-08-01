@@ -1,25 +1,25 @@
 # Mercury V1 Design Decision Log
 
-Status: Draft decision log
-Last updated: 2026-07-25
+Status: Historical decision log with current Design 8 authority
+Last updated: 2026-08-01
 Target final spec:
-`docs/superpowers/specs/2026-07-25-mercury-v1-authorization-gateway-design.md`
+`docs/superpowers/specs/2026-08-01-mercury-v1-aws-primary-agentcore-design.md`
 
-This file preserves decisions as they are approved. It is not the final design
-specification. Update it after each approved section, then reconcile it into the
-final specification and remove contradictions during the spec self-review.
+This file preserves decisions in approval order. Older sections are historical
+when they conflict with Approved Design 8. The AWS-primary specification above
+is implementation authority.
 
 ## Locked Product Scope
 
 - Mercury V1 supports FlowAccount and PEAK Accounting.
-- V1 exposes read capabilities and every provider-supported document-create
-  capability that Mercury has discovered, schema-validated, and qualified.
+- V1 exposes every provider-supported read and mutation capability that Mercury
+  has discovered, schema-validated, and qualified.
 - FlowAccount is the first end-to-end qualification target. PEAK follows the
   same connector contract after the FlowAccount path passes.
-- Update, patch, delete, void, payment, approval, and other non-create
-  mutations are outside V1.
-- Every create operation follows:
-  `Draft -> Validate -> HTML Preview -> Explicit confirmation -> Create -> Audit`.
+- Create, update, patch, delete, void, payment, approval, send, post, and other
+  provider actions are in scope when their exact versions pass qualification.
+- Every mutation follows:
+  `Prepare -> Validate -> Preview -> Explicit confirmation -> Dispatch -> Reconcile -> Audit`.
 - Batch operations may use one confirmation for one immutable preview that
   lists every document in the batch.
 - Thai previews follow the `praneet-front` typography rules. They use a formal
@@ -513,7 +513,85 @@ revoking or disconnecting an affected provider connection, and rolling Render
 back to the previous healthy deployment. V1 database migrations use
 backward-compatible expansion and avoid destructive release-time migrations.
 
+## Approved Design 8: MCP-First SaaS with AgentCore Backend
+
+Owner direction approved on 2026-08-01:
+
+- Mercury is a customer-facing SaaS product; Amazon Bedrock AgentCore remains
+  backend infrastructure and is never the customer experience.
+- Mercury remains the only product-facing MCP server. Provider MCP servers and
+  AgentCore Gateway are internal connector infrastructure.
+- V1 launches MCP-first. Customers use their existing Claude, Codex, ChatGPT or
+  compatible host, so Mercury does not require a customer-supplied LLM API key
+  and does not initially bear general chat-model token costs.
+- Mercury includes a small Web Console for sign-in, workspaces, provider setup,
+  capability status, preview approval, sanitized audit, membership, plan and
+  billing administration.
+- The Web Console is not a standalone accounting application and does not add a
+  Mercury chat interface.
+- Mercury-owned chat, model inference and an AgentCore Harness agent loop are
+  not planned or approved. Adding any of them requires a separate owner
+  decision and must not be inferred as a later phase of this design.
+
+### Managed Infrastructure Boundary
+
+The approved architecture uses AgentCore Runtime, Gateway, Identity,
+Policy and Observability to replace generic hosting, gateway, credential,
+authorization and telemetry plumbing. It preserves the already-tested Mercury
+domain core for Capability Catalog authority, provider normalization, cited
+RAG, Skills, Thai preview, explicit confirmation, idempotency, reconciliation
+and accounting-aware audit.
+
+AWS is the sole target backend. Render and Supabase are frozen as test-only
+reference systems until the one-time canonical URL cutover; there is no
+dual-write, data synchronization, or open-ended hybrid production period. Test
+tenants, credentials, operations, and audit rows are not migrated into AWS.
+AgentCore Memory is not accounting knowledge or operation authority. AWS Agent
+Registry may index Skill and MCP metadata, but Git remains canonical for
+first-party Skills and the Capability Catalog remains execution authority.
+
+### FastMCP and Full ERP Operations
+
+- FastMCP remains the MCP protocol layer inside AgentCore Runtime. The first AWS
+  deployment retains the pinned FastMCP API bundled with the official MCP Python
+  SDK. Standalone FastMCP is a gated upgrade after AgentCore smoke testing.
+- Mercury supports all provider-published operation classes, including reads,
+  Create, Update, Patch, Delete, Void, Payment, Approval, Send, and Post.
+- Only an exact provider, operation, version, and environment that has passed
+  qualification is executable. No generic arbitrary-URL tool is exposed.
+- Every mutation uses immutable preview, role and entitlement checks, one
+  explicit confirmation, idempotency, outcome reconciliation, and sanitized
+  audit.
+
+### AWS Data and Product Delivery
+
+- Asia Pacific Singapore (`ap-southeast-1`) is the primary region.
+- Separate non-production and production AWS accounts isolate VPC, Aurora,
+  S3, KMS, identity, credentials, and audit.
+- Aurora PostgreSQL is the product and operation system of record. S3 plus
+  Bedrock Knowledge Bases provides cited knowledge retrieval.
+- AgentCore Identity manages outbound OAuth/API-key credentials; Aurora stores
+  opaque references and provider account binding only.
+- The one-click plugin authenticates on install and receives a token bound to
+  user, tenant, workspace, role, and entitlements.
+- A minimal Web Console handles workspace, connector, approval, audit, member,
+  and plan controls. It does not contain Mercury Chat.
+
+### Commercial Direction
+
+Initial packaging is value-based rather than MCP-call-based:
+
+- Starter: one-company read and reporting
+- Business: qualified document Create with preview and approval
+- Accountant: multiple companies, users and full audit controls
+- Enterprise: SSO, organization-specific policy and SLA
+
+The exact price, quota and payment provider remain separate commercial
+decisions. Entitlements must bind the authenticated user, tenant, workspace,
+provider connection and capability before execution.
+
 ## Design Status
 
-All Mercury V1 design sections are approved and reconciled into the final
-design specification, which is pending written-spec review by the user.
+Designs 1-8 are approved. The canonical revised written specification is
+`docs/superpowers/specs/2026-08-01-mercury-v1-aws-primary-agentcore-design.md`
+and is pending owner review before an implementation plan may be written.

@@ -1,9 +1,18 @@
 # Mercury V1 Authorization Gateway Design
 
-Status: Approved design sections, written spec pending user review
+Status: Domain baseline; infrastructure and delivery superseded on 2026-08-01
 Date: 2026-07-25
 Target release: `v1.0.0`
 Repository: `mercury-tools`
+
+> **Supersession notice:** The Capability Catalog, provider normalization,
+> preview, confirmation, idempotency, reconciliation, and accounting audit
+> contracts in this document remain domain references. The canonical Mercury V1
+> infrastructure, full ERP operation scope, AWS delivery model, identity, data,
+> release gate, and migration plan are defined in
+> `2026-08-01-mercury-v1-aws-primary-agentcore-design.md`. Render, Supabase,
+> public no-auth MCP, hybrid migration, and Create-only scope below are retained
+> only as historical baseline and are not implementation authority.
 
 ## 1. Executive Summary
 
