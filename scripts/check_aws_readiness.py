@@ -19,8 +19,17 @@ from mercury_tools.aws.readiness import (
 )
 
 
+class _CliInputError(Exception):
+    pass
+
+
+class _SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise _CliInputError from None
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = _SafeArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
         type=Path,
@@ -48,8 +57,8 @@ def _skipped_live_checks() -> tuple[CheckResult, ...]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
     try:
+        args = _parser().parse_args(argv)
         config = load_wave0_config(args.config)
         local_checks = check_local_toolchain()
         live_checks = (
@@ -59,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         report = build_readiness_report(config, (*local_checks, *live_checks))
         write_readiness_report(report, args.output)
-    except (OSError, ValueError, ValidationError):
+    except (_CliInputError, OSError, ValueError, ValidationError):
         print("wave0_readiness_invalid_input")
         return 3
 

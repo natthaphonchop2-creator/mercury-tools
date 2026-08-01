@@ -6,7 +6,10 @@ import hashlib
 import json
 import os
 import re
-import tempfile
+import secrets
+import stat
+from collections import Counter
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -86,6 +89,16 @@ _THROTTLING_MARKERS = (
     "requestlimitexceeded",
 )
 _TOOL_NAMES = frozenset(TOOL_COMMANDS)
+_ACCOUNT_CHECK_NAMES = frozenset({"nonprod_account", "production_account"})
+_ISOLATION_CHECK_NAMES = frozenset({"aws_account_isolation"})
+_SERVICE_CHECK_NAMES = frozenset(
+    f"{environment}_{service}"
+    for environment in ("nonprod", "production")
+    for service in SERVICE_COMMANDS
+)
+_EXPECTED_CHECK_NAMES = (
+    _TOOL_NAMES | _ACCOUNT_CHECK_NAMES | _ISOLATION_CHECK_NAMES | _SERVICE_CHECK_NAMES
+)
 _ACCOUNT_ACCESS_CODES = frozenset(
     {
         "aws_account_access_blocked",
@@ -93,7 +106,10 @@ _ACCOUNT_ACCESS_CODES = frozenset(
         "aws_live_checks_skipped",
     }
 )
-_IDENTITY_CODES = frozenset({"aws_accounts_not_isolated"})
+_IDENTITY_CODES = frozenset(
+    {"aws_accounts_not_isolated", "wave0_evidence_inventory_invalid"}
+)
+_INVENTORY_INVALID_CODE = "wave0_evidence_inventory_invalid"
 _REGION_CODES = frozenset(
     {
         "aws_service_probe_failed",
@@ -364,18 +380,49 @@ def _aurora_serverless_available(payload: dict[str, Any]) -> bool:
 def aggregate_gate(checks: tuple[CheckResult, ...] | list[CheckResult]) -> GateStatus:
     """Aggregate checks using the frozen fail-closed gate precedence."""
 
+    counts = Counter(item.name for item in checks)
     blocked = [item for item in checks if item.state is not CheckState.PASS]
-    if any(item.name in _TOOL_NAMES for item in blocked):
+    substantive_blocked = [item for item in blocked if item.code != _INVENTORY_INVALID_CODE]
+    if any(item.name in _TOOL_NAMES for item in substantive_blocked):
         return GateStatus.BLOCKED_TOOLING
-    if any(item.code in _ACCOUNT_ACCESS_CODES for item in blocked):
+    if any(item.code in _ACCOUNT_ACCESS_CODES for item in substantive_blocked):
         return GateStatus.BLOCKED_ACCOUNT_ACCESS
-    if any(item.code in _REGION_CODES for item in blocked):
+    if any(item.code in _REGION_CODES for item in substantive_blocked):
         return GateStatus.BLOCKED_REGION_SERVICE
-    if any(item.code in _IDENTITY_CODES for item in blocked):
+    if any(item.code in _IDENTITY_CODES for item in substantive_blocked) or substantive_blocked:
         return GateStatus.BLOCKED_IDENTITY_COMPATIBILITY
-    if blocked:
+
+    if _inventory_group_invalid(counts, _TOOL_NAMES):
+        return GateStatus.BLOCKED_TOOLING
+    if _inventory_group_invalid(counts, _ACCOUNT_CHECK_NAMES):
+        return GateStatus.BLOCKED_ACCOUNT_ACCESS
+    if _inventory_group_invalid(counts, _SERVICE_CHECK_NAMES):
+        return GateStatus.BLOCKED_REGION_SERVICE
+    if _inventory_group_invalid(counts, _ISOLATION_CHECK_NAMES) or any(
+        name not in _EXPECTED_CHECK_NAMES for name in counts
+    ):
         return GateStatus.BLOCKED_IDENTITY_COMPATIBILITY
     return GateStatus.READY
+
+
+def _inventory_group_invalid(counts: Counter[str], expected: frozenset[str]) -> bool:
+    return any(counts[name] != 1 for name in expected)
+
+
+def _expected_check_names(config: Wave0Config) -> frozenset[str]:
+    account_names = {f"{account.environment.value}_account" for account in config.accounts}
+    service_names = {
+        f"{account.environment.value}_{probe.value}"
+        for account in config.accounts
+        for probe in config.required_service_probes
+    }
+    return frozenset((*TOOL_COMMANDS, *account_names, "aws_account_isolation", *service_names))
+
+
+def _inventory_is_exact(config: Wave0Config, checks: tuple[CheckResult, ...]) -> bool:
+    expected = _expected_check_names(config)
+    counts = Counter(item.name for item in checks)
+    return set(counts) == set(expected) and all(counts[name] == 1 for name in expected)
 
 
 def build_readiness_report(
@@ -387,6 +434,15 @@ def build_readiness_report(
     """Build the frozen report model from already sanitized checks."""
 
     check_tuple = tuple(checks)
+    if not _inventory_is_exact(config, check_tuple):
+        check_tuple += (
+            _check(
+                "wave0_evidence_inventory",
+                CheckState.BLOCKED,
+                _INVENTORY_INVALID_CODE,
+                "AWS readiness evidence inventory is incomplete or invalid.",
+            ),
+        )
     return ReadinessReport(
         schema_version="mercury.aws.wave0.report.v1",
         primary_region=config.primary_region,
@@ -407,23 +463,76 @@ def write_readiness_report(
     """Atomically write private evidence below the fixed Wave 0 artifact directory."""
 
     root = (repository_root or Path.cwd()).resolve()
-    allowed_root = (root / ".artifacts/aws/wave0").resolve()
-    resolved_output = output.resolve() if output.is_absolute() else (root / output).resolve()
-    if resolved_output.parent != allowed_root:
+    allowed_root = root / ".artifacts/aws/wave0"
+    candidate = output if output.is_absolute() else root / output
+    normalized_output = Path(os.path.abspath(candidate))
+    if normalized_output.parent != allowed_root or normalized_output.name in {"", ".", ".."}:
         raise ValueError("wave0_output_path_invalid")
 
-    allowed_root.mkdir(parents=True, exist_ok=True)
     payload = report.model_dump_json(indent=2).encode("utf-8") + b"\n"
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".readiness-", dir=allowed_root)
-    temporary_path = Path(temporary_name)
+    directory_fd = _open_artifact_directory(root)
+    temporary_name: str | None = None
     try:
+        _reject_symlinked_output(directory_fd, normalized_output.name)
+        descriptor, temporary_name = _create_temporary_file(directory_fd)
         with os.fdopen(descriptor, "wb") as handle:
             os.fchmod(handle.fileno(), 0o600)
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary_path, resolved_output)
-        resolved_output.chmod(0o600)
+        os.replace(
+            temporary_name,
+            normalized_output.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary_name = None
+        os.fsync(directory_fd)
     except BaseException:
-        temporary_path.unlink(missing_ok=True)
+        if temporary_name is not None:
+            with suppress(OSError):
+                os.unlink(temporary_name, dir_fd=directory_fd)
         raise
+    finally:
+        os.close(directory_fd)
+
+
+def _open_artifact_directory(root: Path) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        directory_fd = os.open(root, flags)
+    except OSError:
+        raise ValueError("wave0_output_path_invalid") from None
+    try:
+        for component in (".artifacts", "aws", "wave0"):
+            with suppress(FileExistsError):
+                os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+            next_fd = os.open(component, flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        return directory_fd
+    except OSError:
+        os.close(directory_fd)
+        raise ValueError("wave0_output_path_invalid") from None
+
+
+def _reject_symlinked_output(directory_fd: int, output_name: str) -> None:
+    try:
+        mode = os.stat(output_name, dir_fd=directory_fd, follow_symlinks=False).st_mode
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise ValueError("wave0_output_path_invalid") from None
+    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        raise ValueError("wave0_output_path_invalid")
+
+
+def _create_temporary_file(directory_fd: int) -> tuple[int, str]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    for _ in range(10):
+        name = f".readiness-{secrets.token_hex(8)}"
+        try:
+            return os.open(name, flags, 0o600, dir_fd=directory_fd), name
+        except FileExistsError:
+            continue
+    raise OSError("wave0_temporary_file_unavailable")

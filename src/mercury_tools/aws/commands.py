@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -20,6 +21,13 @@ _ALLOWED_ENVIRONMENT = (
     "AWS_SHARED_CREDENTIALS_FILE",
 )
 _MAX_OUTPUT_CHARS = 4_096
+_AWS_ACCESS_KEY_ASSIGNMENT_RE = re.compile(
+    r"(?i)\bAWS_ACCESS_KEY_ID\s*[:=]\s*[^\s,;]+"
+)
+_AWS_SECRET_KEY_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(?:AWS_)?SECRET_ACCESS_KEY\s*[:=]\s*[^\s,;]+"
+)
+_AWS_ACCESS_KEY_RE = re.compile(r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])")
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +69,18 @@ def run_command(argv: tuple[str, ...], timeout_seconds: int = 20) -> CommandResu
 
     return CommandResult(
         completed.returncode,
-        redact_text(completed.stdout[:_MAX_OUTPUT_CHARS]),
-        redact_text(completed.stderr[:_MAX_OUTPUT_CHARS]),
+        _redact_command_output(completed.stdout),
+        _redact_command_output(completed.stderr),
     )
+
+
+def _redact_command_output(value: str) -> str:
+    bounded = value[:_MAX_OUTPUT_CHARS]
+    bounded = _AWS_ACCESS_KEY_ASSIGNMENT_RE.sub(
+        "[REDACTED_AWS_ACCESS_KEY_ASSIGNMENT]", bounded
+    )
+    bounded = _AWS_SECRET_KEY_ASSIGNMENT_RE.sub(
+        "[REDACTED_AWS_SECRET_KEY_ASSIGNMENT]", bounded
+    )
+    bounded = _AWS_ACCESS_KEY_RE.sub("[REDACTED_AWS_ACCESS_KEY_ID]", bounded)
+    return redact_text(bounded)[:_MAX_OUTPUT_CHARS]

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,6 +26,7 @@ from mercury_tools.aws.readiness import (
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "infra/aws/wave0/environment.yaml"
+SCRIPT_PATH = ROOT / "scripts/check_aws_readiness.py"
 
 
 class FakeRunner:
@@ -135,7 +138,11 @@ def test_runner_uses_bounded_environment_and_redacts_output(
         return subprocess.CompletedProcess(
             argv,
             0,
-            stdout="A" * 5_000 + " secret_access_key=unsafe-value",
+            stdout=(
+                "prefix AWS_ACCESS_KEY_ID=AKIA1234567890ABCDEF "
+                "secret_access_key=unsafe-value "
+                + "A" * 5_000
+            ),
             stderr="Bearer unsafe-bearer-value",
         )
 
@@ -148,8 +155,30 @@ def test_runner_uses_bounded_environment_and_redacts_output(
     assert captured["capture_output"] is True
     assert captured["text"] is True
     assert "UNSAFE_EXTRA" not in captured["env"]
-    assert len(result.stdout) == 4_096
+    assert len(result.stdout) <= 4_096
+    assert "AKIA1234567890ABCDEF" not in result.stdout
+    assert "AWS_ACCESS_KEY_ID" not in result.stdout
+    assert "unsafe-value" not in result.stdout
     assert "unsafe" not in result.stderr
+
+
+@pytest.mark.parametrize("prefix", ["AKIA", "ASIA"])
+def test_runner_redacts_bare_aws_access_key_identifiers(
+    monkeypatch: pytest.MonkeyPatch,
+    prefix: str,
+) -> None:
+    access_key = f"{prefix}1234567890ABCDEF"
+
+    def fake_run(
+        argv: tuple[str, ...], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 0, stdout=f"key={access_key}", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = run_command(("aws", "--version"))
+
+    assert access_key not in result.stdout
+    assert "[REDACTED_AWS_ACCESS_KEY_ID]" in result.stdout
 
 
 def test_runner_maps_timeout_and_missing_executable_to_stable_results(
@@ -254,7 +283,7 @@ def test_throttled_service_retries_three_times_then_blocks() -> None:
     assert any(item.code == "aws_service_throttled" for item in checks)
 
 
-def build_report_fixture():
+def build_complete_checks_fixture() -> tuple[CheckResult, ...]:
     config = load_wave0_config(CONFIG_PATH)
     local_checks = check_local_toolchain(
         FakeRunner.for_tool_versions(
@@ -273,9 +302,13 @@ def build_report_fixture():
         ),
     )
     service_checks = check_region_services(config, FakeRunner.for_services())
+    return (*local_checks, *account_checks, *service_checks)
+
+
+def build_report_fixture():
     return build_readiness_report(
-        config,
-        (*local_checks, *account_checks, *service_checks),
+        load_wave0_config(CONFIG_PATH),
+        build_complete_checks_fixture(),
         checked_at=datetime(2026, 8, 1, tzinfo=UTC),
     )
 
@@ -290,6 +323,47 @@ def test_report_contains_no_raw_account_or_secret() -> None:
     assert "secret_access_key" not in payload.lower()
 
 
+@pytest.mark.parametrize(
+    ("mutation", "expected_gate"),
+    [
+        ("missing", GateStatus.BLOCKED_REGION_SERVICE),
+        ("duplicate", GateStatus.BLOCKED_TOOLING),
+        ("unknown", GateStatus.BLOCKED_IDENTITY_COMPATIBILITY),
+    ],
+)
+def test_report_fails_closed_for_invalid_evidence_inventory(
+    mutation: str,
+    expected_gate: GateStatus,
+) -> None:
+    config = load_wave0_config(CONFIG_PATH)
+    checks = list(build_complete_checks_fixture())
+    if mutation == "missing":
+        checks.pop()
+    elif mutation == "duplicate":
+        checks.append(checks[0])
+    else:
+        checks.append(
+            CheckResult(
+                name="unknown_probe",
+                state=CheckState.PASS,
+                code="unknown_probe_passed",
+                summary="Unknown probe passed.",
+                details={},
+            )
+        )
+
+    report = build_readiness_report(config, checks)
+
+    assert report.gate_status is expected_gate
+    assert sum(item.code == "wave0_evidence_inventory_invalid" for item in report.checks) == 1
+
+
+def test_aggregate_gate_rejects_incomplete_passing_evidence() -> None:
+    checks = list(build_complete_checks_fixture())
+    checks.pop()
+    assert aggregate_gate(checks) is not GateStatus.READY
+
+
 def test_report_writer_is_atomic_private_and_bounded(tmp_path: Path) -> None:
     output = tmp_path / ".artifacts/aws/wave0/readiness.json"
     write_readiness_report(build_report_fixture(), output, repository_root=tmp_path)
@@ -302,6 +376,110 @@ def test_report_writer_is_atomic_private_and_bounded(tmp_path: Path) -> None:
             tmp_path / "readiness.json",
             repository_root=tmp_path,
         )
+
+
+@pytest.mark.parametrize("symlink_component", [".artifacts", "aws", "wave0"])
+def test_report_writer_rejects_symlinked_artifact_components(
+    tmp_path: Path,
+    symlink_component: str,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    artifacts = tmp_path / ".artifacts"
+    aws = artifacts / "aws"
+    wave0 = aws / "wave0"
+    component_paths = {".artifacts": artifacts, "aws": aws, "wave0": wave0}
+    target = component_paths[symlink_component]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="wave0_output_path_invalid"):
+        write_readiness_report(
+            build_report_fixture(),
+            wave0 / "readiness.json",
+            repository_root=tmp_path,
+        )
+
+    assert list(outside.iterdir()) == []
+
+
+def test_report_writer_rejects_symlinked_output_file(tmp_path: Path) -> None:
+    target = tmp_path / "outside.json"
+    target.write_text("unchanged", encoding="utf-8")
+    output = tmp_path / ".artifacts/aws/wave0/readiness.json"
+    output.parent.mkdir(parents=True)
+    output.symlink_to(target)
+
+    with pytest.raises(ValueError, match="wave0_output_path_invalid"):
+        write_readiness_report(build_report_fixture(), output, repository_root=tmp_path)
+
+    assert target.read_text(encoding="utf-8") == "unchanged"
+
+
+def test_report_writer_cleans_temporary_file_when_replace_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / ".artifacts/aws/wave0/readiness.json"
+
+    def fail_replace(*args: object, **kwargs: object) -> None:
+        raise OSError("replacement failed")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replacement failed"):
+        write_readiness_report(build_report_fixture(), output, repository_root=tmp_path)
+
+    assert list(output.parent.glob(".readiness-*")) == []
+    assert not output.exists()
+
+
+def test_report_writer_cleanup_failure_does_not_mask_replace_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / ".artifacts/aws/wave0/readiness.json"
+
+    class ReplacementFailure(OSError):
+        pass
+
+    def fail_replace(*args: object, **kwargs: object) -> None:
+        raise ReplacementFailure("replacement failed")
+
+    def fail_cleanup(*args: object, **kwargs: object) -> None:
+        raise PermissionError("cleanup failed")
+
+    with monkeypatch.context() as context:
+        context.setattr(os, "replace", fail_replace)
+        context.setattr(os, "unlink", fail_cleanup)
+        with pytest.raises(ReplacementFailure, match="replacement failed"):
+            write_readiness_report(build_report_fixture(), output, repository_root=tmp_path)
+
+    leftovers = list(output.parent.glob(".readiness-*"))
+    assert len(leftovers) == 1
+    assert leftovers[0].stat().st_mode & 0o777 == 0o600
+    leftovers[0].unlink()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("--unknown=AKIA1234567890ABCDEF",),
+        ("--output",),
+    ],
+)
+def test_cli_rejects_invalid_arguments_without_echoing_them(arguments: tuple[str, ...]) -> None:
+    result = subprocess.run(
+        (sys.executable, str(SCRIPT_PATH), *arguments),
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 3
+    assert result.stdout == "wave0_readiness_invalid_input\n"
+    assert result.stderr == ""
+    assert "AKIA1234567890ABCDEF" not in f"{result.stdout}{result.stderr}"
 
 
 def test_gate_precedence_is_stable() -> None:
