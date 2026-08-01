@@ -41,13 +41,49 @@ begin
   );
   projected := pg_catalog.regexp_replace(
     projected,
-    '(^|[^0-9])(0[689][0-9][ -]?[0-9]{3}[ -]?[0-9]{4})([^0-9]|$)',
-    '\1[REDACTED_PHONE]\3',
+    '(^|[^0-9+])([+]?66[ -]?([689][0-9]|[2-7])[ -]?[0-9]{3}[ -]?[0-9]{4})([^0-9]|$)',
+    '\1[REDACTED_PHONE]\4',
     'g'
   );
   projected := pg_catalog.regexp_replace(
     projected,
-    'sk-[A-Za-z0-9_-]{12,}',
+    '(^|[^0-9])(0([689][0-9]|[2-7])[ -]?[0-9]{3}[ -]?[0-9]{4})([^0-9]|$)',
+    '\1[REDACTED_PHONE]\4',
+    'g'
+  );
+  projected := pg_catalog.regexp_replace(
+    projected,
+    'https?://[^[:space:],;]*(api[_-]?key|client[_-]?secret|service[_-]?role[_-]?key|private[_-]?key|secret[_-]?key|access[_-]?token|refresh[_-]?token|password|credential|secret|token)[^[:space:],;]*',
+    '[REDACTED]',
+    'gi'
+  );
+  projected := pg_catalog.regexp_replace(
+    projected,
+    '(^|[[:space:]])(authorization|proxy[-_]?authorization)[[:space:]]*[:=][[:space:]]*((bearer|basic)[[:space:]]+)?[^[:space:],;]+',
+    '\1\2=[REDACTED]',
+    'gi'
+  );
+  projected := pg_catalog.regexp_replace(
+    projected,
+    '(^|[[:space:]])(cookie|set[-_]?cookie)[[:space:]]*[:=].*$',
+    '\1\2=[REDACTED]',
+    'gi'
+  );
+  projected := pg_catalog.regexp_replace(
+    projected,
+    '(^|[[:space:]])bearer[[:space:]]+[^[:space:],;]+',
+    '\1[REDACTED_TOKEN]',
+    'gi'
+  );
+  projected := pg_catalog.regexp_replace(
+    projected,
+    '([A-Za-z0-9_-]*(api[_-]?key|client[_-]?secret|service[_-]?role[_-]?key|private[_-]?key|secret[_-]?key|access[_-]?token|refresh[_-]?token|password|credential|secret|token))[[:space:]]*[:=][[:space:]]*[^[:space:],;]+',
+    '\1=[REDACTED]',
+    'gi'
+  );
+  projected := pg_catalog.regexp_replace(
+    projected,
+    '(sk-[A-Za-z0-9_-]{12,}|gho_[A-Za-z0-9_]{12,}|eyj[A-Za-z0-9_-]{20,}|mc_[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}|sb_secret_[A-Za-z0-9_-]{4,})',
     '[REDACTED_TOKEN]',
     'gi'
   );
@@ -90,6 +126,37 @@ as $$
     ), false)
 $$;
 
+create or replace function public.mercury_schema_count_keyword_is_valid(
+  value pg_catalog.jsonb,
+  keyword pg_catalog.text
+)
+returns pg_catalog.bool
+language plpgsql
+immutable
+set search_path = ''
+as $$
+declare
+  candidate pg_catalog.text;
+begin
+  if pg_catalog.jsonb_typeof(value) <> 'object' then
+    return false;
+  end if;
+  if not (value ? keyword) then
+    return true;
+  end if;
+  if pg_catalog.jsonb_typeof(value->keyword) <> 'number' then
+    return false;
+  end if;
+  candidate := value->>keyword;
+  if candidate !~ '^(0|[1-9][0-9]{0,9})$' then
+    return false;
+  end if;
+  return candidate::pg_catalog.numeric <= 2147483647;
+exception when others then
+  return false;
+end;
+$$;
+
 create or replace function public.mercury_create_schema_is_closed(
   value pg_catalog.jsonb,
   is_root pg_catalog.bool default true
@@ -115,6 +182,17 @@ begin
     or value ? 'if'
     or value ? 'then'
     or value ? 'else'
+  then
+    return false;
+  end if;
+  if not public.mercury_schema_count_keyword_is_valid(value, 'minLength')
+    or not public.mercury_schema_count_keyword_is_valid(value, 'maxLength')
+    or not public.mercury_schema_count_keyword_is_valid(value, 'minItems')
+    or not public.mercury_schema_count_keyword_is_valid(value, 'maxItems')
+    or not public.mercury_schema_count_keyword_is_valid(value, 'minContains')
+    or not public.mercury_schema_count_keyword_is_valid(value, 'maxContains')
+    or not public.mercury_schema_count_keyword_is_valid(value, 'minProperties')
+    or not public.mercury_schema_count_keyword_is_valid(value, 'maxProperties')
   then
     return false;
   end if;
@@ -152,8 +230,8 @@ begin
     child := value->'items';
     if pg_catalog.jsonb_typeof(child) <> 'object'
       or child = '{}'::pg_catalog.jsonb
-      or pg_catalog.jsonb_typeof(value->'maxItems') <> 'number'
-      or (value->>'maxItems')::pg_catalog.int4 < 1
+      or not (value ? 'maxItems')
+      or value->>'maxItems' = '0'
     then
       return false;
     end if;
@@ -178,7 +256,25 @@ declare
   all_terminal pg_catalog.bool;
 begin
   if current_state = 'prepared' then
-    return target_state in ('awaiting_confirmation', 'expired', 'cancelled');
+    if target_state = 'awaiting_confirmation' then
+      return not exists (
+        select 1 from pg_catalog.unnest(child_states) as state(value)
+        where state.value <> 'prepared'
+      );
+    end if;
+    if target_state = 'expired' then
+      return child_count > 0 and not exists (
+        select 1 from pg_catalog.unnest(child_states) as state(value)
+        where state.value <> 'expired'
+      );
+    end if;
+    if target_state = 'cancelled' then
+      return child_count > 0 and not exists (
+        select 1 from pg_catalog.unnest(child_states) as state(value)
+        where state.value not in ('cancelled', 'not_dispatched')
+      );
+    end if;
+    return false;
   end if;
   if current_state = 'awaiting_confirmation' then
     if target_state = 'dispatching' then
@@ -188,7 +284,25 @@ begin
         where state.value not in ('awaiting_confirmation', 'failed_pre_dispatch')
       );
     end if;
-    return target_state in ('failed_pre_dispatch', 'expired', 'cancelled');
+    if target_state = 'failed_pre_dispatch' then
+      return child_count > 0 and not exists (
+        select 1 from pg_catalog.unnest(child_states) as state(value)
+        where state.value not in ('failed_pre_dispatch', 'not_dispatched')
+      );
+    end if;
+    if target_state = 'expired' then
+      return child_count > 0 and not exists (
+        select 1 from pg_catalog.unnest(child_states) as state(value)
+        where state.value <> 'expired'
+      );
+    end if;
+    if target_state = 'cancelled' then
+      return child_count > 0 and not exists (
+        select 1 from pg_catalog.unnest(child_states) as state(value)
+        where state.value not in ('cancelled', 'not_dispatched')
+      );
+    end if;
+    return false;
   end if;
   if current_state = 'failed_pre_dispatch' then
     if target_state = 'dispatching' then
@@ -198,7 +312,13 @@ begin
         where state.value not in ('awaiting_confirmation', 'failed_pre_dispatch')
       );
     end if;
-    return target_state = 'cancelled';
+    if target_state = 'cancelled' then
+      return child_count > 0 and not exists (
+        select 1 from pg_catalog.unnest(child_states) as state(value)
+        where state.value not in ('cancelled', 'not_dispatched')
+      );
+    end if;
+    return false;
   end if;
   if current_state = 'outcome_unknown' then
     if target_state = 'succeeded' then
@@ -265,18 +385,28 @@ language sql
 immutable
 set search_path = ''
 as $$
-  select parent_state = 'dispatching' and (
-    (current_state = 'prepared'
-      and target_state in ('awaiting_confirmation', 'expired', 'cancelled'))
-    or (current_state = 'awaiting_confirmation'
-      and target_state in ('dispatching', 'failed_pre_dispatch', 'not_dispatched', 'cancelled', 'expired'))
-    or (current_state = 'failed_pre_dispatch'
-      and target_state in ('dispatching', 'cancelled'))
+  select
+    (current_state = 'prepared' and (
+      (target_state = 'awaiting_confirmation' and parent_state = 'awaiting_confirmation')
+      or (target_state in ('expired', 'cancelled') and parent_state = 'prepared')
+    ))
+    or (current_state = 'awaiting_confirmation' and (
+      (target_state = 'dispatching' and parent_state = 'dispatching')
+      or (target_state = 'not_dispatched'
+        and parent_state in ('awaiting_confirmation', 'dispatching'))
+      or (target_state in ('failed_pre_dispatch', 'cancelled', 'expired')
+        and parent_state = 'awaiting_confirmation')
+    ))
+    or (current_state = 'failed_pre_dispatch' and (
+      (target_state = 'dispatching' and parent_state = 'dispatching')
+      or (target_state = 'cancelled' and parent_state = 'failed_pre_dispatch')
+    ))
     or (current_state = 'dispatching'
-      and target_state in ('succeeded', 'provider_rejected', 'outcome_unknown'))
+      and target_state in ('succeeded', 'provider_rejected', 'outcome_unknown')
+      and parent_state = 'dispatching')
     or (current_state = 'outcome_unknown'
-      and target_state in ('succeeded', 'needs_manual_review'))
-  )
+      and target_state in ('succeeded', 'needs_manual_review')
+      and parent_state = 'outcome_unknown')
 $$;
 
 create table if not exists public.mercury_document_previews (
@@ -360,8 +490,9 @@ create table if not exists public.mercury_document_previews (
     or (status = 'expired' and confirmed_at is null and cancelled_at is null)
   ),
   check (
-    (status in ('prepared', 'awaiting_confirmation') and state_version = 1)
-    or (status in ('confirmed', 'expired', 'cancelled') and state_version = 2)
+    (status = 'prepared' and state_version = 1)
+    or (status = 'awaiting_confirmation' and state_version in (1, 2))
+    or (status in ('confirmed', 'expired', 'cancelled') and state_version in (2, 3))
   ),
   unique (workspace_id, connection_id, provider_call_hash),
   unique (id, tenant_id, auth_user_id, workspace_id, connection_id)
@@ -480,7 +611,14 @@ create table if not exists public.mercury_operation_items (
   )),
   state_version pg_catalog.int8 not null default 1 check (state_version >= 1),
   provider_result_identifier pg_catalog.text
-    check (provider_result_identifier is null or pg_catalog.length(provider_result_identifier) between 1 and 200),
+    check (
+      provider_result_identifier is null
+      or (
+        pg_catalog.length(provider_result_identifier) between 1 and 200
+        and provider_result_identifier = public.mercury_public_text(provider_result_identifier)
+        and provider_result_identifier !~ '[[:cntrl:]]'
+      )
+    ),
   created_at pg_catalog.timestamptz not null,
   updated_at pg_catalog.timestamptz not null,
   check (updated_at >= created_at),
@@ -1319,6 +1457,7 @@ as $$
 declare
   current_operation public.mercury_operations%rowtype;
   current_item public.mercury_operation_items%rowtype;
+  projected_result_identifier pg_catalog.text;
 begin
   perform public.mercury_assert_provider_backend_workspace_access(
     p_tenant_id, p_workspace_id, p_auth_user_id
@@ -1347,11 +1486,22 @@ begin
   if current_item.state_version <> p_expected_state_version then
     raise serialization_failure using message = 'operation_state_stale';
   end if;
+  projected_result_identifier := case
+    when p_provider_result_identifier is null then null
+    else public.mercury_public_text(p_provider_result_identifier)
+  end;
   if p_occurred_at < current_item.updated_at
     or p_occurred_at < current_operation.updated_at
     or not public.mercury_public_identifier_is_safe(p_sanitized_reason)
     or (p_target_state = 'succeeded' and p_provider_result_identifier is null)
     or (p_target_state <> 'succeeded' and p_provider_result_identifier is not null)
+    or (
+      projected_result_identifier is not null
+      and (
+        pg_catalog.length(projected_result_identifier) not between 1 and 200
+        or projected_result_identifier ~ '[[:cntrl:]]'
+      )
+    )
     or not public.mercury_item_operation_transition_is_allowed(
       current_item.status, p_target_state, current_operation.status
     )
@@ -1361,7 +1511,7 @@ begin
   update public.mercury_operation_items
   set status = p_target_state,
       state_version = state_version + 1,
-      provider_result_identifier = p_provider_result_identifier,
+      provider_result_identifier = projected_result_identifier,
       updated_at = p_occurred_at
   where id = p_operation_item_id;
   update public.mercury_operations
@@ -1389,6 +1539,9 @@ revoke all on function public.mercury_public_identifier_is_safe(pg_catalog.text)
   from public, anon, authenticated;
 revoke all on function public.mercury_review_codes_are_safe(pg_catalog.jsonb)
   from public, anon, authenticated;
+revoke all on function public.mercury_schema_count_keyword_is_valid(
+  pg_catalog.jsonb, pg_catalog.text
+) from public, anon, authenticated;
 revoke all on function public.mercury_create_schema_is_closed(pg_catalog.jsonb, pg_catalog.bool)
   from public, anon, authenticated;
 revoke all on function public.mercury_parent_operation_transition_is_allowed(
@@ -1435,6 +1588,9 @@ grant execute on function public.mercury_jsonb_has_exact_keys(pg_catalog.jsonb, 
 grant execute on function public.mercury_public_text(pg_catalog.text) to service_role;
 grant execute on function public.mercury_public_identifier_is_safe(pg_catalog.text) to service_role;
 grant execute on function public.mercury_review_codes_are_safe(pg_catalog.jsonb) to service_role;
+grant execute on function public.mercury_schema_count_keyword_is_valid(
+  pg_catalog.jsonb, pg_catalog.text
+) to service_role;
 grant execute on function public.mercury_create_schema_is_closed(pg_catalog.jsonb, pg_catalog.bool)
   to service_role;
 grant execute on function public.mercury_parent_operation_transition_is_allowed(

@@ -41,6 +41,10 @@ DATABASE = "mercury_task12_test"
 OTHER_AUTH_USER_ID = UUID("abababab-abab-4bab-8bab-abababababab")
 OTHER_TENANT_ID = UUID("bcbcbcbc-bcbc-4cbc-8cbc-bcbcbcbcbcbc")
 OTHER_WORKSPACE_ID = UUID("cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd")
+RAW_PROVIDER_RESULT_IDENTIFIER = (
+    "Result jane@example.com 1234567890123 081-234-5678 "
+    "sk-qrstuvwxyz123456 Bearer provider-secret-value api_key=provider-api-secret"
+)
 
 
 @dataclass(frozen=True)
@@ -313,14 +317,22 @@ def _seed_authority(
     )
 
 
-async def _build_preview(now: datetime, *, metadata_variant: bool = False):
+async def _build_preview(
+    now: datetime,
+    *,
+    metadata_variant: bool = False,
+    document_count: int = 2,
+    ids: tuple[UUID, ...] | None = None,
+    reference_prefix: str = "INV-PG",
+):
     from mercury_tools.execution.hosted.models import BatchDocumentCreate
 
     connection, qualification = _authority(now)
     service, store, _, _, _ = _service(
         connection=connection,
         qualification=qualification,
-        ids=(
+        ids=ids
+        or (
             UUID("60606060-6060-4060-8060-606060606060")
             if not metadata_variant
             else UUID("61616161-6161-4161-8161-616161616161"),
@@ -333,16 +345,17 @@ async def _build_preview(now: datetime, *, metadata_variant: bool = False):
         ),
         clock=lambda: now,
     )
+    documents = (
+        _draft(
+            client_item_id="first" if not metadata_variant else "changed-first",
+            reference=f"{reference_prefix}-1",
+            warnings=("review_one",) if not metadata_variant else ("changed_warning",),
+        ),
+        _draft(client_item_id="second", reference=f"{reference_prefix}-2"),
+    )[:document_count]
     request = BatchDocumentCreate(
         mode="batch",
-        documents=(
-            _draft(
-                client_item_id="first" if not metadata_variant else "changed-first",
-                reference="INV-PG-1",
-                warnings=("review_one",) if not metadata_variant else ("changed_warning",),
-            ),
-            _draft(client_item_id="second", reference="INV-PG-2"),
-        ),
+        documents=documents,
     )
     prepared = await service.prepare_document_create(
         _principal(),
@@ -425,6 +438,12 @@ def _item_transition_sql(
         '{occurred_at.isoformat()}', 'task12_behavior_test', {result_identifier}
       ) as changed;
     """
+
+
+def _text_array(values: tuple[str, ...]) -> str:
+    if not values:
+        return "array[]::pg_catalog.text[]"
+    return "array[" + ",".join(f"'{value}'" for value in values) + "]::pg_catalog.text[]"
 
 
 def test_postgresql_task12_rpcs_enforce_identity_authority_and_state(
@@ -663,6 +682,7 @@ def test_postgresql_schema_and_transition_contract_matches_python(
     from mercury_tools.execution.hosted.models import (
         OperationItemState,
         ParentOperationState,
+        item_operation_transition_allowed,
         parent_operation_transition_allowed,
     )
 
@@ -684,36 +704,778 @@ def test_postgresql_schema_and_transition_contract_matches_python(
         "capability_unavailable",
     )
 
-    child_states = (OperationItemState.AWAITING_CONFIRMATION,)
-    pairs = tuple(
-        (current.value, target.value)
-        for current in ParentOperationState
-        for target in ParentOperationState
+    child_vectors = (
+        (),
+        *((state,) for state in OperationItemState),
+        (OperationItemState.SUCCEEDED, OperationItemState.SUCCEEDED),
+        (OperationItemState.PROVIDER_REJECTED, OperationItemState.NOT_DISPATCHED),
+        (OperationItemState.OUTCOME_UNKNOWN, OperationItemState.NOT_DISPATCHED),
+        (OperationItemState.NEEDS_MANUAL_REVIEW, OperationItemState.NOT_DISPATCHED),
+        (OperationItemState.CANCELLED, OperationItemState.CANCELLED),
+        (OperationItemState.EXPIRED, OperationItemState.EXPIRED),
+        (OperationItemState.FAILED_PRE_DISPATCH, OperationItemState.NOT_DISPATCHED),
+        (OperationItemState.AWAITING_CONFIRMATION, OperationItemState.CANCELLED),
+        (OperationItemState.DISPATCHING, OperationItemState.AWAITING_CONFIRMATION),
     )
-    values = ", ".join(f"('{source}', '{target}')" for source, target in pairs)
+    parent_cases = tuple(
+        (case_id, current, target, child_states)
+        for case_id, (current, target, child_states) in enumerate(
+            (current, target, child_states)
+            for child_states in child_vectors
+            for current in ParentOperationState
+            for target in ParentOperationState
+        )
+    )
+    parent_values = ", ".join(
+        f"({case_id}, '{current.value}', '{target.value}', "
+        f"{_text_array(tuple(state.value for state in child_states))})"
+        for case_id, current, target, child_states in parent_cases
+    )
+    parent_rows = _psql(
+        postgres_context,
+        _service_role(
+            f"""
+            select case_id, source_state, target_state,
+              public.mercury_parent_operation_transition_is_allowed(
+                source_state, target_state, child_states
+              )
+            from (values {parent_values})
+              as cases(case_id, source_state, target_state, child_states)
+            order by case_id;
+            """
+        ),
+    )
+    parent_actual = {
+        int(case_id): allowed == "t"
+        for case_id, _source, _target, allowed in (
+            line.split("|", maxsplit=3) for line in parent_rows.splitlines()
+        )
+    }
+    for case_id, current, target, child_states in parent_cases:
+        assert parent_actual[case_id] is parent_operation_transition_allowed(
+            current,
+            target,
+            child_states=child_states,
+        )
+
+    parent_expected = (
+        (
+            ParentOperationState.AWAITING_CONFIRMATION,
+            ParentOperationState.DISPATCHING,
+            (OperationItemState.AWAITING_CONFIRMATION,),
+            True,
+        ),
+        (
+            ParentOperationState.DISPATCHING,
+            ParentOperationState.PROVIDER_REJECTED,
+            (OperationItemState.PROVIDER_REJECTED, OperationItemState.NOT_DISPATCHED),
+            True,
+        ),
+        (
+            ParentOperationState.AWAITING_CONFIRMATION,
+            ParentOperationState.FAILED_PRE_DISPATCH,
+            (OperationItemState.FAILED_PRE_DISPATCH, OperationItemState.NOT_DISPATCHED),
+            True,
+        ),
+        (
+            ParentOperationState.AWAITING_CONFIRMATION,
+            ParentOperationState.CANCELLED,
+            (OperationItemState.CANCELLED,),
+            True,
+        ),
+        (
+            ParentOperationState.AWAITING_CONFIRMATION,
+            ParentOperationState.EXPIRED,
+            (OperationItemState.EXPIRED,),
+            True,
+        ),
+        (
+            ParentOperationState.OUTCOME_UNKNOWN,
+            ParentOperationState.SUCCEEDED,
+            (OperationItemState.SUCCEEDED,),
+            True,
+        ),
+        (
+            ParentOperationState.OUTCOME_UNKNOWN,
+            ParentOperationState.NEEDS_MANUAL_REVIEW,
+            (OperationItemState.NEEDS_MANUAL_REVIEW,),
+            True,
+        ),
+        (
+            ParentOperationState.AWAITING_CONFIRMATION,
+            ParentOperationState.CANCELLED,
+            (OperationItemState.AWAITING_CONFIRMATION,),
+            False,
+        ),
+    )
+    for current, target, child_states, expected in parent_expected:
+        case_id = next(
+            case_id
+            for case_id, case_current, case_target, case_children in parent_cases
+            if (case_current, case_target, case_children) == (current, target, child_states)
+        )
+        assert parent_actual[case_id] is expected
+
+    item_cases = tuple(
+        (case_id, current, target, parent)
+        for case_id, (current, target, parent) in enumerate(
+            (current, target, parent)
+            for parent in ParentOperationState
+            for current in OperationItemState
+            for target in OperationItemState
+        )
+    )
+    item_values = ", ".join(
+        f"({case_id}, '{current.value}', '{target.value}', '{parent.value}')"
+        for case_id, current, target, parent in item_cases
+    )
+    item_rows = _psql(
+        postgres_context,
+        _service_role(
+            f"""
+            select case_id, current_state, target_state, parent_state,
+              public.mercury_item_operation_transition_is_allowed(
+                current_state, target_state, parent_state
+              )
+            from (values {item_values})
+              as cases(case_id, current_state, target_state, parent_state)
+            order by case_id;
+            """
+        ),
+    )
+    item_actual = {
+        int(case_id): allowed == "t"
+        for case_id, _current, _target, _parent, allowed in (
+            line.split("|", maxsplit=4) for line in item_rows.splitlines()
+        )
+    }
+    for case_id, current, target, parent in item_cases:
+        assert item_actual[case_id] is item_operation_transition_allowed(
+            current,
+            target,
+            parent_state=parent,
+        )
+
+    item_expected = (
+        (
+            OperationItemState.AWAITING_CONFIRMATION,
+            OperationItemState.DISPATCHING,
+            ParentOperationState.DISPATCHING,
+        ),
+        (
+            OperationItemState.DISPATCHING,
+            OperationItemState.PROVIDER_REJECTED,
+            ParentOperationState.DISPATCHING,
+        ),
+        (
+            OperationItemState.AWAITING_CONFIRMATION,
+            OperationItemState.FAILED_PRE_DISPATCH,
+            ParentOperationState.AWAITING_CONFIRMATION,
+        ),
+        (
+            OperationItemState.AWAITING_CONFIRMATION,
+            OperationItemState.NOT_DISPATCHED,
+            ParentOperationState.AWAITING_CONFIRMATION,
+        ),
+        (
+            OperationItemState.AWAITING_CONFIRMATION,
+            OperationItemState.CANCELLED,
+            ParentOperationState.AWAITING_CONFIRMATION,
+        ),
+        (
+            OperationItemState.AWAITING_CONFIRMATION,
+            OperationItemState.EXPIRED,
+            ParentOperationState.AWAITING_CONFIRMATION,
+        ),
+        (
+            OperationItemState.OUTCOME_UNKNOWN,
+            OperationItemState.SUCCEEDED,
+            ParentOperationState.OUTCOME_UNKNOWN,
+        ),
+        (
+            OperationItemState.OUTCOME_UNKNOWN,
+            OperationItemState.NEEDS_MANUAL_REVIEW,
+            ParentOperationState.OUTCOME_UNKNOWN,
+        ),
+    )
+    for current, target, parent in item_expected:
+        case_id = next(
+            case_id
+            for case_id, case_current, case_target, case_parent in item_cases
+            if (case_current, case_target, case_parent) == (current, target, parent)
+        )
+        assert item_actual[case_id] is True
+
+    assert item_operation_transition_allowed(
+        OperationItemState.OUTCOME_UNKNOWN,
+        OperationItemState.SUCCEEDED,
+        parent_state=ParentOperationState.OUTCOME_UNKNOWN,
+    )
+    assert not parent_operation_transition_allowed(
+        ParentOperationState.AWAITING_CONFIRMATION,
+        ParentOperationState.CANCELLED,
+        child_states=(OperationItemState.AWAITING_CONFIRMATION,),
+    )
+
+
+def test_postgresql_preview_transition_supports_prepared_awaiting_lifecycle(
+    postgres_context: PostgresContext,
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    preview, connection, qualification = asyncio.run(
+        _build_preview(
+            now,
+            ids=(uuid4(), uuid4(), uuid4()),
+            reference_prefix=f"INV-LIFECYCLE-{uuid4().hex}",
+        )
+    )
+    _seed_authority(
+        postgres_context,
+        now=now,
+        connection=connection,
+        qualification=qualification,
+    )
+    _psql(postgres_context, _service_role(_save_preview_sql(preview)))
+    _psql(
+        postgres_context,
+        _service_role(
+            f"""
+            update public.mercury_document_previews
+            set status = 'prepared'
+            where id = '{preview.preview_id}';
+            """
+        ),
+    )
+
+    awaiting = json.loads(
+        _psql(
+            postgres_context,
+            _service_role(
+                f"""
+                select pg_catalog.row_to_json(changed)::pg_catalog.text
+                from public.transition_mercury_document_preview(
+                  '{TENANT_ID}', '{WORKSPACE_ID}', '{AUTH_USER_ID}', '{preview.preview_id}',
+                  1, 'awaiting_confirmation', '{(now + timedelta(seconds=1)).isoformat()}'
+                ) as changed;
+                """
+            ),
+        )
+    )
+    cancelled = json.loads(
+        _psql(
+            postgres_context,
+            _service_role(
+                f"""
+                select pg_catalog.row_to_json(changed)::pg_catalog.text
+                from public.transition_mercury_document_preview(
+                  '{TENANT_ID}', '{WORKSPACE_ID}', '{AUTH_USER_ID}', '{preview.preview_id}',
+                  2, 'cancelled', '{(now + timedelta(seconds=2)).isoformat()}'
+                ) as changed;
+                """
+            ),
+        )
+    )
+
+    assert awaiting["preview"]["status"] == "awaiting_confirmation"
+    assert awaiting["preview"]["state_version"] == 2
+    assert cancelled["preview"]["status"] == "cancelled"
+    assert cancelled["preview"]["state_version"] == 3
+
+
+@pytest.mark.parametrize(
+    ("item_target", "parent_target", "provider_result_identifier"),
+    (
+        ("succeeded", "succeeded", RAW_PROVIDER_RESULT_IDENTIFIER),
+        ("needs_manual_review", "needs_manual_review", None),
+    ),
+)
+def test_postgresql_unknown_outcome_recovery_is_reachable(
+    postgres_context: PostgresContext,
+    item_target: str,
+    parent_target: str,
+    provider_result_identifier: str | None,
+) -> None:
+    from mercury_tools.execution.hosted.models import HostedOperation
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    preview, connection, qualification = asyncio.run(
+        _build_preview(
+            now,
+            document_count=1,
+            ids=(uuid4(), uuid4()),
+            reference_prefix=f"INV-RECOVERY-{uuid4().hex}",
+        )
+    )
+    _seed_authority(
+        postgres_context,
+        now=now,
+        connection=connection,
+        qualification=qualification,
+    )
+    _psql(postgres_context, _service_role(_save_preview_sql(preview)))
+    operation = HostedOperation.from_preview(
+        preview,
+        operation_id=uuid4(),
+        operation_item_ids=(uuid4(),),
+        event_id=uuid4(),
+        now=now + timedelta(seconds=1),
+    )
+    _psql(postgres_context, _service_role(_save_operation_sql(operation)))
+    _psql(
+        postgres_context,
+        _service_role(
+            _parent_transition_sql(
+                operation.operation_id,
+                expected_version=1,
+                target="dispatching",
+                event_id=uuid4(),
+                occurred_at=now + timedelta(seconds=2),
+            )
+        ),
+    )
+    _psql(
+        postgres_context,
+        _service_role(
+            _item_transition_sql(
+                operation.operation_id,
+                operation.items[0].operation_item_id,
+                expected_version=1,
+                target="dispatching",
+                event_id=uuid4(),
+                occurred_at=now + timedelta(seconds=3),
+            )
+        ),
+    )
+    _psql(
+        postgres_context,
+        _service_role(
+            _item_transition_sql(
+                operation.operation_id,
+                operation.items[0].operation_item_id,
+                expected_version=2,
+                target="outcome_unknown",
+                event_id=uuid4(),
+                occurred_at=now + timedelta(seconds=4),
+            )
+        ),
+    )
+    _psql(
+        postgres_context,
+        _service_role(
+            _parent_transition_sql(
+                operation.operation_id,
+                expected_version=2,
+                target="outcome_unknown",
+                event_id=uuid4(),
+                occurred_at=now + timedelta(seconds=5),
+            )
+        ),
+    )
+    _psql(
+        postgres_context,
+        _service_role(
+            _item_transition_sql(
+                operation.operation_id,
+                operation.items[0].operation_item_id,
+                expected_version=3,
+                target=item_target,
+                event_id=uuid4(),
+                occurred_at=now + timedelta(seconds=6),
+                provider_result_identifier=provider_result_identifier,
+            )
+        ),
+    )
+    recovered = json.loads(
+        _psql(
+            postgres_context,
+            _service_role(
+                _parent_transition_sql(
+                    operation.operation_id,
+                    expected_version=3,
+                    target=parent_target,
+                    event_id=uuid4(),
+                    occurred_at=now + timedelta(seconds=7),
+                )
+            ),
+        )
+    )
+
+    assert recovered["operation"]["status"] == parent_target
+    assert recovered["items"][0]["status"] == item_target
+    serialized = json.dumps(recovered, sort_keys=True)
+    if provider_result_identifier is not None:
+        for raw in (
+            "jane@example.com",
+            "1234567890123",
+            "081-234-5678",
+            "sk-qrstuvwxyz123456",
+            "provider-secret-value",
+            "provider-api-secret",
+        ):
+            assert raw not in serialized
+        assert "[REDACTED_" in serialized
+
+
+def test_postgresql_operation_text_sanitization_matches_python(
+    postgres_context: PostgresContext,
+) -> None:
+    from mercury_tools.execution.hosted.sanitization import sanitize_public_text
+
+    raw_values = (
+        RAW_PROVIDER_RESULT_IDENTIFIER,
+        "+66 81 234 5678",
+        "02-123-4567",
+        "Authorization: Bearer provider-secret",
+        "Cookie: session=provider-secret",
+        "client_secret=abc123",
+        "gho_abcdefghijklmnop",
+        "https://example.com/path?api_key=provider-secret",
+    )
+    values = ", ".join(
+        f"({case_id}, $mercury_text_{case_id}${value}$mercury_text_{case_id}$)"
+        for case_id, value in enumerate(raw_values)
+    )
     rows = _psql(
         postgres_context,
         _service_role(
             f"""
-            select source_state, target_state,
-              public.mercury_parent_operation_transition_is_allowed(
-                source_state,
-                target_state,
-                array['awaiting_confirmation']::pg_catalog.text[]
-              )
-            from (values {values}) as states(source_state, target_state)
-            order by source_state, target_state;
+            select case_id, public.mercury_public_text(value)
+            from (values {values}) as cases(case_id, value)
+            order by case_id;
             """
         ),
     )
-    actual = {
-        (source, target): allowed == "t"
-        for source, target, allowed in (line.split("|", maxsplit=2) for line in rows.splitlines())
-    }
-    for current in ParentOperationState:
-        for target in ParentOperationState:
-            assert actual[(current.value, target.value)] is parent_operation_transition_allowed(
-                current,
-                target,
-                child_states=child_states,
+    actual = tuple(line.split("|", maxsplit=1)[1] for line in rows.splitlines())
+    expected = tuple(
+        sanitize_public_text(value, code="operation_transition_invalid") for value in raw_values
+    )
+    reason_is_safe = _psql(
+        postgres_context,
+        _service_role("select public.mercury_public_identifier_is_safe('sk-qrstuvwxyz123456');"),
+    )
+
+    assert actual == expected
+    assert reason_is_safe == "f"
+
+
+def test_postgresql_schema_policy_is_total_and_normalizes_authority_errors(
+    postgres_context: PostgresContext,
+) -> None:
+    from mercury_tools.catalog.models import ProviderMCPQualification
+    from mercury_tools.execution.hosted.models import HostedOperation
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    preview, connection, qualification = asyncio.run(
+        _build_preview(
+            now,
+            document_count=1,
+            ids=(uuid4(), uuid4()),
+            reference_prefix=f"INV-SCHEMA-{uuid4().hex}",
+        )
+    )
+    _seed_authority(
+        postgres_context,
+        now=now,
+        connection=connection,
+        qualification=qualification,
+    )
+    _psql(postgres_context, _service_role(_save_preview_sql(preview)))
+
+    cases: list[dict[str, object]] = []
+    for keyword, value in (
+        ("maxItems", 1.5),
+        ("maxItems", "100"),
+        ("maxItems", -1),
+        ("maxItems", True),
+        ("maxItems", 2_147_483_648),
+        ("minItems", 1.5),
+        ("minItems", "1"),
+        ("minItems", -1),
+        ("minItems", True),
+        ("minItems", 2_147_483_648),
+    ):
+        schema = json.loads(json.dumps(qualification.input_schema))
+        schema["properties"]["lines"][keyword] = value
+        cases.append(schema)
+    overflow_length = json.loads(json.dumps(qualification.input_schema))
+    overflow_length["properties"]["reference"]["minLength"] = 2_147_483_648
+    cases.append(overflow_length)
+
+    values = ", ".join(f"({case_id}, {_jsonb(schema)})" for case_id, schema in enumerate(cases))
+    rows = _psql(
+        postgres_context,
+        _service_role(
+            f"""
+            select case_id, public.mercury_create_schema_is_closed(schema, true)
+            from (values {values}) as cases(case_id, schema)
+            order by case_id;
+            """
+        ),
+    )
+    assert rows.splitlines() == [f"{case_id}|f" for case_id in range(len(cases))]
+
+    invalid_definition = ProviderMCPQualification.discovered(
+        provider=qualification.provider,
+        environment=qualification.environment,
+        provider_tool_name=f"create_invalid_{uuid4().hex}",
+        normalized_capability=qualification.normalized_capability,
+        input_schema=cases[0],
+        output_schema=qualification.output_schema,
+        response_shape_hash=qualification.response_shape_hash,
+        required_permissions=qualification.required_permissions,
+    )
+    publication_payload = invalid_definition.model_dump(mode="json")
+    publication_payload.pop("public_output_field_paths", None)
+    publication_payload["capability_version_sha256"] = _psql(
+        postgres_context,
+        f"""
+        with payload as (select {_jsonb(publication_payload)} as value)
+        select pg_catalog.encode(public.digest(
+          pg_catalog.convert_to(public.mercury_canonical_jsonb(pg_catalog.jsonb_build_object(
+            'provider', value->>'provider',
+            'environment', value->>'environment',
+            'provider_tool_name', value->>'provider_tool_name',
+            'normalized_capability', value->>'normalized_capability',
+            'input_schema', value->'input_schema',
+            'output_schema', value->'output_schema',
+            'schema_hash', value->>'schema_hash',
+            'response_shape_hash', value->>'response_shape_hash',
+            'required_permissions', value->'required_permissions'
+          )), 'UTF8'), 'sha256'
+        ), 'hex')
+        from payload;
+        """,
+    )
+    publication = _psql_result(
+        postgres_context,
+        _service_role(
+            "select public.publish_mercury_provider_capability_qualification("
+            f"{_jsonb(publication_payload)}, null);"
+        ),
+    )
+    assert publication.returncode != 0
+    assert "capability_unavailable" in publication.stderr
+    assert "invalid input syntax" not in publication.stderr
+
+    operation = HostedOperation.from_preview(
+        preview,
+        operation_id=uuid4(),
+        operation_item_ids=(uuid4(),),
+        event_id=uuid4(),
+        now=now + timedelta(seconds=1),
+    )
+    authority = _psql_result(
+        postgres_context,
+        f"""
+        begin;
+        alter table public.mercury_provider_capability_qualifications
+          disable trigger mercury_reject_open_create_qualification_trigger;
+        update public.mercury_provider_capability_qualifications
+        set input_schema = {_jsonb(cases[0])}
+        where id = '{qualification.id}';
+        set role service_role;
+        {_save_operation_sql(operation)}
+        rollback;
+        """,
+    )
+    assert authority.returncode != 0
+    assert "capability_unavailable" in authority.stderr
+    assert "invalid input syntax" not in authority.stderr
+
+
+@pytest.mark.parametrize(
+    ("parent_target", "item_target"),
+    (("cancelled", "cancelled"), ("expired", "expired")),
+)
+def test_postgresql_terminal_parent_requires_closed_children(
+    postgres_context: PostgresContext,
+    parent_target: str,
+    item_target: str,
+) -> None:
+    from mercury_tools.execution.hosted.models import HostedOperation
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    preview, connection, qualification = asyncio.run(
+        _build_preview(
+            now,
+            document_count=1,
+            ids=(uuid4(), uuid4()),
+            reference_prefix=f"INV-TERMINAL-{uuid4().hex}",
+        )
+    )
+    _seed_authority(
+        postgres_context,
+        now=now,
+        connection=connection,
+        qualification=qualification,
+    )
+    _psql(postgres_context, _service_role(_save_preview_sql(preview)))
+    operation = HostedOperation.from_preview(
+        preview,
+        operation_id=uuid4(),
+        operation_item_ids=(uuid4(),),
+        event_id=uuid4(),
+        now=now + timedelta(seconds=1),
+    )
+    _psql(postgres_context, _service_role(_save_operation_sql(operation)))
+    _expect_error(
+        postgres_context,
+        _parent_transition_sql(
+            operation.operation_id,
+            expected_version=1,
+            target=parent_target,
+            event_id=uuid4(),
+            occurred_at=now + timedelta(seconds=2),
+        ),
+        "operation_transition_invalid",
+    )
+    _psql(
+        postgres_context,
+        _service_role(
+            _item_transition_sql(
+                operation.operation_id,
+                operation.items[0].operation_item_id,
+                expected_version=1,
+                target=item_target,
+                event_id=uuid4(),
+                occurred_at=now + timedelta(seconds=3),
             )
+        ),
+    )
+    closed = json.loads(
+        _psql(
+            postgres_context,
+            _service_role(
+                _parent_transition_sql(
+                    operation.operation_id,
+                    expected_version=1,
+                    target=parent_target,
+                    event_id=uuid4(),
+                    occurred_at=now + timedelta(seconds=4),
+                )
+            ),
+        )
+    )
+
+    assert closed["operation"]["status"] == parent_target
+    assert closed["items"][0]["status"] == item_target
+
+
+def test_postgresql_terminal_aggregate_ordering_covers_predispatch_and_rejection(
+    postgres_context: PostgresContext,
+) -> None:
+    from mercury_tools.execution.hosted.models import HostedOperation
+
+    for scenario in ("failed_pre_dispatch", "provider_rejected"):
+        now = datetime.now(UTC).replace(microsecond=0)
+        preview, connection, qualification = asyncio.run(
+            _build_preview(
+                now,
+                ids=(uuid4(), uuid4(), uuid4()),
+                reference_prefix=f"INV-{scenario.upper()}-{uuid4().hex}",
+            )
+        )
+        _seed_authority(
+            postgres_context,
+            now=now,
+            connection=connection,
+            qualification=qualification,
+        )
+        _psql(postgres_context, _service_role(_save_preview_sql(preview)))
+        operation = HostedOperation.from_preview(
+            preview,
+            operation_id=uuid4(),
+            operation_item_ids=(uuid4(), uuid4()),
+            event_id=uuid4(),
+            now=now + timedelta(seconds=1),
+        )
+        _psql(postgres_context, _service_role(_save_operation_sql(operation)))
+
+        parent_version = 1
+        first_item_version = 1
+        if scenario == "provider_rejected":
+            _psql(
+                postgres_context,
+                _service_role(
+                    _parent_transition_sql(
+                        operation.operation_id,
+                        expected_version=parent_version,
+                        target="dispatching",
+                        event_id=uuid4(),
+                        occurred_at=now + timedelta(seconds=2),
+                    )
+                ),
+            )
+            parent_version += 1
+            _psql(
+                postgres_context,
+                _service_role(
+                    _item_transition_sql(
+                        operation.operation_id,
+                        operation.items[0].operation_item_id,
+                        expected_version=first_item_version,
+                        target="dispatching",
+                        event_id=uuid4(),
+                        occurred_at=now + timedelta(seconds=3),
+                    )
+                ),
+            )
+            first_item_version += 1
+
+        _expect_error(
+            postgres_context,
+            _parent_transition_sql(
+                operation.operation_id,
+                expected_version=parent_version,
+                target=scenario,
+                event_id=uuid4(),
+                occurred_at=now + timedelta(seconds=4),
+            ),
+            "operation_transition_invalid",
+        )
+        _psql(
+            postgres_context,
+            _service_role(
+                _item_transition_sql(
+                    operation.operation_id,
+                    operation.items[0].operation_item_id,
+                    expected_version=first_item_version,
+                    target=scenario,
+                    event_id=uuid4(),
+                    occurred_at=now + timedelta(seconds=5),
+                )
+            ),
+        )
+        _psql(
+            postgres_context,
+            _service_role(
+                _item_transition_sql(
+                    operation.operation_id,
+                    operation.items[1].operation_item_id,
+                    expected_version=1,
+                    target="not_dispatched",
+                    event_id=uuid4(),
+                    occurred_at=now + timedelta(seconds=6),
+                )
+            ),
+        )
+        closed = json.loads(
+            _psql(
+                postgres_context,
+                _service_role(
+                    _parent_transition_sql(
+                        operation.operation_id,
+                        expected_version=parent_version,
+                        target=scenario,
+                        event_id=uuid4(),
+                        occurred_at=now + timedelta(seconds=7),
+                    )
+                ),
+            )
+        )
+
+        assert closed["operation"]["status"] == scenario
+        assert [item["status"] for item in closed["items"]] == [
+            scenario,
+            "not_dispatched",
+        ]

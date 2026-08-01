@@ -48,6 +48,17 @@ from .sanitization import sanitize_public_text
 from .store import HostedPayloadVault, HostedPreviewError, HostedPreviewStore
 
 _DOCUMENT_CREATE = re.compile(r"^documents\.([a-z][a-z0-9_]*)\.create$")
+_MAX_SCHEMA_CONSTRAINED_INTEGER = 2_147_483_647
+_CONSTRAINED_INTEGER_KEYWORDS = (
+    "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
+    "minContains",
+    "maxContains",
+    "minProperties",
+    "maxProperties",
+)
 
 MembershipResolver = Callable[
     [MercuryPrincipal, UUID],
@@ -125,6 +136,16 @@ def _require_closed_object_schemas(value: Any, *, root: bool = True) -> None:
         key in value for key in ("$ref", "allOf", "anyOf", "oneOf", "not", "if", "then", "else")
     ):
         raise HostedPreviewError("capability_unavailable")
+    for keyword in _CONSTRAINED_INTEGER_KEYWORDS:
+        if keyword not in value:
+            continue
+        constrained = value[keyword]
+        if (
+            isinstance(constrained, bool)
+            or not isinstance(constrained, int)
+            or not 0 <= constrained <= _MAX_SCHEMA_CONSTRAINED_INTEGER
+        ):
+            raise HostedPreviewError("capability_unavailable")
     schema_type = value.get("type")
     if not isinstance(schema_type, str):
         raise HostedPreviewError("capability_unavailable")

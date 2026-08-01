@@ -32,6 +32,7 @@ from .transitions import (
     OperationItemState,
     ParentOperationState,
     item_operation_transition_allowed,
+    parent_operation_children_compatible,
     parent_operation_transition_allowed,
 )
 
@@ -680,10 +681,12 @@ class DocumentPreview(_HostedModel):
             raise ValueError("preview_ttl_invalid")
         if self.connection_readiness is not ConnectionReadiness.READY:
             raise ValueError("preview_binding_invalid")
-        if self.state in {PreviewState.PREPARED, PreviewState.AWAITING_CONFIRMATION}:
+        if self.state is PreviewState.PREPARED:
             valid_state_version = self.state_version == 1
+        elif self.state is PreviewState.AWAITING_CONFIRMATION:
+            valid_state_version = self.state_version in {1, 2}
         else:
-            valid_state_version = self.state_version == 2
+            valid_state_version = self.state_version in {2, 3}
         if not valid_state_version:
             raise ValueError("preview_state_invalid")
         unconfirmed_purge = self.expires_at + UNCONFIRMED_PAYLOAD_RETENTION
@@ -963,7 +966,7 @@ class PreparedPreviewItem(_HostedModel):
 
 
 class PreparedDocumentPreview(_HostedModel):
-    status: Literal["awaiting_confirmation"]
+    status: PreviewState
     workspace_id: UUID
     preview_id: UUID
     state_version: int = Field(ge=1)
@@ -985,20 +988,29 @@ class PreparedDocumentPreview(_HostedModel):
     accountant_review_points: tuple[str, ...]
     items: tuple[PreparedPreviewItem, ...]
     expires_at: datetime
-    next_allowed_actions: tuple[Literal["render_document_preview"], ...] = (
-        "render_document_preview",
-    )
+    next_allowed_actions: tuple[Literal["render_document_preview"], ...] = ()
 
     @field_validator("company_display_name")
     @classmethod
     def validate_company_display(cls, value: str) -> str:
         return sanitize_public_text(value, code="preview_binding_invalid")
 
+    @model_validator(mode="after")
+    def validate_actions(self) -> PreparedDocumentPreview:
+        expected = (
+            ("render_document_preview",)
+            if self.status is PreviewState.AWAITING_CONFIRMATION
+            else ()
+        )
+        if self.next_allowed_actions != expected:
+            raise ValueError("preview_state_invalid")
+        return self
+
     @classmethod
     def from_preview(cls, preview: DocumentPreview) -> PreparedDocumentPreview:
         checked = DocumentPreview.model_validate(preview)
         return cls(
-            status="awaiting_confirmation",
+            status=checked.state,
             workspace_id=checked.workspace_id,
             preview_id=checked.preview_id,
             state_version=checked.state_version,
@@ -1034,6 +1046,11 @@ class PreparedDocumentPreview(_HostedModel):
                 for item in checked.items
             ),
             expires_at=checked.expires_at,
+            next_allowed_actions=(
+                ("render_document_preview",)
+                if checked.state is PreviewState.AWAITING_CONFIRMATION
+                else ()
+            ),
         )
 
 
@@ -1095,6 +1112,13 @@ class OperationItem(_HostedModel):
     def validate_timestamp(cls, value: datetime) -> datetime:
         return _aware_utc(value, "operation_timestamp_invalid")
 
+    @field_validator("provider_result_identifier", mode="before")
+    @classmethod
+    def sanitize_provider_result_identifier(cls, value: object) -> object:
+        if value is None:
+            return None
+        return sanitize_public_text(value, code="operation_transition_invalid")
+
     @model_validator(mode="after")
     def validate_item(self) -> OperationItem:
         _non_nil(self.operation_item_id, "operation_items_invalid")
@@ -1105,10 +1129,6 @@ class OperationItem(_HostedModel):
             self.provider_result_identifier is not None
         ):
             raise ValueError("operation_transition_invalid")
-        if self.provider_result_identifier is not None:
-            sanitize_public_text(
-                self.provider_result_identifier, code="operation_transition_invalid"
-            )
         return self
 
     @property
@@ -1157,6 +1177,11 @@ class OperationEvent(_HostedModel):
     @classmethod
     def validate_timestamp(cls, value: datetime) -> datetime:
         return _aware_utc(value, "operation_event_timestamp_invalid")
+
+    @field_validator("sanitized_reason", mode="before")
+    @classmethod
+    def validate_sanitized_reason(cls, value: object) -> object:
+        return require_safe_public_identifier(value, code="operation_transition_invalid")
 
     @model_validator(mode="after")
     def validate_states(self) -> OperationEvent:
@@ -1243,15 +1268,9 @@ class HostedOperation(_HostedModel):
                 or item_events[-1].to_state != item.state.value
             ):
                 raise ValueError("operation_event_invalid")
-        if self.state in {
-            ParentOperationState.SUCCEEDED,
-            ParentOperationState.PROVIDER_REJECTED,
-            ParentOperationState.OUTCOME_UNKNOWN,
-            ParentOperationState.NEEDS_MANUAL_REVIEW,
-        } and not parent_operation_transition_allowed(
-            ParentOperationState.DISPATCHING,
+        if not parent_operation_children_compatible(
             self.state,
-            child_states=tuple(item.state for item in self.items),
+            tuple(item.state for item in self.items),
         ):
             raise ValueError("operation_transition_invalid")
         return self
@@ -1450,6 +1469,7 @@ __all__ = [
     "UNCONFIRMED_PAYLOAD_RETENTION",
     "authoritative_payload_bytes",
     "item_operation_transition_allowed",
+    "parent_operation_children_compatible",
     "parent_operation_transition_allowed",
     "preview_integrity_hash",
     "preview_integrity_hash_for_hashes",

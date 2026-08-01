@@ -31,6 +31,21 @@ OPERATION_ITEM_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 EVENT_ID = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
 
 
+def _tracking_payload_vault():
+    from mercury_tools.execution.hosted.store import HostedPayloadVault
+
+    class TrackingHostedPayloadVault(HostedPayloadVault):
+        def __init__(self, delegate: object) -> None:
+            self.delegate = delegate
+            self.open_calls = 0
+
+        def open(self, binding, envelope):
+            self.open_calls += 1
+            return self.delegate.open(binding, envelope)
+
+    return TrackingHostedPayloadVault(_payload_vault())
+
+
 async def _prepared():
     from mercury_tools.execution.hosted.models import SingleDocumentCreate
 
@@ -217,6 +232,197 @@ async def test_confirmable_load_rejects_a_preview_with_rebound_expiry() -> None:
         )
 
 
+def _projector_registry_variant(
+    qualification,
+    *,
+    projector_id: str = "mercury.test.invoice",
+    projector_version: str = "c" * 64,
+    mismatch_projection: bool = False,
+):
+    from mercury_tools.execution.hosted.projectors import (
+        DocumentProjectorRegistry,
+        ProjectedDocument,
+        ReviewedInvoiceProjector,
+    )
+
+    projector = ReviewedInvoiceProjector(
+        projector_id=projector_id,
+        projector_version=projector_version,
+        provider=qualification.provider,
+        environment=qualification.environment,
+        provider_tool_name=qualification.provider_tool_name,
+        capability_id=qualification.normalized_capability,
+        capability_version=qualification.capability_version_sha256,
+        schema_hash=qualification.schema_hash,
+        currency_minor_units={"THB": 2, "USD": 2},
+    )
+    if not mismatch_projection:
+        return DocumentProjectorRegistry((projector,))
+
+    class MismatchedProjector:
+        def __init__(self) -> None:
+            self.projector_id = projector.projector_id
+            self.projector_version = projector.projector_version
+            self.provider = projector.provider
+            self.environment = projector.environment
+            self.provider_tool_name = projector.provider_tool_name
+            self.capability_id = projector.capability_id
+            self.capability_version = projector.capability_version
+            self.schema_hash = projector.schema_hash
+
+        def matches(self, candidate) -> bool:
+            return projector.matches(candidate)
+
+        def project(self, provider_arguments):
+            projected = projector.project(provider_arguments)
+            return ProjectedDocument(
+                document_type=projected.document_type,
+                counterparty_display="[REDACTED_COUNTERPARTY_CHANGED]",
+                issue_date=projected.issue_date,
+                due_date=projected.due_date,
+                financials=projected.financials,
+            )
+
+    return DocumentProjectorRegistry((MismatchedProjector(),))
+
+
+def _confirmable_store(
+    kind: str,
+    *,
+    preview,
+    projector_registry,
+    payload_vault,
+):
+    from mercury_tools.execution.hosted.store import (
+        InMemoryHostedPreviewStore,
+        SupabaseHostedPreviewStore,
+    )
+
+    if kind == "memory":
+        store = InMemoryHostedPreviewStore(
+            payload_vault=payload_vault,
+            projector_registry=projector_registry,
+            clock=lambda: NOW,
+        )
+        store.create_preview(preview)
+        return store, None
+
+    from mercury_tools.config import Settings
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/rpc/load_mercury_document_preview")
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "preview": preview.storage_record(),
+                    "items": [item.storage_record() for item in preview.items],
+                }
+            ],
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    store = SupabaseHostedPreviewStore(
+        settings=Settings(
+            supabase_url="https://example.supabase.co",
+            supabase_service_role_key="test-service-role-key",
+            supabase_auth_issuer="https://example.supabase.co/auth/v1",
+            openai_api_key="",
+        ),
+        payload_vault=payload_vault,
+        http_client=client,
+        projector_registry=projector_registry,
+    )
+    return store, client
+
+
+@pytest.mark.parametrize("store_kind", ("memory", "supabase"))
+@pytest.mark.parametrize(
+    ("projector_id", "projector_version"),
+    (
+        ("mercury.drifted.invoice", "c" * 64),
+        ("mercury.test.invoice", "d" * 64),
+    ),
+)
+@pytest.mark.asyncio
+async def test_confirmable_load_rejects_projector_identity_drift_before_payload_open(
+    store_kind: str,
+    projector_id: str,
+    projector_version: str,
+) -> None:
+    from mercury_tools.execution.hosted.store import HostedPreviewError
+
+    preview, _, connection, qualification = await _prepared()
+    tracking_vault = _tracking_payload_vault()
+    store, client = _confirmable_store(
+        store_kind,
+        preview=preview,
+        projector_registry=_projector_registry_variant(
+            qualification,
+            projector_id=projector_id,
+            projector_version=projector_version,
+        ),
+        payload_vault=tracking_vault,
+    )
+    try:
+        with pytest.raises(HostedPreviewError, match="^capability_unavailable$") as raised:
+            store.load_confirmable(
+                tenant_id=TENANT_ID,
+                auth_user_id=AUTH_USER_ID,
+                workspace_id=WORKSPACE_ID,
+                preview_id=preview.preview_id,
+                expected_state_version=preview.state_version,
+                connection=connection,
+                qualification=qualification,
+                now=NOW,
+            )
+    finally:
+        if client is not None:
+            client.close()
+
+    assert tracking_vault.open_calls == 0
+    assert SECRET_COUNTERPARTY not in str(raised.value)
+
+
+@pytest.mark.parametrize("store_kind", ("memory", "supabase"))
+@pytest.mark.asyncio
+async def test_confirmable_load_rejects_same_identity_reprojection_mismatch(
+    store_kind: str,
+) -> None:
+    from mercury_tools.execution.hosted.store import HostedPreviewError
+
+    preview, _, connection, qualification = await _prepared()
+    tracking_vault = _tracking_payload_vault()
+    store, client = _confirmable_store(
+        store_kind,
+        preview=preview,
+        projector_registry=_projector_registry_variant(
+            qualification,
+            mismatch_projection=True,
+        ),
+        payload_vault=tracking_vault,
+    )
+    try:
+        with pytest.raises(HostedPreviewError, match="^preview_payload_changed$") as raised:
+            store.load_confirmable(
+                tenant_id=TENANT_ID,
+                auth_user_id=AUTH_USER_ID,
+                workspace_id=WORKSPACE_ID,
+                preview_id=preview.preview_id,
+                expected_state_version=preview.state_version,
+                connection=connection,
+                qualification=qualification,
+                now=NOW,
+            )
+    finally:
+        if client is not None:
+            client.close()
+
+    assert tracking_vault.open_calls == 1
+    assert "INV-DRAFT-001" not in str(raised.value)
+    assert SECRET_COUNTERPARTY not in str(raised.value)
+
+
 @pytest.mark.asyncio
 async def test_prepare_normalizes_connection_resolver_errors_without_leaking_values() -> None:
     from mercury_tools.execution.hosted.models import SingleDocumentCreate
@@ -358,6 +564,420 @@ async def test_operation_store_persists_versioned_transitions_and_retention_meta
             occurred_at=NOW + timedelta(seconds=2),
             sanitized_reason="provider_succeeded",
         )
+
+
+@pytest.mark.parametrize(
+    ("item_target", "parent_target", "provider_result_identifier"),
+    (
+        ("succeeded", "succeeded", "document-1"),
+        ("needs_manual_review", "needs_manual_review", None),
+    ),
+)
+@pytest.mark.asyncio
+async def test_unknown_outcome_recovery_transitions_item_before_parent(
+    item_target: str,
+    parent_target: str,
+    provider_result_identifier: str | None,
+) -> None:
+    from mercury_tools.execution.hosted.models import (
+        HostedOperation,
+        OperationItemState,
+        ParentOperationState,
+    )
+
+    preview, store, _, _ = await _prepared()
+    operation = store.create_operation(
+        HostedOperation.from_preview(
+            preview,
+            operation_id=OPERATION_ID,
+            operation_item_ids=(OPERATION_ITEM_ID,),
+            event_id=EVENT_ID,
+            now=NOW,
+        )
+    )
+    dispatching = store.transition_operation(
+        tenant_id=TENANT_ID,
+        auth_user_id=AUTH_USER_ID,
+        workspace_id=WORKSPACE_ID,
+        operation_id=operation.operation_id,
+        expected_state_version=1,
+        target_state=ParentOperationState.DISPATCHING,
+        event_id=UUID("21212121-2121-4212-8212-212121212121"),
+        occurred_at=NOW + timedelta(seconds=1),
+        sanitized_reason="explicit_confirmation",
+    )
+    item_dispatching = store.transition_operation_item(
+        tenant_id=TENANT_ID,
+        auth_user_id=AUTH_USER_ID,
+        workspace_id=WORKSPACE_ID,
+        operation_id=operation.operation_id,
+        operation_item_id=operation.items[0].operation_item_id,
+        expected_state_version=1,
+        target_state=OperationItemState.DISPATCHING,
+        event_id=UUID("22222222-2222-4222-8222-222222222223"),
+        occurred_at=NOW + timedelta(seconds=2),
+        sanitized_reason="provider_create_started",
+    )
+    item_unknown = store.transition_operation_item(
+        tenant_id=TENANT_ID,
+        auth_user_id=AUTH_USER_ID,
+        workspace_id=WORKSPACE_ID,
+        operation_id=operation.operation_id,
+        operation_item_id=operation.items[0].operation_item_id,
+        expected_state_version=item_dispatching.items[0].state_version,
+        target_state=OperationItemState.OUTCOME_UNKNOWN,
+        event_id=UUID("23232323-2323-4232-8232-232323232323"),
+        occurred_at=NOW + timedelta(seconds=3),
+        sanitized_reason="provider_outcome_unknown",
+    )
+    parent_unknown = store.transition_operation(
+        tenant_id=TENANT_ID,
+        auth_user_id=AUTH_USER_ID,
+        workspace_id=WORKSPACE_ID,
+        operation_id=operation.operation_id,
+        expected_state_version=dispatching.state_version,
+        target_state=ParentOperationState.OUTCOME_UNKNOWN,
+        event_id=UUID("24242424-2424-4242-8242-242424242424"),
+        occurred_at=NOW + timedelta(seconds=4),
+        sanitized_reason="provider_outcome_unknown",
+    )
+    recovered_item = store.transition_operation_item(
+        tenant_id=TENANT_ID,
+        auth_user_id=AUTH_USER_ID,
+        workspace_id=WORKSPACE_ID,
+        operation_id=operation.operation_id,
+        operation_item_id=operation.items[0].operation_item_id,
+        expected_state_version=item_unknown.items[0].state_version,
+        target_state=OperationItemState(item_target),
+        event_id=UUID("25252525-2525-4252-8252-252525252525"),
+        occurred_at=NOW + timedelta(seconds=5),
+        sanitized_reason="provider_reconciled",
+        provider_result_identifier=provider_result_identifier,
+    )
+    recovered_parent = store.transition_operation(
+        tenant_id=TENANT_ID,
+        auth_user_id=AUTH_USER_ID,
+        workspace_id=WORKSPACE_ID,
+        operation_id=operation.operation_id,
+        expected_state_version=parent_unknown.state_version,
+        target_state=ParentOperationState(parent_target),
+        event_id=UUID("26262626-2626-4262-8262-262626262626"),
+        occurred_at=NOW + timedelta(seconds=6),
+        sanitized_reason="provider_reconciled",
+    )
+
+    assert recovered_item.state is ParentOperationState.OUTCOME_UNKNOWN
+    assert recovered_item.items[0].state is OperationItemState(item_target)
+    assert recovered_parent.state is ParentOperationState(parent_target)
+
+
+@pytest.mark.parametrize(
+    ("terminal_state", "item_state"),
+    (
+        ("cancelled", "cancelled"),
+        ("expired", "expired"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_parent_terminal_transition_requires_children_to_close_first(
+    terminal_state: str,
+    item_state: str,
+) -> None:
+    from mercury_tools.execution.hosted.models import (
+        HostedOperation,
+        OperationItemState,
+        ParentOperationState,
+    )
+    from mercury_tools.execution.hosted.store import HostedPreviewError
+
+    preview, store, _, _ = await _prepared()
+    operation = store.create_operation(
+        HostedOperation.from_preview(
+            preview,
+            operation_id=OPERATION_ID,
+            operation_item_ids=(OPERATION_ITEM_ID,),
+            event_id=EVENT_ID,
+            now=NOW,
+        )
+    )
+
+    with pytest.raises(HostedPreviewError, match="^operation_transition_invalid$"):
+        store.transition_operation(
+            tenant_id=TENANT_ID,
+            auth_user_id=AUTH_USER_ID,
+            workspace_id=WORKSPACE_ID,
+            operation_id=operation.operation_id,
+            expected_state_version=operation.state_version,
+            target_state=ParentOperationState(terminal_state),
+            event_id=UUID("27272727-2727-4272-8272-272727272727"),
+            occurred_at=NOW + timedelta(seconds=1),
+            sanitized_reason="operation_closed",
+        )
+
+    item_closed = store.transition_operation_item(
+        tenant_id=TENANT_ID,
+        auth_user_id=AUTH_USER_ID,
+        workspace_id=WORKSPACE_ID,
+        operation_id=operation.operation_id,
+        operation_item_id=operation.items[0].operation_item_id,
+        expected_state_version=operation.items[0].state_version,
+        target_state=OperationItemState(item_state),
+        event_id=UUID("28282828-2828-4282-8282-282828282828"),
+        occurred_at=NOW + timedelta(seconds=2),
+        sanitized_reason="operation_closed",
+    )
+    parent_closed = store.transition_operation(
+        tenant_id=TENANT_ID,
+        auth_user_id=AUTH_USER_ID,
+        workspace_id=WORKSPACE_ID,
+        operation_id=operation.operation_id,
+        expected_state_version=operation.state_version,
+        target_state=ParentOperationState(terminal_state),
+        event_id=UUID("29292929-2929-4292-8292-292929292929"),
+        occurred_at=NOW + timedelta(seconds=3),
+        sanitized_reason="operation_closed",
+    )
+
+    assert item_closed.items[0].state is OperationItemState(item_state)
+    assert parent_closed.state is ParentOperationState(terminal_state)
+
+
+@pytest.mark.parametrize("child_state", ("cancelled", "expired"))
+def test_prepared_parent_accepts_child_closure_before_terminal_transition(
+    child_state: str,
+) -> None:
+    from mercury_tools.execution.hosted.models import (
+        OperationItemState,
+        ParentOperationState,
+        parent_operation_children_compatible,
+    )
+
+    assert parent_operation_children_compatible(
+        ParentOperationState.PREPARED,
+        (OperationItemState(child_state),),
+    )
+
+
+def test_failed_pre_dispatch_closes_undispatched_children_before_parent() -> None:
+    from mercury_tools.execution.hosted.models import (
+        OperationItemState,
+        ParentOperationState,
+        item_operation_transition_allowed,
+        parent_operation_children_compatible,
+        parent_operation_transition_allowed,
+    )
+
+    child_states = (
+        OperationItemState.FAILED_PRE_DISPATCH,
+        OperationItemState.NOT_DISPATCHED,
+    )
+    assert item_operation_transition_allowed(
+        OperationItemState.AWAITING_CONFIRMATION,
+        OperationItemState.NOT_DISPATCHED,
+        parent_state=ParentOperationState.AWAITING_CONFIRMATION,
+    )
+    assert parent_operation_children_compatible(
+        ParentOperationState.AWAITING_CONFIRMATION,
+        child_states,
+    )
+    assert parent_operation_transition_allowed(
+        ParentOperationState.AWAITING_CONFIRMATION,
+        ParentOperationState.FAILED_PRE_DISPATCH,
+        child_states=child_states,
+    )
+
+
+@pytest.mark.asyncio
+async def test_operation_public_surfaces_sanitize_provider_result_identifiers() -> None:
+    from mercury_tools.execution.hosted.models import (
+        HostedOperation,
+        OperationItemState,
+        ParentOperationState,
+    )
+    from mercury_tools.execution.hosted.store import operation_rpc_payload
+
+    raw_email = "jane@example.com"
+    raw_tax_id = "1234567890123"
+    raw_phone = "081-234-5678"
+    raw_token = "".join(("sk", "-", "qrstuvwxyz", "123456"))
+    raw_bearer = "Bearer provider-secret-value"
+    raw_identifier = f"Result {raw_email} {raw_tax_id} {raw_phone} {raw_token} {raw_bearer}"
+    preview, store, _, _ = await _prepared()
+    operation = store.create_operation(
+        HostedOperation.from_preview(
+            preview,
+            operation_id=OPERATION_ID,
+            operation_item_ids=(OPERATION_ITEM_ID,),
+            event_id=EVENT_ID,
+            now=NOW,
+        )
+    )
+    store.transition_operation(
+        tenant_id=TENANT_ID,
+        auth_user_id=AUTH_USER_ID,
+        workspace_id=WORKSPACE_ID,
+        operation_id=operation.operation_id,
+        expected_state_version=operation.state_version,
+        target_state=ParentOperationState.DISPATCHING,
+        event_id=UUID("30303030-3030-4030-8030-303030303030"),
+        occurred_at=NOW + timedelta(seconds=1),
+        sanitized_reason="explicit_confirmation",
+    )
+    item_dispatching = store.transition_operation_item(
+        tenant_id=TENANT_ID,
+        auth_user_id=AUTH_USER_ID,
+        workspace_id=WORKSPACE_ID,
+        operation_id=operation.operation_id,
+        operation_item_id=operation.items[0].operation_item_id,
+        expected_state_version=operation.items[0].state_version,
+        target_state=OperationItemState.DISPATCHING,
+        event_id=UUID("31313131-3131-4131-8131-313131313131"),
+        occurred_at=NOW + timedelta(seconds=2),
+        sanitized_reason="provider_create_started",
+    )
+    succeeded = store.transition_operation_item(
+        tenant_id=TENANT_ID,
+        auth_user_id=AUTH_USER_ID,
+        workspace_id=WORKSPACE_ID,
+        operation_id=operation.operation_id,
+        operation_item_id=operation.items[0].operation_item_id,
+        expected_state_version=item_dispatching.items[0].state_version,
+        target_state=OperationItemState.SUCCEEDED,
+        event_id=UUID("32323232-3232-4232-8232-323232323232"),
+        occurred_at=NOW + timedelta(seconds=3),
+        sanitized_reason="provider_succeeded",
+        provider_result_identifier=raw_identifier,
+    )
+    public_surfaces = "\n".join(
+        (
+            repr(succeeded),
+            succeeded.model_dump_json(),
+            json.dumps(operation_rpc_payload(succeeded), sort_keys=True),
+        )
+    )
+
+    for raw in (raw_email, raw_tax_id, raw_phone, raw_token, "provider-secret-value"):
+        assert raw not in public_surfaces
+    assert "[REDACTED_" in public_surfaces
+
+
+@pytest.mark.asyncio
+async def test_operation_reason_rejects_secret_like_identifiers_without_error_echo() -> None:
+    from pydantic import ValidationError
+
+    from mercury_tools.execution.hosted.models import (
+        HostedOperation,
+        OperationEvent,
+        ParentOperationState,
+    )
+    from mercury_tools.execution.hosted.store import HostedPreviewError
+
+    raw_reason = "".join(("sk", "-", "qrstuvwxyz", "123456"))
+    preview, store, _, _ = await _prepared()
+    operation = store.create_operation(
+        HostedOperation.from_preview(
+            preview,
+            operation_id=OPERATION_ID,
+            operation_item_ids=(OPERATION_ITEM_ID,),
+            event_id=EVENT_ID,
+            now=NOW,
+        )
+    )
+
+    with pytest.raises(HostedPreviewError, match="^operation_transition_invalid$") as raised:
+        store.transition_operation(
+            tenant_id=TENANT_ID,
+            auth_user_id=AUTH_USER_ID,
+            workspace_id=WORKSPACE_ID,
+            operation_id=operation.operation_id,
+            expected_state_version=operation.state_version,
+            target_state=ParentOperationState.DISPATCHING,
+            event_id=UUID("33333333-3333-4333-8333-333333333334"),
+            occurred_at=NOW + timedelta(seconds=1),
+            sanitized_reason=raw_reason,
+        )
+    assert raw_reason not in str(raised.value)
+
+    with pytest.raises(ValidationError) as validation:
+        OperationEvent(
+            event_id=UUID("34343434-3434-4434-8434-343434343434"),
+            operation_id=operation.operation_id,
+            from_state="awaiting_confirmation",
+            to_state="dispatching",
+            state_version=2,
+            sanitized_reason=raw_reason,
+            occurred_at=NOW + timedelta(seconds=1),
+        )
+    assert raw_reason not in str(validation.value)
+
+
+def test_supabase_operation_requests_sanitize_before_postgrest() -> None:
+    from mercury_tools.config import Settings
+    from mercury_tools.execution.hosted.models import (
+        OperationItemState,
+        ParentOperationState,
+    )
+    from mercury_tools.execution.hosted.store import (
+        HostedPreviewError,
+        SupabaseHostedPreviewStore,
+    )
+
+    raw_email = "jane@example.com"
+    raw_tax_id = "1234567890123"
+    raw_phone = "081-234-5678"
+    raw_token = "".join(("sk", "-", "qrstuvwxyz", "123456"))
+    raw_identifier = f"{raw_email} {raw_tax_id} {raw_phone} {raw_token}"
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(400, json={"message": "operation_transition_invalid"})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        store = SupabaseHostedPreviewStore(
+            settings=Settings(
+                supabase_url="https://example.supabase.co",
+                supabase_service_role_key="test-service-role-key",
+                supabase_auth_issuer="https://example.supabase.co/auth/v1",
+                openai_api_key="",
+            ),
+            payload_vault=_payload_vault(),
+            http_client=client,
+        )
+        with pytest.raises(HostedPreviewError, match="^operation_transition_invalid$"):
+            store.transition_operation_item(
+                tenant_id=TENANT_ID,
+                auth_user_id=AUTH_USER_ID,
+                workspace_id=WORKSPACE_ID,
+                operation_id=OPERATION_ID,
+                operation_item_id=OPERATION_ITEM_ID,
+                expected_state_version=3,
+                target_state=OperationItemState.SUCCEEDED,
+                event_id=EVENT_ID,
+                occurred_at=NOW,
+                sanitized_reason="provider_succeeded",
+                provider_result_identifier=raw_identifier,
+            )
+        item_payload = json.loads(requests[-1].content)
+        serialized_item_payload = json.dumps(item_payload, sort_keys=True)
+        for raw in (raw_email, raw_tax_id, raw_phone, raw_token):
+            assert raw not in serialized_item_payload
+        assert "[REDACTED_" in serialized_item_payload
+
+        request_count = len(requests)
+        with pytest.raises(HostedPreviewError, match="^operation_transition_invalid$"):
+            store.transition_operation(
+                tenant_id=TENANT_ID,
+                auth_user_id=AUTH_USER_ID,
+                workspace_id=WORKSPACE_ID,
+                operation_id=OPERATION_ID,
+                expected_state_version=1,
+                target_state=ParentOperationState.DISPATCHING,
+                event_id=EVENT_ID,
+                occurred_at=NOW,
+                sanitized_reason=raw_token,
+            )
+        assert len(requests) == request_count
 
 
 def _rpc_preview_response(payload: dict[str, object]) -> list[dict[str, object]]:

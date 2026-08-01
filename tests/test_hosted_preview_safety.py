@@ -181,6 +181,49 @@ async def test_prepare_rejects_unconstrained_or_unresolved_create_schemas(
         )
 
 
+@pytest.mark.parametrize(
+    ("path", "value"),
+    (
+        (("properties", "lines", "maxItems"), 1.5),
+        (("properties", "lines", "maxItems"), "100"),
+        (("properties", "lines", "maxItems"), -1),
+        (("properties", "lines", "maxItems"), True),
+        (("properties", "lines", "maxItems"), 2_147_483_648),
+        (("properties", "lines", "minItems"), 1.5),
+        (("properties", "lines", "minItems"), "1"),
+        (("properties", "lines", "minItems"), -1),
+        (("properties", "lines", "minItems"), True),
+        (("properties", "lines", "minItems"), 2_147_483_648),
+        (("properties", "reference", "minLength"), 2_147_483_648),
+    ),
+)
+@pytest.mark.asyncio
+async def test_prepare_normalizes_invalid_constrained_schema_numbers(
+    path: tuple[str, ...],
+    value: object,
+) -> None:
+    from mercury_tools.execution.hosted.models import SingleDocumentCreate
+    from mercury_tools.execution.hosted.store import HostedPreviewError
+
+    schema = json.loads(json.dumps(_qualification().input_schema))
+    target = schema
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    qualification = _qualification(input_schema=schema)
+    service, _, _, _, _ = _service(qualification=qualification)
+
+    with pytest.raises(HostedPreviewError, match="^capability_unavailable$"):
+        await service.prepare_document_create(
+            _principal(),
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            qualification.normalized_capability,
+            qualification.capability_version_sha256,
+            SingleDocumentCreate(mode="single", document=_draft()),
+        )
+
+
 @pytest.mark.asyncio
 async def test_prepare_requires_a_durable_qualification_identity() -> None:
     from mercury_tools.execution.hosted.models import SingleDocumentCreate
@@ -497,6 +540,103 @@ async def test_ambiguous_save_recovers_the_identical_committed_preview() -> None
     assert repeated == first
     assert proxy is not None
     assert proxy.create_calls == 1
+
+
+@pytest.mark.parametrize("terminal_state", ("cancelled", "expired"))
+@pytest.mark.asyncio
+async def test_repeated_prepare_reports_the_durable_terminal_preview_state(
+    terminal_state: str,
+) -> None:
+    from mercury_tools.execution.hosted.models import PreviewState, SingleDocumentCreate
+
+    qualification = _qualification()
+    service, store, _, _, _ = _service(qualification=qualification)
+    request = SingleDocumentCreate(mode="single", document=_draft())
+    first = await service.prepare_document_create(
+        _principal(),
+        WORKSPACE_ID,
+        CONNECTION_ID,
+        qualification.normalized_capability,
+        qualification.capability_version_sha256,
+        request,
+    )
+    occurred_at = first.expires_at if terminal_state == "expired" else NOW + timedelta(seconds=1)
+    durable = store.transition_preview(
+        tenant_id=TENANT_ID,
+        auth_user_id=AUTH_USER_ID,
+        workspace_id=WORKSPACE_ID,
+        preview_id=first.preview_id,
+        expected_state_version=first.state_version,
+        target_state=PreviewState(terminal_state),
+        occurred_at=occurred_at,
+    )
+
+    repeated = await service.prepare_document_create(
+        _principal(),
+        WORKSPACE_ID,
+        CONNECTION_ID,
+        qualification.normalized_capability,
+        qualification.capability_version_sha256,
+        request,
+    )
+
+    assert repeated.preview_id == first.preview_id
+    assert repeated.status == durable.state
+    assert repeated.state_version == durable.state_version
+    assert repeated.next_allowed_actions == ()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_save_recovery_reports_a_concurrently_cancelled_preview() -> None:
+    from mercury_tools.execution.hosted.models import PreviewState, SingleDocumentCreate
+    from mercury_tools.execution.hosted.store import (
+        HostedPreviewError,
+        InMemoryHostedPreviewStore,
+    )
+
+    class CancelledAmbiguousStore(_StoreProxy):
+        def create_preview(self, preview):
+            persisted = self.delegate.create_preview(preview)
+            self.delegate.transition_preview(
+                tenant_id=persisted.tenant_id,
+                auth_user_id=persisted.auth_user_id,
+                workspace_id=persisted.workspace_id,
+                preview_id=persisted.preview_id,
+                expected_state_version=persisted.state_version,
+                target_state=PreviewState.CANCELLED,
+                occurred_at=NOW + timedelta(seconds=1),
+            )
+            raise HostedPreviewError("preview_store_unavailable")
+
+    def store_factory(payload_vault, registry, authority):
+        delegate = InMemoryHostedPreviewStore(
+            payload_vault=payload_vault,
+            projector_registry=registry,
+            authority_resolver=lambda _preview: (
+                authority["connection"],
+                authority["qualification"],
+            ),
+            clock=lambda: NOW,
+        )
+        return CancelledAmbiguousStore(delegate)
+
+    qualification = _qualification()
+    service, _, _, _, _ = _service(
+        qualification=qualification,
+        store_factory=store_factory,
+    )
+    recovered = await service.prepare_document_create(
+        _principal(),
+        WORKSPACE_ID,
+        CONNECTION_ID,
+        qualification.normalized_capability,
+        qualification.capability_version_sha256,
+        SingleDocumentCreate(mode="single", document=_draft()),
+    )
+
+    assert recovered.status is PreviewState.CANCELLED
+    assert recovered.state_version == 2
+    assert recovered.next_allowed_actions == ()
 
 
 @pytest.mark.asyncio

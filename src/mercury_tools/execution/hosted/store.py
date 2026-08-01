@@ -36,7 +36,13 @@ from .models import (
     StoredPreviewItem,
     preview_item_integrity_hash,
 )
-from .projectors import DocumentProjectorRegistry, ProjectorError, provider_call_hash
+from .projectors import (
+    DocumentProjectorRegistry,
+    ProjectorError,
+    ReviewedInvoiceProjector,
+    provider_call_hash,
+)
+from .sanitization import require_safe_public_identifier, sanitize_public_text
 
 _PREVIEW_ERROR_CODES = frozenset(
     {
@@ -214,6 +220,22 @@ def _timestamp(value: datetime, code: str = "preview_store_unavailable") -> date
     return value.astimezone(UTC)
 
 
+def _operation_reason(value: object) -> str:
+    try:
+        return require_safe_public_identifier(value, code="operation_transition_invalid")
+    except (TypeError, ValueError):
+        raise HostedPreviewError("operation_transition_invalid") from None
+
+
+def _provider_result_identifier(value: object) -> str | None:
+    if value is None:
+        return None
+    try:
+        return sanitize_public_text(value, code="operation_transition_invalid")
+    except (TypeError, ValueError):
+        raise HostedPreviewError("operation_transition_invalid") from None
+
+
 def _provider_account_sha256(connection: ProviderConnection) -> str:
     return hashlib.sha256(connection.provider_account_id.encode("utf-8")).hexdigest()
 
@@ -289,8 +311,7 @@ def _validate_authority(
     qualification: ProviderMCPQualification,
     projector_registry: DocumentProjectorRegistry,
     now: datetime,
-    require_projector: bool = True,
-) -> ProviderMCPQualification:
+) -> tuple[ProviderMCPQualification, ReviewedInvoiceProjector]:
     try:
         checked_connection = ProviderConnection.model_validate(connection)
         checked_qualification = ProviderMCPQualification.model_validate(qualification)
@@ -302,15 +323,14 @@ def _validate_authority(
         raise HostedPreviewError("preview_binding_changed")
     if not _qualification_is_current(checked_qualification, checked_connection, now=now):
         raise HostedPreviewError("capability_unavailable")
-    if require_projector:
-        projector = projector_registry.resolve(checked_qualification)
-        if (
-            projector is None
-            or projector.projector_id != preview.projector_id
-            or projector.projector_version != preview.projector_version
-        ):
-            raise HostedPreviewError("capability_unavailable")
-    return checked_qualification
+    projector = projector_registry.resolve(checked_qualification)
+    if (
+        projector is None
+        or projector.projector_id != preview.projector_id
+        or projector.projector_version != preview.projector_version
+    ):
+        raise HostedPreviewError("capability_unavailable")
+    return checked_qualification, projector
 
 
 def _operation_matches_preview(operation: HostedOperation, preview: DocumentPreview) -> bool:
@@ -428,17 +448,13 @@ def _load_confirmable(
         raise HostedPreviewError("preview_state_invalid")
     if preview.expires_at <= checked_now:
         raise HostedPreviewError("preview_expired")
-    checked_qualification = _validate_authority(
+    _, projector = _validate_authority(
         preview,
         connection=connection,
         qualification=qualification,
         projector_registry=projector_registry,
         now=checked_now,
-        require_projector=False,
     )
-    projector = projector_registry.resolve(checked_qualification)
-    if projector is None:
-        raise HostedPreviewError("capability_unavailable")
 
     opened_items: list[OpenedPreviewItem] = []
     for item in preview.items:
@@ -1089,6 +1105,7 @@ class SupabaseHostedPreviewStore:
         occurred_at: datetime,
         sanitized_reason: str,
     ) -> HostedOperation:
+        checked_reason = _operation_reason(sanitized_reason)
         row = self._rpc_one(
             "transition_mercury_operation",
             {
@@ -1100,7 +1117,7 @@ class SupabaseHostedPreviewStore:
                 "p_target_state": ParentOperationState(target_state).value,
                 "p_event_id": str(event_id),
                 "p_occurred_at": _timestamp(occurred_at).isoformat(),
-                "p_sanitized_reason": sanitized_reason,
+                "p_sanitized_reason": checked_reason,
             },
         )
         operation = _operation_from_rpc(row)
@@ -1128,6 +1145,8 @@ class SupabaseHostedPreviewStore:
         sanitized_reason: str,
         provider_result_identifier: str | None = None,
     ) -> HostedOperation:
+        checked_reason = _operation_reason(sanitized_reason)
+        checked_result_identifier = _provider_result_identifier(provider_result_identifier)
         row = self._rpc_one(
             "transition_mercury_operation_item",
             {
@@ -1140,8 +1159,8 @@ class SupabaseHostedPreviewStore:
                 "p_target_state": OperationItemState(target_state).value,
                 "p_event_id": str(event_id),
                 "p_occurred_at": _timestamp(occurred_at).isoformat(),
-                "p_sanitized_reason": sanitized_reason,
-                "p_provider_result_identifier": provider_result_identifier,
+                "p_sanitized_reason": checked_reason,
+                "p_provider_result_identifier": checked_result_identifier,
             },
         )
         operation = _operation_from_rpc(row)
@@ -1319,6 +1338,7 @@ def _preview_from_rpc(row: Mapping[str, Any]) -> DocumentPreview:
 
 
 def operation_rpc_payload(operation: HostedOperation) -> dict[str, Any]:
+    operation = HostedOperation.model_validate(operation)
     return {
         "p_operation": {
             "id": str(operation.operation_id),

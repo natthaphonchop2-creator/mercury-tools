@@ -512,7 +512,55 @@ async def test_preview_state_version_requires_a_real_state_transition() -> None:
     )
 
     with pytest.raises(ValidationError, match="preview_state_invalid"):
-        DocumentPreview.model_validate(preview.model_copy(update={"state_version": 2}))
+        DocumentPreview.model_validate(preview.model_copy(update={"state_version": 3}))
+
+
+@pytest.mark.asyncio
+async def test_prepared_preview_can_transition_to_awaiting_and_then_terminal() -> None:
+    from mercury_tools.execution.hosted.models import (
+        DocumentPreview,
+        PreviewState,
+        SingleDocumentCreate,
+    )
+
+    service, store, _, qualification, _ = _service()
+    result = await service.prepare_document_create(
+        _principal(),
+        WORKSPACE_ID,
+        CONNECTION_ID,
+        qualification.normalized_capability,
+        qualification.capability_version_sha256,
+        SingleDocumentCreate(mode="single", document=_draft()),
+    )
+    direct_awaiting = store.get_preview(
+        tenant_id=TENANT_ID,
+        auth_user_id=AUTH_USER_ID,
+        workspace_id=WORKSPACE_ID,
+        preview_id=result.preview_id,
+    )
+    prepared = DocumentPreview.model_validate(
+        direct_awaiting.model_copy(
+            update={
+                "state": PreviewState.PREPARED,
+                "state_version": 1,
+            }
+        )
+    )
+
+    awaiting = prepared.transition(
+        target_state=PreviewState.AWAITING_CONFIRMATION,
+        occurred_at=NOW + timedelta(seconds=1),
+    )
+    cancelled = awaiting.transition(
+        target_state=PreviewState.CANCELLED,
+        occurred_at=NOW + timedelta(seconds=2),
+    )
+
+    assert direct_awaiting.state_version == 1
+    assert awaiting.state is PreviewState.AWAITING_CONFIRMATION
+    assert awaiting.state_version == 2
+    assert cancelled.state is PreviewState.CANCELLED
+    assert cancelled.state_version == 3
 
 
 @pytest.mark.parametrize(
