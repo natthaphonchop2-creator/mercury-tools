@@ -1,0 +1,57 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Read-only GitHub OIDC role for Mercury AWS Wave 0 probes
+
+Parameters:
+  GitHubOidcProviderArn:
+    Type: String
+    AllowedPattern: '^arn:aws:iam::[0-9]{12}:oidc-provider/token\.actions\.githubusercontent\.com$'
+  GitHubEnvironment:
+    Type: String
+    AllowedValues:
+      - nonprod
+      - production
+
+Resources:
+  MercuryWave0GithubOidcRole:
+    Type: AWS::IAM::Role
+    Properties:
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated:
+                Ref: GitHubOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub:
+                  Fn::Sub: repo:natthaphonchop2-creator/mercury-tools:environment:${GitHubEnvironment}
+      Policies:
+        - PolicyName: MercuryWave0ReadOnlyProbes
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:ListAgentRuntimes
+                  - bedrock-agentcore:ListGateways
+                  - bedrock-agentcore:ListWorkloadIdentities
+                  - bedrock:ListKnowledgeBases
+                  - ecr:DescribeRepositories
+                  - kms:ListAliases
+                  - logs:DescribeLogGroups
+                  - rds:DescribeOrderableDBInstanceOptions
+                  - s3:ListAllMyBuckets
+                  - servicequotas:ListServiceQuotas
+                  - sts:GetCallerIdentity
+                Resource: "*"
+
+Outputs:
+  MercuryWave0GithubOidcRoleArn:
+    Value:
+      Fn::GetAtt:
+        - MercuryWave0GithubOidcRole
+        - Arn
