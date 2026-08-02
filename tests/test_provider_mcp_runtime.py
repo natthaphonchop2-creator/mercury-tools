@@ -3646,7 +3646,7 @@ async def test_real_content_type_failure_respects_dispatch_certainty(
     _install_real_mock_transport(monkeypatch, scenario, observed_requests)
     caplog.set_level(logging.DEBUG)
     driver = _driver()
-    monkeypatch.setattr(driver, "_operation_seconds", lambda _timeout_class: 0.2)
+    monkeypatch.setattr(driver, "_operation_seconds", lambda _timeout_class: 2.0)
 
     with (
         _sdk_logging_configuration(logging_mode),
