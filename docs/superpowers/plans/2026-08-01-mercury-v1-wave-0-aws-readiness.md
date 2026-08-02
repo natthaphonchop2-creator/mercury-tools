@@ -21,7 +21,7 @@
 - Do not accept, print, store, or commit passwords, access keys, secret keys, session tokens, provider credentials, raw JWTs, cookies, or authorization headers.
 - Machine evidence is written only under `.artifacts/aws/wave0/`, which is gitignored. Committed evidence contains statuses, hashes, Region, aliases, tool versions, and public documentation links only.
 - AWS account IDs and principal ARNs may be read transiently but account IDs appear in reports only as `sha256(account_id)[:12]` fingerprints.
-- Live nonprod STS and the required Singapore service/quota probes passed on 2026-08-02. Wave 0 remains blocked until the nonprod GitHub OIDC proof and the three-host identity compatibility proof pass.
+- Live nonprod STS, the required Singapore service/quota probes, and the nonprod GitHub OIDC proof passed on 2026-08-02. Wave 0 remains blocked until the three-host identity compatibility proof passes.
 - One inbound issuer serves the plugin and Web Console. Select `cognito_pre_registered` only if Codex, ChatGPT, and Claude all pass public-client authorization code plus PKCE; otherwise select one tested `external_oidc_dcr` issuer for all hosts and the console.
 - The disposable Cognito stack contains no customer, provider, or production data and is deleted after evidence capture.
 - Keep package version `0.3.1`; do not tag or publish a release in Wave 0.
@@ -620,7 +620,7 @@ aws iam create-open-id-connect-provider \
 State that an existing provider is reused and no AWS credential-file value is
 copied into GitHub.
 
-- [ ] **Step 5: Verify GREEN, run OIDC proof, and commit**
+- [x] **Step 5: Verify GREEN, run OIDC proof, and commit**
 
 ```bash
 uv run pytest tests/test_aws_wave0_templates.py -q
@@ -958,7 +958,7 @@ git diff --name-only 9330e67...HEAD
 Expected: no secret matches; changes are limited to Wave 0 paths; the three
 pre-existing untracked RED tests remain unstaged and unchanged.
 
-- [ ] **Step 6: Write sanitized owner-review evidence**
+- [x] **Step 6: Write sanitized owner-review evidence**
 
 `docs/superpowers/evidence/wave-0-aws-readiness.md` records final status, Task
 commit SHAs, tool versions, Region, account aliases/fingerprints, per-probe
@@ -970,7 +970,7 @@ or Wave 1 infrastructure was created.
 Mark the Wave Index Wave 0 checklist complete only for a ready gate. For a
 blocked gate, commit the blocked evidence and keep both checkboxes unchecked.
 
-- [ ] **Step 7: Commit evidence and stop**
+- [x] **Step 7: Commit evidence and stop**
 
 ```bash
 git add src/mercury_tools/aws/readiness.py scripts/check_aws_readiness.py \
@@ -987,9 +987,9 @@ Do not draft or execute Wave 1 until the owner explicitly approves Wave 0.
 - [x] AWS account suspension is resolved and the `mercury-nonprod` short-lived profile passes STS.
 - [x] The authenticated account is recorded only as the sanitized `mercury-nonprod` fingerprint.
 - [x] All required AgentCore, Bedrock, Aurora, S3, KMS, ECR, CloudWatch, and quota probes pass in `ap-southeast-1` for nonprod.
-- [ ] GitHub OIDC assumes the read-only role in `nonprod` without long-lived AWS keys.
+- [x] GitHub OIDC assumes the read-only role in `nonprod` without long-lived AWS keys.
 - [ ] Codex, ChatGPT, and Claude are covered by one identity mode and one issuer strategy.
-- [ ] The Cognito compatibility stack is deleted.
+- [x] The disposable Cognito compatibility stack is deleted or confirmed absent.
 - [x] Machine evidence remains ignored and sanitized evidence is committed.
 - [x] No customer/provider data, credentials, Mercury runtime, or Wave 1 infrastructure exists.
 - [x] No production customer or provider data entered nonprod, and no production account was created or bound in Wave 0.

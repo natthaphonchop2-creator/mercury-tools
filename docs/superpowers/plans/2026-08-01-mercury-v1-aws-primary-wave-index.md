@@ -72,10 +72,10 @@ domain contracts.
 - [ ] Execute the bounded Wave 0 plan.
 - [ ] Review Wave 0 evidence and stop for owner approval.
 
-Current evidence (2026-08-02): `blocked_account_access`. Live nonprod STS and
-all required Singapore service/quota probes pass. The exact gate remains
-blocked because the nonprod GitHub OIDC run and the Codex, ChatGPT, and Claude
-identity compatibility proof are absent. Wave 1 is not authorized.
+Current evidence (2026-08-02): `blocked_identity_compatibility`. Live nonprod
+STS, all required Singapore service/quota probes, and the nonprod GitHub OIDC
+proof pass. The exact gate remains blocked because the Codex, ChatGPT, and
+Claude identity compatibility proof is absent. Wave 1 is not authorized.
 
 ### Wave 1: AWS Foundation
 
