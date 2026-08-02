@@ -11,7 +11,7 @@ This is a sanitized offline owner-review record. The gate was run with
 `--skip-live`; no live AWS API was called and no GitHub Actions workflow was
 dispatched. The ignored machine report is
 `.artifacts/aws/wave0/readiness.json`, mode `0600`, with SHA-256
-`aa3f52e8868f5367339328e8d6b63bc4c6b8594e5e441570d0cedee184dac525`.
+`bbd2dbbc45f7ee9b7cc5c978bac7b8ddd2d527a903b47dfffe251a8254eeb85b`.
 
 No Mercury runtime, customer data, provider credentials, or Wave 1
 infrastructure was created. No AWS account ID, principal ARN, access key,
@@ -69,9 +69,12 @@ No service or quota availability claim is made.
 - OIDC workflow dispatch: not performed.
 - OIDC CLI inputs require explicit `nonprod=URL` and `production=URL` bindings.
 - URL shape or order does not create pass evidence. When bindings exist, the
-  gate independently verifies closed run metadata, workflow identity, the
-  expected successful matrix job, and the pinned workflow source at the run
-  head SHA through shell-free allowlisted `gh api` calls.
+  public final gate accepts only explicit run references and independently
+  verifies closed run metadata, workflow identity, the expected successful
+  matrix job, and the pinned workflow source at the run head SHA through
+  shell-free allowlisted `gh api` calls.
+- Caller-constructed `OidcRunEvidence`, including a matching deterministic
+  digest, cannot be supplied to the public final gate to produce `ready`.
 - No `gh` call ran during this blocked execution because both bindings are
   absent.
 - Identity decision file: absent.
@@ -92,14 +95,14 @@ issuer kind, host results, account fingerprints, or stack-deletion proof.
 | Task 2 | `25e90006c6b8a8703b5bee4efb730ceb776c640a`, `b30c948db34500cc1adfc8b5ce7f6e9cb798d7ad`, `3fd54420120239f5bd658d420ba68f607bd34f07` |
 | Task 3 | `96931300c5e9a7e5a029112cf129f175e348db06`, `d054321da038099f82bea6e76ce42699864d3298` |
 | Task 4 | `f356e59d94d4e3c6bdfc31913557d61b386653aa`, `8ae5661eeb41c3eb4e9ec3a98cb8d32c5fb9f614` |
-| Task 5 | This evidence commit; its SHA is recorded in Git history and the uncommitted scratch report. |
+| Task 5 | `36d8cc57cacd63347c7a34bf93a38fb237a3fb37`, `5314f35c2ac52efe27473998bb41fd2b1a9ec91b`; Fix Round 2 is this evidence update. |
 
 ## Offline Verification
 
 - `npm ci --ignore-scripts`: pass.
 - Exact tool version commands: pass.
 - `uv sync --extra dev`: pass.
-- Approved four-file Wave 0 pytest matrix: 114 passed.
+- Approved four-file Wave 0 pytest matrix: 117 passed.
 - Approved Ruff matrix: pass.
 - `uv run python scripts/check_aws_readiness.py --skip-live --output .artifacts/aws/wave0/readiness.json`: expected exit 2, `blocked_account_access`.
 - Whitespace checks: pass after the final Task 5 diff.

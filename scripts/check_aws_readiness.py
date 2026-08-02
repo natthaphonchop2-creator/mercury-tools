@@ -26,7 +26,6 @@ from mercury_tools.aws.readiness import (
     check_local_toolchain,
     check_region_services,
     finalize_wave0_gate,
-    verify_oidc_runs,
     write_readiness_report,
 )
 
@@ -173,16 +172,17 @@ def main(
             loaded_identity if loaded_identity is not None else (None, None)
         )
         oidc_references = _parse_oidc_references(args.oidc_run)
-        try:
-            oidc_evidence = verify_oidc_runs(oidc_references, runner)
-        except ValueError:
-            oidc_evidence = ()
-        gate_status = finalize_wave0_gate(report, identity_decision, oidc_evidence)
+        finalization = finalize_wave0_gate(
+            report,
+            identity_decision,
+            oidc_references,
+            runner,
+        )
         report = _machine_report(
             report,
-            gate_status,
+            finalization.gate_status,
             identity_evidence_sha256,
-            oidc_evidence,
+            finalization.oidc_evidence,
         )
         write_readiness_report(report, args.output)
     except (_CliInputError, OSError, ValueError, ValidationError):

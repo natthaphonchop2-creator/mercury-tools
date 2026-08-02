@@ -545,12 +545,56 @@ def oidc_reference(environment: str, run_id: int) -> OidcRunReference:
     )
 
 
-def valid_oidc() -> tuple[OidcRunEvidence, ...]:
-    references = (
+def valid_oidc_references() -> tuple[OidcRunReference, ...]:
+    return (
         oidc_reference("nonprod", 1001),
         oidc_reference("production", 1002),
     )
+
+
+def valid_oidc() -> tuple[OidcRunEvidence, ...]:
+    references = valid_oidc_references()
     return verify_oidc_runs(references, VerifiedGhRunner.for_references(references))
+
+
+def fabricated_oidc() -> tuple[OidcRunEvidence, ...]:
+    evidence: list[OidcRunEvidence] = []
+    workflow_sha256 = hashlib.sha256(WORKFLOW_PATH.read_bytes()).hexdigest()
+    for environment, run_id in (("nonprod", 1001), ("production", 1002)):
+        run_url = str(oidc_reference(environment, run_id).run_url)
+        head_sha = f"{run_id:040x}"
+        workflow_id = run_id + 10_000
+        job_id = run_id * 10 + (1 if environment == "nonprod" else 2)
+        canonical = json.dumps(
+            {
+                "environment": environment,
+                "head_sha": head_sha,
+                "job_id": job_id,
+                "repository": REPOSITORY,
+                "run_id": run_id,
+                "run_url_sha256": hashlib.sha256(run_url.encode("utf-8")).hexdigest(),
+                "schema_version": "mercury.aws.wave0.oidc_run_evidence.v2",
+                "workflow_id": workflow_id,
+                "workflow_path": WORKFLOW_FILE,
+                "workflow_sha256": workflow_sha256,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        evidence.append(
+            OidcRunEvidence(
+                environment=environment,
+                run_url=run_url,
+                run_id=run_id,
+                head_sha=head_sha,
+                workflow_id=workflow_id,
+                workflow_sha256=workflow_sha256,
+                job_id=job_id,
+                evidence_sha256=hashlib.sha256(canonical).hexdigest(),
+            )
+        )
+    return tuple(evidence)
 
 
 def cli_runner(
@@ -567,6 +611,23 @@ def cli_runner(
     )
     runner.results.update(tools.results)
     return runner
+
+
+def finalize_status(
+    report,
+    identity_decision: IdentityDecision | None,
+    references: tuple[OidcRunReference, ...] | None = None,
+) -> GateStatus:
+    checked_references = (
+        valid_oidc_references() if references is None else references
+    )
+    runner = VerifiedGhRunner.for_references(checked_references)
+    return finalize_wave0_gate(
+        report,
+        identity_decision,
+        checked_references,
+        runner,
+    ).gate_status
 
 
 def replace_check(report, name: str, **updates: object):
@@ -946,9 +1007,55 @@ def test_gate_requires_distinct_ready_accounts() -> None:
         details={"account_fingerprint": "a" * 12},
     )
 
-    assert finalize_wave0_gate(report, valid_identity(), valid_oidc()) == (
-        "blocked_account_access"
+    assert finalize_status(report, valid_identity()) == "blocked_account_access"
+
+
+def test_public_finalizer_rejects_fabricated_oidc_self_attestation() -> None:
+    runner = FakeRunner({})
+    result = finalize_wave0_gate(
+        build_report_fixture(),
+        valid_identity(),
+        fabricated_oidc(),
+        runner,
     )
+
+    assert result.gate_status == "blocked_account_access"
+    assert result.oidc_evidence == ()
+    assert runner.calls == []
+
+
+def test_public_finalizer_verifies_references_and_fails_closed_on_mismatch() -> None:
+    references = valid_oidc_references()
+    runner = VerifiedGhRunner.for_references(
+        references,
+        run_updates={"conclusion": "failure"},
+    )
+
+    result = finalize_wave0_gate(
+        build_report_fixture(),
+        valid_identity(),
+        references,
+        runner,
+    )
+
+    assert result.gate_status == "blocked_account_access"
+    assert result.oidc_evidence == ()
+    assert runner.calls
+
+
+def test_public_finalizer_absent_references_stays_blocked_without_gh_calls() -> None:
+    runner = FakeRunner({})
+
+    result = finalize_wave0_gate(
+        build_report_fixture(),
+        valid_identity(),
+        (),
+        runner,
+    )
+
+    assert result.gate_status == "blocked_account_access"
+    assert result.oidc_evidence == ()
+    assert runner.calls == []
 
 
 def test_gate_requires_every_service_and_quota_probe() -> None:
@@ -961,34 +1068,32 @@ def test_gate_requires_every_service_and_quota_probe() -> None:
         },
     )
 
-    assert finalize_wave0_gate(report, valid_identity(), valid_oidc()) == (
-        "blocked_region_service"
-    )
+    assert finalize_status(report, valid_identity()) == "blocked_region_service"
 
 
 def test_gate_requires_identity_and_both_oidc_jobs() -> None:
     report = build_report_fixture()
-    assert finalize_wave0_gate(report, None, valid_oidc()) == (
-        "blocked_identity_compatibility"
-    )
-    assert finalize_wave0_gate(report, valid_identity(), valid_oidc()[:1]) == (
-        "blocked_account_access"
-    )
+    assert finalize_status(report, None) == "blocked_identity_compatibility"
+    assert finalize_status(
+        report,
+        valid_identity(),
+        valid_oidc_references()[:1],
+    ) == "blocked_account_access"
 
 
 def test_gate_rejects_duplicate_oidc_environment_url_or_hash() -> None:
     report = build_report_fixture()
-    first, second = valid_oidc()
+    first, second = valid_oidc_references()
     same_environment = (
         first,
         second.model_copy(update={"environment": first.environment}),
     )
     duplicate_url = (first, second.model_copy(update={"run_url": first.run_url}))
 
-    assert finalize_wave0_gate(report, valid_identity(), same_environment) == (
+    assert finalize_status(report, valid_identity(), same_environment) == (
         "blocked_account_access"
     )
-    assert finalize_wave0_gate(report, valid_identity(), duplicate_url) == (
+    assert finalize_status(report, valid_identity(), duplicate_url) == (
         "blocked_account_access"
     )
 
@@ -1003,15 +1108,9 @@ def test_gate_revalidates_tool_versions_codes_and_report_gate() -> None:
     wrong_code = replace_check(report, "aws_cdk", code="tool_version_assumed")
     forged_gate = report.model_copy(update={"gate_status": GateStatus.BLOCKED_TOOLING})
 
-    assert finalize_wave0_gate(wrong_version, valid_identity(), valid_oidc()) == (
-        "blocked_tooling"
-    )
-    assert finalize_wave0_gate(wrong_code, valid_identity(), valid_oidc()) == (
-        "blocked_tooling"
-    )
-    assert finalize_wave0_gate(forged_gate, valid_identity(), valid_oidc()) == (
-        "blocked_tooling"
-    )
+    assert finalize_status(wrong_version, valid_identity()) == "blocked_tooling"
+    assert finalize_status(wrong_code, valid_identity()) == "blocked_tooling"
+    assert finalize_status(forged_gate, valid_identity()) == "blocked_tooling"
 
 
 def test_gate_revalidates_region_aliases_account_codes_and_service_codes() -> None:
@@ -1028,16 +1127,14 @@ def test_gate_revalidates_region_aliases_account_codes_and_service_codes() -> No
     )
     wrong_region = report.model_copy(update={"primary_region": "us-east-1"})
 
-    assert finalize_wave0_gate(wrong_accounts, valid_identity(), valid_oidc()) == (
+    assert finalize_status(wrong_accounts, valid_identity()) == "blocked_account_access"
+    assert finalize_status(wrong_account_code, valid_identity()) == (
         "blocked_account_access"
     )
-    assert finalize_wave0_gate(wrong_account_code, valid_identity(), valid_oidc()) == (
-        "blocked_account_access"
-    )
-    assert finalize_wave0_gate(wrong_service_code, valid_identity(), valid_oidc()) == (
+    assert finalize_status(wrong_service_code, valid_identity()) == (
         "blocked_region_service"
     )
-    assert finalize_wave0_gate(wrong_region, valid_identity(), valid_oidc()) == (
+    assert finalize_status(wrong_region, valid_identity()) == (
         "blocked_region_service"
     )
 
@@ -1049,20 +1146,31 @@ def test_gate_revalidates_credential_safe_report_fields() -> None:
         summary="Bearer unsafe-value",
     )
 
-    assert finalize_wave0_gate(unsafe_report, valid_identity(), valid_oidc()) == (
+    assert finalize_status(unsafe_report, valid_identity()) == (
         "blocked_identity_compatibility"
     )
 
 
 def test_gate_is_ready_only_with_complete_proof() -> None:
-    assert finalize_wave0_gate(
-        build_report_fixture(), valid_identity(), valid_oidc()
-    ) == "ready"
+    references = valid_oidc_references()
+    runner = VerifiedGhRunner.for_references(references)
+
+    result = finalize_wave0_gate(
+        build_report_fixture(),
+        valid_identity(),
+        references,
+        runner,
+    )
+
+    assert result.gate_status == "ready"
+    assert len(result.oidc_evidence) == 2
+    assert len(runner.calls) == 8
 
 
 def test_cli_verifies_explicit_environment_bindings_and_stores_only_hashes(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     decision_path = tmp_path / "identity-decision.yaml"
     decision_path.write_text(
@@ -1076,6 +1184,23 @@ def test_cli_verifies_explicit_environment_bindings_and_stores_only_hashes(
         references, VerifiedGhRunner.for_references(references)
     )
     runner = cli_runner(references)
+    finalizer_calls = 0
+
+    def counting_finalizer(report, identity_decision, oidc_references, injected_runner):
+        nonlocal finalizer_calls
+        finalizer_calls += 1
+        return finalize_wave0_gate(
+            report,
+            identity_decision,
+            oidc_references,
+            injected_runner,
+        )
+
+    monkeypatch.setitem(
+        readiness_main.__globals__,
+        "finalize_wave0_gate",
+        counting_finalizer,
+    )
     output = ROOT / ".artifacts/aws/wave0/task5-cli-test.json"
     output.unlink(missing_ok=True)
 
@@ -1108,6 +1233,7 @@ def test_cli_verifies_explicit_environment_bindings_and_stores_only_hashes(
                 str(reference.run_url).encode("utf-8")
             ).hexdigest() not in serialized
         assert len([call for call in runner.calls if call[:2] == ("gh", "api")]) == 8
+        assert finalizer_calls == 1
     finally:
         output.unlink(missing_ok=True)
 

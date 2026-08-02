@@ -199,6 +199,13 @@ class OidcRunEvidence(OidcRunReference):
         return self
 
 
+class Wave0GateFinalization(_OidcModel):
+    """Final gate status plus evidence produced by its internal verifier."""
+
+    gate_status: GateStatus
+    oidc_evidence: tuple[OidcRunEvidence, ...]
+
+
 def _run_id_from_url(run_url: AnyHttpUrl) -> int | None:
     if (
         run_url.scheme != "https"
@@ -738,9 +745,32 @@ def aggregate_gate(checks: tuple[CheckResult, ...] | list[CheckResult]) -> GateS
 def finalize_wave0_gate(
     report: ReadinessReport,
     identity_decision: IdentityDecision | None,
+    oidc_references: tuple[OidcRunReference, ...],
+    runner: CommandRunner = run_command,
+) -> Wave0GateFinalization:
+    """Verify OIDC references and independently require every Wave 0 proof."""
+
+    try:
+        oidc_evidence = verify_oidc_runs(oidc_references, runner)
+    except ValueError:
+        oidc_evidence = ()
+    gate_status = _finalize_wave0_gate_with_verified_evidence(
+        report,
+        identity_decision,
+        oidc_evidence,
+    )
+    return Wave0GateFinalization(
+        gate_status=gate_status,
+        oidc_evidence=oidc_evidence,
+    )
+
+
+def _finalize_wave0_gate_with_verified_evidence(
+    report: ReadinessReport,
+    identity_decision: IdentityDecision | None,
     oidc_evidence: tuple[OidcRunEvidence, ...],
 ) -> GateStatus:
-    """Independently require every exact Wave 0 proof before returning ready."""
+    """Evaluate evidence that was produced inside the public finalizer."""
 
     checks = tuple(report.checks)
     counts = Counter(item.name for item in checks)
