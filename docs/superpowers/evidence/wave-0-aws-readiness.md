@@ -37,38 +37,38 @@ changed because advisory remediation is outside this gate's approved scope.
 | Environment | Alias/profile | Account fingerprint | STS status |
 | --- | --- | --- | --- |
 | nonprod | `mercury-nonprod` | unavailable | not run |
-| production | `mercury-prod` | unavailable | not run |
 
-Distinct account fingerprints are not proven. Account access remains the first
-blocked category after the passing tool checks.
+The current authenticated account is not yet proven as the sanitized
+`mercury-nonprod` fingerprint. Account access remains the first blocked category
+after the passing tool checks. Wave 0 neither requires nor creates
+`mercury-prod`.
 
 ## Region And Service Probes
 
 The configured Region is exactly `ap-southeast-1`. Every required probe below
-is present in the closed configuration, but neither account was probed live.
+is present in the closed configuration, but nonprod was not probed live.
 
-| Probe | nonprod | production |
-| --- | --- | --- |
-| `agentcore_runtime` | not run | not run |
-| `agentcore_gateway` | not run | not run |
-| `agentcore_identity` | not run | not run |
-| `bedrock_knowledge_bases` | not run | not run |
-| `aurora_postgresql` | not run | not run |
-| `s3` | not run | not run |
-| `kms` | not run | not run |
-| `ecr` | not run | not run |
-| `cloudwatch_logs` | not run | not run |
-| `agentcore_quotas` | not run | not run |
+| Probe | nonprod |
+| --- | --- |
+| `agentcore_runtime` | not run |
+| `agentcore_gateway` | not run |
+| `agentcore_identity` | not run |
+| `bedrock_knowledge_bases` | not run |
+| `aurora_postgresql` | not run |
+| `s3` | not run |
+| `kms` | not run |
+| `ecr` | not run |
+| `cloudwatch_logs` | not run |
+| `agentcore_quotas` | not run |
 
 No service or quota availability claim is made.
 
 ## OIDC And Identity
 
 - Nonprod GitHub Actions run URL: absent; no URL or hash recorded.
-- Production GitHub Actions run URL: absent; no URL or hash recorded.
 - OIDC workflow dispatch: not performed.
-- OIDC CLI inputs require explicit `nonprod=URL` and `production=URL` bindings
-  from two separate workflow dispatches with distinct nonces and run URLs.
+- OIDC CLI input requires one explicit `nonprod=URL` binding from one workflow
+  dispatch.
 - URL shape or order does not create pass evidence. When bindings exist, the
   public final gate accepts only explicit run references and independently
   verifies closed run metadata, workflow identity, the expected successful
@@ -94,7 +94,7 @@ No service or quota availability claim is made.
 - Caller-constructed `OidcRunEvidence`, including a matching deterministic
   digest, cannot be supplied to the public final gate to produce `ready`.
 - No `gh` or CloudFormation call ran during this blocked offline gate execution:
-  the account gate is evaluated first and both OIDC bindings are absent.
+  the account gate is evaluated first and the nonprod OIDC binding is absent.
 - Identity decision file: absent.
 - Identity decision reads reject symlinked parent components and final
   symlinks before parsing or hashing evidence.
@@ -151,10 +151,9 @@ commit that contains its own update.
 ## Blockers And Stop Decision
 
 Wave 0 remains blocked until all of the following owner-controlled live evidence
-exists: two reachable short-lived AWS profiles with distinct account
-fingerprints, all service and quota probes in both accounts, two distinct
-successful GitHub Actions OIDC run URLs, and one validated identity decision
-with three current host-bound proof references covering Codex, ChatGPT, and
-Claude, plus verified deletion/absence of the disposable Cognito stack. Both
-Wave 0 checkboxes remain unchecked. Wave 1 planning and execution must not
-begin.
+exists: one reachable short-lived `mercury-nonprod` profile with a sanitized
+account fingerprint, all service and quota probes in nonprod, one successful
+nonprod GitHub Actions OIDC run URL, and one validated identity decision with
+three current host-bound proof references covering Codex, ChatGPT, and Claude,
+plus verified deletion/absence of the disposable Cognito stack. Both Wave 0
+checkboxes remain unchecked. Wave 1 planning and execution must not begin.

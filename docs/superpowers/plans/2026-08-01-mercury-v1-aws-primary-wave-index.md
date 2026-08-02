@@ -15,7 +15,8 @@
 - FastMCP remains the MCP protocol layer inside AgentCore Runtime.
 - The first AWS runtime uses `mcp==1.26.0` and `from mcp.server.fastmcp import FastMCP`; a standalone FastMCP upgrade requires a later gated compatibility decision.
 - The primary AWS Region is `ap-southeast-1`.
-- AWS accounts are isolated from the beginning as `mercury-nonprod` and `mercury-prod`.
+- Wave 0 uses the current authenticated AWS account as `mercury-nonprod` for development and qualification. `mercury-prod` is created only in Wave 7, before any production canary or release.
+- No production customer or provider data may enter nonprod. Production remains a separate AWS account before the first production canary.
 - There is no hybrid runtime, dual-write period, or migration of current test tenants, credentials, operations, or audit records.
 - The Capability Catalog is the only execution authority. Skills and RAG may explain or route but cannot enable an endpoint or operation.
 - ERP credentials never enter chat, model context, MCP arguments, widgets, RAG, logs, audit output, or Git.
@@ -48,14 +49,14 @@ domain contracts.
 
 | Wave | Produces | Consumed by |
 | --- | --- | --- |
-| 0 | Secret-safe AWS readiness report, two-account bindings, Singapore service/quota evidence, GitHub OIDC proof, identity compatibility decision | Wave 1 environment and identity inputs |
-| 1 | CDK application, isolated VPC/KMS/ECR/S3/Aurora foundations, budgets, baseline CloudWatch | Waves 2-8 |
+| 0 | Secret-safe nonprod AWS readiness report, Singapore service/quota evidence, one nonprod GitHub OIDC proof, identity compatibility decision | Wave 1 environment and identity inputs |
+| 1 | CDK application, nonprod VPC/KMS/ECR/S3/Aurora foundations, nonprod budgets, baseline CloudWatch | Waves 2-8 |
 | 2 | AgentCore Runtime-hosted FastMCP `/mcp`, validated inbound identity, token-derived tenant/workspace context | Waves 3-8 |
 | 3 | Aurora product stores, Git-published Skills, S3 sources, Bedrock Knowledge Base retrieval | Waves 4-8 |
 | 4 | AgentCore Gateway targets, provider credential bindings, qualified reads, connector-learning quarantine, capability coverage | Waves 5-8 |
 | 5 | Exact mutation tools, preview/confirmation state machine, dispatch, idempotency, reconciliation, batch behavior | Waves 6-8 |
 | 6 | One-click plugin, install authentication, minimal Web Console, Thai preview widget and text fallback | Waves 7-8 |
-| 7 | Nonprod qualification, security/load/backup evidence, owner-authorized production canaries, release candidate | Wave 8 |
+| 7 | Nonprod qualification, security/load/backup evidence, separate `mercury-prod` account and foundation, production OIDC proof, production-canary prerequisites, owner-authorized production canaries, release candidate | Wave 8 |
 | 8 | Canonical AWS MCP URL, clean-install verification, Render/Supabase decommission evidence, `v1.0.0` release | Product operation |
 
 ## Wave Gates
@@ -66,7 +67,7 @@ domain contracts.
 
 **Entry:** Approved AWS-primary Written Spec and a repository branch based on commit `9330e67`.
 
-**Exit:** Both AWS accounts are reachable through short-lived identity, Singapore probes pass, GitHub OIDC assumes a read-only smoke role in each account, and the one-issuer compatibility decision is recorded without credentials.
+**Exit:** The current authenticated account is bound as `mercury-nonprod` through short-lived identity, Singapore probes pass, GitHub OIDC assumes one nonprod read-only smoke role, and the one-issuer compatibility decision is recorded without credentials.
 
 - [ ] Execute the bounded Wave 0 plan.
 - [ ] Review Wave 0 evidence and stop for owner approval.
@@ -81,7 +82,7 @@ service/quota, OIDC, and identity proof remains absent. Wave 1 is not authorized
 
 **Entry:** Owner-approved Wave 0 evidence.
 
-**Exit:** Isolated nonprod/prod foundations exist through reviewed CDK diffs; no customer or provider data is loaded.
+**Exit:** Nonprod foundations exist through reviewed CDK diffs; no production customer or provider data is loaded.
 
 - [ ] Write the bounded Wave 1 plan only after Wave 0 approval.
 - [ ] Execute, review, and stop for owner approval.
@@ -147,7 +148,7 @@ service/quota, OIDC, and identity proof remains absent. Wave 1 is not authorized
 
 **Entry:** Owner-approved one-click product surfaces.
 
-**Exit:** Provider qualification, failure/security/load tests, backup/restore proof, production canaries, and public coverage report all pass.
+**Exit:** Nonprod qualification, failure/security/load tests, and backup/restore proof pass; `mercury-prod` is created as a separate account, its production foundation and GitHub OIDC deployment path are proven, production-canary prerequisites pass, and owner-authorized production canaries and the public coverage report pass.
 
 - [ ] Write the bounded Wave 7 plan only after Wave 6 approval.
 - [ ] Execute, review, and stop for owner approval.

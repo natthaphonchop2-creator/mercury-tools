@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Produce a repeatable, secret-safe proof that Mercury can begin AWS-primary implementation in two isolated accounts in Singapore, with GitHub OIDC and one compatible customer identity strategy.
+**Goal:** Produce a repeatable, secret-safe proof that Mercury can begin AWS-primary implementation in the current authenticated account as `mercury-nonprod` in Singapore, with one nonprod GitHub OIDC proof and one compatible customer identity strategy.
 
 **Architecture:** Wave 0 adds an offline-testable Python readiness package and deterministic Node toolchain, then uses short-lived AWS profiles to collect live account, Region, quota, and OIDC evidence. It creates no Mercury runtime, database, customer tenant, provider connector, or persistent business data; one disposable Cognito stack is allowed only for identity compatibility testing and is deleted before the Wave closes.
 
@@ -14,13 +14,14 @@
 - The program controller is `docs/superpowers/plans/2026-08-01-mercury-v1-aws-primary-wave-index.md`.
 - Execute Wave 0 only. Do not create Wave 1 VPC, KMS, ECR, S3, Aurora, Runtime, Gateway, Knowledge Base, or customer identity resources.
 - The primary Region is exactly `ap-southeast-1`; every live AWS command passes it explicitly and does not alter the user's default Region.
-- Use separate accounts named `mercury-nonprod` and `mercury-prod`; their account fingerprints must differ.
+- Use the current authenticated AWS account as `mercury-nonprod` for development, sandbox, UAT, and qualification. Do not require, create, or bind `mercury-prod` in Wave 0.
+- No production customer or provider data may enter nonprod. Wave 7 creates the separate production account, deploys its production foundation, and proves production OIDC before any production canary.
 - Local access uses short-lived AWS profiles. Do not create IAM users or long-lived access keys.
 - GitHub assumes read-only Wave 0 roles through OIDC. No AWS access key is stored in GitHub.
 - Do not accept, print, store, or commit passwords, access keys, secret keys, session tokens, provider credentials, raw JWTs, cookies, or authorization headers.
 - Machine evidence is written only under `.artifacts/aws/wave0/`, which is gitignored. Committed evidence contains statuses, hashes, Region, aliases, tool versions, and public documentation links only.
 - AWS account IDs and principal ARNs may be read transiently but account IDs appear in reports only as `sha256(account_id)[:12]` fingerprints.
-- The suspended AWS account is a known hard gate. Offline tasks may pass, but Wave 0 cannot complete until both live accounts and required service calls succeed.
+- The suspended AWS account is a known hard gate. Offline tasks may pass, but Wave 0 cannot complete until the nonprod account and its required service calls succeed.
 - One inbound issuer serves the plugin and Web Console. Select `cognito_pre_registered` only if Codex, ChatGPT, and Claude all pass public-client authorization code plus PKCE; otherwise select one tested `external_oidc_dcr` issuer for all hosts and the console.
 - The disposable Cognito stack contains no customer, provider, or production data and is deleted after evidence capture.
 - Keep package version `0.3.1`; do not tag or publish a release in Wave 0.
@@ -45,7 +46,7 @@
 | `scripts/check_aws_readiness.py` | Human/JSON readiness entry point |
 | `scripts/record_identity_probe.py` | Secret-free identity evidence recorder |
 | `infra/aws/wave0/github-oidc-role.yaml` | Read-only GitHub OIDC smoke role |
-| `.github/workflows/aws-wave0-oidc-smoke.yml` | Manual nonprod/prod OIDC proof |
+| `.github/workflows/aws-wave0-oidc-smoke.yml` | Manual nonprod OIDC proof |
 | `infra/aws/wave0/cognito-compatibility-spike.yaml` | Disposable public-client Cognito test stack |
 | `infra/aws/wave0/identity-host-contract.yaml` | Codex, ChatGPT, and Claude test requirements |
 | `infra/aws/wave0/identity-decision.yaml` | Committed one-issuer result after live proof |
@@ -128,12 +129,8 @@ CONFIG_PATH = ROOT / "infra/aws/wave0/environment.yaml"
 def test_config_locks_region_accounts_and_repository() -> None:
     config = load_wave0_config(CONFIG_PATH)
     assert config.primary_region == "ap-southeast-1"
-    assert tuple(item.alias for item in config.accounts) == (
-        "mercury-nonprod", "mercury-prod"
-    )
-    assert tuple(item.github_environment for item in config.accounts) == (
-        "nonprod", "production"
-    )
+    assert tuple(item.alias for item in config.accounts) == ("mercury-nonprod",)
+    assert tuple(item.github_environment for item in config.accounts) == ("nonprod",)
     assert config.github_repository == "natthaphonchop2-creator/mercury-tools"
 
 
@@ -146,9 +143,9 @@ def test_config_rejects_non_singapore_region(tmp_path: Path) -> None:
         load_wave0_config(path)
 
 
-def test_config_requires_distinct_accounts(tmp_path: Path) -> None:
+def test_config_rejects_multiple_wave_zero_accounts(tmp_path: Path) -> None:
     raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-    raw["accounts"][1]["alias"] = "mercury-nonprod"
+    raw["accounts"].append(raw["accounts"][0])
     path = tmp_path / "environment.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     with pytest.raises(ValidationError):
@@ -212,7 +209,6 @@ Use frozen `extra="forbid"` Pydantic models. Define exact enum values:
 ```python
 class EnvironmentName(StrEnum):
     NONPROD = "nonprod"
-    PRODUCTION = "production"
 
 
 class GateStatus(StrEnum):
@@ -235,7 +231,7 @@ class CheckState(StrEnum):
 
 `Wave0Config` locks schema `mercury.aws.wave0.config.v1`, Region
 `ap-southeast-1`, repository `natthaphonchop2-creator/mercury-tools`, exactly
-two account targets, and all ten probe IDs. `CheckResult` permits only a stable
+one nonprod account target, and all ten probe IDs. `CheckResult` permits only a stable
 name, state, code, summary up to 240 characters, and scalar details with safe
 keys. Validate summaries/details with `validate_credential_safe` and
 `validate_credential_safe_paths`.
@@ -251,10 +247,6 @@ accounts:
     alias: mercury-nonprod
     profile: mercury-nonprod
     github_environment: nonprod
-  - environment: production
-    alias: mercury-prod
-    profile: mercury-prod
-    github_environment: production
 required_service_probes:
   - agentcore_runtime
   - agentcore_gateway
@@ -337,14 +329,13 @@ def test_account_ids_are_fingerprinted() -> None:
     assert result != "123456789012"
 
 
-def test_same_account_for_two_profiles_is_blocked() -> None:
+def test_unavailable_nonprod_profile_blocks_account_access() -> None:
     config = load_wave0_config(CONFIG_PATH)
-    runner = FakeRunner.for_sts_accounts(
-        mercury_nonprod="123456789012",
-        mercury_prod="123456789012",
+    runner = FakeRunner.with_failed_command(
+        ("aws", "sts", "get-caller-identity")
     )
     checks = check_aws_accounts(config, runner)
-    assert any(item.code == "aws_accounts_not_isolated" for item in checks)
+    assert any(item.code == "aws_account_access_blocked" for item in checks)
 
 
 def test_failed_required_service_blocks_region() -> None:
@@ -411,14 +402,14 @@ TOOL_COMMANDS = {
 Require AWS CLI `>=2.36.14`, Node `>=20`, Python `>=3.11,<3.14`, AgentCore
 `0.25.0`, and CDK `2.1134.0`.
 
-For each account profile run:
+For the nonprod account profile run:
 
 ```text
 aws sts get-caller-identity --profile PROFILE --region ap-southeast-1 --output json --no-cli-pager
 ```
 
 Parse only `Account`, require 12 digits, and report only
-`sha256(account_id)[:12]`. The two account fingerprints must differ.
+`sha256(account_id)[:12]`.
 
 Define exact service command suffixes:
 
@@ -469,7 +460,7 @@ agentcore/.cli/
 --skip-live
 ```
 
-Default behavior runs local and live checks for both profiles. `--skip-live`
+Default behavior runs local and live checks for the nonprod profile. `--skip-live`
 emits `blocked_account_access` and exists only for offline serialization tests.
 Exit codes are `0=ready`, `2=blocked`, `3=invalid or unsafe input`. Write JSON
 atomically with file mode `0o600`; reject output outside
@@ -492,9 +483,10 @@ git commit -m "feat: add secret-safe AWS readiness probes"
 
 Expected before AWS restoration: tests/lint pass and live CLI exits 2 with
 `blocked_account_access`, without account IDs or credentials. Expected after
-restoration: live CLI exits 0 only when every profile and service probe passes.
+restoration: live CLI exits 0 only when the nonprod profile and every service
+probe pass.
 
-### Task 3: Prove Two-Account Access and GitHub OIDC
+### Task 3: Prove Nonprod Access and GitHub OIDC
 
 **Files:**
 
@@ -505,8 +497,8 @@ restoration: live CLI exits 0 only when every profile and service probe passes.
 
 **Interfaces:**
 
-- Consumes: Account profiles, Region, probe list, and GitHub repository from Tasks 1-2.
-- Produces: one `MercuryWave0GithubOidcRoleArn` output per account and one successful OIDC smoke job per GitHub environment.
+- Consumes: The nonprod account profile, Region, probe list, and GitHub repository from Tasks 1-2.
+- Produces: one `MercuryWave0GithubOidcRoleArn` output in nonprod and one successful nonprod OIDC smoke job.
 
 - [ ] **Step 1: Write failing template and workflow tests**
 
@@ -558,8 +550,8 @@ Expected: failures because template/workflow files are absent.
 - [ ] **Step 3: Implement the read-only OIDC role and workflow**
 
 The CloudFormation template accepts `GitHubOidcProviderArn` with an exact IAM
-OIDC provider ARN pattern and `GitHubEnvironment` with allowed values
-`nonprod`, `production`. The role trust conditions are:
+OIDC provider ARN pattern and `GitHubEnvironment` fixed to `nonprod`. The role
+trust conditions are:
 
 ```yaml
 StringEquals:
@@ -571,8 +563,8 @@ StringEquals:
 The inline policy permits only STS identity plus the list/describe calls from
 Task 2. Output the role ARN as `MercuryWave0GithubOidcRoleArn`.
 
-The manual workflow uses a matrix for `nonprod` and `production`, GitHub
-environment variable `AWS_WAVE0_ROLE_ARN`, Region `ap-southeast-1`, and this
+The manual workflow uses the `nonprod` GitHub environment variable
+`AWS_WAVE0_ROLE_ARN`, Region `ap-southeast-1`, and this
 immutable action:
 
 ```yaml
@@ -591,33 +583,27 @@ the environment and `wave0_oidc_smoke=pass`.
 The runbook gives exact owner actions:
 
 1. restore the AWS management account and verify billing/account status;
-2. create or rename Organizations member accounts exactly
-   `mercury-nonprod` and `mercury-prod`, keeping account emails out of Git/chat;
+2. bind the current authenticated account as `mercury-nonprod`, keeping its
+   account email out of Git/chat; do not create or bind `mercury-prod`;
 3. assign short-lived IAM Identity Center access and run:
 
 ```bash
 aws configure sso --profile mercury-nonprod
-aws configure sso --profile mercury-prod
 aws sso login --profile mercury-nonprod
-aws sso login --profile mercury-prod
 ```
 
-4. create the GitHub OIDC provider once per account when absent:
+4. create the GitHub OIDC provider in nonprod when absent:
 
 ```bash
 aws iam create-open-id-connect-provider \
   --url https://token.actions.githubusercontent.com \
   --client-id-list sts.amazonaws.com \
   --profile mercury-nonprod
-aws iam create-open-id-connect-provider \
-  --url https://token.actions.githubusercontent.com \
-  --client-id-list sts.amazonaws.com \
-  --profile mercury-prod
 ```
 
-5. deploy `github-oidc-role.yaml`, set each output ARN with
-   `gh variable set AWS_WAVE0_ROLE_ARN --env`, protect `production` with a
-   required reviewer, and run the smoke workflow.
+5. deploy `github-oidc-role.yaml`, set its output ARN with
+   `gh variable set AWS_WAVE0_ROLE_ARN --env nonprod`, and run the nonprod
+   smoke workflow.
 
 State that an existing provider is reused and no AWS credential-file value is
 copied into GitHub.
@@ -636,7 +622,7 @@ git add infra/aws/wave0/github-oidc-role.yaml \
 git commit -m "feat: prove AWS access through GitHub OIDC"
 ```
 
-Expected: local checks pass and both jobs succeed. If AWS remains suspended,
+Expected: local checks pass and the nonprod job succeeds. If AWS remains suspended,
 commit offline artifacts, record `blocked_account_access`, and leave the live
 step unchecked.
 
@@ -837,15 +823,15 @@ Wave 0 blocked.
 
 **Interfaces:**
 
-- Consumes: Readiness report, two successful OIDC run URLs, and the validated identity decision.
+- Consumes: Readiness report, one successful nonprod OIDC run URL, and the validated identity decision.
 - Produces: `OidcRunEvidence(environment: EnvironmentName, run_url: AnyHttpUrl, evidence_sha256: str)`, `finalize_wave0_gate(report: ReadinessReport, identity_decision: IdentityDecision | None, oidc_evidence: tuple[OidcRunEvidence, ...]) -> GateStatus`, and one sanitized owner-review record.
 
 - [ ] **Step 1: Write failing final-gate tests**
 
 ```python
-def test_gate_requires_distinct_ready_accounts() -> None:
+def test_gate_requires_ready_nonprod_account() -> None:
     assert finalize_wave0_gate(
-        report_with_same_account_fingerprints(), valid_identity(), valid_oidc()
+        report_without_account_fingerprint(), valid_identity(), valid_oidc()
     ) == "blocked_account_access"
 
 
@@ -855,13 +841,11 @@ def test_gate_requires_every_service_and_quota_probe() -> None:
     ) == "blocked_region_service"
 
 
-def test_gate_requires_identity_and_both_oidc_jobs() -> None:
+def test_gate_requires_identity_and_nonprod_oidc_job() -> None:
     assert finalize_wave0_gate(ready_report(), None, valid_oidc()) == (
         "blocked_identity_compatibility"
     )
-    assert finalize_wave0_gate(ready_report(), valid_identity(), one_oidc_job()) == (
-        "blocked_account_access"
-    )
+    assert finalize_wave0_gate(ready_report(), valid_identity(), ()) == "blocked_account_access"
 
 
 def test_gate_is_ready_only_with_complete_proof() -> None:
@@ -878,26 +862,25 @@ Expected: failures for undefined final-gate behavior.
 
 - [ ] **Step 3: Implement the independent final gate**
 
-The gate revalidates schema versions, Region, aliases, different account
-fingerprints, all ten probes in each account, pinned tools, both OIDC GitHub
-environments, all three host identity results, and credential-safe fields.
+The gate revalidates schema versions, Region, the `mercury-nonprod` alias and
+account fingerprint, all ten probes in nonprod, pinned tools, the nonprod OIDC
+GitHub environment, all three host identity results, and credential-safe fields.
 
 Define `OidcRunEvidence` as a frozen, extra-forbidden Pydantic model with
 `environment: EnvironmentName`, `run_url: AnyHttpUrl`, and a lowercase
-64-character `evidence_sha256`. Validate that the URL host is `github.com`, its
-path begins with `/natthaphonchop2-creator/mercury-tools/actions/runs/`, and the
-two evidence records use different environments and run URLs.
+64-character `evidence_sha256`. Validate that the environment is `nonprod` and
+the URL host is `github.com` with a path beginning
+`/natthaphonchop2-creator/mercury-tools/actions/runs/`.
 
 Add CLI arguments:
 
 ```text
 --identity-decision infra/aws/wave0/identity-decision.yaml
 --oidc-run-url URL
---oidc-run-url URL
 ```
 
 Store only SHA-256 hashes of identity and OIDC evidence in machine output. A
-ready result requires exactly two distinct HTTPS GitHub Actions run URLs.
+ready result requires exactly one HTTPS nonprod GitHub Actions run URL.
 
 - [ ] **Step 4: Run the complete Wave 0 verification matrix**
 
@@ -915,7 +898,6 @@ uv run ruff check src/mercury_tools/aws scripts/check_aws_readiness.py \
 uv run python scripts/check_aws_readiness.py \
   --identity-decision infra/aws/wave0/identity-decision.yaml \
   --oidc-run-url "$MERCURY_NONPROD_OIDC_RUN_URL" \
-  --oidc-run-url "$MERCURY_PROD_OIDC_RUN_URL" \
   --output .artifacts/aws/wave0/readiness.json
 git diff --check
 ```
@@ -961,14 +943,15 @@ Do not draft or execute Wave 1 until the owner explicitly approves Wave 0.
 
 ## Wave 0 Acceptance Checklist
 
-- [ ] AWS account suspension is resolved and both short-lived profiles pass STS.
-- [ ] `mercury-nonprod` and `mercury-prod` produce different account fingerprints.
-- [ ] All required AgentCore, Bedrock, Aurora, S3, KMS, ECR, CloudWatch, and quota probes pass in `ap-southeast-1` for both accounts.
-- [ ] GitHub OIDC assumes the read-only role in `nonprod` and `production` without long-lived AWS keys.
+- [ ] AWS account suspension is resolved and the `mercury-nonprod` short-lived profile passes STS.
+- [ ] The authenticated account is recorded only as the sanitized `mercury-nonprod` fingerprint.
+- [ ] All required AgentCore, Bedrock, Aurora, S3, KMS, ECR, CloudWatch, and quota probes pass in `ap-southeast-1` for nonprod.
+- [ ] GitHub OIDC assumes the read-only role in `nonprod` without long-lived AWS keys.
 - [ ] Codex, ChatGPT, and Claude are covered by one identity mode and one issuer strategy.
 - [ ] The Cognito compatibility stack is deleted.
 - [ ] Machine evidence remains ignored and sanitized evidence is committed.
 - [ ] No customer/provider data, credentials, Mercury runtime, or Wave 1 infrastructure exists.
+- [ ] No production customer or provider data entered nonprod, and no production account was created or bound in Wave 0.
 - [ ] Focused tests, Ruff, whitespace checks, and secret scans pass.
 - [ ] Owner reviews the evidence before Wave 1 planning begins.
 

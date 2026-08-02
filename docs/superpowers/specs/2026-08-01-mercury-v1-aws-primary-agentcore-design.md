@@ -215,13 +215,15 @@ resources are created.
 
 ### 7.2 Account isolation
 
-Mercury uses separate AWS accounts from the beginning:
+Wave 0 uses the current authenticated AWS account as `mercury-nonprod` for
+development, sandbox, UAT, and qualification. It does not require or create
+`mercury-prod`.
 
-- `mercury-nonprod` for development, sandbox, UAT, and qualification
-- `mercury-prod` for production customer traffic and provider credentials
-
-The accounts do not share VPCs, databases, KMS keys, buckets, identity clients,
-or credential vault entries.
+No production customer or provider data may enter `mercury-nonprod`. Wave 7
+creates the separate `mercury-prod` account, deploys its production foundation,
+and proves its GitHub OIDC deployment path before any production canary or
+release. The accounts must not share VPCs, databases, KMS keys, buckets,
+identity clients, or credential vault entries.
 
 ### 7.3 Infrastructure as code
 
@@ -783,16 +785,16 @@ read the current Space
 ### Wave 0: AWS access and architecture readiness
 
 - restore AWS account access
-- create nonprod and production accounts
-- verify Singapore service availability and quotas
-- prove GitHub OIDC and local STS access
+- bind the current authenticated account as `mercury-nonprod`
+- verify Singapore service availability and quotas in nonprod
+- prove nonprod GitHub OIDC and local STS access
 - finalize the identity compatibility result
 
 ### Wave 1: AWS foundation
 
 - CDK project and environment configuration
 - VPC, KMS, ECR, S3, Aurora, budgets, and baseline CloudWatch
-- no customer or provider data
+- deploy nonprod foundations only; no customer or provider data
 
 ### Wave 2: FastMCP Runtime and inbound identity
 
@@ -833,6 +835,10 @@ read the current Space
 
 - provider non-production qualification
 - failure, security, load, backup, and restore tests
+- create the separate `mercury-prod` account after nonprod qualification passes
+- deploy the production foundation and prove its GitHub OIDC deployment path
+- verify production-canary prerequisites without moving production customer or
+  provider data into nonprod
 - owner-authorized production canaries
 - public capability coverage report
 
@@ -857,9 +863,10 @@ supplies reasoning. Primary Mercury costs are:
 - S3 and Bedrock Knowledge Base ingestion/retrieval
 - Identity, KMS, Lambda, API Gateway, and CloudWatch usage
 
-Nonprod and production budgets and alarms are provisioned in Wave 1. Expensive
-optional AgentCore features, including Harness and conversational Memory, are
-not enabled without a separate owner-approved design.
+Nonprod budgets and alarms are provisioned in Wave 1. Production budgets and
+alarms are provisioned only with the separate production foundation in Wave 7.
+Expensive optional AgentCore features, including Harness and conversational
+Memory, are not enabled without a separate owner-approved design.
 
 ## 23. Definition of Done
 
