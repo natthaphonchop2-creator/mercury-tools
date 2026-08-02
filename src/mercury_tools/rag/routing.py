@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
+from datetime import date
 from typing import Any, Literal
+from uuid import UUID
 
 KnowledgeDomain = Literal[
     "connector_endpoint",
@@ -68,6 +71,63 @@ DOMAIN_DOC_TYPES: dict[KnowledgeDomain, str] = {
     "tax": "tax",
     "workflow": "workflow",
 }
+
+V1_KNOWLEDGE_FILTER_FIELDS = frozenset(
+    {
+        "jurisdiction",
+        "provider",
+        "doc_type",
+        "review_status",
+        "effective_on",
+        "source_id",
+        "capability_version",
+    }
+)
+V1KnowledgeSearchMode = Literal["keyword", "hybrid"]
+_V1_SELECTOR = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
+_V1_CAPABILITY_VERSION = re.compile(r"^[0-9a-f]{64}$")
+
+
+def normalize_v1_knowledge_filters(
+    filters: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    """Validate the closed V1 filter contract without preserving rejected values."""
+
+    if filters is None:
+        return {}
+    if not isinstance(filters, Mapping) or set(filters) - V1_KNOWLEDGE_FILTER_FIELDS:
+        raise ValueError("knowledge_filters_invalid")
+
+    normalized: dict[str, str] = {}
+    try:
+        for field, value in filters.items():
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise ValueError
+            if field in {"jurisdiction", "provider", "doc_type", "review_status"}:
+                if _V1_SELECTOR.fullmatch(value) is None:
+                    raise ValueError
+            elif field == "effective_on":
+                if date.fromisoformat(value).isoformat() != value:
+                    raise ValueError
+            elif field == "source_id":
+                if str(UUID(value)) != value.lower():
+                    raise ValueError
+            elif field == "capability_version" and _V1_CAPABILITY_VERSION.fullmatch(value) is None:
+                raise ValueError
+            normalized[field] = value
+    except (TypeError, ValueError):
+        raise ValueError("knowledge_filters_invalid") from None
+    return normalized
+
+
+def validate_v1_search_mode(mode: str) -> V1KnowledgeSearchMode:
+    """Keep both V1 production modes on the PostgreSQL full-text path."""
+
+    if mode not in {"keyword", "hybrid"}:
+        raise ValueError("knowledge_search_mode_invalid")
+    return mode
 
 
 def infer_connector_id(query: str) -> str | None:

@@ -11,8 +11,11 @@ requires-python = ">=3.11,<3.14"
 license = "MIT"
 authors = [{ name = "Mercury Agent" }]
 dependencies = [
+  "cryptography>=45,<47",
   "httpx==0.28.1",
+  "jsonschema[format-nongpl]>=4.26,<5",
   "mcp==1.26.0",
+  "PyJWT[crypto]>=2.10,<3",
   "pydantic==2.13.4",
   "python-dotenv==1.2.2",
   "pyyaml==6.0.3",
@@ -43,6 +46,8 @@ mercury-tools = "mercury_tools.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
+"mercury_tools.auth" = ["templates/*.html"]
+"mercury_tools.providers" = ["templates/*.html"]
 "mercury_tools.catalog" = ["global/*/semantic-contracts.json"]
 
 [tool.pytest.ini_options]

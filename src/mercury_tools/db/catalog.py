@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -14,10 +15,14 @@ from mercury_tools.catalog.models import (
     CatalogAction,
     CatalogSource,
     HttpMethod,
+    ProviderMCPQualification,
+    QualificationState,
     revalidate_catalog_action,
     revalidate_catalog_source,
 )
 from mercury_tools.config import Settings, require_supabase
+from mercury_tools.qualification.artifacts import QualificationArtifact
+from mercury_tools.qualification.provider_mcp import transition_qualification
 
 _FILTER_COLUMNS = {
     "capability": "capability",
@@ -65,8 +70,7 @@ class SupabaseCatalogStore:
             params={"on_conflict": "action_id,version_id"},
             headers={"Prefer": "resolution=ignore-duplicates,return=representation"},
             json=[
-                _version_payload(action, validated_source.source_id)
-                for action in validated_actions
+                _version_payload(action, validated_source.source_id) for action in validated_actions
             ],
         )
         self._request(
@@ -85,9 +89,7 @@ class SupabaseCatalogStore:
 
     def list_active_actions(self, filters: Mapping[str, str] | None = None) -> list[CatalogAction]:
         params = _filter_params(filters)
-        params["select"] = _active_select(
-            method_filtered="erp_action_versions.method" in params
-        )
+        params["select"] = _active_select(method_filtered="erp_action_versions.method" in params)
         rows = self._request("GET", "erp_action_catalog", params=params)
         if not isinstance(rows, list):
             raise RuntimeError("supabase_catalog_response_invalid")
@@ -100,6 +102,140 @@ class SupabaseCatalogStore:
             except (KeyError, TypeError, ValueError):
                 raise ValueError("catalog_active_action_invalid") from None
         return actions
+
+    def list_provider_mcp_qualifications(self) -> list[ProviderMCPQualification]:
+        """Load the separate V1 execution authority; legacy actions are not evidence."""
+
+        rows = self._request(
+            "GET",
+            "mercury_provider_capability_qualifications",
+            params={
+                "select": (
+                    "id,provider,environment,provider_tool_name,normalized_capability,"
+                    "input_schema,output_schema,public_output_field_paths,"
+                    "schema_hash,response_shape_hash,"
+                    "required_permissions,capability_version_sha256,qualification_state,"
+                    "company_sha256,evidence_revision_sha256,qualification_evidence_uri,"
+                    "evidence_evaluated_at,evidence_expires_at,"
+                    "nonproduction_evidence_revision_sha256,nonproduction_company_sha256,"
+                    "production_canary_at,owner_authorized_by,disable_reason"
+                ),
+                "order": (
+                    "provider.asc,environment.asc,normalized_capability.asc,"
+                    "provider_tool_name.asc,capability_version_sha256.asc"
+                ),
+            },
+        )
+        if not isinstance(rows, list):
+            raise RuntimeError("supabase_catalog_response_invalid")
+        try:
+            return [ProviderMCPQualification.model_validate(row) for row in rows]
+        except (TypeError, ValueError):
+            raise ValueError("catalog_qualification_invalid") from None
+
+    def publish_provider_mcp_qualification(
+        self,
+        qualification: ProviderMCPQualification,
+        *,
+        artifact: QualificationArtifact | None = None,
+    ) -> str:
+        """Use the only database mutation path for V1 qualification revisions."""
+
+        try:
+            checked = ProviderMCPQualification.model_validate(qualification)
+            checked_artifact = (
+                QualificationArtifact.model_validate(artifact) if artifact is not None else None
+            )
+            if (
+                checked.qualification_state
+                in {QualificationState.NONPRODUCTION_QUALIFIED, QualificationState.ENABLED}
+                and checked_artifact is None
+            ):
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ValueError("catalog_qualification_invalid") from None
+        result = self._request(
+            "POST",
+            "rpc/publish_mercury_provider_capability_qualification",
+            json={
+                "p_qualification": checked.model_dump(mode="json"),
+                "p_artifact": (
+                    checked_artifact.model_dump(mode="json")
+                    if checked_artifact is not None
+                    else None
+                ),
+            },
+        )
+        if not isinstance(result, str):
+            raise RuntimeError("supabase_catalog_response_invalid")
+        return result
+
+    def disable_provider_mcp_capability_version(
+        self,
+        qualification: ProviderMCPQualification,
+    ) -> tuple[ProviderMCPQualification, ...]:
+        """Persist the exact schema-changed terminal transition idempotently.
+
+        The existing SQL mutation allows enabled -> disabled and keeps immutable
+        version evidence intact. Re-reading after a concurrent winner makes this
+        adapter idempotent without widening that transition graph or requiring a
+        database migration.
+        """
+
+        checked = ProviderMCPQualification.model_validate(qualification)
+        identity = (
+            checked.provider,
+            checked.environment,
+            checked.provider_tool_name,
+            checked.normalized_capability,
+            checked.capability_version_sha256,
+        )
+
+        def matching() -> list[ProviderMCPQualification]:
+            return [
+                item
+                for item in self.list_provider_mcp_qualifications()
+                if (
+                    item.provider,
+                    item.environment,
+                    item.provider_tool_name,
+                    item.normalized_capability,
+                    item.capability_version_sha256,
+                )
+                == identity
+            ]
+
+        rows = matching()
+        if not rows:
+            raise ValueError("catalog_qualification_invalid")
+        pending = [item for item in rows if item.qualification_state is QualificationState.ENABLED]
+        terminal = [
+            item
+            for item in rows
+            if item.qualification_state is QualificationState.DISABLED
+            and item.disable_reason == "schema_changed"
+        ]
+        if len(pending) + len(terminal) != len(rows):
+            raise ValueError("catalog_qualification_invalid")
+        for item in pending:
+            disabled = transition_qualification(
+                item,
+                QualificationState.DISABLED,
+                disable_reason="schema_changed",
+                now=datetime.now(UTC),
+            )
+            try:
+                self.publish_provider_mcp_qualification(disabled)
+            except RuntimeError:
+                # A concurrent worker may have committed the exact same terminal state.
+                current = matching()
+                if not current or any(
+                    row.qualification_state is not QualificationState.DISABLED
+                    or row.disable_reason != "schema_changed"
+                    for row in current
+                ):
+                    raise
+        return tuple(self.list_provider_mcp_qualifications())
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = f"{self.base_url}/{path.lstrip('/')}"

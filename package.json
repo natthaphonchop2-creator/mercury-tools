@@ -1,0 +1,9 @@
+{
+  "name": "mercury-tools-aws-tooling",
+  "private": true,
+  "engines": {"node": ">=20"},
+  "devDependencies": {
+    "@aws/agentcore": "0.25.0",
+    "aws-cdk": "2.1134.0"
+  }
+}

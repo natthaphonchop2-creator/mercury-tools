@@ -4,18 +4,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import os
 import re
-from collections.abc import Mapping
+import threading
+from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 from urllib.parse import urlparse
 
+import httpx
 from mcp.server.fastmcp import FastMCP
-from mcp.types import ToolAnnotations
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import TextContent, ToolAnnotations
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -23,8 +27,21 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
 from mercury_tools import __version__
-from mercury_tools.cloud.api import CloudDependencies, cloud_routes
-from mercury_tools.config import load_settings
+from mercury_tools.auth.consent import (
+    ConsentHandoff,
+    MercuryConsent,
+    OAuthSessionCookie,
+    SupabaseConsentHandoff,
+)
+from mercury_tools.auth.middleware import MercuryOAuthMiddleware
+from mercury_tools.auth.models import PrincipalResolver
+from mercury_tools.auth.supabase_jwt import validator_from_settings
+from mercury_tools.cloud.api import (
+    CloudDependencies,
+    cloud_routes,
+    protected_resource_routes,
+)
+from mercury_tools.config import V1ConfigurationError, load_settings
 from mercury_tools.connectors.catalog import (
     connector_by_id,
     list_connector_public_summaries,
@@ -67,6 +84,11 @@ from mercury_tools.mcp.schemas import (
     SearchMode,
     WorkspaceFlowMetadata,
 )
+from mercury_tools.mcp.v1_tools import (
+    configure_v1_tools,
+    refresh_generated_provider_tools,
+    refresh_generated_provider_tools_until_stopped,
+)
 from mercury_tools.mercury_runtime import (
     get_accounting_skill_schema as runtime_accounting_skill_schema,
 )
@@ -82,6 +104,11 @@ from mercury_tools.product import (
     verify_client_token,
 )
 from mercury_tools.prompts import get_prompt
+from mercury_tools.providers.peak_setup import PEAK_SETUP_PATH
+from mercury_tools.providers.production import (
+    ProviderOAuthProductionComposition,
+    build_provider_oauth_production_composition,
+)
 from mercury_tools.rag.chunking import chunk_document, sha256_text
 from mercury_tools.rag.embeddings import create_embedding_provider
 from mercury_tools.rag.models import (
@@ -135,8 +162,138 @@ class StrictInputFastMCP(FastMCP):
         argument_model.model_rebuild(force=True)
         registered.parameters = argument_model.model_json_schema(by_alias=True)
 
+    def set_tool_input_contract(
+        self,
+        name: str,
+        *,
+        argument_model: type[BaseModel],
+        schema: Mapping[str, Any],
+    ) -> None:
+        """Replace one registered argument model with a closed public contract.
+
+        FastMCP derives an object schema from Python parameters. V1 needs one
+        root-level discriminated provider/environment schema, while retaining
+        a flat argument model for safe handler invocation.
+        """
+
+        registered = self._tool_manager.get_tool(name)
+        if registered is None:
+            raise RuntimeError("FastMCP did not retain the registered tool")
+        if not issubclass(argument_model, BaseModel):
+            raise TypeError("tool_argument_model_invalid")
+        if not callable(getattr(argument_model, "model_dump_one_level", None)):
+            raise TypeError("tool_argument_model_invalid")
+        argument_model.model_config["extra"] = "forbid"
+        argument_model.model_config["hide_input_in_errors"] = True
+        argument_model.model_rebuild(force=True)
+        registered.fn_metadata.arg_model = argument_model
+        registered.parameters = dict(schema)
+
+    def set_tool_output_contract(
+        self,
+        name: str,
+        *,
+        schema: Mapping[str, Any],
+    ) -> None:
+        """Replace one registered output schema without changing its handler model."""
+
+        registered = self._tool_manager.get_tool(name)
+        if registered is None:
+            raise RuntimeError("FastMCP did not retain the registered tool")
+        registered.fn_metadata.output_schema = dict(schema)
+        registered.__dict__.pop("output_schema", None)
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> Any:
+        """Return V1 failures through their published closed output union."""
+
+        registered_before = self._tool_manager.get_tool(name)
+        self._register_active_v1_session()
+        try:
+            return await super().call_tool(name, arguments)
+        except ToolError as error:
+            registered = self._tool_manager.get_tool(name) or registered_before
+            metadata = getattr(registered, "meta", None)
+            if not isinstance(metadata, Mapping) or metadata.get("mercury/surface") != "v1":
+                raise
+            from mercury_tools.mcp.v1_errors import error_output
+
+            output = error_output(error)
+            payload = output.model_dump(mode="json")
+            return ([TextContent(type="text", text=output.model_dump_json())], payload)
+
+    async def list_tools(self) -> list[Any]:
+        self._register_active_v1_session()
+        return await super().list_tools()
+
+    def _register_active_v1_session(self) -> None:
+        publisher = getattr(self, "_mercury_v1_generated_provider_tools", None)
+        register = getattr(publisher, "register_session", None)
+        if not callable(register):
+            return
+        try:
+            context = self.get_context()
+        except (LookupError, RuntimeError):
+            return
+        register(context)
+
+
+def _create_isolated_serving_mcp(
+    source: StrictInputFastMCP,
+    *,
+    streamable_http_path: str,
+) -> StrictInputFastMCP:
+    """Compose an HTTP registry whose protocol handlers close over itself."""
+
+    settings = source.settings.model_copy(deep=True)
+    serving = StrictInputFastMCP(
+        name=source.name,
+        instructions=source.instructions,
+        website_url=source.website_url,
+        icons=list(source.icons) if source.icons else None,
+        auth_server_provider=source._auth_server_provider,
+        token_verifier=source._token_verifier,
+        event_store=source._event_store,
+        retry_interval=source._retry_interval,
+        tools=list(source._tool_manager._tools.values()),
+        debug=settings.debug,
+        log_level=settings.log_level,
+        host=settings.host,
+        port=settings.port,
+        mount_path=settings.mount_path,
+        sse_path=settings.sse_path,
+        message_path=settings.message_path,
+        streamable_http_path=streamable_http_path,
+        json_response=settings.json_response,
+        stateless_http=settings.stateless_http,
+        warn_on_duplicate_resources=settings.warn_on_duplicate_resources,
+        warn_on_duplicate_tools=settings.warn_on_duplicate_tools,
+        warn_on_duplicate_prompts=settings.warn_on_duplicate_prompts,
+        dependencies=list(settings.dependencies),
+        lifespan=settings.lifespan,
+        auth=settings.auth,
+        transport_security=settings.transport_security,
+    )
+    serving._resource_manager._resources.update(source._resource_manager._resources)
+    serving._resource_manager._templates.update(source._resource_manager._templates)
+    serving._prompt_manager._prompts.update(source._prompt_manager._prompts)
+    serving._custom_starlette_routes.extend(source._custom_starlette_routes)
+    return serving
+
 
 mcp = StrictInputFastMCP("Mercury Tools")
+_PROCESS_V1_CONFIGURATION_LOCK = threading.Lock()
+_PROCESS_V1_ENABLED = load_settings().v1_enabled
+
+
+def _require_process_v1_configuration(enabled: bool) -> None:
+    with _PROCESS_V1_CONFIGURATION_LOCK:
+        if enabled != _PROCESS_V1_ENABLED:
+            raise RuntimeError("mercury_v1_process_configuration_conflict")
+
 
 _SEARCH_FILTER_FIELDS = frozenset(SearchFilters.__dataclass_fields__)
 MAX_MCP_FLOW_FILES = 50
@@ -212,6 +369,8 @@ _CLOSED_DESTRUCTIVE_IDEMPOTENT = ToolAnnotations(
     openWorldHint=False,
 )
 _MERCURY_FLOW_SOURCE_ADAPTER = TypeAdapter(MercuryFlowSource)
+_GENERATED_PROVIDER_REFRESH_INTERVAL_SECONDS = 5.0
+_GENERATED_PROVIDER_SHUTDOWN_TIMEOUT_SECONDS = 1.0
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -2170,9 +2329,7 @@ def connector_status(
                     active_context.get("readiness_basis") if active_context else None
                 ),
                 "provider_called_by_mercury": (
-                    active_context.get("provider_called_by_mercury")
-                    if active_context
-                    else None
+                    active_context.get("provider_called_by_mercury") if active_context else None
                 ),
                 "setup_required": not bool(active_context),
                 "next_tool": (
@@ -3245,6 +3402,11 @@ def connector_setup_guide_th() -> str:
     return get_prompt("connector_setup_guide_th")
 
 
+# Legacy decorators execute before this final V1 surface selection. Apply the
+# selected surface after registration so /mcp never mixes contracts.
+configure_v1_tools(mcp, enabled=_PROCESS_V1_ENABLED)
+
+
 async def root(request: Request) -> Response:
     settings = load_settings()
     body = f"""<!doctype html>
@@ -3867,30 +4029,218 @@ async def healthz(request: Request) -> Response:
 def create_http_app(
     *,
     require_auth: bool | None = None,
+):
+    """Build the production HTTP app from settings-bound dependencies."""
+
+    return _create_http_app(require_auth=require_auth)
+
+
+def create_test_http_app(
+    *,
+    require_auth: bool | None = None,
     cloud_dependencies: CloudDependencies | None = None,
+    provider_oauth_service: Any | None = None,
+    peak_setup_service: Any | None = None,
+    principal_resolver: PrincipalResolver | None = None,
+    consent_handoff: ConsentHandoff | None = None,
+    consent_http_client: httpx.AsyncClient | None = None,
+    generated_provider_runtime: Any | None = None,
+    generated_provider_refresh_interval_seconds: float | None = None,
+):
+    """Build an app with explicit test doubles; production serve never calls this."""
+
+    return _create_http_app(
+        require_auth=require_auth,
+        cloud_dependencies=cloud_dependencies,
+        provider_oauth_service=provider_oauth_service,
+        peak_setup_service=peak_setup_service,
+        principal_resolver=principal_resolver,
+        consent_handoff=consent_handoff,
+        consent_http_client=consent_http_client,
+        generated_provider_runtime=generated_provider_runtime,
+        generated_provider_refresh_interval_seconds=generated_provider_refresh_interval_seconds,
+        test_only_dependencies=True,
+    )
+
+
+def _create_http_app(
+    *,
+    require_auth: bool | None = None,
+    cloud_dependencies: CloudDependencies | None = None,
+    provider_oauth_service: Any | None = None,
+    peak_setup_service: Any | None = None,
+    principal_resolver: PrincipalResolver | None = None,
+    consent_handoff: ConsentHandoff | None = None,
+    consent_http_client: httpx.AsyncClient | None = None,
+    generated_provider_runtime: Any | None = None,
+    generated_provider_refresh_interval_seconds: float | None = None,
+    test_only_dependencies: bool = False,
 ):
     settings = load_settings()
-    mcp.settings.streamable_http_path = settings.mcp_path
+    settings.validate_v1()
+    _require_process_v1_configuration(settings.v1_enabled)
+    if not test_only_dependencies and any(
+        dependency is not None
+        for dependency in (
+            cloud_dependencies,
+            provider_oauth_service,
+            peak_setup_service,
+            principal_resolver,
+            consent_handoff,
+            consent_http_client,
+            generated_provider_runtime,
+            generated_provider_refresh_interval_seconds,
+        )
+    ):
+        raise V1ConfigurationError("v1_provider_oauth_composition_invalid")
+    selected_principal_resolver = principal_resolver
+    selected_composition: ProviderOAuthProductionComposition | None = None
+    generated_runtime_factory: Callable[[], Any] | None = None
+    generated_runtime_is_shared = False
+    if settings.v1_enabled:
+        if not test_only_dependencies:
+            selected_composition = build_provider_oauth_production_composition(
+                settings=settings,
+            )
+            selected_composition.validate_for_runtime(settings)
+            selected_principal_resolver = selected_composition.principal_resolver
+            provider_oauth_service = selected_composition.provider_oauth_service
+            peak_setup_service = selected_composition.peak_setup_service
+
+            def selected_runtime() -> Any:
+                return selected_composition
+
+            generated_runtime_factory = selected_runtime
+            generated_runtime_is_shared = True
+        else:
+            if selected_principal_resolver is None:
+                selected_principal_resolver = validator_from_settings(settings)
+            if generated_provider_runtime is not None:
+
+                def supplied_runtime() -> Any:
+                    return generated_provider_runtime
+
+                generated_runtime_factory = supplied_runtime
+                generated_runtime_is_shared = True
+
+    http_mcp = _create_isolated_serving_mcp(
+        mcp,
+        streamable_http_path=settings.mcp_path,
+    )
     if settings.public_base_url:
         public_url = urlparse(settings.public_base_url)
         allowed_host = public_url.netloc
         allowed_origin = f"{public_url.scheme}://{public_url.netloc}"
-        if allowed_host and allowed_host not in mcp.settings.transport_security.allowed_hosts:
-            mcp.settings.transport_security.allowed_hosts.append(allowed_host)
-        if allowed_origin and allowed_origin not in mcp.settings.transport_security.allowed_origins:
-            mcp.settings.transport_security.allowed_origins.append(allowed_origin)
-    public_app = mcp.streamable_http_app()
+        if allowed_host and allowed_host not in http_mcp.settings.transport_security.allowed_hosts:
+            http_mcp.settings.transport_security.allowed_hosts.append(allowed_host)
+        if (
+            allowed_origin
+            and allowed_origin not in http_mcp.settings.transport_security.allowed_origins
+        ):
+            http_mcp.settings.transport_security.allowed_origins.append(allowed_origin)
+    public_app = http_mcp.streamable_http_app()
+    if cloud_dependencies is not None and provider_oauth_service is not None:
+        raise RuntimeError("provider_oauth_service_dependency_conflict")
+    if cloud_dependencies is not None and peak_setup_service is not None:
+        raise RuntimeError("peak_setup_service_dependency_conflict")
+    selected_cloud_dependencies = cloud_dependencies or CloudDependencies(
+        settings=settings,
+        provider_oauth_service=provider_oauth_service,
+        peak_setup_service=peak_setup_service,
+    )
+    if settings.v1_enabled:
+        _validate_v1_cloud_dependencies(selected_cloud_dependencies)
+    refresh_interval_seconds = (
+        generated_provider_refresh_interval_seconds
+        if generated_provider_refresh_interval_seconds is not None
+        else _GENERATED_PROVIDER_REFRESH_INTERVAL_SECONDS
+    )
+    if refresh_interval_seconds <= 0:
+        raise ValueError("generated_refresh_interval_invalid")
+    detached_refresh_tasks: set[asyncio.Task[None]] = set()
+
+    def detach_refresh_task(task: asyncio.Task[None]) -> None:
+        detached_refresh_tasks.add(task)
+
+        def consume_result(completed: asyncio.Task[None]) -> None:
+            detached_refresh_tasks.discard(completed)
+            with suppress(BaseException):
+                completed.result()
+
+        task.add_done_callback(consume_result)
 
     @asynccontextmanager
     async def lifespan(_app):
-        async with public_app.router.lifespan_context(public_app):
-            yield
+        refresh_stop_event: asyncio.Event | None = None
+        refresh_task: asyncio.Task[None] | None = None
+        try:
+            if selected_composition is not None:
+                await selected_composition.startup()
+            if settings.v1_enabled and generated_runtime_factory is not None:
+                # Initial projection is part of readiness: no HTTP session accepts
+                # requests until the serving MCP instance has the catalog tools.
+                await refresh_generated_provider_tools(
+                    http_mcp,
+                    runtime_factory=generated_runtime_factory,
+                    close_runtime=not generated_runtime_is_shared,
+                )
+                refresh_stop_event = asyncio.Event()
+                refresh_task = asyncio.create_task(
+                    refresh_generated_provider_tools_until_stopped(
+                        http_mcp,
+                        runtime_factory=generated_runtime_factory,
+                        close_runtime=not generated_runtime_is_shared,
+                        stop_event=refresh_stop_event,
+                        interval_seconds=refresh_interval_seconds,
+                    ),
+                    name="mercury-v1-generated-provider-refresh",
+                )
+            async with public_app.router.lifespan_context(public_app):
+                yield
+        finally:
+            if refresh_stop_event is not None:
+                refresh_stop_event.set()
+            try:
+                if refresh_task is not None:
+                    refresh_task.cancel()
+                    try:
+                        _done, pending = await asyncio.wait(
+                            {refresh_task},
+                            timeout=_GENERATED_PROVIDER_SHUTDOWN_TIMEOUT_SECONDS,
+                        )
+                    except asyncio.CancelledError:
+                        detach_refresh_task(refresh_task)
+                        raise
+                    if pending:
+                        detach_refresh_task(refresh_task)
+                    else:
+                        with suppress(asyncio.CancelledError):
+                            refresh_task.result()
+            finally:
+                publisher = getattr(http_mcp, "_mercury_v1_generated_provider_tools", None)
+                clear_publisher = getattr(publisher, "clear", None)
+                if callable(clear_publisher):
+                    clear_publisher()
+                if selected_composition is not None:
+                    await selected_composition.aclose()
 
     routes = [
         *public_app.routes,
-        *cloud_routes(cloud_dependencies or CloudDependencies(settings=settings)),
+        *cloud_routes(selected_cloud_dependencies),
     ]
+    if settings.v1_enabled:
+        routes.extend(protected_resource_routes(settings))
     app = Starlette(routes=routes, lifespan=lifespan)
+    app.state.mercury_mcp = http_mcp
+    if generated_runtime_factory is not None:
+        app.state.refresh_generated_provider_tools = lambda context=None: (
+            refresh_generated_provider_tools(
+                http_mcp,
+                runtime_factory=generated_runtime_factory,
+                context=context,
+                close_runtime=not generated_runtime_is_shared,
+            )
+        )
     app.add_route("/", root, methods=["GET"])
     app.add_route("/api/status", status, methods=["GET"])
     app.add_route("/healthz", healthz, methods=["GET"])
@@ -3902,6 +4252,25 @@ def create_http_app(
         openai_apps_challenge,
         methods=["GET"],
     )
+    if settings.v1_enabled:
+        session_cookie = OAuthSessionCookie(settings.vault_active_key)
+        consent = MercuryConsent(
+            handoff=consent_handoff
+            or SupabaseConsentHandoff(
+                authorization_server=settings.supabase_auth_issuer,
+                publishable_key=settings.supabase_publishable_key,
+                session_cookie=session_cookie,
+                http_client=consent_http_client,
+            ),
+            canonical_resource=settings.canonical_mcp_resource,
+            browser_origin=(settings.provider_callback_base_url or settings.canonical_mcp_resource),
+            session_cookie=session_cookie,
+            additional_session_cookie_paths=(PEAK_SETUP_PATH,),
+        )
+        app.add_route("/oauth/consent", consent.show, methods=["GET"])
+        app.add_route("/oauth/consent", consent.decide, methods=["POST"])
+        app.add_route("/oauth/sign-in", consent.sign_in_page, methods=["GET"])
+        app.add_route("/oauth/sign-in", consent.sign_in, methods=["POST"])
     if settings.enable_legacy_http_api:
         for page_path in (
             "/start",
@@ -3928,7 +4297,15 @@ def create_http_app(
 
     should_require_auth = settings.http_require_auth if require_auth is None else require_auth
     app.state.mercury_http_require_auth = should_require_auth
-    if should_require_auth:
+    if settings.v1_enabled:
+        app.add_middleware(
+            MercuryOAuthMiddleware,
+            principal_resolver=selected_principal_resolver,
+            canonical_resource=settings.canonical_mcp_resource,
+            mcp_path=settings.mcp_path,
+            peak_browser_session_key=settings.vault_active_key,
+        )
+    elif should_require_auth:
         if not settings.http_auth_configured:
             raise RuntimeError(
                 "MERCURY_TOOLS_HTTP_BEARER_TOKEN or MERCURY_CONNECT_SIGNING_SECRET is required when HTTP auth is enabled."
@@ -3938,6 +4315,49 @@ def create_http_app(
             protected_path=settings.mcp_path,
         )
     return app
+
+
+def _validate_v1_cloud_dependencies(dependencies: Any) -> None:
+    provider_oauth_service = getattr(
+        dependencies,
+        "provider_oauth_service",
+        None,
+    )
+    if provider_oauth_service is None:
+        raise V1ConfigurationError("v1_provider_oauth_service_missing")
+    if not all(
+        callable(getattr(provider_oauth_service, method, None))
+        for method in ("complete_callback", "disconnect")
+    ):
+        raise V1ConfigurationError("v1_provider_oauth_service_invalid")
+    peak_setup_service = getattr(
+        dependencies,
+        "peak_setup_service",
+        None,
+    )
+    if peak_setup_service is None:
+        raise V1ConfigurationError("v1_peak_setup_service_missing")
+    if not all(
+        callable(getattr(peak_setup_service, method, None))
+        for method in ("start", "exchange", "complete", "disconnect")
+    ):
+        raise V1ConfigurationError("v1_peak_setup_service_invalid")
+    required_handlers = (
+        "flowaccount_oauth_callback",
+        "peak_setup_page",
+        "peak_setup_exchange",
+        "peak_setup_submit",
+        "list_actions",
+        "get_action",
+        "resolve_validation",
+        "list_connectors",
+        "list_skills",
+        "get_skill",
+        "search_knowledge",
+        "get_document",
+    )
+    if not all(callable(getattr(dependencies, name, None)) for name in required_handlers):
+        raise V1ConfigurationError("v1_cloud_dependencies_invalid")
 
 
 def serve(
@@ -3953,7 +4373,12 @@ def serve(
     if transport in {"http", "streamable-http"}:
         import uvicorn
 
-        uvicorn.run(create_http_app(require_auth=require_auth), host=host, port=port)
+        uvicorn.run(
+            create_http_app(require_auth=require_auth),
+            host=host,
+            port=port,
+            access_log=False,
+        )
         return
     raise ValueError(f"Unsupported transport: {transport}")
 

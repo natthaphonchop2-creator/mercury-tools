@@ -10,6 +10,7 @@ from typing import Any, NamedTuple
 
 SUCCESS_MESSAGE = "Mercury MCP review: 0 unclear arguments; annotations verified"
 
+
 class ToolBehavior(NamedTuple):
     """Reviewed annotations and workspace scope for one hosted tool."""
 
@@ -37,13 +38,9 @@ _CLOSED_DESTRUCTIVE_IDEMPOTENT = (False, True, True, False)
 BEHAVIOR_MATRIX: dict[str, ToolBehavior] = {
     "search_knowledge": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
     "retrieve_context_pack": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
-    "retrieve_workspace_context_pack": ToolBehavior(
-        *_CLOSED_READ, requires_workspace=True
-    ),
+    "retrieve_workspace_context_pack": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
     "get_document": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
-    "create_public_workspace": ToolBehavior(
-        *_CLOSED_CREATE, requires_workspace=False
-    ),
+    "create_public_workspace": ToolBehavior(*_CLOSED_CREATE, requires_workspace=False),
     "get_public_workspace": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
     "list_connectors": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
     "get_connector_setup": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
@@ -57,9 +54,7 @@ BEHAVIOR_MATRIX: dict[str, ToolBehavior] = {
     ),
     "connector_status": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
     "list_accounting_skills": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
-    "get_accounting_skill_schema": ToolBehavior(
-        *_CLOSED_READ, requires_workspace=False
-    ),
+    "get_accounting_skill_schema": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
     "run_accounting_skill": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
     "flow_cheat_sheet": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
     "check_flow_syntax": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
@@ -68,17 +63,37 @@ BEHAVIOR_MATRIX: dict[str, ToolBehavior] = {
     "run_flow_files": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
     "list_workspace_flows": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
     "run_workspace_flow": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
-    "save_workspace_flow": ToolBehavior(
-        *_CLOSED_IDEMPOTENT_WRITE, requires_workspace=True
-    ),
+    "save_workspace_flow": ToolBehavior(*_CLOSED_IDEMPOTENT_WRITE, requires_workspace=True),
 }
 
-_MUTUALLY_EXCLUSIVE_SOURCE_FIELDS = frozenset(
-    {"flow_yaml", "flow_files", "workspace_flow_id"}
-)
-_CAMEL_CASE_BOUNDARY_RE = re.compile(
-    r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])"
-)
+V1_BEHAVIOR_MATRIX: dict[str, ToolBehavior] = {
+    "get_mercury_context": ToolBehavior(*_CLOSED_IDEMPOTENT_WRITE, requires_workspace=False),
+    "list_accounting_providers": ToolBehavior(*_CLOSED_READ, requires_workspace=False),
+    "start_provider_connection": ToolBehavior(
+        False,
+        False,
+        False,
+        True,
+        requires_workspace=True,
+    ),
+    "list_provider_connections": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
+    "connector_status": ToolBehavior(False, False, False, False, requires_workspace=True),
+    "list_provider_capabilities": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
+    "get_capability_schema": ToolBehavior(*_CLOSED_READ, requires_workspace=True),
+    "search_knowledge": ToolBehavior(False, False, False, False, requires_workspace=True),
+    "retrieve_context_pack": ToolBehavior(
+        False,
+        False,
+        False,
+        False,
+        requires_workspace=True,
+    ),
+    "run_accounting_skill": ToolBehavior(False, False, False, True, requires_workspace=True),
+    "disconnect_provider": ToolBehavior(False, True, True, True, requires_workspace=True),
+}
+
+_MUTUALLY_EXCLUSIVE_SOURCE_FIELDS = frozenset({"flow_yaml", "flow_files", "workspace_flow_id"})
+_CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 _NON_ALPHANUMERIC_RE = re.compile(r"[^A-Za-z0-9]+")
 _POINTER_ARRAY_INDEX_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 _CREDENTIAL_SINGLE_TOKENS = frozenset(
@@ -135,12 +150,8 @@ _ANNOTATION_FIELDS = (
 _MISSING = object()
 _COMPOSITION_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf"})
 _NON_CONSTRAINT_KEYS = frozenset({"$defs", "definitions"})
-_JSON_TYPES = frozenset(
-    {"array", "boolean", "integer", "null", "number", "object", "string"}
-)
-_ATOMIC_TYPES = frozenset(
-    {"array", "boolean", "integer", "null", "number", "object", "string"}
-)
+_JSON_TYPES = frozenset({"array", "boolean", "integer", "null", "number", "object", "string"})
+_ATOMIC_TYPES = frozenset({"array", "boolean", "integer", "null", "number", "object", "string"})
 _MAX_REF_DEPTH = 32
 _MAX_SCHEMA_DEPTH = 64
 _MAX_EXPANDED_BRANCHES = 256
@@ -219,11 +230,7 @@ def _declared_types(value: object) -> set[str]:
 def _normalized_field_name_tokens(field_name: str) -> tuple[str, ...]:
     """Split public field names into exact lowercase identifier tokens."""
     with_boundaries = _CAMEL_CASE_BOUNDARY_RE.sub(" ", field_name)
-    return tuple(
-        part.lower()
-        for part in _NON_ALPHANUMERIC_RE.split(with_boundaries)
-        if part
-    )
+    return tuple(part.lower() for part in _NON_ALPHANUMERIC_RE.split(with_boundaries) if part)
 
 
 def _contains_token_sequence(
@@ -244,8 +251,7 @@ def _is_credential_field_name(field_name: str) -> bool:
     if any(token in _CREDENTIAL_COMPACT_TOKENS for token in tokens):
         return True
     return any(
-        _contains_token_sequence(tokens, sequence)
-        for sequence in _CREDENTIAL_TOKEN_SEQUENCES
+        _contains_token_sequence(tokens, sequence) for sequence in _CREDENTIAL_TOKEN_SEQUENCES
     )
 
 
@@ -279,8 +285,7 @@ class _SchemaReviewer:
 
         if behavior is not None and behavior.requires_workspace:
             if not self.root_branches or any(
-                "workspace_id" not in branch.properties
-                for branch in self.root_branches
+                "workspace_id" not in branch.properties for branch in self.root_branches
             ):
                 self.add(
                     ("workspace_id",),
@@ -315,9 +320,7 @@ class _SchemaReviewer:
                         return None
                     target = target[part]
                     continue
-                if isinstance(target, Sequence) and not isinstance(
-                    target, (str, bytes, bytearray)
-                ):
+                if isinstance(target, Sequence) and not isinstance(target, (str, bytes, bytearray)):
                     if not _POINTER_ARRAY_INDEX_RE.fullmatch(part):
                         self.add(
                             path,
@@ -509,10 +512,7 @@ class _SchemaReviewer:
     @staticmethod
     def _has_explicit_enum(branch: tuple[_SchemaFragment, ...]) -> bool:
         return any(
-            (
-                isinstance(fragment.schema.get("enum"), list)
-                and bool(fragment.schema["enum"])
-            )
+            (isinstance(fragment.schema.get("enum"), list) and bool(fragment.schema["enum"]))
             or "const" in fragment.schema
             for fragment in branch
         )
@@ -611,15 +611,9 @@ class _SchemaReviewer:
         for fragment in branch:
             schema = fragment.schema
             if "items" in schema:
-                item_nodes.append(
-                    _SchemaNode(schema["items"], (*fragment.path, "items"))
-                )
+                item_nodes.append(_SchemaNode(schema["items"], (*fragment.path, "items")))
             maximum = schema.get("maxItems", _MISSING)
-            if (
-                not isinstance(maximum, bool)
-                and isinstance(maximum, int)
-                and maximum >= 0
-            ):
+            if not isinstance(maximum, bool) and isinstance(maximum, int) and maximum >= 0:
                 finite_max = True
         if not item_nodes:
             self.add(path, "array must define a typed items schema")
@@ -705,9 +699,7 @@ def _annotation_issues(
 ) -> list[str]:
     tool_name = str(_value(tool, "name", "<unnamed>"))
     if behavior is None:
-        return [
-            f"{tool_name}.annotations: tool has no reviewed behavior-matrix entry"
-        ]
+        return [f"{tool_name}.annotations: tool has no reviewed behavior-matrix entry"]
 
     annotations = _value(tool, "annotations", None)
     if annotations is None:
@@ -725,9 +717,7 @@ def _annotation_issues(
     ):
         actual = _value(annotations, field_name)
         if actual is _MISSING:
-            issues.append(
-                f"{tool_name}.annotations.{field_name}: required annotation is missing"
-            )
+            issues.append(f"{tool_name}.annotations.{field_name}: required annotation is missing")
         elif actual != expected_value:
             issues.append(
                 f"{tool_name}.annotations.{field_name}: expected {expected_value!r}, "
@@ -741,12 +731,14 @@ def review_tools(tools: Iterable[object]) -> list[str]:
     issues: list[str] = []
     for tool in sorted(tools, key=lambda item: str(_value(item, "name", ""))):
         tool_name = str(_value(tool, "name", "<unnamed>"))
-        behavior = BEHAVIOR_MATRIX.get(tool_name)
+        metadata = _value(tool, "meta", {})
+        if isinstance(metadata, Mapping) and metadata.get("mercury/surface") == "v1":
+            behavior = V1_BEHAVIOR_MATRIX.get(tool_name)
+        else:
+            behavior = BEHAVIOR_MATRIX.get(tool_name)
         input_schema = _value(tool, "inputSchema", None)
         if not isinstance(input_schema, Mapping):
-            issues.append(
-                f"{tool_name}.<root>: root inputSchema must resolve to a strict object"
-            )
+            issues.append(f"{tool_name}.<root>: root inputSchema must resolve to a strict object")
         else:
             issues.extend(_schema_issues(tool_name, input_schema, behavior))
         issues.extend(_annotation_issues(tool, behavior))

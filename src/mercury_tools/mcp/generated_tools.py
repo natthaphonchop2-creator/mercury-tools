@@ -1,0 +1,1879 @@
+"""Catalog-generated, Mercury-owned wrappers for qualified provider reads."""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import hashlib
+import inspect
+import json
+import time
+import weakref
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
+from functools import partial
+from threading import Lock
+from typing import Any, ClassVar, Literal, TypeAlias
+from uuid import UUID
+
+from jsonschema import Draft202012Validator, FormatChecker
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
+from mcp.types import ToolAnnotations
+from pydantic import BaseModel, ConfigDict, JsonValue, PrivateAttr, model_validator
+
+from mercury_tools.catalog.identity import canonical_json
+from mercury_tools.catalog.models import ProviderMCPQualification, QualificationState
+from mercury_tools.mcp.v1_errors import (
+    MercuryV1ToolError,
+    public_error_code,
+    published_error_output_schema,
+)
+from mercury_tools.mcp.v1_schemas import ProviderReadEnvelope
+from mercury_tools.providers.base import DispatchCertainty, ProviderSchemaChanged
+
+GeneratedReadExecutor: TypeAlias = Callable[..., Awaitable[ProviderReadEnvelope]]
+PersistSchemaChange: TypeAlias = Callable[
+    [ProviderMCPQualification, Context | object],
+    Awaitable[Sequence[ProviderMCPQualification]] | Sequence[ProviderMCPQualification],
+]
+SchemaChangeHandler: TypeAlias = Callable[
+    [ProviderMCPQualification, Context | object, DispatchCertainty],
+    Awaitable[None],
+]
+SchemaDriftAlert: TypeAlias = Callable[[dict[str, object]], Awaitable[object] | object]
+
+_READ_CAPABILITIES = frozenset(
+    {
+        "provider_profile.get",
+        "documents.invoice.list",
+        "documents.invoice.get",
+    }
+)
+_V1_GENERATED_META = {
+    "mercury/surface": "v1",
+    "mercury/error-schema": "mercury.v1.error.v1",
+    "mercury/generated": "provider-read",
+}
+_CLOSED_READ = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    openWorldHint=False,
+)
+_SCHEMA_ANNOTATIONS = frozenset(
+    {
+        "$comment",
+        "default",
+        "deprecated",
+        "description",
+        "examples",
+        "readOnly",
+        "title",
+        "writeOnly",
+    }
+)
+_SUPPORTED_SCHEMA_KEYWORDS = (
+    frozenset(
+        {
+            "$defs",
+            "$ref",
+            "$schema",
+            "additionalProperties",
+            "allOf",
+            "anyOf",
+            "const",
+            "else",
+            "enum",
+            "exclusiveMaximum",
+            "exclusiveMinimum",
+            "format",
+            "if",
+            "items",
+            "maxItems",
+            "maxLength",
+            "maxProperties",
+            "maximum",
+            "minItems",
+            "minLength",
+            "minProperties",
+            "minimum",
+            "multipleOf",
+            "oneOf",
+            "pattern",
+            "properties",
+            "required",
+            "then",
+            "type",
+            "unevaluatedProperties",
+            "uniqueItems",
+        }
+    )
+    | _SCHEMA_ANNOTATIONS
+)
+_PUBLIC_SCALAR_KEYWORDS = frozenset(
+    {
+        "const",
+        "enum",
+        "exclusiveMaximum",
+        "exclusiveMinimum",
+        "format",
+        "maxItems",
+        "maxLength",
+        "maximum",
+        "minItems",
+        "minLength",
+        "minimum",
+        "multipleOf",
+        "pattern",
+        "type",
+        "uniqueItems",
+    }
+)
+_REF_ANNOTATIONS = _SCHEMA_ANNOTATIONS | {"$ref"}
+_MAX_REFRESH_SESSIONS = 64
+_REFRESH_SESSION_IDLE_SECONDS = 300
+_REFRESH_NOTIFICATION_TOTAL_TIMEOUT_SECONDS = 1
+_MAX_WIRE_MODEL_CACHE_SIZE = 128
+
+
+@dataclass(slots=True)
+class _RefreshSession:
+    weak_session: weakref.ReferenceType[object] | None
+    strong_session: object | None
+    last_seen_at: float
+    notified_generation: int
+
+    def resolve(self) -> object | None:
+        return self.weak_session() if self.weak_session is not None else self.strong_session
+
+
+@dataclass(frozen=True, slots=True)
+class _DetachedNotificationTask:
+    task_ref: weakref.ReferenceType[asyncio.Task[None]]
+    generation: int
+
+
+class _RefreshNotificationTaskOwner:
+    """Bound and consume notification tasks without retaining their publishers."""
+
+    def __init__(self) -> None:
+        self._tasks: set[asyncio.Task[None]] = set()
+        self._lock = Lock()
+
+    def create_task(
+        self,
+        coroutine_factory: Callable[[], Awaitable[None]],
+    ) -> asyncio.Task[None] | None:
+        with self._lock:
+            self._consume_completed_locked()
+            if len(self._tasks) >= max(0, _MAX_REFRESH_SESSIONS):
+                return None
+            task = asyncio.create_task(coroutine_factory())
+            self._tasks.add(task)
+        task.add_done_callback(self._consume)
+        return task
+
+    def _consume_completed_locked(self) -> None:
+        for task in tuple(self._tasks):
+            if task.done():
+                self._consume_result(task)
+                self._tasks.discard(task)
+
+    def _consume(self, task: asyncio.Task[None]) -> None:
+        self._consume_result(task)
+        with self._lock:
+            self._tasks.discard(task)
+
+    @staticmethod
+    def _consume_result(task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except BaseException:
+            return
+
+
+_REFRESH_NOTIFICATION_TASK_OWNER = _RefreshNotificationTaskOwner()
+
+
+@dataclass(frozen=True, slots=True)
+class _QuarantinedVersion:
+    qualification: ProviderMCPQualification
+    dispatch_certainty: DispatchCertainty
+
+
+def _schema_fingerprint(schema: Mapping[str, Any]) -> str:
+    return hashlib.sha256(canonical_json(dict(schema)).encode("utf-8")).hexdigest()
+
+
+def _schema_copy(schema: Mapping[str, Any]) -> dict[str, Any]:
+    """Thaw a catalog schema without mutating its immutable authority record."""
+
+    return json.loads(canonical_json(dict(schema)))
+
+
+def _schema_allows_object(schema: Mapping[str, Any]) -> bool:
+    value = schema.get("type")
+    return (
+        value == "object"
+        or (isinstance(value, list | tuple) and "object" in value)
+        or "properties" in schema
+    )
+
+
+def _schema_may_allow_object(schema: Mapping[str, Any]) -> bool:
+    """Return whether a schema can match an object without assuming a branch."""
+
+    value = schema.get("type")
+    if value == "object" or (isinstance(value, list | tuple) and "object" in value):
+        return True
+    if isinstance(value, str | list | tuple):
+        return False
+    if "properties" in schema:
+        return True
+    return True
+
+
+def _schema_has_closed_object_guard(
+    schema: Mapping[str, Any],
+    *,
+    root: Mapping[str, Any],
+    references: frozenset[str] = frozenset(),
+) -> bool:
+    """Prove a public object is closed independently of conditional branches."""
+
+    reference = schema.get("$ref")
+    if reference is not None:
+        if not isinstance(reference, str) or reference in references:
+            raise ValueError("generated_schema_invalid")
+        return _schema_has_closed_object_guard(
+            _reference_target(reference, root),
+            root=root,
+            references=references | {reference},
+        )
+    if _schema_allows_object(schema):
+        return schema.get("additionalProperties") is False and schema.get(
+            "unevaluatedProperties", False
+        ) in {False, None}
+    all_of = schema.get("allOf")
+    if isinstance(all_of, list | tuple) and any(
+        isinstance(branch, Mapping)
+        and _schema_has_closed_object_guard(branch, root=root, references=references)
+        for branch in all_of
+    ):
+        return True
+    for keyword in ("anyOf", "oneOf"):
+        branches = schema.get(keyword)
+        if isinstance(branches, list | tuple) and branches:
+            return all(
+                isinstance(branch, Mapping)
+                and (
+                    not _schema_may_allow_object(branch)
+                    or _schema_has_closed_object_guard(branch, root=root, references=references)
+                )
+                for branch in branches
+            )
+    return False
+
+
+def _reference_target(reference: str, root: Mapping[str, Any]) -> Mapping[str, Any]:
+    if reference == "#":
+        return root
+    if not reference.startswith("#/"):
+        raise ValueError("generated_schema_invalid")
+    target: object = root
+    for segment in reference[2:].split("/"):
+        key = segment.replace("~1", "/").replace("~0", "~")
+        if isinstance(target, Mapping):
+            target = target.get(key)
+        elif isinstance(target, list | tuple) and key.isdigit():
+            index = int(key)
+            target = target[index] if index < len(target) else None
+        else:
+            target = None
+        if target is None:
+            break
+    if not isinstance(target, Mapping):
+        raise ValueError("generated_schema_invalid")
+    return target
+
+
+def _assert_closed_schema(schema: Mapping[str, Any]) -> None:
+    def visit(node: object, references: frozenset[str] = frozenset()) -> None:
+        if not isinstance(node, Mapping):
+            raise ValueError("generated_schema_invalid")
+        if set(node) - _SUPPORTED_SCHEMA_KEYWORDS:
+            raise ValueError("generated_schema_invalid")
+        reference = node.get("$ref")
+        if reference is not None:
+            if (
+                not isinstance(reference, str)
+                or set(node) - _REF_ANNOTATIONS
+                or reference in references
+            ):
+                raise ValueError("generated_schema_invalid")
+            visit(_reference_target(reference, schema), references | {reference})
+            return
+        if not any(
+            key in node
+            for key in (
+                "type",
+                "properties",
+                "items",
+                "allOf",
+                "anyOf",
+                "const",
+                "enum",
+                "oneOf",
+                "if",
+            )
+        ):
+            raise ValueError("generated_schema_invalid")
+        if _schema_allows_object(node) and (
+            node.get("additionalProperties") is not False
+            or node.get("unevaluatedProperties", False) not in {False, None}
+        ):
+            raise ValueError("generated_schema_invalid")
+        properties = node.get("properties")
+        if properties is not None:
+            if not isinstance(properties, Mapping) or any(
+                not isinstance(name, str) or not isinstance(value, Mapping)
+                for name, value in properties.items()
+            ):
+                raise ValueError("generated_schema_invalid")
+            for value in properties.values():
+                visit(value, references)
+        required = node.get("required")
+        if required is not None and (
+            not isinstance(required, list | tuple)
+            or any(not isinstance(item, str) for item in required)
+        ):
+            raise ValueError("generated_schema_invalid")
+        definitions = node.get("$defs")
+        if definitions is not None:
+            if not isinstance(definitions, Mapping) or any(
+                not isinstance(name, str) or not isinstance(value, Mapping)
+                for name, value in definitions.items()
+            ):
+                raise ValueError("generated_schema_invalid")
+            for value in definitions.values():
+                visit(value, references)
+        items = node.get("items")
+        if items is not None:
+            if not isinstance(items, Mapping):
+                raise ValueError("generated_schema_invalid")
+            visit(items, references)
+        for keyword in ("allOf", "anyOf", "oneOf"):
+            values = node.get(keyword)
+            if values is None:
+                continue
+            if (
+                not isinstance(values, list | tuple)
+                or not values
+                or any(not isinstance(item, Mapping) for item in values)
+            ):
+                raise ValueError("generated_schema_invalid")
+            for item in values:
+                visit(item, references)
+        if_condition = node.get("if")
+        if if_condition is not None:
+            if not isinstance(if_condition, Mapping):
+                raise ValueError("generated_schema_invalid")
+            if _schema_may_allow_object(node) and not _schema_has_closed_object_guard(
+                node,
+                root=schema,
+                references=references,
+            ):
+                raise ValueError("generated_schema_invalid")
+            visit(if_condition, references)
+            for keyword in ("then", "else"):
+                branch = node.get(keyword)
+                if branch is not None:
+                    if not isinstance(branch, Mapping):
+                        raise ValueError("generated_schema_invalid")
+                    visit(branch, references)
+        for keyword in ("const", "enum"):
+            if keyword not in node:
+                continue
+            value = node.get(keyword)
+            values = value if keyword == "enum" else (value,)
+            if keyword == "enum" and not isinstance(value, list | tuple):
+                raise ValueError("generated_schema_invalid")
+            if any(isinstance(item, Mapping | list | tuple) for item in values):
+                raise ValueError("generated_schema_invalid")
+
+    try:
+        Draft202012Validator.check_schema(dict(schema))
+        visit(schema)
+    except Exception:
+        raise ValueError("generated_schema_invalid") from None
+
+
+class _CatalogWireModel(BaseModel):
+    """A frozen model whose wire contract is one reviewed catalog JSON Schema."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+        hide_input_in_errors=True,
+    )
+
+    _schema: ClassVar[dict[str, Any]]
+    _validator: ClassVar[Draft202012Validator]
+    _payload: dict[str, JsonValue] = PrivateAttr(default_factory=dict)
+
+    @classmethod
+    def model_validate(cls, obj: Any, **_kwargs: Any) -> _CatalogWireModel:
+        if isinstance(obj, cls):
+            source = obj._payload
+        elif isinstance(obj, BaseModel):
+            source = obj.model_dump(mode="json")
+        else:
+            source = obj
+        if not isinstance(source, Mapping):
+            raise ValueError("generated_schema_validation_failed")
+        try:
+            cls._validator.validate(dict(source))
+        except Exception:
+            raise ValueError("generated_schema_validation_failed") from None
+        instance = cls.model_construct()
+        object.__setattr__(instance, "_payload", copy.deepcopy(dict(source)))
+        return instance
+
+    @classmethod
+    def model_json_schema(cls, **_kwargs: Any) -> dict[str, Any]:
+        return copy.deepcopy(cls._schema)
+
+    def model_dump(self, **_kwargs: Any) -> dict[str, JsonValue]:
+        return copy.deepcopy(self._payload)
+
+
+_WIRE_MODEL_CACHE: OrderedDict[
+    tuple[str, Literal["input", "output"]],
+    type[_CatalogWireModel],
+] = OrderedDict()
+_WIRE_MODEL_CACHE_LOCK = Lock()
+
+
+def catalog_wire_model(
+    schema: Mapping[str, Any],
+    *,
+    kind: Literal["input", "output"],
+) -> type[_CatalogWireModel]:
+    """Return a stable internal model that validates one closed schema exactly."""
+
+    checked = _schema_copy(schema)
+    _assert_closed_schema(checked)
+    fingerprint = _schema_fingerprint(checked)
+    key = (fingerprint, kind)
+    with _WIRE_MODEL_CACHE_LOCK:
+        cached = _WIRE_MODEL_CACHE.get(key)
+        if cached is not None:
+            _WIRE_MODEL_CACHE.move_to_end(key)
+            return cached
+        validation_schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            **checked,
+        }
+        model = type(
+            f"MercuryCatalog{kind.title()}{fingerprint[:12]}",
+            (_CatalogWireModel,),
+            {
+                "__module__": __name__,
+                "__annotations__": {
+                    "_schema": ClassVar[dict[str, Any]],
+                    "_validator": ClassVar[Draft202012Validator],
+                },
+                "_schema": checked,
+                "_validator": Draft202012Validator(
+                    validation_schema,
+                    format_checker=FormatChecker(),
+                ),
+            },
+        )
+        _WIRE_MODEL_CACHE[key] = model
+        while len(_WIRE_MODEL_CACHE) > _MAX_WIRE_MODEL_CACHE_SIZE:
+            _WIRE_MODEL_CACHE.popitem(last=False)
+        return model
+
+
+def _prune_wire_model_cache(
+    retained: frozenset[tuple[str, Literal["input", "output"]]],
+) -> None:
+    with _WIRE_MODEL_CACHE_LOCK:
+        for key in tuple(_WIRE_MODEL_CACHE):
+            if key not in retained:
+                _WIRE_MODEL_CACHE.pop(key, None)
+
+
+def _clear_wire_model_cache() -> None:
+    with _WIRE_MODEL_CACHE_LOCK:
+        _WIRE_MODEL_CACHE.clear()
+
+
+def _public_field_path(path: str) -> tuple[str, ...]:
+    return tuple(segment.replace("~1", "/").replace("~0", "~") for segment in path[1:].split("/"))
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicOutputClassification:
+    paths: frozenset[tuple[str, ...]]
+
+    @classmethod
+    def from_paths(cls, paths: Sequence[str]) -> _PublicOutputClassification:
+        return cls(paths=frozenset(_public_field_path(path) for path in paths))
+
+    def is_public(self, path: tuple[str, ...]) -> bool:
+        return path in self.paths
+
+    def has_public_descendant(self, path: tuple[str, ...]) -> bool:
+        return any(
+            len(candidate) > len(path) and candidate[: len(path)] == path
+            for candidate in self.paths
+        )
+
+    def exposes(self, path: tuple[str, ...]) -> bool:
+        return self.is_public(path) or self.has_public_descendant(path)
+
+
+def _dereference(schema: Mapping[str, Any], root: Mapping[str, Any]) -> Mapping[str, Any]:
+    reference = schema.get("$ref")
+    if reference is None:
+        return schema
+    if not isinstance(reference, str):
+        raise ValueError("generated_schema_invalid")
+    return _reference_target(reference, root)
+
+
+def _schema_mentions_private_field(
+    schema: Mapping[str, Any],
+    *,
+    root: Mapping[str, Any],
+    classification: _PublicOutputClassification,
+    path: tuple[str, ...],
+    references: frozenset[str] = frozenset(),
+) -> bool:
+    reference = schema.get("$ref")
+    if reference is not None:
+        if not isinstance(reference, str) or reference in references:
+            raise ValueError("generated_schema_invalid")
+        return _schema_mentions_private_field(
+            _dereference(schema, root),
+            root=root,
+            classification=classification,
+            path=path,
+            references=references | {reference},
+        )
+    properties = schema.get("properties")
+    if isinstance(properties, Mapping):
+        for name, child in properties.items():
+            if not isinstance(name, str) or not isinstance(child, Mapping):
+                raise ValueError("generated_schema_invalid")
+            child_path = (*path, name)
+            if not classification.exposes(child_path) or _schema_mentions_private_field(
+                child,
+                root=root,
+                classification=classification,
+                path=child_path,
+                references=references,
+            ):
+                return True
+    required = schema.get("required")
+    if isinstance(required, list | tuple) and any(
+        isinstance(name, str) and not classification.exposes((*path, name)) for name in required
+    ):
+        return True
+    for keyword in ("allOf", "anyOf", "oneOf"):
+        values = schema.get(keyword, ())
+        if not isinstance(values, list | tuple):
+            continue
+        if any(
+            _schema_mentions_private_field(
+                item,
+                root=root,
+                classification=classification,
+                path=path,
+                references=references,
+            )
+            for item in values
+            if isinstance(item, Mapping)
+        ):
+            return True
+    for keyword in ("if", "then", "else"):
+        child = schema.get(keyword)
+        if isinstance(child, Mapping) and _schema_mentions_private_field(
+            child,
+            root=root,
+            classification=classification,
+            path=path,
+            references=references,
+        ):
+            return True
+    items = schema.get("items")
+    return isinstance(items, Mapping) and _schema_mentions_private_field(
+        items,
+        root=root,
+        classification=classification,
+        path=(*path, "*"),
+        references=references,
+    )
+
+
+def _public_schema_node(
+    schema: Mapping[str, Any],
+    *,
+    root: Mapping[str, Any],
+    classification: _PublicOutputClassification,
+    path: tuple[str, ...],
+    matched_paths: set[tuple[str, ...]],
+    references: set[str],
+) -> dict[str, Any]:
+    reference = schema.get("$ref")
+    if reference is not None:
+        if not isinstance(reference, str) or reference in references:
+            raise ValueError("generated_schema_invalid")
+        return _public_schema_node(
+            _dereference(schema, root),
+            root=root,
+            classification=classification,
+            path=path,
+            matched_paths=matched_paths,
+            references={*references, reference},
+        )
+    result = {
+        key: copy.deepcopy(value) for key, value in schema.items() if key in _PUBLIC_SCALAR_KEYWORDS
+    }
+    if _schema_allows_object(schema):
+        properties = schema.get("properties", {})
+        if not isinstance(properties, Mapping):
+            raise ValueError("generated_schema_invalid")
+        public_properties: dict[str, Any] = {}
+        for name, value in properties.items():
+            if not isinstance(name, str) or not isinstance(value, Mapping):
+                raise ValueError("generated_schema_invalid")
+            child_path = (*path, name)
+            if not classification.exposes(child_path):
+                continue
+            if classification.is_public(child_path):
+                matched_paths.add(child_path)
+            public_properties[name] = _public_schema_node(
+                value,
+                root=root,
+                classification=classification,
+                path=child_path,
+                matched_paths=matched_paths,
+                references=references,
+            )
+        required = schema.get("required", [])
+        if not isinstance(required, list | tuple) or any(
+            not isinstance(item, str) for item in required
+        ):
+            raise ValueError("generated_schema_invalid")
+        result.update(
+            {
+                "type": copy.deepcopy(schema.get("type", "object")),
+                "properties": public_properties,
+                "required": [item for item in required if item in public_properties],
+                "additionalProperties": False,
+            }
+        )
+    if "items" in schema:
+        items = schema.get("items")
+        if not isinstance(items, Mapping):
+            raise ValueError("generated_schema_invalid")
+        item_path = (*path, "*")
+        if classification.is_public(item_path):
+            matched_paths.add(item_path)
+        result["items"] = _public_schema_node(
+            items,
+            root=root,
+            classification=classification,
+            path=item_path,
+            matched_paths=matched_paths,
+            references=references,
+        )
+    for keyword in ("allOf", "anyOf", "oneOf"):
+        if keyword in schema:
+            values = schema[keyword]
+            if not isinstance(values, list) or not all(
+                isinstance(item, Mapping) for item in values
+            ):
+                raise ValueError("generated_schema_invalid")
+            transformed = [
+                _public_schema_node(
+                    item,
+                    root=root,
+                    classification=classification,
+                    path=path,
+                    matched_paths=matched_paths,
+                    references=references,
+                )
+                for item in values
+            ]
+            # Removing private branch discriminators can make an exact source
+            # ``oneOf`` ambiguous. The public contract is the safe branch union.
+            result["anyOf" if keyword == "oneOf" else keyword] = transformed
+    condition = schema.get("if")
+    if condition is not None:
+        if not isinstance(condition, Mapping):
+            raise ValueError("generated_schema_invalid")
+        if _schema_mentions_private_field(
+            condition,
+            root=root,
+            classification=classification,
+            path=path,
+        ):
+            then_branch = schema.get("then")
+            else_branch = schema.get("else")
+            # A hidden discriminator leaves the omitted arm unconstrained.  A
+            # lone public branch would make that optional arm mandatory.
+            if isinstance(then_branch, Mapping) and isinstance(else_branch, Mapping):
+                result.setdefault("allOf", []).append(
+                    {
+                        "anyOf": [
+                            _public_schema_node(
+                                then_branch,
+                                root=root,
+                                classification=classification,
+                                path=path,
+                                matched_paths=matched_paths,
+                                references=references,
+                            ),
+                            _public_schema_node(
+                                else_branch,
+                                root=root,
+                                classification=classification,
+                                path=path,
+                                matched_paths=matched_paths,
+                                references=references,
+                            ),
+                        ]
+                    }
+                )
+        else:
+            result["if"] = _public_schema_node(
+                condition,
+                root=root,
+                classification=classification,
+                path=path,
+                matched_paths=matched_paths,
+                references=references,
+            )
+            for keyword in ("then", "else"):
+                branch = schema.get(keyword)
+                if isinstance(branch, Mapping):
+                    result[keyword] = _public_schema_node(
+                        branch,
+                        root=root,
+                        classification=classification,
+                        path=path,
+                        matched_paths=matched_paths,
+                        references=references,
+                    )
+    return result
+
+
+def public_output_schema(
+    schema: Mapping[str, Any],
+    *,
+    public_output_field_paths: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Derive a closed public value contract from the exact reviewed output schema."""
+
+    source = _schema_copy(schema)
+    _assert_closed_schema(source)
+    classification = _PublicOutputClassification.from_paths(public_output_field_paths)
+    matched_paths: set[tuple[str, ...]] = set()
+    projected = _public_schema_node(
+        source,
+        root=source,
+        classification=classification,
+        path=(),
+        matched_paths=matched_paths,
+        references=set(),
+    )
+    if matched_paths != set(classification.paths):
+        raise ValueError("generated_public_classification_invalid")
+    _assert_closed_schema(projected)
+    return projected
+
+
+def _schema_nodes(
+    schemas: Sequence[Mapping[str, Any]],
+    *,
+    root: Mapping[str, Any],
+    references: frozenset[str] = frozenset(),
+) -> tuple[Mapping[str, Any], ...]:
+    nodes: list[Mapping[str, Any]] = []
+    for schema in schemas:
+        reference = schema.get("$ref")
+        if reference is not None:
+            if not isinstance(reference, str) or reference in references:
+                raise ValueError("generated_output_invalid")
+            nodes.extend(
+                _schema_nodes(
+                    (_dereference(schema, root),),
+                    root=root,
+                    references=references | {reference},
+                )
+            )
+            continue
+        nodes.append(schema)
+        children: list[Mapping[str, Any]] = []
+        for keyword in ("allOf", "anyOf", "oneOf"):
+            values = schema.get(keyword)
+            if isinstance(values, list | tuple):
+                children.extend(item for item in values if isinstance(item, Mapping))
+        for keyword in ("if", "then", "else"):
+            child = schema.get(keyword)
+            if isinstance(child, Mapping):
+                children.append(child)
+        if children:
+            nodes.extend(_schema_nodes(children, root=root, references=references))
+    return tuple(nodes)
+
+
+def _project_value(
+    value: JsonValue,
+    schemas: Sequence[Mapping[str, Any]],
+    *,
+    root: Mapping[str, Any],
+    classification: _PublicOutputClassification,
+    path: tuple[str, ...],
+) -> JsonValue:
+    nodes = _schema_nodes(schemas, root=root)
+    properties: dict[str, list[Mapping[str, Any]]] = {}
+    item_schemas: list[Mapping[str, Any]] = []
+    for node in nodes:
+        candidate_properties = node.get("properties")
+        if isinstance(candidate_properties, Mapping):
+            for name, child in candidate_properties.items():
+                if isinstance(name, str) and isinstance(child, Mapping):
+                    properties.setdefault(name, []).append(child)
+        items = node.get("items")
+        if isinstance(items, Mapping):
+            item_schemas.append(items)
+    if isinstance(value, Mapping):
+        if not properties:
+            return {}
+        projected: dict[str, JsonValue] = {}
+        for name, item in value.items():
+            if not isinstance(name, str) or name not in properties:
+                continue
+            child_path = (*path, name)
+            if isinstance(item, Mapping | list | tuple):
+                visible = classification.exposes(child_path)
+            else:
+                visible = classification.is_public(child_path)
+            if not visible:
+                continue
+            projected[name] = _project_value(
+                item,
+                tuple(properties[name]),
+                root=root,
+                classification=classification,
+                path=child_path,
+            )
+        return projected
+    if isinstance(value, list | tuple):
+        if not item_schemas:
+            return []
+        item_path = (*path, "*")
+        return [
+            _project_value(
+                item,
+                tuple(item_schemas),
+                root=root,
+                classification=classification,
+                path=item_path,
+            )
+            for item in value
+            if (
+                classification.exposes(item_path)
+                if isinstance(item, Mapping | list | tuple)
+                else classification.is_public(item_path)
+            )
+        ]
+    return value
+
+
+def project_provider_read_data(
+    value: Mapping[str, JsonValue],
+    *,
+    output_schema: Mapping[str, Any],
+    public_output_field_paths: Sequence[str] = (),
+) -> dict[str, JsonValue]:
+    """Project a raw, already exact-schema-validated value into the public contract."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError("generated_output_invalid")
+    source = _schema_copy(output_schema)
+    # Direct callers get the same exact authority validation as HostedReadService.
+    raw_value = (
+        catalog_wire_model(source, kind="output").model_validate(value).model_dump(mode="json")
+    )
+    classification = _PublicOutputClassification.from_paths(public_output_field_paths)
+    public_model = catalog_wire_model(
+        public_output_schema(
+            source,
+            public_output_field_paths=public_output_field_paths,
+        ),
+        kind="output",
+    )
+    projected = _project_value(
+        raw_value,
+        (source,),
+        root=source,
+        classification=classification,
+        path=(),
+    )
+    if not isinstance(projected, Mapping):
+        raise ValueError("generated_output_invalid")
+    return public_model.model_validate(projected).model_dump(mode="json")
+
+
+def _wrapper_name(qualification: ProviderMCPQualification) -> str:
+    suffixes = {
+        "provider_profile.get": "provider_profile_get",
+        "documents.invoice.list": "invoice_list",
+        "documents.invoice.get": "invoice_get",
+    }
+    suffix = suffixes.get(qualification.normalized_capability)
+    if suffix is None:
+        raise ValueError("generated_capability_invalid")
+    return f"mercury_{qualification.provider}_{suffix}"
+
+
+def _qualification_version_identity(
+    qualification: ProviderMCPQualification,
+) -> tuple[str, str, str, str, str]:
+    return (
+        qualification.provider,
+        qualification.environment,
+        qualification.provider_tool_name,
+        qualification.normalized_capability,
+        qualification.capability_version_sha256,
+    )
+
+
+def _schema_change_is_persisted(
+    qualifications: Sequence[ProviderMCPQualification],
+    qualification: ProviderMCPQualification,
+) -> bool:
+    exact = [
+        item
+        for item in qualifications
+        if _qualification_version_identity(item) == _qualification_version_identity(qualification)
+    ]
+    return bool(exact) and all(
+        item.qualification_state in {QualificationState.DISABLED, QualificationState.SUPERSEDED}
+        and item.disable_reason == "schema_changed"
+        for item in exact
+    )
+
+
+def _stronger_dispatch_certainty(
+    current: DispatchCertainty,
+    candidate: DispatchCertainty,
+) -> DispatchCertainty:
+    order = {
+        DispatchCertainty.NOT_APPLICABLE: 0,
+        DispatchCertainty.NOT_DISPATCHED: 1,
+        DispatchCertainty.UNKNOWN: 2,
+        DispatchCertainty.DISPATCHED: 3,
+    }
+    return candidate if order[candidate] > order[current] else current
+
+
+def _rewrite_references(value: Any, names: Mapping[str, str]) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _rewrite_references(item, names) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_rewrite_references(item, names) for item in value]
+    if isinstance(value, str) and value.startswith("#/$defs/"):
+        name = value.rsplit("/", 1)[-1]
+        if name in names:
+            return f"#/$defs/{names[name]}"
+    return value
+
+
+def _merge_schema_definitions(
+    container: dict[str, Any],
+    schema: Mapping[str, Any],
+    *,
+    prefix: str,
+) -> dict[str, Any]:
+    embedded = copy.deepcopy(dict(schema))
+    definitions = embedded.pop("$defs", {})
+    if not definitions:
+        return embedded
+    if not isinstance(definitions, Mapping) or not all(
+        isinstance(name, str) and isinstance(value, Mapping) for name, value in definitions.items()
+    ):
+        raise ValueError("generated_schema_invalid")
+    names = {name: f"{prefix}{name}" for name in definitions}
+    target = container.setdefault("$defs", {})
+    if not isinstance(target, dict) or set(target) & set(names.values()):
+        raise ValueError("generated_schema_invalid")
+    for name, definition in definitions.items():
+        target[names[name]] = _rewrite_references(definition, names)
+    return _rewrite_references(embedded, names)
+
+
+_ROUTING_FIELD_NAMES = ("workspace_id", "connection_id", "capability_version")
+
+
+def _inject_routing_fields(
+    schema: dict[str, Any],
+    *,
+    capability_version: str,
+) -> None:
+    routing_properties = {
+        "workspace_id": {"type": "string", "format": "uuid"},
+        "connection_id": {"type": "string", "format": "uuid"},
+        "capability_version": {"const": capability_version},
+    }
+    visited: set[int] = set()
+
+    def visit(node: Mapping[str, Any]) -> None:
+        reference = node.get("$ref")
+        if reference is not None:
+            if not isinstance(reference, str):
+                raise ValueError("generated_schema_invalid")
+            visit(_reference_target(reference, schema))
+            return
+        node_id = id(node)
+        if node_id in visited:
+            return
+        visited.add(node_id)
+        if _schema_allows_object(node):
+            if not isinstance(node, dict):
+                raise ValueError("generated_schema_invalid")
+            properties = node.setdefault("properties", {})
+            required = node.setdefault("required", [])
+            if (
+                not isinstance(properties, dict)
+                or not isinstance(required, list)
+                or set(_ROUTING_FIELD_NAMES) & set(properties)
+            ):
+                raise ValueError("generated_schema_invalid")
+            properties.update(copy.deepcopy(routing_properties))
+            for field_name in _ROUTING_FIELD_NAMES:
+                if field_name not in required:
+                    required.append(field_name)
+        for keyword in ("allOf", "anyOf", "oneOf"):
+            branches = node.get(keyword)
+            if isinstance(branches, list):
+                for branch in branches:
+                    if isinstance(branch, Mapping):
+                        visit(branch)
+        for keyword in ("if", "then", "else"):
+            branch = node.get(keyword)
+            if isinstance(branch, Mapping):
+                visit(branch)
+
+    visit(schema)
+
+
+@dataclass(frozen=True, slots=True)
+class _GeneratedBranch:
+    qualification: ProviderMCPQualification
+    input_model: type[_CatalogWireModel]
+    public_output_model: type[_CatalogWireModel]
+    public_output_schema: dict[str, Any]
+
+    @property
+    def capability_version(self) -> str:
+        return self.qualification.capability_version_sha256
+
+    @property
+    def identity(self) -> str:
+        return canonical_json(
+            {
+                "provider": self.qualification.provider,
+                "environment": self.qualification.environment,
+                "capability": self.qualification.normalized_capability,
+                "version": self.qualification.capability_version_sha256,
+                "input": self.qualification.input_schema,
+                "output": self.qualification.output_schema,
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedTool:
+    name: str
+    branches: tuple[_GeneratedBranch, ...]
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any]
+    argument_model: type[_GeneratedArguments]
+
+    @property
+    def identity(self) -> str:
+        return canonical_json(
+            {
+                "branches": [branch.identity for branch in self.branches],
+                "input": self.input_schema,
+                "output": self.output_schema,
+            }
+        )
+
+
+def _branch_input_schema(branches: Sequence[_GeneratedBranch], name: str) -> dict[str, Any]:
+    result: dict[str, Any] = {"$defs": {}}
+    options: list[dict[str, str]] = []
+    for index, branch in enumerate(branches):
+        source = _schema_copy(branch.qualification.input_schema)
+        _assert_closed_schema(source)
+        _inject_routing_fields(
+            source,
+            capability_version=branch.capability_version,
+        )
+        embedded = _merge_schema_definitions(result, source, prefix=f"Input{index}_")
+        definition_name = f"Arguments{index}"
+        definitions = result["$defs"]
+        if not isinstance(definitions, dict):
+            raise ValueError("generated_schema_invalid")
+        embedded.setdefault("title", f"{name}Version{index}Arguments")
+        definitions[definition_name] = embedded
+        options.append({"$ref": f"#/$defs/{definition_name}"})
+    result["oneOf"] = options
+    _assert_closed_schema(result)
+    return result
+
+
+def _assert_closed_generated_contract(schema: Mapping[str, Any]) -> None:
+    """Check the static envelope union without narrowing its Pydantic JSON Schema."""
+
+    def visit(node: object) -> None:
+        if not isinstance(node, Mapping):
+            return
+        is_object = _schema_allows_object(node)
+        if is_object and node.get("additionalProperties") is not False:
+            raise ValueError("generated_schema_invalid")
+        for value in node.values():
+            if isinstance(value, Mapping):
+                visit(value)
+            elif isinstance(value, list | tuple):
+                for item in value:
+                    visit(item)
+
+    visit(schema)
+
+
+def _branch_output_schema(branches: Sequence[_GeneratedBranch]) -> dict[str, Any]:
+    result: dict[str, Any] = {"$defs": {}}
+    definitions = result["$defs"]
+    if not isinstance(definitions, dict):
+        raise ValueError("generated_schema_invalid")
+    for index, branch in enumerate(branches):
+        success = _merge_schema_definitions(
+            result,
+            ProviderReadEnvelope.model_json_schema(by_alias=True),
+            prefix=f"Envelope{index}_",
+        )
+        properties = success.get("properties")
+        if not isinstance(properties, dict):
+            raise ValueError("generated_schema_invalid")
+        properties["capability_version"] = {"const": branch.capability_version}
+        properties["data"] = _merge_schema_definitions(
+            result,
+            branch.public_output_schema,
+            prefix=f"PublicData{index}_",
+        )
+        success_name = f"Success{index}"
+        definitions[success_name] = success
+    error = published_error_output_schema()
+    definitions["MercuryV1ErrorOutput"] = _merge_schema_definitions(
+        result,
+        error,
+        prefix="Error_",
+    )
+    result["oneOf"] = [
+        *[{"$ref": f"#/$defs/Success{index}"} for index in range(len(branches))],
+        {"$ref": "#/$defs/MercuryV1ErrorOutput"},
+    ]
+    _assert_closed_generated_contract(result)
+    return result
+
+
+class _GeneratedArguments(ArgModelBase):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    arguments: dict[str, JsonValue]
+    _validator: ClassVar[Draft202012Validator]
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_catalog_arguments(cls, value: object) -> object:
+        if not isinstance(value, Mapping):
+            raise ValueError("generated_schema_validation_failed")
+        try:
+            cls._validator.validate(dict(value))
+        except Exception:
+            raise ValueError("generated_schema_validation_failed") from None
+        return {"arguments": dict(value)}
+
+
+def _arguments_model(schema: Mapping[str, Any], *, name: str) -> type[_GeneratedArguments]:
+    return type(
+        f"{name}Arguments",
+        (_GeneratedArguments,),
+        {
+            "__module__": __name__,
+            "__annotations__": {"_validator": ClassVar[Draft202012Validator]},
+            "_validator": Draft202012Validator(dict(schema), format_checker=FormatChecker()),
+        },
+    )
+
+
+class GeneratedProviderToolPublisher:
+    """Atomically project catalog read authority into one stable Mercury wrapper."""
+
+    def __init__(
+        self,
+        server: FastMCP,
+        *,
+        execute: GeneratedReadExecutor,
+        persist_schema_change: PersistSchemaChange | None = None,
+        schema_change_handler: SchemaChangeHandler | None = None,
+        schema_drift_alert: SchemaDriftAlert | None = None,
+    ) -> None:
+        self._server = server
+        self._execute = execute
+        self._persist_schema_change = persist_schema_change
+        self._schema_change_handler = schema_change_handler
+        self._schema_drift_alert = schema_drift_alert
+        self._published: dict[str, str] = {}
+        self._refresh_lock = asyncio.Lock()
+        self._requested_generation = 0
+        self._committed_generation = 0
+        self._refresh_sessions: OrderedDict[int, _RefreshSession] = OrderedDict()
+        self._detached_notification_tasks: dict[int, _DetachedNotificationTask] = {}
+        self._notification_retention_closed = False
+        self._quarantined_versions: dict[tuple[str, str, str, str, str], _QuarantinedVersion] = {}
+        self._dispatch_tombstones: set[tuple[str, str, str, str, str]] = set()
+
+    async def publish(
+        self,
+        qualifications: Sequence[ProviderMCPQualification],
+        *,
+        context: Context | object | None = None,
+        _release_quarantines: Sequence[tuple[str, str, str, str, str]] = (),
+    ) -> bool:
+        """Stage every branch before one rollback-safe, generation-serialized swap."""
+
+        staged = self._stage(qualifications)
+        self._requested_generation += 1
+        request_generation = self._requested_generation
+        self._remember_session(context)
+        async with self._refresh_lock:
+            if request_generation < self._requested_generation:
+                return False
+            changed = self._swap(staged)
+            retained_wire_models = frozenset(
+                (
+                    _schema_fingerprint(
+                        branch.qualification.input_schema
+                        if kind == "input"
+                        else branch.public_output_schema
+                    ),
+                    kind,
+                )
+                for tool in staged.values()
+                for branch in tool.branches
+                for kind in ("input", "output")
+            )
+            _prune_wire_model_cache(retained_wire_models)
+            if changed:
+                self._committed_generation = request_generation
+            for identity in _release_quarantines:
+                self._quarantined_versions.pop(identity, None)
+            if changed or self._has_pending_refresh_notifications():
+                await self._notify_refresh_sessions()
+            return changed
+
+    async def reconcile(
+        self,
+        qualifications: Sequence[ProviderMCPQualification],
+        *,
+        context: Context | object | None = None,
+    ) -> bool:
+        """Retry safe exact drift transitions before publishing current authority."""
+
+        current = tuple(ProviderMCPQualification.model_validate(item) for item in qualifications)
+        release_quarantines: set[tuple[str, str, str, str, str]] = set()
+        for identity, quarantined in tuple(self._quarantined_versions.items()):
+            qualification = quarantined.qualification
+            if _schema_change_is_persisted(current, qualification):
+                release_quarantines.add(identity)
+                continue
+            enabled = next(
+                (
+                    item
+                    for item in current
+                    if _qualification_version_identity(item) == identity
+                    and item.qualification_state is QualificationState.ENABLED
+                ),
+                None,
+            )
+            if enabled is None:
+                continue
+            try:
+                current = await self._persist_schema_transition(
+                    enabled,
+                    context if context is not None else object(),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await self._emit_schema_drift_alert(
+                    qualification,
+                    quarantined.dispatch_certainty,
+                )
+            else:
+                release_quarantines.add(identity)
+        return await self.publish(
+            current,
+            context=context,
+            _release_quarantines=tuple(release_quarantines),
+        )
+
+    def clear(self) -> bool:
+        """Remove generated tools and retained sessions during disablement or shutdown."""
+
+        self._notification_retention_closed = True
+        changed = False
+        for name in tuple(self._published):
+            if self._server._tool_manager.get_tool(name) is not None:
+                self._server.remove_tool(name)
+            self._published.pop(name, None)
+            changed = True
+        self._refresh_sessions.clear()
+        detached = tuple(
+            tracked.task_ref() for tracked in self._detached_notification_tasks.values()
+        )
+        self._detached_notification_tasks.clear()
+        for task in detached:
+            if task is not None:
+                task.cancel()
+        _clear_wire_model_cache()
+        return changed
+
+    def register_session(self, context: Context | object | None) -> None:
+        """Retain one active MCP session for bounded catalog refresh notification."""
+
+        self._remember_session(context)
+
+    def _stage(
+        self,
+        qualifications: Sequence[ProviderMCPQualification],
+    ) -> dict[str, _StagedTool]:
+        grouped: dict[str, dict[str, _GeneratedBranch]] = {}
+        for item in qualifications:
+            qualification = ProviderMCPQualification.model_validate(item)
+            if (
+                qualification.qualification_state is not QualificationState.ENABLED
+                or qualification.normalized_capability not in _READ_CAPABILITIES
+                or qualification.public_output_field_paths is None
+            ):
+                continue
+            public_schema = public_output_schema(
+                qualification.output_schema,
+                public_output_field_paths=qualification.public_output_field_paths,
+            )
+            branch = _GeneratedBranch(
+                qualification=qualification,
+                input_model=catalog_wire_model(qualification.input_schema, kind="input"),
+                public_output_model=catalog_wire_model(public_schema, kind="output"),
+                public_output_schema=public_schema,
+            )
+            versions = grouped.setdefault(_wrapper_name(qualification), {})
+            existing = versions.get(branch.capability_version)
+            if existing is not None and existing.identity != branch.identity:
+                raise ValueError("generated_capability_ambiguous")
+            versions.setdefault(branch.capability_version, branch)
+        staged: dict[str, _StagedTool] = {}
+        for name, versions in grouped.items():
+            branches = tuple(
+                branch for _, branch in sorted(versions.items(), key=lambda item: item[0])
+            )
+            input_schema = _branch_input_schema(branches, name)
+            staged[name] = _StagedTool(
+                name=name,
+                branches=branches,
+                input_schema=input_schema,
+                output_schema=_branch_output_schema(branches),
+                argument_model=_arguments_model(input_schema, name=name),
+            )
+        return staged
+
+    def _swap(self, staged: Mapping[str, _StagedTool]) -> bool:
+        target_identities = {name: item.identity for name, item in staged.items()}
+        if target_identities == self._published:
+            return False
+        managed_names = set(self._published) | set(staged)
+        previous_tools = {name: self._server._tool_manager.get_tool(name) for name in managed_names}
+        previous_published = dict(self._published)
+        try:
+            for name in sorted(managed_names):
+                registered = self._server._tool_manager.get_tool(name)
+                if registered is not None:
+                    self._server.remove_tool(name)
+            for name in sorted(staged):
+                self._register(staged[name])
+            self._published = target_identities
+        except BaseException:
+            for name in managed_names:
+                if self._server._tool_manager.get_tool(name) is not None:
+                    self._server.remove_tool(name)
+            for name, registered in previous_tools.items():
+                if registered is not None:
+                    self._server._tool_manager._tools[name] = registered
+            self._published = previous_published
+            raise
+        return True
+
+    def _register(self, staged: _StagedTool) -> None:
+        branches = {branch.capability_version: branch for branch in staged.branches}
+
+        async def generated_read_tool(
+            context: Context,
+            arguments: dict[str, JsonValue],
+        ) -> ProviderReadEnvelope:
+            try:
+                self._remember_session(context)
+                values = dict(arguments)
+                workspace_id = UUID(str(values.pop("workspace_id")))
+                connection_id = UUID(str(values.pop("connection_id")))
+                capability_version = str(values.pop("capability_version"))
+                branch = branches.get(capability_version)
+                if branch is None:
+                    raise ValueError("generated_schema_validation_failed")
+                self.ensure_dispatch_allowed(branch.qualification)
+                inputs = branch.input_model.model_validate(values)
+                result = ProviderReadEnvelope.model_validate(
+                    await self._execute(
+                        context,
+                        workspace_id=workspace_id,
+                        connection_id=connection_id,
+                        capability_id=branch.qualification.normalized_capability,
+                        capability_version=branch.capability_version,
+                        inputs=inputs,
+                    )
+                )
+                if (
+                    result.capability_id != branch.qualification.normalized_capability
+                    or result.capability_version != branch.capability_version
+                ):
+                    raise ValueError("generated_output_invalid")
+                data = branch.public_output_model.model_validate(result.data).model_dump(
+                    mode="json"
+                )
+                return result.model_copy(update={"data": data})
+            except ProviderSchemaChanged as error:
+                await self._route_schema_change(
+                    branch.qualification,
+                    context,
+                    error.dispatch_certainty,
+                )
+                raise MercuryV1ToolError(public_error_code(error)) from None
+            except Exception as error:
+                raise MercuryV1ToolError(public_error_code(error)) from None
+
+        generated_read_tool.__name__ = staged.name
+        self._server.add_tool(
+            generated_read_tool,
+            name=staged.name,
+            description=(
+                "Changes: none. External contact: a qualified provider read. "
+                "Omitted options: provider credentials, provider routing, and mutations "
+                "are not accepted."
+            ),
+            annotations=_CLOSED_READ,
+            meta=_V1_GENERATED_META,
+            structured_output=True,
+        )
+        set_input = getattr(self._server, "set_tool_input_contract", None)
+        set_output = getattr(self._server, "set_tool_output_contract", None)
+        if not callable(set_input) or not callable(set_output):
+            raise TypeError("generated_tool_server_invalid")
+        set_input(staged.name, argument_model=staged.argument_model, schema=staged.input_schema)
+        set_output(staged.name, schema=staged.output_schema)
+
+    async def _route_schema_change(
+        self,
+        qualification: ProviderMCPQualification,
+        context: Context | object,
+        dispatch_certainty: DispatchCertainty,
+    ) -> None:
+        if self._schema_change_handler is not None:
+            await self._schema_change_handler(
+                qualification,
+                context,
+                dispatch_certainty,
+            )
+            return
+        await self.handle_schema_change(
+            qualification,
+            context,
+            dispatch_certainty,
+        )
+
+    async def handle_schema_change(
+        self,
+        qualification: ProviderMCPQualification,
+        context: Context | object,
+        dispatch_certainty: DispatchCertainty,
+    ) -> None:
+        """Quarantine, durably demote, and publish one exact drifted version."""
+
+        identity = _qualification_version_identity(qualification)
+        self.quarantine_schema_change(qualification, dispatch_certainty)
+        try:
+            refreshed = await self._persist_schema_transition(qualification, context)
+            await self.publish(
+                refreshed,
+                context=context,
+                _release_quarantines=(identity,),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            quarantined = self._quarantined_versions.get(identity)
+            strongest_certainty = (
+                quarantined.dispatch_certainty if quarantined is not None else dispatch_certainty
+            )
+            await self._emit_schema_drift_alert(qualification, strongest_certainty)
+            raise MercuryV1ToolError("capability_unavailable") from None
+
+    def quarantine_schema_change(
+        self,
+        qualification: ProviderMCPQualification,
+        dispatch_certainty: DispatchCertainty,
+    ) -> None:
+        """Immediately block repeat dispatch while durable authority catches up."""
+
+        self._quarantine(qualification, dispatch_certainty)
+
+    def ensure_dispatch_allowed(
+        self,
+        qualification: ProviderMCPQualification,
+    ) -> None:
+        """Fail closed for a quarantined or process-tombstoned exact version."""
+
+        identity = _qualification_version_identity(qualification)
+        if identity in self._quarantined_versions or identity in self._dispatch_tombstones:
+            raise MercuryV1ToolError("capability_unavailable")
+
+    def _quarantine(
+        self,
+        qualification: ProviderMCPQualification,
+        dispatch_certainty: DispatchCertainty,
+    ) -> None:
+        identity = _qualification_version_identity(qualification)
+        self._dispatch_tombstones.add(identity)
+        existing = self._quarantined_versions.get(identity)
+        if existing is not None:
+            dispatch_certainty = _stronger_dispatch_certainty(
+                existing.dispatch_certainty,
+                dispatch_certainty,
+            )
+        self._quarantined_versions[identity] = _QuarantinedVersion(
+            qualification=qualification,
+            dispatch_certainty=dispatch_certainty,
+        )
+
+    async def _persist_schema_transition(
+        self,
+        qualification: ProviderMCPQualification,
+        context: Context | object,
+    ) -> tuple[ProviderMCPQualification, ...]:
+        if self._persist_schema_change is None:
+            raise ValueError("catalog_schema_transition_unavailable")
+        refreshed = await _await_value(self._persist_schema_change(qualification, context))
+        if not isinstance(refreshed, Sequence):
+            raise ValueError("catalog_schema_transition_unavailable")
+        checked = tuple(ProviderMCPQualification.model_validate(item) for item in refreshed)
+        if not _schema_change_is_persisted(checked, qualification):
+            raise ValueError("catalog_schema_transition_unavailable")
+        return checked
+
+    async def _emit_schema_drift_alert(
+        self,
+        qualification: ProviderMCPQualification,
+        dispatch_certainty: DispatchCertainty,
+    ) -> None:
+        if self._schema_drift_alert is None:
+            return
+        try:
+            await _await_value(
+                self._schema_drift_alert(
+                    {
+                        "tool_name": "generated_provider_read",
+                        "input": {
+                            "capability_id": qualification.normalized_capability,
+                            "capability_version": qualification.capability_version_sha256,
+                        },
+                        "output_summary": {
+                            "provider": qualification.provider,
+                            "environment": qualification.environment,
+                            "status_class": "schema_changed",
+                            "dispatch_certainty": dispatch_certainty.value,
+                            "alert": "catalog_transition_unavailable",
+                        },
+                        "status": "error",
+                        "metadata": {"runtime": "mcp", "surface": "v1"},
+                    }
+                )
+            )
+        except Exception:
+            return
+
+    def _remember_session(self, context: Context | object | None) -> None:
+        if self._notification_retention_closed:
+            return
+        try:
+            session = getattr(context, "session", None)
+        except Exception:
+            return
+        if not callable(getattr(session, "send_tool_list_changed", None)):
+            return
+        now = time.monotonic()
+        self._prune_refresh_sessions(now)
+        key = id(session)
+        if key in self._active_detached_notification_keys():
+            return
+        existing = self._refresh_sessions.get(key)
+        if existing is not None:
+            existing.last_seen_at = now
+            self._refresh_sessions.move_to_end(key)
+            return
+        if _MAX_REFRESH_SESSIONS <= 0:
+            return
+        while len(self._refresh_sessions) >= _MAX_REFRESH_SESSIONS:
+            self._refresh_sessions.popitem(last=False)
+        try:
+            weak_session = weakref.ref(session)
+            strong_session = None
+        except TypeError:
+            # The MCP SDK session is normally weak-referenceable.  Some test and
+            # adapter sessions are not, so retain only a bounded LRU entry.
+            weak_session = None
+            strong_session = session
+        self._refresh_sessions[key] = _RefreshSession(
+            weak_session=weak_session,
+            strong_session=strong_session,
+            last_seen_at=now,
+            notified_generation=self._committed_generation,
+        )
+
+    def _prune_refresh_sessions(self, now: float | None = None) -> None:
+        checked_at = time.monotonic() if now is None else now
+        for key, entry in tuple(self._refresh_sessions.items()):
+            if (
+                checked_at - entry.last_seen_at > _REFRESH_SESSION_IDLE_SECONDS
+                or entry.resolve() is None
+            ):
+                self._refresh_sessions.pop(key, None)
+
+    def _has_pending_refresh_notifications(self) -> bool:
+        if self._notification_retention_closed:
+            return False
+        self._prune_refresh_sessions()
+        return any(
+            entry.notified_generation < self._committed_generation
+            for entry in self._refresh_sessions.values()
+        )
+
+    def _pending_refresh_sessions(self) -> list[tuple[int, object]]:
+        if self._notification_retention_closed:
+            return []
+        self._prune_refresh_sessions()
+        pending: list[tuple[int, object]] = []
+        for key, entry in tuple(self._refresh_sessions.items()):
+            if entry.notified_generation >= self._committed_generation:
+                continue
+            session = entry.resolve()
+            if session is None:
+                self._refresh_sessions.pop(key, None)
+                continue
+            pending.append((key, session))
+        return pending
+
+    @staticmethod
+    async def _send_refresh_notification(session: object) -> None:
+        sender = getattr(session, "send_tool_list_changed", None)
+        if not callable(sender):
+            raise TypeError("generated_refresh_session_invalid")
+        await _await_value(sender())
+
+    def _record_notification_results(
+        self,
+        tasks: Mapping[int, asyncio.Task[None]],
+        *,
+        generation: int,
+    ) -> None:
+        for key, task in tasks.items():
+            if task.cancelled():
+                if not self._notification_retention_closed:
+                    self._refresh_sessions.pop(key, None)
+                continue
+            try:
+                task.result()
+            except Exception:
+                if not self._notification_retention_closed:
+                    self._refresh_sessions.pop(key, None)
+            else:
+                if self._notification_retention_closed:
+                    continue
+                entry = self._refresh_sessions.get(key)
+                if entry is not None:
+                    entry.notified_generation = max(entry.notified_generation, generation)
+
+    def _finish_detached_notification(
+        self,
+        key: int,
+        generation: int,
+        task: asyncio.Task[None],
+    ) -> None:
+        tracked = self._detached_notification_tasks.get(key)
+        is_current = tracked is not None and tracked.task_ref() is task
+        if is_current:
+            self._detached_notification_tasks.pop(key, None)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except BaseException:
+            if is_current and not self._notification_retention_closed:
+                self._refresh_sessions.pop(key, None)
+        else:
+            if is_current and not self._notification_retention_closed:
+                entry = self._refresh_sessions.get(key)
+                if entry is None:
+                    return
+                entry.notified_generation = max(entry.notified_generation, generation)
+
+    def _active_detached_notification_keys(self) -> set[int]:
+        for key, tracked in tuple(self._detached_notification_tasks.items()):
+            task = tracked.task_ref()
+            if task is None:
+                self._detached_notification_tasks.pop(key, None)
+            elif task.done():
+                self._finish_detached_notification(key, tracked.generation, task)
+        return set(self._detached_notification_tasks)
+
+    def _detach_notification_tasks(
+        self,
+        tasks: Mapping[int, asyncio.Task[None]],
+        *,
+        generation: int,
+        evict_sessions: bool,
+    ) -> None:
+        for key, task in tasks.items():
+            if evict_sessions:
+                self._refresh_sessions.pop(key, None)
+            else:
+                entry = self._refresh_sessions.get(key)
+                if entry is not None and entry.weak_session is None:
+                    self._refresh_sessions.pop(key, None)
+            task.cancel()
+            if not self._notification_retention_closed:
+                self._detached_notification_tasks[key] = _DetachedNotificationTask(
+                    task_ref=weakref.ref(task),
+                    generation=generation,
+                )
+            task.add_done_callback(
+                partial(
+                    _consume_detached_notification,
+                    weakref.ref(self),
+                    key,
+                    generation,
+                )
+            )
+
+    async def _notify_refresh_sessions(self) -> None:
+        """Notify pending request sessions concurrently within one total deadline."""
+
+        if self._notification_retention_closed:
+            return
+        generation = self._committed_generation
+        active_keys = self._active_detached_notification_keys()
+        available = max(0, _MAX_REFRESH_SESSIONS - len(active_keys))
+        admitted = [
+            (key, session)
+            for key, session in self._pending_refresh_sessions()
+            if key not in active_keys
+        ][:available]
+        tasks: dict[int, asyncio.Task[None]] = {}
+        for key, session in admitted:
+            task = _REFRESH_NOTIFICATION_TASK_OWNER.create_task(
+                partial(GeneratedProviderToolPublisher._send_refresh_notification, session)
+            )
+            if task is None:
+                break
+            tasks[key] = task
+        if not tasks:
+            return
+        try:
+            done, pending = await asyncio.wait(
+                tasks.values(),
+                timeout=_REFRESH_NOTIFICATION_TOTAL_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            completed = {key: task for key, task in tasks.items() if task.done()}
+            detached = {key: task for key, task in tasks.items() if not task.done()}
+            self._record_notification_results(completed, generation=generation)
+            # Cooperative cancellation remains pending for the next unchanged
+            # refresh. Resistant children are retained only until their eventual
+            # result is consumed.
+            self._detach_notification_tasks(
+                detached,
+                generation=generation,
+                evict_sessions=False,
+            )
+            raise
+        completed = {key: task for key, task in tasks.items() if task in done}
+        detached = {key: task for key, task in tasks.items() if task in pending}
+        self._record_notification_results(completed, generation=generation)
+        self._detach_notification_tasks(
+            detached,
+            generation=generation,
+            evict_sessions=True,
+        )
+
+
+def _consume_detached_notification(
+    publisher_ref: weakref.ReferenceType[GeneratedProviderToolPublisher],
+    key: int,
+    generation: int,
+    task: asyncio.Task[None],
+) -> None:
+    publisher = publisher_ref()
+    if publisher is not None:
+        publisher._finish_detached_notification(key, generation, task)
+        return
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except BaseException:
+        return
+
+
+async def _await_value(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+__all__ = [
+    "GeneratedProviderToolPublisher",
+    "catalog_wire_model",
+    "project_provider_read_data",
+    "public_output_schema",
+]

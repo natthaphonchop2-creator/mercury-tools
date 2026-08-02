@@ -207,10 +207,27 @@ def test_remote_http_app_allows_public_base_url_host(monkeypatch) -> None:
 
     from mercury_tools.mcp.server import mcp
 
-    create_http_app(require_auth=False)
+    original_hosts = tuple(mcp.settings.transport_security.allowed_hosts)
+    original_origins = tuple(mcp.settings.transport_security.allowed_origins)
+    app = create_http_app(require_auth=False)
 
-    assert "mercury.example.com" in mcp.settings.transport_security.allowed_hosts
-    assert "https://mercury.example.com" in mcp.settings.transport_security.allowed_origins
+    with TestClient(
+        app,
+        base_url="https://mercury.example.com",
+        raise_server_exceptions=False,
+    ) as client:
+        assert client.get("/mcp").status_code != 421
+        assert client.get("/mcp", headers={"host": "attacker.example.com"}).status_code == 421
+        assert (
+            client.get(
+                "/mcp",
+                headers={"origin": "https://attacker.example.com"},
+            ).status_code
+            == 403
+        )
+
+    assert tuple(mcp.settings.transport_security.allowed_hosts) == original_hosts
+    assert tuple(mcp.settings.transport_security.allowed_origins) == original_origins
 
 
 def test_remote_http_app_requires_bearer_token_for_mcp_path(monkeypatch) -> None:
@@ -362,8 +379,9 @@ def test_connect_api_issues_client_token_for_mcp(monkeypatch) -> None:
     payload = response.json()
     assert payload["token"].startswith("mc_")
     assert "codex mcp add mercury-tools" in payload["codex"]["command"]
-    assert "codex plugin marketplace add natthaphonchop2-creator/mercury-tools" in (
-        payload["codex"]["setup_command"]
+    assert (
+        "codex plugin marketplace add natthaphonchop2-creator/mercury-tools"
+        in (payload["codex"]["setup_command"])
     )
     assert "codex plugin add mercury-finance" in payload["codex"]["setup_command"]
     assert "codex mcp add mercury-tools" in payload["codex"]["setup_command"]
@@ -391,7 +409,7 @@ def test_connect_page_does_not_present_browser_setup_ux(monkeypatch) -> None:
     assert "Mercury Tools MCP Server" in response.text
     assert "Codex one-command setup" not in response.text
     assert "Advanced MCP client config" not in response.text
-    assert "data-copy=\"codex-command\"" not in response.text
+    assert 'data-copy="codex-command"' not in response.text
 
 
 def test_product_dashboard_requires_mercury_client_token(monkeypatch) -> None:
@@ -512,8 +530,7 @@ def test_legacy_connector_setup_rejects_missing_mode_and_unsafe_fields(monkeypat
     ]
 
     responses = [
-        client.post("/api/connectors/setup", headers=headers, json=body)
-        for body in unsafe_bodies
+        client.post("/api/connectors/setup", headers=headers, json=body) for body in unsafe_bodies
     ]
 
     assert all(400 <= response.status_code < 500 for response in responses)

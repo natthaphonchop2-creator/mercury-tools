@@ -37,6 +37,20 @@ id = "generic-api-key"
   paths = ['''^tests/test_cloud_api\.py$''']
   regexes = ['''^\s*for secret in \("inbound-secret",\s*"inbound-secret2",\s*"inbound-session"\):\s*$''']
 
+  [[rules.allowlists]]
+  description = "Pinned AWS credential action digest fixture"
+  condition = "AND"
+  regexTarget = "line"
+  paths = ['''^tests/test_aws_wave0_templates\.py$''']
+  regexes = ['''^\s*credentials_action_sha\s*=\s*"00943011d9042930efac3dcd3a170e4273319bc8"\s*$''']
+
+  [[rules.allowlists]]
+  description = "Public Render feature-flag variable name"
+  condition = "AND"
+  regexTarget = "line"
+  paths = ['''^render\.yaml$''']
+  regexes = ['''^\s*-\s*key:\s*MERCURY_V1_ENABLED\s*$''']
+
 [[rules]]
 id = "aws-access-token"
 
@@ -49,6 +63,13 @@ id = "aws-access-token"
     '''^\s*"aws=AKIA[0-9]{10}ABCDEF",\s*$''',
     '''^\s*"AKIA[0-9]{10}ABCDEF",\s*$''',
   ]
+
+  [[rules.allowlists]]
+  description = "Wave 0 AWS-token redaction fixtures"
+  condition = "AND"
+  regexTarget = "line"
+  paths = ['''^tests/test_aws_readiness\.py$''']
+  regexes = ['''AKIA1234567890ABCDEF''']
 
 [[rules]]
 id = "jwt"

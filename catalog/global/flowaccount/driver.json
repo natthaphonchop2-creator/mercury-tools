@@ -1,0 +1,52 @@
+{
+  "manifest_version": "1",
+  "provider": "flowaccount",
+  "environments": {
+    "production": "flowaccount_mcp_production_url",
+    "sandbox": "flowaccount_mcp_sandbox_url"
+  },
+  "transport": "streamable_http",
+  "protocol_version": "2025-11-25",
+  "auth_adapter": "oauth2_pkce",
+  "allowed_permissions": [
+    "documents.create",
+    "documents.read",
+    "profile.read"
+  ],
+  "timeout_classes": {
+    "discovery": {
+      "connect_seconds": 5,
+      "operation_seconds": 30
+    },
+    "read": {
+      "connect_seconds": 5,
+      "operation_seconds": 30
+    },
+    "create": {
+      "connect_seconds": 5,
+      "operation_seconds": 60
+    }
+  },
+  "discovery_mappings": [
+    {
+      "provider_tool": "get_provider_profile",
+      "normalized_capability": "provider_profile.get",
+      "timeout_class": "read"
+    },
+    {
+      "provider_tool": "list_invoices",
+      "normalized_capability": "documents.invoice.list",
+      "timeout_class": "read"
+    },
+    {
+      "provider_tool": "get_invoice",
+      "normalized_capability": "documents.invoice.get",
+      "timeout_class": "read"
+    },
+    {
+      "provider_tool": "create_invoice",
+      "normalized_capability": "documents.invoice.create",
+      "timeout_class": "create"
+    }
+  ]
+}

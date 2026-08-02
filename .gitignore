@@ -10,6 +10,7 @@ build/
 *.egg-info/
 .coverage
 htmlcov/
+node_modules/
 .worktrees/
 .superpowers/
 .mercury/
@@ -19,3 +20,6 @@ supabase/.branches/
 .mercury/credentials.env
 .mercury/cache/
 .mercury/audit/
+.artifacts/aws/
+agentcore/.env.local
+agentcore/.cli/

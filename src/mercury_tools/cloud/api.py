@@ -11,13 +11,16 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Any
+from urllib.parse import parse_qsl
 
 import httpx
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
+from mercury_tools.auth.consent import IDENTITY_SCOPES, OAUTH_SESSION_COOKIE
+from mercury_tools.auth.models import MercuryPrincipal
 from mercury_tools.catalog.models import (
     CatalogAction,
     HttpMethod,
@@ -42,12 +45,33 @@ from mercury_tools.cloud.models import (
     validate_public_catalog_action,
     validate_raw_catalog_action_payload,
 )
-from mercury_tools.config import Settings, load_settings
+from mercury_tools.config import Settings, V1ConfigurationError, load_settings
 from mercury_tools.db.catalog import SupabaseCatalogStore
 from mercury_tools.db.product import SKILL_CATALOG_SEED
 from mercury_tools.db.supabase import SupabaseRagStore
 from mercury_tools.db.validation import ResolveResult, SupabaseValidationStore
 from mercury_tools.mercury_runtime import skill_markdown
+from mercury_tools.providers.oauth import (
+    FLOWACCOUNT_CALLBACK_PATH,
+    OAuthCallback,
+    ProviderOAuthError,
+)
+from mercury_tools.providers.peak_setup import (
+    PEAK_SETUP_BROWSER_COOKIE,
+    PEAK_SETUP_EXCHANGE_PATH,
+    PEAK_SETUP_PATH,
+    PeakBrowserSessionBinding,
+    PeakBrowserSessionManager,
+    PeakSetupError,
+    PeakSetupExchangeRequest,
+    PeakSetupSubmission,
+    peak_setup_browser_origin,
+    peak_setup_secret_fields,
+    peak_setup_security_headers,
+    render_peak_setup_form,
+    render_peak_setup_page,
+    render_peak_setup_retry_form,
+)
 from mercury_tools.qualification.selection import (
     EvidenceRequest,
     EvidenceSelection,
@@ -92,9 +116,7 @@ _PUBLIC_SKILL_FIELDS = (
     "tags",
 )
 _CANONICAL_SKILLS = tuple(deepcopy(SKILL_CATALOG_SEED))
-_CANONICAL_SKILL_IDS = frozenset(
-    str(item["skill_id"]) for item in _CANONICAL_SKILLS
-)
+_CANONICAL_SKILL_IDS = frozenset(str(item["skill_id"]) for item in _CANONICAL_SKILLS)
 _ORDINARY_DEPENDENCY_ERRORS = (
     httpx.HTTPError,
     KeyError,
@@ -104,10 +126,27 @@ _ORDINARY_DEPENDENCY_ERRORS = (
     RuntimeError,
     OverflowError,
 )
+_OAUTH_ERROR_DESCRIPTION = re.compile(r"^[\x20-\x21\x23-\x5B\x5D-\x7E]{1,1024}$")
+_OAUTH_ERROR_URI = re.compile(r"^[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]{1,2048}$")
+_OAUTH_ERROR_OPTIONAL_KEYS = frozenset({"error_description", "error_uri"})
+_PEAK_SETUP_MAX_BODY_BYTES = 32 * 1024
 
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _valid_oauth_error_metadata(request: Request, keys: set[str]) -> bool:
+    description = request.query_params.get("error_description")
+    if "error_description" in keys and (
+        description is None or _OAUTH_ERROR_DESCRIPTION.fullmatch(description) is None
+    ):
+        return False
+
+    error_uri = request.query_params.get("error_uri")
+    if "error_uri" not in keys:
+        return True
+    return bool(error_uri and _OAUTH_ERROR_URI.fullmatch(error_uri))
 
 
 @dataclass
@@ -119,6 +158,37 @@ class CloudDependencies:
     skills: Sequence[Mapping[str, Any]] | None = None
     skill_loader: Callable[[str], str | None] = skill_markdown
     clock: Callable[[], datetime] | None = None
+    provider_oauth_service: Any | None = None
+    peak_setup_service: Any | None = None
+
+    def __post_init__(self) -> None:
+        if self.provider_oauth_service is not None and not callable(
+            getattr(self.provider_oauth_service, "complete_callback", None)
+        ):
+            raise V1ConfigurationError("v1_provider_oauth_service_invalid")
+        if (
+            self.settings is not None
+            and self.settings.v1_enabled
+            and self.provider_oauth_service is None
+        ):
+            raise V1ConfigurationError("v1_provider_oauth_service_missing")
+        if (
+            self.settings is not None
+            and self.settings.v1_enabled
+            and not callable(getattr(self.provider_oauth_service, "disconnect", None))
+        ):
+            raise V1ConfigurationError("v1_provider_oauth_service_invalid")
+        if self.peak_setup_service is not None and not all(
+            callable(getattr(self.peak_setup_service, method, None))
+            for method in ("start", "exchange", "complete", "disconnect")
+        ):
+            raise V1ConfigurationError("v1_peak_setup_service_invalid")
+        if (
+            self.settings is not None
+            and self.settings.v1_enabled
+            and self.peak_setup_service is None
+        ):
+            raise V1ConfigurationError("v1_peak_setup_service_missing")
 
     def _catalog_store(self) -> Any:
         if self.catalog_store is None:
@@ -132,9 +202,7 @@ class CloudDependencies:
 
     def _validation_store(self) -> Any:
         if self.validation_store is None:
-            self.validation_store = SupabaseValidationStore(
-                self.settings or load_settings()
-            )
+            self.validation_store = SupabaseValidationStore(self.settings or load_settings())
         return self.validation_store
 
     def _skills(self) -> Sequence[Mapping[str, Any]]:
@@ -143,16 +211,12 @@ class CloudDependencies:
     async def list_actions(self, request: Request) -> Response:
         query = list(request.query_params.multi_items())
         keys = [key for key, _ in query]
-        if (
-            any(key not in {"connector", "method"} for key in keys)
-            or len(keys) != len(set(keys))
-        ):
+        if any(key not in {"connector", "method"} for key in keys) or len(keys) != len(set(keys)):
             return _bad_request()
         connector = request.query_params.get("connector")
         method = request.query_params.get("method")
-        if (
-            not _valid_selector(connector)
-            or (method is not None and method not in {item.value for item in HttpMethod})
+        if not _valid_selector(connector) or (
+            method is not None and method not in {item.value for item in HttpMethod}
         ):
             return _bad_request()
         try:
@@ -191,9 +255,7 @@ class CloudDependencies:
 
     async def resolve_validation(self, request: Request) -> Response:
         try:
-            batch = PublicValidationResolveRequest.model_validate_json(
-                await request.body()
-            )
+            batch = PublicValidationResolveRequest.model_validate_json(await request.body())
             evidence_requests = tuple(
                 EvidenceRequest.model_validate(item.model_dump(mode="python"))
                 for item in batch.requests
@@ -214,9 +276,7 @@ class CloudDependencies:
                 validated,
                 now=resolved_at,
             )
-            envelope = PublicEvidenceSelectionsEnvelope.model_validate(
-                {"selections": selections}
-            )
+            envelope = PublicEvidenceSelectionsEnvelope.model_validate({"selections": selections})
         except _ORDINARY_DEPENDENCY_ERRORS:
             return _service_unavailable()
         return JSONResponse(envelope.model_dump(mode="json"))
@@ -240,9 +300,7 @@ class CloudDependencies:
                 }
                 for connector_id, values in sorted(grouped.items())
             ]
-            envelope = PublicConnectorsEnvelope.model_validate(
-                {"connectors": payload}
-            )
+            envelope = PublicConnectorsEnvelope.model_validate({"connectors": payload})
         except _ORDINARY_DEPENDENCY_ERRORS:
             return _service_unavailable()
         return JSONResponse(envelope.model_dump(mode="json"))
@@ -261,11 +319,7 @@ class CloudDependencies:
             return _bad_request()
         try:
             skill = next(
-                (
-                    item
-                    for item in self._public_skills()
-                    if item["skill_id"] == skill_id
-                ),
+                (item for item in self._public_skills() if item["skill_id"] == skill_id),
                 None,
             )
             if skill is None:
@@ -339,6 +393,258 @@ class CloudDependencies:
             return _not_found()
         return JSONResponse(public_document)
 
+    async def flowaccount_oauth_callback(self, request: Request) -> Response:
+        headers = {
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+        }
+        query = list(request.query_params.multi_items())
+        keys = [key for key, _value in query]
+        key_set = set(keys)
+        success_keys = {"code", "state"}
+        error_keys = {"error", "state"}
+        error_callback = error_keys <= key_set <= error_keys | _OAUTH_ERROR_OPTIONAL_KEYS
+        if len(keys) != len(key_set) or (
+            key_set != success_keys
+            and (not error_callback or not _valid_oauth_error_metadata(request, key_set))
+        ):
+            return JSONResponse(
+                {"error": "provider_oauth_callback_invalid"},
+                status_code=400,
+                headers=headers,
+            )
+        if self.provider_oauth_service is None:
+            return JSONResponse(
+                {"error": "provider_oauth_callback_unavailable"},
+                status_code=503,
+                headers=headers,
+            )
+        try:
+            callback_keys = error_keys if error_callback else success_keys
+            callback = OAuthCallback.model_validate(
+                {key: request.query_params[key] for key in callback_keys}
+            )
+            summary = await self.provider_oauth_service.complete_callback(callback)
+        except ProviderOAuthError as exc:
+            return JSONResponse(
+                {"error": exc.code},
+                status_code=400,
+                headers=headers,
+            )
+        except (KeyError, TypeError, ValueError):
+            return JSONResponse(
+                {"error": "provider_oauth_callback_invalid"},
+                status_code=400,
+                headers=headers,
+            )
+        except Exception:
+            return JSONResponse(
+                {"error": "provider_oauth_callback_unavailable"},
+                status_code=503,
+                headers=headers,
+            )
+        return JSONResponse(
+            {
+                "provider": summary.provider.value,
+                "company_display_name": summary.account_display_name,
+                "environment": summary.environment,
+                "readiness": summary.readiness.value,
+                "instruction": "Return to the Mercury host to continue.",
+            },
+            headers=headers,
+        )
+
+    async def peak_setup_page(self, request: Request) -> Response:
+        headers = peak_setup_security_headers()
+        try:
+            if request.url.query:
+                raise ValueError
+            return HTMLResponse(render_peak_setup_page(), headers=headers)
+        except (AttributeError, TypeError, ValueError):
+            return JSONResponse(
+                {"error": "peak_setup_request_invalid"},
+                status_code=400,
+                headers=headers,
+            )
+        except Exception:
+            return JSONResponse(
+                {"error": "peak_setup_unavailable"},
+                status_code=503,
+                headers=headers,
+            )
+
+    async def peak_setup_exchange(self, request: Request) -> Response:
+        headers = peak_setup_security_headers()
+        if self.peak_setup_service is None:
+            return JSONResponse(
+                {"error": "peak_setup_unavailable"},
+                status_code=503,
+                headers=headers,
+            )
+        try:
+            principal = _request_principal(request)
+            _require_peak_setup_request(
+                request,
+                settings=self.settings,
+                media_type="application/json",
+            )
+            raw = await _bounded_request_body(request)
+            payload = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=_closed_json_object,
+            )
+            exchange_request = PeakSetupExchangeRequest.model_validate(payload)
+            exchange = await self.peak_setup_service.exchange(
+                principal,
+                exchange_request.setup_token.get_secret_value(),
+            )
+            response = HTMLResponse(
+                render_peak_setup_form(exchange),
+                headers=headers,
+            )
+            manager = getattr(
+                request.state,
+                "peak_browser_session_manager",
+                None,
+            )
+            if isinstance(manager, PeakBrowserSessionManager):
+                sealed_binding, max_age = manager.seal_binding(
+                    principal,
+                    exchange,
+                )
+                response.set_cookie(
+                    PEAK_SETUP_BROWSER_COOKIE,
+                    sealed_binding,
+                    max_age=max_age,
+                    path=PEAK_SETUP_PATH,
+                    secure=True,
+                    httponly=True,
+                    samesite="strict",
+                )
+            return response
+        except PeakSetupError as exc:
+            return JSONResponse(
+                {"error": exc.code},
+                status_code=400,
+                headers=headers,
+            )
+        except (AttributeError, TypeError, ValueError, UnicodeDecodeError):
+            return JSONResponse(
+                {"error": "peak_setup_request_invalid"},
+                status_code=400,
+                headers=headers,
+            )
+        except Exception:
+            return JSONResponse(
+                {"error": "peak_setup_unavailable"},
+                status_code=503,
+                headers=headers,
+            )
+        finally:
+            _clear_request_body(request)
+
+    async def peak_setup_submit(self, request: Request) -> Response:
+        headers = peak_setup_security_headers()
+        if self.peak_setup_service is None:
+            return JSONResponse(
+                {"error": "peak_setup_unavailable"},
+                status_code=503,
+                headers=headers,
+            )
+        raw = bytearray()
+        try:
+            principal = _request_principal(request)
+            _require_peak_setup_request(
+                request,
+                settings=self.settings,
+                media_type="application/x-www-form-urlencoded",
+            )
+            raw.extend(await _bounded_request_body(request))
+            _clear_request_body(request)
+            pairs = parse_qsl(
+                raw.decode("utf-8"),
+                keep_blank_values=True,
+                strict_parsing=True,
+            )
+            keys = [key for key, _value in pairs]
+            if tuple(sorted(keys)) != tuple(sorted(peak_setup_secret_fields())) or len(keys) != len(
+                set(keys)
+            ):
+                raise ValueError
+            submission = PeakSetupSubmission.model_validate(dict(pairs))
+            binding = getattr(
+                request.state,
+                "peak_browser_session_binding",
+                None,
+            )
+            manager = getattr(
+                request.state,
+                "peak_browser_session_manager",
+                None,
+            )
+            if (
+                not isinstance(binding, PeakBrowserSessionBinding)
+                or not isinstance(manager, PeakBrowserSessionManager)
+                or not manager.matches(binding, submission.setup_session)
+            ):
+                raise ValueError
+            summary = await self.peak_setup_service.complete(principal, submission)
+            response = JSONResponse(
+                {
+                    "provider": summary.provider.value,
+                    "merchant_display_name": summary.account_display_name,
+                    "environment": summary.environment,
+                    "readiness": summary.readiness.value,
+                    "instruction": "Return to the Mercury host to continue.",
+                },
+                headers=headers,
+            )
+            response.delete_cookie(
+                PEAK_SETUP_BROWSER_COOKIE,
+                path=PEAK_SETUP_PATH,
+                secure=True,
+                httponly=True,
+                samesite="strict",
+            )
+            response.delete_cookie(
+                OAUTH_SESSION_COOKIE,
+                path=PEAK_SETUP_PATH,
+                secure=True,
+                httponly=True,
+                samesite="lax",
+            )
+            return response
+        except PeakSetupError as exc:
+            if exc.code == "peak_setup_validation_failed" and "submission" in locals():
+                return HTMLResponse(
+                    render_peak_setup_retry_form(
+                        submission.setup_session,
+                        submission.csrf_token,
+                    ),
+                    status_code=422,
+                    headers=headers,
+                )
+            return JSONResponse(
+                {"error": exc.code},
+                status_code=400,
+                headers=headers,
+            )
+        except (AttributeError, TypeError, ValueError, UnicodeDecodeError):
+            return JSONResponse(
+                {"error": "peak_setup_request_invalid"},
+                status_code=400,
+                headers=headers,
+            )
+        except Exception:
+            return JSONResponse(
+                {"error": "peak_setup_unavailable"},
+                status_code=503,
+                headers=headers,
+            )
+        finally:
+            raw[:] = b"\x00" * len(raw)
+            _clear_request_body(request)
+
     def _catalog_actions(self) -> list[CatalogAction]:
         rows = self._catalog_store().list_active_actions()
         actions: list[CatalogAction] = []
@@ -351,10 +657,7 @@ class CloudDependencies:
                 validate_raw_catalog_action_payload(row)
                 action = CatalogAction.model_validate(row)
             public_action = _public_catalog_action(action)
-            if (
-                public_action.action_id in action_ids
-                or public_action.version_id in version_ids
-            ):
+            if public_action.action_id in action_ids or public_action.version_id in version_ids:
                 raise ValueError("cloud_catalog_duplicate")
             action_ids.add(public_action.action_id)
             version_ids.add(public_action.version_id)
@@ -393,8 +696,50 @@ class CloudDependencies:
         return sorted(result, key=lambda item: item["skill_id"])
 
 
+def _request_principal(request: Request) -> MercuryPrincipal:
+    return MercuryPrincipal.model_validate(request.state.mercury_principal)
+
+
+def _require_peak_setup_request(
+    request: Request,
+    *,
+    settings: Settings | None,
+    media_type: str,
+) -> None:
+    if settings is None or request.url.query:
+        raise ValueError("peak_setup_request_invalid")
+    origins = request.headers.getlist("origin")
+    content_types = request.headers.getlist("content-type")
+    if (
+        len(origins) != 1
+        or origins[0] != peak_setup_browser_origin(settings)
+        or len(content_types) != 1
+        or content_types[0] != media_type
+    ):
+        raise ValueError("peak_setup_request_invalid")
+
+
+async def _bounded_request_body(request: Request) -> bytes:
+    raw = await request.body()
+    if not raw or len(raw) > _PEAK_SETUP_MAX_BODY_BYTES:
+        raise ValueError("peak_setup_request_invalid")
+    return raw
+
+
+def _closed_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    keys = [key for key, _value in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("peak_setup_request_invalid")
+    return dict(pairs)
+
+
+def _clear_request_body(request: Request) -> None:
+    if hasattr(request, "_body"):
+        request._body = b""
+
+
 def cloud_routes(dependencies: CloudDependencies) -> list[Route]:
-    return [
+    routes = [
         Route("/api/cloud/v1/catalog/actions", dependencies.list_actions, methods=["GET"]),
         Route(
             "/api/cloud/v1/catalog/actions/{action_id}",
@@ -421,6 +766,69 @@ def cloud_routes(dependencies: CloudDependencies) -> list[Route]:
         Route(
             "/api/cloud/v1/documents/{document_id:path}",
             dependencies.get_document,
+            methods=["GET"],
+        ),
+    ]
+    provider_oauth_service = getattr(
+        dependencies,
+        "provider_oauth_service",
+        None,
+    )
+    if provider_oauth_service is not None:
+        routes.append(
+            Route(
+                FLOWACCOUNT_CALLBACK_PATH,
+                dependencies.flowaccount_oauth_callback,
+                methods=["GET"],
+            )
+        )
+    peak_setup_service = getattr(dependencies, "peak_setup_service", None)
+    if peak_setup_service is not None:
+        routes.extend(
+            (
+                Route(
+                    PEAK_SETUP_PATH,
+                    dependencies.peak_setup_page,
+                    methods=["GET"],
+                ),
+                Route(
+                    PEAK_SETUP_EXCHANGE_PATH,
+                    dependencies.peak_setup_exchange,
+                    methods=["POST"],
+                ),
+                Route(
+                    PEAK_SETUP_PATH,
+                    dependencies.peak_setup_submit,
+                    methods=["POST"],
+                ),
+            )
+        )
+    return routes
+
+
+def protected_resource_routes(settings: Settings) -> list[Route]:
+    async def metadata(_request: Request) -> Response:
+        return JSONResponse(
+            {
+                "resource": settings.canonical_mcp_resource,
+                "authorization_servers": [settings.supabase_auth_issuer],
+                "scopes_supported": [
+                    scope for scope in ("openid", "email", "profile") if scope in IDENTITY_SCOPES
+                ],
+                "bearer_methods_supported": ["header"],
+            },
+            headers={"Cache-Control": "public, max-age=300"},
+        )
+
+    return [
+        Route(
+            "/.well-known/oauth-protected-resource",
+            metadata,
+            methods=["GET"],
+        ),
+        Route(
+            "/.well-known/oauth-protected-resource/mcp",
+            metadata,
             methods=["GET"],
         ),
     ]
@@ -477,10 +885,7 @@ def _public_evidence_selection(
         raise ValueError("cloud_validation_response_invalid")
 
     evidence = PublicValidationEvidence.model_validate(
-        {
-            field: getattr(selected, field)
-            for field in PublicValidationEvidence.model_fields
-        }
+        {field: getattr(selected, field) for field in PublicValidationEvidence.model_fields}
     )
     if not evidence.is_admissible_at(now):
         return PublicEvidenceSelection.model_validate(
@@ -489,9 +894,7 @@ def _public_evidence_selection(
                 "blocking_conditions": ("validation_unavailable",),
             }
         )
-    return PublicEvidenceSelection.model_validate(
-        {"selected": evidence, "blocking_conditions": ()}
-    )
+    return PublicEvidenceSelection.model_validate({"selected": evidence, "blocking_conditions": ()})
 
 
 def sanitize_search_query(value: str) -> str:
@@ -515,10 +918,7 @@ def sanitize_search_filters(value: Any) -> dict[str, str]:
             (key == "action_id" and _ACTION_ID_RE.fullmatch(item) is None)
             or (key == "version_id" and _VERSION_ID_RE.fullmatch(item) is None)
             or (key == "environment" and item not in _ENVIRONMENTS)
-            or (
-                key in {"capability", "accounting_use"}
-                and _DOTTED_TERM_RE.fullmatch(item) is None
-            )
+            or (key in {"capability", "accounting_use"} and _DOTTED_TERM_RE.fullmatch(item) is None)
             or (
                 key
                 not in {
@@ -562,9 +962,7 @@ def _public_search_result(result: SearchResult) -> dict[str, Any]:
         "source_title": sanitize_public_text(result.source_title),
         "source_uri": sanitize_public_text(result.source_uri),
         "source_url": (
-            None
-            if validation or not result.source_url
-            else sanitize_public_text(result.source_url)
+            None if validation or not result.source_url else sanitize_public_text(result.source_url)
         ),
         "citation": _public_citation(
             result.citation,
@@ -581,9 +979,7 @@ def _project_public_search_results(
     *,
     top_k: int,
 ) -> list[dict[str, Any]]:
-    if not isinstance(results, Sequence) or isinstance(
-        results, (str, bytes, bytearray)
-    ):
+    if not isinstance(results, Sequence) or isinstance(results, (str, bytes, bytearray)):
         raise ValueError("cloud_search_results_invalid")
     public: list[dict[str, Any]] = []
     for result in results:
@@ -596,9 +992,9 @@ def _project_public_search_results(
             public.append(projected)
             if len(public) == top_k:
                 break
-    return PublicSearchEnvelope.model_validate(
-        {"results": public}
-    ).model_dump(mode="json")["results"]
+    return PublicSearchEnvelope.model_validate({"results": public}).model_dump(mode="json")[
+        "results"
+    ]
 
 
 def _validate_search_result_shape(result: SearchResult) -> None:
@@ -614,8 +1010,7 @@ def _validate_search_result_shape(result: SearchResult) -> None:
     if (
         any(not isinstance(item, str) for item in string_fields)
         or any(
-            not _PUBLIC_RESULT_ID_RE.fullmatch(item)
-            or sanitize_public_text(item) != item
+            not _PUBLIC_RESULT_ID_RE.fullmatch(item) or sanitize_public_text(item) != item
             for item in (result.chunk_id, result.document_id)
         )
         or not isinstance(result.citation, Mapping)
@@ -652,9 +1047,7 @@ def _public_document(document: Mapping[str, Any]) -> dict[str, Any]:
         "source": {
             "title": _clean_public_value(source.get("title")),
             "source_uri": _clean_public_value(source.get("source_uri")),
-            "source_url": (
-                None if validation else _clean_public_value(source.get("source_url"))
-            ),
+            "source_url": (None if validation else _clean_public_value(source.get("source_url"))),
         },
     }
     if validation:
@@ -689,9 +1082,8 @@ def _project_public_document(
     source_is_wiki = _looks_like_wiki_uri(source_uri)
     if not document_is_wiki and not source_is_wiki:
         return None
-    if (
-        not is_canonical_public_wiki_uri(document_uri)
-        or not is_canonical_public_wiki_uri(source_uri)
+    if not is_canonical_public_wiki_uri(document_uri) or not is_canonical_public_wiki_uri(
+        source_uri
     ):
         raise ValueError("cloud_document_invalid")
     review_status = source.get("review_status")
@@ -712,13 +1104,10 @@ def _project_public_document(
         if not isinstance(document.get(field), str):
             raise ValueError("cloud_document_invalid")
     if not isinstance(source.get("title"), str) or (
-        source.get("source_url") is not None
-        and not isinstance(source.get("source_url"), str)
+        source.get("source_url") is not None and not isinstance(source.get("source_url"), str)
     ):
         raise ValueError("cloud_document_invalid")
-    return PublicDocument.model_validate(_public_document(document)).model_dump(
-        mode="json"
-    )
+    return PublicDocument.model_validate(_public_document(document)).model_dump(mode="json")
 
 
 def _clean_public_value(value: Any) -> Any:
@@ -821,11 +1210,7 @@ def _document_source(document: Mapping[str, Any]) -> Mapping[str, Any] | None:
     source = document.get("knowledge_sources")
     if isinstance(source, Mapping):
         return source
-    if (
-        isinstance(source, list)
-        and len(source) == 1
-        and isinstance(source[0], Mapping)
-    ):
+    if isinstance(source, list) and len(source) == 1 and isinstance(source[0], Mapping):
         return source[0]
     return None
 

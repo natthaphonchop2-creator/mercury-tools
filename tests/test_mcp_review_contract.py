@@ -338,9 +338,7 @@ def test_review_resolves_strict_root_refs(definitions_key: str) -> None:
 def test_review_rejects_unconstrained_nested_refs_at_the_use_path(
     definitions_key: str,
 ) -> None:
-    schema = _strict_root(
-        {"filters": {"$ref": f"#/{definitions_key}/LooseFilter"}}
-    )
+    schema = _strict_root({"filters": {"$ref": f"#/{definitions_key}/LooseFilter"}})
     schema[definitions_key] = {"LooseFilter": {}}
 
     _assert_issue(
@@ -362,9 +360,7 @@ def test_review_rejects_cyclic_local_refs_with_an_actionable_use_path() -> None:
 
 def test_review_resolves_local_pointer_through_array_indexes() -> None:
     schema = _strict_root({"choice": {"$ref": "#/$defs/Choice/anyOf/0"}})
-    schema["$defs"] = {
-        "Choice": {"anyOf": [{"type": "string"}, {"type": "integer"}]}
-    }
+    schema["$defs"] = {"Choice": {"anyOf": [{"type": "string"}, {"type": "integer"}]}}
 
     assert _issues(_tool(schema=schema)) == []
 
@@ -392,18 +388,13 @@ def test_review_rejects_invalid_or_external_local_pointer_references(
     message: str,
 ) -> None:
     schema = _strict_root({"choice": {"$ref": reference}})
-    schema["$defs"] = {
-        "Choice": {"anyOf": [{"type": "string"}, {"type": "integer"}]}
-    }
+    schema["$defs"] = {"Choice": {"anyOf": [{"type": "string"}, {"type": "integer"}]}}
 
     _assert_issue(_tool(schema=schema), "choice.$ref", message)
 
 
 def test_review_caps_local_ref_depth_with_an_actionable_use_path() -> None:
-    definitions = {
-        f"Level{index}": {"$ref": f"#/$defs/Level{index + 1}"}
-        for index in range(33)
-    }
+    definitions = {f"Level{index}": {"$ref": f"#/$defs/Level{index + 1}"} for index in range(33)}
     definitions["Level33"] = {"type": "string"}
     schema = _strict_root({"filters": {"$ref": "#/$defs/Level0"}})
     schema["$defs"] = definitions
@@ -793,6 +784,30 @@ def test_behavior_matrix_is_the_only_workspace_scope_registry() -> None:
     assert module.BEHAVIOR_MATRIX
     for tool_name, behavior in module.BEHAVIOR_MATRIX.items():
         assert isinstance(behavior.requires_workspace, bool), tool_name
+
+
+def test_behavior_matrix_covers_every_stable_v1_tool_with_exact_annotations() -> None:
+    from mercury_tools.mcp.contracts import V1_HOSTED_TOOL_NAMES
+
+    module = _review_module()
+    expected = {
+        "get_mercury_context": (False, False, True, False, False),
+        "list_accounting_providers": (True, False, None, False, False),
+        "start_provider_connection": (False, False, False, True, True),
+        "list_provider_connections": (True, False, None, False, True),
+        "connector_status": (False, False, False, False, True),
+        "list_provider_capabilities": (True, False, None, False, True),
+        "get_capability_schema": (True, False, None, False, True),
+        "search_knowledge": (False, False, False, False, True),
+        "retrieve_context_pack": (False, False, False, False, True),
+        "run_accounting_skill": (False, False, False, True, True),
+        "disconnect_provider": (False, True, True, True, True),
+    }
+
+    assert set(module.V1_BEHAVIOR_MATRIX) == V1_HOSTED_TOOL_NAMES
+    for name, expected_behavior in expected.items():
+        behavior = module.V1_BEHAVIOR_MATRIX[name]
+        assert (*behavior.annotation_values, behavior.requires_workspace) == expected_behavior
 
 
 def test_future_workspace_matrix_entry_requires_workspace_id(

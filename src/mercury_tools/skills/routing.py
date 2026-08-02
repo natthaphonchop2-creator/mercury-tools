@@ -6,6 +6,9 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from jsonschema import Draft202012Validator
+
+from mercury_tools.catalog.identity import canonical_json, validate_credential_safe
 from mercury_tools.connectors.catalog import CapabilityState, connector_by_id
 from mercury_tools.skills.catalog import AccountingSkillDefinition
 
@@ -24,6 +27,131 @@ def _sanitize_profile_value(value: Any) -> str | None:
 def _clean_profile_value(value: Any) -> str | None:
     clean = _sanitize_profile_value(value)
     return clean.lower() if clean is not None else None
+
+
+def published_projection_matches(
+    skill: AccountingSkillDefinition,
+    projection: Mapping[str, Any] | None,
+) -> bool:
+    if not isinstance(projection, Mapping):
+        return False
+    if "projection" in projection:
+        if (
+            projection.get("publication_status") != "published"
+            or projection.get("skill_id") != skill.skill_id
+            or projection.get("skill_version") != skill.skill_version
+            or projection.get("projection_sha256") != skill.projection_sha256
+            or projection.get("git_source_path") != skill.git_source_path
+        ):
+            return False
+        projected_definition = projection.get("projection")
+        if not isinstance(projected_definition, Mapping):
+            return False
+        projection = projected_definition
+    try:
+        return (
+            projection.get("skill_id") == skill.skill_id
+            and projection.get("skill_version") == skill.skill_version
+            and canonical_json(dict(projection)) == canonical_json(skill.published_projection())
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def resolve_published_skill_route(
+    skill: AccountingSkillDefinition,
+    *,
+    projection: Mapping[str, Any] | None,
+    enabled_capabilities: Sequence[str],
+    business_fact_count: int,
+    knowledge_source_count: int,
+    citation_count: int,
+) -> dict[str, Any]:
+    """Resolve evidence for an exact published Skill without changing authority."""
+
+    counts = (business_fact_count, knowledge_source_count, citation_count)
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counts):
+        raise ValueError("skill_evidence_invalid")
+    if any(not isinstance(value, str) for value in enabled_capabilities):
+        raise ValueError("skill_capabilities_invalid")
+
+    missing: list[str] = []
+    if not published_projection_matches(skill, projection):
+        missing.append("skill_schema")
+    else:
+        available = frozenset(enabled_capabilities)
+        missing.extend(
+            f"capability:{capability}"
+            for capability in skill.required_capabilities
+            if capability not in available
+        )
+        evidence_counts = {
+            "business_fact": business_fact_count,
+            "knowledge_source": knowledge_source_count,
+            "citation": citation_count,
+        }
+        missing.extend(
+            requirement
+            for requirement in skill.evidence_requirements
+            if evidence_counts.get(requirement, 0) == 0
+        )
+
+    return {
+        "status": "insufficient_evidence" if missing else "ready",
+        "skill_id": skill.skill_id,
+        "skill_version": skill.skill_version,
+        "missing_evidence": missing,
+        "required_capabilities": list(skill.required_capabilities),
+        "optional_capabilities": list(skill.optional_capabilities),
+        "allowed_action_classes": list(skill.allowed_action_classes),
+        "blocked_action_classes": list(skill.blocked_action_classes),
+    }
+
+
+def build_published_skill_output(
+    skill: AccountingSkillDefinition,
+    *,
+    host_facts: Sequence[Mapping[str, Any]],
+    provider_results: Sequence[tuple[str, Mapping[str, Any]]],
+    citations: Sequence[str],
+) -> dict[str, Any]:
+    """Build and validate the exact Git-canonical output from reviewed evidence."""
+
+    facts: list[str] = []
+    for fact in host_facts:
+        if not isinstance(fact, Mapping):
+            raise ValueError("skill_evidence_invalid")
+        facts.append(f"host_fact:{canonical_json(dict(fact))}")
+    for fact_name, result in provider_results:
+        if (
+            not isinstance(fact_name, str)
+            or not re.fullmatch(r"[a-z][a-z0-9_]{0,99}", fact_name)
+            or not isinstance(result, Mapping)
+        ):
+            raise ValueError("skill_evidence_invalid")
+        facts.append(f"{fact_name}:{canonical_json(dict(result))}")
+    unique_citations = list(dict.fromkeys(citations))
+    if (
+        len(facts) > 500
+        or len(unique_citations) > 100
+        or any(not fact or len(fact) > 2_000 for fact in facts)
+        or any(
+            not isinstance(citation, str) or not citation or len(citation) > 2_000
+            for citation in unique_citations
+        )
+    ):
+        raise ValueError("skill_evidence_invalid")
+    output = {
+        "output_schema_name": skill.output_schema_name,
+        "facts": facts,
+        "citations": unique_citations,
+    }
+    validate_credential_safe(output)
+    try:
+        Draft202012Validator(skill.published_projection()["output_schema"]).validate(output)
+    except Exception:
+        raise ValueError("skill_output_invalid") from None
+    return output
 
 
 def _safe_external_server_name(value: Any) -> str | None:
@@ -311,9 +439,7 @@ def resolve_skill_route(
     if len(ready) == 1:
         return _ready_route(skill, ready[0])
 
-    local_bridges = [
-        item for item in assessments if item["reason"] == "local_bridge_required"
-    ]
+    local_bridges = [item for item in assessments if item["reason"] == "local_bridge_required"]
     if len(local_bridges) > 1:
         return _connector_selection_route(skill, local_bridges)
     if local_bridges:

@@ -1,0 +1,19 @@
+schema_version: mercury.aws.wave0.config.v1
+primary_region: ap-southeast-1
+github_repository: natthaphonchop2-creator/mercury-tools
+accounts:
+  - environment: nonprod
+    alias: mercury-nonprod
+    profile: mercury-nonprod
+    github_environment: nonprod
+required_service_probes:
+  - agentcore_runtime
+  - agentcore_gateway
+  - agentcore_identity
+  - bedrock_knowledge_bases
+  - aurora_postgresql
+  - s3
+  - kms
+  - ecr
+  - cloudwatch_logs
+  - agentcore_quotas

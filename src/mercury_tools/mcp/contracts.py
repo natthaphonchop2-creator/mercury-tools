@@ -4,7 +4,7 @@ from __future__ import annotations
 
 HOSTED_MCP_URL = "https://mercury-tools-mcp.onrender.com/mcp"
 
-HOSTED_TOOL_NAMES = frozenset(
+LEGACY_HOSTED_TOOL_NAMES = frozenset(
     {
         "search_knowledge",
         "retrieve_context_pack",
@@ -30,5 +30,24 @@ HOSTED_TOOL_NAMES = frozenset(
         "list_workspace_flows",
         "run_workspace_flow",
         "save_workspace_flow",
+    }
+)
+
+# The legacy public-demo surface remains available only while V1 is disabled.
+HOSTED_TOOL_NAMES = LEGACY_HOSTED_TOOL_NAMES
+
+V1_HOSTED_TOOL_NAMES = frozenset(
+    {
+        "get_mercury_context",
+        "list_accounting_providers",
+        "start_provider_connection",
+        "list_provider_connections",
+        "connector_status",
+        "list_provider_capabilities",
+        "get_capability_schema",
+        "search_knowledge",
+        "retrieve_context_pack",
+        "run_accounting_skill",
+        "disconnect_provider",
     }
 )

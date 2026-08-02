@@ -1,0 +1,101 @@
+name: AWS Wave 0 OIDC smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      evidence_nonce:
+        description: Non-secret identifier used to select this exact workflow run
+        required: true
+        type: string
+
+run-name: AWS Wave 0 OIDC smoke [${{ inputs.evidence_nonce }}]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  oidc-smoke:
+    name: OIDC smoke (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.environment }}
+    strategy:
+      fail-fast: false
+      matrix:
+        environment:
+          - nonprod
+    steps:
+      - name: Assume Wave 0 read-only role
+        uses: aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8
+        with:
+          role-to-assume: ${{ vars.AWS_WAVE0_ROLE_ARN }}
+          aws-region: ap-southeast-1
+          mask-aws-account-id: true
+
+      - name: Create run-bound account proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          proof_dir="${RUNNER_TEMP}/mercury-wave0-oidc-account-proof/${{ matrix.environment }}"
+          proof_file="${proof_dir}/oidc-account-proof-${{ matrix.environment }}.json"
+          mkdir -p "${proof_dir}"
+
+          account_id="$(aws sts get-caller-identity --query Account --output text --region ap-southeast-1)"
+          if [[ ! "${account_id}" =~ ^[0-9]{12}$ ]]; then
+            printf 'wave0_account_identity=invalid\n' >&2
+            exit 1
+          fi
+          account_fingerprint="$(printf '%s' "${account_id}" | sha256sum | cut -c1-12)"
+          unset account_id
+
+          jq -n \
+            --arg repository "${{ github.repository }}" \
+            --arg workflow ".github/workflows/aws-wave0-oidc-smoke.yml" \
+            --argjson run_id "${{ github.run_id }}" \
+            --argjson run_attempt "${{ github.run_attempt }}" \
+            --arg head_sha "${{ github.sha }}" \
+            --arg environment "${{ matrix.environment }}" \
+            --arg account_fingerprint "${account_fingerprint}" \
+            '{
+              "schema": "mercury.aws.wave0.oidc_account_proof.v1",
+              "repository": $repository,
+              "workflow": $workflow,
+              "run_id": $run_id,
+              "run_attempt": $run_attempt,
+              "head_sha": $head_sha,
+              "environment": $environment,
+              "account_fingerprint": $account_fingerprint
+            }' >"${proof_file}"
+          unset account_fingerprint
+          test -s "${proof_file}"
+
+      - name: Upload run-bound account proof
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mercury-wave0-oidc-account-proof-${{ matrix.environment }}
+          path: ${{ runner.temp }}/mercury-wave0-oidc-account-proof/${{ matrix.environment }}/oidc-account-proof-${{ matrix.environment }}.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Run read-only Wave 0 probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          output_dir="${RUNNER_TEMP}/mercury-wave0-oidc"
+          mkdir -p "${output_dir}"
+
+          aws bedrock-agentcore-control list-agent-runtimes --max-results 1 --region ap-southeast-1 >"${output_dir}/agentcore-runtimes.json" 2>&1
+          aws bedrock-agentcore-control list-gateways --max-results 1 --region ap-southeast-1 >"${output_dir}/agentcore-gateways.json" 2>&1
+          aws bedrock-agentcore-control list-workload-identities --max-results 1 --region ap-southeast-1 >"${output_dir}/agentcore-identities.json" 2>&1
+          aws bedrock-agent list-knowledge-bases --max-results 1 --region ap-southeast-1 >"${output_dir}/knowledge-bases.json" 2>&1
+          aws rds describe-orderable-db-instance-options --engine aurora-postgresql --db-instance-class db.serverless --max-records 20 --query '{OrderableDBInstanceOptions: OrderableDBInstanceOptions[0:1].{Engine:Engine,DBInstanceClass:DBInstanceClass}}' --region ap-southeast-1 >"${output_dir}/aurora-options.json" 2>&1
+          aws s3api list-buckets --region ap-southeast-1 >"${output_dir}/s3-buckets.json" 2>&1
+          aws kms list-aliases --limit 1 --region ap-southeast-1 >"${output_dir}/kms-aliases.json" 2>&1
+          aws ecr describe-repositories --max-results 1 --region ap-southeast-1 >"${output_dir}/ecr-repositories.json" 2>&1
+          aws logs describe-log-groups --limit 1 --region ap-southeast-1 >"${output_dir}/log-groups.json" 2>&1
+          aws service-quotas list-service-quotas --service-code bedrock-agentcore --max-results 20 --query '{Quotas: Quotas[].{QuotaCode:QuotaCode,Value:Value}}' --region ap-southeast-1 >"${output_dir}/agentcore-quotas.json" 2>&1
+
+          printf 'environment=%s\n' "${{ matrix.environment }}"
+          printf 'wave0_oidc_smoke=pass\n'

@@ -1,0 +1,862 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from uuid import UUID
+
+import pytest
+from pydantic import BaseModel, ConfigDict
+
+from mercury_tools.auth.models import MercuryPrincipal
+from mercury_tools.catalog.models import ProviderMCPQualification, QualificationState
+from mercury_tools.providers.base import (
+    DispatchCertainty,
+    ProviderCallResult,
+    ProviderOperationClass,
+    ProviderSchemaChanged,
+    ProviderStatusClass,
+    ProviderUnavailable,
+    QualifiedCapabilityBinding,
+)
+from mercury_tools.providers.manifest import load_provider_manifest
+from mercury_tools.providers.models import (
+    AuthorizationMethod,
+    ConnectionReadiness,
+    ProviderConnection,
+    ProviderId,
+)
+from mercury_tools.workspaces.models import WorkspaceMembership, WorkspaceRole
+
+WORKSPACE_ID = UUID("12345678-1234-5678-9234-567812345678")
+CONNECTION_ID = UUID("87654321-4321-8765-4321-876543218765")
+TENANT_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+USER_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+NOW = datetime(2026, 7, 30, 12, tzinfo=UTC)
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class InvoiceReadInputs(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+    invoice_reference: str
+
+
+def _qualification(
+    *,
+    capability_id: str = "documents.invoice.get",
+    capability_version: str | None = None,
+) -> ProviderMCPQualification:
+    definition = ProviderMCPQualification.discovered(
+        provider="flowaccount",
+        environment="sandbox",
+        provider_tool_name="PRIVATE_DOWNSTREAM_GET_INVOICE",
+        normalized_capability=capability_id,
+        input_schema={
+            "type": "object",
+            "properties": {"invoice_reference": {"type": "string", "minLength": 1}},
+            "required": ["invoice_reference"],
+            "additionalProperties": False,
+        },
+        output_schema={
+            "type": "object",
+            "properties": {
+                "document_number": {"type": "string", "minLength": 1},
+                "invoice_id": {"type": "string", "minLength": 1},
+                "contact_email": {"type": "string", "minLength": 1},
+                "tax_id": {"type": "string", "minLength": 1},
+            },
+            "required": ["document_number", "invoice_id", "contact_email", "tax_id"],
+            "additionalProperties": False,
+        },
+        public_output_field_paths=("/document_number", "/invoice_id"),
+        response_shape_hash="a" * 64,
+        required_permissions=("documents.read",),
+    )
+    return definition.model_copy(
+        update={
+            "qualification_state": QualificationState.ENABLED,
+            "capability_version_sha256": capability_version or definition.capability_version_sha256,
+            "company_sha256": "b" * 64,
+            "evidence_revision_sha256": "c" * 64,
+            "qualification_evidence_uri": (
+                "catalog://global/flowaccount/qualifications/"
+                f"{capability_version or definition.capability_version_sha256}-{'c' * 64}.json"
+            ),
+            "evidence_evaluated_at": NOW,
+            "evidence_expires_at": NOW + timedelta(days=1),
+        }
+    )
+
+
+def _connection() -> ProviderConnection:
+    return ProviderConnection(
+        id=CONNECTION_ID,
+        tenant_id=TENANT_ID,
+        workspace_id=WORKSPACE_ID,
+        auth_user_id=USER_ID,
+        provider=ProviderId.FLOWACCOUNT,
+        environment="sandbox",
+        provider_account_id="private-company-id",
+        account_display_name="Example Company",
+        authorization_method=AuthorizationMethod.OAUTH2_PKCE,
+        granted_permissions=("documents.read",),
+        readiness=ConnectionReadiness.READY,
+        revision=1,
+        last_validated_at=NOW,
+        credential_envelope_ids=(UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),),
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+def _principal() -> MercuryPrincipal:
+    return MercuryPrincipal(subject=USER_ID, client_id="test-client", scopes=frozenset())
+
+
+class FakeConnectionStore:
+    def __init__(self, connection: ProviderConnection) -> None:
+        self.connection = connection
+        self.calls: list[dict[str, object]] = []
+
+    def load_connection(self, **kwargs: object) -> ProviderConnection:
+        self.calls.append(kwargs)
+        return self.connection
+
+
+class FakeResolver:
+    def __init__(self, qualification: ProviderMCPQualification) -> None:
+        self.qualification = qualification
+        self.calls: list[tuple[UUID, str, str]] = []
+
+    async def bind_exact_for_connection(
+        self,
+        connection: ProviderConnection,
+        *,
+        capability_id: str,
+        capability_version: str,
+        deadline: object,
+    ) -> tuple[ProviderMCPQualification, QualifiedCapabilityBinding]:
+        self.calls.append((connection.id, capability_id, capability_version))
+        if capability_version != self.qualification.capability_version_sha256:
+            from mercury_tools.qualification.provider_mcp import QualificationGateError
+
+            raise QualificationGateError("capability_unavailable")
+        return (
+            self.qualification,
+            QualifiedCapabilityBinding(
+                provider=ProviderId.FLOWACCOUNT,
+                environment="sandbox",
+                normalized_capability=capability_id,
+                provider_tool="PRIVATE_DOWNSTREAM_GET_INVOICE",
+                operation_class=ProviderOperationClass.READ,
+                qualification_hash="c" * 64,
+            ),
+        )
+
+
+class FakeDriver:
+    def __init__(self, outcomes: list[object]) -> None:
+        self.outcomes = outcomes
+        self._manifest = load_provider_manifest(
+            ROOT / "catalog" / "global" / "flowaccount" / "driver.json"
+        )
+        self.calls: list[
+            tuple[ProviderConnection, QualifiedCapabilityBinding, BaseModel, object]
+        ] = []
+
+    async def call(
+        self,
+        connection: ProviderConnection,
+        binding: QualifiedCapabilityBinding,
+        inputs: BaseModel,
+        operation_id: object,
+        *,
+        deadline: object | None = None,
+    ) -> ProviderCallResult:
+        self.calls.append((connection, binding, inputs, deadline))
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        assert isinstance(outcome, ProviderCallResult)
+        return outcome
+
+
+class FakeRegistry:
+    def __init__(self, driver: FakeDriver) -> None:
+        self.driver = driver
+
+    def get(self, provider: ProviderId) -> FakeDriver:
+        assert provider is ProviderId.FLOWACCOUNT
+        return self.driver
+
+
+class HostedReadOnlyDriver(FakeDriver):
+    async def call(self, *_args: object, **_kwargs: object) -> ProviderCallResult:
+        raise AssertionError("PEAK V1 reads must use the hosted-read entrypoint")
+
+    async def call_hosted_read(
+        self,
+        connection: ProviderConnection,
+        binding: QualifiedCapabilityBinding,
+        inputs: BaseModel,
+        operation_id: object,
+        *,
+        deadline: object | None = None,
+    ) -> ProviderCallResult:
+        return await super().call(
+            connection,
+            binding,
+            inputs,
+            operation_id,
+            deadline=deadline,
+        )
+
+
+def _runtime(qualification: ProviderMCPQualification, driver: FakeDriver):
+    connection_store = FakeConnectionStore(_connection())
+    return SimpleNamespace(
+        connection_store=connection_store,
+        qualification_resolver=FakeResolver(qualification),
+        registry=FakeRegistry(driver),
+    )
+
+
+def _membership(_principal_value: MercuryPrincipal, workspace_id: UUID) -> WorkspaceMembership:
+    assert workspace_id == WORKSPACE_ID
+    return WorkspaceMembership(
+        tenant_id=TENANT_ID,
+        tenant_display_name="Example Tenant",
+        workspace_id=WORKSPACE_ID,
+        workspace_display_name="Example Workspace",
+        role=WorkspaceRole.MEMBER,
+    )
+
+
+@pytest.mark.asyncio
+async def test_hosted_read_requires_the_exact_enabled_capability_version() -> None:
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+    from mercury_tools.qualification.provider_mcp import QualificationGateError
+
+    qualification = _qualification()
+    driver = FakeDriver([])
+    runtime = _runtime(qualification, driver)
+    service = HostedReadService(
+        runtime_factory=lambda: runtime,
+        membership_resolver=_membership,
+    )
+
+    with pytest.raises(QualificationGateError, match="^capability_unavailable$"):
+        await service.execute(
+            _principal(),
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            qualification.normalized_capability,
+            "f" * 64,
+            InvoiceReadInputs(invoice_reference="INV-001"),
+        )
+
+    assert runtime.connection_store.calls == [
+        {
+            "tenant_id": TENANT_ID,
+            "workspace_id": WORKSPACE_ID,
+            "auth_user_id": USER_ID,
+            "connection_id": CONNECTION_ID,
+        }
+    ]
+    assert driver.calls == []
+
+
+@pytest.mark.asyncio
+async def test_hosted_read_retries_only_pre_dispatch_safe_read_failures_within_deadline() -> None:
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+
+    qualification = _qualification()
+    driver = FakeDriver(
+        [
+            ProviderUnavailable(
+                ProviderId.FLOWACCOUNT,
+                dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+            ),
+            ProviderCallResult(
+                provider=ProviderId.FLOWACCOUNT,
+                status_class=ProviderStatusClass.SUCCESS,
+                normalized_data={
+                    "document_number": "INV-001",
+                    "invoice_id": "provider-invoice-id",
+                    "contact_email": "person@example.com",
+                    "tax_id": "1234567890123",
+                },
+                dispatch_certainty=DispatchCertainty.DISPATCHED,
+            ),
+        ]
+    )
+    runtime = _runtime(qualification, driver)
+    pauses: list[float] = []
+    audits: list[dict[str, object]] = []
+    service = HostedReadService(
+        runtime_factory=lambda: runtime,
+        membership_resolver=_membership,
+        sleep=lambda seconds: pauses.append(seconds),
+        audit_recorder=audits.append,
+    )
+
+    envelope = await service.execute(
+        _principal(),
+        WORKSPACE_ID,
+        CONNECTION_ID,
+        qualification.normalized_capability,
+        qualification.capability_version_sha256,
+        InvoiceReadInputs(invoice_reference="INV-001"),
+    )
+
+    assert len(driver.calls) == 2
+    assert pauses == [0.05]
+    assert envelope.capability_id == qualification.normalized_capability
+    assert envelope.capability_version == qualification.capability_version_sha256
+    assert envelope.data == {
+        "document_number": "INV-001",
+        "invoice_id": "provider-invoice-id",
+    }
+    assert len(audits) == 1
+    audit_text = str(audits[0])
+    assert "private-company-id" not in audit_text
+    assert "provider-invoice-id" not in audit_text
+    assert "person@example.com" not in audit_text
+    assert "1234567890123" not in audit_text
+    assert (
+        audits[0]["input"]["workspace_id_sha256"]
+        == hashlib.sha256(str(WORKSPACE_ID).encode("utf-8")).hexdigest()
+    )
+
+
+@pytest.mark.asyncio
+async def test_hosted_read_rechecks_dispatch_guard_before_every_provider_attempt() -> None:
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+    from mercury_tools.qualification.provider_mcp import QualificationGateError
+
+    qualification = _qualification()
+    driver = FakeDriver(
+        [
+            ProviderUnavailable(
+                ProviderId.FLOWACCOUNT,
+                dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+            ),
+            ProviderCallResult(
+                provider=ProviderId.FLOWACCOUNT,
+                status_class=ProviderStatusClass.SUCCESS,
+                normalized_data={
+                    "document_number": "INV-001",
+                    "invoice_id": "provider-invoice-id",
+                    "contact_email": "person@example.com",
+                    "tax_id": "1234567890123",
+                },
+                dispatch_certainty=DispatchCertainty.DISPATCHED,
+            ),
+        ]
+    )
+    runtime = _runtime(qualification, driver)
+    guarded_versions: list[str] = []
+
+    def dispatch_guard(resolved: ProviderMCPQualification) -> None:
+        guarded_versions.append(resolved.capability_version_sha256)
+        if len(guarded_versions) == 2:
+            raise QualificationGateError("capability_unavailable")
+
+    service = HostedReadService(
+        runtime_factory=lambda: runtime,
+        membership_resolver=_membership,
+        sleep=lambda _seconds: None,
+        dispatch_guard=dispatch_guard,
+    )
+
+    with pytest.raises(QualificationGateError, match="^capability_unavailable$"):
+        await service.execute(
+            _principal(),
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            qualification.normalized_capability,
+            qualification.capability_version_sha256,
+            InvoiceReadInputs(invoice_reference="INV-001"),
+        )
+
+    assert guarded_versions == [
+        qualification.capability_version_sha256,
+        qualification.capability_version_sha256,
+    ]
+    assert len(driver.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_projection_guard_denial_preserves_public_code_and_denied_audit() -> None:
+    from mcp.server.fastmcp import FastMCP
+
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+    from mercury_tools.mcp.v1_errors import public_error_code
+    from mercury_tools.mcp.v1_tools import GeneratedProviderToolProjection
+    from mercury_tools.qualification.provider_mcp import QualificationGateError
+
+    qualification = _qualification()
+    driver = FakeDriver([])
+    runtime = _runtime(qualification, driver)
+    audits: list[dict[str, object]] = []
+    projection = GeneratedProviderToolProjection(
+        FastMCP("Projection guard audit"),
+        runtime_factory=lambda: runtime,
+        service_factory=lambda: object(),
+        close_runtime=False,
+    )
+    projection._publisher.quarantine_schema_change(
+        qualification,
+        DispatchCertainty.NOT_DISPATCHED,
+    )
+    service = HostedReadService(
+        runtime_factory=lambda: runtime,
+        membership_resolver=_membership,
+        audit_recorder=audits.append,
+        dispatch_guard=projection.ensure_dispatch_allowed,
+        close_runtime=False,
+    )
+
+    with pytest.raises(QualificationGateError, match="^capability_unavailable$") as caught:
+        await service.execute(
+            _principal(),
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            qualification.normalized_capability,
+            qualification.capability_version_sha256,
+            InvoiceReadInputs(invoice_reference="INV-001"),
+        )
+
+    assert public_error_code(caught.value) == "capability_unavailable"
+    assert driver.calls == []
+    assert len(audits) == 1
+    assert audits[0]["status"] == "denied"
+    assert audits[0]["output_summary"]["status_class"] == "capability_unavailable"
+    assert audits[0]["output_summary"]["dispatch_certainty"] == "not_dispatched"
+
+
+@pytest.mark.asyncio
+async def test_hosted_read_never_retries_a_possibly_dispatched_failure() -> None:
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+
+    qualification = _qualification()
+    driver = FakeDriver(
+        [
+            ProviderUnavailable(
+                ProviderId.FLOWACCOUNT,
+                dispatch_certainty=DispatchCertainty.DISPATCHED,
+            )
+        ]
+    )
+    runtime = _runtime(qualification, driver)
+    service = HostedReadService(
+        runtime_factory=lambda: runtime,
+        membership_resolver=_membership,
+        sleep=lambda _seconds: pytest.fail("possibly dispatched reads must not retry"),
+    )
+
+    with pytest.raises(ProviderUnavailable):
+        await service.execute(
+            _principal(),
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            qualification.normalized_capability,
+            qualification.capability_version_sha256,
+            InvoiceReadInputs(invoice_reference="INV-001"),
+        )
+
+    assert len(driver.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_hosted_read_uses_the_peak_v1_entrypoint_when_available() -> None:
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+
+    qualification = _qualification()
+    driver = HostedReadOnlyDriver(
+        [
+            ProviderCallResult(
+                provider=ProviderId.FLOWACCOUNT,
+                status_class=ProviderStatusClass.SUCCESS,
+                normalized_data={
+                    "document_number": "INV-001",
+                    "invoice_id": "provider-invoice-id",
+                    "contact_email": "person@example.com",
+                    "tax_id": "1234567890123",
+                },
+                dispatch_certainty=DispatchCertainty.DISPATCHED,
+            )
+        ]
+    )
+    runtime = _runtime(qualification, driver)
+    service = HostedReadService(runtime_factory=lambda: runtime, membership_resolver=_membership)
+
+    await service.execute(
+        _principal(),
+        WORKSPACE_ID,
+        CONNECTION_ID,
+        qualification.normalized_capability,
+        qualification.capability_version_sha256,
+        InvoiceReadInputs(invoice_reference="INV-001"),
+    )
+
+    assert len(driver.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_hosted_read_surfaces_schema_drift_as_version_change_without_dispatch_retry() -> None:
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+
+    qualification = _qualification()
+    driver = FakeDriver(
+        [
+            ProviderSchemaChanged(
+                ProviderId.FLOWACCOUNT,
+                dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+            )
+        ]
+    )
+    runtime = _runtime(qualification, driver)
+    service = HostedReadService(runtime_factory=lambda: runtime, membership_resolver=_membership)
+
+    with pytest.raises(ProviderSchemaChanged):
+        await service.execute(
+            _principal(),
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            qualification.normalized_capability,
+            qualification.capability_version_sha256,
+            InvoiceReadInputs(invoice_reference="INV-001"),
+        )
+
+    assert len(driver.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_hosted_read_rejects_a_connection_environment_mismatch() -> None:
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+    from mercury_tools.qualification.provider_mcp import QualificationGateError
+
+    qualification = _qualification()
+    driver = FakeDriver([])
+    runtime = _runtime(qualification, driver)
+    runtime.connection_store.connection = _connection().model_copy(
+        update={"environment": "production"}
+    )
+    service = HostedReadService(runtime_factory=lambda: runtime, membership_resolver=_membership)
+
+    with pytest.raises(QualificationGateError, match="^capability_unavailable$"):
+        await service.execute(
+            _principal(),
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            qualification.normalized_capability,
+            qualification.capability_version_sha256,
+            InvoiceReadInputs(invoice_reference="INV-001"),
+        )
+
+    assert driver.calls == []
+
+
+@pytest.mark.asyncio
+async def test_hosted_read_records_a_sanitized_terminal_audit_for_failure_and_cancellation() -> (
+    None
+):
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+
+    qualification = _qualification()
+    failure_audits: list[dict[str, object]] = []
+    failed_runtime = _runtime(
+        qualification,
+        FakeDriver(
+            [
+                ProviderUnavailable(
+                    ProviderId.FLOWACCOUNT,
+                    dispatch_certainty=DispatchCertainty.DISPATCHED,
+                )
+            ]
+        ),
+    )
+    failed_service = HostedReadService(
+        runtime_factory=lambda: failed_runtime,
+        membership_resolver=_membership,
+        audit_recorder=failure_audits.append,
+    )
+    with pytest.raises(ProviderUnavailable):
+        await failed_service.execute(
+            _principal(),
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            qualification.normalized_capability,
+            qualification.capability_version_sha256,
+            InvoiceReadInputs(invoice_reference="INV-001"),
+        )
+    assert len(failure_audits) == 1
+    assert failure_audits[0]["status"] == "error"
+    assert failure_audits[0]["output_summary"]["status_class"] == "unavailable"
+    assert failure_audits[0]["output_summary"]["dispatch_certainty"] == "dispatched"
+
+    started = asyncio.Event()
+
+    class BlockingDriver(FakeDriver):
+        async def call(self, *_args: object, **_kwargs: object) -> ProviderCallResult:
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("cancellation must interrupt the provider wait")
+
+    cancellation_audits: list[dict[str, object]] = []
+    cancelled_runtime = _runtime(qualification, BlockingDriver([]))
+    cancelled_service = HostedReadService(
+        runtime_factory=lambda: cancelled_runtime,
+        membership_resolver=_membership,
+        audit_recorder=cancellation_audits.append,
+    )
+    task = asyncio.create_task(
+        cancelled_service.execute(
+            _principal(),
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            qualification.normalized_capability,
+            qualification.capability_version_sha256,
+            InvoiceReadInputs(invoice_reference="INV-001"),
+        )
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(cancellation_audits) == 1
+    assert cancellation_audits[0]["status"] == "cancelled"
+    assert cancellation_audits[0]["output_summary"]["dispatch_certainty"] == "unknown"
+    assert "INV-001" not in str(cancellation_audits[0])
+
+
+@pytest.mark.asyncio
+async def test_hosted_read_retains_dispatch_certainty_after_response_validation_failure() -> None:
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+
+    qualification = _qualification()
+    audits: list[dict[str, object]] = []
+    runtime = _runtime(
+        qualification,
+        FakeDriver(
+            [
+                ProviderCallResult(
+                    provider=ProviderId.FLOWACCOUNT,
+                    status_class=ProviderStatusClass.SUCCESS,
+                    normalized_data={"document_number": "INV-1"},
+                    dispatch_certainty=DispatchCertainty.UNKNOWN,
+                )
+            ]
+        ),
+    )
+    service = HostedReadService(
+        runtime_factory=lambda: runtime,
+        membership_resolver=_membership,
+        audit_recorder=audits.append,
+    )
+
+    with pytest.raises(ProviderSchemaChanged) as caught:
+        await service.execute(
+            _principal(),
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            qualification.normalized_capability,
+            qualification.capability_version_sha256,
+            InvoiceReadInputs(invoice_reference="INV-001"),
+        )
+
+    assert caught.value.dispatch_certainty is DispatchCertainty.DISPATCHED
+    assert len(audits) == 1
+    assert audits[0]["output_summary"]["status_class"] == "schema_changed"
+    assert audits[0]["output_summary"]["dispatch_certainty"] == "dispatched"
+
+
+@pytest.mark.asyncio
+async def test_hosted_read_uses_exact_manifest_read_deadline_beyond_five_seconds() -> None:
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+
+    qualification = _qualification()
+
+    class AfterFiveSecondsDriver(FakeDriver):
+        async def call(
+            self,
+            connection: ProviderConnection,
+            binding: QualifiedCapabilityBinding,
+            inputs: BaseModel,
+            operation_id: object,
+            *,
+            deadline: object | None = None,
+        ) -> ProviderCallResult:
+            del operation_id
+            self.calls.append((connection, binding, inputs, deadline))
+            assert deadline is not None
+            assert deadline.expires_at - deadline.started_at == 30
+            deadline._clock = lambda: deadline.started_at + 6
+            deadline.check()
+            return ProviderCallResult(
+                provider=ProviderId.FLOWACCOUNT,
+                status_class=ProviderStatusClass.SUCCESS,
+                normalized_data={
+                    "document_number": "INV-001",
+                    "invoice_id": "provider-invoice-id",
+                    "contact_email": "person@example.com",
+                    "tax_id": "1234567890123",
+                },
+                dispatch_certainty=DispatchCertainty.DISPATCHED,
+            )
+
+    driver = AfterFiveSecondsDriver([])
+    runtime = _runtime(qualification, driver)
+    service = HostedReadService(
+        runtime_factory=lambda: runtime,
+        membership_resolver=_membership,
+    )
+
+    envelope = await service.execute(
+        _principal(),
+        WORKSPACE_ID,
+        CONNECTION_ID,
+        qualification.normalized_capability,
+        qualification.capability_version_sha256,
+        InvoiceReadInputs(invoice_reference="INV-001"),
+    )
+
+    assert envelope.data["document_number"] == "INV-001"
+    assert len(driver.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_hosted_read_marks_generic_and_malformed_provider_call_failures_unknown_once() -> (
+    None
+):
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+
+    qualification = _qualification()
+
+    class MalformedDriver(FakeDriver):
+        async def call(
+            self,
+            connection: ProviderConnection,
+            binding: QualifiedCapabilityBinding,
+            inputs: BaseModel,
+            operation_id: object,
+            *,
+            deadline: object | None = None,
+        ) -> object:
+            del operation_id
+            self.calls.append((connection, binding, inputs, deadline))
+            return {"provider": "flowaccount"}
+
+    for driver in (FakeDriver([RuntimeError("driver failed")]), MalformedDriver([])):
+        audits: list[dict[str, object]] = []
+        service = HostedReadService(
+            runtime_factory=lambda driver=driver: _runtime(qualification, driver),
+            membership_resolver=_membership,
+            audit_recorder=audits.append,
+        )
+
+        with pytest.raises((RuntimeError, ValueError)):
+            await service.execute(
+                _principal(),
+                WORKSPACE_ID,
+                CONNECTION_ID,
+                qualification.normalized_capability,
+                qualification.capability_version_sha256,
+                InvoiceReadInputs(invoice_reference="INV-001"),
+            )
+
+        assert len(audits) == 1
+        assert audits[0]["status"] == "error"
+        assert audits[0]["output_summary"]["status_class"] == "validation_failed"
+        assert audits[0]["output_summary"]["dispatch_certainty"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_explicit_not_dispatched_result_replaces_call_entry_unknown() -> None:
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+
+    qualification = _qualification()
+    audits: list[dict[str, object]] = []
+    runtime = _runtime(
+        qualification,
+        FakeDriver(
+            [
+                ProviderCallResult(
+                    provider=ProviderId.FLOWACCOUNT,
+                    status_class=ProviderStatusClass.UNAVAILABLE,
+                    normalized_data={},
+                    dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+                )
+            ]
+        ),
+    )
+    service = HostedReadService(
+        runtime_factory=lambda: runtime,
+        membership_resolver=_membership,
+        audit_recorder=audits.append,
+    )
+
+    with pytest.raises(ValueError, match="^capability_unavailable$"):
+        await service.execute(
+            _principal(),
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            qualification.normalized_capability,
+            qualification.capability_version_sha256,
+            InvoiceReadInputs(invoice_reference="INV-001"),
+        )
+
+    assert len(audits) == 1
+    assert audits[0]["output_summary"]["dispatch_certainty"] == "not_dispatched"
+
+
+@pytest.mark.asyncio
+async def test_retry_backoff_cancellation_retains_explicit_pre_dispatch_evidence() -> None:
+    from mercury_tools.execution.hosted.read_service import HostedReadService
+
+    qualification = _qualification()
+    backoff_started = asyncio.Event()
+    audits: list[dict[str, object]] = []
+    driver = FakeDriver(
+        [
+            ProviderUnavailable(
+                ProviderId.FLOWACCOUNT,
+                dispatch_certainty=DispatchCertainty.NOT_DISPATCHED,
+            )
+        ]
+    )
+
+    async def blocking_backoff(_seconds: float) -> None:
+        backoff_started.set()
+        await asyncio.Event().wait()
+
+    service = HostedReadService(
+        runtime_factory=lambda: _runtime(qualification, driver),
+        membership_resolver=_membership,
+        audit_recorder=audits.append,
+        sleep=blocking_backoff,
+    )
+    read = asyncio.create_task(
+        service.execute(
+            _principal(),
+            WORKSPACE_ID,
+            CONNECTION_ID,
+            qualification.normalized_capability,
+            qualification.capability_version_sha256,
+            InvoiceReadInputs(invoice_reference="INV-001"),
+        )
+    )
+    await backoff_started.wait()
+    read.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await read
+
+    assert len(driver.calls) == 1
+    assert len(audits) == 1
+    assert audits[0]["status"] == "cancelled"
+    assert audits[0]["output_summary"]["dispatch_certainty"] == "not_dispatched"

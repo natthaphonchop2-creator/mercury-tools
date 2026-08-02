@@ -1,0 +1,93 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Disposable nonprod Cognito public-client compatibility spike for Mercury Wave 0
+
+Parameters:
+  TargetEnvironment:
+    Type: String
+    AllowedValues:
+      - nonprod
+  CodexCallbackUrls:
+    Type: CommaDelimitedList
+  ChatGPTCallbackUrls:
+    Type: CommaDelimitedList
+  ClaudeCallbackUrls:
+    Type: CommaDelimitedList
+
+Resources:
+  MercuryWave0IdentitySpikeUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: mercury-wave0-identity-spike
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      DeletionProtection: INACTIVE
+
+  MercuryWave0IdentitySpikeDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain:
+        Fn::Sub: mercury-wave0-${AWS::AccountId}
+      UserPoolId:
+        Ref: MercuryWave0IdentitySpikeUserPool
+
+  MercuryWave0CodexClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties: &public_client
+      ClientName: mercury-wave0-codex
+      UserPoolId:
+        Ref: MercuryWave0IdentitySpikeUserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      SupportedIdentityProviders:
+        - COGNITO
+      EnableTokenRevocation: true
+      RefreshTokenRotation:
+        Feature: ENABLED
+        RetryGracePeriodSeconds: 60
+      CallbackURLs:
+        Ref: CodexCallbackUrls
+
+  MercuryWave0ChatGPTClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      <<: *public_client
+      ClientName: mercury-wave0-chatgpt
+      CallbackURLs:
+        Ref: ChatGPTCallbackUrls
+
+  MercuryWave0ClaudeClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      <<: *public_client
+      ClientName: mercury-wave0-claude
+      CallbackURLs:
+        Ref: ClaudeCallbackUrls
+
+Outputs:
+  IssuerOrigin:
+    Value:
+      Fn::Sub: https://cognito-idp.${AWS::Region}.amazonaws.com/${MercuryWave0IdentitySpikeUserPool}
+  AuthorizationEndpoint:
+    Value:
+      Fn::Sub: https://${MercuryWave0IdentitySpikeDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/authorize
+  TokenEndpoint:
+    Value:
+      Fn::Sub: https://${MercuryWave0IdentitySpikeDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/token
+  JwksUri:
+    Value:
+      Fn::Sub: https://cognito-idp.${AWS::Region}.amazonaws.com/${MercuryWave0IdentitySpikeUserPool}/.well-known/jwks.json
+  CodexClientId:
+    Value:
+      Ref: MercuryWave0CodexClient
+  ChatGPTClientId:
+    Value:
+      Ref: MercuryWave0ChatGPTClient
+  ClaudeClientId:
+    Value:
+      Ref: MercuryWave0ClaudeClient
