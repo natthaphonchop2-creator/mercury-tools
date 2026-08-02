@@ -115,6 +115,16 @@ def test_template_outputs_only_the_role_arn() -> None:
 def test_workflow_is_manual_and_uses_oidc_only() -> None:
     workflow = load_workflow()
     assert set(workflow["on"]) == {"workflow_dispatch"}
+    assert workflow["on"]["workflow_dispatch"]["inputs"] == {
+        "evidence_nonce": {
+            "description": "Non-secret identifier used to select this exact workflow run",
+            "required": "true",
+            "type": "string",
+        }
+    }
+    assert workflow["run-name"] == (
+        "AWS Wave 0 OIDC smoke [${{ inputs.evidence_nonce }}]"
+    )
     assert workflow["permissions"] == {"contents": "read", "id-token": "write"}
 
     serialized = WORKFLOW_PATH.read_text(encoding="utf-8")
@@ -185,3 +195,25 @@ def test_bootstrap_runbook_preserves_secret_and_live_access_boundaries() -> None
     assert "long-lived" in runbook.lower()
     assert "live OIDC" in runbook
     assert "not proven" in runbook
+
+
+def test_bootstrap_watches_the_exact_just_dispatched_workflow_run() -> None:
+    runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+    assert 'evidence_nonce="wave0-$(uv run python -c' in runbook
+    assert '-f evidence_nonce="${evidence_nonce}"' in runbook
+    assert '--workflow "${workflow}"' in runbook
+    assert "--event workflow_dispatch" in runbook
+    assert '--branch "${workflow_ref}"' in runbook
+    assert "--json databaseId,displayTitle" in runbook
+    assert "select(.displayTitle == $title)" in runbook
+    assert 'if [ "${match_count}" -gt 1 ]; then' in runbook
+    assert 'gh run watch "${run_id}" --exit-status' in runbook
+    assert "gh run watch --exit-status" not in runbook
+
+
+def test_bootstrap_describes_closed_probe_output_without_overclaiming_job_logs() -> None:
+    runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+    normalized = " ".join(runbook.split())
+    assert "Both matrix jobs must print only" not in normalized
+    assert "Mercury probe step emits only" in normalized
+    assert "pinned credentials action may emit masked status logs" in normalized

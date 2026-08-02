@@ -139,11 +139,56 @@ Dispatch the manual workflow only after both environment variables and the
 production reviewer are configured:
 
 ```bash
-gh workflow run aws-wave0-oidc-smoke.yml
-gh run watch --exit-status
+workflow="aws-wave0-oidc-smoke.yml"
+workflow_ref="$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name')"
+evidence_nonce="wave0-$(uv run python -c 'import uuid; print(uuid.uuid4())')"
+run_title="AWS Wave 0 OIDC smoke [${evidence_nonce}]"
+
+gh workflow run "${workflow}" \
+  --ref "${workflow_ref}" \
+  -f evidence_nonce="${evidence_nonce}"
+
+run_id=""
+for attempt in $(seq 1 30); do
+  matching_run_ids="$(
+    gh run list \
+      --workflow "${workflow}" \
+      --event workflow_dispatch \
+      --branch "${workflow_ref}" \
+      --limit 100 \
+      --json databaseId,displayTitle |
+      jq -r --arg title "${run_title}" \
+        '.[] | select(.displayTitle == $title) | .databaseId'
+  )"
+  match_count="$(
+    printf '%s\n' "${matching_run_ids}" | sed '/^$/d' | wc -l | tr -d ' '
+  )"
+
+  if [ "${match_count}" -gt 1 ]; then
+    printf 'wave0_oidc_run_selection=ambiguous\n' >&2
+    exit 1
+  fi
+  if [ "${match_count}" -eq 1 ]; then
+    run_id="${matching_run_ids}"
+    break
+  fi
+  sleep 2
+done
+
+if [ -z "${run_id}" ]; then
+  printf 'wave0_oidc_run_selection=not_found\n' >&2
+  exit 1
+fi
+
+gh run watch "${run_id}" --exit-status
 ```
 
-Both matrix jobs must print only their environment and
-`wave0_oidc_smoke=pass`. The workflow masks the AWS account ID and redirects
-all probe output to runner-temporary files. A local template test pass is not
-live OIDC proof; record success only after both GitHub environment jobs pass.
+The UUID input is a non-secret correlation value. Selection is restricted to
+the exact workflow, dispatch event, default branch, and generated run title;
+zero or multiple matches fail closed instead of selecting the latest run.
+
+The Mercury probe step emits only its environment and
+`wave0_oidc_smoke=pass`, while the pinned credentials action may emit masked
+status logs. The workflow masks the AWS account ID and redirects all AWS probe
+stdout and stderr to runner-temporary files. A local template test pass is not
+live OIDC proof; record success only after both jobs of the selected run pass.

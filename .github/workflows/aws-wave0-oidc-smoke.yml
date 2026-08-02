@@ -2,6 +2,13 @@ name: AWS Wave 0 OIDC smoke
 
 on:
   workflow_dispatch:
+    inputs:
+      evidence_nonce:
+        description: Non-secret identifier used to select this exact workflow run
+        required: true
+        type: string
+
+run-name: AWS Wave 0 OIDC smoke [${{ inputs.evidence_nonce }}]
 
 permissions:
   contents: read
