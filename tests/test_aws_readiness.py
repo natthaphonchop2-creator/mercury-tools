@@ -2045,6 +2045,7 @@ def test_cli_verifies_explicit_environment_bindings_and_stores_only_hashes(
                 str(output),
             ],
             runner=runner,
+            profile_source_inspector=short_lived_profile_source,
         )
 
         assert result == 0

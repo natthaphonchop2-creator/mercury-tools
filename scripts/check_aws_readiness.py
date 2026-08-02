@@ -22,11 +22,13 @@ from mercury_tools.aws.models import (
 from mercury_tools.aws.readiness import (
     OidcRunEvidence,
     OidcRunReference,
+    ProfileSourceInspector,
     build_readiness_report,
     check_aws_accounts,
     check_local_toolchain,
     check_region_services,
     finalize_wave0_gate,
+    inspect_short_lived_profile,
     write_readiness_report,
 )
 
@@ -196,6 +198,7 @@ def main(
     argv: list[str] | None = None,
     *,
     runner: CommandRunner = run_command,
+    profile_source_inspector: ProfileSourceInspector = inspect_short_lived_profile,
 ) -> int:
     try:
         args = _parser().parse_args(argv)
@@ -205,7 +208,7 @@ def main(
             _skipped_live_checks()
             if args.skip_live
             else (
-                *check_aws_accounts(config, runner),
+                *check_aws_accounts(config, runner, profile_source_inspector),
                 *check_region_services(config, runner),
             )
         )
