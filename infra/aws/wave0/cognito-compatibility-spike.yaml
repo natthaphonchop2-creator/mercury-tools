@@ -49,7 +49,7 @@ Resources:
       EnableTokenRevocation: true
       RefreshTokenRotation:
         Feature: ENABLED
-        RetryGracePeriod: 60
+        RetryGracePeriodSeconds: 60
       CallbackURLs:
         Ref: CodexCallbackUrls
 

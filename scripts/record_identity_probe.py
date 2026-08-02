@@ -9,18 +9,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import yaml
 from pydantic import ValidationError
 
 from mercury_tools.aws.identity import (
     HostIdentityProbe,
     HostName,
-    IdentityDecision,
     ProbeResult,
     RegistrationMode,
     decide_identity,
     load_identity_host_contract,
     record_host_probe,
+    write_identity_decision,
 )
 
 _DEFAULT_CONTRACT = Path("infra/aws/wave0/identity-host-contract.yaml")
@@ -73,22 +72,6 @@ def _load_probes(probe_dir: Path) -> tuple[HostIdentityProbe, ...]:
         raise ValueError("identity_probe_directory_invalid") from None
 
 
-def _write_decision(path: Path, decision: IdentityDecision) -> None:
-    try:
-        if path.exists() or path.is_symlink():
-            raise OSError
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if path.parent.is_symlink() or not path.parent.is_dir():
-            raise OSError
-        payload = yaml.safe_dump(
-            decision.model_dump(mode="json"), sort_keys=False, allow_unicode=False
-        )
-        with path.open("x", encoding="utf-8") as handle:
-            handle.write(payload)
-    except OSError:
-        raise ValueError("identity_decision_write_failed") from None
-
-
 def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
@@ -108,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         decision = decide_identity(_load_probes(args.probe_dir))
-        _write_decision(args.output, decision)
+        write_identity_decision(args.output, decision)
         print(f"identity_mode={decision.mode.value}")
         return 0
     except _CliInputError:

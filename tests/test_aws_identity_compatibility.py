@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -13,10 +14,13 @@ from pydantic import ValidationError
 from mercury_tools.aws.identity import (
     HostIdentityProbe,
     HostName,
+    IdentityDecision,
     IdentityHostContract,
+    IdentityMode,
     ProbeResult,
     decide_identity,
     record_host_probe,
+    write_identity_decision,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +69,15 @@ def failing_probe(
         mode=mode,
         issuer_origin=issuer_origin,
     ).model_copy(update={"result": ProbeResult.FAIL})
+
+
+def cognito_decision() -> IdentityDecision:
+    return IdentityDecision(
+        mode=IdentityMode.COGNITO_PRE_REGISTERED,
+        issuer_kind="cognito",
+        issuer_origin="cognito",
+        required_hosts=(HostName.CODEX, HostName.CHATGPT, HostName.CLAUDE),
+    )
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -202,6 +215,117 @@ def test_recorder_hashes_evidence_without_copying_bytes(tmp_path: Path) -> None:
         "result": "pass",
         "schema_version": "mercury.aws.wave0.identity_probe.v1",
     }
+    assert output.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("kind", ("probe", "decision"))
+def test_identity_writers_reject_symlinked_parent_components(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    parent = tmp_path / "parent"
+    parent.symlink_to(outside, target_is_directory=True)
+
+    if kind == "probe":
+        evidence = tmp_path / "codex.json"
+        evidence.write_text("local-only", encoding="utf-8")
+        with pytest.raises(ValueError, match="identity_probe_path_invalid"):
+            record_host_probe(contract(), passing_probe("codex"), evidence, parent / "identity")
+    else:
+        with pytest.raises(ValueError, match="identity_decision_path_invalid"):
+            write_identity_decision(parent / "identity-decision.yaml", cognito_decision())
+
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize("kind", ("probe", "decision"))
+def test_identity_writers_reject_symlinked_final_output(tmp_path: Path, kind: str) -> None:
+    target = tmp_path / "outside.yaml"
+    target.write_text("unchanged", encoding="utf-8")
+    output_dir = tmp_path / "identity"
+    output_dir.mkdir()
+
+    if kind == "probe":
+        output = output_dir / "codex-pre_registered.json"
+        output.symlink_to(target)
+        evidence = tmp_path / "codex.json"
+        evidence.write_text("local-only", encoding="utf-8")
+        with pytest.raises(ValueError, match="identity_probe_path_invalid"):
+            record_host_probe(contract(), passing_probe("codex"), evidence, output_dir)
+    else:
+        output = output_dir / "identity-decision.yaml"
+        output.symlink_to(target)
+        with pytest.raises(ValueError, match="identity_decision_path_invalid"):
+            write_identity_decision(output, cognito_decision())
+
+    assert target.read_text(encoding="utf-8") == "unchanged"
+
+
+@pytest.mark.parametrize("kind", ("probe", "decision"))
+def test_identity_writers_keep_replacement_failure_when_cleanup_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    class ReplacementFailure(OSError):
+        pass
+
+    def fail_replace(*args: object, **kwargs: object) -> None:
+        raise ReplacementFailure("replacement failed")
+
+    def fail_cleanup(*args: object, **kwargs: object) -> None:
+        raise PermissionError("cleanup failed")
+
+    output_dir = tmp_path / "identity"
+    with monkeypatch.context() as context:
+        context.setattr(os, "replace", fail_replace)
+        context.setattr(os, "unlink", fail_cleanup)
+        if kind == "probe":
+            evidence = tmp_path / "codex.json"
+            evidence.write_text("local-only", encoding="utf-8")
+            with pytest.raises(ReplacementFailure, match="replacement failed"):
+                record_host_probe(contract(), passing_probe("codex"), evidence, output_dir)
+            leftovers = list(output_dir.glob(".identity-probe-*"))
+        else:
+            with pytest.raises(ReplacementFailure, match="replacement failed"):
+                write_identity_decision(output_dir / "identity-decision.yaml", cognito_decision())
+            leftovers = list(output_dir.glob(".identity-decision-*"))
+
+    assert len(leftovers) == 1
+    assert leftovers[0].stat().st_mode & 0o777 == 0o600
+    leftovers[0].unlink()
+
+
+def test_identity_decision_requires_exact_distinct_host_tuple() -> None:
+    with pytest.raises(ValidationError, match="identity_required_host_missing"):
+        IdentityDecision(
+            mode=IdentityMode.COGNITO_PRE_REGISTERED,
+            issuer_kind="cognito",
+            issuer_origin="cognito",
+            required_hosts=(
+                HostName.CODEX,
+                HostName.CHATGPT,
+                HostName.CLAUDE,
+                HostName.CLAUDE,
+            ),
+        )
+
+
+def test_decision_writer_is_atomic_private_and_closed(tmp_path: Path) -> None:
+    output = tmp_path / "identity" / "identity-decision.yaml"
+
+    write_identity_decision(output, cognito_decision())
+
+    assert output.stat().st_mode & 0o777 == 0o600
+    assert load_yaml(output) == {
+        "schema_version": "mercury.aws.wave0.identity_decision.v1",
+        "mode": "cognito_pre_registered",
+        "issuer_kind": "cognito",
+        "issuer_origin": "cognito",
+        "required_hosts": ["codex", "chatgpt", "claude"],
+    }
 
 
 def test_host_contract_is_closed_and_requires_all_hosts() -> None:
@@ -254,6 +378,11 @@ def test_cognito_spike_is_nonprod_public_client_only_and_disposable() -> None:
         assert properties["SupportedIdentityProviders"] == ["COGNITO"]
         assert properties["EnableTokenRevocation"] is True
         assert properties["CallbackURLs"] == {"Ref": f"{host}CallbackUrls"}
+        assert properties["RefreshTokenRotation"] == {
+            "Feature": "ENABLED",
+            "RetryGracePeriodSeconds": 60,
+        }
+        assert "RetryGracePeriod" not in properties["RefreshTokenRotation"]
 
     resource_types = {item["Type"] for item in resources.values()}
     assert resource_types == {
@@ -299,6 +428,34 @@ def test_cli_incomplete_proof_exits_two_and_never_writes_decision(tmp_path: Path
 
     assert result.returncode == 2
     assert result.stdout.strip() == "identity_required_host_missing"
+    assert result.stderr == ""
+    assert not decision_path.exists()
+
+
+def test_cli_rejects_malformed_probe_json_without_writing_decision(tmp_path: Path) -> None:
+    probe_dir = tmp_path / "identity"
+    decision_path = tmp_path / "identity-decision.yaml"
+    probe_dir.mkdir()
+    (probe_dir / "codex-pre_registered.json").write_text("{not-json", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CLI_PATH),
+            "decide",
+            "--probe-dir",
+            str(probe_dir),
+            "--output",
+            str(decision_path),
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout.strip() == "identity_probe_directory_invalid"
     assert result.stderr == ""
     assert not decision_path.exists()
 

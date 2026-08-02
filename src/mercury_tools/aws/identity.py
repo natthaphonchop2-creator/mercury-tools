@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
+import stat
 from contextlib import suppress
 from datetime import datetime
 from enum import StrEnum
@@ -133,7 +135,10 @@ class IdentityDecision(_IdentityModel):
 
     @model_validator(mode="after")
     def validate_decision(self) -> IdentityDecision:
-        if {host.value for host in self.required_hosts} != _REQUIRED_HOSTS:
+        if (
+            len(self.required_hosts) != len(_REQUIRED_HOSTS)
+            or {host.value for host in self.required_hosts} != _REQUIRED_HOSTS
+        ):
             raise ValueError("identity_required_host_missing")
         if self.mode is IdentityMode.COGNITO_PRE_REGISTERED:
             if self.issuer_kind != "cognito" or self.issuer_origin != "cognito":
@@ -215,6 +220,21 @@ def decide_identity(probes: tuple[HostIdentityProbe, ...]) -> IdentityDecision:
     )
 
 
+def write_identity_decision(path: Path, decision: IdentityDecision) -> None:
+    """Atomically write a complete, closed identity decision with private mode."""
+
+    checked = IdentityDecision.model_validate(decision)
+    payload = yaml.safe_dump(
+        checked.model_dump(mode="json"), sort_keys=False, allow_unicode=False
+    ).encode("utf-8")
+    _write_identity_output(
+        path,
+        payload,
+        temporary_prefix=".identity-decision-",
+        path_error="identity_decision_path_invalid",
+    )
+
+
 def _probes_by_mode(
     probes: tuple[HostIdentityProbe, ...], mode: RegistrationMode
 ) -> tuple[HostIdentityProbe, ...]:
@@ -272,35 +292,99 @@ def _sha256_file(path: Path) -> str:
 
 
 def _write_probe(output_dir: Path, probe: HostIdentityProbe) -> Path:
+    destination = output_dir / f"{probe.host.value}-{probe.registration_mode.value}.json"
+    payload = json.dumps(
+        probe.model_dump(mode="json"),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    _write_identity_output(
+        destination,
+        payload,
+        temporary_prefix=".identity-probe-",
+        path_error="identity_probe_path_invalid",
+    )
+    return destination
+
+
+def _write_identity_output(
+    output: Path,
+    payload: bytes,
+    *,
+    temporary_prefix: str,
+    path_error: str,
+) -> None:
+    output_path = Path(os.path.abspath(os.fspath(output)))
+    if output_path.name in {"", ".", ".."}:
+        raise ValueError(path_error)
+
+    directory_fd = _open_output_directory(output_path.parent, path_error)
+    temporary_name: str | None = None
     try:
-        output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if output_dir.is_symlink() or not output_dir.is_dir():
-            raise OSError
-        destination = output_dir / f"{probe.host.value}-{probe.registration_mode.value}.json"
-        if destination.exists() and destination.is_symlink():
-            raise OSError
-        payload = json.dumps(
-            probe.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        temporary = output_dir / f".{destination.name}.{os.urandom(8).hex()}.tmp"
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
+        _reject_symlinked_output(directory_fd, output_path.name, path_error)
+        descriptor, temporary_name = _create_temporary_file(directory_fd, temporary_prefix)
+        with os.fdopen(descriptor, "wb") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(
+            temporary_name,
+            output_path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
         )
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, destination)
-            os.chmod(destination, 0o600)
-        finally:
-            with suppress(FileNotFoundError):
-                temporary.unlink()
-        return destination
+        temporary_name = None
+        os.fsync(directory_fd)
+    except BaseException:
+        if temporary_name is not None:
+            with suppress(OSError):
+                os.unlink(temporary_name, dir_fd=directory_fd)
+        raise
+    finally:
+        os.close(directory_fd)
+
+
+def _open_output_directory(path: Path, path_error: str) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parts = path.parts
+    if not path.is_absolute() or not parts:
+        raise ValueError(path_error)
+    try:
+        directory_fd = os.open(path.anchor, flags)
     except OSError:
-        raise ValueError("identity_probe_write_failed") from None
+        raise ValueError(path_error) from None
+    try:
+        for component in parts[1:]:
+            with suppress(FileExistsError):
+                os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+            next_fd = os.open(component, flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        return directory_fd
+    except OSError:
+        os.close(directory_fd)
+        raise ValueError(path_error) from None
+
+
+def _reject_symlinked_output(directory_fd: int, output_name: str, path_error: str) -> None:
+    try:
+        mode = os.stat(output_name, dir_fd=directory_fd, follow_symlinks=False).st_mode
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise ValueError(path_error) from None
+    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        raise ValueError(path_error)
+
+
+def _create_temporary_file(directory_fd: int, prefix: str) -> tuple[int, str]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    for _ in range(10):
+        name = f"{prefix}{secrets.token_hex(8)}"
+        try:
+            return os.open(name, flags, 0o600, dir_fd=directory_fd), name
+        except FileExistsError:
+            continue
+    raise OSError("identity_temporary_file_unavailable")
