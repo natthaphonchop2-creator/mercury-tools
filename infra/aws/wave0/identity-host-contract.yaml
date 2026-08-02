@@ -1,0 +1,9 @@
+schema_version: mercury.aws.wave0.identity_host_contract.v1
+required_hosts:
+  - codex
+  - chatgpt
+  - claude
+authorization_flow: authorization_code
+pkce_method: S256
+refresh_token_rotation: required
+audience_resource_binding: required

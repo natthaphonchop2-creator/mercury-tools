@@ -1,0 +1,306 @@
+"""Closed, hash-only identity compatibility evidence for AWS Wave 0."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from contextlib import suppress
+from datetime import datetime
+from enum import StrEnum
+from pathlib import Path
+from typing import Any, Literal
+from urllib.parse import urlsplit
+
+import yaml
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from mercury_tools.catalog.identity import validate_credential_safe, validate_credential_safe_paths
+
+_SHA256 = r"^[a-f0-9]{64}$"
+_REQUIRED_HOSTS = frozenset(("codex", "chatgpt", "claude"))
+_UNSAFE_PROBE_KEYS = frozenset(
+    (
+        "access_token",
+        "authorization",
+        "authorization_code",
+        "code",
+        "cookie",
+        "cookies",
+        "id_token",
+        "refresh_token",
+        "token",
+    )
+)
+
+
+class HostName(StrEnum):
+    CODEX = "codex"
+    CHATGPT = "chatgpt"
+    CLAUDE = "claude"
+
+
+class RegistrationMode(StrEnum):
+    PRE_REGISTERED = "pre_registered"
+    DCR = "dcr"
+
+
+class ProbeResult(StrEnum):
+    PASS = "pass"
+    FAIL = "fail"
+
+
+class IdentityMode(StrEnum):
+    COGNITO_PRE_REGISTERED = "cognito_pre_registered"
+    EXTERNAL_OIDC_DCR = "external_oidc_dcr"
+
+
+class _IdentityModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+
+class IdentityHostContract(_IdentityModel):
+    schema_version: Literal["mercury.aws.wave0.identity_host_contract.v1"]
+    required_hosts: tuple[HostName, ...]
+    authorization_flow: Literal["authorization_code"]
+    pkce_method: Literal["S256"]
+    refresh_token_rotation: Literal["required"]
+    audience_resource_binding: Literal["required"]
+
+    @model_validator(mode="after")
+    def validate_required_hosts(self) -> IdentityHostContract:
+        if (
+            len(self.required_hosts) != len(_REQUIRED_HOSTS)
+            or {host.value for host in self.required_hosts} != _REQUIRED_HOSTS
+        ):
+            raise ValueError("identity_required_hosts_invalid")
+        return self
+
+
+class HostIdentityProbe(_IdentityModel):
+    schema_version: Literal["mercury.aws.wave0.identity_probe.v1"] = (
+        "mercury.aws.wave0.identity_probe.v1"
+    )
+    host: HostName
+    registration_mode: RegistrationMode
+    result: ProbeResult
+    issuer_origin: str
+    pkce_method: str
+    checked_at: datetime
+    evidence_sha256: str = Field(pattern=_SHA256)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_unsafe_probe(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        if any(str(key).casefold() in _UNSAFE_PROBE_KEYS for key in value):
+            raise ValueError("identity_probe_unsafe")
+        try:
+            validate_credential_safe(value)
+            validate_credential_safe_paths(value)
+        except ValueError:
+            raise ValueError("identity_probe_unsafe") from None
+        return value
+
+    @model_validator(mode="after")
+    def validate_probe(self) -> HostIdentityProbe:
+        if self.pkce_method != "S256":
+            raise ValueError("identity_pkce_method_invalid")
+        if self.checked_at.tzinfo is None or self.checked_at.utcoffset() is None:
+            raise ValueError("identity_checked_at_invalid")
+        if self.registration_mode is RegistrationMode.PRE_REGISTERED:
+            if self.issuer_origin != "cognito":
+                raise ValueError("identity_issuer_origin_invalid")
+        elif not _is_external_https_origin(self.issuer_origin):
+            raise ValueError("identity_issuer_origin_invalid")
+        return self
+
+
+class IdentityDecision(_IdentityModel):
+    schema_version: Literal["mercury.aws.wave0.identity_decision.v1"] = (
+        "mercury.aws.wave0.identity_decision.v1"
+    )
+    mode: IdentityMode
+    issuer_kind: Literal["cognito", "external_oidc"]
+    issuer_origin: str
+    required_hosts: tuple[HostName, ...]
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> IdentityDecision:
+        if {host.value for host in self.required_hosts} != _REQUIRED_HOSTS:
+            raise ValueError("identity_required_host_missing")
+        if self.mode is IdentityMode.COGNITO_PRE_REGISTERED:
+            if self.issuer_kind != "cognito" or self.issuer_origin != "cognito":
+                raise ValueError("identity_decision_invalid")
+        elif self.issuer_kind != "external_oidc" or not _is_external_https_origin(
+            self.issuer_origin
+        ):
+            raise ValueError("identity_decision_invalid")
+        return self
+
+
+def load_identity_host_contract(path: Path) -> IdentityHostContract:
+    """Load the non-secret host compatibility contract from trusted YAML."""
+
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        raise ValueError("identity_host_contract_invalid") from None
+    if not isinstance(raw, dict):
+        raise ValueError("identity_host_contract_invalid")
+    try:
+        return IdentityHostContract.model_validate(raw)
+    except ValueError:
+        raise ValueError("identity_host_contract_invalid") from None
+
+
+def record_host_probe(
+    contract: IdentityHostContract,
+    probe: HostIdentityProbe,
+    evidence_path: Path,
+    output_dir: Path,
+) -> Path:
+    """Persist a closed probe record containing only an evidence SHA-256 digest."""
+
+    checked_contract = IdentityHostContract.model_validate(contract)
+    checked_probe = HostIdentityProbe.model_validate(probe)
+    if checked_probe.host not in checked_contract.required_hosts:
+        raise ValueError("identity_required_host_missing")
+    if checked_probe.pkce_method != checked_contract.pkce_method:
+        raise ValueError("identity_pkce_method_invalid")
+
+    persisted_probe = checked_probe.model_copy(
+        update={"evidence_sha256": _sha256_file(evidence_path)}, deep=True
+    )
+    return _write_probe(output_dir, persisted_probe)
+
+
+def decide_identity(probes: tuple[HostIdentityProbe, ...]) -> IdentityDecision:
+    """Choose the sole allowed issuer strategy from complete host evidence."""
+
+    checked_probes = tuple(HostIdentityProbe.model_validate(probe) for probe in probes)
+    host_values = {probe.host.value for probe in checked_probes}
+    if host_values != _REQUIRED_HOSTS:
+        raise ValueError("identity_required_host_missing")
+    _reject_duplicate_host_mode(checked_probes)
+
+    pre_registered = _probes_by_mode(checked_probes, RegistrationMode.PRE_REGISTERED)
+    if _all_hosts_pass(pre_registered):
+        return IdentityDecision(
+            mode=IdentityMode.COGNITO_PRE_REGISTERED,
+            issuer_kind="cognito",
+            issuer_origin="cognito",
+            required_hosts=(HostName.CODEX, HostName.CHATGPT, HostName.CLAUDE),
+        )
+
+    dcr = _probes_by_mode(checked_probes, RegistrationMode.DCR)
+    if {probe.host.value for probe in dcr} != _REQUIRED_HOSTS:
+        raise ValueError("identity_dcr_evidence_missing")
+    if any(probe.result is not ProbeResult.PASS for probe in dcr):
+        raise ValueError("identity_required_probe_failed")
+    issuer_origins = {probe.issuer_origin for probe in dcr}
+    if len(issuer_origins) != 1:
+        raise ValueError("identity_issuer_not_shared")
+    return IdentityDecision(
+        mode=IdentityMode.EXTERNAL_OIDC_DCR,
+        issuer_kind="external_oidc",
+        issuer_origin=issuer_origins.pop(),
+        required_hosts=(HostName.CODEX, HostName.CHATGPT, HostName.CLAUDE),
+    )
+
+
+def _probes_by_mode(
+    probes: tuple[HostIdentityProbe, ...], mode: RegistrationMode
+) -> tuple[HostIdentityProbe, ...]:
+    return tuple(probe for probe in probes if probe.registration_mode is mode)
+
+
+def _all_hosts_pass(probes: tuple[HostIdentityProbe, ...]) -> bool:
+    return (
+        {probe.host.value for probe in probes} == _REQUIRED_HOSTS
+        and all(probe.result is ProbeResult.PASS for probe in probes)
+    )
+
+
+def _reject_duplicate_host_mode(probes: tuple[HostIdentityProbe, ...]) -> None:
+    pairs = {(probe.host, probe.registration_mode) for probe in probes}
+    if len(pairs) != len(probes):
+        raise ValueError("identity_probe_duplicate")
+
+
+def _is_external_https_origin(value: str) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    hostname = parsed.hostname.casefold() if parsed.hostname else ""
+    return bool(
+        parsed.scheme == "https"
+        and parsed.netloc
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.path
+        and not parsed.query
+        and not parsed.fragment
+        and hostname not in {"localhost", "127.0.0.1", "::1"}
+        and not hostname.endswith(".localhost")
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        raise ValueError("identity_evidence_unavailable") from None
+    try:
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 64 * 1024):
+            digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        raise ValueError("identity_evidence_unavailable") from None
+    finally:
+        os.close(descriptor)
+
+
+def _write_probe(output_dir: Path, probe: HostIdentityProbe) -> Path:
+    try:
+        output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if output_dir.is_symlink() or not output_dir.is_dir():
+            raise OSError
+        destination = output_dir / f"{probe.host.value}-{probe.registration_mode.value}.json"
+        if destination.exists() and destination.is_symlink():
+            raise OSError
+        payload = json.dumps(
+            probe.model_dump(mode="json"),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        temporary = output_dir / f".{destination.name}.{os.urandom(8).hex()}.tmp"
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+            os.chmod(destination, 0o600)
+        finally:
+            with suppress(FileNotFoundError):
+                temporary.unlink()
+        return destination
+    except OSError:
+        raise ValueError("identity_probe_write_failed") from None
