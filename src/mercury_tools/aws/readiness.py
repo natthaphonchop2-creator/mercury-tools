@@ -11,6 +11,7 @@ import re
 import secrets
 import stat
 from collections import Counter
+from collections.abc import Mapping
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,7 +29,11 @@ from pydantic import (
 )
 
 from mercury_tools.aws.commands import CommandResult, CommandRunner, run_command
-from mercury_tools.aws.identity import IdentityDecision
+from mercury_tools.aws.identity import (
+    IdentityDecision,
+    IdentityProofReference,
+    verify_identity_proof,
+)
 from mercury_tools.aws.models import (
     CheckResult,
     CheckState,
@@ -108,7 +113,26 @@ _GITHUB_WORKFLOW_SHA256 = "6a4da75fb63a43b3a9e0bfa480cde3251aea0fa0c6459afa501d4
 _GITHUB_CREDENTIALS_ACTION = (
     "aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8"
 )
+_COGNITO_STACK_NAME = "mercury-wave0-identity-spike"
+_COGNITO_STACK_COMMAND = (
+    "aws",
+    "cloudformation",
+    "describe-stacks",
+    "--stack-name",
+    _COGNITO_STACK_NAME,
+    "--profile",
+    "mercury-nonprod",
+    "--region",
+    "ap-southeast-1",
+    "--output",
+    "json",
+    "--no-cli-pager",
+)
 _GIT_SHA_RE = re.compile(r"^[a-f0-9]{40}$")
+_IAM_ROLE_ARN_RE = re.compile(
+    r"^arn:aws:iam::(?P<account_id>\d{12}):role/"
+    r"[A-Za-z0-9+=,.@_-]+(?:/[A-Za-z0-9+=,.@_-]+)*$"
+)
 _THROTTLING_MARKERS = (
     "throttl",
     "rate exceeded",
@@ -177,6 +201,7 @@ class OidcRunEvidence(OidcRunReference):
     workflow_id: StrictInt = Field(gt=0)
     workflow_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     job_id: StrictInt = Field(gt=0)
+    account_fingerprint: str = Field(pattern=r"^[a-f0-9]{12}$")
     evidence_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
 
     @model_validator(mode="after")
@@ -193,6 +218,7 @@ class OidcRunEvidence(OidcRunReference):
             workflow_id=self.workflow_id,
             workflow_sha256=self.workflow_sha256,
             job_id=self.job_id,
+            account_fingerprint=self.account_fingerprint,
         )
         if not secrets.compare_digest(self.evidence_sha256, expected_hash):
             raise ValueError("wave0_oidc_evidence_hash_invalid")
@@ -229,15 +255,17 @@ def _canonical_oidc_evidence_sha256(
     workflow_id: int,
     workflow_sha256: str,
     job_id: int,
+    account_fingerprint: str,
 ) -> str:
     payload = {
+        "account_fingerprint": account_fingerprint,
         "environment": environment.value,
         "head_sha": head_sha,
         "job_id": job_id,
         "repository": _GITHUB_REPOSITORY,
         "run_id": run_id,
         "run_url_sha256": hashlib.sha256(str(run_url).encode("utf-8")).hexdigest(),
-        "schema_version": "mercury.aws.wave0.oidc_run_evidence.v2",
+        "schema_version": "mercury.aws.wave0.oidc_run_evidence.v3",
         "workflow_id": workflow_id,
         "workflow_path": _GITHUB_WORKFLOW_PATH,
         "workflow_sha256": workflow_sha256,
@@ -253,6 +281,7 @@ def _canonical_oidc_evidence_sha256(
 
 def verify_oidc_runs(
     references: tuple[OidcRunReference, ...],
+    expected_account_fingerprints: Mapping[EnvironmentName, str],
     runner: CommandRunner = run_command,
 ) -> tuple[OidcRunEvidence, ...]:
     """Verify exact GitHub runs and return only closed canonical evidence."""
@@ -268,11 +297,25 @@ def verify_oidc_runs(
         {str(item.run_url) for item in checked}
     ) != len(checked):
         raise ValueError("wave0_oidc_bindings_invalid")
-    return tuple(_verify_oidc_run(item, runner) for item in checked)
+    if set(expected_account_fingerprints) != {item.environment for item in checked} or any(
+        not isinstance(fingerprint, str)
+        or _ACCOUNT_FINGERPRINT_RE.fullmatch(fingerprint) is None
+        for fingerprint in expected_account_fingerprints.values()
+    ):
+        raise ValueError("wave0_oidc_account_unverified")
+    return tuple(
+        _verify_oidc_run(
+            item,
+            expected_account_fingerprints[item.environment],
+            runner,
+        )
+        for item in checked
+    )
 
 
 def _verify_oidc_run(
     reference: OidcRunReference,
+    expected_account_fingerprint: str,
     runner: CommandRunner,
 ) -> OidcRunEvidence:
     run_id = _run_id_from_url(reference.run_url)
@@ -335,6 +378,11 @@ def _verify_oidc_run(
         "wave0_oidc_job_unverified",
     )
     job_id = _verified_environment_job(jobs, reference.environment)
+    account_fingerprint = _verified_oidc_account(
+        reference.environment,
+        expected_account_fingerprint,
+        runner,
+    )
 
     source_result = runner(
         (
@@ -363,6 +411,7 @@ def _verify_oidc_run(
         workflow_id=workflow_id,
         workflow_sha256=workflow_sha256,
         job_id=job_id,
+        account_fingerprint=account_fingerprint,
     )
     return OidcRunEvidence(
         environment=reference.environment,
@@ -372,8 +421,35 @@ def _verify_oidc_run(
         workflow_id=workflow_id,
         workflow_sha256=workflow_sha256,
         job_id=job_id,
+        account_fingerprint=account_fingerprint,
         evidence_sha256=evidence_sha256,
     )
+
+
+def _verified_oidc_account(
+    environment: EnvironmentName,
+    expected_account_fingerprint: str,
+    runner: CommandRunner,
+) -> str:
+    variable = _gh_json(
+        (
+            f"repos/{_GITHUB_REPOSITORY}/environments/{environment.value}/"
+            "variables/AWS_WAVE0_ROLE_ARN"
+        ),
+        "{name,value}",
+        runner,
+        "wave0_oidc_account_unverified",
+    )
+    if set(variable) != {"name", "value"} or variable["name"] != "AWS_WAVE0_ROLE_ARN":
+        raise ValueError("wave0_oidc_account_unverified")
+    role_arn = variable["value"]
+    match = _IAM_ROLE_ARN_RE.fullmatch(role_arn) if isinstance(role_arn, str) else None
+    if match is None:
+        raise ValueError("wave0_oidc_account_unverified")
+    account_fingerprint = fingerprint_account_id(match.group("account_id"))
+    if not secrets.compare_digest(account_fingerprint, expected_account_fingerprint):
+        raise ValueError("wave0_oidc_account_unverified")
+    return account_fingerprint
 
 
 def _gh_json(
@@ -747,59 +823,84 @@ def finalize_wave0_gate(
     identity_decision: IdentityDecision | None,
     oidc_references: tuple[OidcRunReference, ...],
     runner: CommandRunner = run_command,
+    *,
+    identity_proof_references: tuple[IdentityProofReference, ...] = (),
 ) -> Wave0GateFinalization:
-    """Verify OIDC references and independently require every Wave 0 proof."""
-
-    try:
-        oidc_evidence = verify_oidc_runs(oidc_references, runner)
-    except ValueError:
-        oidc_evidence = ()
-    gate_status = _finalize_wave0_gate_with_verified_evidence(
-        report,
-        identity_decision,
-        oidc_evidence,
-    )
-    return Wave0GateFinalization(
-        gate_status=gate_status,
-        oidc_evidence=oidc_evidence,
-    )
-
-
-def _finalize_wave0_gate_with_verified_evidence(
-    report: ReadinessReport,
-    identity_decision: IdentityDecision | None,
-    oidc_evidence: tuple[OidcRunEvidence, ...],
-) -> GateStatus:
-    """Evaluate evidence that was produced inside the public finalizer."""
+    """Independently verify every Wave 0 proof in fail-closed precedence order."""
 
     checks = tuple(report.checks)
     counts = Counter(item.name for item in checks)
     by_name = {item.name: item for item in checks}
 
-    if not _final_tooling_valid(counts, by_name):
-        return GateStatus.BLOCKED_TOOLING
-    if report.gate_status is GateStatus.BLOCKED_TOOLING:
-        return GateStatus.BLOCKED_TOOLING
+    if (
+        not _final_tooling_valid(counts, by_name)
+        or report.gate_status is GateStatus.BLOCKED_TOOLING
+    ):
+        return Wave0GateFinalization(gate_status=GateStatus.BLOCKED_TOOLING, oidc_evidence=())
+    if (
+        not _final_accounts_valid(report, counts, by_name)
+        or report.gate_status is GateStatus.BLOCKED_ACCOUNT_ACCESS
+    ):
+        return Wave0GateFinalization(
+            gate_status=GateStatus.BLOCKED_ACCOUNT_ACCESS,
+            oidc_evidence=(),
+        )
 
-    if not _final_accounts_valid(report, counts, by_name):
-        return GateStatus.BLOCKED_ACCOUNT_ACCESS
+    try:
+        oidc_evidence = verify_oidc_runs(
+            oidc_references,
+            {
+                environment: by_name[f"{environment.value}_account"].details[
+                    "account_fingerprint"
+                ]
+                for environment in EnvironmentName
+            },
+            runner,
+        )
+    except ValueError:
+        oidc_evidence = ()
     if not _final_oidc_valid(oidc_evidence):
-        return GateStatus.BLOCKED_ACCOUNT_ACCESS
+        return Wave0GateFinalization(
+            gate_status=GateStatus.BLOCKED_ACCOUNT_ACCESS,
+            oidc_evidence=(),
+        )
     if report.gate_status is GateStatus.BLOCKED_ACCOUNT_ACCESS:
-        return GateStatus.BLOCKED_ACCOUNT_ACCESS
+        return Wave0GateFinalization(
+            gate_status=GateStatus.BLOCKED_ACCOUNT_ACCESS,
+            oidc_evidence=oidc_evidence,
+        )
 
     if not _final_region_services_valid(report, counts, by_name):
-        return GateStatus.BLOCKED_REGION_SERVICE
+        return Wave0GateFinalization(
+            gate_status=GateStatus.BLOCKED_REGION_SERVICE,
+            oidc_evidence=oidc_evidence,
+        )
     if report.gate_status is GateStatus.BLOCKED_REGION_SERVICE:
-        return GateStatus.BLOCKED_REGION_SERVICE
+        return Wave0GateFinalization(
+            gate_status=GateStatus.BLOCKED_REGION_SERVICE,
+            oidc_evidence=oidc_evidence,
+        )
 
     if not _final_report_contract_valid(report, counts):
-        return GateStatus.BLOCKED_IDENTITY_COMPATIBILITY
-    if not _final_identity_valid(identity_decision):
-        return GateStatus.BLOCKED_IDENTITY_COMPATIBILITY
+        return Wave0GateFinalization(
+            gate_status=GateStatus.BLOCKED_IDENTITY_COMPATIBILITY,
+            oidc_evidence=oidc_evidence,
+        )
+    if not _final_identity_valid(
+        identity_decision,
+        identity_proof_references,
+        verified_at=report.checked_at,
+    ) or not _cognito_stack_absent(runner):
+        return Wave0GateFinalization(
+            gate_status=GateStatus.BLOCKED_IDENTITY_COMPATIBILITY,
+            oidc_evidence=oidc_evidence,
+        )
     if report.gate_status is not GateStatus.READY:
-        return GateStatus.BLOCKED_IDENTITY_COMPATIBILITY
-    return GateStatus.READY
+        return Wave0GateFinalization(
+            gate_status=GateStatus.BLOCKED_IDENTITY_COMPATIBILITY,
+            oidc_evidence=oidc_evidence,
+        )
+    return Wave0GateFinalization(gate_status=GateStatus.READY, oidc_evidence=oidc_evidence)
 
 
 def _final_tooling_valid(
@@ -931,14 +1032,38 @@ def _final_report_contract_valid(
     )
 
 
-def _final_identity_valid(identity_decision: IdentityDecision | None) -> bool:
+def _final_identity_valid(
+    identity_decision: IdentityDecision | None,
+    references: tuple[IdentityProofReference, ...],
+    *,
+    verified_at: datetime,
+) -> bool:
     if identity_decision is None:
         return False
     try:
-        IdentityDecision.model_validate(identity_decision.model_dump(mode="python"))
-    except (AttributeError, TypeError, ValidationError):
+        checked_decision = IdentityDecision.model_validate(
+            identity_decision.model_dump(mode="python")
+        )
+        verify_identity_proof(checked_decision, references, verified_at=verified_at)
+    except (AttributeError, TypeError, ValidationError, ValueError):
         return False
     return True
+
+
+def _cognito_stack_absent(runner: CommandRunner) -> bool:
+    result = runner(_COGNITO_STACK_COMMAND, 20)
+    expected_errors = {
+        f"Stack with id {_COGNITO_STACK_NAME} does not exist",
+        (
+            "An error occurred (ValidationError) when calling the DescribeStacks operation: "
+            f"Stack with id {_COGNITO_STACK_NAME} does not exist"
+        ),
+    }
+    return (
+        result.returncode == 255
+        and not result.stdout.strip()
+        and result.stderr.strip() in expected_errors
+    )
 
 
 def _inventory_group_invalid(counts: Counter[str], expected: frozenset[str]) -> bool:

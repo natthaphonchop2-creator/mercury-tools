@@ -7,6 +7,7 @@ import os
 import runpy
 import subprocess
 import sys
+import tempfile
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,10 +18,20 @@ from pydantic import ValidationError
 from mercury_tools.aws import readiness as aws_readiness
 from mercury_tools.aws.commands import CommandResult, run_command
 from mercury_tools.aws.config import load_wave0_config
-from mercury_tools.aws.identity import HostName, IdentityDecision, IdentityMode
-from mercury_tools.aws.models import CheckResult, CheckState, GateStatus
+from mercury_tools.aws.identity import (
+    HostIdentityProbe,
+    HostName,
+    IdentityDecision,
+    IdentityHostContract,
+    IdentityMode,
+    IdentityProofReference,
+    ProbeResult,
+    record_host_probe,
+)
+from mercury_tools.aws.models import CheckResult, CheckState, EnvironmentName, GateStatus
 from mercury_tools.aws.readiness import (
     SERVICE_COMMANDS,
+    TOOL_COMMANDS,
     OidcRunEvidence,
     OidcRunReference,
     aggregate_gate,
@@ -40,6 +51,20 @@ SCRIPT_PATH = ROOT / "scripts/check_aws_readiness.py"
 WORKFLOW_PATH = ROOT / ".github/workflows/aws-wave0-oidc-smoke.yml"
 REPOSITORY = "natthaphonchop2-creator/mercury-tools"
 WORKFLOW_FILE = ".github/workflows/aws-wave0-oidc-smoke.yml"
+COGNITO_STACK_COMMAND = (
+    "aws",
+    "cloudformation",
+    "describe-stacks",
+    "--stack-name",
+    "mercury-wave0-identity-spike",
+    "--profile",
+    "mercury-nonprod",
+    "--region",
+    "ap-southeast-1",
+    "--output",
+    "json",
+    "--no-cli-pager",
+)
 readiness_main = runpy.run_path(str(SCRIPT_PATH))["main"]
 
 
@@ -144,8 +169,13 @@ class VerifiedGhRunner(FakeRunner):
         job_updates: Mapping[str, object] | None = None,
         workflow_updates: Mapping[str, object] | None = None,
         source: str | None = None,
+        role_account_ids: Mapping[EnvironmentName, str] | None = None,
     ) -> VerifiedGhRunner:
         results: dict[tuple[str, ...], CommandResult] = {}
+        checked_role_accounts = role_account_ids or {
+            EnvironmentName.NONPROD: "123456789012",
+            EnvironmentName.PRODUCTION: "210987654321",
+        }
         for reference in references:
             run_id = int(str(reference.run_url).rstrip("/").rsplit("/", 1)[1])
             head_sha = f"{run_id:040x}"[-40:]
@@ -205,6 +235,29 @@ class VerifiedGhRunner(FakeRunner):
             }
             for endpoint, stdout in endpoints.items():
                 results[("gh", "api", endpoint)] = CommandResult(0, stdout, "")
+            environment_endpoint = (
+                f"repos/{REPOSITORY}/environments/{reference.environment.value}/"
+                "variables/AWS_WAVE0_ROLE_ARN"
+            )
+            results[("gh", "api", environment_endpoint)] = CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "name": "AWS_WAVE0_ROLE_ARN",
+                        "value": (
+                            "arn:aws:iam::"
+                            f"{checked_role_accounts[reference.environment]}:"
+                            "role/mercury-wave0-readiness"
+                        ),
+                    }
+                ),
+                "",
+            )
+        results[COGNITO_STACK_COMMAND] = CommandResult(
+            255,
+            "",
+            "Stack with id mercury-wave0-identity-spike does not exist",
+        )
         return cls(results)
 
     def __call__(self, argv: tuple[str, ...], timeout_seconds: int) -> CommandResult:
@@ -284,8 +337,94 @@ def test_runner_allows_only_closed_wave0_gh_api_calls(
             "--jq",
             ".content",
         ),
+        (
+            "gh",
+            "api",
+            f"repos/{REPOSITORY}/environments/nonprod/variables/AWS_WAVE0_ROLE_ARN",
+            "--jq",
+            "{name,value}",
+        ),
     )
     assert all(run_command(command).returncode == 0 for command in allowed_commands)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        ("aws", "s3", "rm", "s3://unsafe", "--recursive"),
+        (
+            "aws",
+            "cloudformation",
+            "delete-stack",
+            "--stack-name",
+            "mercury-wave0-identity-spike",
+        ),
+        ("npm", "install", "unsafe-package"),
+        ("npx", "--yes", "cdk", "deploy"),
+        (
+            "gh",
+            "api",
+            f"repos/{REPOSITORY}/environments/nonprod/variables/AWS_WAVE0_ROLE_ARN",
+            "--method",
+            "PATCH",
+        ),
+    ),
+)
+def test_runner_rejects_mutating_aws_npm_npx_and_gh_forms(
+    command: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def must_not_run(*args: object, **kwargs: object) -> None:
+        raise AssertionError("rejected command reached subprocess")
+
+    monkeypatch.setattr(subprocess, "run", must_not_run)
+    with pytest.raises(ValueError, match="wave0_command_not_allowed"):
+        run_command(command)
+
+
+def test_runner_allows_exact_local_and_aws_read_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(
+        argv: tuple[str, ...], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    config = load_wave0_config(CONFIG_PATH)
+    commands = list(TOOL_COMMANDS.values())
+    commands.append(COGNITO_STACK_COMMAND)
+    for account in config.accounts:
+        commands.append(
+            (
+                "aws",
+                "sts",
+                "get-caller-identity",
+                "--profile",
+                account.profile,
+                "--region",
+                config.primary_region,
+                "--output",
+                "json",
+                "--no-cli-pager",
+            )
+        )
+        commands.extend(
+            (
+                "aws",
+                *suffix,
+                "--profile",
+                account.profile,
+                "--region",
+                config.primary_region,
+                "--output",
+                "json",
+                "--no-cli-pager",
+            )
+            for suffix in SERVICE_COMMANDS.values()
+        )
+
+    assert all(run_command(command).returncode == 0 for command in commands)
 
 
 def test_runner_uses_bounded_environment_and_redacts_output(
@@ -534,6 +673,52 @@ def valid_identity() -> IdentityDecision:
     )
 
 
+def valid_identity_proof(
+    tmp_path: Path,
+    *,
+    checked_at: datetime = datetime(2026, 8, 1, tzinfo=UTC),
+) -> tuple[IdentityProofReference, ...]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    contract = IdentityHostContract(
+        schema_version="mercury.aws.wave0.identity_host_contract.v1",
+        required_hosts=(HostName.CODEX, HostName.CHATGPT, HostName.CLAUDE),
+        authorization_flow="authorization_code",
+        pkce_method="S256",
+        refresh_token_rotation="required",
+        audience_resource_binding="required",
+    )
+    references: list[IdentityProofReference] = []
+    for host in contract.required_hosts:
+        evidence_path = tmp_path / f"{host.value}-raw.json"
+        evidence_path.write_text(
+            json.dumps({"host": host.value, "authorized": True}),
+            encoding="utf-8",
+        )
+        probe = HostIdentityProbe(
+            host=host,
+            registration_mode="pre_registered",
+            result=ProbeResult.PASS,
+            issuer_origin="cognito",
+            pkce_method="S256",
+            checked_at=checked_at,
+            evidence_sha256="0" * 64,
+        )
+        probe_path = record_host_probe(
+            contract,
+            probe,
+            evidence_path,
+            tmp_path / "identity",
+        )
+        references.append(
+            IdentityProofReference(
+                host=host,
+                probe_path=probe_path,
+                evidence_path=evidence_path,
+            )
+        )
+    return tuple(references)
+
+
 def oidc_reference(environment: str, run_id: int) -> OidcRunReference:
     run_url = (
         "https://github.com/natthaphonchop2-creator/mercury-tools/"
@@ -552,9 +737,26 @@ def valid_oidc_references() -> tuple[OidcRunReference, ...]:
     )
 
 
+def expected_account_fingerprints(
+    references: tuple[OidcRunReference, ...],
+) -> dict[EnvironmentName, str]:
+    account_ids = {
+        EnvironmentName.NONPROD: "123456789012",
+        EnvironmentName.PRODUCTION: "210987654321",
+    }
+    return {
+        reference.environment: fingerprint_account_id(account_ids[reference.environment])
+        for reference in references
+    }
+
+
 def valid_oidc() -> tuple[OidcRunEvidence, ...]:
     references = valid_oidc_references()
-    return verify_oidc_runs(references, VerifiedGhRunner.for_references(references))
+    return verify_oidc_runs(
+        references,
+        expected_account_fingerprints(references),
+        VerifiedGhRunner.for_references(references),
+    )
 
 
 def fabricated_oidc() -> tuple[OidcRunEvidence, ...]:
@@ -565,15 +767,19 @@ def fabricated_oidc() -> tuple[OidcRunEvidence, ...]:
         head_sha = f"{run_id:040x}"
         workflow_id = run_id + 10_000
         job_id = run_id * 10 + (1 if environment == "nonprod" else 2)
+        account_fingerprint = fingerprint_account_id(
+            "123456789012" if environment == "nonprod" else "210987654321"
+        )
         canonical = json.dumps(
             {
+                "account_fingerprint": account_fingerprint,
                 "environment": environment,
                 "head_sha": head_sha,
                 "job_id": job_id,
                 "repository": REPOSITORY,
                 "run_id": run_id,
                 "run_url_sha256": hashlib.sha256(run_url.encode("utf-8")).hexdigest(),
-                "schema_version": "mercury.aws.wave0.oidc_run_evidence.v2",
+                "schema_version": "mercury.aws.wave0.oidc_run_evidence.v3",
                 "workflow_id": workflow_id,
                 "workflow_path": WORKFLOW_FILE,
                 "workflow_sha256": workflow_sha256,
@@ -591,6 +797,7 @@ def fabricated_oidc() -> tuple[OidcRunEvidence, ...]:
                 workflow_id=workflow_id,
                 workflow_sha256=workflow_sha256,
                 job_id=job_id,
+                account_fingerprint=account_fingerprint,
                 evidence_sha256=hashlib.sha256(canonical).hexdigest(),
             )
         )
@@ -610,6 +817,13 @@ def cli_runner(
         cdk="2.1134.0",
     )
     runner.results.update(tools.results)
+    runner.results.update(
+        FakeRunner.for_sts_accounts(
+            mercury_nonprod="123456789012",
+            mercury_prod="210987654321",
+        ).results
+    )
+    runner.results.update(FakeRunner.for_services().results)
     return runner
 
 
@@ -622,12 +836,15 @@ def finalize_status(
         valid_oidc_references() if references is None else references
     )
     runner = VerifiedGhRunner.for_references(checked_references)
-    return finalize_wave0_gate(
-        report,
-        identity_decision,
-        checked_references,
-        runner,
-    ).gate_status
+    with tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve()) as directory:
+        identity_proof = valid_identity_proof(Path(directory))
+        return finalize_wave0_gate(
+            report,
+            identity_decision,
+            checked_references,
+            runner,
+            identity_proof_references=identity_proof,
+        ).gate_status
 
 
 def replace_check(report, name: str, **updates: object):
@@ -865,7 +1082,9 @@ def test_oidc_verifier_uses_closed_gh_api_calls_and_returns_no_raw_payload() -> 
     reference = oidc_reference("nonprod", 1001)
     runner = VerifiedGhRunner.for_references((reference,))
 
-    evidence = verify_oidc_runs((reference,), runner)
+    evidence = verify_oidc_runs(
+        (reference,), expected_account_fingerprints((reference,)), runner
+    )
 
     assert len(evidence) == 1
     assert evidence[0].environment == "nonprod"
@@ -873,10 +1092,61 @@ def test_oidc_verifier_uses_closed_gh_api_calls_and_returns_no_raw_payload() -> 
     assert evidence[0].workflow_sha256 == hashlib.sha256(
         WORKFLOW_PATH.read_bytes()
     ).hexdigest()
-    assert len(runner.calls) == 4
+    assert len(runner.calls) == 5
     assert all(call[:2] == ("gh", "api") for call in runner.calls)
     assert all("--log" not in call for call in runner.calls)
     assert "workflow_dispatch" not in evidence[0].model_dump_json()
+
+
+def test_oidc_verifier_binds_each_environment_role_to_readiness_account() -> None:
+    references = valid_oidc_references()
+    runner = VerifiedGhRunner.for_references(references)
+    expected = {
+        EnvironmentName.NONPROD: fingerprint_account_id("123456789012"),
+        EnvironmentName.PRODUCTION: fingerprint_account_id("210987654321"),
+    }
+
+    evidence = verify_oidc_runs(references, expected, runner)
+
+    assert tuple(item.account_fingerprint for item in evidence) == (
+        expected[EnvironmentName.NONPROD],
+        expected[EnvironmentName.PRODUCTION],
+    )
+    serialized = json.dumps([item.model_dump(mode="json") for item in evidence])
+    assert "123456789012" not in serialized
+    assert "210987654321" not in serialized
+    assert "arn:aws:iam" not in serialized
+    assert len(runner.calls) == 10
+
+
+@pytest.mark.parametrize(
+    "role_account_ids",
+    (
+        {
+            EnvironmentName.NONPROD: "123456789012",
+            EnvironmentName.PRODUCTION: "123456789012",
+        },
+        {
+            EnvironmentName.NONPROD: "999999999999",
+            EnvironmentName.PRODUCTION: "210987654321",
+        },
+    ),
+)
+def test_oidc_verifier_rejects_same_or_wrong_account_role_arns(
+    role_account_ids: Mapping[EnvironmentName, str],
+) -> None:
+    references = valid_oidc_references()
+    runner = VerifiedGhRunner.for_references(
+        references,
+        role_account_ids=role_account_ids,
+    )
+    expected = {
+        EnvironmentName.NONPROD: fingerprint_account_id("123456789012"),
+        EnvironmentName.PRODUCTION: fingerprint_account_id("210987654321"),
+    }
+
+    with pytest.raises(ValueError, match="wave0_oidc_account_unverified"):
+        verify_oidc_runs(references, expected, runner)
 
 
 def test_oidc_verifier_works_through_shell_free_command_runner(
@@ -898,8 +1168,10 @@ def test_oidc_verifier_works_through_shell_free_command_runner(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert verify_oidc_runs((reference,), run_command)[0].run_id == 1001
-    assert len(backend.calls) == 4
+    assert verify_oidc_runs(
+        (reference,), expected_account_fingerprints((reference,)), run_command
+    )[0].run_id == 1001
+    assert len(backend.calls) == 5
 
 
 @pytest.mark.parametrize(
@@ -922,7 +1194,9 @@ def test_oidc_verifier_rejects_untrusted_run_metadata(
     )
 
     with pytest.raises(ValueError, match="wave0_oidc_run_unverified"):
-        verify_oidc_runs((reference,), runner)
+        verify_oidc_runs(
+            (reference,), expected_account_fingerprints((reference,)), runner
+        )
 
 
 def test_oidc_verifier_rejects_missing_or_failed_expected_environment_job() -> None:
@@ -949,7 +1223,9 @@ def test_oidc_verifier_rejects_missing_or_failed_expected_environment_job() -> N
     )
 
     with pytest.raises(ValueError, match="wave0_oidc_job_unverified"):
-        verify_oidc_runs((reference,), runner)
+        verify_oidc_runs(
+            (reference,), expected_account_fingerprints((reference,)), runner
+        )
 
 
 def test_oidc_verifier_rejects_workflow_identity_or_unpinned_source() -> None:
@@ -963,9 +1239,13 @@ def test_oidc_verifier_rejects_workflow_identity_or_unpinned_source() -> None:
     )
 
     with pytest.raises(ValueError, match="wave0_oidc_workflow_unverified"):
-        verify_oidc_runs((reference,), wrong_identity)
+        verify_oidc_runs(
+            (reference,), expected_account_fingerprints((reference,)), wrong_identity
+        )
     with pytest.raises(ValueError, match="wave0_oidc_workflow_source_unverified"):
-        verify_oidc_runs((reference,), changed_source)
+        verify_oidc_runs(
+            (reference,), expected_account_fingerprints((reference,)), changed_source
+        )
 
 
 def test_oidc_verifier_rejects_untrusted_fields_even_with_matching_source_digest(
@@ -984,13 +1264,15 @@ def test_oidc_verifier_rejects_untrusted_fields_even_with_matching_source_digest
     runner = VerifiedGhRunner.for_references((reference,), source=changed_source)
 
     with pytest.raises(ValueError, match="wave0_oidc_workflow_source_unverified"):
-        verify_oidc_runs((reference,), runner)
+        verify_oidc_runs(
+            (reference,), expected_account_fingerprints((reference,)), runner
+        )
 
 
 def test_oidc_verifier_with_no_references_makes_no_gh_calls() -> None:
     runner = FakeRunner({})
 
-    assert verify_oidc_runs((), runner) == ()
+    assert verify_oidc_runs((), {}, runner) == ()
     assert runner.calls == []
 
 
@@ -1151,7 +1433,7 @@ def test_gate_revalidates_credential_safe_report_fields() -> None:
     )
 
 
-def test_gate_is_ready_only_with_complete_proof() -> None:
+def test_public_finalizer_rejects_minimal_identity_decision() -> None:
     references = valid_oidc_references()
     runner = VerifiedGhRunner.for_references(references)
 
@@ -1162,9 +1444,80 @@ def test_gate_is_ready_only_with_complete_proof() -> None:
         runner,
     )
 
-    assert result.gate_status == "ready"
+    assert result.gate_status == "blocked_identity_compatibility"
     assert len(result.oidc_evidence) == 2
-    assert len(runner.calls) == 8
+    assert len(runner.calls) == 10
+
+
+def test_gate_is_ready_only_after_reverified_identity_and_deleted_cognito_stack(
+    tmp_path: Path,
+) -> None:
+    references = valid_oidc_references()
+    runner = VerifiedGhRunner.for_references(references)
+
+    result = finalize_wave0_gate(
+        build_report_fixture(),
+        valid_identity(),
+        references,
+        runner,
+        identity_proof_references=valid_identity_proof(tmp_path),
+    )
+
+    assert result.gate_status == "ready"
+    assert runner.calls[-1] == COGNITO_STACK_COMMAND
+
+
+def test_gate_blocks_when_disposable_cognito_stack_still_exists(tmp_path: Path) -> None:
+    references = valid_oidc_references()
+    runner = VerifiedGhRunner.for_references(references)
+    runner.results[COGNITO_STACK_COMMAND] = CommandResult(
+        0,
+        json.dumps(
+            {
+                "Stacks": [
+                    {
+                        "StackName": "mercury-wave0-identity-spike",
+                        "StackStatus": "CREATE_COMPLETE",
+                    }
+                ]
+            }
+        ),
+        "",
+    )
+
+    result = finalize_wave0_gate(
+        build_report_fixture(),
+        valid_identity(),
+        references,
+        runner,
+        identity_proof_references=valid_identity_proof(tmp_path),
+    )
+
+    assert result.gate_status == "blocked_identity_compatibility"
+
+
+def test_account_gate_blocks_before_identity_oidc_or_cloudformation_calls(
+    tmp_path: Path,
+) -> None:
+    report = replace_check(
+        build_report_fixture(),
+        "nonprod_account",
+        state=CheckState.BLOCKED,
+        code="aws_account_access_blocked",
+        details={"returncode": 254},
+    )
+    runner = FakeRunner({})
+
+    result = finalize_wave0_gate(
+        report,
+        valid_identity(),
+        valid_oidc_references(),
+        runner,
+        identity_proof_references=valid_identity_proof(tmp_path),
+    )
+
+    assert result.gate_status == "blocked_account_access"
+    assert runner.calls == []
 
 
 def test_cli_verifies_explicit_environment_bindings_and_stores_only_hashes(
@@ -1181,19 +1534,34 @@ def test_cli_verifies_explicit_environment_bindings_and_stores_only_hashes(
         oidc_reference("production", 1002),
     )
     evidence = verify_oidc_runs(
-        references, VerifiedGhRunner.for_references(references)
+        references,
+        expected_account_fingerprints(references),
+        VerifiedGhRunner.for_references(references),
     )
     runner = cli_runner(references)
     finalizer_calls = 0
+    proof_references = valid_identity_proof(
+        tmp_path / "proof",
+        checked_at=datetime.now(UTC),
+    )
 
-    def counting_finalizer(report, identity_decision, oidc_references, injected_runner):
+    def counting_finalizer(
+        report,
+        identity_decision,
+        oidc_references,
+        injected_runner,
+        *,
+        identity_proof_references,
+    ):
         nonlocal finalizer_calls
         finalizer_calls += 1
+        assert identity_proof_references == proof_references
         return finalize_wave0_gate(
             report,
             identity_decision,
             oidc_references,
             injected_runner,
+            identity_proof_references=identity_proof_references,
         )
 
     monkeypatch.setitem(
@@ -1207,9 +1575,23 @@ def test_cli_verifies_explicit_environment_bindings_and_stores_only_hashes(
     try:
         result = readiness_main(
             [
-                "--skip-live",
                 "--identity-decision",
                 str(decision_path),
+                "--identity-proof",
+                (
+                    f"codex={proof_references[0].probe_path},"
+                    f"{proof_references[0].evidence_path}"
+                ),
+                "--identity-proof",
+                (
+                    f"chatgpt={proof_references[1].probe_path},"
+                    f"{proof_references[1].evidence_path}"
+                ),
+                "--identity-proof",
+                (
+                    f"claude={proof_references[2].probe_path},"
+                    f"{proof_references[2].evidence_path}"
+                ),
                 "--oidc-run",
                 f"nonprod={references[0].run_url}",
                 "--oidc-run",
@@ -1220,9 +1602,9 @@ def test_cli_verifies_explicit_environment_bindings_and_stores_only_hashes(
             runner=runner,
         )
 
-        assert result == 2
+        assert result == 0
         serialized = output.read_text(encoding="utf-8")
-        assert "gate_status=blocked_account_access" in capsys.readouterr().out
+        assert "gate_status=ready" in capsys.readouterr().out
         assert hashlib.sha256(decision_path.read_bytes()).hexdigest() in serialized
         for reference, verified in zip(references, evidence, strict=True):
             assert str(reference.run_url) not in serialized
@@ -1232,7 +1614,12 @@ def test_cli_verifies_explicit_environment_bindings_and_stores_only_hashes(
             assert hashlib.sha256(
                 str(reference.run_url).encode("utf-8")
             ).hexdigest() not in serialized
-        assert len([call for call in runner.calls if call[:2] == ("gh", "api")]) == 8
+        assert len([call for call in runner.calls if call[:2] == ("gh", "api")]) == 10
+        assert COGNITO_STACK_COMMAND in runner.calls
+        assert str(tmp_path) not in serialized
+        assert "arn:aws:iam" not in serialized
+        assert "123456789012" not in serialized
+        assert "210987654321" not in serialized
         assert finalizer_calls == 1
     finally:
         output.unlink(missing_ok=True)

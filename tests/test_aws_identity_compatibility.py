@@ -3,7 +3,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +11,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from mercury_tools.aws import identity as aws_identity
 from mercury_tools.aws.identity import (
     HostIdentityProbe,
     HostName,
@@ -85,6 +86,31 @@ def load_yaml(path: Path) -> dict[str, Any]:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
+def identity_proof_references(
+    tmp_path: Path,
+    *,
+    checked_at: datetime = datetime(2026, 8, 1, tzinfo=UTC),
+) -> tuple[object, ...]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    references: list[object] = []
+    for host in (HostName.CODEX, HostName.CHATGPT, HostName.CLAUDE):
+        evidence = tmp_path / f"{host.value}-raw.json"
+        evidence.write_text(
+            json.dumps({"host": host.value, "authorized": True}),
+            encoding="utf-8",
+        )
+        probe = passing_probe(host.value).model_copy(update={"checked_at": checked_at})
+        probe_path = record_host_probe(contract(), probe, evidence, tmp_path / "identity")
+        references.append(
+            aws_identity.IdentityProofReference(
+                host=host,
+                probe_path=probe_path,
+                evidence_path=evidence,
+            )
+        )
+    return tuple(references)
+
+
 def test_all_pre_registered_hosts_select_cognito() -> None:
     probes = tuple(
         passing_probe(host, mode="pre_registered", issuer_origin="cognito")
@@ -96,6 +122,78 @@ def test_all_pre_registered_hosts_select_cognito() -> None:
     assert decision.mode == "cognito_pre_registered"
     assert decision.issuer_kind == "cognito"
     assert decision.issuer_origin == "cognito"
+
+
+def test_identity_proof_reloads_records_rehashes_raw_files_and_redecides(
+    tmp_path: Path,
+) -> None:
+    references = identity_proof_references(tmp_path)
+
+    verified = aws_identity.verify_identity_proof(
+        cognito_decision(),
+        references,
+        verified_at=datetime(2026, 8, 1, 1, tzinfo=UTC),
+    )
+
+    assert tuple(item.host for item in verified) == (
+        HostName.CODEX,
+        HostName.CHATGPT,
+        HostName.CLAUDE,
+    )
+    serialized = json.dumps([item.model_dump(mode="json") for item in verified])
+    assert "authorized" not in serialized
+    assert str(tmp_path) not in serialized
+
+
+@pytest.mark.parametrize("mutation", ("missing", "duplicate", "mismatched", "stale", "unsafe"))
+def test_identity_proof_fails_closed_for_invalid_inventory_or_content(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    references = list(identity_proof_references(tmp_path))
+    verified_at = datetime(2026, 8, 1, 1, tzinfo=UTC)
+    if mutation == "missing":
+        references.pop()
+    elif mutation == "duplicate":
+        references[-1] = references[0]
+    elif mutation == "mismatched":
+        references[0].evidence_path.write_text("changed", encoding="utf-8")
+    elif mutation == "stale":
+        references = list(
+            identity_proof_references(
+                tmp_path / "stale",
+                checked_at=verified_at - timedelta(hours=25),
+            )
+        )
+    else:
+        raw = json.loads(references[0].probe_path.read_text(encoding="utf-8"))
+        raw["authorization_code"] = "must-not-enter-proof"
+        references[0].probe_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="identity_proof_invalid"):
+        aws_identity.verify_identity_proof(
+            cognito_decision(),
+            tuple(references),
+            verified_at=verified_at,
+        )
+
+
+def test_identity_proof_rejects_a_decision_that_does_not_exactly_match(
+    tmp_path: Path,
+) -> None:
+    decision = IdentityDecision(
+        mode=IdentityMode.EXTERNAL_OIDC_DCR,
+        issuer_kind="external_oidc",
+        issuer_origin="https://identity.mercury.example",
+        required_hosts=(HostName.CODEX, HostName.CHATGPT, HostName.CLAUDE),
+    )
+
+    with pytest.raises(ValueError, match="identity_proof_invalid"):
+        aws_identity.verify_identity_proof(
+            decision,
+            identity_proof_references(tmp_path),
+            verified_at=datetime(2026, 8, 1, 1, tzinfo=UTC),
+        )
 
 
 def test_pre_registered_failure_requires_one_external_dcr_issuer() -> None:

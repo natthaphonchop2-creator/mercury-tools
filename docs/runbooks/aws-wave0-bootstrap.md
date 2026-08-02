@@ -132,6 +132,11 @@ unset role_arn
 
 `AWS_WAVE0_ROLE_ARN` is a role identifier, not an AWS credential. Never put an
 access key, secret key, session token, or AWS credential-file value in GitHub.
+The final verifier reads this exact variable from each GitHub environment with
+an allowlisted `gh api` GET, extracts the IAM role ARN account ID only in memory,
+hashes it with `fingerprint_account_id`, and requires it to match that
+environment's readiness account fingerprint. It never persists or prints the
+raw account ID or role ARN.
 
 ## 6. Run and record the manual smoke proof
 
@@ -141,54 +146,94 @@ production reviewer are configured:
 ```bash
 workflow="aws-wave0-oidc-smoke.yml"
 workflow_ref="$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name')"
-evidence_nonce="wave0-$(uv run python -c 'import uuid; print(uuid.uuid4())')"
-run_title="AWS Wave 0 OIDC smoke [${evidence_nonce}]"
+nonprod_nonce="wave0-nonprod-$(uv run python -c 'import uuid; print(uuid.uuid4())')"
+production_nonce="wave0-production-$(uv run python -c 'import uuid; print(uuid.uuid4())')"
 
-gh workflow run "${workflow}" \
-  --ref "${workflow_ref}" \
-  -f evidence_nonce="${evidence_nonce}"
-
-run_id=""
-for attempt in $(seq 1 30); do
-  matching_run_ids="$(
-    gh run list \
-      --workflow "${workflow}" \
-      --event workflow_dispatch \
-      --branch "${workflow_ref}" \
-      --limit 100 \
-      --json databaseId,displayTitle |
-      jq -r --arg title "${run_title}" \
-        '.[] | select(.displayTitle == $title) | .databaseId'
-  )"
-  match_count="$(
-    printf '%s\n' "${matching_run_ids}" | sed '/^$/d' | wc -l | tr -d ' '
-  )"
-
-  if [ "${match_count}" -gt 1 ]; then
-    printf 'wave0_oidc_run_selection=ambiguous\n' >&2
-    exit 1
-  fi
-  if [ "${match_count}" -eq 1 ]; then
-    run_id="${matching_run_ids}"
-    break
-  fi
-  sleep 2
-done
-
-if [ -z "${run_id}" ]; then
-  printf 'wave0_oidc_run_selection=not_found\n' >&2
+if [ "${nonprod_nonce}" = "${production_nonce}" ]; then
+  printf 'wave0_oidc_nonce_collision\n' >&2
   exit 1
 fi
 
-gh run watch "${run_id}" --exit-status
+dispatch_and_capture() {
+  evidence_nonce="$1"
+  run_title="AWS Wave 0 OIDC smoke [${evidence_nonce}]"
+
+  gh workflow run "${workflow}" \
+    --ref "${workflow_ref}" \
+    -f evidence_nonce="${evidence_nonce}" >/dev/null
+
+  run_id=""
+  for attempt in $(seq 1 30); do
+    matching_run_ids="$(
+      gh run list \
+        --workflow "${workflow}" \
+        --event workflow_dispatch \
+        --branch "${workflow_ref}" \
+        --limit 100 \
+        --json databaseId,displayTitle |
+        jq -r --arg title "${run_title}" \
+          '.[] | select(.displayTitle == $title) | .databaseId'
+    )"
+    match_count="$(
+      printf '%s\n' "${matching_run_ids}" | sed '/^$/d' | wc -l | tr -d ' '
+    )"
+
+    if [ "${match_count}" -gt 1 ]; then
+      printf 'wave0_oidc_run_selection=ambiguous\n' >&2
+      return 1
+    fi
+    if [ "${match_count}" -eq 1 ]; then
+      run_id="${matching_run_ids}"
+      break
+    fi
+    sleep 2
+  done
+
+  if [ -z "${run_id}" ]; then
+    printf 'wave0_oidc_run_selection=not_found\n' >&2
+    return 1
+  fi
+  printf '%s\n' "${run_id}"
+}
+
+nonprod_run_id="$(dispatch_and_capture "${nonprod_nonce}")"
+production_run_id="$(dispatch_and_capture "${production_nonce}")"
+
+if [ "${nonprod_run_id}" = "${production_run_id}" ]; then
+  printf 'wave0_oidc_run_selection=duplicate\n' >&2
+  exit 1
+fi
+
+nonprod_run_url="https://github.com/natthaphonchop2-creator/mercury-tools/actions/runs/${nonprod_run_id}"
+production_run_url="https://github.com/natthaphonchop2-creator/mercury-tools/actions/runs/${production_run_id}"
+
+if [ "${nonprod_run_url}" = "${production_run_url}" ]; then
+  printf 'wave0_oidc_run_url=duplicate\n' >&2
+  exit 1
+fi
+
+gh run watch "${nonprod_run_id}" --exit-status
+gh run watch "${production_run_id}" --exit-status
+
+uv run python scripts/check_aws_readiness.py \
+  --identity-decision infra/aws/wave0/identity-decision.yaml \
+  --identity-proof "codex=${CODEX_PROBE_RECORD:?},${CODEX_RAW_EVIDENCE:?}" \
+  --identity-proof "chatgpt=${CHATGPT_PROBE_RECORD:?},${CHATGPT_RAW_EVIDENCE:?}" \
+  --identity-proof "claude=${CLAUDE_PROBE_RECORD:?},${CLAUDE_RAW_EVIDENCE:?}" \
+  --oidc-run "nonprod=${nonprod_run_url}" \
+  --oidc-run "production=${production_run_url}"
 ```
 
-The UUID input is a non-secret correlation value. Selection is restricted to
-the exact workflow, dispatch event, default branch, and generated run title;
-zero or multiple matches fail closed instead of selecting the latest run.
+Two dispatches are required even though the approved workflow remains a matrix:
+the final gate binds one distinct, exact run URL to nonprod and a second
+distinct, exact run URL to production. This prevents both environment claims
+from collapsing onto one run reference. Each UUID input is a non-secret
+correlation value. Selection is restricted to the exact workflow, dispatch
+event, default branch, and generated run title; zero or multiple matches fail
+closed instead of selecting the latest run.
 
 The Mercury probe step emits only its environment and
 `wave0_oidc_smoke=pass`, while the pinned credentials action may emit masked
 status logs. The workflow masks the AWS account ID and redirects all AWS probe
 stdout and stderr to runner-temporary files. A local template test pass is not
-live OIDC proof; record success only after both jobs of the selected run pass.
+live OIDC proof; record success only after both jobs in each selected run pass.

@@ -197,17 +197,27 @@ def test_bootstrap_runbook_preserves_secret_and_live_access_boundaries() -> None
     assert "not proven" in runbook
 
 
-def test_bootstrap_watches_the_exact_just_dispatched_workflow_run() -> None:
+def test_bootstrap_dispatches_two_exact_runs_and_binds_distinct_environment_urls() -> None:
     runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
-    assert 'evidence_nonce="wave0-$(uv run python -c' in runbook
+    assert 'nonprod_nonce="wave0-nonprod-$(uv run python -c' in runbook
+    assert 'production_nonce="wave0-production-$(uv run python -c' in runbook
+    assert 'if [ "${nonprod_nonce}" = "${production_nonce}" ]; then' in runbook
     assert '-f evidence_nonce="${evidence_nonce}"' in runbook
+    assert 'nonprod_run_id="$(dispatch_and_capture "${nonprod_nonce}")"' in runbook
+    assert 'production_run_id="$(dispatch_and_capture "${production_nonce}")"' in runbook
     assert '--workflow "${workflow}"' in runbook
     assert "--event workflow_dispatch" in runbook
     assert '--branch "${workflow_ref}"' in runbook
     assert "--json databaseId,displayTitle" in runbook
     assert "select(.displayTitle == $title)" in runbook
     assert 'if [ "${match_count}" -gt 1 ]; then' in runbook
-    assert 'gh run watch "${run_id}" --exit-status' in runbook
+    assert 'if [ "${nonprod_run_id}" = "${production_run_id}" ]; then' in runbook
+    assert 'gh run watch "${nonprod_run_id}" --exit-status' in runbook
+    assert 'gh run watch "${production_run_id}" --exit-status' in runbook
+    assert (
+        '--oidc-run "nonprod=${nonprod_run_url}" \\\n'
+        '  --oidc-run "production=${production_run_url}"'
+    ) in runbook
     assert "gh run watch --exit-status" not in runbook
 
 

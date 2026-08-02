@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from mercury_tools.aws.commands import CommandRunner, run_command
 from mercury_tools.aws.config import load_wave0_config
-from mercury_tools.aws.identity import read_identity_decision
+from mercury_tools.aws.identity import HostName, IdentityProofReference, read_identity_decision
 from mercury_tools.aws.models import (
     CheckResult,
     CheckState,
@@ -68,6 +68,13 @@ def _parser() -> argparse.ArgumentParser:
             "provide once for each environment."
         ),
     )
+    parser.add_argument(
+        "--identity-proof",
+        action="append",
+        default=[],
+        metavar="HOST=PROBE_PATH,RAW_EVIDENCE_PATH",
+        help="Host-bound sanitized probe record and corresponding local raw evidence file.",
+    )
     parser.add_argument("--skip-live", action="store_true")
     return parser
 
@@ -99,6 +106,39 @@ def _parse_oidc_references(values: list[str]) -> tuple[OidcRunReference, ...]:
         references.append(OidcRunReference(environment=environment, run_url=run_url))
     if len({item.environment for item in references}) != len(references):
         raise ValueError("wave0_oidc_bindings_invalid")
+    return tuple(references)
+
+
+def _parse_identity_proof_references(
+    values: list[str],
+) -> tuple[IdentityProofReference, ...]:
+    if len(values) > len(HostName):
+        raise ValueError("identity_proof_invalid")
+    references: list[IdentityProofReference] = []
+    for value in values:
+        host_value, host_separator, paths = value.partition("=")
+        probe_path, path_separator, evidence_path = paths.partition(",")
+        if (
+            not host_separator
+            or not path_separator
+            or not host_value
+            or not probe_path
+            or not evidence_path
+        ):
+            raise ValueError("identity_proof_invalid")
+        try:
+            host = HostName(host_value)
+        except ValueError:
+            raise ValueError("identity_proof_invalid") from None
+        references.append(
+            IdentityProofReference(
+                host=host,
+                probe_path=Path(probe_path),
+                evidence_path=Path(evidence_path),
+            )
+        )
+    if len({reference.host for reference in references}) != len(references):
+        raise ValueError("identity_proof_invalid")
     return tuple(references)
 
 
@@ -171,12 +211,16 @@ def main(
         identity_decision, identity_evidence_sha256 = (
             loaded_identity if loaded_identity is not None else (None, None)
         )
+        identity_proof_references = _parse_identity_proof_references(args.identity_proof)
+        if identity_decision is None and identity_proof_references:
+            raise ValueError("identity_proof_invalid")
         oidc_references = _parse_oidc_references(args.oidc_run)
         finalization = finalize_wave0_gate(
             report,
             identity_decision,
             oidc_references,
             runner,
+            identity_proof_references=identity_proof_references,
         )
         report = _machine_report(
             report,

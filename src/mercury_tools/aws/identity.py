@@ -8,7 +8,8 @@ import os
 import secrets
 import stat
 from contextlib import suppress
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
@@ -22,6 +23,9 @@ from mercury_tools.catalog.identity import validate_credential_safe, validate_cr
 _SHA256 = r"^[a-f0-9]{64}$"
 _REQUIRED_HOSTS = frozenset(("codex", "chatgpt", "claude"))
 _MAX_IDENTITY_DECISION_BYTES = 65_536
+_MAX_IDENTITY_PROBE_BYTES = 65_536
+_MAX_IDENTITY_EVIDENCE_BYTES = 16 * 1024 * 1024
+_IDENTITY_PROOF_MAX_AGE = timedelta(hours=24)
 _UNSAFE_PROBE_KEYS = frozenset(
     (
         "access_token",
@@ -151,6 +155,26 @@ class IdentityDecision(_IdentityModel):
         return self
 
 
+@dataclass(frozen=True, slots=True)
+class IdentityProofReference:
+    """Host-bound local paths used only to re-verify one sanitized proof."""
+
+    host: HostName
+    probe_path: Path = field(repr=False)
+    evidence_path: Path = field(repr=False)
+
+    def __post_init__(self) -> None:
+        try:
+            checked_host = HostName(self.host)
+            checked_probe_path = Path(self.probe_path)
+            checked_evidence_path = Path(self.evidence_path)
+        except (TypeError, ValueError):
+            raise ValueError("identity_proof_invalid") from None
+        object.__setattr__(self, "host", checked_host)
+        object.__setattr__(self, "probe_path", checked_probe_path)
+        object.__setattr__(self, "evidence_path", checked_evidence_path)
+
+
 def load_identity_host_contract(path: Path) -> IdentityHostContract:
     """Load the non-secret host compatibility contract from trusted YAML."""
 
@@ -219,6 +243,60 @@ def decide_identity(probes: tuple[HostIdentityProbe, ...]) -> IdentityDecision:
         issuer_origin=issuer_origins.pop(),
         required_hosts=(HostName.CODEX, HostName.CHATGPT, HostName.CLAUDE),
     )
+
+
+def verify_identity_proof(
+    decision: IdentityDecision,
+    references: tuple[IdentityProofReference, ...],
+    *,
+    verified_at: datetime,
+) -> tuple[HostIdentityProbe, ...]:
+    """Reload, re-hash, and re-decide exactly one current proof per required host."""
+
+    try:
+        checked_decision = IdentityDecision.model_validate(decision.model_dump(mode="python"))
+        if verified_at.tzinfo is None or verified_at.utcoffset() is None:
+            raise ValueError
+        checked_references = tuple(
+            IdentityProofReference(
+                host=reference.host,
+                probe_path=reference.probe_path,
+                evidence_path=reference.evidence_path,
+            )
+            for reference in references
+        )
+        if (
+            len(checked_references) != len(_REQUIRED_HOSTS)
+            or {reference.host.value for reference in checked_references} != _REQUIRED_HOSTS
+            or len({_normalized_path(reference.probe_path) for reference in checked_references})
+            != len(checked_references)
+            or len({_normalized_path(reference.evidence_path) for reference in checked_references})
+            != len(checked_references)
+        ):
+            raise ValueError
+
+        probes: list[HostIdentityProbe] = []
+        evidence_hashes: set[str] = set()
+        for reference in checked_references:
+            probe = _read_host_identity_probe(reference.probe_path)
+            evidence_sha256 = _sha256_file(reference.evidence_path)
+            if (
+                probe.host is not reference.host
+                or not secrets.compare_digest(probe.evidence_sha256, evidence_sha256)
+                or probe.checked_at > verified_at
+                or verified_at - probe.checked_at > _IDENTITY_PROOF_MAX_AGE
+                or evidence_sha256 in evidence_hashes
+            ):
+                raise ValueError
+            evidence_hashes.add(evidence_sha256)
+            probes.append(probe)
+
+        ordered = tuple(sorted(probes, key=lambda item: tuple(HostName).index(item.host)))
+        if decide_identity(ordered) != checked_decision:
+            raise ValueError
+        return ordered
+    except (AttributeError, OSError, TypeError, UnicodeError, ValueError):
+        raise ValueError("identity_proof_invalid") from None
 
 
 def write_identity_decision(path: Path, decision: IdentityDecision) -> None:
@@ -328,11 +406,31 @@ def _is_external_https_origin(value: str) -> bool:
 
 
 def _sha256_file(path: Path) -> str:
+    input_path = Path(os.path.abspath(os.fspath(path)))
+    if input_path.name in {"", ".", ".."}:
+        raise ValueError("identity_evidence_unavailable")
+    directory_fd = _open_identity_directory(
+        input_path.parent,
+        "identity_evidence_unavailable",
+        create_missing=False,
+    )
+    descriptor: int | None = None
     try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(
+            input_path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
     except OSError:
+        os.close(directory_fd)
         raise ValueError("identity_evidence_unavailable") from None
     try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size > _MAX_IDENTITY_EVIDENCE_BYTES
+        ):
+            raise ValueError("identity_evidence_unavailable")
         digest = hashlib.sha256()
         while chunk := os.read(descriptor, 64 * 1024):
             digest.update(chunk)
@@ -341,6 +439,61 @@ def _sha256_file(path: Path) -> str:
         raise ValueError("identity_evidence_unavailable") from None
     finally:
         os.close(descriptor)
+        os.close(directory_fd)
+
+
+def _read_host_identity_probe(path: Path) -> HostIdentityProbe:
+    payload = _read_identity_file(
+        path,
+        max_bytes=_MAX_IDENTITY_PROBE_BYTES,
+        path_error="identity_probe_path_invalid",
+    )
+    try:
+        raw = json.loads(payload.decode("utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError
+        return HostIdentityProbe.model_validate(raw)
+    except (json.JSONDecodeError, UnicodeError, ValueError):
+        raise ValueError("identity_probe_invalid") from None
+
+
+def _read_identity_file(path: Path, *, max_bytes: int, path_error: str) -> bytes:
+    input_path = Path(os.path.abspath(os.fspath(path)))
+    if input_path.name in {"", ".", ".."}:
+        raise ValueError(path_error)
+    directory_fd = _open_identity_directory(
+        input_path.parent,
+        path_error,
+        create_missing=False,
+    )
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            input_path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > max_bytes:
+            raise ValueError(path_error)
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(descriptor, 64 * 1024):
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(path_error)
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except OSError:
+        raise ValueError(path_error) from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory_fd)
+
+
+def _normalized_path(path: Path) -> str:
+    return os.path.abspath(os.fspath(path))
 
 
 def _write_probe(output_dir: Path, probe: HostIdentityProbe) -> Path:

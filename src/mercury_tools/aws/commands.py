@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 from mercury_tools.safety.redaction import redact_text
 
-_ALLOWED_PROGRAMS = frozenset({"aws", "node", "npm", "npx", "uv", "gh"})
+_ALLOWED_PROGRAMS = frozenset({"aws", "node", "npx", "uv", "gh"})
 _ALLOWED_ENVIRONMENT = (
     "PATH",
     "HOME",
@@ -40,12 +40,78 @@ _GH_SOURCE_ENDPOINT_RE = re.compile(
     rf"^{_GH_REPOSITORY_PATH}/contents/\.github/workflows/"
     r"aws-wave0-oidc-smoke\.yml\?ref=[a-f0-9]{40}$"
 )
+_GH_ENVIRONMENT_VARIABLE_ENDPOINT_RE = re.compile(
+    rf"^{_GH_REPOSITORY_PATH}/environments/(?:nonprod|production)/"
+    r"variables/AWS_WAVE0_ROLE_ARN$"
+)
 _GH_RUN_JQ = (
     "{id,html_url,event,status,conclusion,head_sha,workflow_id,path,"
     "repository_full_name:.repository.full_name}"
 )
 _GH_WORKFLOW_JQ = "{id,path}"
 _GH_JOBS_JQ = "{total_count,jobs:[.jobs[]|{id,name,status,conclusion}]}"
+_GH_ENVIRONMENT_VARIABLE_JQ = "{name,value}"
+_LOCAL_VERSION_COMMANDS = frozenset(
+    {
+        ("node", "--version"),
+        ("uv", "run", "python", "--version"),
+        ("npx", "--no-install", "agentcore", "--version"),
+        ("npx", "--no-install", "cdk", "--version"),
+    }
+)
+_AWS_PROFILES = ("mercury-nonprod", "mercury-prod")
+_AWS_TAILS = (
+    ("--profile", "{profile}", "--region", "ap-southeast-1", "--output", "json", "--no-cli-pager"),
+)
+_AWS_READ_PREFIXES = (
+    ("sts", "get-caller-identity"),
+    ("bedrock-agentcore-control", "list-agent-runtimes", "--max-results", "1"),
+    ("bedrock-agentcore-control", "list-gateways", "--max-results", "1"),
+    ("bedrock-agentcore-control", "list-workload-identities", "--max-results", "1"),
+    ("bedrock-agent", "list-knowledge-bases", "--max-results", "1"),
+    (
+        "rds",
+        "describe-orderable-db-instance-options",
+        "--engine",
+        "aurora-postgresql",
+        "--db-instance-class",
+        "db.serverless",
+        "--max-records",
+        "1",
+    ),
+    ("s3api", "list-buckets"),
+    ("kms", "list-aliases", "--limit", "1"),
+    ("ecr", "describe-repositories", "--max-results", "1"),
+    ("logs", "describe-log-groups", "--limit", "1"),
+    (
+        "service-quotas",
+        "list-service-quotas",
+        "--service-code",
+        "bedrock-agentcore",
+        "--max-results",
+        "100",
+    ),
+)
+_AWS_READ_COMMANDS = frozenset(
+    ("aws", *prefix, *(item.format(profile=profile) for item in tail))
+    for profile in _AWS_PROFILES
+    for prefix in _AWS_READ_PREFIXES
+    for tail in _AWS_TAILS
+)
+_AWS_COGNITO_ABSENCE_COMMAND = (
+    "aws",
+    "cloudformation",
+    "describe-stacks",
+    "--stack-name",
+    "mercury-wave0-identity-spike",
+    "--profile",
+    "mercury-nonprod",
+    "--region",
+    "ap-southeast-1",
+    "--output",
+    "json",
+    "--no-cli-pager",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,8 +160,12 @@ def _command_allowed(argv: tuple[str, ...]) -> bool:
         or any(not isinstance(argument, str) or not argument for argument in argv)
     ):
         return False
-    if argv[0] != "gh":
+    if argv == ("aws", "--version"):
         return True
+    if argv[0] == "aws":
+        return argv in _AWS_READ_COMMANDS or argv == _AWS_COGNITO_ABSENCE_COMMAND
+    if argv[0] != "gh":
+        return argv in _LOCAL_VERSION_COMMANDS
     if len(argv) != 5 or argv[:2] != ("gh", "api"):
         return False
     endpoint = argv[2]
@@ -105,6 +175,8 @@ def _command_allowed(argv: tuple[str, ...]) -> bool:
         return _GH_WORKFLOW_ENDPOINT_RE.fullmatch(endpoint) is not None
     if argv[3:] == ("--jq", _GH_JOBS_JQ):
         return _GH_JOBS_ENDPOINT_RE.fullmatch(endpoint) is not None
+    if argv[3:] == ("--jq", _GH_ENVIRONMENT_VARIABLE_JQ):
+        return _GH_ENVIRONMENT_VARIABLE_ENDPOINT_RE.fullmatch(endpoint) is not None
     return (
         argv[3:] == ("--jq", ".content")
         and _GH_SOURCE_ENDPOINT_RE.fullmatch(endpoint) is not None

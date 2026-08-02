@@ -88,6 +88,25 @@ An incomplete, failed, mixed, or unsafe proof exits `2`, prints a stable
 offline while AWS remains blocked, so do not run this command to create a
 decision now.
 
+The public readiness gate does not trust the decision file alone. Supply the
+three host-bound references explicitly when the gate is eventually run:
+
+```bash
+uv run python scripts/check_aws_readiness.py \
+  --identity-decision infra/aws/wave0/identity-decision.yaml \
+  --identity-proof "codex=${CODEX_PROBE_RECORD:?},${CODEX_RAW_EVIDENCE:?}" \
+  --identity-proof "chatgpt=${CHATGPT_PROBE_RECORD:?},${CHATGPT_RAW_EVIDENCE:?}" \
+  --identity-proof "claude=${CLAUDE_PROBE_RECORD:?},${CLAUDE_RAW_EVIDENCE:?}" \
+  --oidc-run "nonprod=${MERCURY_NONPROD_OIDC_RUN_URL:?}" \
+  --oidc-run "production=${MERCURY_PRODUCTION_OIDC_RUN_URL:?}"
+```
+
+The gate independently reloads exactly one sanitized record per host, hashes
+each corresponding local raw evidence file again, rejects duplicate paths or
+hashes, requires every host check to be no more than 24 hours old, recomputes
+`decide_identity`, and compares the result exactly with the supplied decision.
+Raw evidence bytes and paths are never copied into the readiness report.
+
 ## 6. Delete the spike after capture
 
 After recording complete proof and generating the decision, delete the
@@ -105,6 +124,12 @@ aws cloudformation wait stack-delete-complete \
   --region ap-southeast-1 \
   --no-cli-pager
 ```
+
+The final gate then runs one exact shell-free, read-only
+`cloudformation describe-stacks` operation with profile `mercury-nonprod` and
+Region `ap-southeast-1`. It returns `ready` only when the exact disposable stack
+is absent. Access errors, an existing stack, an unexpected response, or any
+other ambiguous result fails closed.
 
 Do not remove, change, or create unrelated AWS resources while handling this
 disposable compatibility proof.
