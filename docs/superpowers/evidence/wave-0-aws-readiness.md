@@ -2,19 +2,22 @@
 
 Date: 2026-08-02
 Region: `ap-southeast-1`
-Final gate: `blocked_account_access`
-Owner approval: not requested; Wave 0 exit proof is incomplete
+Final gate: `blocked_identity_compatibility`
+Owner approval: not requested; the three-host identity proof is incomplete
 
 ## Boundary
 
 This is a sanitized live nonprod owner-review record. The readiness command
-called only the closed, read-only AWS probe allowlist; no GitHub Actions
-workflow was dispatched. The ignored machine report is
+called only the closed, read-only AWS probe allowlist. One manually dispatched
+GitHub Actions workflow assumed the dedicated read-only Wave 0 role through
+OIDC and ran the same bounded service probes. The ignored machine report is
 `.artifacts/aws/wave0/readiness.json`, mode `0600`, with SHA-256
-`d8a599a58675794159286e7d3ac591409ceca91267f9990e2912408d0d12c287`.
+`b151e90edd6ae45a00d638516a41caaba7077fcb0e6c9e589289bc0d7ab4d884`.
 
 No Mercury runtime, customer data, provider credentials, or Wave 1
-infrastructure was created. No AWS account ID, principal ARN, access key,
+infrastructure was created. The only persistent Wave 0 AWS resource is the
+`CREATE_COMPLETE` CloudFormation stack `mercury-wave0-github-oidc`, which
+contains the read-only GitHub smoke role. No AWS account ID, principal ARN, access key,
 secret key, session token, raw JWT, cookie, authorization header, or provider
 credential is recorded here.
 
@@ -68,10 +71,13 @@ production readiness.
 
 ## OIDC And Identity
 
-- Nonprod GitHub Actions run URL: absent; no URL or hash recorded.
-- OIDC workflow dispatch: not performed.
-- OIDC CLI input requires one explicit `nonprod=URL` binding from one workflow
-  dispatch.
+- Nonprod GitHub Actions run:
+  `https://github.com/natthaphonchop2-creator/mercury-tools/actions/runs/30758015246`.
+- Run event/status: exact `workflow_dispatch`, completed successfully in the
+  `nonprod` GitHub environment from merged `main` commit
+  `3e2cf6e1b114e28d4cac4f229d4a3a60829eb010`.
+- OIDC assumption, run-bound proof creation, pinned artifact upload, and all ten
+  read-only AWS probes passed.
 - URL shape or order does not create pass evidence. When bindings exist, the
   public final gate accepts only explicit run references and independently
   verifies closed run metadata, workflow identity, the expected successful
@@ -91,13 +97,19 @@ production readiness.
   fingerprint. Canonical OIDC evidence v4 contains only the account fingerprint
   and canonical proof hash; it contains no account ID, role ARN, download path,
   or raw artifact content.
+- The exact run exposed one expected, non-expired, 409-byte artifact named
+  `mercury-wave0-oidc-account-proof-nonprod`. The independent verifier
+  accepted canonical sanitized evidence SHA-256
+  `20cf3faac63b207f55855e1555be4dc0ff25fd6308a96840707329a2f94bbb80`.
 - The current GitHub environment value of `AWS_WAVE0_ROLE_ARN` is not queried or
   used as historical proof authority. Changing or forging it after a run cannot
   alter or repair that run's artifact evidence.
+- Preflight confirmed that the `AWS_WAVE0_ROLE_ARN` variable name exists.
+  Its value and the role ARN are not recorded. The GitHub OIDC provider was
+  created only after confirming it was absent, and no AWS access key or local
+  credential-file value was copied to GitHub.
 - Caller-constructed `OidcRunEvidence`, including a matching deterministic
   digest, cannot be supplied to the public final gate to produce `ready`.
-- No OIDC workflow dispatch or CloudFormation mutation ran during this live
-  readiness execution. The nonprod OIDC binding is absent.
 - Identity decision file: absent.
 - Identity decision reads reject symlinked parent components and final
   symlinks before parsing or hashing evidence.
@@ -109,13 +121,11 @@ production readiness.
   `decide_identity`, and compares the decision exactly.
 - Identity mode and issuer kind: not selected.
 - Codex, ChatGPT, and Claude host results: not available.
-- Disposable Cognito stack: not deployed, so no deletion command was run. A
-  future otherwise-ready gate must independently confirm absence through the
-  exact read-only `cloudformation describe-stacks` call against
-  `mercury-nonprod` before returning `ready`.
+- Disposable Cognito stack: confirmed absent through the exact read-only
+  `cloudformation describe-stacks` call against `mercury-nonprod`.
 
-The evidence record does not invent OIDC URLs, OIDC hashes, identity mode,
-issuer kind, host results, account fingerprints, or stack-deletion proof.
+The evidence record does not invent identity mode, issuer kind, host results,
+account fingerprints, or customer/provider readiness.
 
 ## Commits Reviewed
 
@@ -128,6 +138,7 @@ issuer kind, host results, account fingerprints, or stack-deletion proof.
 | Task 5 | `36d8cc57cacd63347c7a34bf93a38fb237a3fb37`, `5314f35c2ac52efe27473998bb41fd2b1a9ec91b`, `2ac92269ecda45bef92bf70c51530c30ad32f967` |
 | Broad review base | `2ac92269ecda45bef92bf70c51530c30ad32f967` |
 | Broad remediation Fix Round 1 | `64c3be83c81f699677239b7e7141c3e7ef947d1c` |
+| Nonprod-first Wave 0 and CI remediation | PR `#45`, squash commit `3e2cf6e1b114e28d4cac4f229d4a3a60829eb010` |
 
 Fix Round 2 closes the remaining OIDC TOCTOU finding by replacing post-run
 environment-variable authority with the immutable run-bound artifact contract
@@ -142,21 +153,26 @@ commit that contains its own update.
 - Approved four-file Wave 0 pytest matrix: 180 passed.
 - Full repository pytest matrix: 6209 passed, 88 skipped, with one pre-existing
   Starlette/httpx deprecation warning.
-- One preceding full run hit the existing cumulative-deadline timing test once;
-  its isolated rerun passed, followed by the clean full result above.
+- CI-equivalent local matrix without an AWS profile: 6201 passed with the same
+  pre-existing warning.
+- Both PR `#45` required checks passed the 6201-test matrix, package/plugin
+  validation, build, full-history and release-artifact secret scans, and
+  one-click/hosted-MCP smoke.
 - Approved Ruff matrix: pass.
-- Live `cloudformation validate-template` for the Wave 0 read-only OIDC role:
-  pass with the expected two parameters; no stack was created by validation.
-- `uv run python scripts/check_aws_readiness.py --config infra/aws/wave0/environment.yaml --output .artifacts/aws/wave0/readiness.json`: expected exit 2, `blocked_account_access`; all 16 recorded tool, account, and service checks pass before the missing OIDC/identity gate is applied.
+- The `mercury-wave0-github-oidc` stack is `CREATE_COMPLETE`; its
+  template validation and deployment passed without creating a runtime or data
+  service.
+- OIDC smoke run `30758015246`: pass in 24 seconds.
+- `uv run python scripts/check_aws_readiness.py --oidc-run nonprod=https://github.com/natthaphonchop2-creator/mercury-tools/actions/runs/30758015246`: expected exit 2, `blocked_identity_compatibility`; all 16 tool, account, and service checks plus immutable OIDC evidence pass before the missing host identity gate is applied.
 - Exact command-shape tests reject mutating AWS, npm, npx, GitHub, and arbitrary
   artifact-download forms while preserving only the Wave 0 version probes,
   bounded reads, and run/name/destination-bound artifact retrieval.
 - Whitespace checks: pass after the Fix Round 2 diff.
-- Gitleaks 8.24.3 found no leaks in the complete current diff. A separate full
-  history scan reports seven pre-existing candidates. Manual redacted
-  classification confirms five synthetic AWS redaction fixtures, one pinned
-  GitHub Action commit SHA, and one Render environment-key declaration; none is
-  a stored credential. This Wave does not suppress those historical findings.
+- Gitleaks 8.24.3 found no leaks in the complete Git history, wheel, sdist, or
+  plugin tree. Seven false positives were manually classified as five exact
+  synthetic AWS redaction fixtures, one pinned GitHub Action commit SHA, and one
+  public Render feature-flag name. Narrow path-and-line allowlists cover only
+  those exact fixtures; no secret rule or broad path is disabled.
 
 ## Independent Review
 
@@ -165,13 +181,11 @@ items: unproven short-lived credential source, zero/missing required quota
 acceptance, test/evidence drift, and stale Space interfaces. The implementation,
 tests, runbooks, and source-of-truth plan were remediated. Final re-review passed
 with no remaining Critical or Important finding.
-- The three pre-existing untracked RED tests remain unchanged and unstaged.
 
 ## Blockers And Stop Decision
 
-Wave 0 remains blocked on two proof groups: one successful nonprod GitHub
-Actions OIDC run, and one validated identity decision with three current
-host-bound proof references covering Codex, ChatGPT, and Claude plus verified
-deletion/absence of the disposable Cognito stack. Short-lived nonprod STS and
-all required service/quota probes already pass. Both Wave 0 checkboxes remain
-unchecked. Wave 1 planning and execution must not begin.
+Wave 0 remains blocked only on one validated identity decision with three
+current host-bound proof references covering Codex, ChatGPT, and Claude.
+Short-lived nonprod STS, all required service/quota probes, GitHub OIDC, and
+absence of the disposable Cognito stack already pass. Both Wave 0 checkboxes
+remain unchecked. Wave 1 planning and execution must not begin.
