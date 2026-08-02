@@ -7,6 +7,7 @@ import re
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import PurePath
 
 from mercury_tools.safety.redaction import redact_text
 
@@ -21,6 +22,7 @@ _ALLOWED_ENVIRONMENT = (
     "AWS_SHARED_CREDENTIALS_FILE",
 )
 _MAX_OUTPUT_CHARS = 4_096
+_MAX_WORKFLOW_SOURCE_CHARS = 8_192
 _AWS_ACCESS_KEY_ASSIGNMENT_RE = re.compile(
     r"(?i)\bAWS_ACCESS_KEY_ID\s*[:=]\s*[^\s,;]+"
 )
@@ -36,21 +38,30 @@ _GH_WORKFLOW_ENDPOINT_RE = re.compile(
 _GH_JOBS_ENDPOINT_RE = re.compile(
     rf"^{_GH_REPOSITORY_PATH}/actions/runs/[1-9]\d*/jobs\?per_page=100$"
 )
+_GH_ARTIFACTS_ENDPOINT_RE = re.compile(
+    rf"^{_GH_REPOSITORY_PATH}/actions/runs/[1-9]\d*/artifacts\?per_page=100$"
+)
 _GH_SOURCE_ENDPOINT_RE = re.compile(
     rf"^{_GH_REPOSITORY_PATH}/contents/\.github/workflows/"
     r"aws-wave0-oidc-smoke\.yml\?ref=[a-f0-9]{40}$"
 )
-_GH_ENVIRONMENT_VARIABLE_ENDPOINT_RE = re.compile(
-    rf"^{_GH_REPOSITORY_PATH}/environments/(?:nonprod|production)/"
-    r"variables/AWS_WAVE0_ROLE_ARN$"
-)
 _GH_RUN_JQ = (
-    "{id,html_url,event,status,conclusion,head_sha,workflow_id,path,"
+    "{id,html_url,event,status,conclusion,head_sha,run_attempt,workflow_id,path,"
     "repository_full_name:.repository.full_name}"
 )
 _GH_WORKFLOW_JQ = "{id,path}"
-_GH_JOBS_JQ = "{total_count,jobs:[.jobs[]|{id,name,status,conclusion}]}"
-_GH_ENVIRONMENT_VARIABLE_JQ = "{name,value}"
+_GH_JOBS_JQ = (
+    "{total_count,jobs:[.jobs[]|"
+    "{id,name,status,conclusion,run_id,run_attempt,head_sha}]}"
+)
+_GH_ARTIFACTS_JQ = (
+    "{total_count,artifacts:[.artifacts[]|"
+    "{id,name,size_in_bytes,expired,expires_at,"
+    "workflow_run:{id:.workflow_run.id,head_sha:.workflow_run.head_sha}}]}"
+)
+_GH_DOWNLOAD_DIRECTORY_RE = re.compile(
+    r"^oidc-download-(?P<run_id>[1-9]\d*)-[a-f0-9]{16}$"
+)
 _LOCAL_VERSION_COMMANDS = frozenset(
     {
         ("node", "--version"),
@@ -146,10 +157,18 @@ def run_command(argv: tuple[str, ...], timeout_seconds: int = 20) -> CommandResu
     except OSError:
         return CommandResult(127, "", "wave0_command_missing")
 
+    output_limit = (
+        _MAX_WORKFLOW_SOURCE_CHARS
+        if len(argv) == 5
+        and argv[:2] == ("gh", "api")
+        and argv[3:] == ("--jq", ".content")
+        and _GH_SOURCE_ENDPOINT_RE.fullmatch(argv[2]) is not None
+        else _MAX_OUTPUT_CHARS
+    )
     return CommandResult(
         completed.returncode,
-        _redact_command_output(completed.stdout),
-        _redact_command_output(completed.stderr),
+        _redact_command_output(completed.stdout, output_limit),
+        _redact_command_output(completed.stderr, output_limit),
     )
 
 
@@ -166,6 +185,8 @@ def _command_allowed(argv: tuple[str, ...]) -> bool:
         return argv in _AWS_READ_COMMANDS or argv == _AWS_COGNITO_ABSENCE_COMMAND
     if argv[0] != "gh":
         return argv in _LOCAL_VERSION_COMMANDS
+    if argv[:3] == ("gh", "run", "download"):
+        return _gh_download_allowed(argv)
     if len(argv) != 5 or argv[:2] != ("gh", "api"):
         return False
     endpoint = argv[2]
@@ -175,15 +196,44 @@ def _command_allowed(argv: tuple[str, ...]) -> bool:
         return _GH_WORKFLOW_ENDPOINT_RE.fullmatch(endpoint) is not None
     if argv[3:] == ("--jq", _GH_JOBS_JQ):
         return _GH_JOBS_ENDPOINT_RE.fullmatch(endpoint) is not None
-    if argv[3:] == ("--jq", _GH_ENVIRONMENT_VARIABLE_JQ):
-        return _GH_ENVIRONMENT_VARIABLE_ENDPOINT_RE.fullmatch(endpoint) is not None
+    if argv[3:] == ("--jq", _GH_ARTIFACTS_JQ):
+        return _GH_ARTIFACTS_ENDPOINT_RE.fullmatch(endpoint) is not None
     return (
         argv[3:] == ("--jq", ".content")
         and _GH_SOURCE_ENDPOINT_RE.fullmatch(endpoint) is not None
     )
 
 
-def _redact_command_output(value: str) -> str:
+def _gh_download_allowed(argv: tuple[str, ...]) -> bool:
+    if (
+        len(argv) != 10
+        or not argv[3].isdigit()
+        or argv[3].startswith("0")
+        or argv[4:6] != ("--repo", "natthaphonchop2-creator/mercury-tools")
+        or argv[6] != "--name"
+        or argv[8] != "--dir"
+    ):
+        return False
+    destination = PurePath(argv[9])
+    if not destination.is_absolute() or ".." in destination.parts:
+        return False
+    if len(destination.parts) < 6 or destination.parts[-5:-2] != (
+        ".artifacts",
+        "aws",
+        "wave0",
+    ):
+        return False
+    environment = destination.parts[-1]
+    directory_match = _GH_DOWNLOAD_DIRECTORY_RE.fullmatch(destination.parts[-2])
+    return bool(
+        environment in {"nonprod", "production"}
+        and argv[7] == f"mercury-wave0-oidc-account-proof-{environment}"
+        and directory_match is not None
+        and directory_match.group("run_id") == argv[3]
+    )
+
+
+def _redact_command_output(value: str, max_chars: int = _MAX_OUTPUT_CHARS) -> str:
     redacted = _AWS_ACCESS_KEY_ASSIGNMENT_RE.sub(
         "[REDACTED_AWS_ACCESS_KEY_ASSIGNMENT]", value
     )
@@ -191,4 +241,4 @@ def _redact_command_output(value: str) -> str:
         "[REDACTED_AWS_SECRET_KEY_ASSIGNMENT]", redacted
     )
     redacted = _AWS_ACCESS_KEY_RE.sub("[REDACTED_AWS_ACCESS_KEY_ID]", redacted)
-    return redact_text(redacted)[:_MAX_OUTPUT_CHARS]
+    return redact_text(redacted)[:max_chars]

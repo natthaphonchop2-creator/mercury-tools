@@ -170,16 +170,26 @@ class VerifiedGhRunner(FakeRunner):
         workflow_updates: Mapping[str, object] | None = None,
         source: str | None = None,
         role_account_ids: Mapping[EnvironmentName, str] | None = None,
+        proof_account_ids: Mapping[EnvironmentName, str] | None = None,
+        proof_updates: Mapping[str, object] | None = None,
+        artifact_mutation: str | None = None,
+        download_mutation: str | None = None,
     ) -> VerifiedGhRunner:
         results: dict[tuple[str, ...], CommandResult] = {}
-        checked_role_accounts = role_account_ids or {
+        current_role_accounts = role_account_ids or {
             EnvironmentName.NONPROD: "123456789012",
             EnvironmentName.PRODUCTION: "210987654321",
         }
+        proved_accounts = proof_account_ids or {
+            EnvironmentName.NONPROD: "123456789012",
+            EnvironmentName.PRODUCTION: "210987654321",
+        }
+        downloads: dict[tuple[int, EnvironmentName], dict[str, bytes | tuple[str, str]]] = {}
         for reference in references:
             run_id = int(str(reference.run_url).rstrip("/").rsplit("/", 1)[1])
             head_sha = f"{run_id:040x}"[-40:]
             workflow_id = run_id + 10_000
+            run_attempt = 1
             run_payload: dict[str, object] = {
                 "id": run_id,
                 "html_url": str(reference.run_url),
@@ -187,6 +197,7 @@ class VerifiedGhRunner(FakeRunner):
                 "status": "completed",
                 "conclusion": "success",
                 "head_sha": head_sha,
+                "run_attempt": run_attempt,
                 "workflow_id": workflow_id,
                 "path": WORKFLOW_FILE,
                 "repository_full_name": REPOSITORY,
@@ -205,16 +216,81 @@ class VerifiedGhRunner(FakeRunner):
                         "name": "OIDC smoke (nonprod)",
                         "status": "completed",
                         "conclusion": "success",
+                        "run_id": run_id,
+                        "run_attempt": run_attempt,
+                        "head_sha": head_sha,
                     },
                     {
                         "id": run_id * 10 + 2,
                         "name": "OIDC smoke (production)",
                         "status": "completed",
                         "conclusion": "success",
+                        "run_id": run_id,
+                        "run_attempt": run_attempt,
+                        "head_sha": head_sha,
                     },
                 ],
             }
             jobs_payload.update(job_updates or {})
+            artifacts = [
+                {
+                    "id": run_id * 10 + index,
+                    "name": f"mercury-wave0-oidc-account-proof-{environment.value}",
+                    "size_in_bytes": 512,
+                    "expired": False,
+                    "expires_at": "2099-01-01T00:00:00Z",
+                    "workflow_run": {"id": run_id, "head_sha": head_sha},
+                }
+                for index, environment in enumerate(EnvironmentName, start=1)
+            ]
+            selected_artifact = next(
+                artifact
+                for artifact in artifacts
+                if artifact["name"].endswith(reference.environment.value)
+            )
+            if artifact_mutation == "missing":
+                artifacts.remove(selected_artifact)
+            elif artifact_mutation == "duplicate":
+                artifacts.append({**selected_artifact, "id": run_id * 10 + 99})
+            elif artifact_mutation == "expired":
+                selected_artifact["expired"] = True
+            elif artifact_mutation == "past_expiry":
+                selected_artifact["expires_at"] = "2000-01-01T00:00:00Z"
+            elif artifact_mutation == "oversized":
+                selected_artifact["size_in_bytes"] = 65_537
+            elif artifact_mutation == "wrong_run":
+                selected_artifact["workflow_run"] = {
+                    "id": run_id + 1,
+                    "head_sha": head_sha,
+                }
+
+            proof: dict[str, object] = {
+                "schema": "mercury.aws.wave0.oidc_account_proof.v1",
+                "repository": REPOSITORY,
+                "workflow": WORKFLOW_FILE,
+                "run_id": run_id,
+                "run_attempt": run_attempt,
+                "head_sha": head_sha,
+                "environment": reference.environment.value,
+                "account_fingerprint": fingerprint_account_id(
+                    proved_accounts[reference.environment]
+                ),
+            }
+            proof.update(proof_updates or {})
+            proof_name = f"oidc-account-proof-{reference.environment.value}.json"
+            download_files: dict[str, bytes | tuple[str, str]] = {
+                proof_name: json.dumps(proof).encode("utf-8")
+            }
+            if download_mutation == "missing":
+                download_files = {}
+            elif download_mutation == "additional":
+                download_files["unexpected.json"] = b"{}"
+            elif download_mutation == "oversized":
+                download_files[proof_name] = b"{" + (b" " * 8_192) + b"}"
+            elif download_mutation == "symlink":
+                download_files[proof_name] = ("symlink", "/dev/null")
+            downloads[(run_id, reference.environment)] = download_files
+
             endpoints = {
                 f"repos/{REPOSITORY}/actions/runs/{run_id}": json.dumps(run_payload),
                 f"repos/{REPOSITORY}/actions/workflows/{workflow_id}": json.dumps(
@@ -222,6 +298,9 @@ class VerifiedGhRunner(FakeRunner):
                 ),
                 f"repos/{REPOSITORY}/actions/runs/{run_id}/jobs?per_page=100": (
                     json.dumps(jobs_payload)
+                ),
+                f"repos/{REPOSITORY}/actions/runs/{run_id}/artifacts?per_page=100": (
+                    json.dumps({"total_count": len(artifacts), "artifacts": artifacts})
                 ),
                 f"repos/{REPOSITORY}/contents/{WORKFLOW_FILE}?ref={head_sha}": (
                     base64.b64encode(
@@ -246,7 +325,7 @@ class VerifiedGhRunner(FakeRunner):
                         "name": "AWS_WAVE0_ROLE_ARN",
                         "value": (
                             "arn:aws:iam::"
-                            f"{checked_role_accounts[reference.environment]}:"
+                            f"{current_role_accounts[reference.environment]}:"
                             "role/mercury-wave0-readiness"
                         ),
                     }
@@ -258,12 +337,18 @@ class VerifiedGhRunner(FakeRunner):
             "",
             "Stack with id mercury-wave0-identity-spike does not exist",
         )
-        return cls(results)
+        runner = cls(results)
+        runner.downloads = downloads
+        return runner
 
     def __call__(self, argv: tuple[str, ...], timeout_seconds: int) -> CommandResult:
         self.calls.append(argv)
         assert timeout_seconds > 0
-        assert argv[:2] == ("gh", "api") or argv[0] in {
+        assert argv[:2] == ("gh", "api") or argv[:3] == (
+            "gh",
+            "run",
+            "download",
+        ) or argv[0] in {
             "aws",
             "node",
             "uv",
@@ -272,6 +357,17 @@ class VerifiedGhRunner(FakeRunner):
         if argv[:2] == ("gh", "api"):
             base_command = argv[:3]
             return self.results.get(base_command, CommandResult(127, "", "not found"))
+        if argv[:3] == ("gh", "run", "download"):
+            run_id = int(argv[3])
+            environment = EnvironmentName(argv[7].rsplit("-", 1)[1])
+            destination = Path(argv[9])
+            for name, content in self.downloads[(run_id, environment)].items():
+                target = destination / name
+                if isinstance(content, tuple):
+                    os.symlink(content[1], target)
+                else:
+                    target.write_bytes(content)
+            return CommandResult(0, "", "")
         return self.results.get(argv, CommandResult(127, "", "command unavailable"))
 
 
@@ -301,6 +397,13 @@ def test_runner_allows_only_closed_wave0_gh_api_calls(
             "--jq",
             ".",
         ),
+        (
+            "gh",
+            "api",
+            f"repos/{REPOSITORY}/environments/nonprod/variables/AWS_WAVE0_ROLE_ARN",
+            "--jq",
+            "{name,value}",
+        ),
     ):
         with pytest.raises(ValueError, match="wave0_command_not_allowed"):
             run_command(command)
@@ -311,10 +414,10 @@ def test_runner_allows_only_closed_wave0_gh_api_calls(
             "api",
             f"repos/{REPOSITORY}/actions/runs/1001",
             "--jq",
-            (
-                "{id,html_url,event,status,conclusion,head_sha,workflow_id,path,"
-                "repository_full_name:.repository.full_name}"
-            ),
+                (
+                    "{id,html_url,event,status,conclusion,head_sha,run_attempt,workflow_id,path,"
+                    "repository_full_name:.repository.full_name}"
+                ),
         ),
         (
             "gh",
@@ -328,7 +431,10 @@ def test_runner_allows_only_closed_wave0_gh_api_calls(
             "api",
             f"repos/{REPOSITORY}/actions/runs/1001/jobs?per_page=100",
             "--jq",
-            "{total_count,jobs:[.jobs[]|{id,name,status,conclusion}]}",
+            (
+                "{total_count,jobs:[.jobs[]|"
+                "{id,name,status,conclusion,run_id,run_attempt,head_sha}]}"
+            ),
         ),
         (
             "gh",
@@ -340,9 +446,13 @@ def test_runner_allows_only_closed_wave0_gh_api_calls(
         (
             "gh",
             "api",
-            f"repos/{REPOSITORY}/environments/nonprod/variables/AWS_WAVE0_ROLE_ARN",
+            f"repos/{REPOSITORY}/actions/runs/1001/artifacts?per_page=100",
             "--jq",
-            "{name,value}",
+            (
+                "{total_count,artifacts:[.artifacts[]|"
+                "{id,name,size_in_bytes,expired,expires_at,"
+                "workflow_run:{id:.workflow_run.id,head_sha:.workflow_run.head_sha}}]}"
+            ),
         ),
     )
     assert all(run_command(command).returncode == 0 for command in allowed_commands)
@@ -371,6 +481,59 @@ def test_runner_allows_only_closed_wave0_gh_api_calls(
     ),
 )
 def test_runner_rejects_mutating_aws_npm_npx_and_gh_forms(
+    command: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def must_not_run(*args: object, **kwargs: object) -> None:
+        raise AssertionError("rejected command reached subprocess")
+
+    monkeypatch.setattr(subprocess, "run", must_not_run)
+    with pytest.raises(ValueError, match="wave0_command_not_allowed"):
+        run_command(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        (
+            "gh",
+            "run",
+            "download",
+            "1001",
+            "--repo",
+            REPOSITORY,
+            "--name",
+            "wrong-artifact",
+            "--dir",
+            "/tmp/.artifacts/aws/wave0/oidc-download-1001-0123456789abcdef/nonprod",
+        ),
+        (
+            "gh",
+            "run",
+            "download",
+            "1002",
+            "--repo",
+            REPOSITORY,
+            "--name",
+            "mercury-wave0-oidc-account-proof-nonprod",
+            "--dir",
+            "/tmp/.artifacts/aws/wave0/oidc-download-1001-0123456789abcdef/nonprod",
+        ),
+        (
+            "gh",
+            "run",
+            "download",
+            "1001",
+            "--repo",
+            REPOSITORY,
+            "--name",
+            "mercury-wave0-oidc-account-proof-nonprod",
+            "--dir",
+            "/tmp/arbitrary",
+        ),
+    ),
+)
+def test_runner_rejects_arbitrary_gh_download_names_runs_and_destinations(
     command: tuple[str, ...],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -767,19 +930,23 @@ def fabricated_oidc() -> tuple[OidcRunEvidence, ...]:
         head_sha = f"{run_id:040x}"
         workflow_id = run_id + 10_000
         job_id = run_id * 10 + (1 if environment == "nonprod" else 2)
+        run_attempt = 1
         account_fingerprint = fingerprint_account_id(
             "123456789012" if environment == "nonprod" else "210987654321"
         )
+        account_proof_sha256 = hashlib.sha256(b"fabricated-proof").hexdigest()
         canonical = json.dumps(
             {
                 "account_fingerprint": account_fingerprint,
+                "account_proof_sha256": account_proof_sha256,
                 "environment": environment,
                 "head_sha": head_sha,
                 "job_id": job_id,
                 "repository": REPOSITORY,
                 "run_id": run_id,
+                "run_attempt": run_attempt,
                 "run_url_sha256": hashlib.sha256(run_url.encode("utf-8")).hexdigest(),
-                "schema_version": "mercury.aws.wave0.oidc_run_evidence.v3",
+                "schema_version": "mercury.aws.wave0.oidc_run_evidence.v4",
                 "workflow_id": workflow_id,
                 "workflow_path": WORKFLOW_FILE,
                 "workflow_sha256": workflow_sha256,
@@ -793,11 +960,13 @@ def fabricated_oidc() -> tuple[OidcRunEvidence, ...]:
                 environment=environment,
                 run_url=run_url,
                 run_id=run_id,
+                run_attempt=run_attempt,
                 head_sha=head_sha,
                 workflow_id=workflow_id,
                 workflow_sha256=workflow_sha256,
                 job_id=job_id,
                 account_fingerprint=account_fingerprint,
+                account_proof_sha256=account_proof_sha256,
                 evidence_sha256=hashlib.sha256(canonical).hexdigest(),
             )
         )
@@ -1056,6 +1225,8 @@ def test_oidc_models_are_closed_frozen_and_canonically_bound() -> None:
     evidence = valid_oidc()[0]
     assert evidence.environment == "nonprod"
     assert evidence.run_id == 1001
+    assert evidence.run_attempt == 1
+    assert len(evidence.account_proof_sha256) == 64
     assert evidence.evidence_sha256 != hashlib.sha256(
         str(evidence.run_url).encode("utf-8")
     ).hexdigest()
@@ -1064,7 +1235,7 @@ def test_oidc_models_are_closed_frozen_and_canonically_bound() -> None:
         evidence.environment = "production"
     with pytest.raises(ValidationError):
         OidcRunEvidence.model_validate(
-            {**evidence.model_dump(mode="python"), "run_attempt": 1}
+            {**evidence.model_dump(mode="python"), "raw_account_id": "123456789012"}
         )
     with pytest.raises(ValidationError, match="wave0_oidc_run_url_invalid"):
         OidcRunReference(
@@ -1078,12 +1249,17 @@ def test_oidc_models_are_closed_frozen_and_canonically_bound() -> None:
     assert reference.run_url == evidence.run_url
 
 
-def test_oidc_verifier_uses_closed_gh_api_calls_and_returns_no_raw_payload() -> None:
+def test_oidc_verifier_uses_closed_gh_calls_and_returns_no_raw_payload(
+    tmp_path: Path,
+) -> None:
     reference = oidc_reference("nonprod", 1001)
     runner = VerifiedGhRunner.for_references((reference,))
 
     evidence = verify_oidc_runs(
-        (reference,), expected_account_fingerprints((reference,)), runner
+        (reference,),
+        expected_account_fingerprints((reference,)),
+        runner,
+        repository_root=tmp_path,
     )
 
     assert len(evidence) == 1
@@ -1092,13 +1268,16 @@ def test_oidc_verifier_uses_closed_gh_api_calls_and_returns_no_raw_payload() -> 
     assert evidence[0].workflow_sha256 == hashlib.sha256(
         WORKFLOW_PATH.read_bytes()
     ).hexdigest()
-    assert len(runner.calls) == 5
-    assert all(call[:2] == ("gh", "api") for call in runner.calls)
+    assert len(runner.calls) == 6
+    assert sum(call[:2] == ("gh", "api") for call in runner.calls) == 5
+    assert sum(call[:3] == ("gh", "run", "download") for call in runner.calls) == 1
     assert all("--log" not in call for call in runner.calls)
     assert "workflow_dispatch" not in evidence[0].model_dump_json()
+    assert str(tmp_path) not in evidence[0].model_dump_json()
+    assert not any((tmp_path / ".artifacts/aws/wave0").iterdir())
 
 
-def test_oidc_verifier_binds_each_environment_role_to_readiness_account() -> None:
+def test_oidc_verifier_binds_each_run_artifact_to_readiness_account() -> None:
     references = valid_oidc_references()
     runner = VerifiedGhRunner.for_references(references)
     expected = {
@@ -1116,11 +1295,11 @@ def test_oidc_verifier_binds_each_environment_role_to_readiness_account() -> Non
     assert "123456789012" not in serialized
     assert "210987654321" not in serialized
     assert "arn:aws:iam" not in serialized
-    assert len(runner.calls) == 10
+    assert len(runner.calls) == 12
 
 
 @pytest.mark.parametrize(
-    "role_account_ids",
+    "proof_account_ids",
     (
         {
             EnvironmentName.NONPROD: "123456789012",
@@ -1132,13 +1311,13 @@ def test_oidc_verifier_binds_each_environment_role_to_readiness_account() -> Non
         },
     ),
 )
-def test_oidc_verifier_rejects_same_or_wrong_account_role_arns(
-    role_account_ids: Mapping[EnvironmentName, str],
+def test_oidc_verifier_rejects_same_or_wrong_account_artifact_proofs(
+    proof_account_ids: Mapping[EnvironmentName, str],
 ) -> None:
     references = valid_oidc_references()
     runner = VerifiedGhRunner.for_references(
         references,
-        role_account_ids=role_account_ids,
+        proof_account_ids=proof_account_ids,
     )
     expected = {
         EnvironmentName.NONPROD: fingerprint_account_id("123456789012"),
@@ -1149,8 +1328,123 @@ def test_oidc_verifier_rejects_same_or_wrong_account_role_arns(
         verify_oidc_runs(references, expected, runner)
 
 
+def test_historical_artifact_proof_ignores_changed_current_role_arn() -> None:
+    reference = oidc_reference("nonprod", 1001)
+    runner = VerifiedGhRunner.for_references(
+        (reference,),
+        role_account_ids={
+            EnvironmentName.NONPROD: "999999999999",
+            EnvironmentName.PRODUCTION: "210987654321",
+        },
+    )
+
+    evidence = verify_oidc_runs(
+        (reference,), expected_account_fingerprints((reference,)), runner
+    )
+
+    assert evidence[0].account_fingerprint == fingerprint_account_id("123456789012")
+    assert not any("/environments/" in " ".join(call) for call in runner.calls)
+
+
+def test_forged_current_role_arn_cannot_repair_wrong_historical_artifact() -> None:
+    reference = oidc_reference("nonprod", 1001)
+    runner = VerifiedGhRunner.for_references(
+        (reference,),
+        role_account_ids={
+            EnvironmentName.NONPROD: "123456789012",
+            EnvironmentName.PRODUCTION: "210987654321",
+        },
+        proof_account_ids={
+            EnvironmentName.NONPROD: "999999999999",
+            EnvironmentName.PRODUCTION: "210987654321",
+        },
+    )
+
+    with pytest.raises(ValueError, match="wave0_oidc_account_unverified"):
+        verify_oidc_runs(
+            (reference,), expected_account_fingerprints((reference,)), runner
+        )
+    assert not any("/environments/" in " ".join(call) for call in runner.calls)
+
+
+@pytest.mark.parametrize(
+    "artifact_mutation",
+    ("missing", "duplicate", "expired", "past_expiry", "oversized", "wrong_run"),
+)
+def test_oidc_verifier_rejects_invalid_run_artifact_metadata(
+    artifact_mutation: str,
+    tmp_path: Path,
+) -> None:
+    reference = oidc_reference("nonprod", 1001)
+    runner = VerifiedGhRunner.for_references(
+        (reference,), artifact_mutation=artifact_mutation
+    )
+
+    with pytest.raises(ValueError, match="wave0_oidc_artifact_unverified"):
+        verify_oidc_runs(
+            (reference,),
+            expected_account_fingerprints((reference,)),
+            runner,
+            repository_root=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "download_mutation",
+    ("missing", "additional", "oversized", "symlink"),
+)
+def test_oidc_verifier_rejects_unsafe_downloaded_artifact_files(
+    download_mutation: str,
+    tmp_path: Path,
+) -> None:
+    reference = oidc_reference("nonprod", 1001)
+    runner = VerifiedGhRunner.for_references(
+        (reference,), download_mutation=download_mutation
+    )
+
+    with pytest.raises(ValueError, match="wave0_oidc_artifact_unverified"):
+        verify_oidc_runs(
+            (reference,),
+            expected_account_fingerprints((reference,)),
+            runner,
+            repository_root=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "proof_updates",
+    (
+        {"schema": "wrong"},
+        {"repository": "attacker/fork"},
+        {"workflow": ".github/workflows/other.yml"},
+        {"run_id": 1002},
+        {"run_attempt": 2},
+        {"head_sha": "f" * 40},
+        {"environment": "production"},
+        {"unexpected": "field"},
+    ),
+)
+def test_oidc_verifier_rejects_non_closed_or_mismatched_account_proof(
+    proof_updates: Mapping[str, object],
+    tmp_path: Path,
+) -> None:
+    reference = oidc_reference("nonprod", 1001)
+    runner = VerifiedGhRunner.for_references(
+        (reference,), proof_updates=proof_updates
+    )
+
+    with pytest.raises(ValueError, match="wave0_oidc_artifact_unverified"):
+        verify_oidc_runs(
+            (reference,),
+            expected_account_fingerprints((reference,)),
+            runner,
+            repository_root=tmp_path,
+        )
+
+
 def test_oidc_verifier_works_through_shell_free_command_runner(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     reference = oidc_reference("nonprod", 1001)
     backend = VerifiedGhRunner.for_references((reference,))
@@ -1169,9 +1463,12 @@ def test_oidc_verifier_works_through_shell_free_command_runner(
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert verify_oidc_runs(
-        (reference,), expected_account_fingerprints((reference,)), run_command
+        (reference,),
+        expected_account_fingerprints((reference,)),
+        run_command,
+        repository_root=tmp_path,
     )[0].run_id == 1001
-    assert len(backend.calls) == 5
+    assert len(backend.calls) == 6
 
 
 @pytest.mark.parametrize(
@@ -1180,6 +1477,7 @@ def test_oidc_verifier_works_through_shell_free_command_runner(
         {"event": "push"},
         {"status": "in_progress"},
         {"conclusion": "failure"},
+        {"run_attempt": 0},
         {"path": ".github/workflows/other.yml"},
         {"repository_full_name": "attacker/fork"},
         {"html_url": "https://github.com/attacker/fork/actions/runs/1001"},
@@ -1248,13 +1546,34 @@ def test_oidc_verifier_rejects_workflow_identity_or_unpinned_source() -> None:
         )
 
 
-def test_oidc_verifier_rejects_untrusted_fields_even_with_matching_source_digest(
+@pytest.mark.parametrize(
+    ("trusted_source", "untrusted_source"),
+    (
+        (
+            "aws-actions/configure-aws-credentials@"
+            "00943011d9042930efac3dcd3a170e4273319bc8",
+            "aws-actions/configure-aws-credentials@"
+            "1111111111111111111111111111111111111111",
+        ),
+        (
+            "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+            "actions/upload-artifact@1111111111111111111111111111111111111111",
+        ),
+        (
+            '"account_fingerprint": $account_fingerprint',
+            '"account_id": $account_fingerprint',
+        ),
+    ),
+)
+def test_oidc_verifier_rejects_untrusted_workflow_source_with_matching_digest(
     monkeypatch: pytest.MonkeyPatch,
+    trusted_source: str,
+    untrusted_source: str,
 ) -> None:
     reference = oidc_reference("nonprod", 1001)
     changed_source = WORKFLOW_PATH.read_text(encoding="utf-8").replace(
-        "aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8",
-        "aws-actions/configure-aws-credentials@1111111111111111111111111111111111111111",
+        trusted_source,
+        untrusted_source,
     )
     monkeypatch.setattr(
         aws_readiness,
@@ -1446,7 +1765,7 @@ def test_public_finalizer_rejects_minimal_identity_decision() -> None:
 
     assert result.gate_status == "blocked_identity_compatibility"
     assert len(result.oidc_evidence) == 2
-    assert len(runner.calls) == 10
+    assert len(runner.calls) == 12
 
 
 def test_gate_is_ready_only_after_reverified_identity_and_deleted_cognito_stack(

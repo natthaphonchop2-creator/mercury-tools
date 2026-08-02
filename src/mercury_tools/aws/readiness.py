@@ -9,6 +9,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import stat
 from collections import Counter
 from collections.abc import Mapping
@@ -109,10 +110,16 @@ _GITHUB_RUN_PATH_RE = re.compile(
     r"^/natthaphonchop2-creator/mercury-tools/actions/runs/([1-9]\d*)/?$"
 )
 _GITHUB_WORKFLOW_PATH = ".github/workflows/aws-wave0-oidc-smoke.yml"
-_GITHUB_WORKFLOW_SHA256 = "6a4da75fb63a43b3a9e0bfa480cde3251aea0fa0c6459afa501d40c9bc4b9ded"
+_GITHUB_WORKFLOW_SHA256 = "53378877958f357758160f59712de569023c5918c6369b430813e02ed9a10b0e"
 _GITHUB_CREDENTIALS_ACTION = (
     "aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8"
 )
+_GITHUB_UPLOAD_ACTION = (
+    "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+)
+_OIDC_ACCOUNT_PROOF_SCHEMA = "mercury.aws.wave0.oidc_account_proof.v1"
+_OIDC_ARTIFACT_MAX_BYTES = 65_536
+_OIDC_PROOF_MAX_BYTES = 8_192
 _COGNITO_STACK_NAME = "mercury-wave0-identity-spike"
 _COGNITO_STACK_COMMAND = (
     "aws",
@@ -129,10 +136,6 @@ _COGNITO_STACK_COMMAND = (
     "--no-cli-pager",
 )
 _GIT_SHA_RE = re.compile(r"^[a-f0-9]{40}$")
-_IAM_ROLE_ARN_RE = re.compile(
-    r"^arn:aws:iam::(?P<account_id>\d{12}):role/"
-    r"[A-Za-z0-9+=,.@_-]+(?:/[A-Za-z0-9+=,.@_-]+)*$"
-)
 _THROTTLING_MARKERS = (
     "throttl",
     "rate exceeded",
@@ -197,11 +200,13 @@ class OidcRunEvidence(OidcRunReference):
     """Closed evidence produced only after independent GitHub verification."""
 
     run_id: StrictInt = Field(gt=0)
+    run_attempt: StrictInt = Field(gt=0)
     head_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
     workflow_id: StrictInt = Field(gt=0)
     workflow_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     job_id: StrictInt = Field(gt=0)
     account_fingerprint: str = Field(pattern=r"^[a-f0-9]{12}$")
+    account_proof_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     evidence_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
 
     @model_validator(mode="after")
@@ -214,11 +219,13 @@ class OidcRunEvidence(OidcRunReference):
             environment=self.environment,
             run_url=self.run_url,
             run_id=self.run_id,
+            run_attempt=self.run_attempt,
             head_sha=self.head_sha,
             workflow_id=self.workflow_id,
             workflow_sha256=self.workflow_sha256,
             job_id=self.job_id,
             account_fingerprint=self.account_fingerprint,
+            account_proof_sha256=self.account_proof_sha256,
         )
         if not secrets.compare_digest(self.evidence_sha256, expected_hash):
             raise ValueError("wave0_oidc_evidence_hash_invalid")
@@ -251,21 +258,25 @@ def _canonical_oidc_evidence_sha256(
     environment: EnvironmentName,
     run_url: AnyHttpUrl,
     run_id: int,
+    run_attempt: int,
     head_sha: str,
     workflow_id: int,
     workflow_sha256: str,
     job_id: int,
     account_fingerprint: str,
+    account_proof_sha256: str,
 ) -> str:
     payload = {
         "account_fingerprint": account_fingerprint,
+        "account_proof_sha256": account_proof_sha256,
         "environment": environment.value,
         "head_sha": head_sha,
         "job_id": job_id,
         "repository": _GITHUB_REPOSITORY,
         "run_id": run_id,
+        "run_attempt": run_attempt,
         "run_url_sha256": hashlib.sha256(str(run_url).encode("utf-8")).hexdigest(),
-        "schema_version": "mercury.aws.wave0.oidc_run_evidence.v3",
+        "schema_version": "mercury.aws.wave0.oidc_run_evidence.v4",
         "workflow_id": workflow_id,
         "workflow_path": _GITHUB_WORKFLOW_PATH,
         "workflow_sha256": workflow_sha256,
@@ -283,6 +294,8 @@ def verify_oidc_runs(
     references: tuple[OidcRunReference, ...],
     expected_account_fingerprints: Mapping[EnvironmentName, str],
     runner: CommandRunner = run_command,
+    *,
+    repository_root: Path | None = None,
 ) -> tuple[OidcRunEvidence, ...]:
     """Verify exact GitHub runs and return only closed canonical evidence."""
 
@@ -303,11 +316,13 @@ def verify_oidc_runs(
         for fingerprint in expected_account_fingerprints.values()
     ):
         raise ValueError("wave0_oidc_account_unverified")
+    root = (repository_root or Path.cwd()).resolve()
     return tuple(
         _verify_oidc_run(
             item,
             expected_account_fingerprints[item.environment],
             runner,
+            root,
         )
         for item in checked
     )
@@ -317,6 +332,7 @@ def _verify_oidc_run(
     reference: OidcRunReference,
     expected_account_fingerprint: str,
     runner: CommandRunner,
+    repository_root: Path,
 ) -> OidcRunEvidence:
     run_id = _run_id_from_url(reference.run_url)
     if run_id is None:
@@ -325,7 +341,7 @@ def _verify_oidc_run(
     run = _gh_json(
         run_endpoint,
         (
-            "{id,html_url,event,status,conclusion,head_sha,workflow_id,path,"
+            "{id,html_url,event,status,conclusion,head_sha,run_attempt,workflow_id,path,"
             "repository_full_name:.repository.full_name}"
         ),
         runner,
@@ -338,6 +354,7 @@ def _verify_oidc_run(
         "status",
         "conclusion",
         "head_sha",
+        "run_attempt",
         "workflow_id",
         "path",
         "repository_full_name",
@@ -345,6 +362,7 @@ def _verify_oidc_run(
     if set(run) != expected_run_keys:
         raise ValueError("wave0_oidc_run_unverified")
     head_sha = run["head_sha"]
+    run_attempt = run["run_attempt"]
     workflow_id = run["workflow_id"]
     if (
         type(run["id"]) is not int
@@ -355,6 +373,8 @@ def _verify_oidc_run(
         or run["conclusion"] != "success"
         or type(head_sha) is not str
         or _GIT_SHA_RE.fullmatch(head_sha) is None
+        or type(run_attempt) is not int
+        or run_attempt <= 0
         or type(workflow_id) is not int
         or workflow_id <= 0
         or run["path"] != _GITHUB_WORKFLOW_PATH
@@ -373,15 +393,19 @@ def _verify_oidc_run(
 
     jobs = _gh_json(
         f"{run_endpoint}/jobs?per_page=100",
-        "{total_count,jobs:[.jobs[]|{id,name,status,conclusion}]}",
+        (
+            "{total_count,jobs:[.jobs[]|"
+            "{id,name,status,conclusion,run_id,run_attempt,head_sha}]}"
+        ),
         runner,
         "wave0_oidc_job_unverified",
     )
-    job_id = _verified_environment_job(jobs, reference.environment)
-    account_fingerprint = _verified_oidc_account(
+    job_id = _verified_environment_job(
+        jobs,
         reference.environment,
-        expected_account_fingerprint,
-        runner,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        head_sha=head_sha,
     )
 
     source_result = runner(
@@ -403,53 +427,274 @@ def _verify_oidc_run(
     if source_result.returncode != 0 or not _workflow_source_valid(workflow_source):
         raise ValueError("wave0_oidc_workflow_source_unverified")
     workflow_sha256 = hashlib.sha256(workflow_source.encode("utf-8")).hexdigest()
+    account_fingerprint, account_proof_sha256 = _verified_oidc_account_proof(
+        environment=reference.environment,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        head_sha=head_sha,
+        expected_account_fingerprint=expected_account_fingerprint,
+        runner=runner,
+        repository_root=repository_root,
+    )
     evidence_sha256 = _canonical_oidc_evidence_sha256(
         environment=reference.environment,
         run_url=reference.run_url,
         run_id=run_id,
+        run_attempt=run_attempt,
         head_sha=head_sha,
         workflow_id=workflow_id,
         workflow_sha256=workflow_sha256,
         job_id=job_id,
         account_fingerprint=account_fingerprint,
+        account_proof_sha256=account_proof_sha256,
     )
     return OidcRunEvidence(
         environment=reference.environment,
         run_url=reference.run_url,
         run_id=run_id,
+        run_attempt=run_attempt,
         head_sha=head_sha,
         workflow_id=workflow_id,
         workflow_sha256=workflow_sha256,
         job_id=job_id,
         account_fingerprint=account_fingerprint,
+        account_proof_sha256=account_proof_sha256,
         evidence_sha256=evidence_sha256,
     )
 
 
-def _verified_oidc_account(
+def _verified_oidc_account_proof(
+    *,
     environment: EnvironmentName,
+    run_id: int,
+    run_attempt: int,
+    head_sha: str,
     expected_account_fingerprint: str,
     runner: CommandRunner,
-) -> str:
-    variable = _gh_json(
+    repository_root: Path,
+) -> tuple[str, str]:
+    artifact_name = f"mercury-wave0-oidc-account-proof-{environment.value}"
+    artifacts = _gh_json(
         (
-            f"repos/{_GITHUB_REPOSITORY}/environments/{environment.value}/"
-            "variables/AWS_WAVE0_ROLE_ARN"
+            f"repos/{_GITHUB_REPOSITORY}/actions/runs/{run_id}/"
+            "artifacts?per_page=100"
         ),
-        "{name,value}",
+        (
+            "{total_count,artifacts:[.artifacts[]|"
+            "{id,name,size_in_bytes,expired,expires_at,"
+            "workflow_run:{id:.workflow_run.id,head_sha:.workflow_run.head_sha}}]}"
+        ),
         runner,
-        "wave0_oidc_account_unverified",
+        "wave0_oidc_artifact_unverified",
     )
-    if set(variable) != {"name", "value"} or variable["name"] != "AWS_WAVE0_ROLE_ARN":
+    _verified_artifact_record(artifacts, artifact_name, run_id, head_sha)
+    proof = _download_account_proof(
+        runner=runner,
+        repository_root=repository_root,
+        environment=environment,
+        run_id=run_id,
+        artifact_name=artifact_name,
+    )
+    expected_keys = {
+        "schema",
+        "repository",
+        "workflow",
+        "run_id",
+        "run_attempt",
+        "head_sha",
+        "environment",
+        "account_fingerprint",
+    }
+    if (
+        set(proof) != expected_keys
+        or proof["schema"] != _OIDC_ACCOUNT_PROOF_SCHEMA
+        or proof["repository"] != _GITHUB_REPOSITORY
+        or proof["workflow"] != _GITHUB_WORKFLOW_PATH
+        or type(proof["run_id"]) is not int
+        or proof["run_id"] != run_id
+        or type(proof["run_attempt"]) is not int
+        or proof["run_attempt"] != run_attempt
+        or proof["head_sha"] != head_sha
+        or proof["environment"] != environment.value
+    ):
+        raise ValueError("wave0_oidc_artifact_unverified")
+    account_fingerprint = proof["account_fingerprint"]
+    if (
+        not isinstance(account_fingerprint, str)
+        or _ACCOUNT_FINGERPRINT_RE.fullmatch(account_fingerprint) is None
+        or not secrets.compare_digest(
+            account_fingerprint, expected_account_fingerprint
+        )
+    ):
         raise ValueError("wave0_oidc_account_unverified")
-    role_arn = variable["value"]
-    match = _IAM_ROLE_ARN_RE.fullmatch(role_arn) if isinstance(role_arn, str) else None
-    if match is None:
-        raise ValueError("wave0_oidc_account_unverified")
-    account_fingerprint = fingerprint_account_id(match.group("account_id"))
-    if not secrets.compare_digest(account_fingerprint, expected_account_fingerprint):
-        raise ValueError("wave0_oidc_account_unverified")
-    return account_fingerprint
+    canonical = json.dumps(
+        proof,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return account_fingerprint, hashlib.sha256(canonical).hexdigest()
+
+
+def _verified_artifact_record(
+    payload: dict[str, Any],
+    artifact_name: str,
+    run_id: int,
+    head_sha: str,
+) -> None:
+    if set(payload) != {"total_count", "artifacts"} or type(
+        payload["total_count"]
+    ) is not int:
+        raise ValueError("wave0_oidc_artifact_unverified")
+    records = payload["artifacts"]
+    if (
+        not isinstance(records, list)
+        or payload["total_count"] != len(records)
+        or len(records) > 100
+    ):
+        raise ValueError("wave0_oidc_artifact_unverified")
+    matches = [
+        item
+        for item in records
+        if isinstance(item, dict) and item.get("name") == artifact_name
+    ]
+    if len(matches) != 1:
+        raise ValueError("wave0_oidc_artifact_unverified")
+    artifact = matches[0]
+    expected_keys = {
+        "id",
+        "name",
+        "size_in_bytes",
+        "expired",
+        "expires_at",
+        "workflow_run",
+    }
+    expires_at = artifact.get("expires_at")
+    try:
+        expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("wave0_oidc_artifact_unverified") from None
+    if (
+        set(artifact) != expected_keys
+        or type(artifact["id"]) is not int
+        or artifact["id"] <= 0
+        or type(artifact["size_in_bytes"]) is not int
+        or not 0 < artifact["size_in_bytes"] <= _OIDC_ARTIFACT_MAX_BYTES
+        or artifact["expired"] is not False
+        or expiry.tzinfo is None
+        or expiry <= datetime.now(UTC)
+        or artifact["workflow_run"] != {"id": run_id, "head_sha": head_sha}
+    ):
+        raise ValueError("wave0_oidc_artifact_unverified")
+
+
+def _download_account_proof(
+    *,
+    runner: CommandRunner,
+    repository_root: Path,
+    environment: EnvironmentName,
+    run_id: int,
+    artifact_name: str,
+) -> dict[str, Any]:
+    artifact_directory_fd = _open_artifact_directory(repository_root)
+    temporary_name: str | None = None
+    temporary_fd: int | None = None
+    environment_fd: int | None = None
+    try:
+        temporary_name, temporary_fd = _create_download_directory(
+            artifact_directory_fd, run_id
+        )
+        os.mkdir(environment.value, mode=0o700, dir_fd=temporary_fd)
+        environment_fd = os.open(
+            environment.value,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=temporary_fd,
+        )
+        destination = (
+            repository_root
+            / ".artifacts/aws/wave0"
+            / temporary_name
+            / environment.value
+        )
+        result = runner(
+            (
+                "gh",
+                "run",
+                "download",
+                str(run_id),
+                "--repo",
+                _GITHUB_REPOSITORY,
+                "--name",
+                artifact_name,
+                "--dir",
+                str(destination),
+            ),
+            30,
+        )
+        if result.returncode != 0:
+            raise ValueError("wave0_oidc_artifact_unverified")
+        return _read_closed_account_proof(environment_fd, environment)
+    except OSError:
+        raise ValueError("wave0_oidc_artifact_unverified") from None
+    finally:
+        if environment_fd is not None:
+            os.close(environment_fd)
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        os.close(artifact_directory_fd)
+        if temporary_name is not None:
+            shutil.rmtree(
+                repository_root / ".artifacts/aws/wave0" / temporary_name,
+                ignore_errors=True,
+            )
+
+
+def _create_download_directory(parent_fd: int, run_id: int) -> tuple[str, int]:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    for _ in range(10):
+        name = f"oidc-download-{run_id}-{secrets.token_hex(8)}"
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+            return name, os.open(name, flags, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+    raise OSError("wave0_temporary_directory_unavailable")
+
+
+def _read_closed_account_proof(
+    directory_fd: int,
+    environment: EnvironmentName,
+) -> dict[str, Any]:
+    expected_name = f"oidc-account-proof-{environment.value}.json"
+    if os.listdir(directory_fd) != [expected_name]:
+        raise ValueError("wave0_oidc_artifact_unverified")
+    metadata = os.stat(expected_name, dir_fd=directory_fd, follow_symlinks=False)
+    if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= _OIDC_PROOF_MAX_BYTES:
+        raise ValueError("wave0_oidc_artifact_unverified")
+    descriptor = os.open(expected_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    try:
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(4_096, _OIDC_PROOF_MAX_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > _OIDC_PROOF_MAX_BYTES:
+                raise ValueError("wave0_oidc_artifact_unverified")
+    finally:
+        os.close(descriptor)
+    raw = b"".join(chunks)
+    if len(raw) != metadata.st_size:
+        raise ValueError("wave0_oidc_artifact_unverified")
+    try:
+        proof: Any = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, RecursionError, UnicodeError):
+        raise ValueError("wave0_oidc_artifact_unverified") from None
+    if not isinstance(proof, dict):
+        raise ValueError("wave0_oidc_artifact_unverified")
+    return proof
 
 
 def _gh_json(
@@ -470,7 +715,14 @@ def _gh_json(
     return payload
 
 
-def _verified_environment_job(jobs: dict[str, Any], environment: EnvironmentName) -> int:
+def _verified_environment_job(
+    jobs: dict[str, Any],
+    environment: EnvironmentName,
+    *,
+    run_id: int,
+    run_attempt: int,
+    head_sha: str,
+) -> int:
     if set(jobs) != {"total_count", "jobs"} or type(jobs["total_count"]) is not int:
         raise ValueError("wave0_oidc_job_unverified")
     records = jobs["jobs"]
@@ -490,11 +742,15 @@ def _verified_environment_job(jobs: dict[str, Any], environment: EnvironmentName
         raise ValueError("wave0_oidc_job_unverified")
     job = matches[0]
     if (
-        set(job) != {"id", "name", "status", "conclusion"}
+        set(job)
+        != {"id", "name", "status", "conclusion", "run_id", "run_attempt", "head_sha"}
         or type(job["id"]) is not int
         or job["id"] <= 0
         or job["status"] != "completed"
         or job["conclusion"] != "success"
+        or job["run_id"] != run_id
+        or job["run_attempt"] != run_attempt
+        or job["head_sha"] != head_sha
     ):
         raise ValueError("wave0_oidc_job_unverified")
     return job["id"]
@@ -509,7 +765,11 @@ def _workflow_source_valid(source: str) -> bool:
         permissions = workflow["permissions"]
         jobs = workflow["jobs"]
         job = jobs["oidc-smoke"]
-        assume_role = job["steps"][0]
+        steps = job["steps"]
+        assume_role = steps[0]
+        proof = steps[1]
+        proof_source = proof["run"]
+        upload = steps[2]
     except (KeyError, TypeError, yaml.YAMLError):
         return False
     try:
@@ -517,6 +777,7 @@ def _workflow_source_valid(source: str) -> bool:
             set(dispatch) == {"workflow_dispatch"}
             and permissions == {"contents": "read", "id-token": "write"}
             and set(jobs) == {"oidc-smoke"}
+            and len(steps) == 4
             and job.get("environment") == "${{ matrix.environment }}"
             and job.get("strategy", {}).get("fail-fast") == "false"
             and job.get("strategy", {}).get("matrix", {}).get("environment")
@@ -527,6 +788,38 @@ def _workflow_source_valid(source: str) -> bool:
                 "role-to-assume": "${{ vars.AWS_WAVE0_ROLE_ARN }}",
                 "aws-region": "ap-southeast-1",
                 "mask-aws-account-id": "true",
+            }
+            and proof.get("name") == "Create run-bound account proof"
+            and proof.get("shell") == "bash"
+            and all(
+                required in proof_source
+                for required in (
+                    "set -euo pipefail",
+                    "^[0-9]{12}$",
+                    "sha256sum",
+                    "cut -c1-12",
+                    '"schema": "mercury.aws.wave0.oidc_account_proof.v1"',
+                    '"repository": $repository',
+                    '"workflow": $workflow',
+                    '"run_id": $run_id',
+                    '"run_attempt": $run_attempt',
+                    '"head_sha": $head_sha',
+                    '"environment": $environment',
+                    '"account_fingerprint": $account_fingerprint',
+                )
+            )
+            and '"account_id":' not in proof_source
+            and upload.get("uses") == _GITHUB_UPLOAD_ACTION
+            and upload.get("with")
+            == {
+                "name": "mercury-wave0-oidc-account-proof-${{ matrix.environment }}",
+                "path": (
+                    "${{ runner.temp }}/mercury-wave0-oidc-account-proof/"
+                    "${{ matrix.environment }}/oidc-account-proof-"
+                    "${{ matrix.environment }}.json"
+                ),
+                "if-no-files-found": "error",
+                "retention-days": "1",
             }
         )
     except (AttributeError, TypeError):

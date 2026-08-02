@@ -11,7 +11,7 @@ This is a sanitized offline owner-review record. The gate was run with
 `--skip-live`; no live AWS API was called and no GitHub Actions workflow was
 dispatched. The ignored machine report is
 `.artifacts/aws/wave0/readiness.json`, mode `0600`, with SHA-256
-`734d5fadde805d22453f8dc7dd72eb70bf33af26ffcf4d94d320d9ef8091c603`.
+`0a276f890d166ccbdeb6d696e91d7b14209ce3bcfbbfd126c3843a6baf600654`.
 
 No Mercury runtime, customer data, provider credentials, or Wave 1
 infrastructure was created. No AWS account ID, principal ARN, access key,
@@ -72,13 +72,25 @@ No service or quota availability claim is made.
 - URL shape or order does not create pass evidence. When bindings exist, the
   public final gate accepts only explicit run references and independently
   verifies closed run metadata, workflow identity, the expected successful
-  matrix job, and the pinned workflow source at the run head SHA through exact,
-  shell-free allowlisted `gh api` GET calls.
-- Each run verification reads only the exact GitHub environment variable
-  `AWS_WAVE0_ROLE_ARN`, requires an exact IAM role ARN, fingerprints its account
-  ID, and compares that fingerprint with the corresponding nonprod or
-  production readiness account fingerprint. Canonical OIDC evidence contains
-  the account fingerprint, never the account ID or role ARN.
+  matrix job, run attempt, and pinned workflow source at the run head SHA through
+  exact, shell-free allowlisted `gh api` GET calls.
+- After the pinned credentials action, each matrix job calls STS without
+  printing the 12-digit account ID, computes the existing 12-character account
+  fingerprint, and uploads one closed environment-named JSON proof through
+  pinned `actions/upload-artifact` v4.6.2 with one-day retention.
+- The verifier queries the exact selected run's artifact inventory and requires
+  one non-expired bounded artifact with the expected name. It downloads only
+  that artifact through the exact allowlisted `gh run download` shape into a
+  symlink-safe temporary directory below `.artifacts/aws/wave0/`, then accepts
+  only one expected regular size-limited JSON file with the closed proof schema.
+- The proof is bound to repository, workflow, run ID, run attempt, head SHA,
+  environment, verified job, and the corresponding readiness account
+  fingerprint. Canonical OIDC evidence v4 contains only the account fingerprint
+  and canonical proof hash; it contains no account ID, role ARN, download path,
+  or raw artifact content.
+- The current GitHub environment value of `AWS_WAVE0_ROLE_ARN` is not queried or
+  used as historical proof authority. Changing or forging it after a run cannot
+  alter or repair that run's artifact evidence.
 - Caller-constructed `OidcRunEvidence`, including a matching deterministic
   digest, cannot be supplied to the public final gate to produce `ready`.
 - No `gh` or CloudFormation call ran during this blocked offline gate execution:
@@ -111,21 +123,28 @@ issuer kind, host results, account fingerprints, or stack-deletion proof.
 | Task 3 | `96931300c5e9a7e5a029112cf129f175e348db06`, `d054321da038099f82bea6e76ce42699864d3298` |
 | Task 4 | `f356e59d94d4e3c6bdfc31913557d61b386653aa`, `8ae5661eeb41c3eb4e9ec3a98cb8d32c5fb9f614` |
 | Task 5 | `36d8cc57cacd63347c7a34bf93a38fb237a3fb37`, `5314f35c2ac52efe27473998bb41fd2b1a9ec91b`, `2ac92269ecda45bef92bf70c51530c30ad32f967` |
-| Broad remediation | Based on `2ac92269ecda45bef92bf70c51530c30ad32f967`; identity proof, OIDC account binding, two-run dispatch, and exact read-only command allowlisting were remediated without entering Wave 1/runtime. |
+| Broad review base | `2ac92269ecda45bef92bf70c51530c30ad32f967` |
+| Broad remediation Fix Round 1 | `64c3be83c81f699677239b7e7141c3e7ef947d1c` |
+
+Fix Round 2 closes the remaining OIDC TOCTOU finding by replacing post-run
+environment-variable authority with the immutable run-bound artifact contract
+described above. This inventory intentionally does not attempt to name the
+commit that contains its own update.
 
 ## Offline Verification
 
 - `npm ci --ignore-scripts`: pass.
 - Exact tool version commands: pass.
 - `uv sync --extra dev`: pass.
-- Approved four-file Wave 0 pytest matrix: 136 passed.
+- Approved four-file Wave 0 pytest matrix: 164 passed.
 - Approved Ruff matrix: pass.
 - `uv run python scripts/check_aws_readiness.py --skip-live --output .artifacts/aws/wave0/readiness.json`: expected exit 2, `blocked_account_access`.
-- Exact command-shape tests reject mutating AWS, npm, npx, and GitHub forms
-  while preserving only the Wave 0 version probes and bounded read operations.
-- Whitespace checks: pass after the final Task 5 diff.
+- Exact command-shape tests reject mutating AWS, npm, npx, GitHub, and arbitrary
+  artifact-download forms while preserving only the Wave 0 version probes,
+  bounded reads, and run/name/destination-bound artifact retrieval.
+- Whitespace checks: pass after the Fix Round 2 diff.
 - The approved repository secret scan returned only its own plan command and
-  intentional pre-existing redaction fixtures; the Task 5 added-lines scan
+  intentional pre-existing redaction fixtures; the Fix Round 2 added-lines scan
   returned no matches.
 - The three pre-existing untracked RED tests remain unchanged and unstaged.
 

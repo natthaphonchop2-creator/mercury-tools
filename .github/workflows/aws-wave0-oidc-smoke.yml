@@ -33,6 +33,53 @@ jobs:
           aws-region: ap-southeast-1
           mask-aws-account-id: true
 
+      - name: Create run-bound account proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          proof_dir="${RUNNER_TEMP}/mercury-wave0-oidc-account-proof/${{ matrix.environment }}"
+          proof_file="${proof_dir}/oidc-account-proof-${{ matrix.environment }}.json"
+          mkdir -p "${proof_dir}"
+
+          account_id="$(aws sts get-caller-identity --query Account --output text --region ap-southeast-1)"
+          if [[ ! "${account_id}" =~ ^[0-9]{12}$ ]]; then
+            printf 'wave0_account_identity=invalid\n' >&2
+            exit 1
+          fi
+          account_fingerprint="$(printf '%s' "${account_id}" | sha256sum | cut -c1-12)"
+          unset account_id
+
+          jq -n \
+            --arg repository "${{ github.repository }}" \
+            --arg workflow ".github/workflows/aws-wave0-oidc-smoke.yml" \
+            --argjson run_id "${{ github.run_id }}" \
+            --argjson run_attempt "${{ github.run_attempt }}" \
+            --arg head_sha "${{ github.sha }}" \
+            --arg environment "${{ matrix.environment }}" \
+            --arg account_fingerprint "${account_fingerprint}" \
+            '{
+              "schema": "mercury.aws.wave0.oidc_account_proof.v1",
+              "repository": $repository,
+              "workflow": $workflow,
+              "run_id": $run_id,
+              "run_attempt": $run_attempt,
+              "head_sha": $head_sha,
+              "environment": $environment,
+              "account_fingerprint": $account_fingerprint
+            }' >"${proof_file}"
+          unset account_fingerprint
+          test -s "${proof_file}"
+
+      - name: Upload run-bound account proof
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mercury-wave0-oidc-account-proof-${{ matrix.environment }}
+          path: ${{ runner.temp }}/mercury-wave0-oidc-account-proof/${{ matrix.environment }}/oidc-account-proof-${{ matrix.environment }}.json
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Run read-only Wave 0 probes
         shell: bash
         run: |
@@ -40,7 +87,6 @@ jobs:
           output_dir="${RUNNER_TEMP}/mercury-wave0-oidc"
           mkdir -p "${output_dir}"
 
-          aws sts get-caller-identity --region ap-southeast-1 >"${output_dir}/sts.json" 2>&1
           aws bedrock-agentcore-control list-agent-runtimes --max-results 1 --region ap-southeast-1 >"${output_dir}/agentcore-runtimes.json" 2>&1
           aws bedrock-agentcore-control list-gateways --max-results 1 --region ap-southeast-1 >"${output_dir}/agentcore-gateways.json" 2>&1
           aws bedrock-agentcore-control list-workload-identities --max-results 1 --region ap-southeast-1 >"${output_dir}/agentcore-identities.json" 2>&1

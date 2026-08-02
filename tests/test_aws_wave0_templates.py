@@ -129,13 +129,68 @@ def test_workflow_is_manual_and_uses_oidc_only() -> None:
 
     serialized = WORKFLOW_PATH.read_text(encoding="utf-8")
     credentials_action_sha = "00943011d9042930efac3dcd3a170e4273319bc8"
+    upload_action_sha = "ea165f8d65b6e75b540449e92b4886f43607fa02"
     assert f"aws-actions/configure-aws-credentials@{credentials_action_sha}" in serialized
+    assert f"actions/upload-artifact@{upload_action_sha}" in serialized
     assert "role-to-assume: ${{ vars.AWS_WAVE0_ROLE_ARN }}" in serialized
     assert "aws-region: ap-southeast-1" in serialized
     assert "mask-aws-account-id: true" in serialized
     assert "AWS_ACCESS_KEY_ID" not in serialized
     assert "AWS_SECRET_ACCESS_KEY" not in serialized
     assert "AWS_SESSION_TOKEN" not in serialized
+
+
+def test_workflow_uploads_one_closed_run_bound_account_proof_per_environment() -> None:
+    workflow = load_workflow()
+    steps = workflow["jobs"]["oidc-smoke"]["steps"]
+    assert [step["name"] for step in steps] == [
+        "Assume Wave 0 read-only role",
+        "Create run-bound account proof",
+        "Upload run-bound account proof",
+        "Run read-only Wave 0 probes",
+    ]
+
+    proof_step = steps[1]
+    proof_source = proof_step["run"]
+    assert proof_step["shell"] == "bash"
+    assert "set -euo pipefail" in proof_source
+    assert "umask 077" in proof_source
+    assert "aws sts get-caller-identity --query Account --output text" in proof_source
+    assert "^[0-9]{12}$" in proof_source
+    assert "sha256sum" in proof_source
+    assert "cut -c1-12" in proof_source
+    assert '"schema": "mercury.aws.wave0.oidc_account_proof.v1"' in proof_source
+    for key in (
+        "repository",
+        "workflow",
+        "run_id",
+        "run_attempt",
+        "head_sha",
+        "environment",
+        "account_fingerprint",
+    ):
+        assert f'"{key}"' in proof_source
+    assert "role-to-assume" not in proof_source
+    assert "AWS_WAVE0_ROLE_ARN" not in proof_source
+
+    upload_step = steps[2]
+    assert upload_step == {
+        "name": "Upload run-bound account proof",
+        "uses": (
+            "actions/upload-artifact@"
+            "ea165f8d65b6e75b540449e92b4886f43607fa02"
+        ),
+        "with": {
+            "name": "mercury-wave0-oidc-account-proof-${{ matrix.environment }}",
+            "path": (
+                "${{ runner.temp }}/mercury-wave0-oidc-account-proof/"
+                "${{ matrix.environment }}/oidc-account-proof-"
+                "${{ matrix.environment }}.json"
+            ),
+            "if-no-files-found": "error",
+            "retention-days": "1",
+        },
+    }
 
 
 def test_workflow_targets_both_protected_github_environments() -> None:
@@ -151,7 +206,6 @@ def test_workflow_targets_both_protected_github_environments() -> None:
 def test_workflow_runs_every_probe_without_printing_probe_output() -> None:
     serialized = WORKFLOW_PATH.read_text(encoding="utf-8")
     required_commands = (
-        "sts get-caller-identity",
         "bedrock-agentcore-control list-agent-runtimes",
         "bedrock-agentcore-control list-gateways",
         "bedrock-agentcore-control list-workload-identities",
@@ -164,9 +218,10 @@ def test_workflow_runs_every_probe_without_printing_probe_output() -> None:
         "service-quotas list-service-quotas",
     )
     assert all(command in serialized for command in required_commands)
-    assert serialized.count("--region ap-southeast-1") == len(required_commands)
+    assert serialized.count("--region ap-southeast-1") == len(required_commands) + 1
     assert serialized.count('>"${output_dir}/') == len(required_commands)
     assert serialized.count("2>&1") == len(required_commands)
+    assert "sts.json" not in serialized
     assert "cat " not in serialized
     assert 'printf \'environment=%s\\n\' "${{ matrix.environment }}"' in serialized
     assert "printf 'wave0_oidc_smoke=pass\\n'" in serialized
@@ -199,6 +254,8 @@ def test_bootstrap_runbook_preserves_secret_and_live_access_boundaries() -> None
 
 def test_bootstrap_dispatches_two_exact_runs_and_binds_distinct_environment_urls() -> None:
     runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+    dispatch_block = runbook.split("## 6. Run and record the manual smoke proof", 1)[1]
+    assert "```bash\nset -euo pipefail\n" in dispatch_block
     assert 'nonprod_nonce="wave0-nonprod-$(uv run python -c' in runbook
     assert 'production_nonce="wave0-production-$(uv run python -c' in runbook
     assert 'if [ "${nonprod_nonce}" = "${production_nonce}" ]; then' in runbook
@@ -219,6 +276,18 @@ def test_bootstrap_dispatches_two_exact_runs_and_binds_distinct_environment_urls
         '  --oidc-run "production=${production_run_url}"'
     ) in runbook
     assert "gh run watch --exit-status" not in runbook
+
+
+def test_bootstrap_documents_historical_artifact_account_authority() -> None:
+    runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+    normalized = " ".join(runbook.split())
+    assert "mercury-wave0-oidc-account-proof-nonprod" in runbook
+    assert "mercury-wave0-oidc-account-proof-production" in runbook
+    assert "one-day retention" in normalized
+    assert "run ID, run attempt, head SHA, and environment" in normalized
+    assert "controlled `.artifacts/aws/wave0/`" in normalized
+    assert "current value of `AWS_WAVE0_ROLE_ARN` is not verification authority" in normalized
+    assert "reads this exact variable from each GitHub environment" not in normalized
 
 
 def test_bootstrap_describes_closed_probe_output_without_overclaiming_job_logs() -> None:

@@ -34,6 +34,8 @@ Assign the owner an appropriate temporary permission set through IAM Identity
 Center. Configure and authenticate the exact local profiles:
 
 ```bash
+set -euo pipefail
+
 aws configure sso --profile mercury-nonprod
 aws configure sso --profile mercury-prod
 aws sso login --profile mercury-nonprod
@@ -47,6 +49,8 @@ Run the secret-safe readiness command from the repository root. It stores
 machine evidence only under the ignored `.artifacts/aws/wave0/` directory:
 
 ```bash
+set -euo pipefail
+
 uv run python scripts/check_aws_readiness.py \
   --config infra/aws/wave0/environment.yaml \
   --output .artifacts/aws/wave0/readiness.json
@@ -62,6 +66,8 @@ Each member account needs the GitHub Actions OIDC provider with audience
 when it is absent, once per account:
 
 ```bash
+set -euo pipefail
+
 aws iam create-open-id-connect-provider \
   --url https://token.actions.githubusercontent.com \
   --client-id-list sts.amazonaws.com \
@@ -88,6 +94,8 @@ not print or persist it because it contains the raw account ID. Deploy the same
 template with the matching GitHub environment:
 
 ```bash
+set -euo pipefail
+
 provider_arn="$(aws iam list-open-id-connect-providers \
   --query "OpenIDConnectProviderList[?ends_with(Arn, 'oidc-provider/token.actions.githubusercontent.com')].Arn | [0]" \
   --output text --profile mercury-nonprod --region ap-southeast-1)"
@@ -115,6 +123,8 @@ Read each stack's `MercuryWave0GithubOidcRoleArn` output directly into a shell
 variable, pass it to GitHub, and unset it without echoing it:
 
 ```bash
+set -euo pipefail
+
 role_arn="$(aws cloudformation describe-stacks \
   --stack-name mercury-wave0-github-oidc \
   --query "Stacks[0].Outputs[?OutputKey=='MercuryWave0GithubOidcRoleArn'].OutputValue | [0]" \
@@ -132,11 +142,30 @@ unset role_arn
 
 `AWS_WAVE0_ROLE_ARN` is a role identifier, not an AWS credential. Never put an
 access key, secret key, session token, or AWS credential-file value in GitHub.
-The final verifier reads this exact variable from each GitHub environment with
-an allowlisted `gh api` GET, extracts the IAM role ARN account ID only in memory,
-hashes it with `fingerprint_account_id`, and requires it to match that
-environment's readiness account fingerprint. It never persists or prints the
-raw account ID or role ARN.
+The workflow consumes exactly this variable in the pinned
+`configure-aws-credentials` step. Immediately afterward, the matrix job calls
+STS, validates the account ID as 12 digits without printing it, computes
+`sha256(account_id)[:12]`, and unsets the raw value. It writes only a closed JSON
+proof containing schema, repository, workflow, run ID, run attempt, head SHA,
+environment, and account fingerprint.
+
+Each job uploads exactly one environment-named artifact through the pinned
+official `actions/upload-artifact` v4.6.2 commit, with one-day retention and
+missing-file failure:
+
+- `mercury-wave0-oidc-account-proof-nonprod`
+- `mercury-wave0-oidc-account-proof-production`
+
+The current value of `AWS_WAVE0_ROLE_ARN` is not verification authority for a
+historical run. The final verifier queries the exact run's artifact inventory,
+requires one non-expired bounded artifact with the expected name, and retrieves
+only that artifact through an allowlisted `gh run download`. Retrieval uses a
+symlink-safe temporary directory under the controlled `.artifacts/aws/wave0/`
+tree, accepts one expected regular size-limited JSON file with a closed schema,
+and removes the download after hashing the canonical proof. It binds the proof's
+run ID, run attempt, head SHA, and environment to verified run/job metadata and
+binds its account fingerprint to readiness evidence. No raw account ID, role
+ARN, download path, or artifact content enters the report or command output.
 
 ## 6. Run and record the manual smoke proof
 
@@ -144,6 +173,8 @@ Dispatch the manual workflow only after both environment variables and the
 production reviewer are configured:
 
 ```bash
+set -euo pipefail
+
 workflow="aws-wave0-oidc-smoke.yml"
 workflow_ref="$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name')"
 nonprod_nonce="wave0-nonprod-$(uv run python -c 'import uuid; print(uuid.uuid4())')"
@@ -237,3 +268,6 @@ The Mercury probe step emits only its environment and
 status logs. The workflow masks the AWS account ID and redirects all AWS probe
 stdout and stderr to runner-temporary files. A local template test pass is not
 live OIDC proof; record success only after both jobs in each selected run pass.
+Because proof artifacts expire after one day, an expired selected artifact
+fails closed and requires a new pair of dispatches; the verifier never repairs
+historical evidence from current GitHub environment configuration.
