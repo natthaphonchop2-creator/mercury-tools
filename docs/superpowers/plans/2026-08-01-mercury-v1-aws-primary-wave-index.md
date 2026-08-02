@@ -71,6 +71,10 @@ domain contracts.
 - [ ] Execute the bounded Wave 0 plan.
 - [ ] Review Wave 0 evidence and stop for owner approval.
 
+Current evidence (2026-08-02): `blocked_account_access`. Offline checks are
+recorded in `docs/superpowers/evidence/wave-0-aws-readiness.md`; live account,
+service/quota, OIDC, and identity proof remains absent. Wave 1 is not authorized.
+
 ### Wave 1: AWS Foundation
 
 **Reserved plan path:** `docs/superpowers/plans/2026-08-01-mercury-v1-wave-1-aws-foundation.md`

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -9,17 +10,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from mercury_tools.aws.commands import CommandResult, run_command
 from mercury_tools.aws.config import load_wave0_config
+from mercury_tools.aws.identity import HostName, IdentityDecision, IdentityMode
 from mercury_tools.aws.models import CheckResult, CheckState, GateStatus
 from mercury_tools.aws.readiness import (
     SERVICE_COMMANDS,
+    OidcRunEvidence,
     aggregate_gate,
     build_readiness_report,
     check_aws_accounts,
     check_local_toolchain,
     check_region_services,
+    finalize_wave0_gate,
     fingerprint_account_id,
     write_readiness_report,
 )
@@ -364,6 +369,39 @@ def build_report_fixture():
     )
 
 
+def valid_identity() -> IdentityDecision:
+    return IdentityDecision(
+        mode=IdentityMode.COGNITO_PRE_REGISTERED,
+        issuer_kind="cognito",
+        issuer_origin="cognito",
+        required_hosts=(HostName.CODEX, HostName.CHATGPT, HostName.CLAUDE),
+    )
+
+
+def oidc_run(environment: str, run_id: int) -> OidcRunEvidence:
+    run_url = (
+        "https://github.com/natthaphonchop2-creator/mercury-tools/"
+        f"actions/runs/{run_id}"
+    )
+    return OidcRunEvidence(
+        environment=environment,
+        run_url=run_url,
+        evidence_sha256=hashlib.sha256(run_url.encode("utf-8")).hexdigest(),
+    )
+
+
+def valid_oidc() -> tuple[OidcRunEvidence, ...]:
+    return (oidc_run("nonprod", 1001), oidc_run("production", 1002))
+
+
+def replace_check(report, name: str, **updates: object):
+    checks = tuple(
+        item.model_copy(update=updates) if item.name == name else item
+        for item in report.checks
+    )
+    return report.model_copy(update={"checks": checks})
+
+
 def test_report_contains_no_raw_account_or_secret() -> None:
     report = build_report_fixture()
     payload = report.model_dump_json()
@@ -554,3 +592,203 @@ def test_unknown_blocked_check_fails_closed() -> None:
         details={},
     )
     assert aggregate_gate([check]) is GateStatus.BLOCKED_IDENTITY_COMPATIBILITY
+
+
+def test_oidc_run_evidence_is_closed_frozen_and_bound_to_exact_run_url() -> None:
+    evidence = oidc_run("nonprod", 1001)
+    assert evidence.environment == "nonprod"
+
+    with pytest.raises(ValidationError):
+        evidence.environment = "production"
+    with pytest.raises(ValidationError):
+        OidcRunEvidence(
+            environment="nonprod",
+            run_url=(
+                "https://github.com/natthaphonchop2-creator/mercury-tools/"
+                "actions/runs/1001"
+            ),
+            evidence_sha256="a" * 64,
+            run_attempt=1,
+        )
+    with pytest.raises(ValidationError, match="wave0_oidc_run_url_invalid"):
+        OidcRunEvidence(
+            environment="nonprod",
+            run_url="https://example.com/actions/runs/1001",
+            evidence_sha256="a" * 64,
+        )
+    with pytest.raises(ValidationError, match="wave0_oidc_evidence_hash_invalid"):
+        OidcRunEvidence(
+            environment="nonprod",
+            run_url=(
+                "https://github.com/natthaphonchop2-creator/mercury-tools/"
+                "actions/runs/1001"
+            ),
+            evidence_sha256="a" * 64,
+        )
+
+
+def test_gate_requires_distinct_ready_accounts() -> None:
+    report = build_report_fixture()
+    report = replace_check(
+        report,
+        "production_account",
+        details={"account_fingerprint": "a" * 12},
+    )
+    report = replace_check(
+        report,
+        "nonprod_account",
+        details={"account_fingerprint": "a" * 12},
+    )
+
+    assert finalize_wave0_gate(report, valid_identity(), valid_oidc()) == (
+        "blocked_account_access"
+    )
+
+
+def test_gate_requires_every_service_and_quota_probe() -> None:
+    report = build_report_fixture()
+    report = report.model_copy(
+        update={
+            "checks": tuple(
+                item for item in report.checks if item.name != "production_agentcore_quotas"
+            )
+        },
+    )
+
+    assert finalize_wave0_gate(report, valid_identity(), valid_oidc()) == (
+        "blocked_region_service"
+    )
+
+
+def test_gate_requires_identity_and_both_oidc_jobs() -> None:
+    report = build_report_fixture()
+    assert finalize_wave0_gate(report, None, valid_oidc()) == (
+        "blocked_identity_compatibility"
+    )
+    assert finalize_wave0_gate(report, valid_identity(), valid_oidc()[:1]) == (
+        "blocked_account_access"
+    )
+
+
+def test_gate_rejects_duplicate_oidc_environment_url_or_hash() -> None:
+    report = build_report_fixture()
+    first = oidc_run("nonprod", 1001)
+    same_environment = (first, oidc_run("nonprod", 1002))
+    duplicate_url = (first, oidc_run("production", 1001))
+
+    assert finalize_wave0_gate(report, valid_identity(), same_environment) == (
+        "blocked_account_access"
+    )
+    assert finalize_wave0_gate(report, valid_identity(), duplicate_url) == (
+        "blocked_account_access"
+    )
+
+
+def test_gate_revalidates_tool_versions_codes_and_report_gate() -> None:
+    report = build_report_fixture()
+    wrong_version = replace_check(
+        report,
+        "agentcore_cli",
+        details={"version": "0.26.0"},
+    )
+    wrong_code = replace_check(report, "aws_cdk", code="tool_version_assumed")
+    forged_gate = report.model_copy(update={"gate_status": GateStatus.BLOCKED_TOOLING})
+
+    assert finalize_wave0_gate(wrong_version, valid_identity(), valid_oidc()) == (
+        "blocked_tooling"
+    )
+    assert finalize_wave0_gate(wrong_code, valid_identity(), valid_oidc()) == (
+        "blocked_tooling"
+    )
+    assert finalize_wave0_gate(forged_gate, valid_identity(), valid_oidc()) == (
+        "blocked_tooling"
+    )
+
+
+def test_gate_revalidates_region_aliases_account_codes_and_service_codes() -> None:
+    report = build_report_fixture()
+    wrong_alias = report.accounts[1].model_copy(update={"alias": "mercury-nonprod"})
+    wrong_accounts = report.model_copy(
+        update={"accounts": (report.accounts[0], wrong_alias)}
+    )
+    wrong_account_code = replace_check(
+        report, "nonprod_account", code="aws_account_assumed"
+    )
+    wrong_service_code = replace_check(
+        report, "nonprod_s3", code="aws_service_assumed"
+    )
+    wrong_region = report.model_copy(update={"primary_region": "us-east-1"})
+
+    assert finalize_wave0_gate(wrong_accounts, valid_identity(), valid_oidc()) == (
+        "blocked_account_access"
+    )
+    assert finalize_wave0_gate(wrong_account_code, valid_identity(), valid_oidc()) == (
+        "blocked_account_access"
+    )
+    assert finalize_wave0_gate(wrong_service_code, valid_identity(), valid_oidc()) == (
+        "blocked_region_service"
+    )
+    assert finalize_wave0_gate(wrong_region, valid_identity(), valid_oidc()) == (
+        "blocked_region_service"
+    )
+
+
+def test_gate_revalidates_credential_safe_report_fields() -> None:
+    unsafe_report = replace_check(
+        build_report_fixture(),
+        "nonprod_s3",
+        summary="Bearer unsafe-value",
+    )
+
+    assert finalize_wave0_gate(unsafe_report, valid_identity(), valid_oidc()) == (
+        "blocked_identity_compatibility"
+    )
+
+
+def test_gate_is_ready_only_with_complete_proof() -> None:
+    assert finalize_wave0_gate(
+        build_report_fixture(), valid_identity(), valid_oidc()
+    ) == "ready"
+
+
+def test_cli_hashes_identity_and_oidc_evidence_without_storing_urls(
+    tmp_path: Path,
+) -> None:
+    decision_path = tmp_path / "identity-decision.yaml"
+    decision_path.write_text(
+        json.dumps(valid_identity().model_dump(mode="json")), encoding="utf-8"
+    )
+    urls = tuple(str(item.run_url) for item in valid_oidc())
+    output = ROOT / ".artifacts/aws/wave0/task5-cli-test.json"
+    output.unlink(missing_ok=True)
+
+    try:
+        result = subprocess.run(
+            (
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--skip-live",
+                "--identity-decision",
+                str(decision_path),
+                "--oidc-run-url",
+                urls[0],
+                "--oidc-run-url",
+                urls[1],
+                "--output",
+                str(output),
+            ),
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 2
+        serialized = output.read_text(encoding="utf-8")
+        assert "gate_status=blocked_account_access" in result.stdout
+        assert hashlib.sha256(decision_path.read_bytes()).hexdigest() in serialized
+        for url in urls:
+            assert url not in serialized
+            assert hashlib.sha256(url.encode("utf-8")).hexdigest() in serialized
+    finally:
+        output.unlink(missing_ok=True)

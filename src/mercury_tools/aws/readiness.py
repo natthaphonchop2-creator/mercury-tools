@@ -14,10 +14,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, ValidationError, model_validator
+
 from mercury_tools.aws.commands import CommandResult, CommandRunner, run_command
+from mercury_tools.aws.identity import IdentityDecision
 from mercury_tools.aws.models import (
     CheckResult,
     CheckState,
+    EnvironmentName,
     GateStatus,
     ReadinessReport,
     Wave0Config,
@@ -82,6 +86,11 @@ SERVICE_COMMANDS = {
 
 _VERSION_RE = re.compile(r"(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)")
 _ACCOUNT_ID_RE = re.compile(r"^\d{12}$")
+_ACCOUNT_FINGERPRINT_RE = re.compile(r"^[a-f0-9]{12}$")
+_SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
+_GITHUB_RUN_PATH_RE = re.compile(
+    r"^/natthaphonchop2-creator/mercury-tools/actions/runs/[1-9]\d*/?$"
+)
 _THROTTLING_MARKERS = (
     "throttl",
     "rate exceeded",
@@ -118,6 +127,39 @@ _REGION_CODES = frozenset(
         "aurora_serverless_unavailable",
     }
 )
+
+
+class OidcRunEvidence(BaseModel):
+    """One exact GitHub Actions run reference with only its publishable digest."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    environment: EnvironmentName
+    run_url: AnyHttpUrl
+    evidence_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+    @model_validator(mode="after")
+    def validate_run_evidence(self) -> OidcRunEvidence:
+        url = self.run_url
+        if (
+            url.scheme != "https"
+            or url.host != "github.com"
+            or url.username is not None
+            or url.password is not None
+            or url.query is not None
+            or url.fragment is not None
+            or _GITHUB_RUN_PATH_RE.fullmatch(url.path) is None
+        ):
+            raise ValueError("wave0_oidc_run_url_invalid")
+        expected_hash = hashlib.sha256(str(url).encode("utf-8")).hexdigest()
+        if not secrets.compare_digest(self.evidence_sha256, expected_hash):
+            raise ValueError("wave0_oidc_evidence_hash_invalid")
+        return self
 
 
 def _check(
@@ -403,6 +445,182 @@ def aggregate_gate(checks: tuple[CheckResult, ...] | list[CheckResult]) -> GateS
     ):
         return GateStatus.BLOCKED_IDENTITY_COMPATIBILITY
     return GateStatus.READY
+
+
+def finalize_wave0_gate(
+    report: ReadinessReport,
+    identity_decision: IdentityDecision | None,
+    oidc_evidence: tuple[OidcRunEvidence, ...],
+) -> GateStatus:
+    """Independently require every exact Wave 0 proof before returning ready."""
+
+    checks = tuple(report.checks)
+    counts = Counter(item.name for item in checks)
+    by_name = {item.name: item for item in checks}
+
+    if not _final_tooling_valid(counts, by_name):
+        return GateStatus.BLOCKED_TOOLING
+    if report.gate_status is GateStatus.BLOCKED_TOOLING:
+        return GateStatus.BLOCKED_TOOLING
+
+    if not _final_accounts_valid(report, counts, by_name):
+        return GateStatus.BLOCKED_ACCOUNT_ACCESS
+    if not _final_oidc_valid(oidc_evidence):
+        return GateStatus.BLOCKED_ACCOUNT_ACCESS
+    if report.gate_status is GateStatus.BLOCKED_ACCOUNT_ACCESS:
+        return GateStatus.BLOCKED_ACCOUNT_ACCESS
+
+    if not _final_region_services_valid(report, counts, by_name):
+        return GateStatus.BLOCKED_REGION_SERVICE
+    if report.gate_status is GateStatus.BLOCKED_REGION_SERVICE:
+        return GateStatus.BLOCKED_REGION_SERVICE
+
+    if not _final_report_contract_valid(report, counts):
+        return GateStatus.BLOCKED_IDENTITY_COMPATIBILITY
+    if not _final_identity_valid(identity_decision):
+        return GateStatus.BLOCKED_IDENTITY_COMPATIBILITY
+    if report.gate_status is not GateStatus.READY:
+        return GateStatus.BLOCKED_IDENTITY_COMPATIBILITY
+    return GateStatus.READY
+
+
+def _final_tooling_valid(
+    counts: Counter[str],
+    by_name: dict[str, CheckResult],
+) -> bool:
+    if _inventory_group_invalid(counts, _TOOL_NAMES):
+        return False
+    for name in TOOL_COMMANDS:
+        check = by_name[name]
+        if check.state is not CheckState.PASS or check.code != "tool_version_verified":
+            return False
+        if set(check.details) != {"version"}:
+            return False
+        version_text = check.details["version"]
+        if not isinstance(version_text, str) or _VERSION_RE.fullmatch(version_text) is None:
+            return False
+        version = _version_tuple(version_text)
+        if version is None or not _tool_version_allowed(name, version):
+            return False
+    return True
+
+
+def _final_accounts_valid(
+    report: ReadinessReport,
+    counts: Counter[str],
+    by_name: dict[str, CheckResult],
+) -> bool:
+    expected_accounts = (
+        (EnvironmentName.NONPROD, "mercury-nonprod", EnvironmentName.NONPROD),
+        (EnvironmentName.PRODUCTION, "mercury-prod", EnvironmentName.PRODUCTION),
+    )
+    actual_accounts = tuple(
+        (account.environment, account.alias, account.github_environment)
+        for account in report.accounts
+    )
+    if actual_accounts != expected_accounts or any(
+        account.profile != account.alias for account in report.accounts
+    ):
+        return False
+    if _inventory_group_invalid(counts, _ACCOUNT_CHECK_NAMES | _ISOLATION_CHECK_NAMES):
+        return False
+
+    fingerprints: list[str] = []
+    for name in sorted(_ACCOUNT_CHECK_NAMES):
+        check = by_name[name]
+        if check.state is not CheckState.PASS or check.code != "aws_account_verified":
+            return False
+        allowed_keys = {"account_fingerprint", "oidc_evidence_sha256"}
+        if "account_fingerprint" not in check.details or not set(check.details) <= allowed_keys:
+            return False
+        fingerprint = check.details["account_fingerprint"]
+        if (
+            not isinstance(fingerprint, str)
+            or _ACCOUNT_FINGERPRINT_RE.fullmatch(fingerprint) is None
+        ):
+            return False
+        oidc_hash = check.details.get("oidc_evidence_sha256")
+        if oidc_hash is not None and (
+            not isinstance(oidc_hash, str) or _SHA256_RE.fullmatch(oidc_hash) is None
+        ):
+            return False
+        fingerprints.append(fingerprint)
+
+    isolation = by_name["aws_account_isolation"]
+    if isolation.state is not CheckState.PASS or isolation.code != "aws_accounts_isolated":
+        return False
+    if not set(isolation.details) <= {"identity_evidence_sha256"}:
+        return False
+    identity_hash = isolation.details.get("identity_evidence_sha256")
+    if identity_hash is not None and (
+        not isinstance(identity_hash, str) or _SHA256_RE.fullmatch(identity_hash) is None
+    ):
+        return False
+    return len(set(fingerprints)) == 2
+
+
+def _final_oidc_valid(oidc_evidence: tuple[OidcRunEvidence, ...]) -> bool:
+    if len(oidc_evidence) != len(EnvironmentName):
+        return False
+    try:
+        checked = tuple(
+            OidcRunEvidence.model_validate(item.model_dump(mode="python"))
+            for item in oidc_evidence
+        )
+    except (AttributeError, TypeError, ValidationError):
+        return False
+    return (
+        {item.environment for item in checked} == set(EnvironmentName)
+        and len({str(item.run_url) for item in checked}) == len(checked)
+        and len({item.evidence_sha256 for item in checked}) == len(checked)
+    )
+
+
+def _final_region_services_valid(
+    report: ReadinessReport,
+    counts: Counter[str],
+    by_name: dict[str, CheckResult],
+) -> bool:
+    if report.primary_region != "ap-southeast-1":
+        return False
+    if _inventory_group_invalid(counts, _SERVICE_CHECK_NAMES):
+        return False
+    return all(
+        by_name[name].state is CheckState.PASS
+        and by_name[name].code == "aws_service_available"
+        and not by_name[name].details
+        for name in _SERVICE_CHECK_NAMES
+    )
+
+
+def _final_report_contract_valid(
+    report: ReadinessReport,
+    counts: Counter[str],
+) -> bool:
+    try:
+        ReadinessReport.model_validate(report.model_dump(mode="python"))
+    except (AttributeError, TypeError, ValidationError):
+        return False
+    if (
+        report.schema_version != "mercury.aws.wave0.report.v1"
+        or report.github_repository != "natthaphonchop2-creator/mercury-tools"
+        or report.checked_at.tzinfo is None
+        or report.checked_at.utcoffset() is None
+    ):
+        return False
+    return set(counts) == set(_EXPECTED_CHECK_NAMES) and all(
+        counts[name] == 1 for name in _EXPECTED_CHECK_NAMES
+    )
+
+
+def _final_identity_valid(identity_decision: IdentityDecision | None) -> bool:
+    if identity_decision is None:
+        return False
+    try:
+        IdentityDecision.model_validate(identity_decision.model_dump(mode="python"))
+    except (AttributeError, TypeError, ValidationError):
+        return False
+    return True
 
 
 def _inventory_group_invalid(counts: Counter[str], expected: frozenset[str]) -> bool:
