@@ -11,17 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "infra/aws/wave0/environment.yaml"
 
 
-def test_config_locks_region_accounts_and_repository() -> None:
+def test_config_locks_region_nonprod_account_and_repository() -> None:
     config = load_wave0_config(CONFIG_PATH)
     assert config.primary_region == "ap-southeast-1"
-    assert tuple(item.alias for item in config.accounts) == (
-        "mercury-nonprod",
-        "mercury-prod",
-    )
-    assert tuple(item.github_environment for item in config.accounts) == (
-        "nonprod",
-        "production",
-    )
+    assert tuple(item.alias for item in config.accounts) == ("mercury-nonprod",)
+    assert tuple(item.github_environment for item in config.accounts) == ("nonprod",)
     assert config.github_repository == "natthaphonchop2-creator/mercury-tools"
 
 
@@ -34,12 +28,28 @@ def test_config_rejects_non_singapore_region(tmp_path: Path) -> None:
         load_wave0_config(path)
 
 
-def test_config_requires_distinct_accounts(tmp_path: Path) -> None:
+def test_config_rejects_a_production_account_in_wave0(tmp_path: Path) -> None:
     raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-    raw["accounts"][1]["alias"] = "mercury-nonprod"
+    raw["accounts"].append(
+        {
+            "environment": "production",
+            "alias": "mercury-prod",
+            "profile": "mercury-prod",
+            "github_environment": "production",
+        }
+    )
     path = tmp_path / "environment.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError, match="wave0_accounts_invalid"):
+        load_wave0_config(path)
+
+
+def test_config_rejects_missing_or_misnamed_nonprod_account(tmp_path: Path) -> None:
+    raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    raw["accounts"][0]["alias"] = "mercury-development"
+    path = tmp_path / "environment.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ValidationError, match="wave0_accounts_invalid"):
         load_wave0_config(path)
 
 

@@ -614,3 +614,5 @@ def test_runbook_requires_live_host_proof_and_cleanup_without_overclaiming() -> 
         assert required in runbook
     assert "not prove identity compatibility" in runbook
     assert "documentation claim alone is not" in " ".join(runbook.lower().split())
+    assert '--oidc-run "nonprod=${MERCURY_NONPROD_OIDC_RUN_URL:?}"' in runbook
+    assert '--oidc-run "production=' not in runbook

@@ -6,10 +6,6 @@ accounts:
     alias: mercury-nonprod
     profile: mercury-nonprod
     github_environment: nonprod
-  - environment: production
-    alias: mercury-prod
-    profile: mercury-prod
-    github_environment: production
 required_service_probes:
   - agentcore_runtime
   - agentcore_gateway

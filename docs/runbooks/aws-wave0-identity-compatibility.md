@@ -1,9 +1,10 @@
 # AWS Wave 0 identity compatibility
 
 This procedure proves one inbound identity issuer for Codex, ChatGPT, Claude,
-and the Mercury Web Console. Current status is `blocked_account_access`: these
-offline contracts do not prove identity compatibility. Do not record
-`identity-decision.yaml` until complete host evidence exists.
+and the Mercury Web Console. Current status is `blocked_account_access`: live
+nonprod STS and service/quota probes pass, but GitHub OIDC and host identity
+proof remain absent. These passing probes do not prove identity compatibility.
+Do not record `identity-decision.yaml` until complete host evidence exists.
 
 ## 1. Prepare nonprod-only inputs
 
@@ -19,8 +20,9 @@ each host.
 
 ## 2. Deploy the disposable Cognito spike
 
-Only after AWS access is restored, deploy the disposable stack in nonprod. Pass
-each callback list directly at deploy time; never commit the supplied values.
+After obtaining all three callback lists from the current host setup screens,
+deploy the disposable stack in nonprod. Pass each callback list directly at
+deploy time; never commit the supplied values.
 
 ```bash
 aws cloudformation deploy \
@@ -84,9 +86,8 @@ uv run python scripts/record_identity_probe.py decide \
 ```
 
 An incomplete, failed, mixed, or unsafe proof exits `2`, prints a stable
-`identity_*` code, and leaves `identity-decision.yaml` absent. This task is
-offline while AWS remains blocked, so do not run this command to create a
-decision now.
+`identity_*` code, and leaves `identity-decision.yaml` absent. The current host
+proof set is incomplete, so do not run this command to create a decision yet.
 
 The public readiness gate does not trust the decision file alone. Supply the
 three host-bound references explicitly when the gate is eventually run:
@@ -97,8 +98,7 @@ uv run python scripts/check_aws_readiness.py \
   --identity-proof "codex=${CODEX_PROBE_RECORD:?},${CODEX_RAW_EVIDENCE:?}" \
   --identity-proof "chatgpt=${CHATGPT_PROBE_RECORD:?},${CHATGPT_RAW_EVIDENCE:?}" \
   --identity-proof "claude=${CLAUDE_PROBE_RECORD:?},${CLAUDE_RAW_EVIDENCE:?}" \
-  --oidc-run "nonprod=${MERCURY_NONPROD_OIDC_RUN_URL:?}" \
-  --oidc-run "production=${MERCURY_PRODUCTION_OIDC_RUN_URL:?}"
+  --oidc-run "nonprod=${MERCURY_NONPROD_OIDC_RUN_URL:?}"
 ```
 
 The gate independently reloads exactly one sanitized record per host, hashes

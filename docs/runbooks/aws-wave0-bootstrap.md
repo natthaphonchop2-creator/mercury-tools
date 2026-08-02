@@ -11,17 +11,17 @@ No production customer or provider data may enter nonprod. Wave 7 creates the
 separate production account, deploys its production foundation, and proves its
 GitHub OIDC deployment path before any production canary or release.
 
-Current Task 3 status is `blocked_account_access`. The committed template and
-workflow have been verified offline, but live nonprod OIDC is not proven. Do
-not run the live sections until the current AWS account is available.
+Current Task 3 status is `blocked_account_access`. Short-lived nonprod STS and
+the required Singapore service/quota probes passed on 2026-08-02. The committed
+template and workflow are verified locally, but live nonprod OIDC is not proven
+yet.
 
-## 1. Restore account access
+## 1. Confirm account access
 
-The AWS account owner restores the management account through the approved AWS
-billing and support process, then verifies that billing and account status are
-active. Do not put account emails, passwords, support correspondence, account
-IDs, principal ARNs, cookies, or authorization headers in Git, chat, command
-logs, or committed evidence.
+The AWS account owner verifies that billing and account status remain active
+before every live proof. Do not put account emails, passwords, support
+correspondence, account IDs, principal ARNs, cookies, or authorization headers
+in Git, chat, command logs, or committed evidence.
 
 Bind the current authenticated account as `mercury-nonprod`. Do not create or
 rename a production account in Wave 0. Keep the account email in the owner's

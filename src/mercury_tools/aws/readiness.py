@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import base64
 import binascii
+import configparser
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
 import shutil
 import stat
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,6 +38,7 @@ from mercury_tools.aws.identity import (
     verify_identity_proof,
 )
 from mercury_tools.aws.models import (
+    WAVE0_ENVIRONMENTS,
     CheckResult,
     CheckState,
     EnvironmentName,
@@ -85,7 +88,13 @@ SERVICE_COMMANDS = {
         "--db-instance-class",
         "db.serverless",
         "--max-records",
-        "1",
+        "20",
+        "--query",
+        (
+            "{OrderableDBInstanceOptions: "
+            "OrderableDBInstanceOptions[0:1]."
+            "{Engine:Engine,DBInstanceClass:DBInstanceClass}}"
+        ),
     ),
     "s3": ("s3api", "list-buckets"),
     "kms": ("kms", "list-aliases", "--limit", "1"),
@@ -97,7 +106,9 @@ SERVICE_COMMANDS = {
         "--service-code",
         "bedrock-agentcore",
         "--max-results",
-        "100",
+        "20",
+        "--query",
+        "{Quotas: Quotas[].{QuotaCode:QuotaCode,Value:Value}}",
     ),
 }
 
@@ -110,12 +121,28 @@ _GITHUB_RUN_PATH_RE = re.compile(
     r"^/natthaphonchop2-creator/mercury-tools/actions/runs/([1-9]\d*)/?$"
 )
 _GITHUB_WORKFLOW_PATH = ".github/workflows/aws-wave0-oidc-smoke.yml"
-_GITHUB_WORKFLOW_SHA256 = "53378877958f357758160f59712de569023c5918c6369b430813e02ed9a10b0e"
+_GITHUB_WORKFLOW_SHA256 = "83fb7b55e395250cc87c6e66fe92faa8453e345651de6dbd0bc17a966e1b560c"
 _GITHUB_CREDENTIALS_ACTION = (
     "aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8"
 )
 _GITHUB_UPLOAD_ACTION = (
     "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+)
+_SHORT_LIVED_PROFILE_SOURCES = frozenset({"login_session", "sso_session"})
+_STATIC_CREDENTIAL_KEYS = frozenset(
+    {"aws_access_key_id", "aws_secret_access_key", "aws_session_token"}
+)
+_CREDENTIAL_ENVIRONMENT_KEYS = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+)
+_REQUIRED_AGENTCORE_QUOTA_CODES = frozenset(
+    {
+        "L-AB3B12EE",  # ListAgentRuntimeEndpoints
+        "L-DEAB43C2",  # ListWorkloadIdentities
+        "L-55F87EC2",  # Gateway inline schema size
+    }
 )
 _OIDC_ACCOUNT_PROOF_SCHEMA = "mercury.aws.wave0.oidc_account_proof.v1"
 _OIDC_ARTIFACT_MAX_BYTES = 65_536
@@ -143,26 +170,22 @@ _THROTTLING_MARKERS = (
     "requestlimitexceeded",
 )
 _TOOL_NAMES = frozenset(TOOL_COMMANDS)
-_ACCOUNT_CHECK_NAMES = frozenset({"nonprod_account", "production_account"})
-_ISOLATION_CHECK_NAMES = frozenset({"aws_account_isolation"})
+_ACCOUNT_CHECK_NAMES = frozenset({"nonprod_account"})
 _SERVICE_CHECK_NAMES = frozenset(
-    f"{environment}_{service}"
-    for environment in ("nonprod", "production")
+    f"{environment.value}_{service}"
+    for environment in WAVE0_ENVIRONMENTS
     for service in SERVICE_COMMANDS
 )
-_EXPECTED_CHECK_NAMES = (
-    _TOOL_NAMES | _ACCOUNT_CHECK_NAMES | _ISOLATION_CHECK_NAMES | _SERVICE_CHECK_NAMES
-)
+_EXPECTED_CHECK_NAMES = _TOOL_NAMES | _ACCOUNT_CHECK_NAMES | _SERVICE_CHECK_NAMES
 _ACCOUNT_ACCESS_CODES = frozenset(
     {
         "aws_account_access_blocked",
         "aws_account_response_invalid",
+        "aws_profile_not_short_lived",
         "aws_live_checks_skipped",
     }
 )
-_IDENTITY_CODES = frozenset(
-    {"aws_accounts_not_isolated", "wave0_evidence_inventory_invalid"}
-)
+_IDENTITY_CODES = frozenset({"wave0_evidence_inventory_invalid"})
 _INVENTORY_INVALID_CODE = "wave0_evidence_inventory_invalid"
 _REGION_CODES = frozenset(
     {
@@ -170,6 +193,7 @@ _REGION_CODES = frozenset(
         "aws_service_response_invalid",
         "aws_service_throttled",
         "aurora_serverless_unavailable",
+        "agentcore_quotas_unavailable",
     }
 )
 
@@ -309,6 +333,8 @@ def verify_oidc_runs(
     if len({item.environment for item in checked}) != len(checked) or len(
         {str(item.run_url) for item in checked}
     ) != len(checked):
+        raise ValueError("wave0_oidc_bindings_invalid")
+    if checked and tuple(item.environment for item in checked) != WAVE0_ENVIRONMENTS:
         raise ValueError("wave0_oidc_bindings_invalid")
     if set(expected_account_fingerprints) != {item.environment for item in checked} or any(
         not isinstance(fingerprint, str)
@@ -781,7 +807,7 @@ def _workflow_source_valid(source: str) -> bool:
             and job.get("environment") == "${{ matrix.environment }}"
             and job.get("strategy", {}).get("fail-fast") == "false"
             and job.get("strategy", {}).get("matrix", {}).get("environment")
-            == ["nonprod", "production"]
+            == ["nonprod"]
             and assume_role.get("uses") == _GITHUB_CREDENTIALS_ACTION
             and assume_role.get("with")
             == {
@@ -896,15 +922,93 @@ def fingerprint_account_id(account_id: str) -> str:
     return hashlib.sha256(account_id.encode("ascii")).hexdigest()[:12]
 
 
+ProfileSourceInspector = Callable[[str], str | None]
+
+
+def inspect_short_lived_profile(profile: str) -> str | None:
+    """Return an approved temporary source without exposing credential values."""
+
+    if any(os.environ.get(name) for name in _CREDENTIAL_ENVIRONMENT_KEYS):
+        return None
+
+    config_path = Path(
+        os.environ.get("AWS_CONFIG_FILE", str(Path.home() / ".aws" / "config"))
+    ).expanduser()
+    credentials_path = Path(
+        os.environ.get(
+            "AWS_SHARED_CREDENTIALS_FILE",
+            str(Path.home() / ".aws" / "credentials"),
+        )
+    ).expanduser()
+    config = _read_aws_ini(config_path)
+    if config is None:
+        return None
+    section = "default" if profile == "default" else f"profile {profile}"
+    if not config.has_section(section):
+        return None
+    configured_keys = {
+        key for key, value in config.items(section) if isinstance(value, str) and value.strip()
+    }
+    if configured_keys & _STATIC_CREDENTIAL_KEYS:
+        return None
+    sources = tuple(
+        source for source in _SHORT_LIVED_PROFILE_SOURCES if source in configured_keys
+    )
+    if len(sources) != 1:
+        return None
+
+    credentials = _read_aws_ini(credentials_path, missing_ok=True)
+    if credentials is None:
+        return None
+    if credentials.has_section(profile):
+        credential_keys = {
+            key
+            for key, value in credentials.items(profile)
+            if isinstance(value, str) and value.strip()
+        }
+        if credential_keys & _STATIC_CREDENTIAL_KEYS:
+            return None
+    return sources[0]
+
+
+def _read_aws_ini(
+    path: Path,
+    *,
+    missing_ok: bool = False,
+) -> configparser.RawConfigParser | None:
+    parser = configparser.RawConfigParser()
+    try:
+        if not path.exists():
+            return parser if missing_ok else None
+        if not path.is_file() or path.stat().st_size > 1_048_576:
+            return None
+        with path.open("r", encoding="utf-8") as handle:
+            parser.read_file(handle)
+    except (OSError, UnicodeError, configparser.Error):
+        return None
+    return parser
+
+
 def check_aws_accounts(
     config: Wave0Config,
     runner: CommandRunner = run_command,
+    profile_source_inspector: ProfileSourceInspector = inspect_short_lived_profile,
 ) -> tuple[CheckResult, ...]:
-    """Verify both AWS profiles and prove that their account IDs are isolated."""
+    """Verify the single nonprod AWS profile required by Wave 0."""
 
     checks: list[CheckResult] = []
-    fingerprints: list[str] = []
     for account in config.accounts:
+        credential_source = profile_source_inspector(account.profile)
+        if credential_source not in _SHORT_LIVED_PROFILE_SOURCES:
+            checks.append(
+                _check(
+                    f"{account.environment.value}_account",
+                    CheckState.BLOCKED,
+                    "aws_profile_not_short_lived",
+                    "AWS profile is not bound to an approved short-lived source.",
+                )
+            )
+            continue
         command = (
             "aws",
             "sts",
@@ -943,7 +1047,6 @@ def check_aws_accounts(
             continue
 
         fingerprint = fingerprint_account_id(account_id)
-        fingerprints.append(fingerprint)
         checks.append(
             _check(
                 f"{account.environment.value}_account",
@@ -951,23 +1054,10 @@ def check_aws_accounts(
                 "aws_account_verified",
                 "AWS account identity verified.",
                 account_fingerprint=fingerprint,
+                credential_source=credential_source,
             )
         )
 
-    if len(fingerprints) == len(config.accounts):
-        isolated = len(set(fingerprints)) == len(fingerprints)
-        checks.append(
-            _check(
-                "aws_account_isolation",
-                CheckState.PASS if isolated else CheckState.BLOCKED,
-                "aws_accounts_isolated" if isolated else "aws_accounts_not_isolated",
-                (
-                    "AWS account fingerprints are isolated."
-                    if isolated
-                    else "AWS account fingerprints are not isolated."
-                ),
-            )
-        )
     return tuple(checks)
 
 
@@ -988,7 +1078,7 @@ def check_region_services(
     config: Wave0Config,
     runner: CommandRunner = run_command,
 ) -> tuple[CheckResult, ...]:
-    """Probe every required service for both profiles in the frozen Region."""
+    """Probe every required service for the Wave 0 nonprod profile."""
 
     checks: list[CheckResult] = []
     for account in config.accounts:
@@ -1042,6 +1132,16 @@ def check_region_services(
                     )
                 )
                 continue
+            if name == "agentcore_quotas" and not _agentcore_quotas_available(payload):
+                checks.append(
+                    _check(
+                        check_name,
+                        CheckState.BLOCKED,
+                        "agentcore_quotas_unavailable",
+                        "AgentCore quota evidence did not match the required shape.",
+                    )
+                )
+                continue
             checks.append(
                 _check(
                     check_name,
@@ -1080,7 +1180,42 @@ def _parse_service_payload(output: str) -> dict[str, Any] | None:
 
 def _aurora_serverless_available(payload: dict[str, Any]) -> bool:
     options = payload.get("OrderableDBInstanceOptions")
-    return isinstance(options, list) and len(options) > 0
+    return (
+        set(payload) == {"OrderableDBInstanceOptions"}
+        and isinstance(options, list)
+        and len(options) == 1
+        and options[0]
+        == {
+            "Engine": "aurora-postgresql",
+            "DBInstanceClass": "db.serverless",
+        }
+    )
+
+
+def _agentcore_quotas_available(payload: dict[str, Any]) -> bool:
+    quotas = payload.get("Quotas")
+    shape_is_valid = (
+        set(payload) == {"Quotas"}
+        and isinstance(quotas, list)
+        and bool(quotas)
+        and all(
+            isinstance(item, dict)
+            and set(item) == {"QuotaCode", "Value"}
+            and isinstance(item["QuotaCode"], str)
+            and re.fullmatch(r"L-[A-Z0-9]{8}", item["QuotaCode"]) is not None
+            and type(item["Value"]) in {int, float}
+            and math.isfinite(item["Value"])
+            and item["Value"] > 0
+            for item in quotas
+        )
+    )
+    if not shape_is_valid:
+        return False
+    quota_values = {item["QuotaCode"]: item["Value"] for item in quotas}
+    return (
+        len(quota_values) == len(quotas)
+        and set(quota_values) >= _REQUIRED_AGENTCORE_QUOTA_CODES
+    )
 
 
 def aggregate_gate(checks: tuple[CheckResult, ...] | list[CheckResult]) -> GateStatus:
@@ -1104,9 +1239,7 @@ def aggregate_gate(checks: tuple[CheckResult, ...] | list[CheckResult]) -> GateS
         return GateStatus.BLOCKED_ACCOUNT_ACCESS
     if _inventory_group_invalid(counts, _SERVICE_CHECK_NAMES):
         return GateStatus.BLOCKED_REGION_SERVICE
-    if _inventory_group_invalid(counts, _ISOLATION_CHECK_NAMES) or any(
-        name not in _EXPECTED_CHECK_NAMES for name in counts
-    ):
+    if any(name not in _EXPECTED_CHECK_NAMES for name in counts):
         return GateStatus.BLOCKED_IDENTITY_COMPATIBILITY
     return GateStatus.READY
 
@@ -1146,7 +1279,7 @@ def finalize_wave0_gate(
                 environment: by_name[f"{environment.value}_account"].details[
                     "account_fingerprint"
                 ]
-                for environment in EnvironmentName
+                for environment in WAVE0_ENVIRONMENTS
             },
             runner,
         )
@@ -1224,7 +1357,6 @@ def _final_accounts_valid(
 ) -> bool:
     expected_accounts = (
         (EnvironmentName.NONPROD, "mercury-nonprod", EnvironmentName.NONPROD),
-        (EnvironmentName.PRODUCTION, "mercury-prod", EnvironmentName.PRODUCTION),
     )
     actual_accounts = tuple(
         (account.environment, account.alias, account.github_environment)
@@ -1234,15 +1366,19 @@ def _final_accounts_valid(
         account.profile != account.alias for account in report.accounts
     ):
         return False
-    if _inventory_group_invalid(counts, _ACCOUNT_CHECK_NAMES | _ISOLATION_CHECK_NAMES):
+    if _inventory_group_invalid(counts, _ACCOUNT_CHECK_NAMES):
         return False
 
-    fingerprints: list[str] = []
     for name in sorted(_ACCOUNT_CHECK_NAMES):
         check = by_name[name]
         if check.state is not CheckState.PASS or check.code != "aws_account_verified":
             return False
-        allowed_keys = {"account_fingerprint", "oidc_evidence_sha256"}
+        allowed_keys = {
+            "account_fingerprint",
+            "credential_source",
+            "identity_evidence_sha256",
+            "oidc_evidence_sha256",
+        }
         if "account_fingerprint" not in check.details or not set(check.details) <= allowed_keys:
             return False
         fingerprint = check.details["account_fingerprint"]
@@ -1251,28 +1387,23 @@ def _final_accounts_valid(
             or _ACCOUNT_FINGERPRINT_RE.fullmatch(fingerprint) is None
         ):
             return False
+        if check.details.get("credential_source") not in _SHORT_LIVED_PROFILE_SOURCES:
+            return False
         oidc_hash = check.details.get("oidc_evidence_sha256")
         if oidc_hash is not None and (
             not isinstance(oidc_hash, str) or _SHA256_RE.fullmatch(oidc_hash) is None
         ):
             return False
-        fingerprints.append(fingerprint)
-
-    isolation = by_name["aws_account_isolation"]
-    if isolation.state is not CheckState.PASS or isolation.code != "aws_accounts_isolated":
-        return False
-    if not set(isolation.details) <= {"identity_evidence_sha256"}:
-        return False
-    identity_hash = isolation.details.get("identity_evidence_sha256")
-    if identity_hash is not None and (
-        not isinstance(identity_hash, str) or _SHA256_RE.fullmatch(identity_hash) is None
-    ):
-        return False
-    return len(set(fingerprints)) == 2
+        identity_hash = check.details.get("identity_evidence_sha256")
+        if identity_hash is not None and (
+            not isinstance(identity_hash, str) or _SHA256_RE.fullmatch(identity_hash) is None
+        ):
+            return False
+    return True
 
 
 def _final_oidc_valid(oidc_evidence: tuple[OidcRunEvidence, ...]) -> bool:
-    if len(oidc_evidence) != len(EnvironmentName):
+    if len(oidc_evidence) != len(WAVE0_ENVIRONMENTS):
         return False
     try:
         checked = tuple(
@@ -1282,7 +1413,7 @@ def _final_oidc_valid(oidc_evidence: tuple[OidcRunEvidence, ...]) -> bool:
     except (AttributeError, TypeError, ValidationError):
         return False
     return (
-        {item.environment for item in checked} == set(EnvironmentName)
+        tuple(item.environment for item in checked) == WAVE0_ENVIRONMENTS
         and len({str(item.run_url) for item in checked}) == len(checked)
         and len({item.evidence_sha256 for item in checked}) == len(checked)
     )
@@ -1370,7 +1501,7 @@ def _expected_check_names(config: Wave0Config) -> frozenset[str]:
         for account in config.accounts
         for probe in config.required_service_probes
     }
-    return frozenset((*TOOL_COMMANDS, *account_names, "aws_account_isolation", *service_names))
+    return frozenset((*TOOL_COMMANDS, *account_names, *service_names))
 
 
 def _inventory_is_exact(config: Wave0Config, checks: tuple[CheckResult, ...]) -> bool:

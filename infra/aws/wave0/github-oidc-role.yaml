@@ -9,7 +9,6 @@ Parameters:
     Type: String
     AllowedValues:
       - nonprod
-      - production
 
 Resources:
   MercuryWave0GithubOidcRole:

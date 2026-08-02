@@ -48,6 +48,9 @@ class EnvironmentName(StrEnum):
     PRODUCTION = "production"
 
 
+WAVE0_ENVIRONMENTS = (EnvironmentName.NONPROD,)
+
+
 class ServiceProbeId(StrEnum):
     AGENTCORE_RUNTIME = "agentcore_runtime"
     AGENTCORE_GATEWAY = "agentcore_gateway"
@@ -122,10 +125,9 @@ class Wave0Config(_FrozenSafeModel):
 
     @model_validator(mode="after")
     def validate_contract(self) -> Wave0Config:
-        expected_environments = frozenset(EnvironmentName)
         if (
-            len(self.accounts) != 2
-            or {item.environment for item in self.accounts} != expected_environments
+            len(self.accounts) != len(WAVE0_ENVIRONMENTS)
+            or tuple(item.environment for item in self.accounts) != WAVE0_ENVIRONMENTS
         ):
             raise ValueError("wave0_accounts_invalid")
         if len({item.alias for item in self.accounts}) != len(self.accounts):
@@ -133,13 +135,8 @@ class Wave0Config(_FrozenSafeModel):
         if len({item.profile for item in self.accounts}) != len(self.accounts):
             raise ValueError("wave0_accounts_invalid")
         for item in self.accounts:
-            expected_alias = (
-                "mercury-nonprod"
-                if item.environment is EnvironmentName.NONPROD
-                else "mercury-prod"
-            )
             if (
-                item.alias != expected_alias
+                item.alias != "mercury-nonprod"
                 or item.profile != item.alias
                 or item.github_environment != item.environment
             ):

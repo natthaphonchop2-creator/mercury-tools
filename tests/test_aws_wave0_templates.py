@@ -62,7 +62,7 @@ def test_template_parameters_are_closed_to_github_provider_and_environments() ->
     }
     assert parameters["GitHubEnvironment"] == {
         "Type": "String",
-        "AllowedValues": ["nonprod", "production"],
+        "AllowedValues": ["nonprod"],
     }
 
 
@@ -193,13 +193,13 @@ def test_workflow_uploads_one_closed_run_bound_account_proof_per_environment() -
     }
 
 
-def test_workflow_targets_both_protected_github_environments() -> None:
+def test_workflow_targets_only_the_protected_nonprod_environment() -> None:
     workflow = load_workflow()
     jobs = workflow["jobs"]
     assert set(jobs) == {"oidc-smoke"}
     job = jobs["oidc-smoke"]
     assert job["environment"] == "${{ matrix.environment }}"
-    assert job["strategy"]["matrix"]["environment"] == ["nonprod", "production"]
+    assert job["strategy"]["matrix"]["environment"] == ["nonprod"]
     assert job["runs-on"] == "ubuntu-latest"
 
 
@@ -218,6 +218,14 @@ def test_workflow_runs_every_probe_without_printing_probe_output() -> None:
         "service-quotas list-service-quotas",
     )
     assert all(command in serialized for command in required_commands)
+    assert "--db-instance-class db.serverless --max-records 20" in serialized
+    assert (
+        "--query '{OrderableDBInstanceOptions: "
+        "OrderableDBInstanceOptions[0:1]."
+        "{Engine:Engine,DBInstanceClass:DBInstanceClass}}'"
+    ) in serialized
+    assert "--service-code bedrock-agentcore --max-results 20" in serialized
+    assert "--query '{Quotas: Quotas[].{QuotaCode:QuotaCode,Value:Value}}'" in serialized
     assert serialized.count("--region ap-southeast-1") == len(required_commands) + 1
     assert serialized.count('>"${output_dir}/') == len(required_commands)
     assert serialized.count("2>&1") == len(required_commands)
@@ -231,20 +239,19 @@ def test_bootstrap_runbook_preserves_secret_and_live_access_boundaries() -> None
     runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
     for value in (
         "mercury-nonprod",
-        "mercury-prod",
         "aws configure sso --profile mercury-nonprod",
-        "aws configure sso --profile mercury-prod",
         "aws sso login --profile mercury-nonprod",
-        "aws sso login --profile mercury-prod",
         "https://token.actions.githubusercontent.com",
         "--client-id-list sts.amazonaws.com",
         "gh variable set AWS_WAVE0_ROLE_ARN --env nonprod",
-        "gh variable set AWS_WAVE0_ROLE_ARN --env production",
         "blocked_account_access",
     ):
         assert value in runbook
+    assert "aws configure sso --profile mercury-prod" not in runbook
+    assert "aws sso login --profile mercury-prod" not in runbook
+    assert "gh variable set AWS_WAVE0_ROLE_ARN --env production" not in runbook
     assert "ap-southeast-1" in runbook
-    assert "required reviewer" in runbook.lower()
+    assert "Wave 7 creates the separate production account" in " ".join(runbook.split())
     assert "reuse" in runbook.lower()
     assert "credential file" in runbook.lower()
     assert "long-lived" in runbook.lower()
@@ -252,29 +259,24 @@ def test_bootstrap_runbook_preserves_secret_and_live_access_boundaries() -> None
     assert "not proven" in runbook
 
 
-def test_bootstrap_dispatches_two_exact_runs_and_binds_distinct_environment_urls() -> None:
+def test_bootstrap_dispatches_one_exact_nonprod_run() -> None:
     runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
     dispatch_block = runbook.split("## 6. Run and record the manual smoke proof", 1)[1]
     assert "```bash\nset -euo pipefail\n" in dispatch_block
     assert 'nonprod_nonce="wave0-nonprod-$(uv run python -c' in runbook
-    assert 'production_nonce="wave0-production-$(uv run python -c' in runbook
-    assert 'if [ "${nonprod_nonce}" = "${production_nonce}" ]; then' in runbook
     assert '-f evidence_nonce="${evidence_nonce}"' in runbook
     assert 'nonprod_run_id="$(dispatch_and_capture "${nonprod_nonce}")"' in runbook
-    assert 'production_run_id="$(dispatch_and_capture "${production_nonce}")"' in runbook
     assert '--workflow "${workflow}"' in runbook
     assert "--event workflow_dispatch" in runbook
     assert '--branch "${workflow_ref}"' in runbook
     assert "--json databaseId,displayTitle" in runbook
     assert "select(.displayTitle == $title)" in runbook
     assert 'if [ "${match_count}" -gt 1 ]; then' in runbook
-    assert 'if [ "${nonprod_run_id}" = "${production_run_id}" ]; then' in runbook
     assert 'gh run watch "${nonprod_run_id}" --exit-status' in runbook
-    assert 'gh run watch "${production_run_id}" --exit-status' in runbook
-    assert (
-        '--oidc-run "nonprod=${nonprod_run_url}" \\\n'
-        '  --oidc-run "production=${production_run_url}"'
-    ) in runbook
+    assert '--oidc-run "nonprod=${nonprod_run_url}"' in runbook
+    assert "production_nonce=" not in runbook
+    assert "production_run_id=" not in runbook
+    assert '--oidc-run "production=' not in runbook
     assert "gh run watch --exit-status" not in runbook
 
 
@@ -282,7 +284,7 @@ def test_bootstrap_documents_historical_artifact_account_authority() -> None:
     runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
     normalized = " ".join(runbook.split())
     assert "mercury-wave0-oidc-account-proof-nonprod" in runbook
-    assert "mercury-wave0-oidc-account-proof-production" in runbook
+    assert "mercury-wave0-oidc-account-proof-production" not in runbook
     assert "one-day retention" in normalized
     assert "run ID, run attempt, head SHA, and environment" in normalized
     assert "controlled `.artifacts/aws/wave0/`" in normalized

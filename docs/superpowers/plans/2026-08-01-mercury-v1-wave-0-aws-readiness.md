@@ -21,7 +21,7 @@
 - Do not accept, print, store, or commit passwords, access keys, secret keys, session tokens, provider credentials, raw JWTs, cookies, or authorization headers.
 - Machine evidence is written only under `.artifacts/aws/wave0/`, which is gitignored. Committed evidence contains statuses, hashes, Region, aliases, tool versions, and public documentation links only.
 - AWS account IDs and principal ARNs may be read transiently but account IDs appear in reports only as `sha256(account_id)[:12]` fingerprints.
-- The suspended AWS account is a known hard gate. Offline tasks may pass, but Wave 0 cannot complete until the nonprod account and its required service calls succeed.
+- Live nonprod STS and the required Singapore service/quota probes passed on 2026-08-02. Wave 0 remains blocked until the nonprod GitHub OIDC proof and the three-host identity compatibility proof pass.
 - One inbound issuer serves the plugin and Web Console. Select `cognito_pre_registered` only if Codex, ChatGPT, and Claude all pass public-client authorization code plus PKCE; otherwise select one tested `external_oidc_dcr` issuer for all hosts and the console.
 - The disposable Cognito stack contains no customer, provider, or production data and is deleted after evidence capture.
 - Keep package version `0.3.1`; do not tag or publish a release in Wave 0.
@@ -66,11 +66,11 @@ def load_wave0_config(path: Path) -> Wave0Config:
 
 def build_readiness_report(
     config: Wave0Config,
-    runner: CommandRunner,
+    checks: tuple[CheckResult, ...] | list[CheckResult],
     *,
-    checked_at: datetime,
+    checked_at: datetime | None = None,
 ) -> ReadinessReport:
-    """Run local and live checks and return sanitized evidence."""
+    """Build the frozen report model from already sanitized checks."""
 
 def decide_identity(probes: tuple[HostIdentityProbe, ...]) -> IdentityDecision:
     """Return the only issuer strategy allowed by complete host evidence."""
@@ -86,9 +86,12 @@ def record_host_probe(
 def finalize_wave0_gate(
     report: ReadinessReport,
     identity_decision: IdentityDecision | None,
-    oidc_evidence: tuple[OidcRunEvidence, ...],
-) -> GateStatus:
-    """Return ready only when every Wave 0 proof is complete."""
+    oidc_references: tuple[OidcRunReference, ...],
+    runner: CommandRunner = run_command,
+    *,
+    identity_proof_references: tuple[IdentityProofReference, ...] = (),
+) -> Wave0GateFinalization:
+    """Independently verify every Wave 0 proof in fail-closed order."""
 ```
 
 ### Task 1: Lock the Toolchain and Configuration Contract
@@ -108,7 +111,7 @@ def finalize_wave0_gate(
 - Consumes: Existing Python floor `>=3.11,<3.14`, Pydantic 2.13.4, PyYAML 6.0.3, and credential-safe validators in `mercury_tools.catalog.identity`.
 - Produces: `EnvironmentName`, `ServiceProbeId`, `GateStatus`, `CheckState`, `CheckResult`, `Wave0Config`, `ReadinessReport`, and `load_wave0_config(path: Path) -> Wave0Config`.
 
-- [ ] **Step 1: Write failing configuration tests**
+- [x] **Step 1: Write failing configuration tests**
 
 Create `tests/test_aws_wave0_config.py` with these assertions:
 
@@ -168,14 +171,14 @@ def test_node_tools_are_exactly_pinned() -> None:
     }
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `uv run pytest tests/test_aws_wave0_config.py -q`
 
 Expected: collection fails because `mercury_tools.aws` and Wave 0 files do not
 exist.
 
-- [ ] **Step 3: Add the deterministic Node toolchain**
+- [x] **Step 3: Add the deterministic Node toolchain**
 
 Create `package.json`:
 
@@ -202,7 +205,7 @@ npx --no-install cdk --version
 
 Expected: versions `0.25.0` and `2.1134.0`.
 
-- [ ] **Step 4: Implement closed models and configuration**
+- [x] **Step 4: Implement closed models and configuration**
 
 Use frozen `extra="forbid"` Pydantic models. Define exact enum values:
 
@@ -263,7 +266,7 @@ required_service_probes:
 `load_wave0_config` uses `yaml.safe_load`, rejects a non-mapping document, and
 returns `Wave0Config.model_validate(raw)`.
 
-- [ ] **Step 5: Verify GREEN and commit**
+- [x] **Step 5: Verify GREEN and commit**
 
 ```bash
 uv run pytest tests/test_aws_wave0_config.py -q
@@ -292,7 +295,7 @@ files are committed.
 - Consumes: Wave 0 models/config from Task 1 and `redact_text(value: str) -> str` from `mercury_tools.safety.redaction`.
 - Produces: `CommandResult`, `CommandRunner`, `run_command`, `check_local_toolchain`, `check_aws_accounts`, `check_region_services`, `aggregate_gate`, `build_readiness_report`, and `write_readiness_report`.
 
-- [ ] **Step 1: Write failing command, account, and gate tests**
+- [x] **Step 1: Write failing command, account, and gate tests**
 
 Create `tests/test_aws_readiness.py` with a callable fake runner and these
 cases:
@@ -355,13 +358,13 @@ def test_report_contains_no_raw_account_or_secret() -> None:
     assert "secret_access_key" not in payload.lower()
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `uv run pytest tests/test_aws_readiness.py -q`
 
 Expected: imports fail because command and readiness modules do not exist.
 
-- [ ] **Step 3: Implement the bounded command runner**
+- [x] **Step 3: Implement the bounded command runner**
 
 Use this exact public contract:
 
@@ -385,7 +388,7 @@ present. Truncate each output stream to 4,096 characters and apply
 `redact_text`. Represent timeout as return code 124 and missing executable as
 127 without including raw exception data.
 
-- [ ] **Step 4: Implement tool and AWS probes**
+- [x] **Step 4: Implement tool and AWS probes**
 
 Local commands and versions are exact:
 
@@ -408,8 +411,11 @@ For the nonprod account profile run:
 aws sts get-caller-identity --profile PROFILE --region ap-southeast-1 --output json --no-cli-pager
 ```
 
-Parse only `Account`, require 12 digits, and report only
-`sha256(account_id)[:12]`.
+Before STS, inspect only AWS profile key names. Reject environment credential
+overrides and static credential keys in either AWS config file, and require
+exactly one approved temporary source: `login_session` or `sso_session`. Parse
+only `Account` from STS, require 12 digits, and report only
+`sha256(account_id)[:12]` plus the non-secret credential-source kind.
 
 Define exact service command suffixes:
 
@@ -421,7 +427,8 @@ SERVICE_COMMANDS = {
     "bedrock_knowledge_bases": ("bedrock-agent", "list-knowledge-bases", "--max-results", "1"),
     "aurora_postgresql": (
         "rds", "describe-orderable-db-instance-options", "--engine", "aurora-postgresql",
-        "--db-instance-class", "db.serverless", "--max-records", "1"
+        "--db-instance-class", "db.serverless", "--max-records", "20", "--query",
+        "{OrderableDBInstanceOptions: OrderableDBInstanceOptions[0:1].{Engine:Engine,DBInstanceClass:DBInstanceClass}}"
     ),
     "s3": ("s3api", "list-buckets"),
     "kms": ("kms", "list-aliases", "--limit", "1"),
@@ -429,20 +436,25 @@ SERVICE_COMMANDS = {
     "cloudwatch_logs": ("logs", "describe-log-groups", "--limit", "1"),
     "agentcore_quotas": (
         "service-quotas", "list-service-quotas", "--service-code",
-        "bedrock-agentcore", "--max-results", "100"
+        "bedrock-agentcore", "--max-results", "20", "--query",
+        "{Quotas: Quotas[].{QuotaCode:QuotaCode,Value:Value}}"
     ),
 }
 ```
 
 Prefix with `aws`; append profile, Region, JSON output, and no pager. A probe
 passes only on exit 0 with valid JSON. Access denial, unavailable endpoint,
-invalid quota service, throttling after three bounded attempts, or empty Aurora
-Serverless options blocks the Region gate; do not reinterpret it as a pass.
+invalid quota service, throttling after three bounded attempts, or a missing
+exact Aurora Serverless option blocks the Region gate. AgentCore quota evidence
+must include positive values for Runtime endpoint listing (`L-AB3B12EE`),
+Identity workload listing (`L-DEAB43C2`), and Gateway inline schema size
+(`L-55F87EC2`); zero, duplicate, malformed, or missing required quota records
+block the gate. Do not reinterpret a blocked response as a pass.
 
 Gate precedence is tooling, account access, Region/service, identity, then
 ready. `ReadinessReport` uses schema `mercury.aws.wave0.report.v1`.
 
-- [ ] **Step 5: Add the CLI and ignored machine evidence**
+- [x] **Step 5: Add the CLI and ignored machine evidence**
 
 Append to `.gitignore`:
 
@@ -466,7 +478,7 @@ Exit codes are `0=ready`, `2=blocked`, `3=invalid or unsafe input`. Write JSON
 atomically with file mode `0o600`; reject output outside
 `.artifacts/aws/wave0/`.
 
-- [ ] **Step 6: Verify GREEN, exercise the known blocker, and commit**
+- [x] **Step 6: Verify GREEN, exercise the known blocker, and commit**
 
 ```bash
 uv run pytest tests/test_aws_wave0_config.py tests/test_aws_readiness.py -q
@@ -500,7 +512,7 @@ probe pass.
 - Consumes: The nonprod account profile, Region, probe list, and GitHub repository from Tasks 1-2.
 - Produces: one `MercuryWave0GithubOidcRoleArn` output in nonprod and one successful nonprod OIDC smoke job.
 
-- [ ] **Step 1: Write failing template and workflow tests**
+- [x] **Step 1: Write failing template and workflow tests**
 
 Tests parse YAML and assert:
 
@@ -541,13 +553,13 @@ def test_workflow_is_manual_and_uses_oidc_only() -> None:
     assert "mask-aws-account-id: true" in serialized
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `uv run pytest tests/test_aws_wave0_templates.py -q`
 
 Expected: failures because template/workflow files are absent.
 
-- [ ] **Step 3: Implement the read-only OIDC role and workflow**
+- [x] **Step 3: Implement the read-only OIDC role and workflow**
 
 The CloudFormation template accepts `GitHubOidcProviderArn` with an exact IAM
 OIDC provider ARN pattern and `GitHubEnvironment` fixed to `nonprod`. The role
@@ -578,7 +590,7 @@ immutable action:
 Run all required probes with output redirected to temporary files; print only
 the environment and `wave0_oidc_smoke=pass`.
 
-- [ ] **Step 4: Write the bootstrap runbook**
+- [x] **Step 4: Write the bootstrap runbook**
 
 The runbook gives exact owner actions:
 
@@ -622,9 +634,9 @@ git add infra/aws/wave0/github-oidc-role.yaml \
 git commit -m "feat: prove AWS access through GitHub OIDC"
 ```
 
-Expected: local checks pass and the nonprod job succeeds. If AWS remains suspended,
-commit offline artifacts, record `blocked_account_access`, and leave the live
-step unchecked.
+Expected: local checks pass and the nonprod job succeeds. If account access,
+OIDC assumption, or a required read-only probe fails, commit sanitized blocked
+evidence and leave the live step unchecked.
 
 ### Task 4: Decide One Identity Strategy for All Required Hosts
 
@@ -643,7 +655,7 @@ step unchecked.
 - Consumes: Nonprod short-lived AWS access and host set `codex`, `chatgpt`, `claude`.
 - Produces: `HostName`, `RegistrationMode`, `ProbeResult`, `IdentityMode`, `IdentityHostContract`, `HostIdentityProbe`, `IdentityDecision`, `record_host_probe(contract: IdentityHostContract, probe: HostIdentityProbe, evidence_path: Path, output_dir: Path) -> Path`, and `decide_identity(probes: tuple[HostIdentityProbe, ...]) -> IdentityDecision`.
 
-- [ ] **Step 1: Write failing one-issuer tests**
+- [x] **Step 1: Write failing one-issuer tests**
 
 Create tests for these exact rules:
 
@@ -698,13 +710,13 @@ def test_recorder_hashes_evidence_without_copying_bytes(tmp_path: Path) -> None:
     assert hashlib.sha256(evidence.read_bytes()).hexdigest() in serialized
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `uv run pytest tests/test_aws_identity_compatibility.py -q`
 
 Expected: imports fail because identity contracts are absent.
 
-- [ ] **Step 3: Implement host evidence and decision contracts**
+- [x] **Step 3: Implement host evidence and decision contracts**
 
 Exact enum values:
 
@@ -740,7 +752,7 @@ probes pass. Otherwise it requires all three DCR probes to pass against one
 identical external HTTPS origin. Missing evidence, mixed issuers, mixed modes,
 or a failed required probe raises a stable `identity_*` error.
 
-- [ ] **Step 4: Add the host contract and disposable Cognito stack**
+- [x] **Step 4: Add the host contract and disposable Cognito stack**
 
 `identity-host-contract.yaml` requires all three hosts, authorization-code
 flow, PKCE `S256`, refresh-token rotation expectation, and audience/resource
@@ -760,7 +772,7 @@ binding. It contains no client IDs, callback URLs, users, or secrets.
 
 The stack must not create AgentCore, customer, provider, or business resources.
 
-- [ ] **Step 5: Implement the evidence CLI and runbook**
+- [x] **Step 5: Implement the evidence CLI and runbook**
 
 CLI surface:
 
@@ -824,65 +836,91 @@ Wave 0 blocked.
 **Interfaces:**
 
 - Consumes: Readiness report, one successful nonprod OIDC run URL, and the validated identity decision.
-- Produces: `OidcRunEvidence(environment: EnvironmentName, run_url: AnyHttpUrl, evidence_sha256: str)`, `finalize_wave0_gate(report: ReadinessReport, identity_decision: IdentityDecision | None, oidc_evidence: tuple[OidcRunEvidence, ...]) -> GateStatus`, and one sanitized owner-review record.
+- Produces: closed run/job/workflow/account-bound `OidcRunEvidence`,
+  `Wave0GateFinalization(gate_status, oidc_evidence)`, and one sanitized
+  owner-review record. The public finalizer accepts untrusted
+  `OidcRunReference` values plus a bounded runner and independently constructs
+  evidence; callers cannot submit `OidcRunEvidence` directly.
 
-- [ ] **Step 1: Write failing final-gate tests**
+- [x] **Step 1: Write failing final-gate tests**
 
 ```python
 def test_gate_requires_ready_nonprod_account() -> None:
-    assert finalize_wave0_gate(
-        report_without_account_fingerprint(), valid_identity(), valid_oidc()
-    ) == "blocked_account_access"
+    report = replace_check(
+        build_report_fixture(),
+        "nonprod_account",
+        details={"account_fingerprint": "a" * 11},
+    )
+    assert finalize_status(report, valid_identity()) == "blocked_account_access"
 
 
 def test_gate_requires_every_service_and_quota_probe() -> None:
-    assert finalize_wave0_gate(
-        report_without_probe("agentcore_quotas"), valid_identity(), valid_oidc()
-    ) == "blocked_region_service"
+    report = build_report_fixture()
+    report = report.model_copy(
+        update={
+            "checks": tuple(
+                item
+                for item in report.checks
+                if item.name != "nonprod_agentcore_quotas"
+            )
+        }
+    )
+    assert finalize_status(report, valid_identity()) == "blocked_region_service"
 
 
 def test_gate_requires_identity_and_nonprod_oidc_job() -> None:
-    assert finalize_wave0_gate(ready_report(), None, valid_oidc()) == (
-        "blocked_identity_compatibility"
+    report = build_report_fixture()
+    assert finalize_status(report, None) == "blocked_identity_compatibility"
+    assert finalize_status(report, valid_identity(), ()) == "blocked_account_access"
+
+
+def test_gate_is_ready_only_with_complete_proof(tmp_path: Path) -> None:
+    references = valid_oidc_references()
+    runner = VerifiedGhRunner.for_references(references)
+    result = finalize_wave0_gate(
+        build_report_fixture(),
+        valid_identity(),
+        references,
+        runner,
+        identity_proof_references=valid_identity_proof(tmp_path),
     )
-    assert finalize_wave0_gate(ready_report(), valid_identity(), ()) == "blocked_account_access"
-
-
-def test_gate_is_ready_only_with_complete_proof() -> None:
-    assert finalize_wave0_gate(
-        ready_report(), valid_identity(), valid_oidc()
-    ) == "ready"
+    assert result.gate_status == "ready"
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `uv run pytest tests/test_aws_readiness.py -q`
 
 Expected: failures for undefined final-gate behavior.
 
-- [ ] **Step 3: Implement the independent final gate**
+- [x] **Step 3: Implement the independent final gate**
 
 The gate revalidates schema versions, Region, the `mercury-nonprod` alias and
 account fingerprint, all ten probes in nonprod, pinned tools, the nonprod OIDC
 GitHub environment, all three host identity results, and credential-safe fields.
 
-Define `OidcRunEvidence` as a frozen, extra-forbidden Pydantic model with
-`environment: EnvironmentName`, `run_url: AnyHttpUrl`, and a lowercase
-64-character `evidence_sha256`. Validate that the environment is `nonprod` and
-the URL host is `github.com` with a path beginning
-`/natthaphonchop2-creator/mercury-tools/actions/runs/`.
+Define `OidcRunReference` as the caller input containing only
+`environment: EnvironmentName` and `run_url: AnyHttpUrl`. Define the internally
+produced `OidcRunEvidence` as a frozen, extra-forbidden extension containing
+positive `run_id`, `run_attempt`, `workflow_id`, and `job_id`; exact
+`head_sha`, pinned `workflow_sha256`, sanitized `account_fingerprint`,
+`account_proof_sha256`, and canonical `evidence_sha256`. Validate that the
+environment is `nonprod`, the URL is the exact HTTPS GitHub Actions run path,
+and every evidence field is independently derived from the selected run,
+verified job, pinned workflow source, and closed downloaded proof artifact.
 
 Add CLI arguments:
 
 ```text
 --identity-decision infra/aws/wave0/identity-decision.yaml
---oidc-run-url URL
+--identity-proof HOST=PROBE_PATH,RAW_EVIDENCE_PATH
+--oidc-run nonprod=URL
 ```
 
 Store only SHA-256 hashes of identity and OIDC evidence in machine output. A
 ready result requires exactly one HTTPS nonprod GitHub Actions run URL.
 
-- [ ] **Step 4: Run the complete Wave 0 verification matrix**
+- [x] **Step 4: Run the complete Wave 0 verification matrix**
 
 ```bash
 npm ci --ignore-scripts
@@ -897,7 +935,10 @@ uv run ruff check src/mercury_tools/aws scripts/check_aws_readiness.py \
   tests/test_aws_identity_compatibility.py
 uv run python scripts/check_aws_readiness.py \
   --identity-decision infra/aws/wave0/identity-decision.yaml \
-  --oidc-run-url "$MERCURY_NONPROD_OIDC_RUN_URL" \
+  --identity-proof "codex=${CODEX_PROBE_RECORD:?},${CODEX_RAW_EVIDENCE:?}" \
+  --identity-proof "chatgpt=${CHATGPT_PROBE_RECORD:?},${CHATGPT_RAW_EVIDENCE:?}" \
+  --identity-proof "claude=${CLAUDE_PROBE_RECORD:?},${CLAUDE_RAW_EVIDENCE:?}" \
+  --oidc-run "nonprod=${MERCURY_NONPROD_OIDC_RUN_URL:?}" \
   --output .artifacts/aws/wave0/readiness.json
 git diff --check
 ```
@@ -905,7 +946,7 @@ git diff --check
 Expected: tests/lint pass; readiness exits 0 only for `ready`, otherwise exit 2
 with one exact blocked category and no sensitive output.
 
-- [ ] **Step 5: Run scope and secret checks**
+- [x] **Step 5: Run scope and secret checks**
 
 ```bash
 git status --short
@@ -943,16 +984,16 @@ Do not draft or execute Wave 1 until the owner explicitly approves Wave 0.
 
 ## Wave 0 Acceptance Checklist
 
-- [ ] AWS account suspension is resolved and the `mercury-nonprod` short-lived profile passes STS.
-- [ ] The authenticated account is recorded only as the sanitized `mercury-nonprod` fingerprint.
-- [ ] All required AgentCore, Bedrock, Aurora, S3, KMS, ECR, CloudWatch, and quota probes pass in `ap-southeast-1` for nonprod.
+- [x] AWS account suspension is resolved and the `mercury-nonprod` short-lived profile passes STS.
+- [x] The authenticated account is recorded only as the sanitized `mercury-nonprod` fingerprint.
+- [x] All required AgentCore, Bedrock, Aurora, S3, KMS, ECR, CloudWatch, and quota probes pass in `ap-southeast-1` for nonprod.
 - [ ] GitHub OIDC assumes the read-only role in `nonprod` without long-lived AWS keys.
 - [ ] Codex, ChatGPT, and Claude are covered by one identity mode and one issuer strategy.
 - [ ] The Cognito compatibility stack is deleted.
-- [ ] Machine evidence remains ignored and sanitized evidence is committed.
-- [ ] No customer/provider data, credentials, Mercury runtime, or Wave 1 infrastructure exists.
-- [ ] No production customer or provider data entered nonprod, and no production account was created or bound in Wave 0.
-- [ ] Focused tests, Ruff, whitespace checks, and secret scans pass.
+- [x] Machine evidence remains ignored and sanitized evidence is committed.
+- [x] No customer/provider data, credentials, Mercury runtime, or Wave 1 infrastructure exists.
+- [x] No production customer or provider data entered nonprod, and no production account was created or bound in Wave 0.
+- [x] Focused tests, Ruff, whitespace checks, and secret scans pass.
 - [ ] Owner reviews the evidence before Wave 1 planning begins.
 
 ## Primary References

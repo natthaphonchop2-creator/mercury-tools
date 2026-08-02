@@ -236,9 +236,11 @@ identity clients, or credential vault entries.
 - Production changes require reviewed infrastructure diffs and environment
   approval.
 
-The AWS account is currently suspended pending owner verification. Repository,
-contract, container, and IaC work may proceed offline, but no AWS deployment or
-connectivity claim may be made until STS and service access succeed.
+As of 2026-08-02, the current authenticated account is bound locally as
+`mercury-nonprod`: an approved short-lived profile source, STS access, and every
+required Singapore service/quota readiness probe pass. This does not authorize
+deployment or establish product readiness. GitHub OIDC and the Codex, ChatGPT,
+and Claude identity compatibility proof remain mandatory Wave 0 gates.
 
 ## 8. Data Architecture
 

@@ -68,6 +68,10 @@ COGNITO_STACK_COMMAND = (
 readiness_main = runpy.run_path(str(SCRIPT_PATH))["main"]
 
 
+def short_lived_profile_source(_profile: str) -> str:
+    return "login_session"
+
+
 class FakeRunner:
     def __init__(self, results: Mapping[tuple[str, ...], CommandResult]) -> None:
         self.results = dict(results)
@@ -149,9 +153,26 @@ class FakeRunner:
                     "--no-cli-pager",
                 )
                 payload = (
-                    {"OrderableDBInstanceOptions": [{"Engine": "aurora-postgresql"}]}
+                    {
+                        "OrderableDBInstanceOptions": [
+                            {
+                                "Engine": "aurora-postgresql",
+                                "DBInstanceClass": "db.serverless",
+                            }
+                        ]
+                    }
                     if name == "aurora_postgresql"
-                    else {}
+                    else (
+                        {
+                            "Quotas": [
+                                {"QuotaCode": "L-AB3B12EE", "Value": 5.0},
+                                {"QuotaCode": "L-DEAB43C2", "Value": 20.0},
+                                {"QuotaCode": "L-55F87EC2", "Value": 1.0},
+                            ]
+                        }
+                        if name == "agentcore_quotas"
+                        else {}
+                    )
                 )
                 results[command] = CommandResult(0, json.dumps(payload), "")
                 if name == failed:
@@ -178,11 +199,9 @@ class VerifiedGhRunner(FakeRunner):
         results: dict[tuple[str, ...], CommandResult] = {}
         current_role_accounts = role_account_ids or {
             EnvironmentName.NONPROD: "123456789012",
-            EnvironmentName.PRODUCTION: "210987654321",
         }
         proved_accounts = proof_account_ids or {
             EnvironmentName.NONPROD: "123456789012",
-            EnvironmentName.PRODUCTION: "210987654321",
         }
         downloads: dict[tuple[int, EnvironmentName], dict[str, bytes | tuple[str, str]]] = {}
         for reference in references:
@@ -209,20 +228,11 @@ class VerifiedGhRunner(FakeRunner):
             }
             workflow_payload.update(workflow_updates or {})
             jobs_payload: dict[str, object] = {
-                "total_count": 2,
+                "total_count": 1,
                 "jobs": [
                     {
                         "id": run_id * 10 + 1,
-                        "name": "OIDC smoke (nonprod)",
-                        "status": "completed",
-                        "conclusion": "success",
-                        "run_id": run_id,
-                        "run_attempt": run_attempt,
-                        "head_sha": head_sha,
-                    },
-                    {
-                        "id": run_id * 10 + 2,
-                        "name": "OIDC smoke (production)",
+                        "name": f"OIDC smoke ({reference.environment.value})",
                         "status": "completed",
                         "conclusion": "success",
                         "run_id": run_id,
@@ -232,22 +242,18 @@ class VerifiedGhRunner(FakeRunner):
                 ],
             }
             jobs_payload.update(job_updates or {})
-            artifacts = [
-                {
-                    "id": run_id * 10 + index,
-                    "name": f"mercury-wave0-oidc-account-proof-{environment.value}",
-                    "size_in_bytes": 512,
-                    "expired": False,
-                    "expires_at": "2099-01-01T00:00:00Z",
-                    "workflow_run": {"id": run_id, "head_sha": head_sha},
-                }
-                for index, environment in enumerate(EnvironmentName, start=1)
-            ]
-            selected_artifact = next(
-                artifact
-                for artifact in artifacts
-                if artifact["name"].endswith(reference.environment.value)
-            )
+            selected_artifact = {
+                "id": run_id * 10 + 1,
+                "name": (
+                    "mercury-wave0-oidc-account-proof-"
+                    f"{reference.environment.value}"
+                ),
+                "size_in_bytes": 512,
+                "expired": False,
+                "expires_at": "2099-01-01T00:00:00Z",
+                "workflow_run": {"id": run_id, "head_sha": head_sha},
+            }
+            artifacts = [selected_artifact]
             if artifact_mutation == "missing":
                 artifacts.remove(selected_artifact)
             elif artifact_mutation == "duplicate":
@@ -478,6 +484,18 @@ def test_runner_allows_only_closed_wave0_gh_api_calls(
             "--method",
             "PATCH",
         ),
+        (
+            "aws",
+            "sts",
+            "get-caller-identity",
+            "--profile",
+            "mercury-prod",
+            "--region",
+            "ap-southeast-1",
+            "--output",
+            "json",
+            "--no-cli-pager",
+        ),
     ),
 )
 def test_runner_rejects_mutating_aws_npm_npx_and_gh_forms(
@@ -530,6 +548,18 @@ def test_runner_rejects_mutating_aws_npm_npx_and_gh_forms(
             "mercury-wave0-oidc-account-proof-nonprod",
             "--dir",
             "/tmp/arbitrary",
+        ),
+        (
+            "gh",
+            "run",
+            "download",
+            "1001",
+            "--repo",
+            REPOSITORY,
+            "--name",
+            "mercury-wave0-oidc-account-proof-production",
+            "--dir",
+            "/tmp/.artifacts/aws/wave0/oidc-download-1001-0123456789abcdef/production",
         ),
     ),
 )
@@ -734,28 +764,87 @@ def test_account_ids_are_fingerprinted() -> None:
     assert result != "123456789012"
 
 
-def test_same_account_for_two_profiles_is_blocked() -> None:
+def test_wave0_account_probe_verifies_only_nonprod_without_isolation_check() -> None:
     config = load_wave0_config(CONFIG_PATH)
     runner = FakeRunner.for_sts_accounts(
         mercury_nonprod="123456789012",
-        mercury_prod="123456789012",
     )
-    checks = check_aws_accounts(config, runner)
-    assert any(item.code == "aws_accounts_not_isolated" for item in checks)
-    assert aggregate_gate(checks) == "blocked_identity_compatibility"
+    checks = check_aws_accounts(config, runner, short_lived_profile_source)
+    assert tuple(item.name for item in checks) == ("nonprod_account",)
+    assert checks[0].code == "aws_account_verified"
+    assert checks[0].details["credential_source"] == "login_session"
+    assert not any(item.name == "aws_account_isolation" for item in checks)
 
 
 def test_account_probe_parses_only_strict_account_shape() -> None:
     config = load_wave0_config(CONFIG_PATH)
     runner = FakeRunner.for_sts_accounts(
         mercury_nonprod="123456789012",
-        mercury_prod="210987654321",
     )
     command = next(command for command in runner.results if "mercury-nonprod" in command)
     runner.results[command] = CommandResult(0, '{"Account": 123456789012}', "")
 
-    checks = check_aws_accounts(config, runner)
+    checks = check_aws_accounts(config, runner, short_lived_profile_source)
     assert any(item.code == "aws_account_response_invalid" for item in checks)
+    assert aggregate_gate(checks) == "blocked_account_access"
+
+
+@pytest.mark.parametrize("source", ("login_session", "sso_session"))
+def test_profile_inspector_accepts_short_lived_source_without_static_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> None:
+    config_path = tmp_path / "config"
+    credentials_path = tmp_path / "credentials"
+    config_path.write_text(
+        f"[profile mercury-nonprod]\n{source} = mercury\nregion = ap-southeast-1\n",
+        encoding="utf-8",
+    )
+    credentials_path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(config_path))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(credentials_path))
+    for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+
+    assert aws_readiness.inspect_short_lived_profile("mercury-nonprod") == source
+
+
+def test_profile_inspector_rejects_static_or_environment_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config"
+    credentials_path = tmp_path / "credentials"
+    config_path.write_text(
+        "[profile mercury-nonprod]\nlogin_session = mercury\n",
+        encoding="utf-8",
+    )
+    credentials_path.write_text(
+        "[mercury-nonprod]\naws_access_key_id = placeholder\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(config_path))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(credentials_path))
+    for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+
+    assert aws_readiness.inspect_short_lived_profile("mercury-nonprod") is None
+
+    credentials_path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "placeholder")
+    assert aws_readiness.inspect_short_lived_profile("mercury-nonprod") is None
+
+
+def test_account_probe_blocks_profile_without_proven_short_lived_source() -> None:
+    config = load_wave0_config(CONFIG_PATH)
+    runner = FakeRunner.for_sts_accounts(mercury_nonprod="123456789012")
+
+    checks = check_aws_accounts(config, runner, lambda _profile: None)
+
+    assert checks[0].code == "aws_profile_not_short_lived"
+    assert checks[0].state == "blocked"
+    assert runner.calls == []
     assert aggregate_gate(checks) == "blocked_account_access"
 
 
@@ -766,6 +855,35 @@ def test_failed_required_service_blocks_region() -> None:
         FakeRunner.for_services(failed="agentcore_gateway"),
     )
     assert aggregate_gate(checks) == "blocked_region_service"
+
+
+def test_service_commands_use_valid_bounded_aurora_and_quota_queries() -> None:
+    assert SERVICE_COMMANDS["aurora_postgresql"] == (
+        "rds",
+        "describe-orderable-db-instance-options",
+        "--engine",
+        "aurora-postgresql",
+        "--db-instance-class",
+        "db.serverless",
+        "--max-records",
+        "20",
+        "--query",
+        (
+            "{OrderableDBInstanceOptions: "
+            "OrderableDBInstanceOptions[0:1]."
+            "{Engine:Engine,DBInstanceClass:DBInstanceClass}}"
+        ),
+    )
+    assert SERVICE_COMMANDS["agentcore_quotas"] == (
+        "service-quotas",
+        "list-service-quotas",
+        "--service-code",
+        "bedrock-agentcore",
+        "--max-results",
+        "20",
+        "--query",
+        "{Quotas: Quotas[].{QuotaCode:QuotaCode,Value:Value}}",
+    )
 
 
 def test_invalid_json_and_empty_aurora_options_block_region() -> None:
@@ -783,6 +901,58 @@ def test_invalid_json_and_empty_aurora_options_block_region() -> None:
     codes = {item.code for item in checks}
     assert "aws_service_response_invalid" in codes
     assert "aurora_serverless_unavailable" in codes
+    assert aggregate_gate(checks) == "blocked_region_service"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"OrderableDBInstanceOptions": [{"Engine": "mysql", "DBInstanceClass": "db.serverless"}]},
+        {"OrderableDBInstanceOptions": [{"Engine": "aurora-postgresql"}]},
+        {"unexpected": []},
+    ),
+)
+def test_malformed_aurora_serverless_payload_blocks_region(
+    payload: dict[str, object],
+) -> None:
+    config = load_wave0_config(CONFIG_PATH)
+    runner = FakeRunner.for_services()
+    command = next(command for command in runner.results if command[1] == "rds")
+    runner.results[command] = CommandResult(0, json.dumps(payload), "")
+
+    checks = check_region_services(config, runner)
+
+    assert any(item.code == "aurora_serverless_unavailable" for item in checks)
+    assert aggregate_gate(checks) == "blocked_region_service"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"Quotas": []},
+        {"Quotas": [{"QuotaCode": "invalid", "Value": 1.0}]},
+        {
+            "Quotas": [
+                {"QuotaCode": "L-AB3B12EE", "Value": 0.0},
+                {"QuotaCode": "L-DEAB43C2", "Value": 20.0},
+                {"QuotaCode": "L-55F87EC2", "Value": 1.0},
+            ]
+        },
+        {"Quotas": [{"QuotaCode": "L-8FD67D3B", "Value": 5.0}]},
+        {"unexpected": []},
+    ),
+)
+def test_empty_or_malformed_agentcore_quota_payload_blocks_region(
+    payload: dict[str, object],
+) -> None:
+    config = load_wave0_config(CONFIG_PATH)
+    runner = FakeRunner.for_services()
+    command = next(command for command in runner.results if command[1] == "service-quotas")
+    runner.results[command] = CommandResult(0, json.dumps(payload), "")
+
+    checks = check_region_services(config, runner)
+
+    assert any(item.code == "agentcore_quotas_unavailable" for item in checks)
     assert aggregate_gate(checks) == "blocked_region_service"
 
 
@@ -812,8 +982,8 @@ def build_complete_checks_fixture() -> tuple[CheckResult, ...]:
         config,
         FakeRunner.for_sts_accounts(
             mercury_nonprod="123456789012",
-            mercury_prod="210987654321",
         ),
+        short_lived_profile_source,
     )
     service_checks = check_region_services(config, FakeRunner.for_services())
     return (*local_checks, *account_checks, *service_checks)
@@ -894,19 +1064,13 @@ def oidc_reference(environment: str, run_id: int) -> OidcRunReference:
 
 
 def valid_oidc_references() -> tuple[OidcRunReference, ...]:
-    return (
-        oidc_reference("nonprod", 1001),
-        oidc_reference("production", 1002),
-    )
+    return (oidc_reference("nonprod", 1001),)
 
 
 def expected_account_fingerprints(
     references: tuple[OidcRunReference, ...],
 ) -> dict[EnvironmentName, str]:
-    account_ids = {
-        EnvironmentName.NONPROD: "123456789012",
-        EnvironmentName.PRODUCTION: "210987654321",
-    }
+    account_ids = {EnvironmentName.NONPROD: "123456789012"}
     return {
         reference.environment: fingerprint_account_id(account_ids[reference.environment])
         for reference in references
@@ -925,15 +1089,13 @@ def valid_oidc() -> tuple[OidcRunEvidence, ...]:
 def fabricated_oidc() -> tuple[OidcRunEvidence, ...]:
     evidence: list[OidcRunEvidence] = []
     workflow_sha256 = hashlib.sha256(WORKFLOW_PATH.read_bytes()).hexdigest()
-    for environment, run_id in (("nonprod", 1001), ("production", 1002)):
+    for environment, run_id in (("nonprod", 1001),):
         run_url = str(oidc_reference(environment, run_id).run_url)
         head_sha = f"{run_id:040x}"
         workflow_id = run_id + 10_000
-        job_id = run_id * 10 + (1 if environment == "nonprod" else 2)
+        job_id = run_id * 10 + 1
         run_attempt = 1
-        account_fingerprint = fingerprint_account_id(
-            "123456789012" if environment == "nonprod" else "210987654321"
-        )
+        account_fingerprint = fingerprint_account_id("123456789012")
         account_proof_sha256 = hashlib.sha256(b"fabricated-proof").hexdigest()
         canonical = json.dumps(
             {
@@ -989,7 +1151,6 @@ def cli_runner(
     runner.results.update(
         FakeRunner.for_sts_accounts(
             mercury_nonprod="123456789012",
-            mercury_prod="210987654321",
         ).results
     )
     runner.results.update(FakeRunner.for_services().results)
@@ -1201,7 +1362,7 @@ def test_gate_precedence_is_stable() -> None:
     config = load_wave0_config(CONFIG_PATH)
     checks = [
         *check_region_services(config, FakeRunner.for_services(failed="s3")),
-        *check_aws_accounts(config, FakeRunner({})),
+        *check_aws_accounts(config, FakeRunner({}), short_lived_profile_source),
         *check_local_toolchain(
             FakeRunner.with_failed_command(("npx", "--no-install", "cdk", "--version"))
         ),
@@ -1280,49 +1441,27 @@ def test_oidc_verifier_uses_closed_gh_calls_and_returns_no_raw_payload(
 def test_oidc_verifier_binds_each_run_artifact_to_readiness_account() -> None:
     references = valid_oidc_references()
     runner = VerifiedGhRunner.for_references(references)
-    expected = {
-        EnvironmentName.NONPROD: fingerprint_account_id("123456789012"),
-        EnvironmentName.PRODUCTION: fingerprint_account_id("210987654321"),
-    }
+    expected = {EnvironmentName.NONPROD: fingerprint_account_id("123456789012")}
 
     evidence = verify_oidc_runs(references, expected, runner)
 
     assert tuple(item.account_fingerprint for item in evidence) == (
         expected[EnvironmentName.NONPROD],
-        expected[EnvironmentName.PRODUCTION],
     )
     serialized = json.dumps([item.model_dump(mode="json") for item in evidence])
     assert "123456789012" not in serialized
     assert "210987654321" not in serialized
     assert "arn:aws:iam" not in serialized
-    assert len(runner.calls) == 12
+    assert len(runner.calls) == 6
 
 
-@pytest.mark.parametrize(
-    "proof_account_ids",
-    (
-        {
-            EnvironmentName.NONPROD: "123456789012",
-            EnvironmentName.PRODUCTION: "123456789012",
-        },
-        {
-            EnvironmentName.NONPROD: "999999999999",
-            EnvironmentName.PRODUCTION: "210987654321",
-        },
-    ),
-)
-def test_oidc_verifier_rejects_same_or_wrong_account_artifact_proofs(
-    proof_account_ids: Mapping[EnvironmentName, str],
-) -> None:
+def test_oidc_verifier_rejects_wrong_nonprod_account_artifact_proof() -> None:
     references = valid_oidc_references()
     runner = VerifiedGhRunner.for_references(
         references,
-        proof_account_ids=proof_account_ids,
+        proof_account_ids={EnvironmentName.NONPROD: "999999999999"},
     )
-    expected = {
-        EnvironmentName.NONPROD: fingerprint_account_id("123456789012"),
-        EnvironmentName.PRODUCTION: fingerprint_account_id("210987654321"),
-    }
+    expected = {EnvironmentName.NONPROD: fingerprint_account_id("123456789012")}
 
     with pytest.raises(ValueError, match="wave0_oidc_account_unverified"):
         verify_oidc_runs(references, expected, runner)
@@ -1332,10 +1471,7 @@ def test_historical_artifact_proof_ignores_changed_current_role_arn() -> None:
     reference = oidc_reference("nonprod", 1001)
     runner = VerifiedGhRunner.for_references(
         (reference,),
-        role_account_ids={
-            EnvironmentName.NONPROD: "999999999999",
-            EnvironmentName.PRODUCTION: "210987654321",
-        },
+        role_account_ids={EnvironmentName.NONPROD: "999999999999"},
     )
 
     evidence = verify_oidc_runs(
@@ -1350,14 +1486,8 @@ def test_forged_current_role_arn_cannot_repair_wrong_historical_artifact() -> No
     reference = oidc_reference("nonprod", 1001)
     runner = VerifiedGhRunner.for_references(
         (reference,),
-        role_account_ids={
-            EnvironmentName.NONPROD: "123456789012",
-            EnvironmentName.PRODUCTION: "210987654321",
-        },
-        proof_account_ids={
-            EnvironmentName.NONPROD: "999999999999",
-            EnvironmentName.PRODUCTION: "210987654321",
-        },
+        role_account_ids={EnvironmentName.NONPROD: "123456789012"},
+        proof_account_ids={EnvironmentName.NONPROD: "999999999999"},
     )
 
     with pytest.raises(ValueError, match="wave0_oidc_account_unverified"):
@@ -1497,20 +1627,14 @@ def test_oidc_verifier_rejects_untrusted_run_metadata(
         )
 
 
-def test_oidc_verifier_rejects_missing_or_failed_expected_environment_job() -> None:
-    reference = oidc_reference("production", 1001)
+def test_oidc_verifier_rejects_failed_nonprod_environment_job() -> None:
+    reference = oidc_reference("nonprod", 1001)
     failed_jobs = {
-        "total_count": 2,
+        "total_count": 1,
         "jobs": [
             {
                 "id": 10011,
                 "name": "OIDC smoke (nonprod)",
-                "status": "completed",
-                "conclusion": "success",
-            },
-            {
-                "id": 10012,
-                "name": "OIDC smoke (production)",
                 "status": "completed",
                 "conclusion": "failure",
             },
@@ -1595,17 +1719,25 @@ def test_oidc_verifier_with_no_references_makes_no_gh_calls() -> None:
     assert runner.calls == []
 
 
-def test_gate_requires_distinct_ready_accounts() -> None:
+def test_oidc_verifier_rejects_production_binding_in_wave0() -> None:
+    reference = oidc_reference("production", 1002)
+    runner = FakeRunner({})
+
+    with pytest.raises(ValueError, match="wave0_oidc_bindings_invalid"):
+        verify_oidc_runs(
+            (reference,),
+            {EnvironmentName.PRODUCTION: fingerprint_account_id("210987654321")},
+            runner,
+        )
+    assert runner.calls == []
+
+
+def test_gate_requires_valid_nonprod_account_fingerprint() -> None:
     report = build_report_fixture()
     report = replace_check(
         report,
-        "production_account",
-        details={"account_fingerprint": "a" * 12},
-    )
-    report = replace_check(
-        report,
         "nonprod_account",
-        details={"account_fingerprint": "a" * 12},
+        details={"account_fingerprint": "a" * 11},
     )
 
     assert finalize_status(report, valid_identity()) == "blocked_account_access"
@@ -1664,7 +1796,7 @@ def test_gate_requires_every_service_and_quota_probe() -> None:
     report = report.model_copy(
         update={
             "checks": tuple(
-                item for item in report.checks if item.name != "production_agentcore_quotas"
+                item for item in report.checks if item.name != "nonprod_agentcore_quotas"
             )
         },
     )
@@ -1672,19 +1804,20 @@ def test_gate_requires_every_service_and_quota_probe() -> None:
     assert finalize_status(report, valid_identity()) == "blocked_region_service"
 
 
-def test_gate_requires_identity_and_both_oidc_jobs() -> None:
+def test_gate_requires_identity_and_exactly_one_nonprod_oidc_job() -> None:
     report = build_report_fixture()
     assert finalize_status(report, None) == "blocked_identity_compatibility"
     assert finalize_status(
         report,
         valid_identity(),
-        valid_oidc_references()[:1],
+        (),
     ) == "blocked_account_access"
 
 
 def test_gate_rejects_duplicate_oidc_environment_url_or_hash() -> None:
     report = build_report_fixture()
-    first, second = valid_oidc_references()
+    first = valid_oidc_references()[0]
+    second = oidc_reference("nonprod", 1002)
     same_environment = (
         first,
         second.model_copy(update={"environment": first.environment}),
@@ -1716,10 +1849,8 @@ def test_gate_revalidates_tool_versions_codes_and_report_gate() -> None:
 
 def test_gate_revalidates_region_aliases_account_codes_and_service_codes() -> None:
     report = build_report_fixture()
-    wrong_alias = report.accounts[1].model_copy(update={"alias": "mercury-nonprod"})
-    wrong_accounts = report.model_copy(
-        update={"accounts": (report.accounts[0], wrong_alias)}
-    )
+    wrong_alias = report.accounts[0].model_copy(update={"alias": "mercury-development"})
+    wrong_accounts = report.model_copy(update={"accounts": (wrong_alias,)})
     wrong_account_code = replace_check(
         report, "nonprod_account", code="aws_account_assumed"
     )
@@ -1764,8 +1895,8 @@ def test_public_finalizer_rejects_minimal_identity_decision() -> None:
     )
 
     assert result.gate_status == "blocked_identity_compatibility"
-    assert len(result.oidc_evidence) == 2
-    assert len(runner.calls) == 12
+    assert len(result.oidc_evidence) == 1
+    assert len(runner.calls) == 6
 
 
 def test_gate_is_ready_only_after_reverified_identity_and_deleted_cognito_stack(
@@ -1848,10 +1979,7 @@ def test_cli_verifies_explicit_environment_bindings_and_stores_only_hashes(
     decision_path.write_text(
         json.dumps(valid_identity().model_dump(mode="json")), encoding="utf-8"
     )
-    references = (
-        oidc_reference("nonprod", 1001),
-        oidc_reference("production", 1002),
-    )
+    references = (oidc_reference("nonprod", 1001),)
     evidence = verify_oidc_runs(
         references,
         expected_account_fingerprints(references),
@@ -1913,8 +2041,6 @@ def test_cli_verifies_explicit_environment_bindings_and_stores_only_hashes(
                 ),
                 "--oidc-run",
                 f"nonprod={references[0].run_url}",
-                "--oidc-run",
-                f"production={references[1].run_url}",
                 "--output",
                 str(output),
             ],
@@ -1933,7 +2059,7 @@ def test_cli_verifies_explicit_environment_bindings_and_stores_only_hashes(
             assert hashlib.sha256(
                 str(reference.run_url).encode("utf-8")
             ).hexdigest() not in serialized
-        assert len([call for call in runner.calls if call[:2] == ("gh", "api")]) == 10
+        assert len([call for call in runner.calls if call[:2] == ("gh", "api")]) == 5
         assert COGNITO_STACK_COMMAND in runner.calls
         assert str(tmp_path) not in serialized
         assert "arn:aws:iam" not in serialized

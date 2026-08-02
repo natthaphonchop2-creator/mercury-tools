@@ -70,7 +70,7 @@ _LOCAL_VERSION_COMMANDS = frozenset(
         ("npx", "--no-install", "cdk", "--version"),
     }
 )
-_AWS_PROFILES = ("mercury-nonprod", "mercury-prod")
+_AWS_PROFILES = ("mercury-nonprod",)
 _AWS_TAILS = (
     ("--profile", "{profile}", "--region", "ap-southeast-1", "--output", "json", "--no-cli-pager"),
 )
@@ -88,7 +88,13 @@ _AWS_READ_PREFIXES = (
         "--db-instance-class",
         "db.serverless",
         "--max-records",
-        "1",
+        "20",
+        "--query",
+        (
+            "{OrderableDBInstanceOptions: "
+            "OrderableDBInstanceOptions[0:1]."
+            "{Engine:Engine,DBInstanceClass:DBInstanceClass}}"
+        ),
     ),
     ("s3api", "list-buckets"),
     ("kms", "list-aliases", "--limit", "1"),
@@ -100,7 +106,9 @@ _AWS_READ_PREFIXES = (
         "--service-code",
         "bedrock-agentcore",
         "--max-results",
-        "100",
+        "20",
+        "--query",
+        "{Quotas: Quotas[].{QuotaCode:QuotaCode,Value:Value}}",
     ),
 )
 _AWS_READ_COMMANDS = frozenset(
@@ -226,7 +234,7 @@ def _gh_download_allowed(argv: tuple[str, ...]) -> bool:
     environment = destination.parts[-1]
     directory_match = _GH_DOWNLOAD_DIRECTORY_RE.fullmatch(destination.parts[-2])
     return bool(
-        environment in {"nonprod", "production"}
+        environment == "nonprod"
         and argv[7] == f"mercury-wave0-oidc-account-proof-{environment}"
         and directory_match is not None
         and directory_match.group("run_id") == argv[3]

@@ -12,6 +12,7 @@ from mercury_tools.aws.commands import CommandRunner, run_command
 from mercury_tools.aws.config import load_wave0_config
 from mercury_tools.aws.identity import HostName, IdentityProofReference, read_identity_decision
 from mercury_tools.aws.models import (
+    WAVE0_ENVIRONMENTS,
     CheckResult,
     CheckState,
     EnvironmentName,
@@ -64,8 +65,8 @@ def _parser() -> argparse.ArgumentParser:
         default=[],
         metavar="ENV=URL",
         help=(
-            "Verified GitHub run bound explicitly to nonprod or production; "
-            "provide once for each environment."
+            "Verified GitHub run bound explicitly to the Wave 0 nonprod environment; "
+            "provide exactly once when finalizing the gate."
         ),
     )
     parser.add_argument(
@@ -92,7 +93,7 @@ def _skipped_live_checks() -> tuple[CheckResult, ...]:
 
 
 def _parse_oidc_references(values: list[str]) -> tuple[OidcRunReference, ...]:
-    if len(values) > len(EnvironmentName):
+    if len(values) > len(WAVE0_ENVIRONMENTS):
         raise ValueError("wave0_oidc_bindings_invalid")
     references: list[OidcRunReference] = []
     for value in values:
@@ -103,6 +104,8 @@ def _parse_oidc_references(values: list[str]) -> tuple[OidcRunReference, ...]:
             environment = EnvironmentName(environment_value)
         except ValueError:
             raise ValueError("wave0_oidc_bindings_invalid") from None
+        if environment not in WAVE0_ENVIRONMENTS:
+            raise ValueError("wave0_oidc_bindings_invalid")
         references.append(OidcRunReference(environment=environment, run_url=run_url))
     if len({item.environment for item in references}) != len(references):
         raise ValueError("wave0_oidc_bindings_invalid")
@@ -154,7 +157,7 @@ def _machine_report(
     stored_oidc: set[EnvironmentName] = set()
     for check in report.checks:
         details = dict(check.details)
-        if check.name == "aws_account_isolation" and identity_evidence_sha256 is not None:
+        if check.name == "nonprod_account" and identity_evidence_sha256 is not None:
             details["identity_evidence_sha256"] = identity_evidence_sha256
             stored_identity = True
         for environment, evidence_hash in oidc_hashes.items():
