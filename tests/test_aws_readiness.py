@@ -181,6 +181,57 @@ def test_runner_redacts_bare_aws_access_key_identifiers(
     assert "[REDACTED_AWS_ACCESS_KEY_ID]" in result.stdout
 
 
+@pytest.mark.parametrize("prefix", ["AKIA", "ASIA"])
+def test_runner_redacts_bare_aws_key_crossing_output_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    prefix: str,
+) -> None:
+    access_key = f"{prefix}1234567890ABCDEF"
+
+    def fake_run(
+        argv: tuple[str, ...], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        output = "X" * 4_089 + " " + access_key
+        return subprocess.CompletedProcess(argv, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = run_command(("aws", "--version"))
+
+    assert len(result.stdout) <= 4_096
+    for fragment_length in range(4, len(access_key) + 1):
+        assert access_key[:fragment_length] not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("assignment_name", "credential"),
+    [
+        ("AWS_ACCESS_KEY_ID", "AKIA1234567890ABCDEF"),
+        ("secret_access_key", "boundary-secret-value-123456"),
+    ],
+)
+def test_runner_redacts_assignment_value_crossing_output_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    assignment_name: str,
+    credential: str,
+) -> None:
+    assignment = f"{assignment_name}={credential}"
+
+    def fake_run(
+        argv: tuple[str, ...], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        value_offset = 4_090
+        output = "X" * (value_offset - len(assignment_name) - 2) + " " + assignment
+        return subprocess.CompletedProcess(argv, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = run_command(("aws", "--version"))
+
+    assert len(result.stdout) <= 4_096
+    assert assignment_name not in result.stdout
+    for fragment_length in range(4, len(credential) + 1):
+        assert credential[:fragment_length] not in result.stdout
+
+
 def test_runner_maps_timeout_and_missing_executable_to_stable_results(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

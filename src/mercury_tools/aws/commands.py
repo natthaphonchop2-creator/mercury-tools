@@ -75,12 +75,11 @@ def run_command(argv: tuple[str, ...], timeout_seconds: int = 20) -> CommandResu
 
 
 def _redact_command_output(value: str) -> str:
-    bounded = value[:_MAX_OUTPUT_CHARS]
-    bounded = _AWS_ACCESS_KEY_ASSIGNMENT_RE.sub(
-        "[REDACTED_AWS_ACCESS_KEY_ASSIGNMENT]", bounded
+    redacted = _AWS_ACCESS_KEY_ASSIGNMENT_RE.sub(
+        "[REDACTED_AWS_ACCESS_KEY_ASSIGNMENT]", value
     )
-    bounded = _AWS_SECRET_KEY_ASSIGNMENT_RE.sub(
-        "[REDACTED_AWS_SECRET_KEY_ASSIGNMENT]", bounded
+    redacted = _AWS_SECRET_KEY_ASSIGNMENT_RE.sub(
+        "[REDACTED_AWS_SECRET_KEY_ASSIGNMENT]", redacted
     )
-    bounded = _AWS_ACCESS_KEY_RE.sub("[REDACTED_AWS_ACCESS_KEY_ID]", bounded)
-    return redact_text(bounded)[:_MAX_OUTPUT_CHARS]
+    redacted = _AWS_ACCESS_KEY_RE.sub("[REDACTED_AWS_ACCESS_KEY_ID]", redacted)
+    return redact_text(redacted)[:_MAX_OUTPUT_CHARS]
