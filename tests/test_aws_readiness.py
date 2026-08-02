@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
+import runpy
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -12,6 +14,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from mercury_tools.aws import readiness as aws_readiness
 from mercury_tools.aws.commands import CommandResult, run_command
 from mercury_tools.aws.config import load_wave0_config
 from mercury_tools.aws.identity import HostName, IdentityDecision, IdentityMode
@@ -19,6 +22,7 @@ from mercury_tools.aws.models import CheckResult, CheckState, GateStatus
 from mercury_tools.aws.readiness import (
     SERVICE_COMMANDS,
     OidcRunEvidence,
+    OidcRunReference,
     aggregate_gate,
     build_readiness_report,
     check_aws_accounts,
@@ -26,12 +30,17 @@ from mercury_tools.aws.readiness import (
     check_region_services,
     finalize_wave0_gate,
     fingerprint_account_id,
+    verify_oidc_runs,
     write_readiness_report,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "infra/aws/wave0/environment.yaml"
 SCRIPT_PATH = ROOT / "scripts/check_aws_readiness.py"
+WORKFLOW_PATH = ROOT / ".github/workflows/aws-wave0-oidc-smoke.yml"
+REPOSITORY = "natthaphonchop2-creator/mercury-tools"
+WORKFLOW_FILE = ".github/workflows/aws-wave0-oidc-smoke.yml"
+readiness_main = runpy.run_path(str(SCRIPT_PATH))["main"]
 
 
 class FakeRunner:
@@ -125,11 +134,158 @@ class FakeRunner:
         return cls(results)
 
 
+class VerifiedGhRunner(FakeRunner):
+    @classmethod
+    def for_references(
+        cls,
+        references: tuple[OidcRunReference, ...],
+        *,
+        run_updates: Mapping[str, object] | None = None,
+        job_updates: Mapping[str, object] | None = None,
+        workflow_updates: Mapping[str, object] | None = None,
+        source: str | None = None,
+    ) -> VerifiedGhRunner:
+        results: dict[tuple[str, ...], CommandResult] = {}
+        for reference in references:
+            run_id = int(str(reference.run_url).rstrip("/").rsplit("/", 1)[1])
+            head_sha = f"{run_id:040x}"[-40:]
+            workflow_id = run_id + 10_000
+            run_payload: dict[str, object] = {
+                "id": run_id,
+                "html_url": str(reference.run_url),
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "success",
+                "head_sha": head_sha,
+                "workflow_id": workflow_id,
+                "path": WORKFLOW_FILE,
+                "repository_full_name": REPOSITORY,
+            }
+            run_payload.update(run_updates or {})
+            workflow_payload: dict[str, object] = {
+                "id": workflow_id,
+                "path": WORKFLOW_FILE,
+            }
+            workflow_payload.update(workflow_updates or {})
+            jobs_payload: dict[str, object] = {
+                "total_count": 2,
+                "jobs": [
+                    {
+                        "id": run_id * 10 + 1,
+                        "name": "OIDC smoke (nonprod)",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                    {
+                        "id": run_id * 10 + 2,
+                        "name": "OIDC smoke (production)",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                ],
+            }
+            jobs_payload.update(job_updates or {})
+            endpoints = {
+                f"repos/{REPOSITORY}/actions/runs/{run_id}": json.dumps(run_payload),
+                f"repos/{REPOSITORY}/actions/workflows/{workflow_id}": json.dumps(
+                    workflow_payload
+                ),
+                f"repos/{REPOSITORY}/actions/runs/{run_id}/jobs?per_page=100": (
+                    json.dumps(jobs_payload)
+                ),
+                f"repos/{REPOSITORY}/contents/{WORKFLOW_FILE}?ref={head_sha}": (
+                    base64.b64encode(
+                        (
+                            source
+                            if source is not None
+                            else WORKFLOW_PATH.read_text(encoding="utf-8")
+                        ).encode("utf-8")
+                    ).decode("ascii")
+                ),
+            }
+            for endpoint, stdout in endpoints.items():
+                results[("gh", "api", endpoint)] = CommandResult(0, stdout, "")
+        return cls(results)
+
+    def __call__(self, argv: tuple[str, ...], timeout_seconds: int) -> CommandResult:
+        self.calls.append(argv)
+        assert timeout_seconds > 0
+        assert argv[:2] == ("gh", "api") or argv[0] in {
+            "aws",
+            "node",
+            "uv",
+            "npx",
+        }
+        if argv[:2] == ("gh", "api"):
+            base_command = argv[:3]
+            return self.results.get(base_command, CommandResult(127, "", "not found"))
+        return self.results.get(argv, CommandResult(127, "", "command unavailable"))
+
+
 def test_runner_rejects_shell_and_unknown_programs() -> None:
     with pytest.raises(ValueError, match="wave0_command_not_allowed"):
         run_command(("sh", "-c", "env"))
     with pytest.raises(ValueError, match="wave0_command_not_allowed"):
         run_command(("curl", "https://example.com"))
+
+
+def test_runner_allows_only_closed_wave0_gh_api_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(
+        argv: tuple[str, ...], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    for command in (
+        ("gh", "auth", "token"),
+        ("gh", "api", "user"),
+        (
+            "gh",
+            "api",
+            f"repos/{REPOSITORY}/actions/runs/1001",
+            "--jq",
+            ".",
+        ),
+    ):
+        with pytest.raises(ValueError, match="wave0_command_not_allowed"):
+            run_command(command)
+
+    allowed_commands = (
+        (
+            "gh",
+            "api",
+            f"repos/{REPOSITORY}/actions/runs/1001",
+            "--jq",
+            (
+                "{id,html_url,event,status,conclusion,head_sha,workflow_id,path,"
+                "repository_full_name:.repository.full_name}"
+            ),
+        ),
+        (
+            "gh",
+            "api",
+            f"repos/{REPOSITORY}/actions/workflows/11001",
+            "--jq",
+            "{id,path}",
+        ),
+        (
+            "gh",
+            "api",
+            f"repos/{REPOSITORY}/actions/runs/1001/jobs?per_page=100",
+            "--jq",
+            "{total_count,jobs:[.jobs[]|{id,name,status,conclusion}]}",
+        ),
+        (
+            "gh",
+            "api",
+            f"repos/{REPOSITORY}/contents/{WORKFLOW_FILE}?ref={'1' * 40}",
+            "--jq",
+            ".content",
+        ),
+    )
+    assert all(run_command(command).returncode == 0 for command in allowed_commands)
 
 
 def test_runner_uses_bounded_environment_and_redacts_output(
@@ -378,20 +534,39 @@ def valid_identity() -> IdentityDecision:
     )
 
 
-def oidc_run(environment: str, run_id: int) -> OidcRunEvidence:
+def oidc_reference(environment: str, run_id: int) -> OidcRunReference:
     run_url = (
         "https://github.com/natthaphonchop2-creator/mercury-tools/"
         f"actions/runs/{run_id}"
     )
-    return OidcRunEvidence(
+    return OidcRunReference(
         environment=environment,
         run_url=run_url,
-        evidence_sha256=hashlib.sha256(run_url.encode("utf-8")).hexdigest(),
     )
 
 
 def valid_oidc() -> tuple[OidcRunEvidence, ...]:
-    return (oidc_run("nonprod", 1001), oidc_run("production", 1002))
+    references = (
+        oidc_reference("nonprod", 1001),
+        oidc_reference("production", 1002),
+    )
+    return verify_oidc_runs(references, VerifiedGhRunner.for_references(references))
+
+
+def cli_runner(
+    references: tuple[OidcRunReference, ...],
+    **gh_options: object,
+) -> VerifiedGhRunner:
+    runner = VerifiedGhRunner.for_references(references, **gh_options)
+    tools = FakeRunner.for_tool_versions(
+        aws="aws-cli/2.36.14",
+        node="v22.22.2",
+        python="Python 3.11.15",
+        agentcore="0.25.0",
+        cdk="2.1134.0",
+    )
+    runner.results.update(tools.results)
+    return runner
 
 
 def replace_check(report, name: str, **updates: object):
@@ -554,6 +729,10 @@ def test_report_writer_cleanup_failure_does_not_mask_replace_failure(
     [
         ("--unknown=AKIA1234567890ABCDEF",),
         ("--output",),
+        (
+            "--oidc-run-url",
+            "https://github.com/natthaphonchop2-creator/mercury-tools/actions/runs/1",
+        ),
     ],
 )
 def test_cli_rejects_invalid_arguments_without_echoing_them(arguments: tuple[str, ...]) -> None:
@@ -594,37 +773,164 @@ def test_unknown_blocked_check_fails_closed() -> None:
     assert aggregate_gate([check]) is GateStatus.BLOCKED_IDENTITY_COMPATIBILITY
 
 
-def test_oidc_run_evidence_is_closed_frozen_and_bound_to_exact_run_url() -> None:
-    evidence = oidc_run("nonprod", 1001)
+def test_oidc_models_are_closed_frozen_and_canonically_bound() -> None:
+    reference = oidc_reference("nonprod", 1001)
+    evidence = valid_oidc()[0]
     assert evidence.environment == "nonprod"
+    assert evidence.run_id == 1001
+    assert evidence.evidence_sha256 != hashlib.sha256(
+        str(evidence.run_url).encode("utf-8")
+    ).hexdigest()
 
     with pytest.raises(ValidationError):
         evidence.environment = "production"
     with pytest.raises(ValidationError):
-        OidcRunEvidence(
-            environment="nonprod",
-            run_url=(
-                "https://github.com/natthaphonchop2-creator/mercury-tools/"
-                "actions/runs/1001"
-            ),
-            evidence_sha256="a" * 64,
-            run_attempt=1,
+        OidcRunEvidence.model_validate(
+            {**evidence.model_dump(mode="python"), "run_attempt": 1}
         )
     with pytest.raises(ValidationError, match="wave0_oidc_run_url_invalid"):
-        OidcRunEvidence(
+        OidcRunReference(
             environment="nonprod",
             run_url="https://example.com/actions/runs/1001",
-            evidence_sha256="a" * 64,
         )
     with pytest.raises(ValidationError, match="wave0_oidc_evidence_hash_invalid"):
-        OidcRunEvidence(
-            environment="nonprod",
-            run_url=(
-                "https://github.com/natthaphonchop2-creator/mercury-tools/"
-                "actions/runs/1001"
-            ),
-            evidence_sha256="a" * 64,
+        OidcRunEvidence.model_validate(
+            {**evidence.model_dump(mode="python"), "evidence_sha256": "a" * 64}
         )
+    assert reference.run_url == evidence.run_url
+
+
+def test_oidc_verifier_uses_closed_gh_api_calls_and_returns_no_raw_payload() -> None:
+    reference = oidc_reference("nonprod", 1001)
+    runner = VerifiedGhRunner.for_references((reference,))
+
+    evidence = verify_oidc_runs((reference,), runner)
+
+    assert len(evidence) == 1
+    assert evidence[0].environment == "nonprod"
+    assert evidence[0].head_sha == f"{1001:040x}"
+    assert evidence[0].workflow_sha256 == hashlib.sha256(
+        WORKFLOW_PATH.read_bytes()
+    ).hexdigest()
+    assert len(runner.calls) == 4
+    assert all(call[:2] == ("gh", "api") for call in runner.calls)
+    assert all("--log" not in call for call in runner.calls)
+    assert "workflow_dispatch" not in evidence[0].model_dump_json()
+
+
+def test_oidc_verifier_works_through_shell_free_command_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = oidc_reference("nonprod", 1001)
+    backend = VerifiedGhRunner.for_references((reference,))
+
+    def fake_run(
+        argv: tuple[str, ...], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        result = backend(argv, 20)
+        return subprocess.CompletedProcess(
+            argv,
+            result.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert verify_oidc_runs((reference,), run_command)[0].run_id == 1001
+    assert len(backend.calls) == 4
+
+
+@pytest.mark.parametrize(
+    "run_updates",
+    (
+        {"event": "push"},
+        {"status": "in_progress"},
+        {"conclusion": "failure"},
+        {"path": ".github/workflows/other.yml"},
+        {"repository_full_name": "attacker/fork"},
+        {"html_url": "https://github.com/attacker/fork/actions/runs/1001"},
+    ),
+)
+def test_oidc_verifier_rejects_untrusted_run_metadata(
+    run_updates: Mapping[str, object],
+) -> None:
+    reference = oidc_reference("nonprod", 1001)
+    runner = VerifiedGhRunner.for_references(
+        (reference,), run_updates=run_updates
+    )
+
+    with pytest.raises(ValueError, match="wave0_oidc_run_unverified"):
+        verify_oidc_runs((reference,), runner)
+
+
+def test_oidc_verifier_rejects_missing_or_failed_expected_environment_job() -> None:
+    reference = oidc_reference("production", 1001)
+    failed_jobs = {
+        "total_count": 2,
+        "jobs": [
+            {
+                "id": 10011,
+                "name": "OIDC smoke (nonprod)",
+                "status": "completed",
+                "conclusion": "success",
+            },
+            {
+                "id": 10012,
+                "name": "OIDC smoke (production)",
+                "status": "completed",
+                "conclusion": "failure",
+            },
+        ],
+    }
+    runner = VerifiedGhRunner.for_references(
+        (reference,), job_updates=failed_jobs
+    )
+
+    with pytest.raises(ValueError, match="wave0_oidc_job_unverified"):
+        verify_oidc_runs((reference,), runner)
+
+
+def test_oidc_verifier_rejects_workflow_identity_or_unpinned_source() -> None:
+    reference = oidc_reference("nonprod", 1001)
+    wrong_identity = VerifiedGhRunner.for_references(
+        (reference,), workflow_updates={"path": ".github/workflows/other.yml"}
+    )
+    changed_source = VerifiedGhRunner.for_references(
+        (reference,),
+        source=WORKFLOW_PATH.read_text(encoding="utf-8") + "\n# changed\n",
+    )
+
+    with pytest.raises(ValueError, match="wave0_oidc_workflow_unverified"):
+        verify_oidc_runs((reference,), wrong_identity)
+    with pytest.raises(ValueError, match="wave0_oidc_workflow_source_unverified"):
+        verify_oidc_runs((reference,), changed_source)
+
+
+def test_oidc_verifier_rejects_untrusted_fields_even_with_matching_source_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = oidc_reference("nonprod", 1001)
+    changed_source = WORKFLOW_PATH.read_text(encoding="utf-8").replace(
+        "aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8",
+        "aws-actions/configure-aws-credentials@1111111111111111111111111111111111111111",
+    )
+    monkeypatch.setattr(
+        aws_readiness,
+        "_GITHUB_WORKFLOW_SHA256",
+        hashlib.sha256(changed_source.encode("utf-8")).hexdigest(),
+    )
+    runner = VerifiedGhRunner.for_references((reference,), source=changed_source)
+
+    with pytest.raises(ValueError, match="wave0_oidc_workflow_source_unverified"):
+        verify_oidc_runs((reference,), runner)
+
+
+def test_oidc_verifier_with_no_references_makes_no_gh_calls() -> None:
+    runner = FakeRunner({})
+
+    assert verify_oidc_runs((), runner) == ()
+    assert runner.calls == []
 
 
 def test_gate_requires_distinct_ready_accounts() -> None:
@@ -672,9 +978,12 @@ def test_gate_requires_identity_and_both_oidc_jobs() -> None:
 
 def test_gate_rejects_duplicate_oidc_environment_url_or_hash() -> None:
     report = build_report_fixture()
-    first = oidc_run("nonprod", 1001)
-    same_environment = (first, oidc_run("nonprod", 1002))
-    duplicate_url = (first, oidc_run("production", 1001))
+    first, second = valid_oidc()
+    same_environment = (
+        first,
+        second.model_copy(update={"environment": first.environment}),
+    )
+    duplicate_url = (first, second.model_copy(update={"run_url": first.run_url}))
 
     assert finalize_wave0_gate(report, valid_identity(), same_environment) == (
         "blocked_account_access"
@@ -751,44 +1060,145 @@ def test_gate_is_ready_only_with_complete_proof() -> None:
     ) == "ready"
 
 
-def test_cli_hashes_identity_and_oidc_evidence_without_storing_urls(
+def test_cli_verifies_explicit_environment_bindings_and_stores_only_hashes(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     decision_path = tmp_path / "identity-decision.yaml"
     decision_path.write_text(
         json.dumps(valid_identity().model_dump(mode="json")), encoding="utf-8"
     )
-    urls = tuple(str(item.run_url) for item in valid_oidc())
+    references = (
+        oidc_reference("nonprod", 1001),
+        oidc_reference("production", 1002),
+    )
+    evidence = verify_oidc_runs(
+        references, VerifiedGhRunner.for_references(references)
+    )
+    runner = cli_runner(references)
     output = ROOT / ".artifacts/aws/wave0/task5-cli-test.json"
     output.unlink(missing_ok=True)
 
     try:
-        result = subprocess.run(
-            (
-                sys.executable,
-                str(SCRIPT_PATH),
+        result = readiness_main(
+            [
                 "--skip-live",
                 "--identity-decision",
                 str(decision_path),
-                "--oidc-run-url",
-                urls[0],
-                "--oidc-run-url",
-                urls[1],
+                "--oidc-run",
+                f"nonprod={references[0].run_url}",
+                "--oidc-run",
+                f"production={references[1].run_url}",
                 "--output",
                 str(output),
-            ),
-            cwd=ROOT,
-            check=False,
-            capture_output=True,
-            text=True,
+            ],
+            runner=runner,
         )
 
-        assert result.returncode == 2
+        assert result == 2
         serialized = output.read_text(encoding="utf-8")
-        assert "gate_status=blocked_account_access" in result.stdout
+        assert "gate_status=blocked_account_access" in capsys.readouterr().out
         assert hashlib.sha256(decision_path.read_bytes()).hexdigest() in serialized
-        for url in urls:
-            assert url not in serialized
-            assert hashlib.sha256(url.encode("utf-8")).hexdigest() in serialized
+        for reference, verified in zip(references, evidence, strict=True):
+            assert str(reference.run_url) not in serialized
+            assert verified.evidence_sha256 in serialized
+            assert verified.head_sha not in serialized
+            assert verified.workflow_sha256 not in serialized
+            assert hashlib.sha256(
+                str(reference.run_url).encode("utf-8")
+            ).hexdigest() not in serialized
+        assert len([call for call in runner.calls if call[:2] == ("gh", "api")]) == 8
+    finally:
+        output.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize(
+    "bindings",
+    (
+        (
+            "staging=https://github.com/natthaphonchop2-creator/"
+            "mercury-tools/actions/runs/1001",
+        ),
+        (
+            "nonprod=https://github.com/natthaphonchop2-creator/"
+            "mercury-tools/actions/runs/1001",
+            "nonprod=https://github.com/natthaphonchop2-creator/"
+            "mercury-tools/actions/runs/1002",
+        ),
+        (
+            "https://github.com/natthaphonchop2-creator/"
+            "mercury-tools/actions/runs/1001",
+        ),
+    ),
+)
+def test_cli_rejects_unknown_duplicate_or_implicit_environment_bindings(
+    bindings: tuple[str, ...],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runner = cli_runner(())
+    arguments = ["--skip-live"]
+    for binding in bindings:
+        arguments.extend(("--oidc-run", binding))
+
+    assert readiness_main(arguments, runner=runner) == 3
+    assert capsys.readouterr().out == "wave0_readiness_invalid_input\n"
+    assert not any(call[:2] == ("gh", "api") for call in runner.calls)
+
+
+def test_cli_with_absent_oidc_bindings_makes_no_gh_calls_and_stays_blocked(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runner = cli_runner(())
+    output = ROOT / ".artifacts/aws/wave0/task5-cli-absent.json"
+    output.unlink(missing_ok=True)
+
+    try:
+        assert readiness_main(
+            ["--skip-live", "--output", str(output)], runner=runner
+        ) == 2
+        assert "gate_status=blocked_account_access" in capsys.readouterr().out
+        assert not any(call[:2] == ("gh", "api") for call in runner.calls)
+    finally:
+        output.unlink(missing_ok=True)
+
+
+def test_cli_failed_gh_proof_stays_blocked_without_persisting_url_hash(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reference = oidc_reference("nonprod", 1001)
+    jobs = {
+        "total_count": 1,
+        "jobs": [
+            {
+                "id": 10011,
+                "name": "OIDC smoke (nonprod)",
+                "status": "completed",
+                "conclusion": "failure",
+            }
+        ],
+    }
+    runner = cli_runner((reference,), job_updates=jobs)
+    output = ROOT / ".artifacts/aws/wave0/task5-cli-failed-gh.json"
+    output.unlink(missing_ok=True)
+
+    try:
+        result = readiness_main(
+            [
+                "--skip-live",
+                "--oidc-run",
+                f"nonprod={reference.run_url}",
+                "--output",
+                str(output),
+            ],
+            runner=runner,
+        )
+
+        assert result == 2
+        assert "gate_status=blocked_account_access" in capsys.readouterr().out
+        serialized = output.read_text(encoding="utf-8")
+        assert str(reference.run_url) not in serialized
+        assert hashlib.sha256(
+            str(reference.run_url).encode("utf-8")
+        ).hexdigest() not in serialized
     finally:
         output.unlink(missing_ok=True)

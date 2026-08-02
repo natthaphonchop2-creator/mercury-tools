@@ -4,15 +4,13 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 from pathlib import Path
-from typing import Any
 
-import yaml
 from pydantic import ValidationError
 
+from mercury_tools.aws.commands import CommandRunner, run_command
 from mercury_tools.aws.config import load_wave0_config
-from mercury_tools.aws.identity import IdentityDecision
+from mercury_tools.aws.identity import read_identity_decision
 from mercury_tools.aws.models import (
     CheckResult,
     CheckState,
@@ -22,11 +20,13 @@ from mercury_tools.aws.models import (
 )
 from mercury_tools.aws.readiness import (
     OidcRunEvidence,
+    OidcRunReference,
     build_readiness_report,
     check_aws_accounts,
     check_local_toolchain,
     check_region_services,
     finalize_wave0_gate,
+    verify_oidc_runs,
     write_readiness_report,
 )
 
@@ -59,7 +59,16 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=_DEFAULT_IDENTITY_DECISION,
     )
-    parser.add_argument("--oidc-run-url", action="append", default=[])
+    parser.add_argument(
+        "--oidc-run",
+        action="append",
+        default=[],
+        metavar="ENV=URL",
+        help=(
+            "Verified GitHub run bound explicitly to nonprod or production; "
+            "provide once for each environment."
+        ),
+    )
     parser.add_argument("--skip-live", action="store_true")
     return parser
 
@@ -76,34 +85,22 @@ def _skipped_live_checks() -> tuple[CheckResult, ...]:
     )
 
 
-def _load_identity_decision(path: Path) -> tuple[IdentityDecision | None, str | None]:
-    if not path.exists():
-        return None, None
-    try:
-        if path.is_symlink() or not path.is_file() or path.stat().st_size > 65_536:
-            raise OSError
-        payload = path.read_bytes()
-        raw: Any = yaml.safe_load(payload.decode("utf-8"))
-        if not isinstance(raw, dict):
-            raise ValueError("wave0_identity_decision_invalid")
-        decision = IdentityDecision.model_validate(raw)
-    except (OSError, UnicodeError, yaml.YAMLError, ValidationError):
-        raise ValueError("wave0_identity_decision_invalid") from None
-    return decision, hashlib.sha256(payload).hexdigest()
-
-
-def _build_oidc_evidence(run_urls: list[str]) -> tuple[OidcRunEvidence, ...]:
-    if len(run_urls) > len(EnvironmentName):
-        raise ValueError("wave0_oidc_evidence_invalid")
-    environments = (EnvironmentName.NONPROD, EnvironmentName.PRODUCTION)
-    return tuple(
-        OidcRunEvidence(
-            environment=environments[index],
-            run_url=run_url,
-            evidence_sha256=hashlib.sha256(run_url.encode("utf-8")).hexdigest(),
-        )
-        for index, run_url in enumerate(run_urls)
-    )
+def _parse_oidc_references(values: list[str]) -> tuple[OidcRunReference, ...]:
+    if len(values) > len(EnvironmentName):
+        raise ValueError("wave0_oidc_bindings_invalid")
+    references: list[OidcRunReference] = []
+    for value in values:
+        environment_value, separator, run_url = value.partition("=")
+        if not separator or not environment_value or not run_url:
+            raise ValueError("wave0_oidc_bindings_invalid")
+        try:
+            environment = EnvironmentName(environment_value)
+        except ValueError:
+            raise ValueError("wave0_oidc_bindings_invalid") from None
+        references.append(OidcRunReference(environment=environment, run_url=run_url))
+    if len({item.environment for item in references}) != len(references):
+        raise ValueError("wave0_oidc_bindings_invalid")
+    return tuple(references)
 
 
 def _machine_report(
@@ -153,21 +150,33 @@ def _machine_report(
     return ReadinessReport.model_validate(payload)
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    runner: CommandRunner = run_command,
+) -> int:
     try:
         args = _parser().parse_args(argv)
         config = load_wave0_config(args.config)
-        local_checks = check_local_toolchain()
+        local_checks = check_local_toolchain(runner)
         live_checks = (
             _skipped_live_checks()
             if args.skip_live
-            else (*check_aws_accounts(config), *check_region_services(config))
+            else (
+                *check_aws_accounts(config, runner),
+                *check_region_services(config, runner),
+            )
         )
         report = build_readiness_report(config, (*local_checks, *live_checks))
-        identity_decision, identity_evidence_sha256 = _load_identity_decision(
-            args.identity_decision
+        loaded_identity = read_identity_decision(args.identity_decision)
+        identity_decision, identity_evidence_sha256 = (
+            loaded_identity if loaded_identity is not None else (None, None)
         )
-        oidc_evidence = _build_oidc_evidence(args.oidc_run_url)
+        oidc_references = _parse_oidc_references(args.oidc_run)
+        try:
+            oidc_evidence = verify_oidc_runs(oidc_references, runner)
+        except ValueError:
+            oidc_evidence = ()
         gate_status = finalize_wave0_gate(report, identity_decision, oidc_evidence)
         report = _machine_report(
             report,

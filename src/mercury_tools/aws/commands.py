@@ -28,6 +28,24 @@ _AWS_SECRET_KEY_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(?:AWS_)?SECRET_ACCESS_KEY\s*[:=]\s*[^\s,;]+"
 )
 _AWS_ACCESS_KEY_RE = re.compile(r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])")
+_GH_REPOSITORY_PATH = r"repos/natthaphonchop2-creator/mercury-tools"
+_GH_RUN_ENDPOINT_RE = re.compile(rf"^{_GH_REPOSITORY_PATH}/actions/runs/[1-9]\d*$")
+_GH_WORKFLOW_ENDPOINT_RE = re.compile(
+    rf"^{_GH_REPOSITORY_PATH}/actions/workflows/[1-9]\d*$"
+)
+_GH_JOBS_ENDPOINT_RE = re.compile(
+    rf"^{_GH_REPOSITORY_PATH}/actions/runs/[1-9]\d*/jobs\?per_page=100$"
+)
+_GH_SOURCE_ENDPOINT_RE = re.compile(
+    rf"^{_GH_REPOSITORY_PATH}/contents/\.github/workflows/"
+    r"aws-wave0-oidc-smoke\.yml\?ref=[a-f0-9]{40}$"
+)
+_GH_RUN_JQ = (
+    "{id,html_url,event,status,conclusion,head_sha,workflow_id,path,"
+    "repository_full_name:.repository.full_name}"
+)
+_GH_WORKFLOW_JQ = "{id,path}"
+_GH_JOBS_JQ = "{total_count,jobs:[.jobs[]|{id,name,status,conclusion}]}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,12 +61,7 @@ CommandRunner = Callable[[tuple[str, ...], int], CommandResult]
 def run_command(argv: tuple[str, ...], timeout_seconds: int = 20) -> CommandResult:
     """Run one allowlisted executable without a shell or inherited secret variables."""
 
-    if (
-        not argv
-        or argv[0] not in _ALLOWED_PROGRAMS
-        or any(not isinstance(argument, str) or not argument for argument in argv)
-        or timeout_seconds <= 0
-    ):
+    if not _command_allowed(argv) or timeout_seconds <= 0:
         raise ValueError("wave0_command_not_allowed")
 
     environment = {key: os.environ[key] for key in _ALLOWED_ENVIRONMENT if key in os.environ}
@@ -71,6 +84,30 @@ def run_command(argv: tuple[str, ...], timeout_seconds: int = 20) -> CommandResu
         completed.returncode,
         _redact_command_output(completed.stdout),
         _redact_command_output(completed.stderr),
+    )
+
+
+def _command_allowed(argv: tuple[str, ...]) -> bool:
+    if (
+        not argv
+        or argv[0] not in _ALLOWED_PROGRAMS
+        or any(not isinstance(argument, str) or not argument for argument in argv)
+    ):
+        return False
+    if argv[0] != "gh":
+        return True
+    if len(argv) != 5 or argv[:2] != ("gh", "api"):
+        return False
+    endpoint = argv[2]
+    if argv[3:] == ("--jq", _GH_RUN_JQ):
+        return _GH_RUN_ENDPOINT_RE.fullmatch(endpoint) is not None
+    if argv[3:] == ("--jq", _GH_WORKFLOW_JQ):
+        return _GH_WORKFLOW_ENDPOINT_RE.fullmatch(endpoint) is not None
+    if argv[3:] == ("--jq", _GH_JOBS_JQ):
+        return _GH_JOBS_ENDPOINT_RE.fullmatch(endpoint) is not None
+    return (
+        argv[3:] == ("--jq", ".content")
+        and _GH_SOURCE_ENDPOINT_RE.fullmatch(endpoint) is not None
     )
 
 

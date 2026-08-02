@@ -21,6 +21,7 @@ from mercury_tools.catalog.identity import validate_credential_safe, validate_cr
 
 _SHA256 = r"^[a-f0-9]{64}$"
 _REQUIRED_HOSTS = frozenset(("codex", "chatgpt", "claude"))
+_MAX_IDENTITY_DECISION_BYTES = 65_536
 _UNSAFE_PROBE_KEYS = frozenset(
     (
         "access_token",
@@ -235,6 +236,57 @@ def write_identity_decision(path: Path, decision: IdentityDecision) -> None:
     )
 
 
+def read_identity_decision(path: Path) -> tuple[IdentityDecision, str] | None:
+    """Read one decision without following parent or final-component symlinks."""
+
+    input_path = Path(os.path.abspath(os.fspath(path)))
+    if input_path.name in {"", ".", ".."}:
+        raise ValueError("identity_decision_path_invalid")
+    directory_fd = _open_identity_directory(
+        input_path.parent,
+        "identity_decision_path_invalid",
+        create_missing=False,
+    )
+    descriptor: int | None = None
+    try:
+        try:
+            descriptor = os.open(
+                input_path.name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise ValueError("identity_decision_path_invalid") from None
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > _MAX_IDENTITY_DECISION_BYTES:
+            raise ValueError("identity_decision_path_invalid")
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(descriptor, 64 * 1024):
+            total += len(chunk)
+            if total > _MAX_IDENTITY_DECISION_BYTES:
+                raise ValueError("identity_decision_path_invalid")
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+    except OSError:
+        raise ValueError("identity_decision_path_invalid") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory_fd)
+
+    try:
+        raw = yaml.safe_load(payload.decode("utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError
+        decision = IdentityDecision.model_validate(raw)
+    except (UnicodeError, yaml.YAMLError, ValueError):
+        raise ValueError("identity_decision_invalid") from None
+    return decision, hashlib.sha256(payload).hexdigest()
+
+
 def _probes_by_mode(
     probes: tuple[HostIdentityProbe, ...], mode: RegistrationMode
 ) -> tuple[HostIdentityProbe, ...]:
@@ -319,7 +371,11 @@ def _write_identity_output(
     if output_path.name in {"", ".", ".."}:
         raise ValueError(path_error)
 
-    directory_fd = _open_output_directory(output_path.parent, path_error)
+    directory_fd = _open_identity_directory(
+        output_path.parent,
+        path_error,
+        create_missing=True,
+    )
     temporary_name: str | None = None
     try:
         _reject_symlinked_output(directory_fd, output_path.name, path_error)
@@ -346,7 +402,12 @@ def _write_identity_output(
         os.close(directory_fd)
 
 
-def _open_output_directory(path: Path, path_error: str) -> int:
+def _open_identity_directory(
+    path: Path,
+    path_error: str,
+    *,
+    create_missing: bool,
+) -> int:
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     parts = path.parts
     if not path.is_absolute() or not parts:
@@ -357,8 +418,9 @@ def _open_output_directory(path: Path, path_error: str) -> int:
         raise ValueError(path_error) from None
     try:
         for component in parts[1:]:
-            with suppress(FileExistsError):
-                os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+            if create_missing:
+                with suppress(FileExistsError):
+                    os.mkdir(component, mode=0o700, dir_fd=directory_fd)
             next_fd = os.open(component, flags, dir_fd=directory_fd)
             os.close(directory_fd)
             directory_fd = next_fd

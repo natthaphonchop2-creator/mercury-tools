@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -14,7 +16,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, ValidationError, model_validator
+import yaml
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    ValidationError,
+    model_validator,
+)
 
 from mercury_tools.aws.commands import CommandResult, CommandRunner, run_command
 from mercury_tools.aws.identity import IdentityDecision
@@ -88,9 +99,16 @@ _VERSION_RE = re.compile(r"(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)")
 _ACCOUNT_ID_RE = re.compile(r"^\d{12}$")
 _ACCOUNT_FINGERPRINT_RE = re.compile(r"^[a-f0-9]{12}$")
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
+_GITHUB_REPOSITORY = "natthaphonchop2-creator/mercury-tools"
 _GITHUB_RUN_PATH_RE = re.compile(
-    r"^/natthaphonchop2-creator/mercury-tools/actions/runs/[1-9]\d*/?$"
+    r"^/natthaphonchop2-creator/mercury-tools/actions/runs/([1-9]\d*)/?$"
 )
+_GITHUB_WORKFLOW_PATH = ".github/workflows/aws-wave0-oidc-smoke.yml"
+_GITHUB_WORKFLOW_SHA256 = "6a4da75fb63a43b3a9e0bfa480cde3251aea0fa0c6459afa501d40c9bc4b9ded"
+_GITHUB_CREDENTIALS_ACTION = (
+    "aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8"
+)
+_GIT_SHA_RE = re.compile(r"^[a-f0-9]{40}$")
 _THROTTLING_MARKERS = (
     "throttl",
     "rate exceeded",
@@ -129,9 +147,7 @@ _REGION_CODES = frozenset(
 )
 
 
-class OidcRunEvidence(BaseModel):
-    """One exact GitHub Actions run reference with only its publishable digest."""
-
+class _OidcModel(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
         frozen=True,
@@ -139,27 +155,299 @@ class OidcRunEvidence(BaseModel):
         revalidate_instances="always",
     )
 
+
+class OidcRunReference(_OidcModel):
+    """One explicitly environment-bound GitHub Actions run URL."""
+
     environment: EnvironmentName
     run_url: AnyHttpUrl
+
+    @model_validator(mode="after")
+    def validate_run_reference(self) -> OidcRunReference:
+        if _run_id_from_url(self.run_url) is None:
+            raise ValueError("wave0_oidc_run_url_invalid")
+        return self
+
+
+class OidcRunEvidence(OidcRunReference):
+    """Closed evidence produced only after independent GitHub verification."""
+
+    run_id: StrictInt = Field(gt=0)
+    head_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
+    workflow_id: StrictInt = Field(gt=0)
+    workflow_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    job_id: StrictInt = Field(gt=0)
     evidence_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
 
     @model_validator(mode="after")
     def validate_run_evidence(self) -> OidcRunEvidence:
-        url = self.run_url
-        if (
-            url.scheme != "https"
-            or url.host != "github.com"
-            or url.username is not None
-            or url.password is not None
-            or url.query is not None
-            or url.fragment is not None
-            or _GITHUB_RUN_PATH_RE.fullmatch(url.path) is None
-        ):
+        if _run_id_from_url(self.run_url) != self.run_id:
             raise ValueError("wave0_oidc_run_url_invalid")
-        expected_hash = hashlib.sha256(str(url).encode("utf-8")).hexdigest()
+        if self.workflow_sha256 != _GITHUB_WORKFLOW_SHA256:
+            raise ValueError("wave0_oidc_workflow_source_unverified")
+        expected_hash = _canonical_oidc_evidence_sha256(
+            environment=self.environment,
+            run_url=self.run_url,
+            run_id=self.run_id,
+            head_sha=self.head_sha,
+            workflow_id=self.workflow_id,
+            workflow_sha256=self.workflow_sha256,
+            job_id=self.job_id,
+        )
         if not secrets.compare_digest(self.evidence_sha256, expected_hash):
             raise ValueError("wave0_oidc_evidence_hash_invalid")
         return self
+
+
+def _run_id_from_url(run_url: AnyHttpUrl) -> int | None:
+    if (
+        run_url.scheme != "https"
+        or run_url.host != "github.com"
+        or run_url.username is not None
+        or run_url.password is not None
+        or run_url.query is not None
+        or run_url.fragment is not None
+    ):
+        return None
+    match = _GITHUB_RUN_PATH_RE.fullmatch(run_url.path)
+    return int(match.group(1)) if match is not None else None
+
+
+def _canonical_oidc_evidence_sha256(
+    *,
+    environment: EnvironmentName,
+    run_url: AnyHttpUrl,
+    run_id: int,
+    head_sha: str,
+    workflow_id: int,
+    workflow_sha256: str,
+    job_id: int,
+) -> str:
+    payload = {
+        "environment": environment.value,
+        "head_sha": head_sha,
+        "job_id": job_id,
+        "repository": _GITHUB_REPOSITORY,
+        "run_id": run_id,
+        "run_url_sha256": hashlib.sha256(str(run_url).encode("utf-8")).hexdigest(),
+        "schema_version": "mercury.aws.wave0.oidc_run_evidence.v2",
+        "workflow_id": workflow_id,
+        "workflow_path": _GITHUB_WORKFLOW_PATH,
+        "workflow_sha256": workflow_sha256,
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def verify_oidc_runs(
+    references: tuple[OidcRunReference, ...],
+    runner: CommandRunner = run_command,
+) -> tuple[OidcRunEvidence, ...]:
+    """Verify exact GitHub runs and return only closed canonical evidence."""
+
+    try:
+        checked = tuple(
+            OidcRunReference.model_validate(item.model_dump(mode="python"))
+            for item in references
+        )
+    except (AttributeError, TypeError, ValidationError):
+        raise ValueError("wave0_oidc_bindings_invalid") from None
+    if len({item.environment for item in checked}) != len(checked) or len(
+        {str(item.run_url) for item in checked}
+    ) != len(checked):
+        raise ValueError("wave0_oidc_bindings_invalid")
+    return tuple(_verify_oidc_run(item, runner) for item in checked)
+
+
+def _verify_oidc_run(
+    reference: OidcRunReference,
+    runner: CommandRunner,
+) -> OidcRunEvidence:
+    run_id = _run_id_from_url(reference.run_url)
+    if run_id is None:
+        raise ValueError("wave0_oidc_run_unverified")
+    run_endpoint = f"repos/{_GITHUB_REPOSITORY}/actions/runs/{run_id}"
+    run = _gh_json(
+        run_endpoint,
+        (
+            "{id,html_url,event,status,conclusion,head_sha,workflow_id,path,"
+            "repository_full_name:.repository.full_name}"
+        ),
+        runner,
+        "wave0_oidc_run_unverified",
+    )
+    expected_run_keys = {
+        "id",
+        "html_url",
+        "event",
+        "status",
+        "conclusion",
+        "head_sha",
+        "workflow_id",
+        "path",
+        "repository_full_name",
+    }
+    if set(run) != expected_run_keys:
+        raise ValueError("wave0_oidc_run_unverified")
+    head_sha = run["head_sha"]
+    workflow_id = run["workflow_id"]
+    if (
+        type(run["id"]) is not int
+        or run["id"] != run_id
+        or run["html_url"] != str(reference.run_url)
+        or run["event"] != "workflow_dispatch"
+        or run["status"] != "completed"
+        or run["conclusion"] != "success"
+        or type(head_sha) is not str
+        or _GIT_SHA_RE.fullmatch(head_sha) is None
+        or type(workflow_id) is not int
+        or workflow_id <= 0
+        or run["path"] != _GITHUB_WORKFLOW_PATH
+        or run["repository_full_name"] != _GITHUB_REPOSITORY
+    ):
+        raise ValueError("wave0_oidc_run_unverified")
+
+    workflow = _gh_json(
+        f"repos/{_GITHUB_REPOSITORY}/actions/workflows/{workflow_id}",
+        "{id,path}",
+        runner,
+        "wave0_oidc_workflow_unverified",
+    )
+    if workflow != {"id": workflow_id, "path": _GITHUB_WORKFLOW_PATH}:
+        raise ValueError("wave0_oidc_workflow_unverified")
+
+    jobs = _gh_json(
+        f"{run_endpoint}/jobs?per_page=100",
+        "{total_count,jobs:[.jobs[]|{id,name,status,conclusion}]}",
+        runner,
+        "wave0_oidc_job_unverified",
+    )
+    job_id = _verified_environment_job(jobs, reference.environment)
+
+    source_result = runner(
+        (
+            "gh",
+            "api",
+            f"repos/{_GITHUB_REPOSITORY}/contents/{_GITHUB_WORKFLOW_PATH}?ref={head_sha}",
+            "--jq",
+            ".content",
+        ),
+        20,
+    )
+    try:
+        workflow_source = base64.b64decode(
+            "".join(source_result.stdout.split()).encode("ascii"), validate=True
+        ).decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError, binascii.Error):
+        raise ValueError("wave0_oidc_workflow_source_unverified") from None
+    if source_result.returncode != 0 or not _workflow_source_valid(workflow_source):
+        raise ValueError("wave0_oidc_workflow_source_unverified")
+    workflow_sha256 = hashlib.sha256(workflow_source.encode("utf-8")).hexdigest()
+    evidence_sha256 = _canonical_oidc_evidence_sha256(
+        environment=reference.environment,
+        run_url=reference.run_url,
+        run_id=run_id,
+        head_sha=head_sha,
+        workflow_id=workflow_id,
+        workflow_sha256=workflow_sha256,
+        job_id=job_id,
+    )
+    return OidcRunEvidence(
+        environment=reference.environment,
+        run_url=reference.run_url,
+        run_id=run_id,
+        head_sha=head_sha,
+        workflow_id=workflow_id,
+        workflow_sha256=workflow_sha256,
+        job_id=job_id,
+        evidence_sha256=evidence_sha256,
+    )
+
+
+def _gh_json(
+    endpoint: str,
+    jq_filter: str,
+    runner: CommandRunner,
+    error_code: str,
+) -> dict[str, Any]:
+    result = runner(("gh", "api", endpoint, "--jq", jq_filter), 20)
+    if result.returncode != 0:
+        raise ValueError(error_code)
+    try:
+        payload: Any = json.loads(result.stdout)
+    except (json.JSONDecodeError, RecursionError, UnicodeError):
+        raise ValueError(error_code) from None
+    if not isinstance(payload, dict):
+        raise ValueError(error_code)
+    return payload
+
+
+def _verified_environment_job(jobs: dict[str, Any], environment: EnvironmentName) -> int:
+    if set(jobs) != {"total_count", "jobs"} or type(jobs["total_count"]) is not int:
+        raise ValueError("wave0_oidc_job_unverified")
+    records = jobs["jobs"]
+    if (
+        not isinstance(records, list)
+        or jobs["total_count"] != len(records)
+        or len(records) > 100
+    ):
+        raise ValueError("wave0_oidc_job_unverified")
+    expected_name = f"OIDC smoke ({environment.value})"
+    matches = [
+        item
+        for item in records
+        if isinstance(item, dict) and item.get("name") == expected_name
+    ]
+    if len(matches) != 1:
+        raise ValueError("wave0_oidc_job_unverified")
+    job = matches[0]
+    if (
+        set(job) != {"id", "name", "status", "conclusion"}
+        or type(job["id"]) is not int
+        or job["id"] <= 0
+        or job["status"] != "completed"
+        or job["conclusion"] != "success"
+    ):
+        raise ValueError("wave0_oidc_job_unverified")
+    return job["id"]
+
+
+def _workflow_source_valid(source: str) -> bool:
+    if hashlib.sha256(source.encode("utf-8")).hexdigest() != _GITHUB_WORKFLOW_SHA256:
+        return False
+    try:
+        workflow: Any = yaml.load(source, Loader=yaml.BaseLoader)
+        dispatch = workflow["on"]
+        permissions = workflow["permissions"]
+        jobs = workflow["jobs"]
+        job = jobs["oidc-smoke"]
+        assume_role = job["steps"][0]
+    except (KeyError, TypeError, yaml.YAMLError):
+        return False
+    try:
+        return bool(
+            set(dispatch) == {"workflow_dispatch"}
+            and permissions == {"contents": "read", "id-token": "write"}
+            and set(jobs) == {"oidc-smoke"}
+            and job.get("environment") == "${{ matrix.environment }}"
+            and job.get("strategy", {}).get("fail-fast") == "false"
+            and job.get("strategy", {}).get("matrix", {}).get("environment")
+            == ["nonprod", "production"]
+            and assume_role.get("uses") == _GITHUB_CREDENTIALS_ACTION
+            and assume_role.get("with")
+            == {
+                "role-to-assume": "${{ vars.AWS_WAVE0_ROLE_ARN }}",
+                "aws-region": "ap-southeast-1",
+                "mask-aws-account-id": "true",
+            }
+        )
+    except (AttributeError, TypeError):
+        return False
 
 
 def _check(

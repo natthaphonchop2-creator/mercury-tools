@@ -19,6 +19,7 @@ from mercury_tools.aws.identity import (
     IdentityMode,
     ProbeResult,
     decide_identity,
+    read_identity_decision,
     record_host_probe,
     write_identity_decision,
 )
@@ -326,6 +327,43 @@ def test_decision_writer_is_atomic_private_and_closed(tmp_path: Path) -> None:
         "issuer_origin": "cognito",
         "required_hosts": ["codex", "chatgpt", "claude"],
     }
+
+
+def test_decision_reader_returns_validated_decision_and_file_hash(tmp_path: Path) -> None:
+    output = tmp_path / "identity" / "identity-decision.yaml"
+    write_identity_decision(output, cognito_decision())
+
+    loaded = read_identity_decision(output)
+
+    assert loaded is not None
+    decision, evidence_sha256 = loaded
+    assert decision == cognito_decision()
+    assert evidence_sha256 == hashlib.sha256(output.read_bytes()).hexdigest()
+    assert read_identity_decision(tmp_path / "identity" / "missing.yaml") is None
+
+
+@pytest.mark.parametrize("symlink_component", ("parent", "final"))
+def test_decision_reader_rejects_symlinked_path_components(
+    tmp_path: Path,
+    symlink_component: str,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    decision = outside / "identity-decision.yaml"
+    write_identity_decision(decision, cognito_decision())
+
+    if symlink_component == "parent":
+        parent = tmp_path / "identity"
+        parent.symlink_to(outside, target_is_directory=True)
+        candidate = parent / "identity-decision.yaml"
+    else:
+        parent = tmp_path / "identity"
+        parent.mkdir()
+        candidate = parent / "identity-decision.yaml"
+        candidate.symlink_to(decision)
+
+    with pytest.raises(ValueError, match="identity_decision_path_invalid"):
+        read_identity_decision(candidate)
 
 
 def test_host_contract_is_closed_and_requires_all_hosts() -> None:

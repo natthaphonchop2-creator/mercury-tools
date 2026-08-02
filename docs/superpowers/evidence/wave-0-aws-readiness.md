@@ -11,7 +11,7 @@ This is a sanitized offline owner-review record. The gate was run with
 `--skip-live`; no live AWS API was called and no GitHub Actions workflow was
 dispatched. The ignored machine report is
 `.artifacts/aws/wave0/readiness.json`, mode `0600`, with SHA-256
-`bfd696f8bebf83c4cddb6e6c3ec45f218234f837cefe1a310903993018c3b4e5`.
+`aa3f52e8868f5367339328e8d6b63bc4c6b8594e5e441570d0cedee184dac525`.
 
 No Mercury runtime, customer data, provider credentials, or Wave 1
 infrastructure was created. No AWS account ID, principal ARN, access key,
@@ -67,7 +67,16 @@ No service or quota availability claim is made.
 - Nonprod GitHub Actions run URL: absent; no URL or hash recorded.
 - Production GitHub Actions run URL: absent; no URL or hash recorded.
 - OIDC workflow dispatch: not performed.
+- OIDC CLI inputs require explicit `nonprod=URL` and `production=URL` bindings.
+- URL shape or order does not create pass evidence. When bindings exist, the
+  gate independently verifies closed run metadata, workflow identity, the
+  expected successful matrix job, and the pinned workflow source at the run
+  head SHA through shell-free allowlisted `gh api` calls.
+- No `gh` call ran during this blocked execution because both bindings are
+  absent.
 - Identity decision file: absent.
+- Identity decision reads reject symlinked parent components and final
+  symlinks before parsing or hashing evidence.
 - Identity mode and issuer kind: not selected.
 - Codex, ChatGPT, and Claude host results: not available.
 - Disposable Cognito stack: not deployed, so no deletion command was run.
@@ -90,7 +99,7 @@ issuer kind, host results, account fingerprints, or stack-deletion proof.
 - `npm ci --ignore-scripts`: pass.
 - Exact tool version commands: pass.
 - `uv sync --extra dev`: pass.
-- Approved four-file Wave 0 pytest matrix: 92 passed.
+- Approved four-file Wave 0 pytest matrix: 114 passed.
 - Approved Ruff matrix: pass.
 - `uv run python scripts/check_aws_readiness.py --skip-live --output .artifacts/aws/wave0/readiness.json`: expected exit 2, `blocked_account_access`.
 - Whitespace checks: pass after the final Task 5 diff.
