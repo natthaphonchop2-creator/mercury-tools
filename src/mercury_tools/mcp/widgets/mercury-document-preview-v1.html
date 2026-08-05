@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="th">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ตัวอย่างเอกสาร Mercury</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --ink: #172033;
+        --muted: #566174;
+        --surface: #ffffff;
+        --line: #cbd5e1;
+        --accent: #0f766e;
+        --accent-strong: #115e59;
+        --warning: #92400e;
+        --warning-surface: #fffbeb;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        background: transparent;
+        color: var(--ink);
+        font-family: Sarabun, Tahoma, Arial, sans-serif;
+        line-height: 1.5;
+      }
+
+      main {
+        max-width: 960px;
+        margin: 0 auto;
+        padding: 20px;
+      }
+
+      header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+        border-bottom: 1px solid var(--line);
+        padding-bottom: 16px;
+      }
+
+      h1, h2, p { margin: 0; }
+      h1 { font-size: 1.4rem; }
+      h2 { font-size: 1.05rem; margin-top: 24px; }
+      .muted { color: var(--muted); }
+      .status { font-weight: 700; color: var(--accent-strong); }
+      .summary { margin-top: 12px; color: var(--muted); }
+      .table-wrap { margin-top: 16px; overflow-x: auto; }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        min-width: 620px;
+      }
+
+      caption {
+        padding-bottom: 10px;
+        text-align: left;
+        color: var(--muted);
+      }
+
+      th, td {
+        border-bottom: 1px solid var(--line);
+        padding: 10px 8px;
+        text-align: left;
+        vertical-align: top;
+      }
+
+      th { font-size: 0.875rem; color: var(--muted); }
+      .amount { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+      .details { margin-top: 20px; display: grid; gap: 12px; }
+      .document-card { border: 1px solid var(--line); padding: 14px; border-radius: 6px; }
+      .document-card dl { display: grid; grid-template-columns: 150px 1fr; gap: 6px 12px; margin: 0; }
+      .document-card dt { color: var(--muted); }
+      .document-card dd { margin: 0; font-variant-numeric: tabular-nums; }
+      .warning-list { margin: 14px 0 0; padding: 12px 16px 12px 32px; background: var(--warning-surface); color: var(--warning); }
+      .actions { display: flex; justify-content: flex-end; margin-top: 20px; }
+
+      button {
+        border: 0;
+        border-radius: 6px;
+        padding: 10px 16px;
+        background: var(--accent);
+        color: #ffffff;
+        cursor: pointer;
+        font: inherit;
+      }
+
+      button:hover:not(:disabled) { background: var(--accent-strong); }
+      button:disabled { cursor: not-allowed; opacity: 0.58; }
+      button:focus-visible { outline: 3px solid #f59e0b; outline-offset: 3px; }
+      #notice { min-height: 1.5em; margin-top: 12px; color: var(--muted); }
+
+      @media (max-width: 640px) {
+        main { padding: 14px; }
+        header { display: block; }
+        .summary { margin-top: 8px; }
+        .document-card dl { grid-template-columns: 1fr; gap: 2px; }
+        .document-card dt { margin-top: 8px; }
+        .actions { justify-content: stretch; }
+        button { width: 100%; }
+      }
+
+      @page { size: A4; margin: 14mm; }
+
+      @media print {
+        body { color: #000000; background: #ffffff; }
+        main { max-width: none; padding: 0; }
+        .actions, #notice { display: none; }
+        .document-card { break-inside: avoid; }
+        table { min-width: 0; }
+      }
+    </style>
+  </head>
+  <body>
+    <main aria-labelledby="preview-title">
+      <header>
+        <div>
+          <h1 id="preview-title">ตัวอย่างเอกสารก่อนสร้างจริง</h1>
+          <p id="document-summary" class="summary">กำลังรอข้อมูลตัวอย่างจาก Mercury</p>
+        </div>
+        <p id="status" class="status" aria-live="polite">กำลังรอ</p>
+      </header>
+
+      <section aria-labelledby="items-title">
+        <h2 id="items-title">รายการเอกสาร</h2>
+        <div class="table-wrap">
+          <table aria-describedby="document-summary">
+            <caption>รายการเอกสารที่รอการยืนยัน</caption>
+            <thead>
+              <tr>
+                <th scope="col">ประเภท</th>
+                <th scope="col">คู่ค้า</th>
+                <th scope="col">วันที่ออก</th>
+                <th scope="col">ครบกำหนด</th>
+                <th scope="col" class="amount">ยอดรวม</th>
+              </tr>
+            </thead>
+            <tbody id="document-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="document-details" class="details" aria-label="รายละเอียดเอกสาร"></section>
+      <p id="notice" aria-live="polite"></p>
+      <div class="actions">
+        <button id="confirm-button" type="button" disabled>ยืนยันสร้างเอกสาร</button>
+      </div>
+    </main>
+
+    <script>
+      (() => {
+        "use strict";
+
+        const documentBody = document.querySelector("#document-body");
+        const documentDetails = document.querySelector("#document-details");
+        const summary = document.querySelector("#document-summary");
+        const status = document.querySelector("#status");
+        const notice = document.querySelector("#notice");
+        const confirmButton = document.querySelector("#confirm-button");
+        let currentPreview = null;
+
+        function text(value) {
+          return typeof value === "string" || typeof value === "number" ? String(value) : "-";
+        }
+
+        function clear(element) {
+          while (element.firstChild) element.removeChild(element.firstChild);
+        }
+
+        function cell(row, value, className) {
+          const element = document.createElement("td");
+          element.textContent = text(value);
+          if (className) element.className = className;
+          row.appendChild(element);
+        }
+
+        function detail(document) {
+          const card = document.createElement("article");
+          card.className = "document-card";
+          const heading = document.createElement("h2");
+          heading.textContent = `${text(document.document_type)} · ${text(document.draft_id)}`;
+          const list = document.createElement("dl");
+          const values = [
+            ["คู่ค้า", document.counterparty_display],
+            ["วันที่ออก", document.issue_date],
+            ["วันครบกำหนด", document.due_date],
+            ["ยอดก่อนส่วนลด", document.subtotal],
+            ["ส่วนลด", document.discount_total],
+            ["VAT", document.vat_total],
+            ["ภาษีหัก ณ ที่จ่าย", document.withholding_tax_total],
+            ["ยอดรวม", document.grand_total],
+          ];
+          values.forEach(([label, value]) => {
+            const term = document.createElement("dt");
+            term.textContent = label;
+            const description = document.createElement("dd");
+            description.textContent = `${text(document.currency)} ${text(value)}`;
+            list.append(term, description);
+          });
+          card.append(heading, list);
+
+          const warnings = Array.isArray(document.warnings) ? document.warnings : [];
+          const reviewPoints = Array.isArray(document.accountant_review_points)
+            ? document.accountant_review_points
+            : [];
+          if (warnings.length || reviewPoints.length) {
+            const messages = document.createElement("ul");
+            messages.className = "warning-list";
+            [...warnings, ...reviewPoints].forEach((message) => {
+              const item = document.createElement("li");
+              item.textContent = text(message);
+              messages.appendChild(item);
+            });
+            card.appendChild(messages);
+          }
+          return card;
+        }
+
+        function render(preview) {
+          if (!preview || !Array.isArray(preview.documents)) return;
+          currentPreview = preview;
+          clear(documentBody);
+          clear(documentDetails);
+          preview.documents.forEach((document) => {
+            const row = document.createElement("tr");
+            cell(row, document.document_type);
+            cell(row, document.counterparty_display);
+            cell(row, document.issue_date);
+            cell(row, document.due_date);
+            cell(row, `${text(document.currency)} ${text(document.grand_total)}`, "amount");
+            documentBody.appendChild(row);
+            documentDetails.appendChild(detail(document));
+          });
+          summary.textContent = `Preview ${text(preview.preview_id)} · เวอร์ชัน ${text(preview.state_version)} · ${text(preview.document_count)} เอกสาร · ยอดรวม ${text(preview.currency)} ${text(preview.grand_total)}`;
+          status.textContent = text(preview.status);
+          const canConfirm = preview.status === "awaiting_confirmation" || preview.status === "prepared";
+          confirmButton.disabled = !canConfirm;
+          confirmButton.textContent = preview.documents[0] && preview.documents[0].confirmation_label
+            ? text(preview.documents[0].confirmation_label)
+            : "ยืนยันสร้างเอกสาร";
+          notice.textContent = canConfirm
+            ? "ตรวจสอบข้อมูลให้ครบก่อนยืนยัน ระบบจะสร้างตามตัวอย่างเวอร์ชันนี้เท่านั้น"
+            : "ตัวอย่างนี้ไม่พร้อมยืนยัน กรุณารอข้อมูลสถานะล่าสุดจาก Mercury";
+        }
+
+        function previewFrom(value) {
+          if (!value || typeof value !== "object") return null;
+          if (value["mercury/preview"]) return value["mercury/preview"];
+          if (value._meta && value._meta["mercury/preview"]) return value._meta["mercury/preview"];
+          if (value.structuredContent && value.structuredContent["mercury/preview"]) {
+            return value.structuredContent["mercury/preview"];
+          }
+          return null;
+        }
+
+        function refreshFromHost() {
+          const preview = previewFrom(window.openai && window.openai.toolOutput);
+          if (preview) render(preview);
+        }
+
+        async function confirm() {
+          const preview = currentPreview;
+          if (!preview || confirmButton.disabled || !window.openai || !window.openai.callTool) return;
+          confirmButton.disabled = true;
+          notice.textContent = "กำลังส่งคำยืนยัน…";
+          try {
+            const result = await window.openai.callTool(
+              "confirm_document_create",
+              {
+                workspace_id: preview.workspace_id,
+                preview_id: preview.preview_id,
+                state_version: preview.state_version,
+                confirmation: "CONFIRM_CREATE",
+              },
+            );
+            const latestPreview = previewFrom(result);
+            if (latestPreview) {
+              render(latestPreview);
+              return;
+            }
+            const code = result && result.structuredContent && result.structuredContent.error
+              ? result.structuredContent.error.code
+              : null;
+            if (code === "preview_state_changed" || code === "preview_expired") {
+              notice.textContent = "ข้อมูลตัวอย่างเปลี่ยนหรือหมดอายุแล้ว กรุณารอข้อมูลล่าสุดจาก Mercury";
+            } else {
+              notice.textContent = "Mercury ไม่สามารถยืนยันเอกสารนี้ได้ โปรดตรวจสอบสถานะก่อนลองใหม่";
+            }
+          } catch (_error) {
+            notice.textContent = "ไม่สามารถส่งคำยืนยันได้ โปรดตรวจสอบการเชื่อมต่อและสถานะเอกสาร";
+          } finally {
+            if (currentPreview && (currentPreview.status === "awaiting_confirmation" || currentPreview.status === "prepared")) {
+              confirmButton.disabled = false;
+            }
+          }
+        }
+
+        confirmButton.addEventListener("click", confirm);
+        window.addEventListener("openai:set_globals", refreshFromHost);
+        refreshFromHost();
+      })();
+    </script>
+  </body>
+</html>
