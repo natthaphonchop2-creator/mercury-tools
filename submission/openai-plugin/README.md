@@ -1,9 +1,8 @@
 # Mercury Finance Public Plugin Submission
 
-This directory is the review-ready source bundle for the public one-click
-Mercury Finance plugin. It is an **app-plus-skills** submission backed by the
-hosted Streamable HTTP MCP server. It does not include a custom UI or web setup
-application.
+This directory is the review-ready source bundle for the Mercury Finance
+app-plus-skills submission. It uses the hosted Streamable HTTP MCP server without a
+custom UI. The V1 MCP is OAuth protected: first use opens secure Mercury sign-in.
 
 ## Production endpoints
 
@@ -32,21 +31,14 @@ The command writes a deterministic ZIP to
 4. Copy the portal challenge token into the Render environment variable
    `OPENAI_APPS_CHALLENGE_TOKEN`, deploy, and verify the challenge URL returns
    only that token.
-5. Scan tools and confirm every tool exposes `readOnlyHint`, `openWorldHint`,
-   and `destructiveHint`.
-6. Upload the generated skills ZIP, starter prompts, and the exact five
-   positive plus three negative cases from `test-cases.json`.
+5. Scan tools and confirm each published tool has the matching V1 annotation.
+6. Upload the generated skills ZIP, starter prompts, and the exact five positive plus
+   three negative cases from `test-cases.json`.
 7. Review `release-notes.md`, complete policy attestations, and submit.
-
-After OpenAI approves and the publisher selects Publish, end users install the
-plugin from the Plugins Directory with one click. Repository marketplace setup
-is not required for the public listing.
 
 ## Capability boundary
 
-The public plugin provides accounting knowledge, cited context packs, ERP
-endpoint catalogs, non-secret connector profiles, and Mercury Flow planning and
-closed-workspace execution. It does not accept ERP secrets or directly post
-production ERP transactions. The separate repository-local plugin remains the
-optional path for direct ERP GET/POST/PUT/PATCH/DELETE with local credentials
-and approval controls.
+Provider credentials are encrypted server-side and never enter chat, model, RAG, log,
+or audit output. The plugin exposes only qualified capabilities for the selected
+connection. A document create requires its exact qualified capability, an immutable
+preview, and explicit confirmation; it never claims arbitrary provider writes.

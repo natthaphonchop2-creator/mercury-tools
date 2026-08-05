@@ -1,20 +1,19 @@
 ---
 name: erp-endpoint-catalog-th
-description: Use when the user asks what an ERP connector or API endpoint supports, or how Mercury can learn a new ERP API.
+description: Use when the user asks what a connected ERP provider supports or needs reviewed capability details.
 ---
 
 # ERP Endpoint Catalog TH
 
-1. Call `list_connectors` to identify the supported ERP connector.
-2. Call `get_connector_setup` to distinguish native MCP, reviewed API-driver, and Local
-   Bridge availability without requesting a credential.
-3. For a linked workspace profile, call `connector_capabilities` before claiming an
-   action is available in a specific mode and environment.
-4. Call `search_knowledge` with the connector and requested capability, method, or
-   endpoint term. Use `get_document` only for the full indexed source.
-5. Report documented capability, environment, method/path when cited, source, and any
-   unresolved schema, authorization, or validation requirement.
+1. Call `list_accounting_providers` when the user has not selected a provider.
+2. For a selected connection, call `list_provider_capabilities` before claiming that an
+   operation is available in its provider and environment.
+3. Call `get_capability_schema` only for an exact qualified capability and version.
+4. Call `search_knowledge` for connector documentation, capability details, method, or
+   endpoint terminology; preserve the cited source for material claims.
+5. Report the qualified capability, version, documented scope, and any unresolved
+   authorization or schema requirement.
 
-Do not infer endpoint support from another connector. Do not ask for ERP credentials in
-the hosted plugin. A new or advanced reviewed driver is a local handoff; Mercury must
-curate official endpoint documentation before claiming support or planning a write.
+Do not infer support from another provider. Do not ask for ERP credentials in the hosted
+plugin. A document create needs the exact qualified capability, an immutable preview,
+and explicit confirmation; do not present it as an arbitrary write.

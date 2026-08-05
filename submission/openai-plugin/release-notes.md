@@ -1,17 +1,12 @@
-# Mercury Finance initial public plugin submission
+# Mercury Finance V1 public submission
 
-Initial public app-plus-skills submission for Mercury Finance.
-
-- Connects to the public Mercury Tools Streamable HTTP MCP on Render.
-- Provides cited accounting and tax knowledge retrieval, ERP connector and
-  endpoint catalogs, guided accounting skills, and Mercury Flow tools.
-- Includes accurate audited closed-system annotations for all 20 MCP tools.
-- Includes public privacy, terms, support, and domain-verification endpoints.
-- Does not include custom UI, ERP credentials, or direct production ERP
-  posting in the hosted plugin.
-- Review tests require no login, MFA, private network, or third-party ERP
-  account.
-
-The repository-local Mercury Finance plugin remains a separate optional surface
-for locally controlled ERP execution with user-held credentials and approval
-gates.
+- Migrates the submission to the OAuth-protected Mercury V1 hosted MCP.
+- First use opens secure Mercury sign-in, followed by the provider connection lifecycle
+  and connection-scoped qualified capabilities.
+- Provider credentials are encrypted server-side and never enter chat, model, RAG, log,
+  or audit output.
+- The tool map contains only the currently published V1 hosted tools.
+- Accounting Skills perform only exact qualified reads and cited context work.
+- Document creation is capability-gated and requires an immutable preview plus explicit
+  confirmation; the submission does not claim arbitrary provider writes.
+- Includes five V1 positive cases and three V1 negative cases.

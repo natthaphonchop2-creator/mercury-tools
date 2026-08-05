@@ -15,6 +15,24 @@ from zipfile import ZipFile
 ROOT = Path(__file__).resolve().parents[1]
 SUBMISSION = ROOT / "submission" / "openai-plugin"
 BUILD_SCRIPT = ROOT / "scripts" / "build_openai_plugin_bundle.py"
+LEGACY_TOOL_NAMES = {
+    "create_public_workspace",
+    "list_connectors",
+    "get_connector_setup",
+    "link_connector_profile",
+    "validate_connector_connection",
+    "connector_capabilities",
+    "get_accounting_skill_schema",
+    "retrieve_workspace_context_pack",
+    "list_workspace_flows",
+    "run_workspace_flow",
+    "save_workspace_flow",
+    "flow_cheat_sheet",
+    "check_flow_syntax",
+    "inspect_flow_files",
+    "run_inline_flow",
+    "run_flow_files",
+}
 
 
 def _build_module() -> ModuleType:
@@ -29,17 +47,25 @@ def _json(name: str) -> dict:
     return json.loads((SUBMISSION / name).read_text(encoding="utf-8"))
 
 
-def test_submission_listing_uses_public_mcp_without_custom_ui() -> None:
+def _v1_hosted_tools() -> dict[str, object]:
+    from mercury_tools.mcp.server import StrictInputFastMCP
+    from mercury_tools.mcp.v1_tools import configure_v1_tools
+
+    server = StrictInputFastMCP("Mercury V1 OpenAI submission")
+    configure_v1_tools(server, enabled=True)
+    return {tool.name: tool for tool in asyncio.run(server.list_tools())}
+
+
+def test_submission_listing_uses_oauth_protected_v1_mcp_without_custom_ui() -> None:
     listing = _json("listing.json")
 
     assert listing["submission_type"] == "app-plus-skills"
     assert listing["mcp"] == {
         "url": "https://mercury-tools-mcp.onrender.com/mcp",
-        "authentication": "none",
+        "authentication": "oauth",
         "custom_ui": False,
         "challenge_url": (
-            "https://mercury-tools-mcp.onrender.com/"
-            ".well-known/openai-apps-challenge"
+            "https://mercury-tools-mcp.onrender.com/.well-known/openai-apps-challenge"
         ),
         "content_security_policy": {
             "connect_domains": ["https://mercury-tools-mcp.onrender.com"],
@@ -56,33 +82,33 @@ def test_submission_listing_uses_public_mcp_without_custom_ui() -> None:
             listing["data_handling_summary"],
         )
     ).lower()
-    assert "one hosted mcp" in boundary
-    assert "sanitized connector profile and audit metadata" in boundary
-    assert "no erp credentials" in boundary
-    assert "connected mcp host or erp integration" in boundary
+    assert "oauth-protected hosted mcp" in boundary
+    assert "secure mercury sign-in" in boundary
+    assert "encrypted server-side" in boundary
+    assert "never enter chat, model, rag, log, or audit output" in boundary
 
 
-def test_chatgpt_submission_describes_the_same_connector_neutral_boundary() -> None:
-    submission = json.loads(
-        (ROOT / "chatgpt-app-submission.json").read_text(encoding="utf-8")
-    )
+def test_chatgpt_submission_describes_the_v1_connection_and_write_boundary() -> None:
+    submission = json.loads((ROOT / "chatgpt-app-submission.json").read_text(encoding="utf-8"))
     description = submission["app_info"]["description"].lower()
 
     assert "one oauth-protected hosted mcp" in description
-    assert "qualified erp connectors" in description
+    assert "secure mercury sign-in" in description
     assert "encrypted provider credentials" in description
-    assert "never enter chat or model context" in description
+    assert "never enter chat, model, rag, log, or audit output" in description
+    assert "qualified capability" in description
+    assert "immutable preview" in description
+    assert "explicit confirmation" in description
 
 
-def test_chatgpt_submission_annotations_match_the_hosted_registry() -> None:
-    from mercury_tools.mcp.server import mcp
+def test_chatgpt_submission_annotations_match_the_fresh_v1_registry() -> None:
+    from mercury_tools.mcp.contracts import V1_HOSTED_TOOL_NAMES
 
-    submission = json.loads(
-        (ROOT / "chatgpt-app-submission.json").read_text(encoding="utf-8")
-    )
-    hosted = {tool.name: tool for tool in asyncio.run(mcp.list_tools())}
+    submission = json.loads((ROOT / "chatgpt-app-submission.json").read_text(encoding="utf-8"))
+    hosted = _v1_hosted_tools()
 
-    assert set(submission["tools"]) == set(hosted)
+    assert set(hosted) == V1_HOSTED_TOOL_NAMES
+    assert set(submission["tools"]) == V1_HOSTED_TOOL_NAMES
     for name, tool in hosted.items():
         submitted = submission["tools"][name]
         annotations = submitted["annotations"]
@@ -113,93 +139,81 @@ def test_submission_has_exact_required_test_case_counts() -> None:
     assert len({case["id"] for case in cases["positive"] + cases["negative"]}) == 8
 
 
-def test_submission_test_cases_cover_connector_neutral_review_paths() -> None:
+def test_submission_test_cases_cover_v1_connection_and_capability_paths() -> None:
     cases = _json("test-cases.json")
 
     assert [case["id"] for case in cases["positive"]] == [
-        "positive-native-mcp-read-only",
-        "positive-peak-api-driver-handoff",
-        "positive-express-local-bridge-handoff",
-        "positive-portable-skill-routing",
-        "positive-cited-knowledge",
+        "positive-v1-connection-lifecycle",
+        "positive-v1-qualified-capability-discovery",
+        "positive-v1-qualified-skill-read",
+        "positive-v1-document-create-guard",
+        "positive-v1-cited-knowledge",
     ]
     assert [case["id"] for case in cases["negative"]] == [
-        "negative-secret-in-chat",
-        "negative-unavailable-provider-write",
-        "negative-ambiguous-multi-profile",
+        "negative-v1-secret-in-chat",
+        "negative-v1-unqualified-provider-write",
+        "negative-v1-unconfirmed-document-create",
     ]
 
-    positive = {
-        case["id"]: json.dumps(case, ensure_ascii=False).lower()
-        for case in cases["positive"]
-    }
-    negative = {
-        case["id"]: json.dumps(case, ensure_ascii=False).lower()
-        for case in cases["negative"]
-    }
-    assert "native_mcp" in positive["positive-native-mcp-read-only"]
-    assert "read-only" in positive["positive-native-mcp-read-only"]
-    assert "peak" in positive["positive-peak-api-driver-handoff"]
-    assert "api_driver" in positive["positive-peak-api-driver-handoff"]
-    assert "express" in positive["positive-express-local-bridge-handoff"]
-    assert "local_bridge" in positive["positive-express-local-bridge-handoff"]
-    assert "run_accounting_skill" in positive["positive-portable-skill-routing"]
-    assert "citation" in positive["positive-cited-knowledge"]
-    assert "secret" in negative["negative-secret-in-chat"]
-    assert "provider_capability_unavailable" in negative[
-        "negative-unavailable-provider-write"
-    ]
-    assert "mode_required" in negative["negative-ambiguous-multi-profile"]
+    combined = json.dumps(cases, ensure_ascii=False).lower()
+    lifecycle = (
+        "get_mercury_context -> list_accounting_providers -> "
+        "start_provider_connection -> secure authorization_url/setup_url -> "
+        "list_provider_connections -> connector_status -> "
+        "list_provider_capabilities"
+    )
+    assert lifecycle in combined
+    assert "encrypted server-side" in combined
+    assert "qualified capability" in combined
+    assert "immutable preview" in combined
+    assert "explicit confirmation" in combined
+    assert "secret" in combined
+    assert "provider_capability_unavailable" in combined
 
 
-def test_public_submission_skills_only_reference_public_tools() -> None:
-    from mercury_tools.mcp.server import mcp
+def test_public_submission_skills_only_reference_v1_hosted_tools() -> None:
+    from mercury_tools.mcp.contracts import V1_HOSTED_TOOL_NAMES
 
-    local_only = {
-        "credential_status",
-        "search_erp_actions",
-        "get_erp_action_schema",
-        "run_erp_read",
-        "prepare_erp_mutation",
-        "execute_erp_create",
-        "execute_erp_update",
-        "execute_sensitive_erp_action",
-        "get_erp_request_status",
-        "import_erp_spec",
-        "list_connector_drivers",
-        "run_mercury_flow",
-        "preview_erp_write",
-        "confirm_erp_write",
-        "execute_erp_write",
-        "run_erp_write",
-    }
     skills = sorted((SUBMISSION / "skills").glob("*/SKILL.md"))
 
     assert len(skills) == 6
     combined = "\n".join(path.read_text(encoding="utf-8") for path in skills)
     normalized = " ".join(combined.split())
-    hosted_tools = {tool.name for tool in asyncio.run(mcp.list_tools())}
     referenced_tools = set(re.findall(r"`([a-z][a-z0-9_]+)`", combined))
-    assert referenced_tools <= hosted_tools
-    assert not (local_only & referenced_tools)
-    assert all(tool_name not in combined for tool_name in local_only)
+    assert referenced_tools <= V1_HOSTED_TOOL_NAMES
+    assert not (LEGACY_TOOL_NAMES & referenced_tools)
     assert "Never pass an API key" in combined
     assert "no ERP credentials" in combined
     assert "user approval" in normalized
+    assert "qualified capability" in normalized
+    assert "immutable preview" in normalized
+    assert "explicit confirmation" in normalized
 
 
-def test_connector_onboarding_skill_uses_the_exact_public_lifecycle() -> None:
-    skill = (
-        SUBMISSION / "skills" / "connector-onboarding-th" / "SKILL.md"
-    ).read_text(encoding="utf-8")
+def test_connector_onboarding_skill_uses_the_exact_v1_lifecycle() -> None:
+    skill = (SUBMISSION / "skills" / "connector-onboarding-th" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
     normalized = " ".join(skill.replace("`", "").split())
 
     lifecycle = (
-        "list_connectors -> get_connector_setup -> link_connector_profile -> "
-        "host/provider authorization -> validate_connector_connection -> "
-        "connector_status"
+        "get_mercury_context -> list_accounting_providers -> "
+        "start_provider_connection -> secure authorization_url/setup_url -> "
+        "list_provider_connections -> connector_status -> "
+        "list_provider_capabilities"
     )
     assert lifecycle in normalized
+
+
+def test_submission_artifacts_do_not_reference_legacy_hosted_tools() -> None:
+    artifact_paths = [
+        ROOT / "chatgpt-app-submission.json",
+        *SUBMISSION.rglob("*.json"),
+        *SUBMISSION.rglob("*.md"),
+    ]
+    combined = "\n".join(path.read_text(encoding="utf-8") for path in artifact_paths)
+
+    assert not (LEGACY_TOOL_NAMES & set(re.findall(r"\b[a-z][a-z0-9_]+\b", combined)))
 
 
 def test_submission_bundle_is_deterministic_and_has_flat_skill_tree(tmp_path) -> None:
@@ -222,9 +236,7 @@ def test_submission_bundle_is_deterministic_and_has_flat_skill_tree(tmp_path) ->
             for path in (SUBMISSION / "skills").glob("*/SKILL.md")
         )
         assert names == expected_names
-        assert all(
-            info.date_time == build_module.ZIP_TIMESTAMP for info in archive.infolist()
-        )
+        assert all(info.date_time == build_module.ZIP_TIMESTAMP for info in archive.infolist())
         assert archive.comment == b""
         for info in archive.infolist():
             assert info.create_system == 3

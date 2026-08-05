@@ -2,8 +2,8 @@
   "schema_version": 1,
   "submission_type": "app-plus-skills",
   "plugin_name": "Mercury Finance",
-  "short_description": "Connector-neutral accounting knowledge, profiles, Skills, and finance workflow plans.",
-  "long_description": "Mercury Finance is one hosted MCP for cited accounting knowledge, sanitized ERP connector profiles, portable Skills, capability routing, and controlled Mercury Flow plans. It stores no ERP credentials and never claims a provider action succeeded without host-observed evidence. Provider OAuth and provider calls remain owned by the user's connected MCP host or ERP integration.",
+  "short_description": "Qualified accounting connections, cited context, and controlled Skills.",
+  "long_description": "Mercury Finance is one OAuth-protected hosted MCP for cited accounting knowledge, provider connections, qualified capabilities, and controlled accounting Skills. First use opens a secure Mercury sign-in. Provider credentials are encrypted server-side and never enter chat, model, RAG, log, or audit output. A document create requires the exact qualified capability, an immutable preview, and explicit confirmation; Mercury never claims arbitrary provider writes.",
   "category": "Finance",
   "logo_file": "assets/mercury-finance-logo.png",
   "developer_identity_instruction": "Select the verified individual or business identity from the publishing OpenAI organization.",
@@ -14,19 +14,15 @@
   "source_url": "https://github.com/natthaphonchop2-creator/mercury-tools",
   "mcp": {
     "url": "https://mercury-tools-mcp.onrender.com/mcp",
-    "authentication": "none",
+    "authentication": "oauth",
     "custom_ui": false,
     "challenge_url": "https://mercury-tools-mcp.onrender.com/.well-known/openai-apps-challenge",
     "content_security_policy": {
-      "connect_domains": [
-        "https://mercury-tools-mcp.onrender.com"
-      ],
+      "connect_domains": ["https://mercury-tools-mcp.onrender.com"],
       "resource_domains": []
     }
   },
-  "recommended_availability": [
-    "TH"
-  ],
-  "data_handling_summary": "The hosted core stores sanitized connector profile and audit metadata, optional non-sensitive workspace display metadata, immutable Mercury Flow versions, and evidence references. It stores no ERP credentials, OAuth tokens, API keys, personal identifiers, raw provider payloads, or LAN access details. Provider authorization remains with the user's connected MCP host or ERP integration.",
+  "recommended_availability": ["TH"],
+  "data_handling_summary": "Mercury stores tenant-bound workspace and connection metadata, encrypted server-side provider credentials, qualified capability evidence, sanitized audit events, and cited knowledge references. Provider credentials never enter chat, model, RAG, log, or audit output. Mercury does not store raw provider credentials in submission data or request them in conversation.",
   "independence_notice": "Mercury Finance is an independent open-source project and is not affiliated with Mercury Technologies, Inc."
 }

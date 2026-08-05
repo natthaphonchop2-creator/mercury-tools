@@ -1,19 +1,19 @@
 ---
 name: mercury-flow-planner
-description: Use when the user asks to inspect, validate, save, preview, or run a Mercury Flow through the hosted plugin.
+description: Use when the user asks for a controlled accounting action plan for a connected provider.
 ---
 
-# Mercury Flow Planner
+# Mercury Action Planner
 
-1. Use `flow_cheat_sheet` when syntax or command choice is unclear.
-2. Use `check_flow_syntax` before every new or edited flow.
-3. Use `inspect_flow_files` for a multi-file in-memory workspace.
-4. Use `run_inline_flow` for one inline source and `run_flow_files` for a file suite. Keep
-   `dry_run=true` unless the user explicitly requests closed Mercury execution.
-5. Create a public workspace only with user approval. Use `save_workspace_flow` only
-   after showing title, purpose, and declared capabilities.
-6. Use `list_workspace_flows` before selecting a saved flow, then use
-   `run_workspace_flow` with `dry_run=true` first.
+1. Establish the workspace with `get_mercury_context` and identify the intended
+   provider connection with `list_provider_connections`.
+2. Call `connector_status` and `list_provider_capabilities` before proposing an action.
+3. Use `get_capability_schema` only for an exact qualified capability and reviewed
+   version. State any unmet qualification or provider readiness requirement.
+4. Use `run_accounting_skill` only when the requested work is supported by its exact
+   qualified read capability.
+5. For document creation, explain the immutable preview and explicit confirmation
+   gates. Do not claim a provider write before those gates complete.
 
-Hosted Mercury Flows never substitute for a provider write. Never convert a flow plan
-into an external financial action or claim that it changed an ERP record.
+Mercury does not perform arbitrary writes. A plan remains a plan until the selected
+connection exposes the qualified capability and the user gives explicit user approval.
