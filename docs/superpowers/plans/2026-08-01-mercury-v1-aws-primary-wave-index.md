@@ -1,5 +1,9 @@
 # Mercury V1 AWS-Primary Wave Index Implementation Plan
 
+> **Status update (2026-08-06): Paused.** This AWS Wave sequence is retained as
+> optional future infrastructure work and is not an active V1 release blocker.
+> The active plan is `2026-08-06-mercury-v1-render-supabase-primary.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Deliver Mercury V1 as one AWS-primary, one-click, OAuth-protected MCP product through nine separately reviewed migration Waves.

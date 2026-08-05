@@ -1,5 +1,10 @@
 # Mercury V1 AWS-Primary AgentCore Design
 
+> **Status update (2026-08-06): Paused optional deployment target.**
+> `2026-08-06-mercury-v1-render-supabase-primary-design.md` supersedes this
+> document for Mercury V1 infrastructure and release delivery. The product and
+> accounting-domain contracts preserved by the new design remain valid.
+
 Status: Owner-approved design; written spec ready for owner review
 Date: 2026-08-01
 Target release: `v1.0.0`

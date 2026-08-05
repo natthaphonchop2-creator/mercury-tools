@@ -590,8 +590,28 @@ The exact price, quota and payment provider remain separate commercial
 decisions. Entitlements must bind the authenticated user, tenant, workspace,
 provider connection and capability before execution.
 
+## Approved Design 9: Render and Supabase Primary V1 Backend
+
+Owner direction approved on 2026-08-06:
+
+- Mercury V1 resumes the existing Render Hosted MCP and Supabase Auth/Postgres
+  architecture immediately instead of waiting for AgentCore quota changes.
+- AWS AgentCore work is paused and preserved as an optional future deployment
+  target. It is not a V1 release blocker and is not deleted.
+- Render runs the product-facing FastMCP Streamable HTTP service. Supabase
+  provides OAuth 2.1/PKCE identity, PostgreSQL product state, RAG metadata,
+  tenant isolation, operation state, and sanitized audit.
+- All previously approved Capability Catalog, connector, provider credential,
+  immutable preview, confirmation, idempotency, reconciliation, evidence, and
+  accounting audit contracts remain unchanged.
+- Production `/mcp` requires authentication. The current public unauthenticated
+  configuration remains demo-only until the V1 release gates pass.
+- The canonical written specification is
+  `docs/superpowers/specs/2026-08-06-mercury-v1-render-supabase-primary-design.md`.
+
 ## Design Status
 
-Designs 1-8 are approved. The canonical revised written specification is
-`docs/superpowers/specs/2026-08-01-mercury-v1-aws-primary-agentcore-design.md`
-and is pending owner review before an implementation plan may be written.
+Designs 1-9 are approved. The canonical infrastructure and delivery
+specification is
+`docs/superpowers/specs/2026-08-06-mercury-v1-render-supabase-primary-design.md`.
+The AWS-primary specification and Wave index are paused optional references.
