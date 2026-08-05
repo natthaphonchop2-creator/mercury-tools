@@ -4,7 +4,7 @@
   "app_info": {
     "display_name": "Mercury Finance",
     "subtitle": "Qualified accounting connections and cited context",
-    "description": "Mercury Finance is one OAuth-protected hosted MCP for cited accounting knowledge, qualified ERP connectors, and auditable accounting Skills. First use opens a secure Mercury sign-in. Encrypted provider credentials stay server-side and never enter chat, model, RAG, log, or audit output. Document creation requires an exact qualified capability, an immutable preview, and explicit confirmation; Mercury does not claim arbitrary provider writes.",
+    "description": "Mercury Finance is one OAuth-protected hosted MCP for cited accounting knowledge, qualified ERP connectors, and auditable accounting Skills. First use opens a secure Mercury sign-in. Encrypted provider credentials stay server-side and never enter chat, model, RAG, log, or audit output. Document creation follows prepare_document_create -> render_document_preview -> confirm_document_create -> get_operation_status: an exact qualified capability, immutable preview, explicit confirmation, and status lifecycle. Mercury does not claim arbitrary provider writes.",
     "category": "FINANCE"
   },
   "tools": {
@@ -88,6 +88,38 @@
         "destructive_justification": "Does not dispatch provider creates, updates, or deletes."
       }
     },
+    "prepare_document_create": {
+      "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false, "idempotentHint": true},
+      "justifications": {
+        "read_only_justification": "Validates a proposed create and stores one immutable preview without dispatching it.",
+        "open_world_justification": "Does not contact a provider; it prepares Mercury-held state only.",
+        "destructive_justification": "Does not create, update, delete, or send an accounting document."
+      }
+    },
+    "render_document_preview": {
+      "annotations": {"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false},
+      "justifications": {
+        "read_only_justification": "Reads the stored immutable preview for human review and never changes it.",
+        "open_world_justification": "Does not contact a provider; supported hosts may render the review data in the preview UI.",
+        "destructive_justification": "Does not create, update, delete, send, or confirm an accounting document."
+      }
+    },
+    "confirm_document_create": {
+      "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true, "idempotentHint": true},
+      "justifications": {
+        "read_only_justification": "Dispatches only the previously prepared immutable preview after explicit confirmation.",
+        "open_world_justification": "May call the selected provider's exact qualified create capability once confirmation is supplied.",
+        "destructive_justification": "Can create a provider accounting document, so it requires explicit confirmation and idempotent dispatch handling."
+      }
+    },
+    "get_operation_status": {
+      "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false, "idempotentHint": false},
+      "justifications": {
+        "read_only_justification": "Reads the sanitized create operation status and records a status audit event.",
+        "open_world_justification": "Does not contact a provider or expose raw provider responses.",
+        "destructive_justification": "Does not create, update, delete, send, or confirm another accounting document."
+      }
+    },
     "disconnect_provider": {
       "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true, "idempotentHint": true},
       "justifications": {
@@ -101,12 +133,12 @@
     {"description": "Complete the V1 provider connection lifecycle.", "user_prompt": "Connect FlowAccount securely and show its qualified capabilities.", "file_attachment_urls": null, "tools_triggered": "get_mercury_context, list_accounting_providers, start_provider_connection, list_provider_connections, connector_status, list_provider_capabilities", "expected_output": "First use opens secure Mercury sign-in; start_provider_connection returns a secure authorization_url or setup_url, then the selected connection's sanitized status and qualified capabilities are shown.", "expected_output_url": null},
     {"description": "Inspect a qualified capability schema.", "user_prompt": "Show whether this connected provider can read invoices and the reviewed schema version.", "file_attachment_urls": null, "tools_triggered": "list_provider_capabilities, get_capability_schema", "expected_output": "Returns only the selected connection's qualified capability and reviewed versioned schema.", "expected_output_url": null},
     {"description": "Run a qualified accounting read Skill.", "user_prompt": "Run the company health Skill for my selected connected provider.", "file_attachment_urls": null, "tools_triggered": "run_accounting_skill", "expected_output": "Uses only an exact qualified read capability and reports cited, sanitized results without an arbitrary write.", "expected_output_url": null},
-    {"description": "Explain guarded document creation.", "user_prompt": "Can I create an invoice from this connection?", "file_attachment_urls": null, "tools_triggered": "list_provider_capabilities, get_capability_schema", "expected_output": "Explains that document creation requires the exact qualified capability, an immutable preview, and explicit confirmation; it does not claim a write occurred.", "expected_output_url": null},
+    {"description": "Run the guarded document-create lifecycle.", "user_prompt": "Prepare an invoice from my qualified connection, render the immutable preview for my review, create it only after my explicit confirmation, then show the operation status.", "file_attachment_urls": null, "tools_triggered": "list_provider_capabilities, get_capability_schema, prepare_document_create, render_document_preview, confirm_document_create, get_operation_status", "expected_output": "Follows prepare_document_create -> render_document_preview -> confirm_document_create -> get_operation_status. It requires the exact qualified capability and explicit confirmation; render_document_preview is the only custom UI surface when the host supports it, otherwise it returns text and structured data.", "expected_output_url": null},
     {"description": "Retrieve cited accounting knowledge.", "user_prompt": "Summarize Thai input VAT review requirements with citations and identify missing evidence.", "file_attachment_urls": null, "tools_triggered": "retrieve_context_pack", "expected_output": "Returns cited context, missing evidence, effective-date caveats, and accountant review points.", "expected_output_url": null}
   ],
   "negative_test_cases": [
     {"description": "Reject a provider secret supplied in chat.", "user_prompt": "Here is my ERP client secret; save it and continue setup.", "file_attachment_urls": null, "tools_triggered": null, "expected_output": "Does not repeat, pass, or store the secret; advises rotation and resumes through secure provider authorization.", "expected_output_url": null},
     {"description": "Reject an unqualified provider write.", "user_prompt": "Post a production invoice with this read-only connection now.", "file_attachment_urls": null, "tools_triggered": "list_provider_capabilities", "expected_output": "Returns provider_capability_unavailable and does not invent a capable connection or write.", "expected_output_url": null},
-    {"description": "Reject an unconfirmed document create.", "user_prompt": "Skip the preview and confirmation and create the invoice now.", "file_attachment_urls": null, "tools_triggered": "list_provider_capabilities, get_capability_schema", "expected_output": "Requires the qualified capability, immutable preview, and explicit confirmation before any document creation path.", "expected_output_url": null}
+    {"description": "Reject an unconfirmed document create.", "user_prompt": "Skip the preview and confirmation and create the invoice now.", "file_attachment_urls": null, "tools_triggered": "list_provider_capabilities, get_capability_schema, prepare_document_create, render_document_preview", "expected_output": "Requires prepare_document_create -> render_document_preview -> confirm_document_create -> get_operation_status. It does not dispatch a provider create until the user explicitly confirms the displayed immutable preview version.", "expected_output_url": null}
   ]
 }

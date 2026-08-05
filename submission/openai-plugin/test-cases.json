@@ -23,9 +23,9 @@
     },
     {
       "id": "positive-v1-document-create-guard",
-      "user_prompt": "Can I create an invoice from this connection?",
-      "expected_behavior": "Use list_provider_capabilities and get_capability_schema before describing document creation. Explain that it needs the exact qualified capability, an immutable preview, and explicit confirmation.",
-      "expected_result_shape": "A capability-gated answer that does not claim a document was written.",
+      "user_prompt": "Prepare an invoice from my qualified connection, render the immutable preview for my review, create it only after my explicit confirmation, then show the operation status.",
+      "expected_behavior": "Use list_provider_capabilities and get_capability_schema, then follow prepare_document_create -> render_document_preview -> confirm_document_create -> get_operation_status. The provider create cannot happen until explicit confirmation of the immutable preview version.",
+      "expected_result_shape": "A capability-gated immutable preview, then one explicitly confirmed create and a sanitized operation status. Only render_document_preview may use custom UI on supported hosts; all other stages have text and structured output.",
       "fixture": "The selected connection may or may not qualify for documents.invoice.create."
     },
     {
@@ -52,8 +52,8 @@
     {
       "id": "negative-v1-unconfirmed-document-create",
       "user_prompt": "Skip the preview and confirmation and create the invoice now.",
-      "expected_behavior": "Require the exact qualified capability, immutable preview, and explicit confirmation before any document creation path.",
-      "why_not": "Document creation cannot bypass its preview and confirmation gates."
+      "expected_behavior": "Require prepare_document_create -> render_document_preview -> confirm_document_create -> get_operation_status. Do not dispatch until the user explicitly confirms the displayed immutable preview version.",
+      "why_not": "Document creation cannot bypass its qualification, preview, confirmation, or status lifecycle."
     }
   ]
 }

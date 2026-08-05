@@ -3,7 +3,7 @@
   "submission_type": "app-plus-skills",
   "plugin_name": "Mercury Finance",
   "short_description": "Qualified accounting connections, cited context, and controlled Skills.",
-  "long_description": "Mercury Finance is one OAuth-protected hosted MCP for cited accounting knowledge, provider connections, qualified capabilities, and controlled accounting Skills. First use opens a secure Mercury sign-in. Provider credentials are encrypted server-side and never enter chat, model, RAG, log, or audit output. A document create requires the exact qualified capability, an immutable preview, and explicit confirmation; Mercury never claims arbitrary provider writes.",
+  "long_description": "Mercury Finance is one OAuth-protected hosted MCP for cited accounting knowledge, provider connections, qualified capabilities, and controlled accounting Skills. First use opens a secure Mercury sign-in. Provider credentials are encrypted server-side and never enter chat, model, RAG, log, or audit output. A document create follows prepare_document_create -> render_document_preview -> confirm_document_create -> get_operation_status: exact qualified capability, immutable preview, explicit confirmation, and status lifecycle. Custom UI only applies to render_document_preview on hosts that support it; all other tools use structured and text results. Mercury never claims arbitrary provider writes.",
   "category": "Finance",
   "logo_file": "assets/mercury-finance-logo.png",
   "developer_identity_instruction": "Select the verified individual or business identity from the publishing OpenAI organization.",
@@ -15,7 +15,7 @@
   "mcp": {
     "url": "https://mercury-tools-mcp.onrender.com/mcp",
     "authentication": "oauth",
-    "custom_ui": false,
+    "custom_ui": true,
     "challenge_url": "https://mercury-tools-mcp.onrender.com/.well-known/openai-apps-challenge",
     "content_security_policy": {
       "connect_domains": ["https://mercury-tools-mcp.onrender.com"],

@@ -33,6 +33,29 @@ LEGACY_TOOL_NAMES = {
     "run_inline_flow",
     "run_flow_files",
 }
+EXPECTED_V1_HOSTED_TOOL_NAMES = frozenset(
+    {
+        "get_mercury_context",
+        "list_accounting_providers",
+        "start_provider_connection",
+        "list_provider_connections",
+        "connector_status",
+        "list_provider_capabilities",
+        "get_capability_schema",
+        "search_knowledge",
+        "retrieve_context_pack",
+        "run_accounting_skill",
+        "prepare_document_create",
+        "render_document_preview",
+        "confirm_document_create",
+        "get_operation_status",
+        "disconnect_provider",
+    }
+)
+DOCUMENT_CREATE_LIFECYCLE = (
+    "prepare_document_create -> render_document_preview -> "
+    "confirm_document_create -> get_operation_status"
+)
 
 
 def _build_module() -> ModuleType:
@@ -56,14 +79,14 @@ def _v1_hosted_tools() -> dict[str, object]:
     return {tool.name: tool for tool in asyncio.run(server.list_tools())}
 
 
-def test_submission_listing_uses_oauth_protected_v1_mcp_without_custom_ui() -> None:
+def test_submission_listing_uses_oauth_protected_v1_mcp_with_preview_only_custom_ui() -> None:
     listing = _json("listing.json")
 
     assert listing["submission_type"] == "app-plus-skills"
     assert listing["mcp"] == {
         "url": "https://mercury-tools-mcp.onrender.com/mcp",
         "authentication": "oauth",
-        "custom_ui": False,
+        "custom_ui": True,
         "challenge_url": (
             "https://mercury-tools-mcp.onrender.com/.well-known/openai-apps-challenge"
         ),
@@ -86,6 +109,8 @@ def test_submission_listing_uses_oauth_protected_v1_mcp_without_custom_ui() -> N
     assert "secure mercury sign-in" in boundary
     assert "encrypted server-side" in boundary
     assert "never enter chat, model, rag, log, or audit output" in boundary
+    assert "render_document_preview" in boundary
+    assert "custom ui only" in boundary
 
 
 def test_chatgpt_submission_describes_the_v1_connection_and_write_boundary() -> None:
@@ -99,6 +124,8 @@ def test_chatgpt_submission_describes_the_v1_connection_and_write_boundary() -> 
     assert "qualified capability" in description
     assert "immutable preview" in description
     assert "explicit confirmation" in description
+    assert "status lifecycle" in description
+    assert DOCUMENT_CREATE_LIFECYCLE in description
 
 
 def test_chatgpt_submission_annotations_match_the_fresh_v1_registry() -> None:
@@ -107,8 +134,9 @@ def test_chatgpt_submission_annotations_match_the_fresh_v1_registry() -> None:
     submission = json.loads((ROOT / "chatgpt-app-submission.json").read_text(encoding="utf-8"))
     hosted = _v1_hosted_tools()
 
-    assert set(hosted) == V1_HOSTED_TOOL_NAMES
-    assert set(submission["tools"]) == V1_HOSTED_TOOL_NAMES
+    assert V1_HOSTED_TOOL_NAMES == EXPECTED_V1_HOSTED_TOOL_NAMES
+    assert set(hosted) == EXPECTED_V1_HOSTED_TOOL_NAMES
+    assert set(submission["tools"]) == EXPECTED_V1_HOSTED_TOOL_NAMES
     for name, tool in hosted.items():
         submitted = submission["tools"][name]
         annotations = submitted["annotations"]
@@ -120,6 +148,79 @@ def test_chatgpt_submission_annotations_match_the_fresh_v1_registry() -> None:
         else:
             assert annotations["idempotentHint"] is tool.annotations.idempotentHint, name
         assert all(submitted["justifications"].values()), name
+
+
+def test_document_create_tools_publish_the_immutable_confirmation_lifecycle() -> None:
+    submission = json.loads((ROOT / "chatgpt-app-submission.json").read_text(encoding="utf-8"))
+    tools = submission["tools"]
+
+    assert tuple(
+        name
+        for name in (
+            "prepare_document_create",
+            "render_document_preview",
+            "confirm_document_create",
+            "get_operation_status",
+        )
+        if name in tools
+    ) == (
+        "prepare_document_create",
+        "render_document_preview",
+        "confirm_document_create",
+        "get_operation_status",
+    )
+    assert tools["prepare_document_create"]["annotations"] == {
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "openWorldHint": False,
+        "idempotentHint": True,
+    }
+    assert tools["render_document_preview"]["annotations"] == {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": False,
+    }
+    assert tools["confirm_document_create"]["annotations"] == {
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "openWorldHint": True,
+        "idempotentHint": True,
+    }
+    assert tools["get_operation_status"]["annotations"] == {
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "openWorldHint": False,
+        "idempotentHint": False,
+    }
+    combined = " ".join(
+        value
+        for name in (
+            "prepare_document_create",
+            "render_document_preview",
+            "confirm_document_create",
+            "get_operation_status",
+        )
+        for value in tools[name]["justifications"].values()
+    ).lower()
+    assert "immutable preview" in combined
+    assert "explicit confirmation" in combined
+    assert "status" in combined
+    assert "credential" not in combined
+
+
+def test_render_document_preview_is_the_only_v1_tool_with_custom_ui_metadata() -> None:
+    hosted = _v1_hosted_tools()
+
+    widget_tools = {
+        name
+        for name, tool in hosted.items()
+        if "openai/outputTemplate" in (tool.meta or {})
+    }
+    assert widget_tools == {"render_document_preview"}
+    render_meta = hosted["render_document_preview"].meta or {}
+    assert render_meta["openai/outputTemplate"] == (
+        "ui://widget/mercury-document-preview-v1.html"
+    )
 
 
 def test_submission_logo_is_square_png() -> None:
@@ -167,6 +268,8 @@ def test_submission_test_cases_cover_v1_connection_and_capability_paths() -> Non
     assert "qualified capability" in combined
     assert "immutable preview" in combined
     assert "explicit confirmation" in combined
+    assert DOCUMENT_CREATE_LIFECYCLE in combined
+    assert "get_operation_status" in combined
     assert "secret" in combined
     assert "provider_capability_unavailable" in combined
 
@@ -178,7 +281,7 @@ def test_public_submission_skills_only_reference_v1_hosted_tools() -> None:
 
     assert len(skills) == 6
     combined = "\n".join(path.read_text(encoding="utf-8") for path in skills)
-    normalized = " ".join(combined.split())
+    normalized = " ".join(combined.replace("`", "").split())
     referenced_tools = set(re.findall(r"`([a-z][a-z0-9_]+)`", combined))
     assert referenced_tools <= V1_HOSTED_TOOL_NAMES
     assert not (LEGACY_TOOL_NAMES & referenced_tools)
@@ -188,6 +291,7 @@ def test_public_submission_skills_only_reference_v1_hosted_tools() -> None:
     assert "qualified capability" in normalized
     assert "immutable preview" in normalized
     assert "explicit confirmation" in normalized
+    assert DOCUMENT_CREATE_LIFECYCLE in normalized
 
 
 def test_connector_onboarding_skill_uses_the_exact_v1_lifecycle() -> None:
