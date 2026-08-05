@@ -346,6 +346,12 @@ begin
   if current_state <> 'dispatching' then
     return false;
   end if;
+  if target_state = 'failed_pre_dispatch' then
+    return child_count > 0 and not exists (
+      select 1 from pg_catalog.unnest(child_states) as state(value)
+      where state.value not in ('failed_pre_dispatch', 'not_dispatched')
+    );
+  end if;
   select child_count > 0 and not exists (
     select 1
     from pg_catalog.unnest(child_states) as state(value)
@@ -402,7 +408,9 @@ as $$
       or (target_state = 'cancelled' and parent_state = 'failed_pre_dispatch')
     ))
     or (current_state = 'dispatching'
-      and target_state in ('succeeded', 'provider_rejected', 'outcome_unknown')
+      and target_state in (
+        'succeeded', 'failed_pre_dispatch', 'provider_rejected', 'outcome_unknown'
+      )
       and parent_state = 'dispatching')
     or (current_state = 'outcome_unknown'
       and target_state in ('succeeded', 'needs_manual_review')

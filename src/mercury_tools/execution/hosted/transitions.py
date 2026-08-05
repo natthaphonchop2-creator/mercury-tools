@@ -55,6 +55,7 @@ _PARENT_TRANSITIONS: dict[ParentOperationState, frozenset[ParentOperationState]]
     ParentOperationState.DISPATCHING: frozenset(
         {
             ParentOperationState.SUCCEEDED,
+            ParentOperationState.FAILED_PRE_DISPATCH,
             ParentOperationState.PROVIDER_REJECTED,
             ParentOperationState.OUTCOME_UNKNOWN,
             ParentOperationState.NEEDS_MANUAL_REVIEW,
@@ -93,6 +94,7 @@ _ITEM_TRANSITIONS: dict[OperationItemState, frozenset[OperationItemState]] = {
     OperationItemState.DISPATCHING: frozenset(
         {
             OperationItemState.SUCCEEDED,
+            OperationItemState.FAILED_PRE_DISPATCH,
             OperationItemState.PROVIDER_REJECTED,
             OperationItemState.OUTCOME_UNKNOWN,
         }

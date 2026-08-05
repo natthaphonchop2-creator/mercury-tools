@@ -788,6 +788,88 @@ def test_failed_pre_dispatch_closes_undispatched_children_before_parent() -> Non
 
 
 @pytest.mark.asyncio
+async def test_proven_undispatched_attempt_retries_the_same_operation() -> None:
+    from mercury_tools.execution.hosted.models import (
+        HostedOperation,
+        OperationItemState,
+        ParentOperationState,
+    )
+
+    preview, store, _, _ = await _prepared()
+    operation = store.create_operation(
+        HostedOperation.from_preview(
+            preview,
+            operation_id=OPERATION_ID,
+            operation_item_ids=(OPERATION_ITEM_ID,),
+            event_id=EVENT_ID,
+            now=NOW,
+        )
+    )
+    dispatching = store.transition_operation(
+        tenant_id=TENANT_ID,
+        auth_user_id=AUTH_USER_ID,
+        workspace_id=WORKSPACE_ID,
+        operation_id=operation.operation_id,
+        expected_state_version=operation.state_version,
+        target_state=ParentOperationState.DISPATCHING,
+        event_id=UUID("31313131-3131-4131-8131-313131313131"),
+        occurred_at=NOW + timedelta(seconds=1),
+        sanitized_reason="provider_create_started",
+    )
+    item_dispatching = store.transition_operation_item(
+        tenant_id=TENANT_ID,
+        auth_user_id=AUTH_USER_ID,
+        workspace_id=WORKSPACE_ID,
+        operation_id=operation.operation_id,
+        operation_item_id=operation.items[0].operation_item_id,
+        expected_state_version=operation.items[0].state_version,
+        target_state=OperationItemState.DISPATCHING,
+        event_id=UUID("32323232-3232-4232-8232-323232323232"),
+        occurred_at=NOW + timedelta(seconds=2),
+        sanitized_reason="provider_create_started",
+    )
+    item_failed = store.transition_operation_item(
+        tenant_id=TENANT_ID,
+        auth_user_id=AUTH_USER_ID,
+        workspace_id=WORKSPACE_ID,
+        operation_id=operation.operation_id,
+        operation_item_id=operation.items[0].operation_item_id,
+        expected_state_version=item_dispatching.items[0].state_version,
+        target_state=OperationItemState.FAILED_PRE_DISPATCH,
+        event_id=UUID("33333333-3333-4333-8333-333333333333"),
+        occurred_at=NOW + timedelta(seconds=3),
+        sanitized_reason="provider_not_dispatched",
+    )
+    failed = store.transition_operation(
+        tenant_id=TENANT_ID,
+        auth_user_id=AUTH_USER_ID,
+        workspace_id=WORKSPACE_ID,
+        operation_id=operation.operation_id,
+        expected_state_version=dispatching.state_version,
+        target_state=ParentOperationState.FAILED_PRE_DISPATCH,
+        event_id=UUID("34343434-3434-4434-8434-343434343434"),
+        occurred_at=NOW + timedelta(seconds=4),
+        sanitized_reason="provider_not_dispatched",
+    )
+    retried = store.transition_operation(
+        tenant_id=TENANT_ID,
+        auth_user_id=AUTH_USER_ID,
+        workspace_id=WORKSPACE_ID,
+        operation_id=operation.operation_id,
+        expected_state_version=failed.state_version,
+        target_state=ParentOperationState.DISPATCHING,
+        event_id=UUID("35353535-3535-4535-8535-353535353535"),
+        occurred_at=NOW + timedelta(seconds=5),
+        sanitized_reason="provider_create_retried",
+    )
+
+    assert item_failed.items[0].state is OperationItemState.FAILED_PRE_DISPATCH
+    assert failed.state is ParentOperationState.FAILED_PRE_DISPATCH
+    assert retried.operation_id == operation.operation_id
+    assert retried.state is ParentOperationState.DISPATCHING
+
+
+@pytest.mark.asyncio
 async def test_operation_public_surfaces_sanitize_provider_result_identifiers() -> None:
     from mercury_tools.execution.hosted.models import (
         HostedOperation,
