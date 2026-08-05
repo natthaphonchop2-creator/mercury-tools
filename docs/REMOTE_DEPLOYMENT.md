@@ -12,9 +12,10 @@ The Render service is the single MCP used by the Mercury Finance plugin.
 - Terms: `https://mercury-tools-mcp.onrender.com/terms`
 - Support: `https://mercury-tools-mcp.onrender.com/support`
 
-The MCP uses Streamable HTTP and exposes 24 hosted tools. Public clients do not
-provide a Mercury token, Supabase key, custom header, environment variable, or local
-launch command.
+The MCP uses Streamable HTTP. Public health, legal, support, and OAuth metadata routes
+remain available without a session. Protected tools require a secure Mercury sign-in
+using OAuth 2.1 with PKCE. Clients do not manually configure a Mercury bearer token,
+Supabase key, custom header, environment variable, or local launch command.
 
 ## Render configuration
 
@@ -25,12 +26,15 @@ SUPABASE_URL
 SUPABASE_SERVICE_ROLE_KEY
 MERCURY_TOOLS_PUBLIC_BASE_URL=https://mercury-tools-mcp.onrender.com
 MERCURY_TOOLS_EMBEDDING_PROVIDER=hash
-MERCURY_TOOLS_HTTP_REQUIRE_AUTH=false
+MERCURY_V1_ENABLED=true
+MERCURY_TOOLS_HTTP_REQUIRE_AUTH=true
 MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API=false
 ```
 
-Do not add FlowAccount, PEAK, Express, or custom ERP credentials to Render. Provider
-authorization remains with the ERP or MCP host.
+Configure every `sync: false` value declared by `render.yaml` in the Render dashboard.
+Provider OAuth exchanges happen server-side. Encrypted provider credentials are stored
+in tenant-bound Supabase records using an encryption key held only by Render; they never
+enter chat or model context and are never returned to MCP clients.
 
 ## Supabase boundary
 
@@ -38,11 +42,13 @@ Supabase stores:
 
 - reviewed knowledge sources, documents, chunks, and citations
 - connector catalog and sanitized capability evidence
-- public workspace, Skill, and Flow metadata
+- private workspace, membership, Skill, and Flow metadata
+- encrypted provider credential envelopes and operation state
 - redacted MCP audit metadata
 
-It must not store ERP API keys, OAuth tokens, passwords, raw provider payloads, tax IDs,
-or personal contact data.
+Plaintext ERP API keys, OAuth tokens, and passwords must not be persisted. Raw provider
+payloads, tax IDs, and personal contact data must not appear in knowledge, logs, or audit
+output.
 
 ## Deploy and verify
 
@@ -53,5 +59,6 @@ curl --fail https://mercury-tools-mcp.onrender.com/healthz
 uv run python scripts/smoke_hosted_plugin.py --remote-only
 ```
 
-The smoke test initializes MCP, lists the exact hosted tool surface, and executes safe
-read-only calls.
+Without a test access token, the smoke test verifies health, OAuth discovery, and that
+protected MCP access is rejected. Set `MERCURY_SMOKE_ACCESS_TOKEN` only in a private
+runtime to exercise authenticated safe calls; the script never prints the token.

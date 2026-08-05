@@ -68,10 +68,10 @@ def test_chatgpt_submission_describes_the_same_connector_neutral_boundary() -> N
     )
     description = submission["app_info"]["description"].lower()
 
-    assert "one hosted mcp" in description
-    assert "sanitized erp connector profiles" in description
-    assert "no erp credentials" in description
-    assert "connected mcp host or erp integration" in description
+    assert "one oauth-protected hosted mcp" in description
+    assert "qualified erp connectors" in description
+    assert "encrypted provider credentials" in description
+    assert "never enter chat or model context" in description
 
 
 def test_chatgpt_submission_annotations_match_the_hosted_registry() -> None:

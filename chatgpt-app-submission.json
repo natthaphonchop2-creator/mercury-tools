@@ -4,7 +4,7 @@
   "app_info": {
     "display_name": "Mercury Finance",
     "subtitle": "Connector-neutral accounting and ERP context",
-    "description": "Mercury Finance is one hosted MCP for cited accounting knowledge, sanitized ERP connector profiles, portable Skills, capability routing, and controlled flow plans. It stores no ERP credentials. Provider authorization and provider calls remain with the user's connected MCP host or ERP integration.",
+    "description": "Mercury Finance is one OAuth-protected hosted MCP for cited accounting knowledge, qualified ERP connectors, portable Skills, immutable previews, approvals, and sanitized audit. First use opens a secure Mercury sign-in. Encrypted provider credentials stay in a tenant-bound server-side vault and never enter chat or model context.",
     "category": "FINANCE"
   },
   "tools": {

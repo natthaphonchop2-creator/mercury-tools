@@ -18,7 +18,9 @@ codex plugin marketplace add natthaphonchop2-creator/mercury-tools --ref v0.3.1 
 ```
 
 Restart the ChatGPT desktop app, open a new task, and select **Mercury Finance**. The
-plugin installs one remote server named `mercury-finance` and requires no authentication.
+plugin installs one remote server named `mercury-finance`. On first use, the MCP host
+opens a secure Mercury sign-in; users do not manually configure a bearer token,
+Supabase key, Python runtime, or local Mercury server.
 
 Example requests:
 
@@ -35,11 +37,13 @@ Hosts that support Streamable HTTP can connect directly:
 https://mercury-tools-mcp.onrender.com/mcp
 ```
 
-The public configuration has no bearer token, custom headers, environment variables, or
-local launch command. The service exposes 24 hosted tools in five groups:
+The plugin has no custom-header, environment-variable, or local launch configuration.
+Protected tools use OAuth 2.1 with PKCE through the secure Mercury sign-in. The service
+exposes accounting knowledge, workspace, connector, Skill, and controlled operation
+tools.
 
 - cited accounting and ERP knowledge
-- public workspace state
+- authenticated tenant and workspace state
 - connector catalog, setup, status, and capability routing
 - accounting Skill catalog and Skill plans
 - Mercury Flow validation, execution planning, and saved flows
@@ -47,13 +51,14 @@ local launch command. The service exposes 24 hosted tools in five groups:
 ## Connector model
 
 Mercury is connector-neutral. It can describe FlowAccount, PEAK, Express, and custom ERP
-interfaces from reviewed catalog and RAG sources. Provider authorization remains with the
-ERP or MCP host. Mercury stores only sanitized connector profile metadata and evidence
-references; it does not accept ERP credentials in chat or store raw provider tokens.
+interfaces from reviewed catalog and RAG sources. Provider authorization is completed
+through the provider's approved OAuth or credential setup flow. Encrypted provider
+credentials are stored only in a tenant-bound server-side vault; they never enter chat or
+model context and are never returned by MCP tools, logs, RAG, or audit output.
 
-When an authorized ERP or productivity provider is already connected to the host, Mercury
-returns the ordered capabilities and evidence requirements that the host should use.
-Catalog presence alone is not a claim that a provider endpoint is currently available.
+Mercury executes only exact provider capabilities that have passed qualification for the
+selected environment. Catalog presence alone is not a claim that a provider endpoint is
+currently available.
 
 ## Development
 

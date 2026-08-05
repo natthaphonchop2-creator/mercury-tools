@@ -21,7 +21,7 @@
   "interface": {
     "displayName": "Mercury Finance",
     "shortDescription": "Accounting knowledge, ERP connectors, and finance workflows.",
-    "longDescription": "Mercury Finance connects Codex to one hosted MCP for cited accounting knowledge, connector discovery, workspace readiness, and reusable finance workflows. Install once with no local server, Python runtime, Supabase key, or Mercury token. Mercury Tools is an independent open-source project and is not affiliated with Mercury Technologies, Inc.",
+    "longDescription": "Mercury Finance connects Codex to one hosted MCP for cited accounting knowledge, qualified ERP connectors, workspace operations, previews, approvals, and audit. Install once with no local server, Python runtime, or manually configured token; first use opens a secure Mercury sign-in. Encrypted provider credentials never enter chat or model context. Mercury Tools is an independent open-source project and is not affiliated with Mercury Technologies, Inc.",
     "developerName": "Mercury Agent",
     "category": "Finance",
     "capabilities": [

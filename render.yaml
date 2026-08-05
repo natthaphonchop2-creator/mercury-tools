@@ -13,9 +13,9 @@ services:
       - key: MERCURY_TOOLS_MCP_PATH
         value: /mcp
       - key: MERCURY_TOOLS_HTTP_REQUIRE_AUTH
-        value: "false"
+        value: "true"
       - key: MERCURY_V1_ENABLED
-        value: "false"
+        value: "true"
       - key: MERCURY_CANONICAL_MCP_RESOURCE
         value: https://mercury-tools-mcp.onrender.com/mcp
       - key: SUPABASE_AUTH_ISSUER
