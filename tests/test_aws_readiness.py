@@ -2016,6 +2016,20 @@ def test_cli_verifies_explicit_environment_bindings_and_stores_only_hashes(
         "finalize_wave0_gate",
         counting_finalizer,
     )
+    original_account_check = readiness_main.__globals__["check_aws_accounts"]
+
+    def isolated_account_check(config, injected_runner):
+        return original_account_check(
+            config,
+            injected_runner,
+            short_lived_profile_source,
+        )
+
+    monkeypatch.setitem(
+        readiness_main.__globals__,
+        "check_aws_accounts",
+        isolated_account_check,
+    )
     output = ROOT / ".artifacts/aws/wave0/task5-cli-test.json"
     output.unlink(missing_ok=True)
 
