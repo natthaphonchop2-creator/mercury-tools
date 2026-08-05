@@ -48,6 +48,10 @@ V1_HOSTED_TOOL_NAMES = frozenset(
         "search_knowledge",
         "retrieve_context_pack",
         "run_accounting_skill",
+        "prepare_document_create",
+        "render_document_preview",
+        "confirm_document_create",
+        "get_operation_status",
         "disconnect_provider",
     }
 )

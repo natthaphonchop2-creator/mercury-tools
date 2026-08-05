@@ -89,6 +89,7 @@ from mercury_tools.mcp.v1_tools import (
     refresh_generated_provider_tools,
     refresh_generated_provider_tools_until_stopped,
 )
+from mercury_tools.mcp.widget_tools import register_document_preview_widget
 from mercury_tools.mercury_runtime import (
     get_accounting_skill_schema as runtime_accounting_skill_schema,
 )
@@ -285,6 +286,7 @@ def _create_isolated_serving_mcp(
 
 
 mcp = StrictInputFastMCP("Mercury Tools")
+register_document_preview_widget(mcp)
 _PROCESS_V1_CONFIGURATION_LOCK = threading.Lock()
 _PROCESS_V1_ENABLED = load_settings().v1_enabled
 

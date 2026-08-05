@@ -8,7 +8,6 @@ from mercury_tools.mcp.contracts import (
     V1_HOSTED_TOOL_NAMES,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SKILLS_ROOT = ROOT / "plugins" / "mercury-finance" / "skills"
 SETUP_SKILLS = (

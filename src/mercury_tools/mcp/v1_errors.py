@@ -7,6 +7,8 @@ from typing import Literal, TypeAlias
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from mercury_tools.auth.models import MercuryAuthError
+from mercury_tools.execution.hosted.operation_service import DocumentOperationError
+from mercury_tools.execution.hosted.store import HostedPreviewError
 from mercury_tools.providers.base import (
     ProviderAuthRequired,
     ProviderOutcomeUnknown,
@@ -94,6 +96,10 @@ def public_error_code(error: BaseException) -> V1ErrorCode:
             return "mercury_auth_required"
         if isinstance(current, WorkspaceAccessError):
             return "workspace_access_denied"
+        if isinstance(current, HostedPreviewError):
+            return _hosted_preview_error_code(current.code)
+        if isinstance(current, DocumentOperationError):
+            return _document_operation_error_code(current.code)
         if isinstance(current, QualificationGateError):
             return current.code
         if isinstance(current, ProviderSchemaChanged):
@@ -177,6 +183,36 @@ def _provider_oauth_error_code(code: str) -> V1ErrorCode:
     if "company" in code:
         return "provider_company_mismatch"
     return "provider_connection_invalid"
+
+
+def _hosted_preview_error_code(code: str) -> V1ErrorCode:
+    if code == "preview_expired":
+        return "preview_expired"
+    if code == "preview_binding_changed":
+        return "preview_binding_mismatch"
+    if code in {"preview_state_invalid", "preview_state_stale"}:
+        return "preview_state_changed"
+    if code == "duplicate_provider_call":
+        return "duplicate_batch_item"
+    if code in {
+        "operation_conflict",
+        "operation_state_stale",
+        "operation_transition_invalid",
+    }:
+        return "operation_in_progress"
+    if code == "workspace_access_denied":
+        return "workspace_access_denied"
+    if code in {"capability_unavailable", "capability_unreviewed"}:
+        return code
+    return "validation_failed"
+
+
+def _document_operation_error_code(code: str) -> V1ErrorCode:
+    if code == "retry_payload_unavailable":
+        return "manual_review_required"
+    if code == "audit_write_failed":
+        return "capability_unavailable"
+    return "validation_failed"
 
 
 def _peak_setup_error_code(code: str) -> V1ErrorCode:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 DOCUMENT_PREVIEW_WIDGET_URI = "ui://widget/mercury-document-preview-v1.html"
 DOCUMENT_PREVIEW_WIDGET_MIME_TYPE = "text/html;profile=mcp-app"
@@ -95,6 +96,24 @@ def document_preview_widget_resource() -> dict[str, object]:
         "mimeType": DOCUMENT_PREVIEW_WIDGET_MIME_TYPE,
         "_meta": preview_widget_tool_meta(),
     }
+
+
+def register_document_preview_widget(server: Any) -> None:
+    """Register the immutable preview resource once on a FastMCP-compatible server."""
+
+    resources = getattr(getattr(server, "_resource_manager", None), "_resources", None)
+    if not isinstance(resources, dict):
+        raise TypeError("preview_widget_server_invalid")
+    if DOCUMENT_PREVIEW_WIDGET_URI in resources:
+        return
+    server.resource(
+        DOCUMENT_PREVIEW_WIDGET_URI,
+        name="mercury_document_preview_v1",
+        title="Mercury document preview",
+        description=DOCUMENT_PREVIEW_WIDGET_DESCRIPTION,
+        mime_type=DOCUMENT_PREVIEW_WIDGET_MIME_TYPE,
+        meta=preview_widget_tool_meta(),
+    )(document_preview_widget_html)
 
 
 def build_document_preview_result(
@@ -243,5 +262,6 @@ __all__ = [
     "document_preview_widget_html",
     "document_preview_widget_resource",
     "preview_widget_tool_meta",
+    "register_document_preview_widget",
     "render_document_preview_text_fallback",
 ]

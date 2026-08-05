@@ -801,6 +801,10 @@ def test_behavior_matrix_covers_every_stable_v1_tool_with_exact_annotations() ->
         "search_knowledge": (False, False, False, False, True),
         "retrieve_context_pack": (False, False, False, False, True),
         "run_accounting_skill": (False, False, False, True, True),
+        "prepare_document_create": (False, False, True, False, True),
+        "render_document_preview": (True, False, None, False, True),
+        "confirm_document_create": (False, True, True, True, True),
+        "get_operation_status": (False, False, False, False, True),
         "disconnect_provider": (False, True, True, True, True),
     }
 

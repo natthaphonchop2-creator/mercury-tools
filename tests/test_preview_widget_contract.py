@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import pytest
+from mcp.server.fastmcp import FastMCP
+
 from mercury_tools.mcp.widget_tools import (
     DOCUMENT_PREVIEW_WIDGET_MIME_TYPE,
     DOCUMENT_PREVIEW_WIDGET_URI,
     build_document_preview_result,
+    document_preview_widget_html,
     document_preview_widget_resource,
     preview_widget_tool_meta,
+    register_document_preview_widget,
     render_document_preview_text_fallback,
 )
 
@@ -89,6 +94,38 @@ def test_widget_tool_metadata_has_standard_and_openai_compatibility_pointers() -
     assert metadata["ui"]["resourceUri"] == DOCUMENT_PREVIEW_WIDGET_URI
     assert metadata["openai/outputTemplate"] == DOCUMENT_PREVIEW_WIDGET_URI
     assert "immutable accounting-document preview" in metadata["openai/widgetDescription"]
+
+
+@pytest.mark.asyncio
+async def test_widget_resource_registers_once_with_exact_metadata() -> None:
+    server = FastMCP("widget-test")
+
+    register_document_preview_widget(server)
+    register_document_preview_widget(server)
+
+    resources = server._resource_manager.list_resources()
+    assert len(resources) == 1
+    resource = resources[0]
+    assert str(resource.uri) == DOCUMENT_PREVIEW_WIDGET_URI
+    assert resource.mime_type == DOCUMENT_PREVIEW_WIDGET_MIME_TYPE
+    assert resource.meta["ui"]["resourceUri"] == DOCUMENT_PREVIEW_WIDGET_URI
+    assert await resource.read() == document_preview_widget_html()
+
+
+def test_render_preview_tool_points_to_the_widget_resource() -> None:
+    from mercury_tools.mcp.server import StrictInputFastMCP
+    from mercury_tools.mcp.v1_tools import (
+        RENDER_DOCUMENT_PREVIEW_TOOL,
+        configure_v1_tools,
+    )
+
+    server = StrictInputFastMCP("widget-tool-test")
+    configure_v1_tools(server, enabled=True)
+
+    tool = server._tool_manager.get_tool(RENDER_DOCUMENT_PREVIEW_TOOL)
+    assert tool is not None
+    assert tool.meta["ui"]["resourceUri"] == DOCUMENT_PREVIEW_WIDGET_URI
+    assert tool.meta["openai/outputTemplate"] == DOCUMENT_PREVIEW_WIDGET_URI
 
 
 def test_preview_result_separates_model_text_and_widget_only_surfaces() -> None:

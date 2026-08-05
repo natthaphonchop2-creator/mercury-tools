@@ -22,6 +22,15 @@ from mercury_tools.auth.models import MercuryAuthError, MercuryPrincipal
 from mercury_tools.catalog.models import ProviderMCPQualification, QualificationState
 from mercury_tools.config import load_settings
 from mercury_tools.db.supabase import SupabaseRagStore
+from mercury_tools.execution.hosted.models import (
+    BatchDocumentCreate,
+    DocumentCreateDraft,
+    HostedOperation,
+    PreparedDocumentPreview,
+    PrepareDocumentCreate,
+    PreviewState,
+    SingleDocumentCreate,
+)
 from mercury_tools.execution.hosted.read_service import HostedReadService
 from mercury_tools.mcp.contracts import LEGACY_HOSTED_TOOL_NAMES, V1_HOSTED_TOOL_NAMES
 from mercury_tools.mcp.generated_tools import (
@@ -36,10 +45,16 @@ from mercury_tools.mcp.v1_errors import (
 from mercury_tools.mcp.v1_schemas import (
     CAPABILITY_ID_PATTERN,
     SHA256_PATTERN,
+    ConfirmDocumentCreateArguments,
     ConnectorStatusData,
     ConnectorStatusOutput,
     DisconnectProviderData,
     DisconnectProviderOutput,
+    DocumentCreateItemInput,
+    DocumentOperationOutput,
+    DocumentOperationSummaryOutput,
+    DocumentPreviewOutput,
+    DocumentPreviewSummaryOutput,
     FlowAccountConnectionOutput,
     FlowAccountConnectionStartData,
     FlowAccountDisconnectedData,
@@ -47,6 +62,7 @@ from mercury_tools.mcp.v1_schemas import (
     FlowAccountRevocationRequiredData,
     GetCapabilitySchemaOutput,
     GetMercuryContextOutput,
+    GetOperationStatusArguments,
     HostConnectedEvidenceInput,
     KnowledgeCitationOutput,
     KnowledgeFiltersInput,
@@ -54,12 +70,16 @@ from mercury_tools.mcp.v1_schemas import (
     ListAccountingProvidersOutput,
     ListProviderCapabilitiesOutput,
     ListProviderConnectionsOutput,
+    OperationItemSummaryOutput,
     PeakConnectionOutput,
     PeakConnectionStartData,
     PeakDisconnectData,
     PeakProviderOutput,
+    PrepareDocumentCreateArguments,
+    PreviewItemSummaryOutput,
     ProviderCapabilityOutput,
     ProviderConnectionOutput,
+    RenderDocumentPreviewArguments,
     RetrieveContextPackOutput,
     ReviewedCapabilitySchemaOutput,
     RunAccountingSkillArguments,
@@ -73,6 +93,7 @@ from mercury_tools.mcp.v1_schemas import (
     run_accounting_skill_input_schema,
     start_provider_connection_input_schema,
 )
+from mercury_tools.mcp.widget_tools import preview_widget_tool_meta
 from mercury_tools.providers.base import DispatchCertainty, ProviderSchemaChanged
 from mercury_tools.providers.finalization import await_cleanup
 from mercury_tools.providers.models import (
@@ -117,10 +138,15 @@ GET_CAPABILITY_SCHEMA_TOOL = "get_capability_schema"
 SEARCH_KNOWLEDGE_TOOL = "search_knowledge"
 RETRIEVE_CONTEXT_PACK_TOOL = "retrieve_context_pack"
 RUN_ACCOUNTING_SKILL_TOOL = "run_accounting_skill"
+PREPARE_DOCUMENT_CREATE_TOOL = "prepare_document_create"
+RENDER_DOCUMENT_PREVIEW_TOOL = "render_document_preview"
+CONFIRM_DOCUMENT_CREATE_TOOL = "confirm_document_create"
+GET_OPERATION_STATUS_TOOL = "get_operation_status"
 DISCONNECT_PROVIDER_TOOL = "disconnect_provider"
 
 WorkspaceServiceFactory = Callable[[], WorkspaceService]
 ProviderRuntimeFactory: TypeAlias = Callable[[], Any | Awaitable[Any]]
+DocumentRuntimeFactory: TypeAlias = Callable[[], Any | Awaitable[Any]]
 AuditRecorder: TypeAlias = Callable[[dict[str, object]], object | Awaitable[object]]
 RagStoreFactory: TypeAlias = Callable[[], SupabaseRagStore]
 SchemaChangeHandler: TypeAlias = Callable[
@@ -173,6 +199,18 @@ _SKILL_RUN = ToolAnnotations(
     idempotentHint=False,
     openWorldHint=True,
 )
+_PREPARE_DOCUMENT_CREATE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+_CONFIRM_DOCUMENT_CREATE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=True,
+    openWorldHint=True,
+)
 _V1_TOOL_META = {
     "mercury/surface": "v1",
     "mercury/error-schema": "mercury.v1.error.v1",
@@ -191,6 +229,17 @@ def _rag_store() -> SupabaseRagStore:
 async def _provider_runtime() -> Any:
     return await asyncio.to_thread(
         build_provider_oauth_production_composition,
+        settings=load_settings(),
+    )
+
+
+async def _document_runtime() -> Any:
+    from mercury_tools.execution.hosted.production import (
+        build_hosted_document_production_composition,
+    )
+
+    return await asyncio.to_thread(
+        build_hosted_document_production_composition,
         settings=load_settings(),
     )
 
@@ -1805,6 +1854,250 @@ async def disconnect_provider(
             await _close_runtime(runtime)
 
 
+async def _document_runtime_from(factory: DocumentRuntimeFactory | None) -> Any:
+    return await _await_value((factory or _document_runtime)())
+
+
+def _document_request(
+    *,
+    mode: Literal["single", "batch"],
+    documents: Sequence[DocumentCreateItemInput],
+) -> PrepareDocumentCreate:
+    drafts: list[DocumentCreateDraft] = []
+    for item in documents:
+        try:
+            provider_arguments = json.loads(item.provider_arguments_json)
+        except (TypeError, ValueError):
+            raise ValueError("validation_failed") from None
+        if not isinstance(provider_arguments, dict):
+            raise ValueError("validation_failed")
+        drafts.append(
+            DocumentCreateDraft(
+                client_item_id=item.client_item_id,
+                provider_arguments=provider_arguments,
+                warnings=tuple(item.warnings),
+                accountant_review_points=tuple(item.accountant_review_points),
+            )
+        )
+    if mode == "single":
+        if len(drafts) != 1:
+            raise ValueError("validation_failed")
+        return SingleDocumentCreate(mode="single", document=drafts[0])
+    return BatchDocumentCreate(mode="batch", documents=tuple(drafts))
+
+
+def _preview_output(
+    preview: PreparedDocumentPreview,
+    *,
+    rendered: bool,
+) -> DocumentPreviewOutput:
+    checked = PreparedDocumentPreview.model_validate(preview)
+    next_actions = list(checked.next_allowed_actions)
+    if rendered and checked.status is PreviewState.AWAITING_CONFIRMATION:
+        next_actions = [CONFIRM_DOCUMENT_CREATE_TOOL]
+    return DocumentPreviewOutput(
+        workspace_id=checked.workspace_id,
+        connection_id=checked.connection_id,
+        preview_id=checked.preview_id,
+        state_version=checked.state_version,
+        data=DocumentPreviewSummaryOutput(
+            preview_state=checked.status.value,
+            provider=checked.provider,
+            environment=checked.environment,
+            company_display_name=checked.company_display_name,
+            capability_id=checked.capability_id,
+            capability_version=checked.capability_version,
+            document_count=checked.document_count,
+            currency=checked.currency,
+            subtotal=str(checked.subtotal),
+            discount_total=str(checked.discount_total),
+            vat_total=str(checked.vat_total),
+            withholding_tax_total=str(checked.withholding_tax_total),
+            grand_total=str(checked.grand_total),
+            warning_count=checked.warning_count,
+            warnings=list(checked.warnings),
+            accountant_review_points=list(checked.accountant_review_points),
+            items=[
+                PreviewItemSummaryOutput(
+                    client_item_id=item.client_item_id,
+                    document_type=item.document_type,
+                    counterparty_display=item.counterparty_display,
+                    issue_date=item.issue_date,
+                    due_date=item.due_date,
+                    currency=item.financials.currency,
+                    grand_total=str(item.financials.grand_total),
+                    warnings=list(item.warnings),
+                    accountant_review_points=list(item.accountant_review_points),
+                )
+                for item in checked.items
+            ],
+            expires_at=checked.expires_at,
+        ),
+        next_allowed_actions=next_actions,
+    )
+
+
+def _operation_output(operation: HostedOperation) -> DocumentOperationOutput:
+    checked = HostedOperation.model_validate(operation)
+    next_actions = (
+        [GET_OPERATION_STATUS_TOOL]
+        if checked.state.value in {"dispatching", "outcome_unknown"}
+        else []
+    )
+    return DocumentOperationOutput(
+        workspace_id=checked.workspace_id,
+        connection_id=checked.connection_id,
+        operation_id=checked.operation_id,
+        state_version=checked.state_version,
+        data=DocumentOperationSummaryOutput(
+            preview_id=checked.preview_id,
+            provider=checked.provider,
+            environment=checked.environment,
+            capability_id=checked.capability_id,
+            capability_version=checked.capability_version,
+            operation_state=checked.state.value,
+            items=[
+                OperationItemSummaryOutput(
+                    client_item_id=item.client_item_id,
+                    state=item.state.value,
+                )
+                for item in checked.items
+            ],
+            updated_at=checked.updated_at,
+        ),
+        next_allowed_actions=next_actions,
+    )
+
+
+async def prepare_document_create(
+    context: Context,
+    *,
+    workspace_id: UUID,
+    connection_id: UUID,
+    capability_id: str,
+    capability_version: str,
+    mode: Literal["single", "batch"],
+    documents: Sequence[DocumentCreateItemInput],
+    service_factory: WorkspaceServiceFactory = _workspace_service,
+    document_runtime_factory: DocumentRuntimeFactory | None = None,
+) -> DocumentPreviewOutput:
+    runtime: Any | None = None
+    try:
+        principal, _membership = await _require_workspace(
+            context,
+            workspace_id=workspace_id,
+            service_factory=service_factory,
+        )
+        request = _document_request(mode=mode, documents=documents)
+        runtime = await _document_runtime_from(document_runtime_factory)
+        result = await _await_value(
+            runtime.prepare_document_create(
+                principal,
+                workspace_id,
+                connection_id,
+                capability_id,
+                capability_version,
+                request,
+            )
+        )
+        return _preview_output(result, rendered=False)
+    except Exception as error:
+        raise MercuryV1ToolError(public_error_code(error)) from None
+    finally:
+        if runtime is not None:
+            await _close_runtime(runtime)
+
+
+async def render_document_preview(
+    context: Context,
+    *,
+    workspace_id: UUID,
+    preview_id: UUID,
+    service_factory: WorkspaceServiceFactory = _workspace_service,
+    document_runtime_factory: DocumentRuntimeFactory | None = None,
+) -> DocumentPreviewOutput:
+    runtime: Any | None = None
+    try:
+        principal, _membership = await _require_workspace(
+            context,
+            workspace_id=workspace_id,
+            service_factory=service_factory,
+        )
+        runtime = await _document_runtime_from(document_runtime_factory)
+        result = await _await_value(
+            runtime.render_document_preview(principal, workspace_id, preview_id)
+        )
+        return _preview_output(result, rendered=True)
+    except Exception as error:
+        raise MercuryV1ToolError(public_error_code(error)) from None
+    finally:
+        if runtime is not None:
+            await _close_runtime(runtime)
+
+
+async def confirm_document_create(
+    context: Context,
+    *,
+    workspace_id: UUID,
+    preview_id: UUID,
+    state_version: int,
+    confirmation: Literal["CONFIRM_CREATE"],
+    service_factory: WorkspaceServiceFactory = _workspace_service,
+    document_runtime_factory: DocumentRuntimeFactory | None = None,
+) -> DocumentOperationOutput:
+    if confirmation != "CONFIRM_CREATE":
+        raise MercuryV1ToolError("confirmation_required")
+    runtime: Any | None = None
+    try:
+        principal, _membership = await _require_workspace(
+            context,
+            workspace_id=workspace_id,
+            service_factory=service_factory,
+        )
+        runtime = await _document_runtime_from(document_runtime_factory)
+        result = await _await_value(
+            runtime.confirm_document_create(
+                principal,
+                workspace_id,
+                preview_id,
+                state_version,
+            )
+        )
+        return _operation_output(result)
+    except Exception as error:
+        raise MercuryV1ToolError(public_error_code(error)) from None
+    finally:
+        if runtime is not None:
+            await _close_runtime(runtime)
+
+
+async def get_operation_status(
+    context: Context,
+    *,
+    workspace_id: UUID,
+    operation_id: UUID,
+    service_factory: WorkspaceServiceFactory = _workspace_service,
+    document_runtime_factory: DocumentRuntimeFactory | None = None,
+) -> DocumentOperationOutput:
+    runtime: Any | None = None
+    try:
+        principal, _membership = await _require_workspace(
+            context,
+            workspace_id=workspace_id,
+            service_factory=service_factory,
+        )
+        runtime = await _document_runtime_from(document_runtime_factory)
+        result = await _await_value(
+            runtime.get_operation_status(principal, workspace_id, operation_id)
+        )
+        return _operation_output(result)
+    except Exception as error:
+        raise MercuryV1ToolError(public_error_code(error)) from None
+    finally:
+        if runtime is not None:
+            await _close_runtime(runtime)
+
+
 def _register_tool(
     server: FastMCP,
     function: Callable[..., Any],
@@ -1812,6 +2105,7 @@ def _register_tool(
     name: str,
     description: str,
     annotations: ToolAnnotations,
+    meta: Mapping[str, Any] | None = None,
 ) -> None:
     if server._tool_manager.get_tool(name) is None:
         server.add_tool(
@@ -1819,7 +2113,7 @@ def _register_tool(
             name=name,
             description=description,
             annotations=annotations,
-            meta=_V1_TOOL_META,
+            meta={**_V1_TOOL_META, **dict(meta or {})},
             structured_output=True,
         )
 
@@ -1871,6 +2165,7 @@ def configure_v1_tools(
     service_factory: WorkspaceServiceFactory = _workspace_service,
     runtime_factory: ProviderRuntimeFactory | None = None,
     store_factory: RagStoreFactory = _rag_store,
+    document_runtime_factory: DocumentRuntimeFactory | None = None,
 ) -> None:
     """Register the stable V1 surface and remove legacy tools when V1 is enabled."""
 
@@ -1881,6 +2176,7 @@ def configure_v1_tools(
             service_factory=service_factory,
             runtime_factory=runtime_factory,
             store_factory=store_factory,
+            document_runtime_factory=document_runtime_factory,
         )
 
 
@@ -1891,6 +2187,7 @@ def _configure_v1_tools(
     service_factory: WorkspaceServiceFactory,
     runtime_factory: ProviderRuntimeFactory | None,
     store_factory: RagStoreFactory,
+    document_runtime_factory: DocumentRuntimeFactory | None,
 ) -> None:
     if not enabled:
         publisher = getattr(server, "_mercury_v1_generated_provider_tools", None)
@@ -2117,6 +2414,73 @@ def _configure_v1_tools(
             ),
         )
 
+    async def prepare_document_create_tool(
+        context: Context,
+        workspace_id: UUID,
+        connection_id: UUID,
+        capability_id: Annotated[
+            str,
+            Field(min_length=3, max_length=200, pattern=CAPABILITY_ID_PATTERN),
+        ],
+        capability_version: Annotated[str, Field(pattern=SHA256_PATTERN)],
+        mode: Literal["single", "batch"],
+        documents: Annotated[list[DocumentCreateItemInput], Field(min_length=1, max_length=25)],
+    ) -> DocumentPreviewOutput:
+        return await prepare_document_create(
+            context,
+            workspace_id=workspace_id,
+            connection_id=connection_id,
+            capability_id=capability_id,
+            capability_version=capability_version,
+            mode=mode,
+            documents=documents,
+            service_factory=service_factory,
+            document_runtime_factory=document_runtime_factory,
+        )
+
+    async def render_document_preview_tool(
+        context: Context,
+        workspace_id: UUID,
+        preview_id: UUID,
+    ) -> DocumentPreviewOutput:
+        return await render_document_preview(
+            context,
+            workspace_id=workspace_id,
+            preview_id=preview_id,
+            service_factory=service_factory,
+            document_runtime_factory=document_runtime_factory,
+        )
+
+    async def confirm_document_create_tool(
+        context: Context,
+        workspace_id: UUID,
+        preview_id: UUID,
+        state_version: Annotated[int, Field(ge=1)],
+        confirmation: Literal["CONFIRM_CREATE"],
+    ) -> DocumentOperationOutput:
+        return await confirm_document_create(
+            context,
+            workspace_id=workspace_id,
+            preview_id=preview_id,
+            state_version=state_version,
+            confirmation=confirmation,
+            service_factory=service_factory,
+            document_runtime_factory=document_runtime_factory,
+        )
+
+    async def get_operation_status_tool(
+        context: Context,
+        workspace_id: UUID,
+        operation_id: UUID,
+    ) -> DocumentOperationOutput:
+        return await get_operation_status(
+            context,
+            workspace_id=workspace_id,
+            operation_id=operation_id,
+            service_factory=service_factory,
+            document_runtime_factory=document_runtime_factory,
+        )
+
     async def disconnect_provider_tool(
         context: Context,
         workspace_id: UUID,
@@ -2211,6 +2575,35 @@ def _configure_v1_tools(
             _SKILL_RUN,
         ),
         (
+            prepare_document_create_tool,
+            PREPARE_DOCUMENT_CREATE_TOOL,
+            "Changes: validates and stores one immutable document-create preview. "
+            "External contact: none. Omitted options: credentials and provider dispatch.",
+            _PREPARE_DOCUMENT_CREATE,
+        ),
+        (
+            render_document_preview_tool,
+            RENDER_DOCUMENT_PREVIEW_TOOL,
+            "Changes: none. External contact: none. Omitted options: provider payloads and "
+            "provider dispatch.",
+            _CLOSED_READ,
+        ),
+        (
+            confirm_document_create_tool,
+            CONFIRM_DOCUMENT_CREATE_TOOL,
+            "Changes: confirms and dispatches the exact immutable preview once. External "
+            "contact: the qualified provider create operation. Omitted options: replacement "
+            "payloads, arbitrary provider routes, and automatic unknown-outcome retry.",
+            _CONFIRM_DOCUMENT_CREATE,
+        ),
+        (
+            get_operation_status_tool,
+            GET_OPERATION_STATUS_TOOL,
+            "Changes: records a sanitized operation-status audit. External contact: none. "
+            "Omitted options: provider payloads and replay controls.",
+            _AUDIT_ONLY,
+        ),
+        (
             disconnect_provider_tool,
             DISCONNECT_PROVIDER_TOOL,
             "Changes: removes usable local provider authorization. External contact: "
@@ -2227,6 +2620,7 @@ def _configure_v1_tools(
             name=name,
             description=description,
             annotations=tool_annotations,
+            meta=(preview_widget_tool_meta() if name == RENDER_DOCUMENT_PREVIEW_TOOL else None),
         )
 
     server.set_tool_input_contract(
@@ -2239,6 +2633,17 @@ def _configure_v1_tools(
         argument_model=RunAccountingSkillArguments,
         schema=run_accounting_skill_input_schema(),
     )
+    for name, argument_model in (
+        (PREPARE_DOCUMENT_CREATE_TOOL, PrepareDocumentCreateArguments),
+        (RENDER_DOCUMENT_PREVIEW_TOOL, RenderDocumentPreviewArguments),
+        (CONFIRM_DOCUMENT_CREATE_TOOL, ConfirmDocumentCreateArguments),
+        (GET_OPERATION_STATUS_TOOL, GetOperationStatusArguments),
+    ):
+        server.set_tool_input_contract(
+            name,
+            argument_model=argument_model,
+            schema=non_nullable_public_schema(argument_model.model_json_schema()),
+        )
     for name in V1_HOSTED_TOOL_NAMES:
         registered = server._tool_manager.get_tool(name)
         if registered is None:
@@ -2256,31 +2661,40 @@ def _configure_v1_tools(
 
 __all__ = [
     "CONNECTOR_STATUS_TOOL",
+    "CONFIRM_DOCUMENT_CREATE_TOOL",
     "AuditRecorder",
     "DISCONNECT_PROVIDER_TOOL",
     "GET_CAPABILITY_SCHEMA_TOOL",
+    "GET_OPERATION_STATUS_TOOL",
     "GET_MERCURY_CONTEXT_TOOL",
     "LIST_ACCOUNTING_PROVIDERS_TOOL",
     "LIST_PROVIDER_CAPABILITIES_TOOL",
     "LIST_PROVIDER_CONNECTIONS_TOOL",
+    "PREPARE_DOCUMENT_CREATE_TOOL",
     "ProviderRuntimeFactory",
+    "DocumentRuntimeFactory",
     "RETRIEVE_CONTEXT_PACK_TOOL",
+    "RENDER_DOCUMENT_PREVIEW_TOOL",
     "RUN_ACCOUNTING_SKILL_TOOL",
     "RagStoreFactory",
     "SEARCH_KNOWLEDGE_TOOL",
     "START_PROVIDER_CONNECTION_TOOL",
     "WorkspaceServiceFactory",
     "configure_v1_tools",
+    "confirm_document_create",
     "connector_status",
     "disconnect_provider",
     "get_capability_schema",
+    "get_operation_status",
     "get_mercury_context",
     "list_accounting_providers",
     "list_provider_capabilities",
     "list_provider_connections",
+    "prepare_document_create",
     "refresh_generated_provider_tools",
     "refresh_generated_provider_tools_until_stopped",
     "retrieve_context_pack",
+    "render_document_preview",
     "run_accounting_skill",
     "search_knowledge",
     "start_provider_connection",

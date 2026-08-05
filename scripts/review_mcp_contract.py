@@ -89,6 +89,34 @@ V1_BEHAVIOR_MATRIX: dict[str, ToolBehavior] = {
         requires_workspace=True,
     ),
     "run_accounting_skill": ToolBehavior(False, False, False, True, requires_workspace=True),
+    "prepare_document_create": ToolBehavior(
+        False,
+        False,
+        True,
+        False,
+        requires_workspace=True,
+    ),
+    "render_document_preview": ToolBehavior(
+        True,
+        False,
+        None,
+        False,
+        requires_workspace=True,
+    ),
+    "confirm_document_create": ToolBehavior(
+        False,
+        True,
+        True,
+        True,
+        requires_workspace=True,
+    ),
+    "get_operation_status": ToolBehavior(
+        False,
+        False,
+        False,
+        False,
+        requires_workspace=True,
+    ),
     "disconnect_provider": ToolBehavior(False, True, True, True, requires_workspace=True),
 }
 

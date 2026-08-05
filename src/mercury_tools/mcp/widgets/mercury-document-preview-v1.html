@@ -94,6 +94,21 @@
       button:focus-visible { outline: 3px solid #f59e0b; outline-offset: 3px; }
       #notice { min-height: 1.5em; margin-top: 12px; color: var(--muted); }
 
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --ink: #f8fafc;
+          --muted: #cbd5e1;
+          --surface: #101827;
+          --line: #475569;
+          --accent: #14b8a6;
+          --accent-strong: #5eead4;
+          --warning: #fde68a;
+          --warning-surface: #422006;
+        }
+
+        button { color: #ffffff; }
+      }
+
       @media (max-width: 640px) {
         main { padding: 14px; }
         header { display: block; }
@@ -178,34 +193,32 @@
           row.appendChild(element);
         }
 
-        function detail(document) {
+        function detail(previewDocument) {
           const card = document.createElement("article");
           card.className = "document-card";
           const heading = document.createElement("h2");
-          heading.textContent = `${text(document.document_type)} · ${text(document.draft_id)}`;
+          heading.textContent = `${text(previewDocument.document_type)} · ${text(previewDocument.draft_id)}`;
           const list = document.createElement("dl");
           const values = [
-            ["คู่ค้า", document.counterparty_display],
-            ["วันที่ออก", document.issue_date],
-            ["วันครบกำหนด", document.due_date],
-            ["ยอดก่อนส่วนลด", document.subtotal],
-            ["ส่วนลด", document.discount_total],
-            ["VAT", document.vat_total],
-            ["ภาษีหัก ณ ที่จ่าย", document.withholding_tax_total],
-            ["ยอดรวม", document.grand_total],
+            ["คู่ค้า", previewDocument.counterparty_display],
+            ["วันที่ออก", previewDocument.issue_date],
+            ["วันครบกำหนด", previewDocument.due_date],
+            ["ยอดรวม", previewDocument.grand_total],
           ];
           values.forEach(([label, value]) => {
             const term = document.createElement("dt");
             term.textContent = label;
             const description = document.createElement("dd");
-            description.textContent = `${text(document.currency)} ${text(value)}`;
+            description.textContent = label === "ยอดรวม"
+              ? `${text(previewDocument.currency)} ${text(value)}`
+              : text(value);
             list.append(term, description);
           });
           card.append(heading, list);
 
-          const warnings = Array.isArray(document.warnings) ? document.warnings : [];
-          const reviewPoints = Array.isArray(document.accountant_review_points)
-            ? document.accountant_review_points
+          const warnings = Array.isArray(previewDocument.warnings) ? previewDocument.warnings : [];
+          const reviewPoints = Array.isArray(previewDocument.accountant_review_points)
+            ? previewDocument.accountant_review_points
             : [];
           if (warnings.length || reviewPoints.length) {
             const messages = document.createElement("ul");
@@ -225,15 +238,15 @@
           currentPreview = preview;
           clear(documentBody);
           clear(documentDetails);
-          preview.documents.forEach((document) => {
+          preview.documents.forEach((previewDocument) => {
             const row = document.createElement("tr");
-            cell(row, document.document_type);
-            cell(row, document.counterparty_display);
-            cell(row, document.issue_date);
-            cell(row, document.due_date);
-            cell(row, `${text(document.currency)} ${text(document.grand_total)}`, "amount");
+            cell(row, previewDocument.document_type);
+            cell(row, previewDocument.counterparty_display);
+            cell(row, previewDocument.issue_date);
+            cell(row, previewDocument.due_date);
+            cell(row, `${text(previewDocument.currency)} ${text(previewDocument.grand_total)}`, "amount");
             documentBody.appendChild(row);
-            documentDetails.appendChild(detail(document));
+            documentDetails.appendChild(detail(previewDocument));
           });
           summary.textContent = `Preview ${text(preview.preview_id)} · เวอร์ชัน ${text(preview.state_version)} · ${text(preview.document_count)} เอกสาร · ยอดรวม ${text(preview.currency)} ${text(preview.grand_total)}`;
           status.textContent = text(preview.status);
@@ -247,6 +260,13 @@
             : "ตัวอย่างนี้ไม่พร้อมยืนยัน กรุณารอข้อมูลสถานะล่าสุดจาก Mercury";
         }
 
+        function structured(value) {
+          if (!value || typeof value !== "object") return null;
+          return value.structuredContent && typeof value.structuredContent === "object"
+            ? value.structuredContent
+            : value;
+        }
+
         function previewFrom(value) {
           if (!value || typeof value !== "object") return null;
           if (value["mercury/preview"]) return value["mercury/preview"];
@@ -254,7 +274,50 @@
           if (value.structuredContent && value.structuredContent["mercury/preview"]) {
             return value.structuredContent["mercury/preview"];
           }
-          return null;
+          const output = structured(value);
+          const data = output && output.data;
+          if (!output || !data || !Array.isArray(data.items) || !output.preview_id) return null;
+          return {
+            workspace_id: output.workspace_id,
+            preview_id: output.preview_id,
+            state_version: output.state_version,
+            status: data.preview_state,
+            provider: data.provider,
+            environment: data.environment,
+            company_display_name: data.company_display_name,
+            document_count: data.document_count,
+            currency: data.currency,
+            subtotal: data.subtotal,
+            discount_total: data.discount_total,
+            tax_total: data.vat_total,
+            withholding_tax_total: data.withholding_tax_total,
+            grand_total: data.grand_total,
+            warning_count: data.warning_count,
+            expires_at: data.expires_at,
+            documents: data.items.map((item) => ({
+              draft_id: item.client_item_id,
+              document_type: item.document_type,
+              counterparty_display: item.counterparty_display,
+              issue_date: item.issue_date,
+              due_date: item.due_date,
+              currency: item.currency,
+              grand_total: item.grand_total,
+              warnings: item.warnings,
+              accountant_review_points: item.accountant_review_points,
+              confirmation_label: "ยืนยันสร้างเอกสาร",
+            })),
+          };
+        }
+
+        function operationFrom(value) {
+          const output = structured(value);
+          const data = output && output.data;
+          if (!output || !data || !output.operation_id || !data.operation_state) return null;
+          return {
+            operation_id: output.operation_id,
+            state_version: output.state_version,
+            state: data.operation_state,
+          };
         }
 
         function refreshFromHost() {
@@ -280,6 +343,13 @@
             const latestPreview = previewFrom(result);
             if (latestPreview) {
               render(latestPreview);
+              return;
+            }
+            const operation = operationFrom(result);
+            if (operation) {
+              currentPreview = { ...preview, status: operation.state };
+              render(currentPreview);
+              notice.textContent = `รับคำยืนยันแล้ว · Operation ${text(operation.operation_id)} · สถานะ ${text(operation.state)}`;
               return;
             }
             const code = result && result.structuredContent && result.structuredContent.error

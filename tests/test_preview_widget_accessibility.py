@@ -16,6 +16,8 @@ def test_widget_is_a_self_contained_thai_accessible_document() -> None:
     assert "font-variant-numeric: tabular-nums" in html
     assert "Sarabun" in html
     assert "@media (max-width: 640px)" in html
+    assert "@media (prefers-color-scheme: dark)" in html
+    assert "--ink: #f8fafc" in html
     assert "@media print" in html
     assert "@page { size: A4;" in html
 

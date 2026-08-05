@@ -37,6 +37,24 @@ id = "generic-api-key"
   paths = ['''^tests/test_cloud_api\.py$''']
   regexes = ['''^\s*for secret in \("inbound-secret",\s*"inbound-secret2",\s*"inbound-session"\):\s*$''']
 
+  [[rules.allowlists]]
+  description = "Mercury V1 boolean Render setting"
+  condition = "AND"
+  regexTarget = "line"
+  paths = ['''^render\.yaml$''']
+  regexes = ['''^\s*- key: MERCURY_V1_ENABLED\s*$''']
+
+  [[rules.allowlists]]
+  description = "Pinned public GitHub Action commit fixture"
+  condition = "AND"
+  regexTarget = "line"
+  paths = ['''^tests/test_aws_wave0_templates\.py$''']
+  regexes = ['''^\s*(credentials_action_sha|upload_action_sha) = "[0-9a-f]{40}"\s*$''']
+
+  [[rules.allowlists]]
+  description = "Generated Python bytecode"
+  paths = ['''(^|/)__pycache__/''']
+
 [[rules]]
 id = "aws-access-token"
 

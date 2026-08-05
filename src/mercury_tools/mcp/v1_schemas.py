@@ -586,6 +586,185 @@ class DisconnectProviderOutput(V1SuccessEnvelope):
     data: DisconnectProviderData
 
 
+class DocumentCreateItemInput(V1PublicModel):
+    """One exact provider payload encoded as JSON after schema discovery."""
+
+    client_item_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$",
+    )
+    provider_arguments_json: str = Field(
+        min_length=2,
+        max_length=1_000_000,
+        description=(
+            "JSON object matching the exact schema returned by get_capability_schema. "
+            "Credentials and authorization tokens are never accepted."
+        ),
+    )
+    warnings: list[
+        Annotated[
+            str,
+            Field(
+                min_length=1,
+                max_length=200,
+                pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$",
+            ),
+        ]
+    ] = Field(default_factory=list, max_length=100)
+    accountant_review_points: list[
+        Annotated[
+            str,
+            Field(
+                min_length=1,
+                max_length=200,
+                pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$",
+            ),
+        ]
+    ] = Field(default_factory=list, max_length=100)
+
+
+class PrepareDocumentCreateArguments(ArgModelBase):
+    """Closed fallback contract; generated create wrappers publish exact object schemas."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    workspace_id: UUID
+    connection_id: UUID
+    capability_id: str = Field(
+        min_length=3,
+        max_length=200,
+        pattern=CAPABILITY_ID_PATTERN,
+    )
+    capability_version: str = Field(pattern=SHA256_PATTERN)
+    mode: Literal["single", "batch"]
+    documents: list[DocumentCreateItemInput] = Field(min_length=1, max_length=25)
+
+    @model_validator(mode="after")
+    def require_mode_count(self) -> PrepareDocumentCreateArguments:
+        if self.mode == "single" and len(self.documents) != 1:
+            raise ValueError("single_document_count_invalid")
+        if len({item.client_item_id for item in self.documents}) != len(self.documents):
+            raise ValueError("duplicate_batch_item")
+        return self
+
+
+class PreviewItemSummaryOutput(V1PublicModel):
+    client_item_id: str = Field(min_length=1, max_length=200)
+    document_type: str = Field(min_length=1, max_length=100)
+    counterparty_display: str = Field(min_length=1, max_length=200)
+    issue_date: date
+    due_date: date
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    grand_total: str = Field(pattern=r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]{1,4})?$")
+    warnings: list[str] = Field(default_factory=list, max_length=100)
+    accountant_review_points: list[str] = Field(default_factory=list, max_length=100)
+
+
+class DocumentPreviewSummaryOutput(V1PublicModel):
+    preview_state: Literal[
+        "prepared",
+        "awaiting_confirmation",
+        "confirmed",
+        "expired",
+        "cancelled",
+    ]
+    provider: ProviderId
+    environment: Literal["sandbox", "uat", "production"]
+    company_display_name: str = Field(min_length=1, max_length=200)
+    capability_id: str = Field(pattern=CAPABILITY_ID_PATTERN, max_length=200)
+    capability_version: str = Field(pattern=SHA256_PATTERN)
+    document_count: int = Field(ge=1, le=25)
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    subtotal: str = Field(pattern=r"^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,4})?$")
+    discount_total: str = Field(pattern=r"^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,4})?$")
+    vat_total: str = Field(pattern=r"^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,4})?$")
+    withholding_tax_total: str = Field(
+        pattern=r"^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,4})?$"
+    )
+    grand_total: str = Field(pattern=r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]{1,4})?$")
+    warning_count: int = Field(ge=0)
+    warnings: list[str] = Field(default_factory=list, max_length=100)
+    accountant_review_points: list[str] = Field(default_factory=list, max_length=100)
+    items: list[PreviewItemSummaryOutput] = Field(min_length=1, max_length=25)
+    expires_at: datetime
+
+
+class DocumentPreviewOutput(V1SuccessEnvelope):
+    workspace_id: UUID
+    connection_id: UUID
+    preview_id: UUID
+    state_version: int = Field(ge=1)
+    data: DocumentPreviewSummaryOutput
+
+
+class RenderDocumentPreviewArguments(ArgModelBase):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    workspace_id: UUID
+    preview_id: UUID
+
+
+class ConfirmDocumentCreateArguments(ArgModelBase):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    workspace_id: UUID
+    preview_id: UUID
+    state_version: int = Field(ge=1)
+    confirmation: Literal["CONFIRM_CREATE"]
+
+
+class GetOperationStatusArguments(ArgModelBase):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    workspace_id: UUID
+    operation_id: UUID
+
+
+class OperationItemSummaryOutput(V1PublicModel):
+    client_item_id: str = Field(min_length=1, max_length=200)
+    state: Literal[
+        "awaiting_confirmation",
+        "dispatching",
+        "succeeded",
+        "failed_pre_dispatch",
+        "provider_rejected",
+        "outcome_unknown",
+        "needs_manual_review",
+        "expired",
+        "cancelled",
+    ]
+
+
+class DocumentOperationSummaryOutput(V1PublicModel):
+    preview_id: UUID
+    provider: ProviderId
+    environment: Literal["sandbox", "uat", "production"]
+    capability_id: str = Field(pattern=CAPABILITY_ID_PATTERN, max_length=200)
+    capability_version: str = Field(pattern=SHA256_PATTERN)
+    operation_state: Literal[
+        "awaiting_confirmation",
+        "dispatching",
+        "succeeded",
+        "failed_pre_dispatch",
+        "provider_rejected",
+        "outcome_unknown",
+        "needs_manual_review",
+        "expired",
+        "cancelled",
+    ]
+    items: list[OperationItemSummaryOutput] = Field(min_length=1, max_length=25)
+    updated_at: datetime
+
+
+class DocumentOperationOutput(V1SuccessEnvelope):
+    workspace_id: UUID
+    connection_id: UUID
+    operation_id: UUID
+    state_version: int = Field(ge=1)
+    data: DocumentOperationSummaryOutput
+
+
 __all__ = [
     "AccountingProviderOutput",
     "CAPABILITY_ID_PATTERN",
@@ -596,6 +775,12 @@ __all__ = [
     "DisconnectProviderData",
     "DisconnectProviderInput",
     "DisconnectProviderOutput",
+    "ConfirmDocumentCreateArguments",
+    "DocumentCreateItemInput",
+    "DocumentOperationOutput",
+    "DocumentOperationSummaryOutput",
+    "DocumentPreviewOutput",
+    "DocumentPreviewSummaryOutput",
     "FlowAccountDisconnectedData",
     "FlowAccountDisconnectData",
     "FlowAccountRevocationRequiredData",
@@ -604,6 +789,7 @@ __all__ = [
     "FlowAccountConnectionStartData",
     "FlowAccountProviderOutput",
     "GetCapabilitySchemaOutput",
+    "GetOperationStatusArguments",
     "GetMercuryContextInput",
     "GetMercuryContextOutput",
     "HTTPS_URL_PATTERN",
@@ -619,6 +805,8 @@ __all__ = [
     "PeakConnectionStartData",
     "PeakDisconnectData",
     "PeakProviderOutput",
+    "PrepareDocumentCreateArguments",
+    "PreviewItemSummaryOutput",
     "ProviderCapabilityOutput",
     "ProviderConnectionOutput",
     "ProviderReadEnvelope",
@@ -628,6 +816,7 @@ __all__ = [
     "RunAccountingSkillArguments",
     "RunAccountingSkillData",
     "RunAccountingSkillOutput",
+    "RenderDocumentPreviewArguments",
     "SHA256_PATTERN",
     "SearchKnowledgeOutput",
     "SkillCapabilityBindingOutput",
