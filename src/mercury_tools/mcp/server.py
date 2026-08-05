@@ -4014,6 +4014,7 @@ async def healthz(request: Request) -> Response:
     return JSONResponse(
         {
             "status": "ok",
+            "v1_enabled": settings.v1_enabled,
             "supabase": settings.supabase_configured,
             "openai": settings.openai_configured,
             "embedding_provider": settings.embedding_provider,

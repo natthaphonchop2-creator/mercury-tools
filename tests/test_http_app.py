@@ -66,6 +66,7 @@ def test_remote_http_app_exposes_healthz(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+    assert response.json()["v1_enabled"] is False
     assert response.json()["mcp_path"] == "/mcp"
     assert "private_mcp" not in response.json()
     assert client.post("/private-mcp").status_code == 404
