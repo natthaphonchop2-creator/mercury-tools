@@ -35,21 +35,21 @@ services:
       - key: MERCURY_VAULT_PREVIOUS_KEY_VERSION
         sync: false
       - key: FLOWACCOUNT_MCP_SANDBOX_URL
-        sync: false
+        value: https://mcp.flowaccount.com/mcp
       - key: FLOWACCOUNT_MCP_PRODUCTION_URL
-        sync: false
+        value: https://mcp.flowaccount.com/mcp
       - key: FLOWACCOUNT_OAUTH_SANDBOX_AUTHORIZATION_SERVER_ORIGIN
-        sync: false
+        value: https://mcp.flowaccount.com
       - key: FLOWACCOUNT_OAUTH_PRODUCTION_AUTHORIZATION_SERVER_ORIGIN
-        sync: false
+        value: https://mcp.flowaccount.com
       - key: PEAK_MCP_UAT_URL
-        sync: false
+        value: https://mcp.peakaccount.com/mcp
       - key: PEAK_MCP_PRODUCTION_URL
-        sync: false
+        value: https://mcp.peakaccount.com/mcp
       - key: PEAK_APPLICATION_CODE
         sync: false
       - key: MERCURY_PROVIDER_CALLBACK_BASE_URL
-        sync: false
+        value: https://mercury-tools-mcp.onrender.com
       - key: MERCURY_TOOLS_ENABLE_LEGACY_HTTP_API
         value: "false"
       - key: MERCURY_CONNECT_SIGNING_SECRET
@@ -57,7 +57,7 @@ services:
       - key: OPENAI_APPS_CHALLENGE_TOKEN
         sync: false
       - key: MERCURY_TOOLS_PUBLIC_BASE_URL
-        sync: false
+        value: https://mercury-tools-mcp.onrender.com
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY

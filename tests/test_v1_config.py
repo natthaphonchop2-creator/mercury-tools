@@ -331,5 +331,5 @@ def test_publishable_key_is_loaded_and_declared_without_literal_value(
     ):
         assert env_vars[name] == {
             "key": name,
-            "sync": False,
+            "value": "https://mcp.flowaccount.com",
         }
