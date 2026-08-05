@@ -1,32 +1,23 @@
 ---
 name: flowaccount-connector-setup-th
-description: Use when a FlowAccount task needs connector setup or connection troubleshooting
+description: Use when a FlowAccount task needs a new, renewed, or verified Mercury connection
 ---
 
 # FlowAccount Connector Setup TH
 
-Use the hosted lifecycle for the user-selected FlowAccount mode and environment:
+## Required V1 lifecycle
 
-1. If this task has no current `workspace_id`, call `create_public_workspace`. Reuse the
-   returned `workspace_id` for every later step and keep it private; never repeat it in a
-   public issue, log, or unrelated chat.
-2. Call `list_connectors` and confirm the exact FlowAccount connection mode and
-   environment selected by the user.
-3. Call `get_connector_setup` for FlowAccount and the selected mode. Provider
-   authorization belongs to the MCP host or FlowAccount, never to Mercury chat.
-4. Call `link_connector_profile` only after the user completes provider or host
-   authorization outside Mercury. Store only the sanitized profile selection.
-5. After the host performs the documented safe probe, call
-   `validate_connector_connection` with only its sanitized evidence for the same
-   FlowAccount mode and environment.
-6. Call `connector_status` for the workspace and stop when it reports setup or
-   readiness is incomplete.
-7. Call `connector_capabilities` for the exact mode and environment before describing
-   any available action. Treat `provider_unavailable` and `not_validated` as distinct
-   outcomes. State the returned readiness basis and never imply that hosted Mercury
-   called FlowAccount when `provider_called_by_mercury` is false.
+1. Call `get_mercury_context` and select one authorized `workspace_id`.
+2. Call `list_accounting_providers` and use `flowaccount` with `sandbox` or `production` exactly
+   as selected by the user.
+3. Call `start_provider_connection` for FlowAccount.
+4. Open its `authorization_url` so the user can sign in to FlowAccount and approve access. Do
+   not continue until the OAuth handoff completes; never request an OAuth token in chat.
+   Do not continue when the callback reports an error or an account mismatch.
+5. Call `list_provider_connections` and select the matching FlowAccount connection.
+6. Call `connector_status`; stop on expired, revoked, mismatched, or incomplete authorization.
+7. Call `list_provider_capabilities`; report only exact capability versions that passed
+   qualification for this environment.
 
-For reads or writes, invoke only capabilities exposed by an already connected and
-authorized provider in the host. If the provider capability is unavailable, report
-`provider_connection_required` and stop. Never ask for, accept, or paste credentials in
-chat. Never change environments implicitly. Respond in concise Thai.
+Provider credentials never enter chat or model context. Mercury keeps encrypted OAuth material
+server-side and returns only company-safe connection metadata, evidence, and sanitized audit.
